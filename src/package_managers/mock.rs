@@ -540,6 +540,22 @@ mod tests {
         let pm2 = MockPackageManager::new_in("arch", dir.path());
         let installed = futures::executor::block_on(pm2.list_explicit())?;
         assert!(installed.iter().any(|package| package == "test-pkg"));
+        let packages = futures::executor::block_on(pm2.list_installed())?;
+        let rows: Vec<_> = packages
+            .iter()
+            .map(|package| {
+                (
+                    package.name.as_str(),
+                    package.version.to_string(),
+                    package.installed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("test-pkg", "1.0.0".to_string(), true)],
+            "a reopened mock must preserve the installed package version"
+        );
         Ok(())
     }
 
@@ -555,6 +571,21 @@ mod tests {
 
         let search = futures::executor::block_on(package_manager.search("uppercase"))?;
         assert_eq!(search.len(), 1);
+        let rows: Vec<_> = search
+            .iter()
+            .map(|package| {
+                (
+                    package.name.as_str(),
+                    package.description.as_str(),
+                    package.installed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("UpperCase", "Example package", true)],
+            "case-insensitive search must preserve the installed package identity"
+        );
         let status = futures::executor::block_on(package_manager.get_status(false))?;
         assert_eq!(status.3, 1, "status must expose the pending mock update");
         Ok(())
@@ -592,6 +623,22 @@ mod tests {
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].old_version, "0.9");
         assert_eq!(updates[0].new_version, "0.10");
+        let rows: Vec<_> = updates
+            .iter()
+            .map(|update| {
+                (
+                    update.name.as_str(),
+                    update.old_version.as_str(),
+                    update.new_version.as_str(),
+                    update.repo.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [("example", "0.9", "0.10", "main")],
+            "pending updates must preserve the package and repository identity"
+        );
         Ok(())
     }
 
