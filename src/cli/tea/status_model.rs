@@ -301,5 +301,20 @@ mod tests {
         let _cmd = model.update(StatusMsg::Loaded(data));
         assert_eq!(model.state, StatusState::Complete);
         assert!(model.data.is_some());
+        let received = model.data.as_ref().unwrap();
+        assert_eq!(
+            (
+                received.total_packages,
+                received.explicit_packages,
+                received.orphan_packages,
+                received.updates_available,
+            ),
+            (100, 50, 2, 5)
+        );
+        assert!(
+            model
+                .view()
+                .contains("100 packages installed · 50 explicit")
+        );
     }
 }

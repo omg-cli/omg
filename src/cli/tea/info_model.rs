@@ -498,6 +498,7 @@ mod tests {
         let _cmd = model.update(InfoMsg::InfoReceived(test_info));
         assert_eq!(model.state, InfoState::Complete);
         assert_eq!(model.info.as_ref().unwrap().name, "test-pkg");
+        assert_eq!(model.info.as_ref().unwrap().version, "1.0.0");
     }
 
     #[test]
@@ -506,7 +507,7 @@ mod tests {
         let _ = model.update(InfoMsg::InfoReceived(PackageInfo {
             name: "test-pkg".to_string(),
             version: "1.0.0\u{200b}\u{1b}[31m\u{202e}spoofed".to_string(),
-            description: "Test".to_string(),
+            description: "A package for displaying fixture metadata".to_string(),
             source: InfoSource::Official,
             repo: "extra\u{1b}[31m\u{202e}repo".to_string(),
             url: None,
@@ -520,6 +521,7 @@ mod tests {
         let view = model.view();
         assert!(view.contains("test-pkg"));
         assert!(view.contains("Official Repository"));
+        assert!(view.contains("A package for displaying fixture metadata"));
         assert!(
             !view.contains("\u{1b}[31m"),
             "view must exclude the raw ANSI control sequence, got: {view}"
