@@ -553,7 +553,7 @@ nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
   -monitor none "${legacy_apic[@]}" \
-  "${firmware[@]}" -display none -serial "file:$vm_serial" \
+  "${firmware[@]}" -display none -vga none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off,hostfwd=tcp:127.0.0.1:2222-10.0.2.15:22 -device virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile= \
   -pidfile qemu.pid > qemu-startup.log 2>&1 < /dev/null &
