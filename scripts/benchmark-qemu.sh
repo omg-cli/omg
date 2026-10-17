@@ -475,6 +475,27 @@ ssh-keygen -q -t ed25519 -N '' -f guest-host-key
   cat <<'CLOCK'
 bootcmd:
   - |
+    if [ "$(. /etc/os-release; printf '%s' "$ID")" = arch ]; then
+      mkdir -p /etc/systemd/network || exit 1
+      cat > /etc/systemd/network/05-omg-qemu.network.tmp <<'NETWORK' || exit 1
+    [Match]
+    MACAddress=52:54:00:12:34:56
+    [Link]
+    RequiredForOnline=no-carrier
+    [Network]
+    Gateway=10.0.2.2
+    DNS=10.0.2.3
+    DHCP=no
+    IPv6AcceptRA=no
+    LinkLocalAddressing=no
+    ConfigureWithoutCarrier=yes
+    [Address]
+    Address=10.0.2.15/24
+    DuplicateAddressDetection=none
+    NETWORK
+      chmod 0644 /etc/systemd/network/05-omg-qemu.network.tmp || exit 1
+      mv -f -- /etc/systemd/network/05-omg-qemu.network.tmp /etc/systemd/network/05-omg-qemu.network || exit 1
+    fi
     if [ "$(systemctl show -p LoadState --value systemd-timesyncd.service)" != not-found ]; then
       mkdir -p /etc/systemd/timesyncd.conf.d
       printf '[Time]\nNTP=\nNTP=162.159.200.1 162.159.200.123\nFallbackNTP=\n' > /etc/systemd/timesyncd.conf.d/99-omg-qemu.conf
@@ -534,7 +555,7 @@ nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -monitor none "${legacy_apic[@]}" \
   "${firmware[@]}" -display none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
-  -netdev user,id=n,ipv6=off,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=n,romfile= \
+  -netdev user,id=n,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off,hostfwd=tcp:127.0.0.1:2222-10.0.2.15:22 -device virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile= \
   -pidfile qemu.pid > qemu-startup.log 2>&1 < /dev/null &
 # Launch from the controller instead of QEMU's daemonize fork, which would
 # conflict with spawn=deny. The controller teardown owns the background process.
