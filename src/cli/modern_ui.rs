@@ -737,14 +737,14 @@ pub fn print_aur_build_phase(phase: &str, package: &str) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use indicatif::{ProgressDrawTarget, ProgressStyle, TermLike};
     use std::io;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Debug, Default)]
-    struct RecordingTerm {
+    pub(crate) struct RecordingTerm {
         events: Arc<Mutex<Vec<String>>>,
     }
 
@@ -759,6 +759,29 @@ mod tests {
         fn events(&self) -> Vec<String> {
             self.events.lock().expect("recording terminal lock").clone()
         }
+    }
+
+    impl RecordingTerm {
+        pub(crate) fn writes(&self) -> Vec<String> {
+            self.events()
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .strip_prefix("write:")
+                        .or_else(|| event.strip_prefix("line:"))
+                })
+                .map(|text| console::strip_ansi_codes(text).into_owned())
+                .filter(|text| !text.trim().is_empty())
+                .collect()
+        }
+    }
+
+    pub(crate) fn recording_completion_terminal() -> RecordingTerm {
+        let terminal = RecordingTerm::default();
+        progress_registry()
+            .set_draw_target(ProgressDrawTarget::term_like(Box::new(terminal.clone())));
+        OUTPUT_MODE.store(OutputMode::Interactive as u8, Ordering::Relaxed);
+        terminal
     }
 
     impl TermLike for RecordingTerm {
@@ -875,9 +898,17 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn finished_spinner_clears_its_animated_lane() {
+        if crate::core::testing::run_isolated_test(
+            "cli::modern_ui::tests::finished_spinner_clears_its_animated_lane",
+        ) {
+            return;
+        }
         let (progress, terminal) = recording_spinner("Checking package sources");
+        let completion = recording_completion_terminal();
 
         finish_success(&progress, "Checked", "package sources");
+        assert!(progress.is_finished());
+        assert_eq!(completion.writes(), ["✓ Checked package sources"]);
 
         let events = terminal.events();
         assert!(
@@ -891,9 +922,20 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn finished_info_spinner_clears_its_animated_lane() {
+        if crate::core::testing::run_isolated_test(
+            "cli::modern_ui::tests::finished_info_spinner_clears_its_animated_lane",
+        ) {
+            return;
+        }
         let (progress, terminal) = recording_spinner("Checking official repositories");
+        let completion = recording_completion_terminal();
 
         finish_info(&progress, "No updates in official repositories");
+        assert!(progress.is_finished());
+        assert_eq!(
+            completion.writes(),
+            ["· No updates in official repositories"]
+        );
 
         let events = terminal.events();
         assert!(
