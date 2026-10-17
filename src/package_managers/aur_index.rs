@@ -450,6 +450,17 @@ mod tests {
         assert_eq!(updates[0].0, "pkg-a");
         assert_eq!(missing, vec!["stale-only".to_string()]);
 
+        assert_eq!(
+            updates
+                .iter()
+                .map(|(name, local, remote)| {
+                    (name.as_str(), local.to_string(), remote.to_string())
+                })
+                .collect::<Vec<_>>(),
+            vec![("pkg-a", "1.0".to_string(), "2.0".to_string())],
+            "updates must preserve complete name/local/remote tuples"
+        );
+
         Ok(())
     }
 
@@ -472,6 +483,17 @@ mod tests {
         assert!(missing.is_empty());
         assert_eq!(updates.len(), 1, "Only pkg-a should have an update");
         assert_eq!(updates[0].0, "pkg-a");
+
+        assert_eq!(
+            updates
+                .iter()
+                .map(|(name, local, remote)| {
+                    (name.as_str(), local.to_string(), remote.to_string())
+                })
+                .collect::<Vec<_>>(),
+            vec![("pkg-a", "1.0".to_string(), "2.0".to_string())],
+            "updates must preserve complete name/local/remote tuples"
+        );
 
         Ok(())
     }
@@ -528,6 +550,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["pkg-ok"],
             "the parseable update must survive; no fabricated 0-update for pkg-bad"
+        );
+
+        assert_eq!(
+            updates
+                .iter()
+                .map(|(name, local, remote)| {
+                    (name.as_str(), local.to_string(), remote.to_string())
+                })
+                .collect::<Vec<_>>(),
+            vec![("pkg-ok", "1.0".to_string(), "2.0".to_string())],
+            "updates must preserve complete name/local/remote tuples"
         );
 
         Ok(())
