@@ -414,6 +414,30 @@ mod tests {
             metadata_index_is_fresh(&archive, &index, Duration::from_mins(1)),
             "a just-published generation must be coherent and fresh"
         );
+
+        let published_index = crate::package_managers::aur_index::AurIndex::open(&index);
+        assert!(
+            published_index.is_ok(),
+            "the published binary index must be queryable"
+        );
+        let published_index = published_index.unwrap();
+        assert_eq!(
+            published_index
+                .search("", 2)
+                .unwrap()
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.version.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("aur-helper", "1.2.3-1")],
+            "the published binary index must contain exactly the literal package and version"
+        );
+        let entry = published_index.get("aur-helper").unwrap().unwrap();
+        assert!(entry.maintainer.is_none());
+        assert!(entry.last_modified.is_none());
+        assert!(entry.description.is_none());
+        assert_eq!(entry.num_votes, 0);
+        assert_eq!(entry.popularity, 0.0);
+        assert!(entry.out_of_date.is_none());
     }
 
     #[test]
