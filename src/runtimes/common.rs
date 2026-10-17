@@ -4065,6 +4065,12 @@ mod tests {
         assert!(message.contains("bytes="), "{message}");
         assert!(message.contains("sha256="), "{message}");
         assert!(message.contains("runtime.tar.xz"), "{message}");
+        assert!(
+            message.contains(
+                "bytes=53 sha256=3ae02d12460688961d71ac07139d60958c636c8656d1b7f714809d49b4ae1116)"
+            ),
+            "{message}"
+        );
         Ok(())
     }
 
@@ -4308,7 +4314,15 @@ mod tests {
         let temp = TempDir::new()?;
         let src = temp.path().join("src");
         let dest = temp.path().join("dest");
-        fs::create_dir_all(&src)?;
+        fs::create_dir_all(src.join("nested/deeper"))?;
+        fs::write(src.join("root.bin"), b"root\0payload")?;
+        fs::write(src.join("nested/deeper/tool"), b"nested\xffpayload")?;
+        copy_regular_tree(&src, &dest)?;
+        assert_eq!(fs::read(dest.join("root.bin"))?, b"root\0payload");
+        assert_eq!(
+            fs::read(dest.join("nested/deeper/tool"))?,
+            b"nested\xffpayload"
+        );
         std::os::unix::fs::symlink("/tmp", src.join("link"))?;
 
         let error = copy_regular_tree(&src, &dest).expect_err("symlinks must be rejected");
@@ -4687,6 +4701,29 @@ mod tests {
 
     #[test]
     fn budgeted_writer_stops_before_exceeding_cumulative_budget() {
+        {
+            let mut remaining = 16;
+            let mut output = Vec::new();
+            let first = copy_with_budget(
+                &mut std::io::Cursor::new(b"archive-"),
+                &mut output,
+                &mut remaining,
+            )
+            .expect("first payload fits the shared budget");
+            let second = copy_with_budget(
+                &mut std::io::Cursor::new(b"payload!"),
+                &mut output,
+                &mut remaining,
+            )
+            .expect("second payload fits the remaining budget exactly");
+            assert_eq!((first, second, remaining), (8, 8, 0));
+            assert_eq!(output, b"archive-payload!");
+            let error =
+                copy_with_budget(&mut std::io::Cursor::new(b"x"), &mut output, &mut remaining)
+                    .expect_err("a later copy must share the exhausted budget");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(output, b"archive-payload!");
+        }
         let mut remaining = 16;
         let mut output = Vec::new();
         let error = copy_with_budget(
@@ -4704,12 +4741,18 @@ mod tests {
     fn budgeted_sink_stops_growing_at_the_budget() {
         let mut sink = BudgetedSink::with_budget(16);
 
-        let ok = sink.write(&[0u8; 10]).unwrap();
+        let ok = sink.write(b"payload123").unwrap();
+        let cumulative = sink
+            .write(b"1234567")
+            .expect_err("a write must fit the remaining budget");
+        assert_eq!(cumulative.kind(), std::io::ErrorKind::InvalidData);
         let error = sink.write(&[0u8; 32]).expect_err("budget must abort");
 
         assert_eq!(ok, 10);
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(sink.into_inner().len(), 10);
+        let payload = sink.into_inner();
+        assert_eq!(payload.len(), 10);
+        assert_eq!(payload, b"payload123");
     }
 }
 
