@@ -60,7 +60,7 @@ class QemuProcessIsolationTests(unittest.TestCase):
                 self.assertEqual(result.stdout.strip(), 'q35,sata=off' if arch == 'x86_64' else 'virt')
 
     @unittest.skipIf(os.name == 'nt', 'launch fixture requires POSIX executable scripts')
-    def test_headless_launch_preserves_default_vga_serial_and_network(self):
+    def test_headless_launch_disables_vga_and_preserves_serial_and_network(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         launch = 'nohup "$5"' + source.split('nohup "$5"', 1)[1].split('# Launch from the controller', 1)[0]
         with tempfile.TemporaryDirectory() as directory:
@@ -68,7 +68,7 @@ class QemuProcessIsolationTests(unittest.TestCase):
             executable = root / 'qemu-fixture'
             executable.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
             executable.chmod(0o755)
-            for machine in ('q35', 'virt'):
+            for machine in ('q35', 'q35,sata=off', 'virt'):
                 with self.subTest(machine=machine):
                     command = ('set -- bios vars code firmware "$1" "$2" tcg max; '
                                'accel=tcg; firmware=(); vm_serial=serial.log; vm_disk=disk.qcow2; '
@@ -77,7 +77,8 @@ class QemuProcessIsolationTests(unittest.TestCase):
                                             cwd=root, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     arguments = json.loads((root / 'qemu-startup.log').read_text())
-                    self.assertNotIn('-vga', arguments)
+                    self.assertEqual(arguments.count('-vga'), 1)
+                    self.assertEqual(arguments[arguments.index('-vga') + 1], 'none')
                     self.assertEqual(arguments[arguments.index('-display') + 1], 'none')
                     self.assertEqual(arguments[arguments.index('-serial') + 1], 'file:serial.log')
                     self.assertIn('virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile=', arguments)
