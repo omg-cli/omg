@@ -418,7 +418,12 @@ mod tests {
     #[test]
     #[serial]
     fn finish_is_once_across_clones() {
-        modern_ui::configure_output(0, false);
+        if crate::core::testing::run_isolated_test(
+            "cli::progress::tests::finish_is_once_across_clones",
+        ) {
+            return;
+        }
+        let completion = modern_ui::tests::recording_completion_terminal();
         let task = ProgressTask::start(&spec("db", TaskKind::Items { total: 3 }));
         let clone = task.clone();
         let bar = lock_bar(&task.inner).clone().expect("lane exists");
@@ -430,6 +435,23 @@ mod tests {
         // A second finish through another clone must not re-print or re-finish.
         clone.finish(Outcome::Failed);
         assert!(lock_bar(&task.inner).is_none());
+        let lines: Vec<_> = completion
+            .writes()
+            .into_iter()
+            .filter(|text| text.starts_with("  ✓ ") || text.starts_with("  ✗ "))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "one emitted completion across both clones: {lines:?}"
+        );
+        let elapsed = lines[0]
+            .strip_prefix("  ✓ db · ")
+            .expect("the first completion stays successful after the failed clone finish");
+        assert!(
+            !elapsed.is_empty(),
+            "completion includes an elapsed duration"
+        );
         modern_ui::configure_output(0, false);
     }
 
