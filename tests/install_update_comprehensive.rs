@@ -1015,28 +1015,80 @@ mod system_state_tests {
 
     #[test]
     fn test_info_shows_package_details() {
-        if !system_tests_enabled() {
-            return;
-        }
-
-        let result = run_omg(&["info", "pacman"]);
+        let project = common::TestProject::for_distro("arch");
+        let result = run_in_project(&project, &["info", "pacman"]);
         result.assert_success();
-        // Official-package info renders the version inline next to the name
-        // and labels Description/Repository sections
-        // (src/cli/packages/info.rs).
         result.assert_contains("Description");
-        result.assert_contains("Repository");
+        let rows: Vec<_> = result
+            .stdout
+            .lines()
+            .filter_map(|line| line.trim().split_once(':'))
+            .map(|(label, value)| (label.trim(), value.trim()))
+            .filter(|(label, _)| {
+                matches!(
+                    *label,
+                    "Name" | "Version" | "Source" | "Installed" | "Description"
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Name", "pacman"),
+                ("Version", "6.0.2"),
+                ("Source", "Official repository (pacman)"),
+                ("Installed", "no"),
+                ("Description", "Arch package manager"),
+            ],
+            "info must preserve the package's complete public metadata rows"
+        );
+        project.close_checked();
     }
 
     #[test]
     fn test_update_check_shows_available_updates() {
-        if !system_tests_enabled() {
-            return;
-        }
+        let project = common::TestProject::for_distro("arch");
+        project.mock_install("git", "2.42.0").unwrap();
+        project.mock_available("git", "2.43.0").unwrap();
+        let before = project.run(&["explicit", "--json"]);
+        before.assert_success();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&before.stdout).unwrap(),
+            serde_json::json!({"packages": ["git"], "count": 1})
+        );
+        let state_path = project.data_dir.path().join("mock_state_pacman.json");
+        let before_state = std::fs::read(&state_path).unwrap();
 
-        let result = run_omg(&["update", "--check"]);
+        let result = run_in_project(&project, &["update", "--check"]);
         result.assert_success();
-        result.assert_reports_update_status();
+        let lines: Vec<_> = result.stdout.lines().map(str::trim).collect();
+        assert!(
+            lines.contains(&"| 1 update available"),
+            "update check must report exactly one pending update: {}",
+            result.stdout
+        );
+        assert!(
+            lines.contains(&"1 official packages"),
+            "update check must identify the official package count: {}",
+            result.stdout
+        );
+        assert!(
+            lines.contains(&"git 2.42.0 → 2.43.0 (extra)"),
+            "update check must preserve the package/version/repository row: {}",
+            result.stdout
+        );
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            before_state,
+            "checking updates must preserve the installed and available versions"
+        );
+        let after = project.run(&["explicit", "--json"]);
+        after.assert_success();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&after.stdout).unwrap(),
+            serde_json::json!({"packages": ["git"], "count": 1})
+        );
+        project.close_checked();
     }
 
     #[test]
