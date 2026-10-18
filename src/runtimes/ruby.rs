@@ -332,11 +332,15 @@ mod tests {
 
     #[test]
     fn ruby_platform_is_host_specific() {
+        const EXPECTED: Option<&str> = if cfg!(target_os = "linux") {
+            Some("ubuntu-22.04")
+        } else if cfg!(target_os = "macos") {
+            Some("darwin")
+        } else {
+            None
+        };
         let platform = ruby_platform().expect("host platform should be supported");
-        match std::env::consts::OS {
-            "linux" => assert_eq!(platform, "ubuntu-22.04"),
-            "macos" => assert_eq!(platform, "darwin"),
-            os => panic!("unsupported test host: {os}"),
-        }
+        let expected = EXPECTED.expect("unsupported test host");
+        assert_eq!(platform, expected);
     }
 }

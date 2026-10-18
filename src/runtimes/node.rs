@@ -2035,14 +2035,19 @@ mod tests {
 
     #[test]
     fn node_platform_uses_host_os_and_arch() {
-        let platform = node_platform().expect("host platform should be supported");
-        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => "linux-x64",
-            ("linux", "aarch64") => "linux-arm64",
-            ("macos", "x86_64") => "darwin-x64",
-            ("macos", "aarch64") => "darwin-arm64",
-            (os, arch) => panic!("unsupported test host: {os}/{arch}"),
+        const EXPECTED: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Some("linux-x64")
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            Some("linux-arm64")
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            Some("darwin-x64")
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some("darwin-arm64")
+        } else {
+            None
         };
+        let platform = node_platform().expect("host platform should be supported");
+        let expected = EXPECTED.expect("unsupported test host");
         assert_eq!(platform, expected);
         assert!(platform.contains('-'));
         assert!(!platform.starts_with("linux-") || std::env::consts::OS == "linux");

@@ -680,14 +680,19 @@ mod tests {
 
     #[test]
     fn deno_target_uses_host_os_and_arch() {
-        let target = deno_target().expect("host target should be supported");
-        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-            ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-            ("macos", "x86_64") => "x86_64-apple-darwin",
-            ("macos", "aarch64") => "aarch64-apple-darwin",
-            (os, arch) => panic!("unsupported test host: {os}/{arch}"),
+        const EXPECTED: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Some("x86_64-unknown-linux-gnu")
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            Some("aarch64-unknown-linux-gnu")
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            Some("x86_64-apple-darwin")
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some("aarch64-apple-darwin")
+        } else {
+            None
         };
+        let target = deno_target().expect("host target should be supported");
+        let expected = EXPECTED.expect("unsupported test host");
         assert_eq!(target, expected);
     }
 

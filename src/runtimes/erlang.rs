@@ -646,14 +646,20 @@ mod tests {
 
     #[test]
     fn host_arch_tokens_name_the_platform() {
+        const EXPECTED: Option<(&str, &str)> =
+            if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+                Some(("amd64", "amd64"))
+            } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                Some(("arm64", "arm64"))
+            } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+                Some(("x86_64", "x86_64"))
+            } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                Some(("aarch64", "aarch64"))
+            } else {
+                None
+            };
         let (index, tarball) = host_arch_tokens().expect("host is supported");
-        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => ("amd64", "amd64"),
-            ("linux", "aarch64") => ("arm64", "arm64"),
-            ("macos", "x86_64") => ("x86_64", "x86_64"),
-            ("macos", "aarch64") => ("aarch64", "aarch64"),
-            (os, arch) => panic!("unsupported test host: {os}/{arch}"),
-        };
+        let expected = EXPECTED.expect("unsupported test host");
         assert_eq!((index, tarball), expected);
         assert_eq!(index, tarball);
         match std::env::consts::ARCH {

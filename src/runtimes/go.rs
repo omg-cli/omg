@@ -403,14 +403,19 @@ mod tests {
 
     #[test]
     fn go_platform_uses_host_os_and_arch() {
-        let platform = go_platform().expect("host platform should be supported");
-        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("linux", "x86_64") => "linux-amd64",
-            ("linux", "aarch64") => "linux-arm64",
-            ("macos", "x86_64") => "darwin-amd64",
-            ("macos", "aarch64") => "darwin-arm64",
-            (os, arch) => panic!("unsupported test host: {os}/{arch}"),
+        const EXPECTED: Option<&str> = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Some("linux-amd64")
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            Some("linux-arm64")
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            Some("darwin-amd64")
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some("darwin-arm64")
+        } else {
+            None
         };
+        let platform = go_platform().expect("host platform should be supported");
+        let expected = EXPECTED.expect("unsupported test host");
         assert_eq!(platform, expected);
         if std::env::consts::OS == "linux" {
             assert!(platform.starts_with("linux-"));
