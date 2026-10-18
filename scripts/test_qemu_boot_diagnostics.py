@@ -1,6 +1,8 @@
 """Run the observer against native proc/socket state; no guest success is claimed."""
 from pathlib import Path
 import os
+import json
+import sys
 import signal
 import shlex
 import socket
@@ -92,6 +94,35 @@ class BootDiagnostics(unittest.TestCase):
                 child.wait(timeout=5)
             dead = self.observe(directory)
             self.assertIn("qemu_process_status=unavailable", dead)
+
+    def test_identity_selects_designated_child_and_preserves_argument_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = [sys.executable, "-c", "import time; time.sleep(30)", "literal spaced argument", ""]
+            child = subprocess.Popen(command)
+            decoy = subprocess.Popen(["sleep", "30"])
+            try:
+                (Path(directory) / "qemu.pid").write_text(f"{child.pid}\n")
+                expected_start = Path(f"/proc/{child.pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+                expected_exe = os.readlink(f"/proc/{child.pid}/exe")
+                output = self.observe(directory)
+                self.assertIn("qemu_identity=", output)
+                identity = json.loads(next(line.split("=", 1)[1] for line in output.splitlines()
+                                           if line.startswith("qemu_identity=")))
+                self.assertEqual(identity, {"state": "observed", "pid": child.pid,
+                                           "starttime_ticks": expected_start, "exe": expected_exe,
+                                           "argv": command, "argv_truncated": False})
+                self.assertNotEqual(identity["pid"], decoy.pid)
+                self.assertIsNone(child.poll(), "the observer must not signal the designated child")
+                self.assertIsNone(decoy.poll(), "the observer must not signal the decoy")
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
+                decoy.terminate()
+                decoy.wait(timeout=5)
+            dead = self.observe(directory)
+            identity = json.loads(next(line.split("=", 1)[1] for line in dead.splitlines()
+                                       if line.startswith("qemu_identity=")))
+            self.assertEqual(identity, {"state": "unavailable", "pid": child.pid})
 
     def test_stopped_child_state_is_preserved_without_resuming_it(self):
         with tempfile.TemporaryDirectory() as directory:
