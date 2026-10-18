@@ -32,6 +32,8 @@ class QemuProcessIsolationTests(unittest.TestCase):
                         capture_output=True, text=True, timeout=5)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     arguments = (root / 'arguments').read_text().splitlines()
+                    self.assertNotIn('-vga', arguments)
+                    self.assertEqual(arguments[arguments.index('-display') + 1], 'none')
                     self.assertEqual(arguments.count('apic-common.vapic=false'), 0 if machine == 'virt' else 1)
                     if machine != 'virt':
                         self.assertEqual(arguments[arguments.index('-global') + 1], 'apic-common.vapic=false')
