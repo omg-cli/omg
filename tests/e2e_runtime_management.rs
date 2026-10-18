@@ -17,6 +17,16 @@
 
 pub mod common;
 
+#[path = "common/runtime_installed.rs"]
+mod runtime_installed;
+
+use runtime_installed::{installed_rows, seed_installed};
+
+#[path = "common/runtime_available.rs"]
+pub mod runtime_available;
+
+use runtime_available::{expected_node_alias, has_expected_row, node_alias_from_table};
+
 use common::*;
 
 /// Bound local selection and activation; a timeout is not a successful result.
@@ -36,56 +46,6 @@ fn node_alias_oracle_uses_release_versions_and_lts_column_not_row_order() {
     assert_eq!(node_alias_from_table(table, true).unwrap(), "24.21.0");
     assert!(node_alias_from_table("version\tlts\nv26.9.0\t-\n", true).is_err());
     assert!(node_alias_from_table("version\n", false).is_err());
-}
-
-fn node_alias_from_table(table: &str, lts_only: bool) -> anyhow::Result<String> {
-    let mut lines = table.lines();
-    let header: Vec<_> = lines.next().unwrap_or_default().split('\t').collect();
-    let version_column = header
-        .iter()
-        .position(|value| *value == "version")
-        .ok_or_else(|| anyhow::anyhow!("Node release table lacks version column"))?;
-    let lts_column = header
-        .iter()
-        .position(|value| *value == "lts")
-        .ok_or_else(|| anyhow::anyhow!("Node release table lacks lts column"))?;
-    let mut candidates = Vec::new();
-    for line in lines {
-        let fields: Vec<_> = line.split('\t').collect();
-        anyhow::ensure!(
-            fields.len() == header.len(),
-            "Malformed Node release row: {line}"
-        );
-        let version = semver::Version::parse(fields[version_column].trim_start_matches('v'))?;
-        if version.pre.is_empty() && (!lts_only || !matches!(fields[lts_column], "" | "-")) {
-            candidates.push(version);
-        }
-    }
-    candidates
-        .into_iter()
-        .max()
-        .map(|version| version.to_string())
-        .ok_or_else(|| anyhow::anyhow!("No eligible Node release in independent table"))
-}
-
-fn expected_node_alias(lts_only: bool) -> String {
-    // Separate upstream representation and ordering rule from OMG's JSON resolver.
-    let table = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap()
-            .get("https://nodejs.org/dist/index.tab")
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .text()
-            .await
-            .unwrap()
-    });
-    node_alias_from_table(&table, lts_only).unwrap()
 }
 
 /// Assert the documented detection contract: `omg use <runtime>` without an
@@ -483,25 +443,34 @@ fn test_use_node_lts() {
 
 #[test]
 fn test_list_all_runtimes() {
-    init_test_env();
+    let project = TestProject::new();
+    seed_installed(&project, "node", &["20.9.0", "20.10.0"]);
+    seed_installed(&project, "python", &["3.9.0", "3.12.0"]);
 
-    let result = run_omg(&["list"]);
+    let result = project.run_with_env(&["list"], &[("NO_COLOR", "1")]);
     result.assert_success();
-    // The summary always renders the "Installed runtime versions" header,
-    // even when no runtime is installed.
-    result.assert_stdout_contains("runtime");
+    result.assert_stdout_contains("runtime versions");
+    assert_eq!(
+        installed_rows(&result.stdout),
+        [
+            "• node 20.10.0",
+            "• node 20.9.0",
+            "• python 3.12.0",
+            "• python 3.9.0",
+        ]
+    );
 }
 
 #[test]
 fn test_list_specific_runtime() {
-    init_test_env();
+    let project = TestProject::new();
+    seed_installed(&project, "node", &["20.9.0", "20.10.0"]);
+    seed_installed(&project, "python", &["3.9.0", "3.12.0"]);
 
-    let result = run_omg(&["list", "node"]);
-
-    // Listing a known runtime always succeeds and renders the per-runtime
-    // "<runtime> versions" header (list_versions_sync in src/cli/runtimes.rs).
+    let result = project.run_with_env(&["list", "node"], &[("NO_COLOR", "1")]);
     result.assert_success();
     result.assert_stdout_contains("node versions");
+    assert_eq!(installed_rows(&result.stdout), ["• 20.10.0", "• 20.9.0"]);
 }
 
 #[test]
@@ -685,10 +654,22 @@ fn test_list_available_versions() {
     init_test_env();
     require_network_tests!();
 
-    let result = run_capped(&["list", "node", "--available"], INSTALL_TIMEOUT_SECS);
+    let expected = format!("v{}", expected_node_alias(false));
+    let result = run_omg_with_env(
+        &["list", "node", "--available"],
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
+            ("NO_COLOR", "1"),
+        ],
+    );
 
     result.assert_success();
     result.assert_stdout_contains("Available remote versions");
+    assert!(
+        has_expected_row(&result.stdout, &expected),
+        "missing independently expected Node row {expected}: {}",
+        result.stdout
+    );
 }
 
 #[test]

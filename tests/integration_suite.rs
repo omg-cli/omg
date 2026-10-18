@@ -22,6 +22,18 @@
 
 pub mod common;
 
+#[path = "common/runtime_installed.rs"]
+mod runtime_installed;
+
+use runtime_installed::{installed_rows, seed_installed};
+
+#[path = "common/runtime_available.rs"]
+pub mod runtime_available;
+
+use runtime_available::{
+    Catalog, expected_catalog_versions, expected_node_alias, has_catalog_row, has_expected_row,
+};
+
 use common::*;
 use std::env;
 use std::fs::{self, File};
@@ -465,83 +477,161 @@ mod runtime_management {
 
     #[test]
     fn test_list_all_runtimes() {
-        let result = run_omg(&["list"]);
+        let project = TestProject::new();
+        seed_installed(&project, "node", &["20.9.0", "20.10.0"]);
+        seed_installed(&project, "python", &["3.9.0", "3.12.0"]);
+
+        let result = project.run_with_env(&["list"], &[("NO_COLOR", "1")]);
         result.assert_success();
-        // Falsifiable contract: the overview header is rendered
-        // (src/cli/runtimes.rs:379 "Installed runtime versions").
         result.assert_stdout_contains("runtime versions");
+        assert_eq!(
+            installed_rows(&result.stdout),
+            [
+                "• node 20.10.0",
+                "• node 20.9.0",
+                "• python 3.12.0",
+                "• python 3.9.0",
+            ]
+        );
     }
 
     #[test]
     fn test_list_installed_node() {
-        let result = run_omg(&["list", "node"]);
+        let project = TestProject::new();
+        seed_installed(&project, "node", &["20.9.0", "20.10.0"]);
+        seed_installed(&project, "python", &["3.9.0", "3.12.0"]);
+
+        let result = project.run_with_env(&["list", "node"], &[("NO_COLOR", "1")]);
         result.assert_success();
         result.assert_stdout_contains("node versions");
+        assert_eq!(installed_rows(&result.stdout), ["• 20.10.0", "• 20.9.0"]);
     }
 
     #[test]
     fn test_list_installed_python() {
-        let result = run_omg(&["list", "python"]);
+        let project = TestProject::new();
+        seed_installed(&project, "node", &["20.9.0", "20.10.0"]);
+        seed_installed(&project, "python", &["3.9.0", "3.12.0"]);
+
+        let result = project.run_with_env(&["list", "python"], &[("NO_COLOR", "1")]);
         result.assert_success();
         result.assert_stdout_contains("python versions");
+        assert_eq!(installed_rows(&result.stdout), ["• 3.12.0", "• 3.9.0"]);
     }
 
     #[test]
     #[ignore = "requires network access to runtime metadata"]
     fn test_list_available_node() {
-        let result = run_omg(&["list", "node", "--available"]);
+        let expected = format!("v{}", expected_node_alias(false));
+        let result = run_omg_with_env(&["list", "node", "--available"], &[("NO_COLOR", "1")]);
         assert!(result.success, "List available node should succeed");
         // Should show versions from nodejs.org
+        assert!(
+            has_expected_row(&result.stdout, &expected),
+            "missing independently expected Node row {expected}: {}",
+            result.stdout
+        );
     }
 
     #[test]
-    #[ignore = "requires network access to runtime metadata"]
     fn test_list_available_python() {
-        let result = run_omg(&["list", "python", "--available"]);
+        let result = run_omg_with_env(&["list", "python", "--available"], &[("NO_COLOR", "1")]);
         assert!(result.success, "List available python should succeed");
+        assert!(
+            has_expected_row(&result.stdout, "3.12.0"),
+            "missing complete Python 3.12.0 row: {}",
+            result.stdout
+        );
+        assert!(
+            has_expected_row(&result.stdout, "3.11.0"),
+            "missing complete Python 3.11.0 row: {}",
+            result.stdout
+        );
     }
 
     #[test]
     #[ignore = "requires network access to runtime metadata"]
     fn test_list_available_go() {
-        let result = run_omg(&["list", "go", "--available"]);
+        let expected =
+            expected_catalog_versions(Catalog::Go).expect("independent go catalog setup failed");
+        let result = run_omg_with_env(&["list", "go", "--available"], &[("NO_COLOR", "1")]);
         assert!(result.success, "List available go should succeed");
+        assert!(
+            has_catalog_row(&result.stdout, &expected),
+            "no independently observed go version row: {}",
+            result.stdout
+        );
     }
 
     #[test]
     #[ignore = "requires network access to runtime metadata"]
     fn test_list_available_rust() {
-        let result = run_omg(&["list", "rust", "--available"]);
+        let expected = expected_catalog_versions(Catalog::Rust)
+            .expect("independent rust catalog setup failed");
+        let result = run_omg_with_env(&["list", "rust", "--available"], &[("NO_COLOR", "1")]);
         assert!(result.success, "List available rust should succeed");
+        assert!(
+            has_catalog_row(&result.stdout, &expected),
+            "no independently observed rust version row: {}",
+            result.stdout
+        );
     }
 
     #[test]
     #[ignore = "requires network access to runtime metadata"]
     fn test_list_available_ruby() {
-        let result = run_omg(&["list", "ruby", "--available"]);
+        let expected = expected_catalog_versions(Catalog::Ruby)
+            .expect("independent ruby catalog setup failed");
+        let result = run_omg_with_env(&["list", "ruby", "--available"], &[("NO_COLOR", "1")]);
         assert!(result.success, "List available ruby should succeed");
+        assert!(
+            has_catalog_row(&result.stdout, &expected),
+            "no independently observed ruby version row: {}",
+            result.stdout
+        );
     }
 
     #[test]
     #[ignore = "requires network access to runtime metadata"]
     fn test_list_available_java() {
-        let result = run_omg(&["list", "java", "--available"]);
+        let expected = expected_catalog_versions(Catalog::Java)
+            .expect("independent java catalog setup failed");
+        let result = run_omg_with_env(&["list", "java", "--available"], &[("NO_COLOR", "1")]);
         assert!(result.success, "List available java should succeed");
         // Should show LTS markers
+        assert!(
+            has_catalog_row(&result.stdout, &expected),
+            "no independently observed java version row: {}",
+            result.stdout
+        );
     }
 
     #[test]
     #[ignore = "requires network access to runtime metadata"]
     fn test_list_available_bun() {
-        let result = run_omg(&["list", "bun", "--available"]);
+        let expected =
+            expected_catalog_versions(Catalog::Bun).expect("independent bun catalog setup failed");
+        let result = run_omg_with_env(&["list", "bun", "--available"], &[("NO_COLOR", "1")]);
         assert!(result.success, "List available bun should succeed");
+        assert!(
+            has_catalog_row(&result.stdout, &expected),
+            "no independently observed bun version row: {}",
+            result.stdout
+        );
     }
 
     #[test]
     #[ignore = "requires network access to runtime metadata"]
     fn test_list_available_deno() {
-        let result = run_omg(&["list", "deno", "--available"]);
+        let expected = expected_catalog_versions(Catalog::Deno)
+            .expect("independent deno catalog setup failed");
+        let result = run_omg_with_env(&["list", "deno", "--available"], &[("NO_COLOR", "1")]);
         assert!(result.success, "List available deno should succeed");
+        assert!(
+            has_catalog_row(&result.stdout, &expected),
+            "no independently observed deno version row: {}",
+            result.stdout
+        );
     }
 
     // Falsifiable contract pinned at src/cli/runtimes.rs:322 (via the fast
@@ -647,22 +737,36 @@ mod runtime_management {
     // must succeed on its own - not merely agree with the other's outcome.
     #[test]
     fn test_runtime_alias_node_nodejs() {
-        let result1 = run_omg(&["list", "node"]);
-        let result2 = run_omg(&["list", "nodejs"]);
-        assert!(
-            result1.success && result2.success,
-            "node and nodejs must both be accepted"
-        );
+        let project = TestProject::new();
+        seed_installed(&project, "node", &["20.9.0", "20.10.0"]);
+        seed_installed(&project, "python", &["3.12.0"]);
+
+        for runtime in ["node", "nodejs"] {
+            let result = project.run_with_env(&["list", runtime], &[("NO_COLOR", "1")]);
+            result.assert_success();
+            assert_eq!(
+                installed_rows(&result.stdout),
+                ["• 20.10.0", "• 20.9.0"],
+                "{runtime} must list the canonical runtime inventory"
+            );
+        }
     }
 
     #[test]
     fn test_runtime_alias_go_golang() {
-        let result1 = run_omg(&["list", "go"]);
-        let result2 = run_omg(&["list", "golang"]);
-        assert!(
-            result1.success && result2.success,
-            "go and golang must both be accepted"
-        );
+        let project = TestProject::new();
+        seed_installed(&project, "go", &["1.9.9", "1.21.10"]);
+        seed_installed(&project, "rust", &["1.75.0"]);
+
+        for runtime in ["go", "golang"] {
+            let result = project.run_with_env(&["list", runtime], &[("NO_COLOR", "1")]);
+            result.assert_success();
+            assert_eq!(
+                installed_rows(&result.stdout),
+                ["• 1.21.10", "• 1.9.9"],
+                "{runtime} must list the canonical runtime inventory"
+            );
+        }
     }
 }
 
