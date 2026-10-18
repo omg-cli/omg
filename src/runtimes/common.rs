@@ -4178,28 +4178,127 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_download_removes_only_its_own_directory() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const BODY: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
         let versions = TempDir::new()?;
         let surviving = begin_download(versions.path())?;
-        let cancelled = begin_download(versions.path())?;
-        let cancelled_path = cancelled.path().to_path_buf();
         let survivor_path = surviving.path().join("runtime.zip");
         fs::write(&survivor_path, b"verified")?;
-        fs::write(cancelled.path().join("runtime.zip"), b"partial")?;
-        let (ready, started) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _owner = cancelled;
-            let _ = ready.send(());
-            std::future::pending::<()>().await;
-        });
-        started.await?;
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("task must be cancelled")
-                .is_cancelled()
-        );
-        assert!(!cancelled_path.exists());
-        assert_eq!(fs::read(&survivor_path)?, b"verified");
+        for slow in [true, false] {
+            let cancelled = begin_download(versions.path())?;
+            let cancelled_path = cancelled.path().to_path_buf();
+            let dest = cancelled_path.join("runtime.zip");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/archive", listener.local_addr()?);
+            let (_release_completion, mut completion) = tokio::sync::oneshot::channel::<()>();
+            let mut servers = tokio::task::JoinSet::new();
+            servers.spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    anyhow::ensure!(header.len() < 4096, "fixture header too large");
+                    header.push(socket.read_u8().await?);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+                for (offset, byte) in BODY.iter().enumerate() {
+                    if slow && offset == 32 {
+                        (&mut completion).await?;
+                    }
+                    socket.write_all(&[*byte]).await?;
+                    if slow {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            let request_dest = dest.clone();
+            let mut transfers = tokio::task::JoinSet::new();
+            transfers.spawn(async move {
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .read_timeout(std::time::Duration::from_secs(5))
+                    .build()?;
+                let result = stream_runtime_download_to_temp::<Sha256, _, _>(
+                    "fixture",
+                    |_| async { Ok(client.get(&url).send().await?) },
+                    &request_dest,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((cancelled, result))
+            });
+            if slow {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let mut positive = false;
+                        for entry in fs::read_dir(&cancelled_path)? {
+                            let bytes = fs::read(entry?.path())?;
+                            if bytes.len() >= 4 {
+                                assert!(bytes.len() <= 32);
+                                assert_eq!(bytes, BODY[..bytes.len()]);
+                                positive = true;
+                            }
+                        }
+                        if positive {
+                            break Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("at least four body bytes must arrive before cancellation")?;
+                assert!(!dest.exists());
+                tokio::time::timeout(std::time::Duration::from_millis(200), transfers.join_next())
+                    .await
+                    .expect_err(
+                        "progressing response with held completion must exceed the outer deadline",
+                    );
+                let files = fs::read_dir(&cancelled_path)?.collect::<std::io::Result<Vec<_>>>()?;
+                assert_eq!(files.len(), 1);
+                let prefix = fs::read(files[0].path())?;
+                assert!(prefix.len() >= 4 && prefix.len() <= 32);
+                assert_eq!(prefix, BODY[..prefix.len()]);
+                transfers.abort_all();
+                servers.abort_all();
+                assert!(
+                    transfers
+                        .join_next()
+                        .await
+                        .unwrap()
+                        .expect_err("task must be cancelled")
+                        .is_cancelled()
+                );
+                assert!(!cancelled_path.exists());
+                assert!(!dest.exists());
+                assert!(
+                    servers
+                        .join_next()
+                        .await
+                        .unwrap()
+                        .expect_err("fixture must be cancelled")
+                        .is_cancelled()
+                );
+            } else {
+                let (owner, (temporary, digest)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), transfers.join_next())
+                        .await
+                        .expect("fast body must complete")
+                        .expect("transfer task must exist")??;
+                assert_eq!(fs::read(&temporary)?, BODY);
+                assert_eq!(
+                    digest,
+                    "e5b38ac5aa22fee56fe7095e076e74c03ce60d2ea43b818d0f7b4252faf32e5a"
+                );
+                drop(temporary);
+                assert_eq!(fs::read_dir(owner.path())?.count(), 0);
+                drop(owner);
+                servers.join_next().await.unwrap()??;
+            }
+            assert_eq!(fs::read(&survivor_path)?, b"verified");
+        }
         Ok(())
     }
 
