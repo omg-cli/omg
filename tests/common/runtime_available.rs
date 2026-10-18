@@ -26,7 +26,7 @@ pub enum Catalog {
 }
 
 impl Catalog {
-    fn endpoint(self) -> &'static str {
+    const fn endpoint(self) -> &'static str {
         match self {
             Self::Go => "https://go.dev/dl/?mode=json&include=all",
             Self::Rust => "https://static.rust-lang.org/dist/channel-rust-stable.toml",

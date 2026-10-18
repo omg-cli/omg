@@ -35,10 +35,6 @@ const DETECTION_TIMEOUT_SECS: &str = "15";
 /// Command cap for gated end-to-end installs (download + extract + switch).
 const INSTALL_TIMEOUT_SECS: &str = "600";
 
-fn run_capped(args: &[&str], timeout_secs: &str) -> CommandResult {
-    run_omg_with_env(args, &[("OMG_TEST_COMMAND_TIMEOUT_SECS", timeout_secs)])
-}
-
 #[test]
 fn node_alias_oracle_uses_release_versions_and_lts_column_not_row_order() {
     let table = "version\tlts\nv20.10.0\tIron\nv27.0.0-rc.1\t-\nv26.9.0\t-\nv24.21.0\tKrypton\nv22.23.2\tJod\n";
