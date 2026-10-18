@@ -325,5 +325,29 @@ compiler = "base-devel"
         let a = serde_json::to_string(&plan(MANIFEST, "ubuntu-x86_64").unwrap()).unwrap();
         let b = serde_json::to_string(&plan(MANIFEST, "ubuntu-x86_64").unwrap()).unwrap();
         assert_eq!(a, b);
+        assert_eq!(
+            super::to_json(MANIFEST, "ubuntu-x86_64").unwrap(),
+            r#"{
+  "schema_version": 1,
+  "target": "ubuntu-x86_64",
+  "packages": {
+    "compiler": "build-essential",
+    "git": "git"
+  },
+  "unmapped_tools": [],
+  "runtimes": {
+    "node": "22"
+  },
+  "dotfiles": {
+    "dotfiles/editor.toml": ".config/editor/config.toml"
+  },
+  "notices": [
+    "Read-only intent preview: no packages installed and no files copied.",
+    "Package availability, runtime compatibility and installed state are not checked.",
+    "Dotfile existence, permissions and destination conflicts require later review.",
+    "This is not an omg.lock resolution or an executable migration recipe."
+  ]
+}"#
+        );
     }
 }
