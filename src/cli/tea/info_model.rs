@@ -548,6 +548,10 @@ mod tests {
     fn info_without_backend_is_an_error_not_not_found() {
         match info_requires_backend("bash") {
             InfoMsg::Error(message) => {
+                assert_eq!(
+                    message,
+                    "Package information for 'bash' is not available without an Arch or Debian package backend"
+                );
                 assert!(
                     message.contains("not available without an Arch or Debian package backend"),
                     "got: {message}"

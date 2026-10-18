@@ -364,6 +364,11 @@ mod tests {
         temp_env::with_vars([("NO_COLOR", None), ("OMG_COLORS", Some("always"))], || {
             assert!(colors_enabled());
         });
+        for alias in ["1", "true"] {
+            temp_env::with_vars([("NO_COLOR", None), ("OMG_COLORS", Some(alias))], || {
+                assert!(colors_enabled(), "OMG_COLORS={alias}");
+            });
+        }
     }
 
     #[test]
@@ -372,22 +377,28 @@ mod tests {
         temp_env::with_var("OMG_COLORS", Some("never"), || {
             assert!(!colors_enabled());
         });
+        for alias in ["0", "false"] {
+            temp_env::with_vars([("NO_COLOR", None), ("OMG_COLORS", Some(alias))], || {
+                assert!(!colors_enabled(), "OMG_COLORS={alias}");
+            });
+        }
     }
 
     #[test]
     #[serial]
     fn semantic_text_styles_are_plain_when_colors_are_disabled() {
         temp_env::with_var("NO_COLOR", Some("1"), || {
-            for rendered in [
-                emphasis("label"),
-                accent("accent"),
-                positive("positive"),
-                negative("negative"),
-                caution("caution"),
-                community("community"),
-                informative("informative"),
+            for (rendered, expected) in [
+                (emphasis("label"), "label"),
+                (accent("accent"), "accent"),
+                (positive("positive"), "positive"),
+                (negative("negative"), "negative"),
+                (caution("caution"), "caution"),
+                (community("community"), "community"),
+                (informative("informative"), "informative"),
             ] {
                 assert!(!rendered.contains("\u{1b}["), "{rendered:?}");
+                assert_eq!(rendered, expected);
             }
         });
     }
@@ -396,16 +407,17 @@ mod tests {
     #[serial]
     fn semantic_text_styles_honor_forced_color() {
         temp_env::with_vars([("NO_COLOR", None), ("OMG_COLORS", Some("always"))], || {
-            for rendered in [
-                emphasis("label"),
-                accent("accent"),
-                positive("positive"),
-                negative("negative"),
-                caution("caution"),
-                community("community"),
-                informative("informative"),
+            for (rendered, expected) in [
+                (emphasis("label"), "label"),
+                (accent("accent"), "accent"),
+                (positive("positive"), "positive"),
+                (negative("negative"), "negative"),
+                (caution("caution"), "caution"),
+                (community("community"), "community"),
+                (informative("informative"), "informative"),
             ] {
                 assert!(rendered.contains("\u{1b}["), "{rendered:?}");
+                assert_eq!(console::strip_ansi_codes(&rendered), expected);
             }
         });
     }
@@ -413,17 +425,32 @@ mod tests {
     #[test]
     #[serial]
     fn status_helpers_do_not_duplicate_existing_icons() {
-        temp_env::with_vars([("NO_COLOR", None), ("OMG_COLORS", Some("always"))], || {
-            for (rendered, icon) in [
-                (success("✓"), '✓'),
-                (success("✓ completed"), '✓'),
-                (error("✗"), '✗'),
-                (warning("⚠"), '⚠'),
-                (info("ℹ"), 'ℹ'),
-            ] {
-                assert_eq!(rendered.matches(icon).count(), 1, "{rendered:?}");
-            }
-        });
+        temp_env::with_vars(
+            [
+                ("NO_COLOR", None),
+                ("OMG_COLORS", Some("always")),
+                ("OMG_UNICODE", Some("1")),
+            ],
+            || {
+                for (rendered, expected) in [
+                    (success("completed"), "✓ completed"),
+                    (error("failed"), "✗ failed"),
+                    (warning("check this"), "⚠ check this"),
+                    (info("details"), "ℹ details"),
+                ] {
+                    assert_eq!(console::strip_ansi_codes(&rendered), expected);
+                }
+                for (rendered, icon) in [
+                    (success("✓"), '✓'),
+                    (success("✓ completed"), '✓'),
+                    (error("✗"), '✗'),
+                    (warning("⚠"), '⚠'),
+                    (info("ℹ"), 'ℹ'),
+                ] {
+                    assert_eq!(rendered.matches(icon).count(), 1, "{rendered:?}");
+                }
+            },
+        );
         temp_env::with_vars(
             [
                 ("NO_COLOR", None),
