@@ -39,15 +39,29 @@ class DiagnosticTests(unittest.TestCase):
    root=Path(name);trial=root/'trial';trial.mkdir()
    (root/'handler').write_bytes(b'fixture-handler-before\n')
    (root/'boot').write_text(BOOT+'\n')
+   (root/'comm').write_bytes(b'systemd-shutdow\n')
+   (root/'cmdline').write_bytes(b'/usr/lib/systemd/systemd-shutdown\x00poweroff\x00')
+   (root/'exe').write_bytes(b'fixture-pid1-executable')
+   (root/'uptime').write_bytes(b'123.45 240.00\n')
+   if mode=='pid1_oversized':
+    (root/'comm').write_bytes(b'x'*257)
+    (root/'cmdline').write_bytes(b'x'*4097)
+    (root/'exe').write_bytes(b'x'*(16*1024*1024+1))
+    (root/'uptime').write_bytes(b'x'*129)
+   if mode=='pid1_invalid':
+    (root/'cmdline').write_bytes(b'not-nul-terminated')
+    (root/'uptime').write_bytes(b'not-an-uptime')
    (root/'remote.py').write_text('''import builtins,json,os,sys
 from pathlib import Path
 root=Path(os.environ['FIXTURE_ROOT']); realopen=builtins.open
 def fixture_open(path,*args,**kw):
- name={'/proc/sys/kernel/core_pattern':'handler','/proc/sys/kernel/random/boot_id':'boot'}.get(str(path))
+ name={'/proc/sys/kernel/core_pattern':'handler','/proc/sys/kernel/random/boot_id':'boot','/proc/1/comm':'comm','/proc/1/cmdline':'cmdline','/proc/1/exe':'exe','/proc/uptime':'uptime'}.get(str(path))
  if name is None:raise AssertionError('unexpected remote path '+str(path))
  if os.environ['FIXTURE_MODE']=='read_failure' and name=='handler':raise PermissionError('controlled read failure')
+ if os.environ['FIXTURE_MODE']=='pid1_unavailable' and name in ('comm','cmdline','exe','uptime'):raise PermissionError('controlled unavailable')
  return realopen(root/name,*args,**kw)
 builtins.open=fixture_open
+os.readlink=lambda path: '/usr/lib/systemd/systemd-shutdown' if str(path)=='/proc/1/exe' else (_ for _ in ()).throw(AssertionError('unexpected link'))
 assert sys.argv[1]=='-'
 sys.argv=sys.argv[1:]
 exec(compile(sys.stdin.read(),'<received-remote-diagnostic>','exec'))
@@ -92,6 +106,49 @@ exit "$FIXTURE_HEALTH"
     records.append(dict(method=self.id(),mode=mode,requested_health_exit=health,transport=transport,actual_exit=result.returncode,records=rows,status=status,stdout=result.stdout.decode(errors='replace'),stderr=result.stderr.decode(errors='replace'),shell_sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
     evidence.write_text(json.dumps(records,indent=2)+'\n')
    return result,rows,status,log
+
+ def test_pid1_identity_is_literal_same_observation_and_false_health_remains_failure(self):
+  p,rows,status,_=self.run_case('unchanged',health=2)
+  self.assertEqual(p.returncode,2)
+  self.assertEqual(status,'measurement\nhealth:2\n')
+  for row in rows:
+   self.assertEqual(row['pid1']['comm'],{'status':'OBSERVED','value':'systemd-shutdow'})
+   self.assertEqual(row['pid1']['cmdline'],{'status':'OBSERVED','value':['/usr/lib/systemd/systemd-shutdown','poweroff']})
+   self.assertEqual(row['pid1']['executable'],{'status':'OBSERVED','link':'/usr/lib/systemd/systemd-shutdown','bytes':23,'sha256':'c7f778671a7ece8a1a532fbb25a9fb5c2edcb295b35bed843985cb7eeeb64f86'})
+   self.assertEqual(row['pid1']['uptime'],{'status':'OBSERVED','value':'123.45'})
+   self.assertEqual(row['boot_id'],BOOT)
+
+ def test_pid1_unavailable_is_explicit_and_does_not_mask_failure(self):
+  p,rows,status,_=self.run_case('pid1_unavailable',health=7)
+  self.assertEqual(p.returncode,7)
+  for row in rows:
+   self.assertEqual(row['status'],'observed')
+   self.assertEqual(row['pid1'],{key:{'status':'UNKNOWN','reason':'read-error'} for key in ('comm','cmdline','executable','uptime')})
+  self.assertEqual(status,'measurement\nhealth:7\n')
+
+ def test_pid1_oversized_inputs_are_unknown_without_partial_values(self):
+  p,rows,status,log=self.run_case('pid1_oversized',health=7)
+  self.assertEqual(p.returncode,7)
+  self.assertEqual(status,'measurement\nhealth:7\n')
+  for row in rows:
+   self.assertEqual(row['pid1'],{key:{'status':'UNKNOWN','reason':'oversized-input'} for key in ('comm','cmdline','executable','uptime')})
+  self.assertLess(len(log.encode()),4096)
+
+ def test_pid1_invalid_cmdline_and_uptime_are_unknown(self):
+  p,rows,_,_=self.run_case('pid1_invalid')
+  self.assertEqual(p.returncode,2)
+  for row in rows:
+   for key in ('cmdline','uptime'):
+    self.assertEqual(row['pid1'][key],{'status':'UNKNOWN','reason':'invalid-or-changing-identity'})
+
+ def test_bin_false_still_refused_by_unchanged_health_collector(self):
+  import importlib.util
+  from unittest.mock import patch
+  spec=importlib.util.spec_from_file_location('private_qemu_health',HERE/'check-qemu-health.py')
+  health=importlib.util.module_from_spec(spec);spec.loader.exec_module(health)
+  with patch.object(health,'query',return_value='|/bin/false'):
+   with self.assertRaisesRegex(ValueError,'unsupported kernel crash handler: bytes=11 sha256='):
+    health.crash_channel_capability(BOOT)
 
  def test_records_actual_handler_drift_on_the_same_boot(self):
   p,rows,status,log=self.run_case()

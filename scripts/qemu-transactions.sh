@@ -79,13 +79,50 @@ handler_observation() {
   local diagnostic_phase=$1 diagnostic_exit=0
   remote_argv timeout --kill-after=2s 5s sudo -n python3 - "$diagnostic_phase" "$boot_id" \
     >> "$trial/boot.log" 2>/dev/null <<'PY' || diagnostic_exit=$?
-import datetime,hashlib,json,re,sys
+import datetime,hashlib,json,os,re,sys
 phase,expected=sys.argv[1:]
 row=dict(kind="kernel-handler-identity",phase=phase,observed_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),expected_boot_id=expected,boot_id=None,status="unavailable",error=None,bytes=None,sha256=None)
-def read(path,limit):
+def read_bytes(path,limit):
     with open(path,"rb") as stream: data=stream.read(limit+1)
     if len(data)>limit: raise OverflowError
-    return data.decode("utf-8","strict").strip()
+    return data
+
+def read(path,limit):
+    return read_bytes(path,limit).decode("utf-8","strict").strip()
+
+def unknown(reason):
+    return dict(status="UNKNOWN",reason=reason)
+
+def pid1_identity():
+    result={}
+    for field,path,limit in (("comm","/proc/1/comm",256),("cmdline","/proc/1/cmdline",4096),
+                             ("executable","/proc/1/exe",16*1024*1024),("uptime","/proc/uptime",128)):
+        try:
+            if field=="executable":
+                link=os.readlink(path)
+                if len(link.encode("utf-8"))>4096: raise OverflowError
+                data=read_bytes(path,limit)
+                if os.readlink(path)!=link: raise ValueError
+                result[field]=dict(status="OBSERVED",link=link,bytes=len(data),sha256=hashlib.sha256(data).hexdigest())
+            else:
+                value=read_bytes(path,limit).decode("utf-8","strict")
+                if field=="cmdline":
+                    if not value.endswith("\0"): raise ValueError
+                    value=value[:-1].split("\0")
+                elif field=="uptime":
+                    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)? [0-9]+(?:\.[0-9]+)?\n?",value): raise ValueError
+                    value=value.split()[0]
+                else:
+                    value=value.rstrip("\n")
+                result[field]=dict(status="OBSERVED",value=value)
+        except OSError: result[field]=unknown("read-error")
+        except UnicodeError: result[field]=unknown("invalid-utf8")
+        except OverflowError: result[field]=unknown("oversized-input")
+        except ValueError: result[field]=unknown("invalid-or-changing-identity")
+    return result
+
+row["pid1"]={field:unknown("boot-unverified") for field in ("comm","cmdline","executable","uptime")}
+
 try:
     row["boot_id"]=read("/proc/sys/kernel/random/boot_id",128)
     if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",expected) or row["boot_id"]!=expected:
@@ -96,6 +133,8 @@ try:
 except OSError: row["error"]="read-error"
 except UnicodeError: row["error"]="invalid-utf8"
 except OverflowError: row["error"]="oversized-input"
+if row["boot_id"]==expected and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",expected):
+    row["pid1"]=pid1_identity()
 print(json.dumps(row,separators=(",",":"),sort_keys=True))
 PY
   if [[ "$diagnostic_exit" != 0 ]]; then
