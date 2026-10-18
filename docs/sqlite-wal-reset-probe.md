@@ -49,6 +49,12 @@ clean run with no acknowledged writer commits also refuses exit 2. The writer
 records errors atomically and is joined before connection diagnostics or
 cleanup. An unexpected join failure exits 2 without closing a possibly live
 writer connection; keep the external timeout/process supervisor. Exit 0 requires exactly the committed IDs `1..N` and a passing integrity check.
+After all three original connections close successfully, an otherwise clean run
+reopens the same database through the loaded SQLite library and repeats the
+committed-row count, exact ID-membership predicate and integrity check. The
+`reopened` summary reports those observations before the reopened connection
+closes and the library unloads. Reopen and query errors retain the existing
+phase-aware classification and first-outcome precedence.
 The canary primary key is unique; count `N` plus zero IDs outside `1..N` rejects
 a same-count substitution that row count alone would miss. The race is timing-dependent: a green run
 alone does not establish that an affected build is fixed. Confirm the publisher's

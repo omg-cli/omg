@@ -292,6 +292,64 @@ cleanup:
     if (close_rc != SQLITE_OK)
       database_error("close reader", close_rc, error_message(reader));
   }
+  if (outcome == 0) {
+    long acknowledged = atomic_load(&committed);
+    sqlite3 *reopened = 0;
+    int reopen_rc = open_db(argv[2], &reopened);
+    if (reopen_rc != SQLITE_OK) {
+      database_error("reopen", reopen_rc,
+                     reopened ? error_message(reopened) : "(unavailable)");
+    } else {
+      Count persisted = count(reopened, "SELECT count(*) FROM canary",
+                              "reopened canary read");
+      if (persisted.ok && persisted.value != acknowledged)
+        record_loss();
+      char reopened_membership_query[100];
+      snprintf(reopened_membership_query, sizeof(reopened_membership_query),
+               "SELECT count(*) FROM canary WHERE id < 1 OR id > %ld",
+               acknowledged);
+      Count reopened_unexpected = count(reopened, reopened_membership_query,
+                                         "reopened canary ID membership");
+      if (reopened_unexpected.ok && reopened_unexpected.value != 0)
+        record_loss();
+      sqlite3_stmt *reopen_check = 0;
+      int reopen_integrity = 0;
+      reopen_rc = prepare(reopened, "PRAGMA integrity_check", -1, &reopen_check, 0);
+      if (reopen_rc != SQLITE_OK) {
+        database_error("reopened integrity prepare", reopen_rc,
+                       error_message(reopened));
+      } else {
+        reopen_rc = step(reopen_check);
+        if (reopen_rc != SQLITE_ROW) {
+          database_error("reopened integrity step", reopen_rc,
+                         error_message(reopened));
+        } else {
+          const unsigned char *value = text(reopen_check, 0);
+          if (!value)
+            harness_error("reopened integrity text unavailable");
+          else {
+            reopen_integrity = strcmp((const char *)value, "ok") == 0;
+            if (!reopen_integrity)
+              record_loss();
+          }
+        }
+      }
+      if (reopen_check) {
+        reopen_rc = finalize(reopen_check);
+        if (reopen_rc != SQLITE_OK)
+          database_error("finalize reopened integrity", reopen_rc,
+                         error_message(reopened));
+      }
+      printf("reopened committed=%ld recovered=%ld integrity_ok=%d "
+             "unexpected_ids=%ld\n", acknowledged, persisted.value,
+             reopen_integrity, reopened_unexpected.value);
+    }
+    if (reopened) {
+      int close_rc = close_db(reopened);
+      if (close_rc != SQLITE_OK)
+        database_error("close reopened", close_rc, error_message(reopened));
+    }
+  }
   if (dlclose(library) != 0)
     harness_error("dlclose");
   return outcome;
