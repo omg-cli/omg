@@ -4120,6 +4120,31 @@ mod tests {
                 .collect();
             names.sort();
             assert_eq!(names.len(), 3, "{label} extracted {names:?}");
+            assert_eq!(names, ["file-1.txt", "file-2.txt", "file-3.txt"], "{label}");
+            for (name, first, repeated) in [
+                (
+                    "file-1.txt",
+                    "omg xz fixture file 1\n",
+                    "repeated line for block splitting 1\n",
+                ),
+                (
+                    "file-2.txt",
+                    "omg xz fixture file 2\n",
+                    "repeated line for block splitting 2\n",
+                ),
+                (
+                    "file-3.txt",
+                    "omg xz fixture file 3\n",
+                    "repeated line for block splitting 3\n",
+                ),
+            ] {
+                let expected = format!("{first}{}", repeated.repeat(400));
+                assert_eq!(
+                    fs::read(dest.join(name)).expect("extracted fixture"),
+                    expected.as_bytes(),
+                    "{label} {name}"
+                );
+            }
             assert!(
                 names.iter().all(|name| name.starts_with("file-")),
                 "{label} extracted unexpected names: {names:?}"
@@ -4178,28 +4203,127 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_download_removes_only_its_own_directory() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const BODY: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/";
         let versions = TempDir::new()?;
         let surviving = begin_download(versions.path())?;
-        let cancelled = begin_download(versions.path())?;
-        let cancelled_path = cancelled.path().to_path_buf();
         let survivor_path = surviving.path().join("runtime.zip");
         fs::write(&survivor_path, b"verified")?;
-        fs::write(cancelled.path().join("runtime.zip"), b"partial")?;
-        let (ready, started) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _owner = cancelled;
-            let _ = ready.send(());
-            std::future::pending::<()>().await;
-        });
-        started.await?;
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("task must be cancelled")
-                .is_cancelled()
-        );
-        assert!(!cancelled_path.exists());
-        assert_eq!(fs::read(&survivor_path)?, b"verified");
+        for slow in [true, false] {
+            let cancelled = begin_download(versions.path())?;
+            let cancelled_path = cancelled.path().to_path_buf();
+            let dest = cancelled_path.join("runtime.zip");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/archive", listener.local_addr()?);
+            let (_release_completion, mut completion) = tokio::sync::oneshot::channel::<()>();
+            let mut servers = tokio::task::JoinSet::new();
+            servers.spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    anyhow::ensure!(header.len() < 4096, "fixture header too large");
+                    header.push(socket.read_u8().await?);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n",
+                    )
+                    .await?;
+                for (offset, byte) in BODY.iter().enumerate() {
+                    if slow && offset == 32 {
+                        (&mut completion).await?;
+                    }
+                    socket.write_all(&[*byte]).await?;
+                    if slow {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            let request_dest = dest.clone();
+            let mut transfers = tokio::task::JoinSet::new();
+            transfers.spawn(async move {
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .read_timeout(std::time::Duration::from_secs(5))
+                    .build()?;
+                let result = stream_runtime_download_to_temp::<Sha256, _, _>(
+                    "fixture",
+                    |_| async { Ok(client.get(&url).send().await?) },
+                    &request_dest,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((cancelled, result))
+            });
+            if slow {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let mut positive = false;
+                        for entry in fs::read_dir(&cancelled_path)? {
+                            let bytes = fs::read(entry?.path())?;
+                            if bytes.len() >= 4 {
+                                assert!(bytes.len() <= 32);
+                                assert_eq!(bytes, BODY[..bytes.len()]);
+                                positive = true;
+                            }
+                        }
+                        if positive {
+                            break Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("at least four body bytes must arrive before cancellation")?;
+                assert!(!dest.exists());
+                tokio::time::timeout(std::time::Duration::from_millis(200), transfers.join_next())
+                    .await
+                    .expect_err(
+                        "progressing response with held completion must exceed the outer deadline",
+                    );
+                let files = fs::read_dir(&cancelled_path)?.collect::<std::io::Result<Vec<_>>>()?;
+                assert_eq!(files.len(), 1);
+                let prefix = fs::read(files[0].path())?;
+                assert!(prefix.len() >= 4 && prefix.len() <= 32);
+                assert_eq!(prefix, BODY[..prefix.len()]);
+                transfers.abort_all();
+                servers.abort_all();
+                assert!(
+                    transfers
+                        .join_next()
+                        .await
+                        .unwrap()
+                        .expect_err("task must be cancelled")
+                        .is_cancelled()
+                );
+                assert!(!cancelled_path.exists());
+                assert!(!dest.exists());
+                assert!(
+                    servers
+                        .join_next()
+                        .await
+                        .unwrap()
+                        .expect_err("fixture must be cancelled")
+                        .is_cancelled()
+                );
+            } else {
+                let (owner, (temporary, digest)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), transfers.join_next())
+                        .await
+                        .expect("fast body must complete")
+                        .expect("transfer task must exist")??;
+                assert_eq!(fs::read(&temporary)?, BODY);
+                assert_eq!(
+                    digest,
+                    "e5b38ac5aa22fee56fe7095e076e74c03ce60d2ea43b818d0f7b4252faf32e5a"
+                );
+                drop(temporary);
+                assert_eq!(fs::read_dir(owner.path())?.count(), 0);
+                drop(owner);
+                servers.join_next().await.unwrap()??;
+            }
+            assert_eq!(fs::read(&survivor_path)?, b"verified");
+        }
         Ok(())
     }
 
@@ -4214,6 +4338,7 @@ mod tests {
         complete_staged_install(&staging, &version_dir, "1.0.0")?;
 
         assert!(version_dir.join("bin").is_file());
+        assert_eq!(fs::read(version_dir.join("bin"))?, b"binary");
         assert_eq!(
             fs::read_to_string(version_dir.join(INSTALL_MARKER))?,
             "1.0.0\n"
@@ -4231,12 +4356,16 @@ mod tests {
         let versions_dir = temp.path().join("versions");
         let version_dir = versions_dir.join("1.0.0");
 
+        let staging_path;
         {
             let staging = begin_staged_install(&versions_dir)?;
+            staging_path = staging.path().to_path_buf();
             fs::write(staging.path().join("bin"), "partial")?;
             // Simulate an interrupted install: staging drops without publishing.
         }
 
+        assert!(!staging_path.exists());
+        assert_eq!(fs::read_dir(&versions_dir)?.count(), 0);
         assert!(!version_dir.exists());
         assert!(list_installed_versions(&versions_dir)?.is_empty());
         Ok(())
@@ -4680,6 +4809,15 @@ mod tests {
 
     #[test]
     fn budgeted_reader_aborts_a_decompression_bomb_during_streaming() {
+        let mut legal = BudgetedReader::new(std::io::Cursor::new(b"safe-payload"), 12);
+        let mut payload = Vec::new();
+        assert_eq!(
+            legal
+                .read_to_end(&mut payload)
+                .expect("payload fits exactly"),
+            12
+        );
+        assert_eq!(payload, b"safe-payload");
         let bomb = gzip_bomb(64 * 1024 * 1024); // 64 MiB of zeros compresses to ~60 KiB
         let decoder = flate2::read::GzDecoder::new(bomb.as_slice());
         let mut reader = BudgetedReader::new(decoder, 1024 * 1024); // 1 MiB budget
@@ -4832,5 +4970,11 @@ mod entry_budget_tests {
                 .charge(Path::new("runtime/bin/node"))
                 .is_ok()
         );
+        let mut pathname_budget = ArchiveEntryBudget {
+            entries: 0,
+            path_bytes: 32 * 1024 * 1024 - 3,
+        };
+        assert!(pathname_budget.charge(Path::new("abc")).is_ok());
+        assert!(pathname_budget.charge(Path::new("d")).is_err());
     }
 }

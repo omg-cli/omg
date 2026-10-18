@@ -261,6 +261,16 @@ mod tests {
         let output = data.render();
         assert!(output.contains("omg clean --orphans --dry-run"));
         assert!(output.contains("omg outdated"));
+        assert!(
+            output
+                .lines()
+                .any(|line| line.split_whitespace().eq(["Updates", "5"]))
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line.split_whitespace().eq(["Orphans", "2"]))
+        );
         let mut model = StatusModel::new();
         let _ = model.update(StatusMsg::Loaded(data));
         assert_eq!(model.view(), output);

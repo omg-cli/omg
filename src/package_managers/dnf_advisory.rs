@@ -264,6 +264,7 @@ mod tests {
         for details in [false, true] {
             let args = query_args(details);
             assert!(args.contains(&"--setopt=*.skip_if_unavailable=false"));
+            assert!(args.contains(&"--setopt=disable_excludes=*"));
             assert!(args.contains(&"--available"));
             assert!(args.contains(&"--security"));
             assert!(!args.contains(&"--installed"));

@@ -64,6 +64,14 @@ mod tests {
             UpdateType::from_versions("1.0.0", "1.0.1"),
             UpdateType::Patch
         );
+        for (kind, label) in [
+            (UpdateType::Major, "major"),
+            (UpdateType::Minor, "minor"),
+            (UpdateType::Patch, "patch"),
+            (UpdateType::Unknown, "unknown"),
+        ] {
+            assert_eq!(kind.to_string(), label);
+        }
     }
 
     #[test]
