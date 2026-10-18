@@ -4120,6 +4120,31 @@ mod tests {
                 .collect();
             names.sort();
             assert_eq!(names.len(), 3, "{label} extracted {names:?}");
+            assert_eq!(names, ["file-1.txt", "file-2.txt", "file-3.txt"], "{label}");
+            for (name, first, repeated) in [
+                (
+                    "file-1.txt",
+                    "omg xz fixture file 1\n",
+                    "repeated line for block splitting 1\n",
+                ),
+                (
+                    "file-2.txt",
+                    "omg xz fixture file 2\n",
+                    "repeated line for block splitting 2\n",
+                ),
+                (
+                    "file-3.txt",
+                    "omg xz fixture file 3\n",
+                    "repeated line for block splitting 3\n",
+                ),
+            ] {
+                let expected = format!("{first}{}", repeated.repeat(400));
+                assert_eq!(
+                    fs::read(dest.join(name)).expect("extracted fixture"),
+                    expected.as_bytes(),
+                    "{label} {name}"
+                );
+            }
             assert!(
                 names.iter().all(|name| name.starts_with("file-")),
                 "{label} extracted unexpected names: {names:?}"
@@ -4313,6 +4338,7 @@ mod tests {
         complete_staged_install(&staging, &version_dir, "1.0.0")?;
 
         assert!(version_dir.join("bin").is_file());
+        assert_eq!(fs::read(version_dir.join("bin"))?, b"binary");
         assert_eq!(
             fs::read_to_string(version_dir.join(INSTALL_MARKER))?,
             "1.0.0\n"
@@ -4330,12 +4356,16 @@ mod tests {
         let versions_dir = temp.path().join("versions");
         let version_dir = versions_dir.join("1.0.0");
 
+        let staging_path;
         {
             let staging = begin_staged_install(&versions_dir)?;
+            staging_path = staging.path().to_path_buf();
             fs::write(staging.path().join("bin"), "partial")?;
             // Simulate an interrupted install: staging drops without publishing.
         }
 
+        assert!(!staging_path.exists());
+        assert_eq!(fs::read_dir(&versions_dir)?.count(), 0);
         assert!(!version_dir.exists());
         assert!(list_installed_versions(&versions_dir)?.is_empty());
         Ok(())
@@ -4779,6 +4809,15 @@ mod tests {
 
     #[test]
     fn budgeted_reader_aborts_a_decompression_bomb_during_streaming() {
+        let mut legal = BudgetedReader::new(std::io::Cursor::new(b"safe-payload"), 12);
+        let mut payload = Vec::new();
+        assert_eq!(
+            legal
+                .read_to_end(&mut payload)
+                .expect("payload fits exactly"),
+            12
+        );
+        assert_eq!(payload, b"safe-payload");
         let bomb = gzip_bomb(64 * 1024 * 1024); // 64 MiB of zeros compresses to ~60 KiB
         let decoder = flate2::read::GzDecoder::new(bomb.as_slice());
         let mut reader = BudgetedReader::new(decoder, 1024 * 1024); // 1 MiB budget
@@ -4931,5 +4970,11 @@ mod entry_budget_tests {
                 .charge(Path::new("runtime/bin/node"))
                 .is_ok()
         );
+        let mut pathname_budget = ArchiveEntryBudget {
+            entries: 0,
+            path_bytes: 32 * 1024 * 1024 - 3,
+        };
+        assert!(pathname_budget.charge(Path::new("abc")).is_ok());
+        assert!(pathname_budget.charge(Path::new("d")).is_err());
     }
 }
