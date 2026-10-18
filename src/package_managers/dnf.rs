@@ -3483,8 +3483,13 @@ mod tests {
 
     #[tokio::test]
     async fn native_history_query_is_noninteractive_and_bounded() {
+        use std::io::{Seek, Write};
         let mut command = tokio::process::Command::new("/bin/sh");
         command.args(["-c", "if read line; then exit 9; fi; printf '[]'"]);
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"caller input\n").unwrap();
+        input.rewind().unwrap();
+        command.stdin(std::process::Stdio::from(input));
         assert_eq!(
             DnfPackageManager::query_output(command).await.unwrap(),
             b"[]"
