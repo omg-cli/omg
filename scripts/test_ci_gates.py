@@ -154,7 +154,16 @@ class FedoraSetupSourceTests(unittest.TestCase):
             with self.subTest(workflow=workflow.name):
                 source = workflow.read_text(encoding="utf-8")
                 expected = 2 if workflow.name == "qemu-matrix.yml" else 1
-                self.assertEqual(source.count("--setopt='*.skip_if_unavailable=False'"), expected)
+                build_source = source
+                if workflow.name == "qemu-matrix.yml":
+                    build_source = "\n".join(
+                        json.loads(encoded)
+                        for encoded in re.findall(r'"setup":\s*("(?:\\.|[^"\\])*")', source)
+                    )
+                commands = re.findall(r"timeout -k 10s 12m dnf(?:[^\n]*\\\n)*[^\n]*", build_source)
+                self.assertEqual(len(commands), expected)
+                for command in commands:
+                    self.assertEqual(command.count("--setopt='*.skip_if_unavailable=False'"), 1)
                 self.assertNotIn("--setopt=fedora.metalink=", source)
                 self.assertNotIn("--setopt=updates.metalink=", source)
                 self.assertNotIn("--setopt=fedora.baseurl=", source)
@@ -162,6 +171,58 @@ class FedoraSetupSourceTests(unittest.TestCase):
                 self.assertEqual(source.count("timeout -k 10s 12m dnf"), expected)
                 self.assertNotIn("dnf makecache --refresh", source)
                 self.assertNotIn("--nogpgcheck", source)
+
+
+    def test_fedora_fixture_provision_argv_and_failure_stop_helper(self) -> None:
+        source = CI_YML.read_text(encoding="utf-8")
+        step = source.split("      - name: Native Fedora ignored integration fixtures\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        script = step.split("        run: |\n", 1)[1]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        # Exercise provisioning, receipt accounting, and the helper gate together.
+        script = "set -euo pipefail\nmkdir -p target/fedora-ignored\n" + script[script.index("started=$(date +%s)"):]
+        script = script.replace("${{ matrix.features }}", "fedora,pgp,license")
+        for exit_code in [0, 42]:
+            with self.subTest(dnf_exit=exit_code):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / "dnf").write_text(
+                        f"#!{sys.executable}\n"
+                        "import json,os,sys\n"
+                        "from pathlib import Path\n"
+                        "Path(os.environ['DNF_CALL']).write_text(json.dumps(sys.argv[1:]))\n"
+                        "sys.exit(int(os.environ['DNF_EXIT']))\n",
+                        encoding="utf-8",
+                    )
+                    (root / "python3").write_text(
+                        f"#!{sys.executable}\n"
+                        "import os\nfrom pathlib import Path\n"
+                        "Path(os.environ['HELPER_CALL']).write_text('helper reached')\n",
+                        encoding="utf-8",
+                    )
+                    for name in ["dnf", "python3"]:
+                        (root / name).chmod(0o755)
+                    receipt = root / "call.json"
+                    helper = root / "helper.txt"
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", script],
+                        cwd=root,
+                        env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                                 DNF_CALL=str(receipt), DNF_EXIT=str(exit_code), HELPER_CALL=str(helper)),
+                        capture_output=True, text=True, timeout=10, check=False,
+                    )
+                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    self.assertEqual(json.loads(receipt.read_text(encoding="utf-8")), [
+                        "--setopt=*.skip_if_unavailable=False", "install", "-y",
+                        "--setopt=install_weak_deps=False", "tree", "createrepo_c", "gnupg2",
+                    ])
+                    provision = json.loads((root / "target/fedora-ignored/provision.json").read_text(encoding="utf-8"))
+                    self.assertEqual(provision["exit_code"], exit_code)
+                    self.assertGreaterEqual(provision["elapsed_seconds"], 0)
+                    if exit_code == 0:
+                        self.assertEqual(helper.read_text(encoding="utf-8"), "helper reached")
+                    else:
+                        self.assertFalse(helper.exists(), "failed provisioning must stop before the helper")
 
 
 class QemuConcurrencyTests(unittest.TestCase):

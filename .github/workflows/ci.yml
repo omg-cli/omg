@@ -986,7 +986,47 @@ jobs:
       - name: Run serial library and binary contracts
         if: matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'
         # Preserve the former staged-QEMU libtest owner alongside nextest.
-        run: cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ '${{ matrix.platform }}' == fedora ]]; then
+            cargo test --lib --bins --no-default-features --features ${{ matrix.features }} \
+              --locked --no-fail-fast --message-format=json -- --test-threads=1 \
+              | tee target/fedora-serial-libtest.jsonl
+          else
+            cargo test --lib --bins --no-default-features --features ${{ matrix.features }} --locked --no-fail-fast -- --test-threads=1
+          fi
+
+      - name: Native Fedora ignored integration fixtures
+        if: matrix.platform == 'fedora'
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I -B -m unittest discover -s scripts -p test_fedora_ignored_integrations.py
+          mkdir -p target/fedora-ignored
+          started=$(date +%s)
+          status=0
+          timeout --kill-after=5s 90s dnf --setopt='*.skip_if_unavailable=False' \
+            install -y --setopt=install_weak_deps=False tree createrepo_c gnupg2 \
+            > target/fedora-ignored/provision.stdout 2> target/fedora-ignored/provision.stderr || status=$?
+          elapsed=$(($(date +%s)-started))
+          printf '{"exit_code":%s,"elapsed_seconds":%s}\n' "$status" "$elapsed" > target/fedora-ignored/provision.json
+          [[ "$status" == 0 ]] || exit "$status"
+          timeout --kill-after=5s 140s python3 -I -B scripts/run-fedora-ignored-integrations.py \
+            --artifacts target/fedora-serial-libtest.jsonl --features '${{ matrix.features }}' \
+            --evidence-dir target/fedora-ignored/fixture
+
+      - name: Upload native Fedora ignored integration evidence
+        if: always() && matrix.platform == 'fedora'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora-ignored-integrations
+          path: |
+            target/fedora-serial-libtest.jsonl
+            target/fedora-ignored/
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Prepare sandbox regression executable
         if: matrix.platform == 'arch'
