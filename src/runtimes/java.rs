@@ -439,7 +439,8 @@ mod tests {
 
     #[test]
     fn test_java_manager_new() -> Result<()> {
-        if !cfg!(debug_assertions) && crate::core::is_root() {
+        #[cfg(not(debug_assertions))]
+        if crate::core::is_root() {
             let mgr = JavaManager::new();
             assert_eq!(
                 mgr.versions_dir,

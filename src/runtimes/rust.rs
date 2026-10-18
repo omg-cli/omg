@@ -1416,7 +1416,8 @@ mod tests {
 
     #[test]
     fn test_rust_manager_new() -> Result<()> {
-        if !cfg!(debug_assertions) && crate::core::is_root() {
+        #[cfg(not(debug_assertions))]
+        if crate::core::is_root() {
             let mgr = RustManager::new();
             assert_eq!(
                 mgr.versions_dir,

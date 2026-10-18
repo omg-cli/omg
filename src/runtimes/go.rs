@@ -255,7 +255,8 @@ mod tests {
 
     #[test]
     fn test_go_manager_new() -> Result<()> {
-        if !cfg!(debug_assertions) && crate::core::is_root() {
+        #[cfg(not(debug_assertions))]
+        if crate::core::is_root() {
             let mgr = GoManager::new();
             assert_eq!(
                 mgr.versions_dir,

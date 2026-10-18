@@ -284,7 +284,8 @@ mod tests {
 
     #[test]
     fn test_bun_manager_new() -> Result<()> {
-        if !cfg!(debug_assertions) && crate::core::is_root() {
+        #[cfg(not(debug_assertions))]
+        if crate::core::is_root() {
             let mgr = BunManager::new();
             assert_eq!(
                 mgr.versions_dir,

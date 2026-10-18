@@ -441,6 +441,16 @@ mod terminal_group {
             Ok(member)
         }
 
+        #[cfg(test)]
+        pub(in crate::runtimes::node) fn diagnostic_member(pid: i32, pgid: i32) -> Result<Member> {
+            read_member(pid, pgid)
+        }
+
+        #[cfg(test)]
+        pub(in crate::runtimes::node) fn diagnostic_snapshot(pgid: i32) -> Result<Vec<Member>> {
+            snapshot(pgid)
+        }
+
         pub(in crate::runtimes::node) fn capture(pgid: i32) -> Result<OwnedLeader> {
             // SAFETY: these identity queries have no arguments or pointers.
             let (uid, ruid) = unsafe { (libc::geteuid(), libc::getuid()) };
@@ -585,9 +595,18 @@ async fn probe_node_with_signals(
 
     // Every post-spawn path terminates the isolated group before reaping the
     // leader, including bounded-read failures and inherited-pipe timeouts.
+    #[cfg(all(test, target_os = "macos"))]
+    eprintln!(
+        "NODE_MAC_CLEANUP_BEFORE group={group} owned_leader={owned_leader:?} snapshot={:?}",
+        terminal_group::macos::diagnostic_snapshot(group.as_raw())
+    );
     let cleanup_end = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let observation_end = cleanup_end - std::time::Duration::from_millis(250);
     let group_signal = signal_group(group);
+    #[cfg(all(test, target_os = "macos"))]
+    eprintln!(
+        "NODE_MAC_GROUP_SIGNAL group={group} result={group_signal:?} owned_leader={owned_leader:?}"
+    );
     let leader_cleanup = if group_signal.is_err() && group_signal != Err(nix::errno::Errno::ESRCH) {
         node_probe_exit_observed(group).and_then(|terminal| {
             if terminal {
@@ -1264,6 +1283,10 @@ mod tests {
             "accepted unusable candidate; publication={publication}"
         );
         let error = result.unwrap_err();
+        #[cfg(target_os = "macos")]
+        if body.contains("probe.pid") {
+            eprintln!("NODE_MAC_REFUSAL publication={publication} error={error:#}");
+        }
         assert!(
             format!("{error:#}").contains(expected_error),
             "wrong refusal: {error:#}"
@@ -1684,6 +1707,18 @@ mod tests {
                 println!("NODE_LEADER_REAP_ESRCH {leader}");
                 return reap_owned_node_descendant(pid, leader);
             }
+            #[cfg(target_os = "macos")]
+            if descendant {
+                let observation = (|| -> Result<_> {
+                    let leader = fs::read_to_string(directory.join("probe-leader.pid"))?;
+                    let leader: i32 = leader.trim().parse()?;
+                    Ok((
+                        leader,
+                        terminal_group::macos::diagnostic_member(pid.as_raw(), leader),
+                    ))
+                })();
+                eprintln!("NODE_MAC_DESCENDANT_ASSERT pid={pid} observation={observation:?}");
+            }
             #[cfg(not(target_os = "linux"))]
             let _ = descendant;
             assert_eq!(
@@ -1783,7 +1818,8 @@ mod tests {
 
     #[test]
     fn test_node_manager_new() -> Result<()> {
-        if !cfg!(debug_assertions) && crate::core::is_root() {
+        #[cfg(not(debug_assertions))]
+        if crate::core::is_root() {
             let mgr = NodeManager::new();
             assert_eq!(
                 mgr.versions_dir,
