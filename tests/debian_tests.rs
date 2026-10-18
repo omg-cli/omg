@@ -12,6 +12,11 @@
 //! `scripts/debian-smoke-test.sh` and the QEMU inventory.
 
 pub mod common;
+
+#[path = "common/runtime_available.rs"]
+pub mod runtime_available;
+
+use runtime_available::{expected_node_alias, has_expected_row};
 pub mod platform_semantics;
 
 use common::fixtures::*;
@@ -1817,16 +1822,30 @@ mod runtime_management {
     fn test_list_available_node() {
         require_network_tests!();
 
-        let result = run_omg(&["list", "node", "--available"]);
+        let expected = format!("v{}", expected_node_alias(false));
+        let result = run_omg_with_env(&["list", "node", "--available"], &[("NO_COLOR", "1")]);
         result.assert_success();
+        assert!(
+            has_expected_row(&result.stdout, &expected),
+            "missing independently expected Node row {expected}: {}",
+            result.stdout
+        );
     }
 
     #[test]
     fn test_list_available_python() {
-        require_network_tests!();
-
-        let result = run_omg(&["list", "python", "--available"]);
+        let result = run_omg_with_env(&["list", "python", "--available"], &[("NO_COLOR", "1")]);
         result.assert_success();
+        assert!(
+            has_expected_row(&result.stdout, "3.12.0"),
+            "missing complete Python 3.12.0 row: {}",
+            result.stdout
+        );
+        assert!(
+            has_expected_row(&result.stdout, "3.11.0"),
+            "missing complete Python 3.11.0 row: {}",
+            result.stdout
+        );
     }
 
     #[test]
