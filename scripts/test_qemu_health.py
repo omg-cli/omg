@@ -71,14 +71,16 @@ class HealthTests(unittest.TestCase):
         source = Path(__file__).with_name("benchmark-qemu.sh").read_text()
         begin = source.index("health_rc=0\n")
         end = source.index("# Verdict map:", begin)
-        for transactions, serial_fatal, stale_boot, boot_probe_failure, accepted in (
-            (0, False, False, False, True),
-            (1, False, False, False, True),
-            (1, True, False, False, False),
-            (1, False, True, False, False),
-            (1, False, False, True, False),
+        for transactions, serial_fatal, stale_boot, boot_probe_failure, accepted, collector_refusal in (
+            (0, False, False, False, True, False),
+            (1, False, False, False, True, False),
+            (1, True, False, False, False, False),
+            (1, False, True, False, False, False),
+            (1, False, False, True, False, False),
+            (1, False, False, False, False, True),
         ):
-            with self.subTest(transactions=transactions, fatal=serial_fatal, stale=stale_boot):
+            with self.subTest(transactions=transactions, fatal=serial_fatal, stale=stale_boot,
+                              collector_refusal=collector_refusal):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     (root / "guest").mkdir()
@@ -95,6 +97,16 @@ class HealthTests(unittest.TestCase):
                         kernel_bytes=100, fatal_signatures=[], product_crashes=[],
                         crash_channel=channel_fixture(observed)
                     )))
+                    (root / "collector.py").write_text('''import importlib.util,sys
+from unittest.mock import patch
+spec=importlib.util.spec_from_file_location("fixture_collector",sys.argv[1])
+health=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(health)
+sys.argv=["check-qemu-health.py","collect"]
+with patch.object(health.Path,"read_text",return_value="00000000-1111-2222-3333-555555555555"), \
+        patch.object(health,"query",return_value="|/bin/false"):
+    sys.exit(health.main())
+''')
                     setup = '''set -euo pipefail
 work="$PWD"
 controller=fixture
@@ -104,7 +116,11 @@ docker() {
   if [[ "$1" == inspect ]]; then
     printf '{"Running":true,"OOMKilled":false,"ExitCode":0}\\n'
   elif [[ "$*" == *collect* ]]; then
-    cat receipt.json
+    if [[ "$collector_refusal" == true ]]; then
+      "$fixture_python" -I -B "$work/collector.py" "$here/check-qemu-health.py"
+    else
+      cat receipt.json
+    fi
   else
     if [[ "$boot_probe_failure" == true ]]; then return 255; fi
     printf '00000000-1111-2222-3333-555555555555\\n'
@@ -115,11 +131,20 @@ docker() {
                     setup += f"here={shlex.quote(str(Path(__file__).resolve().parent))}\n"
                     setup += f"transaction_samples={transactions}\n"
                     setup += f"boot_probe_failure={str(boot_probe_failure).lower()}\n"
+                    setup += f"collector_refusal={str(collector_refusal).lower()}\n"
+                    setup += f"fixture_python={shlex.quote(sys.executable)}\n"
                     result = subprocess.run(
                         ["bash", "-c", setup + source[begin:end] + '\nexit "$rc"\n'],
                         cwd=root, capture_output=True, text=True, timeout=10
                     )
                     self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                    if collector_refusal:
+                        self.assertEqual(result.returncode, 120, result.stderr)
+                        self.assertEqual((root / "guest-health.json").read_bytes(), b"")
+                        self.assertEqual((root / "health-validation.log").read_text(),
+                                         "QEMU health evidence failed admission: unsupported kernel crash handler: "
+                                         "bytes=11 sha256=28526ed217ac6eade404fdec538653f6d2e4d37bf378cb64d1806402aaf7713d\n")
+                        self.assertIn("Final guest/controller health failed admission", result.stderr)
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

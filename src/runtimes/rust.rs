@@ -1415,9 +1415,26 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_manager_new() {
-        let mgr = RustManager::new();
-        assert!(mgr.versions_dir.ends_with("rust"));
+    fn test_rust_manager_new() -> Result<()> {
+        #[cfg(not(debug_assertions))]
+        if crate::core::is_root() {
+            let mgr = RustManager::new();
+            assert_eq!(
+                mgr.versions_dir,
+                std::path::PathBuf::from("/var/lib/omg/versions/rust")
+            );
+            return Ok(());
+        }
+
+        super::super::common::assert_constructor_inventory(
+            "rust",
+            "runtimes::rust::tests::test_rust_manager_new",
+            || {
+                let mgr = RustManager::new();
+                assert!(mgr.versions_dir.ends_with("rust"));
+                Ok((mgr.list_installed()?, mgr.current_version()))
+            },
+        )
     }
 
     #[test]

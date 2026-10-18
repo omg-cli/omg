@@ -2126,6 +2126,73 @@ pub(crate) fn harden_untrusted_runtime_command(
 }
 
 #[cfg(test)]
+pub(crate) fn assert_constructor_inventory<F>(
+    runtime: &str,
+    test_name: &str,
+    query: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<(Vec<String>, Option<String>)>,
+{
+    const CHILD: &str = "OMG_RUNTIME_CONSTRUCTOR_CHILD";
+    let marker = format!("[omg-runtime-constructor-child] runtime={runtime} test={test_name}");
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        let (installed, current) = query()?;
+        anyhow::ensure!(
+            installed == ["2.0.0", "1.0.0"],
+            "{runtime} constructor returned the wrong installed inventory: {installed:?}"
+        );
+        anyhow::ensure!(
+            current.as_deref() == Some("1.0.0"),
+            "{runtime} constructor returned the wrong current version: {current:?}"
+        );
+        println!("{marker}");
+        return Ok(());
+    }
+
+    let data = tempfile::Builder::new()
+        .prefix("omg-runtime-constructor-")
+        .tempdir_in("/var/tmp")?;
+    for (versions, versions_to_create, current) in [
+        (
+            data.path().join("versions").join(runtime),
+            ["1.0.0", "2.0.0"],
+            "1.0.0",
+        ),
+        (
+            data.path().join("wrong-ancestor").join(runtime),
+            ["8.0.0", "9.0.0"],
+            "9.0.0",
+        ),
+        (data.path().join(runtime), ["6.0.0", "7.0.0"], "7.0.0"),
+    ] {
+        for version in versions_to_create {
+            fs::create_dir_all(versions.join(version))?;
+        }
+        std::os::unix::fs::symlink(current, versions.join("current"))?;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD, test_name)
+        .env("OMG_DATA_DIR", data.path())
+        .env("OMG_NATIVE_TEST_DATA_DIR", "1")
+        .env("OMG_TEST_MODE", "0")
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::ensure!(
+        output.status.success()
+            && stdout.matches("running 1 test").count() == 1
+            && stdout.matches("1 passed; 0 failed; 0 ignored;").count() == 1
+            && stdout.matches(&format!("test {test_name} ...")).count() == 1
+            && stdout.matches(&marker).count() == 1,
+        "{runtime} constructor fixture failed for {test_name}:\n{stdout}\n{stderr}"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
     #[tokio::test]
@@ -4573,13 +4640,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::create_dir(temp.path().join("1.0.0")).unwrap();
         fs::create_dir(temp.path().join("2.0.0")).unwrap();
+        fs::create_dir(temp.path().join("10.0.0")).unwrap();
         fs::create_dir(temp.path().join("current")).unwrap(); // Should be excluded
 
         let versions = list_installed_versions(temp.path()).unwrap();
-        assert_eq!(versions.len(), 2);
-        assert!(versions.contains(&"1.0.0".to_string()));
-        assert!(versions.contains(&"2.0.0".to_string()));
-        assert!(!versions.contains(&"current".to_string()));
+        assert_eq!(versions, ["10.0.0", "2.0.0", "1.0.0"]);
     }
 
     #[test]
