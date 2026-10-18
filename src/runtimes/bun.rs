@@ -283,9 +283,25 @@ mod tests {
     }
 
     #[test]
-    fn test_bun_manager_new() {
-        let mgr = BunManager::new();
-        assert!(mgr.versions_dir.ends_with("bun"));
+    fn test_bun_manager_new() -> Result<()> {
+        if !cfg!(debug_assertions) && crate::core::is_root() {
+            let mgr = BunManager::new();
+            assert_eq!(
+                mgr.versions_dir,
+                std::path::PathBuf::from("/var/lib/omg/versions/bun")
+            );
+            return Ok(());
+        }
+
+        super::super::common::assert_constructor_inventory(
+            "bun",
+            "runtimes::bun::tests::test_bun_manager_new",
+            || {
+                let mgr = BunManager::new();
+                assert!(mgr.versions_dir.ends_with("bun"));
+                Ok((mgr.list_installed()?, mgr.current_version()))
+            },
+        )
     }
 
     #[test]
@@ -319,6 +335,14 @@ mod tests {
     #[test]
     fn bun_platform_is_host_specific() {
         let platform = bun_platform().expect("host platform should be supported");
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "linux-x64",
+            ("linux", "aarch64") => "linux-aarch64",
+            ("macos", "x86_64") => "darwin-x64",
+            ("macos", "aarch64") => "darwin-aarch64",
+            (os, arch) => panic!("unsupported test host: {os}/{arch}"),
+        };
+        assert_eq!(platform, expected);
         if std::env::consts::OS == "linux" {
             assert!(platform.starts_with("linux-"));
         } else {

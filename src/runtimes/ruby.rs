@@ -276,9 +276,25 @@ mod tests {
     }
 
     #[test]
-    fn test_ruby_manager_new() {
-        let mgr = RubyManager::new();
-        assert!(mgr.versions_dir.ends_with("ruby"));
+    fn test_ruby_manager_new() -> Result<()> {
+        if !cfg!(debug_assertions) && crate::core::is_root() {
+            let mgr = RubyManager::new();
+            assert_eq!(
+                mgr.versions_dir,
+                std::path::PathBuf::from("/var/lib/omg/versions/ruby")
+            );
+            return Ok(());
+        }
+
+        super::super::common::assert_constructor_inventory(
+            "ruby",
+            "runtimes::ruby::tests::test_ruby_manager_new",
+            || {
+                let mgr = RubyManager::new();
+                assert!(mgr.versions_dir.ends_with("ruby"));
+                Ok((mgr.list_installed()?, mgr.current_version()))
+            },
+        )
     }
 
     #[test]
@@ -316,10 +332,10 @@ mod tests {
     #[test]
     fn ruby_platform_is_host_specific() {
         let platform = ruby_platform().expect("host platform should be supported");
-        if std::env::consts::OS == "linux" {
-            assert_eq!(platform, "ubuntu-22.04");
-        } else {
-            assert_ne!(platform, "ubuntu-22.04");
+        match std::env::consts::OS {
+            "linux" => assert_eq!(platform, "ubuntu-22.04"),
+            "macos" => assert_eq!(platform, "darwin"),
+            os => panic!("unsupported test host: {os}"),
         }
     }
 }

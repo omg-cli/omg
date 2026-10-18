@@ -1782,9 +1782,25 @@ mod tests {
     }
 
     #[test]
-    fn test_node_manager_new() {
-        let mgr = NodeManager::new();
-        assert!(mgr.versions_dir.ends_with("node"));
+    fn test_node_manager_new() -> Result<()> {
+        if !cfg!(debug_assertions) && crate::core::is_root() {
+            let mgr = NodeManager::new();
+            assert_eq!(
+                mgr.versions_dir,
+                std::path::PathBuf::from("/var/lib/omg/versions/node")
+            );
+            return Ok(());
+        }
+
+        super::super::common::assert_constructor_inventory(
+            "node",
+            "runtimes::node::tests::test_node_manager_new",
+            || {
+                let mgr = NodeManager::new();
+                assert!(mgr.versions_dir.ends_with("node"));
+                Ok((mgr.list_installed()?, mgr.current_version()))
+            },
+        )
     }
 
     #[test]
@@ -1984,6 +2000,14 @@ mod tests {
     #[test]
     fn node_platform_uses_host_os_and_arch() {
         let platform = node_platform().expect("host platform should be supported");
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "linux-x64",
+            ("linux", "aarch64") => "linux-arm64",
+            ("macos", "x86_64") => "darwin-x64",
+            ("macos", "aarch64") => "darwin-arm64",
+            (os, arch) => panic!("unsupported test host: {os}/{arch}"),
+        };
+        assert_eq!(platform, expected);
         assert!(platform.contains('-'));
         assert!(!platform.starts_with("linux-") || std::env::consts::OS == "linux");
     }

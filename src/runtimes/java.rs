@@ -438,9 +438,25 @@ mod tests {
     }
 
     #[test]
-    fn test_java_manager_new() {
-        let mgr = JavaManager::new();
-        assert!(mgr.versions_dir.ends_with("java"));
+    fn test_java_manager_new() -> Result<()> {
+        if !cfg!(debug_assertions) && crate::core::is_root() {
+            let mgr = JavaManager::new();
+            assert_eq!(
+                mgr.versions_dir,
+                std::path::PathBuf::from("/var/lib/omg/versions/java")
+            );
+            return Ok(());
+        }
+
+        super::super::common::assert_constructor_inventory(
+            "java",
+            "runtimes::java::tests::test_java_manager_new",
+            || {
+                let mgr = JavaManager::new();
+                assert!(mgr.versions_dir.ends_with("java"));
+                Ok((mgr.list_installed()?, mgr.current_version()))
+            },
+        )
     }
 
     #[cfg(unix)]

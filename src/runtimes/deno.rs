@@ -679,6 +679,19 @@ mod tests {
     }
 
     #[test]
+    fn deno_target_uses_host_os_and_arch() {
+        let target = deno_target().expect("host target should be supported");
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+            ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+            ("macos", "x86_64") => "x86_64-apple-darwin",
+            ("macos", "aarch64") => "aarch64-apple-darwin",
+            (os, arch) => panic!("unsupported test host: {os}/{arch}"),
+        };
+        assert_eq!(target, expected);
+    }
+
+    #[test]
     fn unsupported_host_combinations_have_no_vendor_triple() {
         assert_eq!(deno_triple("windows", "x86_64"), None);
         assert_eq!(deno_triple("freebsd", "x86_64"), None);

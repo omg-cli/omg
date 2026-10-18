@@ -647,6 +647,14 @@ mod tests {
     #[test]
     fn host_arch_tokens_name_the_platform() {
         let (index, tarball) = host_arch_tokens().expect("host is supported");
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => ("amd64", "amd64"),
+            ("linux", "aarch64") => ("arm64", "arm64"),
+            ("macos", "x86_64") => ("x86_64", "x86_64"),
+            ("macos", "aarch64") => ("aarch64", "aarch64"),
+            (os, arch) => panic!("unsupported test host: {os}/{arch}"),
+        };
+        assert_eq!((index, tarball), expected);
         assert_eq!(index, tarball);
         match std::env::consts::ARCH {
             "x86_64" => assert!(index.contains("64") || index.contains("amd")),
