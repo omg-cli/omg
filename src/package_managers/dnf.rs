@@ -3880,6 +3880,10 @@ mod tests {
         let database = Connection::open(&manager.rpm_db_path)?;
         database.pragma_update(None, "journal_mode", "WAL")?;
         assert_eq!(manager.list_installed().await?.len(), 1);
+        assert!(
+            manager.is_installed("publicsuffix-list-dafsa").await?,
+            "the private fixture package must be present before testing its removal"
+        );
         let original_bytes = std::fs::read(&manager.rpm_db_path)?;
         let original_mtime = std::fs::metadata(&manager.rpm_db_path)?.modified()?;
 
@@ -3903,6 +3907,10 @@ mod tests {
         let mut manager = DnfPackageManager::new();
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
         assert_eq!(manager.list_installed().await?.len(), 1);
+        assert!(
+            manager.is_installed("publicsuffix-list-dafsa").await?,
+            "the private fixture package must be present before testing its removal"
+        );
         let original_mtime = std::fs::metadata(&manager.rpm_db_path)?.modified()?;
         let replacement = write_packages_db(&[]);
         let replacement_path = replacement.path().join("rpmdb.sqlite");
@@ -3970,6 +3978,21 @@ mod tests {
         let mut manager = DnfPackageManager::new();
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
         assert_eq!(manager.list_installed().await?.len(), 1);
+        let cached = manager
+            .cached_installed_packages()
+            .expect("private fixture cache must exist before testing invalidation");
+        assert_eq!(
+            cached
+                .iter()
+                .map(|package| (
+                    package.name.as_str(),
+                    package.version.as_str(),
+                    package.release.as_str(),
+                    package.architecture.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![("publicsuffix-list-dafsa", "20260116", "1.fc44", "noarch")]
+        );
         let wal = directory.path().join("rpmdb.sqlite-wal");
         std::fs::create_dir(&wal)?;
         assert!(manager.cached_installed_packages().is_none());
@@ -3985,13 +4008,13 @@ mod tests {
         let mut manager = DnfPackageManager::new();
         manager.rpm_db_path = directory.path().join("rpmdb.sqlite");
         let identity = RpmDatabaseObservation::read(&manager.rpm_db_path);
-        let packages: Vec<_> = ["1.fc42.x86_64", "1.fc42.i686"]
+        let packages: Vec<_> = ["x86_64", "i686"]
             .into_iter()
-            .map(|release| InstalledPackage {
+            .map(|architecture| InstalledPackage {
                 name: "glibc".to_string(),
                 version: "2.41".to_string(),
-                release: release.to_string(),
-                architecture: "x86_64".to_string(),
+                release: "1.fc42".to_string(),
+                architecture: architecture.to_string(),
                 summary: "C library".to_string(),
                 reason: InstallReason::Dependency,
             })
@@ -4004,15 +4027,24 @@ mod tests {
             .cached_installed_packages()
             .expect("populated cache");
         assert_eq!(cached.len(), 2);
-        assert!(
-            cached
-                .iter()
-                .any(|package| package.release.ends_with("x86_64"))
-        );
-        assert!(
-            cached
-                .iter()
-                .any(|package| package.release.ends_with("i686"))
+        let mut identities: Vec<_> = cached
+            .iter()
+            .map(|package| {
+                (
+                    package.name.as_str(),
+                    package.version.as_str(),
+                    package.release.as_str(),
+                    package.architecture.as_str(),
+                )
+            })
+            .collect();
+        identities.sort_unstable();
+        assert_eq!(
+            identities,
+            [
+                ("glibc", "2.41", "1.fc42", "i686"),
+                ("glibc", "2.41", "1.fc42", "x86_64"),
+            ]
         );
     }
 
