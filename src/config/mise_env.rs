@@ -139,9 +139,12 @@ fn glob_match(pattern: &str, name: &str) -> bool {
             return false;
         }
     }
-    for part in parts.iter().skip(1) {
+    for (index, part) in parts.iter().enumerate().skip(1) {
         if part.is_empty() {
             continue;
+        }
+        if index == parts.len() - 1 {
+            break;
         }
         match rest.find(part) {
             Some(index) => rest = &rest[index + part.len()..],
@@ -149,7 +152,7 @@ fn glob_match(pattern: &str, name: &str) -> bool {
         }
     }
     if !pattern.ends_with('*') {
-        return rest.is_empty();
+        return rest.ends_with(parts[parts.len() - 1]);
     }
     true
 }
@@ -1393,12 +1396,53 @@ mod tests {
         assert!(!glob_match("SECRET_*", "MY_SECRET"));
         assert!(glob_match("*", "ANYTHING"));
         assert!(!glob_match("EXACT", "exact"));
+        for (pattern, name, expected) in [
+            ("A*_TOKEN", "API_TOKEN_OLD_TOKEN", true),
+            ("*API*_TOKEN", "API_TOKEN_OLD_TOKEN", true),
+            ("*A*A", "A", false),
+            ("A*A", "A", false),
+            ("A*A", "AA", true),
+            ("**_TOKEN", "API_TOKEN_OLD_TOKEN", true),
+            ("*_TOKEN", "API_TOKEN_SUFFIX", false),
+            ("*MISSING*", "API_TOKEN", false),
+            ("**", "", true),
+        ] {
+            assert_eq!(glob_match(pattern, name), expected, "{pattern:?} {name:?}");
+        }
 
         let text = "redactions = [\"*_TOKEN\"]\n[env]\nA = \"1\"\nB = { value = \"s\", redact = true }\nC = \"x\"\n";
         let resolved = resolve_text(text, &base(&[]), Strictness::Strict);
         assert!(!resolved.redacted.contains("A"));
         assert!(resolved.redacted.contains("B"));
         assert!(!resolved.redacted.contains("C"));
+    }
+
+    #[test]
+    fn redaction_patterns_match_repeated_suffixes_without_changing_values() {
+        let resolved = resolve_text(
+            "redactions = ['*_TOKEN']\n[env]\nAPI_TOKEN = 'first'\nAPI_TOKEN_OLD_TOKEN = 'repeated'\nAPI_TOKEN_SUFFIX = 'visible'\nTOKEN = 'plain'\nFLAGGED = { value = 'explicit', redact = true }\n",
+            &base(&[]),
+            Strictness::Strict,
+        );
+        assert_eq!(
+            resolved.set.into_iter().collect::<HashMap<_, _>>(),
+            base(&[
+                ("API_TOKEN", "first"),
+                ("API_TOKEN_OLD_TOKEN", "repeated"),
+                ("API_TOKEN_SUFFIX", "visible"),
+                ("TOKEN", "plain"),
+                ("FLAGGED", "explicit"),
+            ])
+        );
+        assert_eq!(
+            resolved.redacted,
+            HashSet::from([
+                "API_TOKEN".to_string(),
+                "API_TOKEN_OLD_TOKEN".to_string(),
+                "FLAGGED".to_string(),
+            ])
+        );
+        assert!(resolved.unset.is_empty());
     }
 
     #[test]
