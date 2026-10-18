@@ -144,12 +144,15 @@ fn glob_match(pattern: &str, name: &str) -> bool {
             continue;
         }
         if index == parts.len() - 1 {
-            return rest.ends_with(part);
+            break;
         }
         match rest.find(part) {
             Some(index) => rest = &rest[index + part.len()..],
             None => return false,
         }
+    }
+    if !pattern.ends_with('*') {
+        return rest.ends_with(parts[parts.len() - 1]);
     }
     true
 }
@@ -1401,6 +1404,7 @@ mod tests {
             ("A*A", "AA", true),
             ("**_TOKEN", "API_TOKEN_OLD_TOKEN", true),
             ("*_TOKEN", "API_TOKEN_SUFFIX", false),
+            ("*MISSING*", "API_TOKEN", false),
             ("**", "", true),
         ] {
             assert_eq!(glob_match(pattern, name), expected, "{pattern:?} {name:?}");
