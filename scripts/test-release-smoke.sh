@@ -373,6 +373,8 @@ fedora_probe_package="$probe_root/omg-v9.9.9-x86_64-linux-fedora"
 mkdir -p "$fedora_probe_package"
 cp "$probe_package/omg" "$probe_package/omgd" "$fedora_probe_package/"
 fedora_probe_env=("${probe_env[@]}" OMG_PROBE_BIN=omg-v9.9.9-x86_64-linux-fedora/omg)
+export FAKE_SEARCH_OUTPUT='  tree 2.2.1-4.fc44  Official'
+assert_rc 0 env "${fedora_probe_env[@]}" bash "$probe"
 export FAKE_SEARCH_OUTPUT='  tree.x86_64 2.2.1-4.fc44  Official'
 assert_rc 0 env "${fedora_probe_env[@]}" bash "$probe"
 assert_rc 1 env "${probe_env[@]}" bash "$probe"

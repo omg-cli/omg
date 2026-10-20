@@ -362,7 +362,7 @@ case "$OMG_SMOKE_PROBE_KIND" in
       *-x86_64-linux-fedora/omg) search_name=tree.x86_64 ;;
     esac
     awk -v package="$search_name" '
-      /^[[:space:]]/ && $1 == package && NF >= 2 { found = 1 }
+      /^[[:space:]]/ && ($1 == "tree" || $1 == package) && NF >= 2 { found = 1 }
       END { exit !found }
     ' <<< "$search_output"
     ;;
