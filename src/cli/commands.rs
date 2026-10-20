@@ -1811,7 +1811,7 @@ mod tests {
                         }
                         stats(false).unwrap();
                     }
-                    "env" | "new" => {
+                    "env" | "new" | "tool" => {
                         println!("COMPLETIONS_BEGIN");
                         tokio::runtime::Builder::new_current_thread()
                             .enable_all()
@@ -1944,6 +1944,39 @@ mod tests {
             TOOL_COMMANDS,
             &["install", "list", "remove", "update", "search", "registry"]
         );
+
+        #[cfg(unix)]
+        {
+            use clap::{CommandFactory, Parser};
+            use std::collections::BTreeSet;
+
+            let words = emitted_completion_words("tool");
+            let expected =
+                BTreeSet::from(["install", "list", "remove", "update", "search", "registry"]);
+            let offered = words.iter().map(String::as_str).collect::<BTreeSet<_>>();
+            assert_eq!(
+                offered, expected,
+                "live tool completion must expose the accepted inventory"
+            );
+            assert_eq!(
+                words.len(),
+                6,
+                "live tool completion must not duplicate candidates"
+            );
+            let parser = crate::cli::Cli::command();
+            let accepted = parser
+                .find_subcommand("tool")
+                .expect("tool command")
+                .get_subcommands()
+                .map(|command| command.get_name())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                accepted, expected,
+                "tool completion must agree with the actual parser"
+            );
+            crate::cli::Cli::try_parse_from(["omg", "tool", "registry"])
+                .expect("emitted registry command must be accepted");
+        }
     }
 
     #[test]

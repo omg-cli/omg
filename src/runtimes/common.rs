@@ -3503,6 +3503,14 @@ mod tests {
 
     #[test]
     fn equal_runtime_versions_have_a_deterministic_directory_order() {
+        let temp = TempDir::new().unwrap();
+        for version in ["1.0", "1.0.0"] {
+            fs::create_dir(temp.path().join(version)).unwrap();
+        }
+        assert_eq!(
+            list_installed_versions(temp.path()).unwrap(),
+            ["1.0.0", "1.0"]
+        );
         let mut versions = ["1.0".to_string(), "1.0.0".to_string()];
         versions.sort_by(|a, b| version_cmp(b, a).then_with(|| b.cmp(a)));
         assert_eq!(versions, ["1.0.0", "1.0"]);
@@ -3607,6 +3615,14 @@ mod tests {
 
     #[test]
     fn ordering_mixed_catalog_obeys_comparison_laws() {
+        let temp = TempDir::new().unwrap();
+        for version in ["1.2.3alpha3", "1.2.3-alpha10", "1.2.3-alpha2"] {
+            fs::create_dir(temp.path().join(version)).unwrap();
+        }
+        assert_eq!(
+            list_installed_versions(temp.path()).unwrap(),
+            ["1.2.3-alpha2", "1.2.3-alpha10", "1.2.3alpha3"]
+        );
         let versions = [
             "1.2.3-alpha10",
             "1.2.3-alpha2",
