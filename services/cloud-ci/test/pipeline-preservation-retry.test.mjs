@@ -93,9 +93,12 @@ export default {async fetch(request,env){
 const require=createRequire(${JSON.stringify(new URL("../node_modules/wrangler/package.json", import.meta.url).href)});
 const {Miniflare,convertV4MiniflareOptions}=require('miniflare');
 const mf=new Miniflare(convertV4MiniflareOptions({modules:true,compatibilityDate:'2026-10-20',compatibilityFlags:['nodejs_compat'],r2Buckets:['BUCKET'],script:${JSON.stringify(worker)}}));
-try{const results=[];for(const mode of ${JSON.stringify(modes)}){const response=await mf.dispatchFetch('https://fixture.invalid/'+mode);results.push({mode,status:response.status,body:await response.json()});}console.log(JSON.stringify(results));}finally{await mf.dispose();}`;
+let timer;
+const deadline=new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Workerd preservation fixture exceeded 20 seconds')),20_000);});
+try{const results=await Promise.race([deadline,(async()=>{const results=[];for(const mode of ${JSON.stringify(modes)}){const response=await mf.dispatchFetch('https://fixture.invalid/'+mode);results.push({mode,status:response.status,body:await response.json()});}return results;})()]);console.log(JSON.stringify(results));}finally{clearTimeout(timer);await mf.dispose();}`;
     const child = Bun.spawn(["node", "--input-type=module", "-"], {
         stdin: new TextEncoder().encode(program), stdout: "pipe", stderr: "pipe",
+        timeout: 25_000, killSignal: "SIGKILL",
     });
     const [code, output, errors] = await Promise.all([
         child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
@@ -112,4 +115,4 @@ try{const results=[];for(const mode of ${JSON.stringify(modes)}){const response=
             expect(result.body.checks).toBe(7);
         }
     }
-});
+}, 30_000);
