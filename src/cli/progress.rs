@@ -368,6 +368,7 @@ mod tests {
     #[serial]
     fn quiet_lanes_are_invisible() {
         modern_ui::configure_output(0, true);
+        assert_eq!(modern_ui::output_mode(), OutputMode::Quiet);
         let task = ProgressTask::start(&spec("db", TaskKind::Bytes { total: Some(10) }));
         let bar = lock_bar(&task.inner).clone().expect("lane exists");
         assert!(bar.is_hidden());
@@ -383,18 +384,12 @@ mod tests {
             TaskKind::Bytes { total: None },
         ));
         let label = task.lock_label().clone();
-        assert_eq!(
-            label,
-            style::sanitize_terminal_text("core\x1b]0;pwn\u{202e}db")
-        );
+        assert_eq!(label, "core]0;pwndb");
         assert!(!label.contains('\u{1b}'));
 
         task.set_message("retry \u{2066}2\u{2069}");
         let bar = lock_bar(&task.inner).clone().expect("lane exists");
-        assert_eq!(
-            bar.message(),
-            style::sanitize_terminal_text("retry \u{2066}2\u{2069}")
-        );
+        assert_eq!(bar.message(), "retry 2");
         modern_ui::configure_output(0, false);
     }
 

@@ -948,6 +948,7 @@ pub(crate) mod tests {
     #[serial_test::serial]
     fn quiet_spinners_are_hidden() {
         configure_output(0, true);
+        assert_eq!(output_mode(), OutputMode::Quiet);
         let progress = modern_spinner("phase", "action");
         assert!(progress.is_hidden());
         configure_output(0, false);
