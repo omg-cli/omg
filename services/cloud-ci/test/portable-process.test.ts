@@ -11,6 +11,9 @@ test("portable execution drops identity and does not inherit controller credenti
             GITHUB_RUN_ID: "123",
             GH_TOKEN: "fixture-injected-secret",
             NODE_OPTIONS: "--import=untrusted",
+            GIT_CONFIG_COUNT: "1",
+            GIT_CONFIG_KEY_0: "safe.directory",
+            GIT_CONFIG_VALUE_0: "*",
         });
 
         expect(options.uid).toBe(10001);
@@ -20,6 +23,19 @@ test("portable execution drops identity and does not inherit controller credenti
         expect(options.env).toMatchObject({ GITHUB_RUN_ID: "123" });
         expect(Object.hasOwn(options.env, "GH_TOKEN")).toBe(false);
         expect(Object.hasOwn(options.env, "NODE_OPTIONS")).toBe(false);
+        expect(options.env).toMatchObject({
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_COUNT: "3",
+            GIT_CONFIG_KEY_0: "maintenance.auto",
+            GIT_CONFIG_VALUE_0: "false",
+            GIT_CONFIG_KEY_1: "gc.auto",
+            GIT_CONFIG_VALUE_1: "0",
+            GIT_CONFIG_KEY_2: "safe.directory",
+            GIT_CONFIG_VALUE_2: "/workspace",
+        });
+        expect(Object.hasOwn(options.env, "GIT_DIR")).toBe(false);
+        expect(Object.hasOwn(options.env, "GIT_WORK_TREE")).toBe(false);
     } finally {
         if (previous === undefined) delete process.env.GH_TOKEN;
         else process.env.GH_TOKEN = previous;

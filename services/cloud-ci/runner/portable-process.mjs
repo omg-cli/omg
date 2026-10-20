@@ -32,6 +32,16 @@ export function portableOptions(workspace, home, env = {}) {
             CARGO_PROFILE_TEST_DEBUG: "0",
             RUST_BACKTRACE: "0",
             PYTHONDONTWRITEBYTECODE: "1",
+            // Exact protected checkout exception; temporary fixture repositories keep normal Git discovery.
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_CONFIG_COUNT: "3",
+            GIT_CONFIG_KEY_0: "maintenance.auto",
+            GIT_CONFIG_VALUE_0: "false",
+            GIT_CONFIG_KEY_1: "gc.auto",
+            GIT_CONFIG_VALUE_1: "0",
+            GIT_CONFIG_KEY_2: "safe.directory",
+            GIT_CONFIG_VALUE_2: workspace,
             WRANGLER_SEND_METRICS: "false",
             CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
             ...Object.fromEntries(
