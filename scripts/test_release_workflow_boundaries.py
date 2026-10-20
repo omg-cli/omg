@@ -269,6 +269,11 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                 result = subprocess.run([BASH, '-c', fake + script], cwd=root, env=env, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((root / 'telemetry').exists(), expected)
+                if expected:
+                    self.assertEqual((root / 'telemetry').read_text().splitlines(), [
+                        'scripts/ci-smoke-report.py status --distro arch --case-id smoke-arch-setup '
+                        '--status failure --evidence-dir release-smoke-evidence/run-123-1',
+                    ])
 
 
 if __name__ == '__main__':
