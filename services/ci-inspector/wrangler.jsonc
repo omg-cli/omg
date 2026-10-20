@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "omg-ci-inspector",
+  "account_id": "f1e95b3e1b502cf366dfc81a863695fa",
+  "workers_dev": true,
+  "preview_urls": false,
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI" },
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "limits": { "cpu_ms": 1000 },
+  "observability": { "enabled": false },
+}

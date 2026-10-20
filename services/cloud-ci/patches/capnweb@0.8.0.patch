@@ -1,0 +1,17 @@
+diff --git a/dist/index-workers-CiDKhXAE.d.ts b/dist/index-workers-CiDKhXAE.d.ts
+--- a/dist/index-workers-CiDKhXAE.d.ts
++++ b/dist/index-workers-CiDKhXAE.d.ts
+@@ -125,12 +125,7 @@ type UnstubifyInner<T> =
+   : T extends Promise<infer U> ? UnstubifyInner<U>
+   : T extends Map<infer K, infer V> ? Map<Unstubify<K>, Unstubify<V>>
+   : T extends Set<infer V> ? Set<Unstubify<V>>
+-  : T extends [] ? []
+-  : T extends [infer Head, ...infer Tail] ? [Unstubify<Head>, ...Unstubify<Tail>]
+-  : T extends readonly [] ? readonly []
+-  : T extends readonly [infer Head, ...infer Tail] ? readonly [Unstubify<Head>, ...Unstubify<Tail>]
+-  : T extends Array<infer V> ? Array<Unstubify<V>>
+-  : T extends ReadonlyArray<infer V> ? ReadonlyArray<Unstubify<V>>
++  : T extends readonly unknown[] ? { [K in keyof T]: Unstubify<T[K]> }
+   : T extends BaseType ? T
+   : T extends { [key: string | number]: unknown } ? { [K in keyof T as K extends string | number ? K : never]: Unstubify<T[K]> }
+   : T;

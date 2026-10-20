@@ -1,0 +1,13 @@
+{
+  "name": "@omg/ci-orchestration",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:cloud-ci": "bun test tests/unit",
+    "check:cloud-ci": "bun run --cwd services/cloud-ci check && bun run --cwd services/ci-inspector check && bun run --cwd services/ci-coder check"
+  },
+  "dependencies": {
+    "effect": "4.0.1"
+  },
+  "packageManager": "bun@1.4.2"
+}

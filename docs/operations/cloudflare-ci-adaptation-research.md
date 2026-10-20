@@ -1,0 +1,69 @@
+# CodeLoud pipeline adaptation evidence
+
+Research date 2026-10-20. Reference source is CodeLoud commit `f4371c4ccacbf5fe7ab6e5c776bd9151c9a6850c`. Its handoff is `docs/operations/cloudflare-ci-handoff.md`, SHA-256 `e89d97296c43c432e056d3d342cf8cd8b978c51f1c718e25aaf8afe3e6e71271`. CodeLoud remains unchanged.
+
+## Decisions and sources
+
+| Change or retained behavior | Why this source was read | Evidence and implementation consequence |
+| --- | --- | --- |
+| Retain the existing CI, inspector, OpenCode and separate publisher structure | The user's handoff is the implementation contract | Read the handoff and its referenced `services/cloud-ci`, `services/ci-inspector`, `services/ci-coder`, courier and publisher scripts at the pinned commit. Copy the SDK patches with their regression checks. Do not substitute a second orchestration engine. |
+| Replace product identities and credentials | OMG must not operate on CodeLoud resources | [Artifacts namespaces](https://developers.cloudflare.com/artifacts/get-started/) documents project namespaces and Workers or REST setup. Use OMG-specific resources and tokens. Existing CodeLoud image pins are not OMG deployment evidence. |
+| Add the pinned Rust toolchain to the trusted image | CodeLoud's image provides JavaScript tooling rather than OMG's compiler | [Official Rust image](https://hub.docker.com/_/rust) identifies the Rust Project-maintained toolchain image. [Docker multi-stage builds](https://docs.docker.com/build/building/multi-stage/) documents copying tools between named stages. Match OMG's committed Rust 1.95.0 requirement and verify the real compiler, not a floating `stable` tag. |
+| Add Rust regression execution and artifact discovery | A substring Cargo filter can select the wrong test or none | [Cargo test](https://doc.rust-lang.org/cargo/commands/cargo-test.html) documents target selection and libtest arguments. [Cargo JSON messages](https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages) documents compiler-artifact identities and executable paths. Require one actual selected case and intended assertion failure before accepting RED. Compiler/setup failure is not RED. |
+| Extend the existing Sandbox image rather than replacing its runtime | Sandbox image and SDK versions must stay compatible | [Sandbox 0.x Dockerfile reference](https://developers.cloudflare.com/sandbox/sdk/configuration/dockerfile/) documents custom images. Its example version is illustrative, not the selected pin. Keep the handoff's tested 0.12.12 image/SDK pair and inspect actual package and image identities. |
+| Retain SDK large-log correction | A nested stream caused an actual hosted Workflow serialization failure | [Workflows step API](https://developers.cloudflare.com/workflows/build/workers-api/) distinguishes serializable step results and direct fresh byte streams. CodeLoud persists large log bodies in R2 inside the step, returns references and awaits cleanup. Its actual Workerd/R2 tests are retained. Local fixtures are not hosted acceptance. |
+| Keep bounded OpenCode and mandatory skill delivery | Model promises do not establish tool restrictions or delivered instructions | [OpenCode on Cloudflare](https://developers.cloudflare.com/agents/harnesses/opencode/) documents SQLite sessions, Lifecycle recovery, Workers AI and plugin tools. Retain actual session delivery hashes and restricted tools, then add pinned Rust and TDD guidance. |
+| Keep immutable image and deployment admission | A requested rollout need not identify an already running executor | [Image management](https://developers.cloudflare.com/containers/guides/image-management/) documents image configuration and deployment behavior. Read back the actual deployed Worker, application image and health before running acceptance. |
+| Preserve native/QEMU and release requirements | Container capability is not equivalent to native ABI, architecture or KVM acceptance | [Container limits](https://developers.cloudflare.com/containers/platform/limits/) documents instance resources. [Docker-in-Docker](https://developers.cloudflare.com/sandbox/sdk/guides/docker-in-docker/) documents restricted network configuration, ephemeral storage and deployed-only Docker support. Neither establishes `/dev/kvm` or every native platform. Retain OMG's existing native/QEMU gates until executed equivalents exist. |
+| Keep publication separate from approval and merge | The user wants cloud fixes and PRs, followed by human review | [GitHub token behavior](https://docs.github.com/en/actions/concepts/security/github_token) documents approval-required PR workflows created with `GITHUB_TOKEN`, and GitHub App/PAT alternatives. Keep publisher credentials out of candidate execution and the model. No automatic approval, merge or product release. |
+
+## Observed reference status
+
+The initial CodeLoud owner checkout and PR 42 reference head were `f4371c4`; the owner subsequently advanced to `ed8cd06`. SDK `@cloudflare/ci` remains pinned at 0.2.0, with Sandbox 0.12.12 and four dependency patches. Independent source review found no released upstream replacement for that correction.
+
+Saved local reference evidence reports 73 passing tests and 355 assertions across 17 files plus three strict TypeScript contexts. Seven log-regression modes use actual Workerd and R2 with explicit Sandbox and Workflow-checkpoint fixtures. Corrected-head hosted run `39504470869` subsequently ended in failure, with no passing receipt. Free run `39501646098`, attempt 2, failed without a passing receipt. These facts do not establish complete hosted acceptance or a verified repair PR.
+
+## First automatic publication boundary
+
+The first publication recipe repairs production Rust and adds a new standalone regression while preserving existing assertions. Existing-test strengthening requires the prior four-state evidence and remains held until that recipe is integrated. Dependency edits remain held until dependency receipts are supported. Unsupported work must stay visible in the backlog and must not increase completed counts.
+
+## Throughput checkpoint
+
+- Blocking first steps. Review the pinned handoff, SDK correction and hosted state, then establish deterministic execution and evidence before AI writes.
+- Independent workstreams. The cloud service and inspector, Rust runner/verifier, coder and courier/publisher have separate file owners.
+- Shared mutable state. Owners agree on the existing proposal and receipt contracts. Only the owning agent edits each contract.
+- Smallest safe decomposition. Port the existing engine, then add fixed Rust recipes. Do not copy JavaScript product/browser checks or introduce a second queue engine.
+
+## Acceptance record
+
+OMG inspector identity control failed under the original CodeLoud policy, then passed after the OMG identity change. Current local inspector suite is 26 passing tests, 57 assertions, with both strict TypeScript checks passing. The inspector is deployed separately; full hosted fix-PR acceptance is pending.
+
+## Hosted courier transport (October 20)
+
+OMG has no registered dedicated courier runner. Use GitHub-hosted `ubuntu-24.04` only for the immutable-controller courier and separate publisher jobs; source builds and regression verification remain in Cloudflare Sandbox. [GitHub documents each standard hosted runner as a new VM](https://docs.github.com/en/actions/concepts/runners/github-hosted-runners). Each job downloads Bun 1.4.2 and checks the frozen binary SHA/revision, then writes private, job-local OMG service configurations from three separate OMG secrets. No CodeLoud credential is reused. Both workflows remain manual-only. The publisher defaults to preview; actual publication requires its explicit dispatch flag plus either a dedicated OMG publisher token or explicit confirmation of repository GITHUB_TOKEN PR creation policy. [GitHub documents least-privilege GITHUB_TOKEN permissions and separate App/token credentials for additional permissions](https://docs.github.com/en/actions/tutorials/authenticate-with-github_token). Hosted acceptance and repository policy remain runtime gates; source checks do not establish them.
+
+## Final pass update
+
+The CodeLoud owner advanced to clean commit `ed8cd06cda8cf65118f03718e50442f6d4cdda5a` during this implementation. Its additional Sandbox startup/disconnect fix is copied byte-for-byte with `rpc-start-lifecycle.test.mjs`. The actual package patch SHA-256 is `0c6d6a6b4b9a449c5486162f96017851baf492391d6ce0aedc0766470b5daa2a`. The earlier f437 patch is historical, SHA-256 `27b6eb20719ca732cc252f1577b5c824df80d9a9c5c88cb7f3dea24502acfbe6`. Do not conflate current working files with an immutable Git blob. The 10 actual SDK lifecycle tests and the seven-mode actual Workerd/R2 log regression pass locally, 11 tests and 53 assertions. Full hosted acceptance remains a separate gate.
+
+The final review found and repaired an actual report-hash mismatch and missing independent raw-regression retrieval. The verifier hashes the actual stored report bytes without embedding a self-referential hash; the publisher re-reads both raw objects. Missing, duplicate or forged reports fail admission. These are OMG adapter corrections, not claims that CodeLoud had hosted repair acceptance.
+
+The image adds cargo-nextest 0.9.148 using the official musl release archive and its SHA-256 `bf92cb81450872d960ffa13857a83084d557ec0cdc141663d263bb23ef756f97`. [Nextest installation](https://nexte.st/docs/installation/pre-built-binaries/) was read to select the supported static binary instead of compiling an extra installer. The [official release](https://github.com/nextest-rs/nextest/releases/tag/cargo-nextest-0.9.148) supplies its exact artifact identity. Rust's AMD64 base is pinned to `sha256:6f9e63259f12e1e599296f5ecfed2bae46de4af0ee0525dd8b89c046e236d5c5`, verified through the actual registry manifest.
+
+The Windows D: drive is not mounted in the build distro. A bounded tar context is passed through stdin rather than adding mounts or copying the entire checkout. [Docker build contexts](https://docs.docker.com/build/concepts/context/#local-tarballs) documents this input. The first local image build passed actual trusted imports and UID 10001 Rust compiler access. It is an intermediate image, not an admitted hosted executor.
+
+OMG-only resources now exist: Artifacts `omg-ci/omg` and R2 `omg-ci-private`. R2 readback shows public r2.dev disabled, no custom domains, 7-day cache/backups, 30-day reports/logs/diagnostics, 90-day requests/receipts/reviews and one-day incomplete multipart retirement. These reproduce the handoff's actual lifecycle configuration. The implementation uses an R2 binding fallback first; it does not reuse CodeLoud signing credentials. Three independent OMG service tokens are generated in owner-only storage, with no values in source or receipts.
+
+Local Rust proof profiles record `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`, `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_TEST_DEBUG=0`. These affect this portable executor's generated output; existing coverage/release/native acceptance configuration is unchanged.
+
+## OMG execution checkpoint at 22:45 UTC
+
+The OMG executor image is published and its raw registry manifest SHA-256 was independently recomputed as `sha256:7d7c8bc89570da1e1234a3596758db6d3d046ba969eccc56ea1e9937166f47a3`. It was built from committed verifier source `2d4a40a4590111fd6b7c9c94bd0ff80479959a2a`; the config digest is a different value and is not used as the manifest pin.
+
+A real bounded Docker component run with Rust 1.95.0 produced baseline exit 101 at the unchanged literal assertion and patched exit 0. UID 10001 could write build output but received EACCES for the tracked audit ledger and its parent. Exact Git source identity worked with root-owned metadata. Container writable growth peaked at 1,658,880 bytes; the owned container terminated and was retired. This is a component control, not a real OMG bug fix, hosted acceptance or additional audited product-test credit.
+
+Current local suites pass 230 unique pipeline tests: Cloud CI 79 (400 assertions), inspector 26 (57), coder 29 (69), and courier/publisher 96 (32 Bun expectations plus Node assertions). Repeated runs do not increase that count.
+
+All three OMG Workers are deployed separately. After secret installation the verifier version is `6d289028-e20a-4a9c-9df8-d71b3ae2338b`, coder version `cc953725-5a6f-44f6-bed7-9475dee3b904`, and inspector version `f88ad40b-a903-4432-80d4-83337987731c`. The container application is `a03f931a-ff51-44cb-b808-de83537d368f`, bound only to OMG's sandbox namespace. Readback confirms the exact image, standard-4 resources and no reported health errors; no hosted workload has been admitted. Verifier unauthenticated requests return 401 and authenticated health returns 200. The coder rejects unauthenticated requests; it has no health route, so an authenticated health request returns 404 rather than proving model execution.
+
+CodeLoud reference run `39504470869`, attempt 1 at f437, subsequently ended in failure during receipt admission. Its GitHub log reports `running` then `errored`, and its artifact listing is empty. Subsequent read-only Cloudflare instance detail identifies `chromium-browser-channels` exit 1; dependencies, formatting, Linux symlinks, builds, portable unit behavior, source static, subscription service and their evidence-preservation steps succeeded. The truncated browser diagnostic does not identify the underlying assertion or process cause. The handoff's private JUnit byte claim was not independently retrieved here. The successful hosted portable-unit and preservation steps support the earlier large-log correction; the later lifecycle patch still has local regression evidence only. Full hosted reference acceptance remains unproven. No CodeLoud resource, credential or deployment was changed.

@@ -1,0 +1,11 @@
+# Cloud Rust execution adapter
+
+The adapter uses the same trusted-source/proposal and report envelope as the CodeLoud pipeline. The execution extension is fixed: `cargo test --test <designated file stem> --no-run --message-format=json --no-default-features --features pgp,license --locked --offline`, compiler-discovered artifact, SHA-256 before/after, one-entry executable catalog, one exact libtest case. The baseline must exit 101 at an actual `assert!`, `assert_eq!` or `assert_ne!` source line in the new designated regression; the patched case must exit 0. An ignored/empty/wrong-name/compile/setup/timeout/nonassertion failure is refused.
+
+Regression files use `tests/ai-review-<finding16>-<base12>.rs`, contain one named nonignored test, and may use the existing public `omg_lib` API. Production changes are restricted to existing `src/**/*.rs` files with unchanged conditional attributes and preserved existing test tails. Cargo changes and existing-test strengthening remain held; strengthening needs explicit old-intact/old-fault/strong-fault/strong-intact evidence before admission.
+
+`services/cloud-ci/test/rust-evidence.test.mjs` tests Cargo discovery, strict libtest results, source-bound panic evidence, modern Rust numeric thread IDs and a real write/read of the exact raw-report bytes/hash. Other contract/application tests exercise proposal identity, immutable test/source and returned evidence. These local checks do not compile Rust or establish hosted runtime acceptance.
+
+Portable production checks reuse `scripts/run-native-contracts.py` separately for `pgp,license` and `debian-pure`, preserving the existing exact listing/JUnit/contracts/skip-debt policy. Native distro, privileged, transaction, release and QEMU gates remain in their existing workflows. The portable cloud lane does not replace them.
+
+Run local adapter checks with `bun test services/cloud-ci/test/rust-evidence.test.mjs services/cloud-ci/test/verification-contract.test.ts services/cloud-ci/test/verification-apply.test.ts services/cloud-ci/test/plan.test.ts services/cloud-ci/test/portable-process.test.ts` and the service's `bun run check`. No Rust build was run while implementing this adapter. A pinned image build plus an actual baseline assertion RED / patched GREEN smoke remains required before deployment/publication.

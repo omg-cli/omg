@@ -1,0 +1,212 @@
+name: AI source review
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Trusted branch to review at its current exact head
+        type: choice
+        options: [main]
+        default: main
+        required: true
+      publish:
+        description: Publish unconfirmed findings with verified fix PRs for human review
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omg-ai-review-global
+  cancel-in-progress: false
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+  CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+
+jobs:
+  review:
+    if: >-
+      github.repository == 'omg-cli/omg' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.branch == 'main' && github.ref_name == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    outputs:
+      controller-sha: ${{ steps.review.outputs.controller-sha }}
+      publish: ${{ steps.review.outputs.publish }}
+      verified: ${{ steps.review.outputs.verified }}
+    steps:
+      - name: Validate immutable review controller
+        env:
+          CONTROLLER_SHA: ${{ vars.OMG_CI_CONTROLLER_SHA }}
+        shell: bash
+        run: '[[ "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]'
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ vars.OMG_CI_CONTROLLER_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify trusted controller Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          mkdir -m 700 -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          directory="$tools/bun-linux-x64"
+          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - name: Create private OMG service configuration
+        env:
+          OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
+          OMG_CI_INSPECTOR_TOKEN: ${{ secrets.OMG_CI_INSPECTOR_TOKEN }}
+          OMG_CI_CODER_TOKEN: ${{ secrets.OMG_CI_CODER_TOKEN }}
+          OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
+          OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+          OMG_CI_CODER_SKILL_BUNDLE_SHA256: ${{ vars.OMG_CI_CODER_SKILL_BUNDLE_SHA256 }}
+        run: |
+          bun run - <<'JS'
+          import { mkdirSync, writeFileSync } from "node:fs";
+          import { homedir } from "node:os";
+          import path from "node:path";
+          const root = path.join(homedir(), "ci");
+          const services = [
+            ["omg-cloud-ci", "OMG_CI_API_TOKEN", "https://omg-cloud-ci.latham.workers.dev/"],
+            ["omg-ci-inspector", "OMG_CI_INSPECTOR_TOKEN", "https://omg-ci-inspector.latham.workers.dev/"],
+            ["omg-ci-coder", "OMG_CI_CODER_TOKEN", "https://omg-ci-coder.latham.workers.dev/"],
+          ];
+          const { OMG_CI_IMAGE_DIGEST: imageDigest, OMG_CI_VERIFIER_REVISION: verifierRevision,
+            OMG_CI_CODER_SKILL_BUNDLE_SHA256: bundleSha256 } = process.env;
+          if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest ?? "") ||
+              !/^[a-f0-9]{40}$/.test(verifierRevision ?? "") ||
+              !/^[a-f0-9]{64}$/.test(bundleSha256 ?? "")) throw new Error("Missing immutable OMG deployment pins");
+          for (const [, variable] of services)
+            if (!/^[^\s]{32,512}$/.test(process.env[variable] ?? "")) throw new Error(`Missing dedicated OMG credential: ${variable}`);
+          mkdirSync(root, { mode: 0o700 });
+          for (const [name, variable, endpoint] of services) {
+            const tokenFile = path.join(root, `${name}.token`);
+            writeFileSync(tokenFile, process.env[variable], { mode: 0o600, flag: "wx" });
+            writeFileSync(path.join(root, `${name}.json`), JSON.stringify({ endpoint, tokenFile,
+              ...(name === "omg-cloud-ci" ? { imageDigest, verifierRevision } : {}),
+              ...(name === "omg-ci-coder" ? { bundleSha256 } : {}),
+            }), { mode: 0o600, flag: "wx" });
+          }
+          JS
+      - name: Install trusted controller dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install trusted review schema dependencies
+        run: bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+      - name: Install trusted coding schema dependencies
+        run: bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
+      - name: Collect, review and independently verify exact source
+        id: review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/ai-review-flow.mjs collect .audit/ai-review
+
+      - name: Remove private OMG service configuration
+        if: always()
+        shell: bash
+        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json"
+
+  publish:
+    needs: review
+    if: github.event_name == 'workflow_dispatch' && needs.review.result == 'success' && needs.review.outputs.verified != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.review.outputs.controller-sha }}
+          persist-credentials: false
+      - name: Verify trusted controller Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          mkdir -m 700 -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          directory="$tools/bun-linux-x64"
+          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - name: Create private OMG service configuration
+        env:
+          OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
+          OMG_CI_INSPECTOR_TOKEN: ${{ secrets.OMG_CI_INSPECTOR_TOKEN }}
+          OMG_CI_CODER_TOKEN: ${{ secrets.OMG_CI_CODER_TOKEN }}
+          OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
+          OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+          OMG_CI_CODER_SKILL_BUNDLE_SHA256: ${{ vars.OMG_CI_CODER_SKILL_BUNDLE_SHA256 }}
+        run: |
+          bun run - <<'JS'
+          import { mkdirSync, writeFileSync } from "node:fs";
+          import { homedir } from "node:os";
+          import path from "node:path";
+          const root = path.join(homedir(), "ci");
+          const services = [
+            ["omg-cloud-ci", "OMG_CI_API_TOKEN", "https://omg-cloud-ci.latham.workers.dev/"],
+            ["omg-ci-inspector", "OMG_CI_INSPECTOR_TOKEN", "https://omg-ci-inspector.latham.workers.dev/"],
+            ["omg-ci-coder", "OMG_CI_CODER_TOKEN", "https://omg-ci-coder.latham.workers.dev/"],
+          ];
+          const { OMG_CI_IMAGE_DIGEST: imageDigest, OMG_CI_VERIFIER_REVISION: verifierRevision,
+            OMG_CI_CODER_SKILL_BUNDLE_SHA256: bundleSha256 } = process.env;
+          if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest ?? "") ||
+              !/^[a-f0-9]{40}$/.test(verifierRevision ?? "") ||
+              !/^[a-f0-9]{64}$/.test(bundleSha256 ?? "")) throw new Error("Missing immutable OMG deployment pins");
+          for (const [, variable] of services)
+            if (!/^[^\s]{32,512}$/.test(process.env[variable] ?? "")) throw new Error(`Missing dedicated OMG credential: ${variable}`);
+          mkdirSync(root, { mode: 0o700 });
+          for (const [name, variable, endpoint] of services) {
+            const tokenFile = path.join(root, `${name}.token`);
+            writeFileSync(tokenFile, process.env[variable], { mode: 0o600, flag: "wx" });
+            writeFileSync(path.join(root, `${name}.json`), JSON.stringify({ endpoint, tokenFile,
+              ...(name === "omg-cloud-ci" ? { imageDigest, verifierRevision } : {}),
+              ...(name === "omg-ci-coder" ? { bundleSha256 } : {}),
+            }), { mode: 0o600, flag: "wx" });
+          }
+          JS
+      - name: Install trusted controller dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install trusted review schema dependencies
+        run: bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+      - name: Install trusted coding schema dependencies
+        run: bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
+      - name: Re-fetch server proof and preview publication
+        if: needs.review.outputs.publish != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/ai-review-flow.mjs publish .audit/ai-review
+      - name: Require explicit GitHub publication credentials policy
+        if: needs.review.outputs.publish == 'true'
+        env:
+          PUBLISHER_TOKEN: ${{ secrets.OMG_CI_PUBLISHER_TOKEN }}
+          TOKEN_PR_CREATION_ENABLED: ${{ vars.OMG_CI_GITHUB_TOKEN_PR_CREATION_ENABLED }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$PUBLISHER_TOKEN" ] && [ "$TOKEN_PR_CREATION_ENABLED" != true ]; then
+            echo 'Publication blocked: configure a dedicated OMG publisher token or explicitly enable GitHub Actions PR creation and its required approval policy.' >&2
+            exit 1
+          fi
+      - name: Re-fetch server proof and publish issues with verified fix PRs
+        if: needs.review.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.OMG_CI_PUBLISHER_TOKEN || github.token }}
+        run: bun scripts/ai-review-flow.mjs publish .audit/ai-review --publish
+      - name: Remove private OMG service configuration
+        if: always()
+        shell: bash
+        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json"

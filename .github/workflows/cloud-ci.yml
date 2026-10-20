@@ -1,0 +1,148 @@
+name: Cloudflare verification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+  CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+
+jobs:
+  portable:
+    name: Cloudflare portable checks
+    if: >-
+      github.repository == 'omg-cli/omg' && github.ref_name == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CONTROLLER_SHA: ${{ vars.OMG_CI_CONTROLLER_SHA }}
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.ref_name }}
+      SOURCE_BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha || '' }}
+    steps:
+      - name: Validate immutable controller and candidate identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CANDIDATE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          if [ -n "$SOURCE_BASE_SHA" ]; then [[ "$SOURCE_BASE_SHA" =~ ^[a-f0-9]{40}$ ]]; fi
+          case "$TARGET_BRANCH" in main) ;; *) exit 1 ;; esac
+          printf 'RECEIPT_FILE=%s/omg-cloud-ci-%s-%s.json\n' "$RUNNER_TEMP" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ vars.OMG_CI_CONTROLLER_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify trusted checkout and dedicated Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CONTROLLER_SHA"
+          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          mkdir -m 700 -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          directory="$tools/bun-linux-x64"
+          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - name: Fetch candidate Git objects without checking out candidate files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "$CANDIDATE_SHA^{commit}" 2>/dev/null; then
+            credential="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $credential" \
+              git fetch --no-tags origin "$CANDIDATE_SHA"
+          fi
+          git cat-file -e "$CANDIDATE_SHA^{commit}"
+      - name: Create private OMG service configuration
+        env:
+          OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
+          OMG_CI_INSPECTOR_TOKEN: ${{ secrets.OMG_CI_INSPECTOR_TOKEN }}
+          OMG_CI_CODER_TOKEN: ${{ secrets.OMG_CI_CODER_TOKEN }}
+          OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
+          OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+          OMG_CI_CODER_SKILL_BUNDLE_SHA256: ${{ vars.OMG_CI_CODER_SKILL_BUNDLE_SHA256 }}
+        run: |
+          bun run - <<'JS'
+          import { mkdirSync, writeFileSync } from "node:fs";
+          import { homedir } from "node:os";
+          import path from "node:path";
+          const root = path.join(homedir(), "ci");
+          const services = [
+            ["omg-cloud-ci", "OMG_CI_API_TOKEN", "https://omg-cloud-ci.latham.workers.dev/"],
+            ["omg-ci-inspector", "OMG_CI_INSPECTOR_TOKEN", "https://omg-ci-inspector.latham.workers.dev/"],
+            ["omg-ci-coder", "OMG_CI_CODER_TOKEN", "https://omg-ci-coder.latham.workers.dev/"],
+          ];
+          const { OMG_CI_IMAGE_DIGEST: imageDigest, OMG_CI_VERIFIER_REVISION: verifierRevision,
+            OMG_CI_CODER_SKILL_BUNDLE_SHA256: bundleSha256 } = process.env;
+          if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest ?? "") ||
+              !/^[a-f0-9]{40}$/.test(verifierRevision ?? "") ||
+              !/^[a-f0-9]{64}$/.test(bundleSha256 ?? "")) throw new Error("Missing immutable OMG deployment pins");
+          for (const [, variable] of services)
+            if (!/^[^\s]{32,512}$/.test(process.env[variable] ?? "")) throw new Error(`Missing dedicated OMG credential: ${variable}`);
+          mkdirSync(root, { mode: 0o700 });
+          for (const [name, variable, endpoint] of services) {
+            const tokenFile = path.join(root, `${name}.token`);
+            writeFileSync(tokenFile, process.env[variable], { mode: 0o600, flag: "wx" });
+            writeFileSync(path.join(root, `${name}.json`), JSON.stringify({ endpoint, tokenFile,
+              ...(name === "omg-cloud-ci" ? { imageDigest, verifierRevision } : {}),
+              ...(name === "omg-ci-coder" ? { bundleSha256 } : {}),
+            }), { mode: 0o600, flag: "wx" });
+          }
+          JS
+      - name: Install immutable controller dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Mirror exact candidate Git objects
+        run: bun scripts/cloud-ci-mirror.mjs "$CANDIDATE_SHA"
+      - name: Run isolated Cloudflare checks and admit exact-run receipt
+        id: cloud
+        run: bun scripts/run-cloud-ci.mjs "$CANDIDATE_SHA" "$TARGET_BRANCH" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RECEIPT_FILE"
+      - name: Report admitted Cloudflare result
+        if: always()
+        env:
+          CLOUD_OUTCOME: ${{ steps.cloud.outcome }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$CLOUD_OUTCOME" != success ]; then
+            printf 'Cloudflare verification did not produce an admitted passing receipt. See the failed step.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          bun run - <<'JS'
+          import { appendFileSync, readFileSync } from "node:fs";
+          const receipt = JSON.parse(readFileSync(process.env.RECEIPT_FILE, "utf8"));
+          const lines = [
+            `Cloudflare verified commit: ${receipt.sha}`,
+            `Run: ${receipt.runId}; attempt: ${receipt.attempt}`,
+            `Image: ${receipt.imageDigest}`,
+            "",
+            "| Check | Exit code |",
+            "| --- | --- |",
+            ...receipt.checks.map((check) => `| ${check.name} | ${check.exitCode} |`),
+            "",
+            "Existing native and QEMU checks remain required. This portable receipt does not replace them.",
+          ];
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          JS
+      - name: Remove local receipt copy
+        if: always()
+        shell: bash
+        run: 'if [ -n "${RECEIPT_FILE:-}" ]; then rm -f -- "$RECEIPT_FILE"; fi'
+      - name: Remove private OMG service configuration
+        if: always()
+        shell: bash
+        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json"

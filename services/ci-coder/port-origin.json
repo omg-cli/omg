@@ -1,0 +1,45 @@
+{
+  "repository": "CodeLoud/codeloud-desktop",
+  "commit": "f4371c4ccacbf5fe7ab6e5c776bd9151c9a6850c",
+  "scope": "services/ci-coder",
+  "originals": {
+    "README.md": "7c0e3400f0a6c5e3f8c7b6b90c2d25ca8fe29328cb9c7b7b704bb59fc9afcce2",
+    "bun.lock": "4dad19ccf697b4f27bd9b7c256e5038acbc1618d144262322efb9fff4fd9cf2c",
+    "package.json": "2bca76f65a3024334459ff406ab7d2ec8eadc5485c9e8efe6ed9f18662f73cdd",
+    "runtime.d.ts": "49368ae524182e6da183793b48dbb65e301c55e219d3b5a845f06d2c90080317",
+    "skills/bundle.json": "a181a1e797e8183fbac31d484ac7eba4833bf29b527f2cd0d5bc1a57d0f90f60",
+    "skills/manifest.json": "9fd560e8840e834eca8ecd6687ac22ff7ad6c325fb83f48191cb5ff5f4d0623e",
+    "skills/workerd/ADAPTER.md": "01ec94ec9dc5817bc2acd37d536b61016d03d7bd6c154682ae7b5b0eabb1ec06",
+    "src/env.ts": "58fa707332f48072722a714a5bc5a151329cbe711235bd409c1b0f2412b9b05e",
+    "src/harness.ts": "82e7091ec4da56c7532003a66f0c60072f9b8b214df606875c759ac73beb7904",
+    "src/index.ts": "81b4075e32151125972a140ec160cd66330897ce61923f388599006225e312bf",
+    "src/proposal.ts": "05b31b52e9d44bf145f7e41fd4b05a6efa2b2f13f68b8f15c9025d96fce22789",
+    "src/request.ts": "3fbc70f152f033bb2f4ae6d8a6f63898d9f361167ea421cbac27d7b4dfd81b17",
+    "src/runtime.ts": "cc5fd1010b09b7f980e6b36c6553608994694b74e099db605fa37a4237411f45",
+    "src/skills.ts": "3d63b66805550b6ed2ff6a2cdb22200773c99e7c9c47f54749f39d85bd779931",
+    "src/tools.ts": "b431bf8baca11e55a8d70ee29fe3d4071b9b7445ac01434dbb710b263fa89160",
+    "test/api.test.ts": "da4ec3873d3e0d0839e444493b8e108af6fe0025ea551dbe8a82c5311ed2e8e4",
+    "test/harness-runtime.mjs": "c3478e2477e58306e28c30c01579c0dd3949d8af0553ae54d0969bbb1fd1a76e",
+    "test/harness.test.ts": "117d9e1450e0298915e83e3d67b8864f484f62b475becbea5972b5b251714208",
+    "test/proposal.test.ts": "d49d457e37e24c0335e5aa358de9e741193cf1165662eb370ec0fb6601c6faa1",
+    "test/skills.test.ts": "de3fa55a1cbfe4ccebaf29556017e14b8999648894f708b24a5fec221ab7270b",
+    "test/tools.test.ts": "758121d374b7a7ca044b6da925b361b1aeecabe7e0855c37d4c24b7ccdb71f72",
+    "test/tsconfig.json": "586304ab91248aedd739bf50248fabc60c1830920bfc7ca95b0ebb3fb2b110f5",
+    "tsconfig.json": "1c0992484f94058e0396408322b94bd944adae98bed174db626e739a60ccffb4",
+    "tsconfig.test.json": "44f117fca44585c3f778ed5f5c1c09528fd4a2ab7957d13b3d7d7dd1d68ce66b",
+    "wrangler.jsonc": "d0d2b52d3390f2d3b68972f97c1c70ef9fbd3948e3cf91ee4a674ac1c8171c52"
+  },
+  "adaptations": [
+    "omg-cli/omg main-only repository admission",
+    "OMG Worker/service/courier names; original cl- protocol retained",
+    "Rust source and designated regression fixtures",
+    "Rust1.1.2 and TDD6.4.2 primary skills with original hashed references",
+    "Separate actual OMG verifier image/revision pins required; no CodeLoud deployment pins copied"
+  ],
+  "unchanged_boundaries": [
+    "OpenCodeHarness Durable Object lifecycle",
+    "Source read and tool budgets",
+    "Independent verification receipts/object hash admission",
+    "No GitHub credentials or publication mutations in coding tools"
+  ]
+}

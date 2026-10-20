@@ -1,0 +1,188 @@
+import assert from "node:assert/strict";
+import { test } from "bun:test";
+import { admitCoderResult } from "../../scripts/ai-coder-client.mjs";
+import { proposalDigest } from "../../scripts/ai-review-publication.mjs";
+import { operationIdentity } from "../../services/ci-coder/src/request.ts";
+
+function fixture() {
+    const request = {
+        repository: "omg-cli/omg",
+        sha: "a".repeat(40),
+        branch: "main",
+        runId: "42",
+        attempt: "1",
+        source: {
+            repository: "omg-cli/omg",
+            sha: "a".repeat(40),
+            branch: "main",
+            changedPaths: ["src/value.rs"],
+            diff: "value",
+            ciFailures: [],
+            sourceFiles: [
+                {
+                    path: "src/value.rs",
+                    content: "pub const value: usize = 1;\n",
+                    blobSha: "e".repeat(40),
+                },
+            ],
+        },
+    };
+
+    const policy = {
+        bundleSha256: "b".repeat(64),
+        imageDigest: `sha256:${"c".repeat(64)}`,
+        verifierRevision: "d".repeat(40),
+    };
+
+    const proposal = {
+        repository: request.repository,
+        baseSha: request.sha,
+        branch: request.branch,
+        changes: [],
+    };
+
+    const digest = proposalDigest(proposal);
+
+    const response = {
+        ...request,
+        id: operationIdentity(request),
+        status: "done",
+        runtime: {
+            ...policy,
+            model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
+            reasoningEffort: "high",
+        },
+        skillsDelivery: { bundleSha256: policy.bundleSha256, sessionId: "session-1" },
+        result: {
+            calls: 4,
+            reads: [{ path: "src/value.rs", start: 1, end: 1 }],
+            sessionId: "session-1",
+            skillBundleSha256: policy.bundleSha256,
+            proposal: {
+                proposal,
+                regression: { path: "tests/ci-review-a-1.rs", testName: "value" },
+                proposalSha256: digest,
+            },
+            verification: {
+                proposalSha256: digest,
+                id: `cl-42-1-${request.sha}-v-${digest.slice(0, 16)}`,
+                receipt: {},
+            },
+        },
+    };
+
+    const id = operationIdentity(request);
+    const continuationId = `cv-${request.runId}-${request.attempt}-${request.sha}-${digest.slice(0, 16)}`;
+    response.initialOperation = { operationId: id, status: "done" };
+    response.continuation = {
+        operationId: continuationId,
+        parentOperationId: id,
+        sessionId: "session-1",
+        proposalSha256: digest,
+        verificationId: response.result.verification.id,
+        status: "done",
+    };
+    response.result.verificationJob = {
+        id: response.result.verification.id,
+        proposalSha256: digest,
+        sessionId: "session-1",
+        continuationId,
+        status: "verified",
+        deadline: 1,
+    };
+
+    return { request, policy, response };
+}
+
+test("coding admission binds exact server skill delivery, runtime, source and verified proposal", () => {
+    const { request, policy, response } = fixture();
+    assert.equal(
+        admitCoderResult(response, request, policy).proposalSha256,
+        response.result.proposal.proposalSha256,
+    );
+
+    for (const mutate of [
+        (value) => {
+            value.skillsDelivery = undefined;
+        },
+        (value) => {
+            value.result.sessionId = "different-session";
+        },
+        (value) => {
+            value.runtime.bundleSha256 = "e".repeat(64);
+        },
+        (value) => {
+            value.runtime.model = "unapproved";
+        },
+        (value) => {
+            value.result.verification.proposalSha256 = "f".repeat(64);
+        },
+        (value) => {
+            value.result.proposal.proposal.changes.push({ path: "changed" });
+        },
+        (value) => {
+            value.sha = "f".repeat(40);
+        },
+        (value) => {
+            value.result.reads = [];
+        },
+        (value) => {
+            value.result.calls = 97;
+        },
+    ]) {
+        const changed = structuredClone(response);
+        mutate(changed);
+        assert.throws(() => admitCoderResult(changed, request, policy));
+    }
+});
+
+test("coding proposals require the actual completed continuation of the verified original session", () => {
+    const { request, policy, response } = fixture();
+    for (const change of [
+        (value) => {
+            delete value.continuation;
+        },
+        (value) => {
+            value.continuation.status = "unanswered";
+        },
+        (value) => {
+            value.continuation.operationId = value.id;
+        },
+        (value) => {
+            value.continuation.parentOperationId = "other";
+        },
+        (value) => {
+            value.continuation.sessionId = "other";
+        },
+        (value) => {
+            value.continuation.proposalSha256 = "0".repeat(64);
+        },
+        (value) => {
+            value.continuation.verificationId = "other";
+        },
+        (value) => {
+            value.initialOperation.status = "running";
+        },
+        (value) => {
+            value.initialOperation.operationId = "other";
+        },
+        (value) => {
+            value.result.verificationJob.status = "pending";
+        },
+        (value) => {
+            value.result.verificationJob.continuationId = "other";
+        },
+        (value) => {
+            value.result.verificationJob.sessionId = "other";
+        },
+    ]) {
+        const changed = structuredClone(response);
+        change(changed);
+        assert.throws(() => admitCoderResult(changed, request, policy));
+    }
+    const noFinding = structuredClone(response);
+    delete noFinding.result.proposal;
+    delete noFinding.result.verificationJob;
+    delete noFinding.continuation;
+    assert.equal(admitCoderResult(noFinding, request, policy), null);
+});

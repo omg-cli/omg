@@ -1,0 +1,18 @@
+{
+  "name": "omg-ci-coder",
+  "account_id": "f1e95b3e1b502cf366dfc81a863695fa",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI", "remote": true },
+  "durable_objects": {
+    "bindings": [{ "name": "CODER", "class_name": "Coder" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Coder"] }],
+  "services": [{ "binding": "CI_SERVICE", "service": "omg-cloud-ci" }],
+  "vars": {
+    "CI_IMAGE_DIGEST": "sha256:7d7c8bc89570da1e1234a3596758db6d3d046ba969eccc56ea1e9937166f47a3",
+    "CI_VERIFIER_REVISION": "2d4a40a4590111fd6b7c9c94bd0ff80479959a2a"
+  },
+  "observability": { "enabled": false },
+}
