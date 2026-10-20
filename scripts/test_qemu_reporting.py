@@ -1,4 +1,5 @@
 import copy
+from test_ci_gates import job_block
 import base64
 from contextlib import nullcontext
 import hashlib
@@ -1695,13 +1696,25 @@ class ReportingBoundaryTests(unittest.TestCase):
 
     def test_privileged_report_job_excludes_pull_request_runs(self):
         text = (ROOT / ".github/workflows/qemu-report.yml").read_text()
-        self.assertIn("    branches: [main]", text)
-        self.assertIn("if: github.event.workflow_run.head_branch == 'main'", text)
-        self.assertIn("github.event.workflow_run.event != 'pull_request'", text)
+        trigger = text.split("\njobs:", 1)[0]
+        trigger = "\n".join(line for line in trigger.splitlines() if not line.lstrip().startswith("#"))
+        branches = [line.partition(":")[2].partition("#")[0].strip()
+                    for line in trigger.splitlines() if line.startswith("    branches: ")]
+        self.assertEqual(branches, ["[main]"])
+        report = job_block(text, "report")
+        condition = next(line.partition(":")[2].partition("#")[0].strip()
+                         for line in report.splitlines() if line.startswith("    if: "))
+        self.assertTrue(condition.startswith("github.event.workflow_run.head_branch == 'main'"), condition)
+        self.assertIn("github.event.workflow_run.event != 'pull_request'", condition)
 
     def test_reporter_checks_out_default_sha_and_never_executes_artifacts(self):
         text = (ROOT / ".github/workflows/qemu-report.yml").read_text()
-        self.assertIn("ref: ${{ github.sha }}", text)
+        report = job_block(text, "report")
+        checkout = report.split("      - name: Check out trusted default-branch reporter\n", 1)[1]
+        checkout = checkout.split("\n      - name:", 1)[0]
+        refs = [line.partition(":")[2].partition("#")[0].strip()
+                for line in checkout.splitlines() if line.startswith("          ref:")]
+        self.assertEqual(refs, ["${{ github.sha }}"])
         self.assertNotIn("workflow_run.head_sha", text)
         self.assertNotIn("download-artifact", text)
         source = (ROOT / "scripts/report-qemu-workflow.py").read_text()

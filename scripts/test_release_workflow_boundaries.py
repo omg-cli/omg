@@ -193,6 +193,42 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             self.assertNotIn("dsn='${{", block)
             self.assertIn('ci-smoke-report.py status', block)
             self.assertIn('JOB_STATUS: ${{ job.status }}', block)
+
+            import json
+            import sys
+            script = step_script(block, 'Preserve setup failure and surface reporting')
+            distro = 'arch' if job == 'smoke' else 'macos'
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'scripts').mkdir()
+                command = root / 'scripts/ci-smoke-report.py'
+                command.write_text(
+                    'import importlib.util, os, subprocess, sys\n'
+                    'from unittest.mock import patch\n'
+                    'spec = importlib.util.spec_from_file_location("report", os.environ["REPORT_HELPER"])\n'
+                    'report = importlib.util.module_from_spec(spec)\n'
+                    'spec.loader.exec_module(report)\n'
+                    'with patch.object(report.subprocess, "run", return_value=subprocess.CompletedProcess([], 23, "local sender rejected", "")):\n'
+                    '    sys.exit(report.main())\n', encoding='utf-8', newline='\n')
+                env = dict(os.environ, JOB_STATUS='failure', DISTRO=distro,
+                           GITHUB_RUN_ID='123', GITHUB_RUN_ATTEMPT='1',
+                           REPORT_HELPER=(ROOT / 'scripts/ci-smoke-report.py').as_posix(),
+                           TEST_PYTHON=Path(sys.executable).as_posix())
+                result = subprocess.run(
+                    [BASH, '-c', 'python3() { "$TEST_PYTHON" "$@"; }\n' + script],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                evidence = root / ('release-smoke-evidence' if job == 'smoke'
+                                   else 'release-smoke-evidence-macos') / 'run-123-1'
+                self.assertTrue((evidence / 'results.json').is_file(), result.stdout + result.stderr)
+                self.assertEqual(json.loads((evidence / 'results.json').read_text()), [{
+                    'case_id': f'smoke-{distro}-setup', 'distro': distro,
+                    'result': 'HARNESS_ERROR', 'exit_code': 1, 'elapsed_seconds': 0,
+                }])
+                self.assertEqual(json.loads((evidence / 'reporting-status.json').read_text()),
+                                 {'exit_code': 23})
+                self.assertIn('local sender rejected', (evidence / 'reporting.log').read_text())
+
         self.assertNotIn('merge-multiple: true', job_block(text, 'file-issues'))
 
     def test_pull_requests_never_configure_sentry_credentials(self):
@@ -224,6 +260,10 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             visited = (root / 'visited').read_text().splitlines() if (root / 'visited').exists() else []
             self.assertEqual(len(visited), 2)
             self.assertEqual(len(set(visited)), 2)
+            self.assertEqual(set(visited), {
+                'evidence/release-smoke-arch/same-run/results.json',
+                'evidence/release-smoke-macos/same-run/results.json',
+            })
 
     def test_release_path_and_exact_commit_benchmark_availability(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
@@ -265,6 +305,11 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
                 result = subprocess.run([BASH, '-c', fake + script], cwd=root, env=env, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((root / 'telemetry').exists(), expected)
+                if expected:
+                    self.assertEqual((root / 'telemetry').read_text().splitlines(), [
+                        'scripts/ci-smoke-report.py status --distro arch --case-id smoke-arch-setup '
+                        '--status failure --evidence-dir release-smoke-evidence/run-123-1',
+                    ])
 
 
 if __name__ == '__main__':

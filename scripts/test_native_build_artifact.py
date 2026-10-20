@@ -568,6 +568,10 @@ class NativeBuildAdmission(unittest.TestCase):
                    status='completed', conclusion='failure')
         BUILD.validate_producer_run(run, expected)
 
+        malformed = dict(run, run_started_at='not-a-timestamp')
+        with self.assertRaisesRegex(ValueError, '^invalid producer timestamp$'):
+            BUILD.validate_producer_run(malformed, expected)
+
     def test_packager_proves_build_invocation_and_exact_pair_before_admission(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -681,6 +685,21 @@ class NativeBuildAdmission(unittest.TestCase):
             data = bundle(provenance, payload)
             with self.subTest(kind=kind), self.assertRaises(ValueError):
                 BUILD.validate_bundle(data, 'sha256:' + hashlib.sha256(data).hexdigest(), expected)
+
+        expected, provenance, safe_payload = fixture()
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=io.BytesIO(safe_payload), mode='r:gz') as safe, \
+                tarfile.open(fileobj=buffer, mode='w:gz') as output:
+            for member in safe:
+                output.addfile(member, safe.extractfile(member))
+            foreign = tarfile.TarInfo('../escape')
+            foreign.size = len(b'foreign')
+            output.addfile(foreign, io.BytesIO(b'foreign'))
+        payload = buffer.getvalue()
+        provenance['archive_sha256'] = hashlib.sha256(payload).hexdigest()
+        data = bundle(provenance, payload)
+        with self.assertRaises(ValueError):
+            BUILD.validate_bundle(data, 'sha256:' + hashlib.sha256(data).hexdigest(), expected)
 
 
 if __name__ == '__main__':
