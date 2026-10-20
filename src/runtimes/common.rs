@@ -2291,8 +2291,11 @@ mod tests {
                         .is_some_and(|name| name.to_string_lossy().starts_with(".download-"))
                 })
                 .expect("owned partial download exists before body progress");
-            while fs::metadata(&partial)?.len() == 0 {
+            loop {
                 tokio::task::yield_now().await;
+                if fs::metadata(&partial)?.len() != 0 {
+                    break;
+                }
             }
             assert_eq!(fs::metadata(&partial)?.len(), 1);
             tokio::time::pause();
