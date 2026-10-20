@@ -1968,7 +1968,7 @@ mod tests {
                 .find_subcommand("tool")
                 .expect("tool command")
                 .get_subcommands()
-                .map(|command| command.get_name())
+                .map(clap::Command::get_name)
                 .collect::<BTreeSet<_>>();
             assert_eq!(
                 accepted, expected,
