@@ -224,6 +224,10 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
             visited = (root / 'visited').read_text().splitlines() if (root / 'visited').exists() else []
             self.assertEqual(len(visited), 2)
             self.assertEqual(len(set(visited)), 2)
+            self.assertEqual(set(visited), {
+                'evidence/release-smoke-arch/same-run/results.json',
+                'evidence/release-smoke-macos/same-run/results.json',
+            })
 
     def test_release_path_and_exact_commit_benchmark_availability(self):
         release = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
