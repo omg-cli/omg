@@ -4978,18 +4978,18 @@ mod tests {
     }
 
     #[test]
-    fn budgeted_sink_stops_growing_at_the_budget() {
-        let mut sink = BudgetedSink::with_budget(16);
+    fn budgeted_writer_rejects_excess_without_growing_output() {
+        let mut sink = BudgetedWriter::new(Vec::new(), 16);
 
         let ok = sink.write(b"payload123").unwrap();
         let cumulative = sink
             .write(b"1234567")
             .expect_err("a write must fit the remaining budget");
-        assert_eq!(cumulative.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(cumulative.kind(), std::io::ErrorKind::Other);
         let error = sink.write(&[0u8; 32]).expect_err("budget must abort");
 
         assert_eq!(ok, 10);
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
         let payload = sink.into_inner();
         assert_eq!(payload.len(), 10);
         assert_eq!(payload, b"payload123");

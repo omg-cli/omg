@@ -463,14 +463,35 @@ mod tests {
             "mode = \"dark\"\naccent = \"#89b4fa\"\nmuted = \"#585b70\"\ncyan = \"#94e2d5\"\nmagenta = \"#f5c2e7\"\ngreen = \"#a6e3a1\"\nyellow = \"#f9e2af\"\nred = \"#f38ba8\"\nblue = \"#89b4fa\"\n",
         )
         .expect("valid theme");
-        assert_eq!(parsed.accent, parse_hex("#89b4fa").unwrap());
-        assert_eq!(parsed.muted, parse_hex("#585b70").unwrap());
+        assert_eq!(
+            parsed.accent,
+            Rgb {
+                r: 0x89,
+                g: 0xb4,
+                b: 0xfa
+            }
+        );
+        assert_eq!(
+            parsed.muted,
+            Rgb {
+                r: 0x58,
+                g: 0x5b,
+                b: 0x70
+            }
+        );
     }
 
     #[test]
     fn palette_tolerates_partial_toml() {
         let parsed = Palette::parse_toml("accent = \"#ff0000\"\n").expect("partial");
-        assert_eq!(parsed.accent, parse_hex("#ff0000").unwrap());
+        assert_eq!(
+            parsed.accent,
+            Rgb {
+                r: 0xff,
+                g: 0x00,
+                b: 0x00
+            }
+        );
         assert_eq!(parsed.cyan, Palette::fallback().cyan);
     }
 
