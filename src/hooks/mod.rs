@@ -1196,6 +1196,50 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn emitted_hook_output(shell: &str, name: &str) -> Option<String> {
+        const CHILD: &str = "OMG_PRINTED_HOOK_TEST";
+        const SHELL: &str = "OMG_PRINTED_HOOK_SHELL";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            let requested = std::env::var(SHELL).expect("requested fixture shell");
+            println!("PRINTED_HOOK_BEGIN {name} {requested}");
+            print_hook(&requested).expect("print requested hook");
+            println!("PRINTED_HOOK_END {name} {requested}");
+            return None;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                name,
+                "--nocapture",
+                "--color",
+                "never",
+                "--test-threads=1",
+            ])
+            .env(CHILD, name)
+            .env(SHELL, shell)
+            .output()
+            .expect("capture printed hook fixture");
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 hook output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.len() + stderr.len() <= 128 * 1024,
+            "hook fixture exceeded capture limit:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "hook fixture {name}/{shell} failed ({}):\n{stdout}\n{stderr}",
+            output.status
+        );
+        let begin = format!("PRINTED_HOOK_BEGIN {name} {shell}\n");
+        let end = format!("PRINTED_HOOK_END {name} {shell}\n");
+        assert_eq!(stdout.matches(&begin).count(), 1, "{stdout}");
+        assert_eq!(stdout.matches(&end).count(), 1, "{stdout}");
+        let (_, printed) = stdout.split_once(&begin).expect("hook begin frame");
+        let (printed, _) = printed.split_once(&end).expect("hook end frame");
+        Some(printed.to_string())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn fish_hook_roundtrips_backslashes_and_apostrophes_in_runtime_paths() -> Result<()> {
@@ -2073,12 +2117,31 @@ path = "hostile"
             FISH_HOOK.contains("command omg hook-env -s fish"),
             "fish hook must invoke the binary via `command omg`, got:\n{FISH_HOOK}"
         );
+
+        let Some(output) =
+            emitted_hook_output("fish", "hooks::tests::fish_hook_uses_command_guard")
+        else {
+            return;
+        };
+        assert!(output.contains("command omg hook-env -s fish"), "{output}");
     }
 
     #[test]
     fn zsh_and_bash_hooks_keep_command_guard() {
         assert!(ZSH_HOOK.contains("\\command omg hook-env -s zsh"));
         assert!(BASH_HOOK.contains("\\command omg hook-env -s bash"));
+
+        for shell in ["zsh", "bash"] {
+            let Some(output) =
+                emitted_hook_output(shell, "hooks::tests::zsh_and_bash_hooks_keep_command_guard")
+            else {
+                return;
+            };
+            assert!(
+                output.contains(&format!("\\command omg hook-env -s {shell}")),
+                "{output}"
+            );
+        }
     }
 
     #[test]
@@ -2096,6 +2159,24 @@ path = "hostile"
             !registration.contains("local "),
             "top-level hook registration must not use local"
         );
+
+        let Some(output) = emitted_hook_output(
+            "zsh",
+            "hooks::tests::zsh_hook_registers_completions_on_load",
+        ) else {
+            return;
+        };
+        assert!(
+            output.contains("fpath=(\"$HOME/.oh-my-zsh/completions\" \"$HOME/.zfunc\" $fpath)"),
+            "{output}"
+        );
+        assert!(output.contains("autoload -Uz _omg"), "{output}");
+        assert!(output.contains("compdef _omg omg"), "{output}");
+        let registration = output
+            .split("# ~/.zfunc is not on a default omz fpath")
+            .nth(1)
+            .expect("emitted completion registration block");
+        assert!(!registration.contains("local "), "{registration}");
     }
 
     #[test]
