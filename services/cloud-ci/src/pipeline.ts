@@ -98,15 +98,14 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
 
         const save = async (name: string, result: CheckResult) => {
             const prefix = `logs/${event.instanceId}/${name}`;
+            // Streams are single-use; retries must capture reusable bytes before entering the step.
+            const stdout = await new Response(result.logs.stdout).text();
+            const stderr = await new Response(result.logs.stderr).text();
 
             const evidence = await step.do(
                 `preserve-${name}`,
                 { retries: { limit: 2, delay: 1000 }, timeout: "1 minute" },
                 async () => {
-                    const stdout = await new Response(result.logs.stdout).text();
-
-                    const stderr = await new Response(result.logs.stderr).text();
-
                     await this.env.BACKUP_BUCKET.put(`${prefix}.stdout`, stdout);
                     await this.env.BACKUP_BUCKET.put(`${prefix}.stderr`, stderr);
                     const reports: { name: string; key: string; sha256: string }[] = [];
