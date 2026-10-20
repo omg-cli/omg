@@ -50,13 +50,19 @@ mod tests {
     #[test]
     fn test_suggest_for_anyhow_permission() {
         let err = anyhow::anyhow!("permission denied: /etc/foo");
-        assert!(suggest_for_anyhow(&err).is_some());
+        assert_eq!(
+            suggest_for_anyhow(&err),
+            Some("Try running with sudo, or check file/directory permissions")
+        );
     }
 
     #[test]
     fn test_suggest_for_anyhow_network() {
         let err = anyhow::anyhow!("connection refused");
-        assert!(suggest_for_anyhow(&err).is_some());
+        assert_eq!(
+            suggest_for_anyhow(&err),
+            Some("Check your internet connection and try again")
+        );
     }
 
     #[test]
