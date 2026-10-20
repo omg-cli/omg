@@ -686,7 +686,6 @@ class NativeBuildAdmission(unittest.TestCase):
             with self.subTest(kind=kind), self.assertRaises(ValueError):
                 BUILD.validate_bundle(data, 'sha256:' + hashlib.sha256(data).hexdigest(), expected)
 
-        # Keep a complete pair so its presence cannot mask foreign-path admission.
         expected, provenance, safe_payload = fixture()
         buffer = io.BytesIO()
         with tarfile.open(fileobj=io.BytesIO(safe_payload), mode='r:gz') as safe, \
