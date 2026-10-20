@@ -305,10 +305,29 @@ export function publicationBodies({ proposal, receipt, evidenceDigest }) {
     };
 }
 
-export function findPublication(records, marker) {
+const defaultPublisher = Object.freeze({ login: "github-actions[bot]", id: 41898282 });
+
+function configuredPublisher() {
+    const login = process.env.OMG_CI_PUBLISHER_LOGIN ?? "";
+    const rawId = process.env.OMG_CI_PUBLISHER_ID ?? "";
+    if (!login && !rawId) return defaultPublisher;
+    const id = Number(rawId);
+    if (
+        !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?(?:\[bot\])?$/.test(login) ||
+        !/^[1-9][0-9]*$/.test(rawId) ||
+        !Number.isSafeInteger(id)
+    )
+        throw new Error("Invalid trusted publisher identity configuration.");
+    return { login, id };
+}
+
+const publisherMatches = (author, expected) =>
+    author?.login === expected.login && author?.id === expected.id;
+
+export function findPublication(records, marker, publisher = defaultPublisher) {
     const matches = records.filter(
         (item) =>
-            item.user?.login === "github-actions[bot]" &&
+            publisherMatches(item.user, publisher) &&
             Schema.is(Schema.String)(item.body) &&
             item.body.split(/\r?\n/)[0] === marker,
     );
@@ -440,6 +459,7 @@ export async function publishAiReview({
     requiredChecks,
     publish = false,
 }) {
+    const publisher = configuredPublisher();
     const proposal = decode(proposalSchema, input);
     const { sources, treeSha, treeEntries } = await loadSources(github, proposal);
 
@@ -461,14 +481,14 @@ export async function publishAiReview({
     const issue = findPublication(
         issues.filter((item) => !item.pull_request),
         `<!-- ai-review:${proposal.finding.key} -->`,
+        publisher,
     );
 
     const patchPrefix = `<!-- ai-review-patch:${proposal.finding.key}:${proposal.branch}:`;
 
     const patchMarkers = pulls
         .filter(
-            (item) =>
-                item.user?.login === "github-actions[bot]" && Schema.is(Schema.String)(item.body),
+            (item) => publisherMatches(item.user, publisher) && Schema.is(Schema.String)(item.body),
         )
         .map((item) => item.body.split(/\r?\n/)[0])
         .filter(
@@ -479,7 +499,8 @@ export async function publishAiReview({
 
     if (patchMarkers.length > 1)
         throw new Error("Ambiguous prior repair history; human reconciliation required.");
-    const pull = patchMarkers.length === 1 ? findPublication(pulls, patchMarkers[0]) : undefined;
+    const pull =
+        patchMarkers.length === 1 ? findPublication(pulls, patchMarkers[0], publisher) : undefined;
 
     if (issue?.state === "closed" || pull?.state === "closed")
         return { action: "closed", issue, pull };
@@ -511,6 +532,9 @@ export async function publishAiReview({
             title: `[Unconfirmed AI finding] ${proposal.finding.title}`,
             body: bodies.issue,
         }));
+
+    if (!publisherMatches(openedIssue.user, publisher))
+        throw new Error("GitHub issue publisher identity mismatch.");
 
     let commit = resumedCommit;
 
@@ -553,6 +577,9 @@ export async function publishAiReview({
         base: proposal.branch,
         draft: false,
     });
+
+    if (!publisherMatches(openedPull.user, publisher))
+        throw new Error("GitHub PR publisher identity mismatch.");
 
     return {
         action: "published",

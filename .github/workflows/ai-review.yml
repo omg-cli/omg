@@ -124,6 +124,9 @@ jobs:
       issues: write
       pull-requests: write
       actions: read
+    env:
+      OMG_CI_PUBLISHER_LOGIN: ${{ vars.OMG_CI_PUBLISHER_LOGIN }}
+      OMG_CI_PUBLISHER_ID: ${{ vars.OMG_CI_PUBLISHER_ID }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:

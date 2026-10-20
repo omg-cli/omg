@@ -2,6 +2,7 @@ import test from "node:test";
 import { Schema } from "effect";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
     admitPublication,
     publicationBodies,
@@ -310,7 +311,7 @@ test("deduplication respects closed bot records and ignores human marker spoofin
         {
             number: 2,
             body: "<!-- ai-review:key -->",
-            user: { login: "github-actions[bot]" },
+            user: { login: "github-actions[bot]", id: 41898282 },
             state: "closed",
         },
     ];
@@ -320,7 +321,14 @@ test("deduplication respects closed bot records and ignores human marker spoofin
 
 function githubFixture() {
     const writes = [];
-    const state = { head: baseSha, issues: [], pulls: [], branch: null };
+    const state = {
+        head: baseSha,
+        issues: [],
+        pulls: [],
+        branch: null,
+        author: { login: "github-actions[bot]", id: 41898282 },
+        pullAuthor: null,
+    };
 
     const github = {
         async request(method, route, body) {
@@ -328,10 +336,18 @@ function githubFixture() {
                 writes.push({ method, route, body });
 
                 if (route.endsWith("/issues"))
-                    return { number: 7, html_url: "https://github.com/omg-cli/omg/issues/7" };
+                    return {
+                        number: 7,
+                        html_url: "https://github.com/omg-cli/omg/issues/7",
+                        user: state.author,
+                    };
 
                 if (route.endsWith("/pulls"))
-                    return { number: 8, html_url: "https://github.com/omg-cli/omg/pull/8" };
+                    return {
+                        number: 8,
+                        html_url: "https://github.com/omg-cli/omg/pull/8",
+                        user: state.pullAuthor ?? state.author,
+                    };
 
                 return { sha: "8".repeat(40) };
             }
@@ -415,7 +431,7 @@ test("closed prior issue blocks replay without reopening or publishing", async (
             number: 7,
             state: "closed",
             body: `<!-- ai-review:${key} -->`,
-            user: { login: "github-actions[bot]" },
+            user: { login: "github-actions[bot]", id: 41898282 },
         },
     ];
     const result = await publishAiReview({ ...fixture(), ...connection, publish: true });
@@ -432,7 +448,7 @@ test("interrupted publication resumes an identical owned branch without another 
             state: "open",
             html_url: "https://github.com/omg-cli/omg/issues/7",
             body: `<!-- ai-review:${key} -->`,
-            user: { login: "github-actions[bot]" },
+            user: { login: "github-actions[bot]", id: 41898282 },
         },
     ];
     const request = connection.github.request.bind(connection.github);
@@ -507,7 +523,7 @@ test("embedded publication markers cannot spoof another finding", () => {
                 number: 7,
                 state: "open",
                 body: "Untrusted explanation\n<!-- ai-review:key -->",
-                user: { login: "github-actions[bot]" },
+                user: { login: "github-actions[bot]", id: 41898282 },
             },
         ],
         "<!-- ai-review:key -->",
@@ -521,7 +537,7 @@ test("embedded publication markers cannot spoof another finding", () => {
                     number: 8,
                     state: "open",
                     body: "<!-- ai-review:key -->\nEvidence",
-                    user: { login: "github-actions[bot]" },
+                    user: { login: "github-actions[bot]", id: 41898282 },
                 },
             ],
             "<!-- ai-review:key -->",
@@ -537,7 +553,7 @@ test("a closed repair on an earlier base is respected instead of opening another
             number: 8,
             state: "closed",
             body: `<!-- ai-review-patch:${key}:main:${"9".repeat(40)} -->`,
-            user: { login: "github-actions[bot]" },
+            user: { login: "github-actions[bot]", id: 41898282 },
         },
     ];
     const result = await publishAiReview({ ...fixture(), ...connection, publish: true });
@@ -568,4 +584,141 @@ test("publication preserves existing inline Rust tests and conditional attribute
     input.proposal.changes[0].sha256 = sha(input.proposal.changes[0].newContent);
     input.receipt.proposalSha256 = sha(canonical(input.proposal));
     assert.equal(admitPublication(input).proposal.changes.length, 1);
+});
+
+async function withPublisherIdentity(login, id, operation) {
+    const keys = ["OMG_CI_PUBLISHER_LOGIN", "OMG_CI_PUBLISHER_ID"];
+    const previous = keys.map((key) => process.env[key]);
+    for (const [index, value] of [login, id].entries()) {
+        if (value === undefined) delete process.env[keys[index]];
+        else process.env[keys[index]] = value;
+    }
+    try {
+        return await operation();
+    } finally {
+        keys.forEach((key, index) => {
+            if (previous[index] === undefined) delete process.env[key];
+            else process.env[key] = previous[index];
+        });
+    }
+}
+
+test("deduplication rejects the same login with the wrong numeric GitHub actor ID", () => {
+    assert.equal(
+        findPublication(
+            [
+                {
+                    body: "<!-- ai-review:key -->",
+                    user: { login: "github-actions[bot]", id: 7 },
+                },
+            ],
+            "<!-- ai-review:key -->",
+        ),
+        undefined,
+    );
+});
+
+test("explicit trusted App identity replays its own open and closed publications without writes", async () => {
+    await withPublisherIdentity("omg-repair[bot]", "123456", async () => {
+        for (const state of ["open", "closed"]) {
+            const connection = githubFixture();
+            const user = { login: "omg-repair[bot]", id: 123456 };
+            connection.state.issues = [
+                { number: 7, state, user, body: `<!-- ai-review:${key} -->` },
+            ];
+            connection.state.pulls = [
+                { number: 8, state, user, body: `<!-- ai-review-patch:${key}:main:${baseSha} -->` },
+            ];
+            const result = await publishAiReview({ ...fixture(), ...connection, publish: true });
+            assert.equal(result.action, state === "closed" ? "closed" : "existing");
+            assert.equal(connection.writes.length, 0);
+        }
+    });
+});
+
+test("partial or invalid trusted actor configuration fails before writes", async () => {
+    for (const [login, id] of [
+        ["omg-repair[bot]", undefined],
+        [undefined, "123456"],
+        ["bad\nactor", "123456"],
+        ["omg-repair[bot]", "0"],
+        ["omg-repair[bot]", "1.5"],
+        ["omg-repair[bot]", "9007199254740992"],
+    ]) {
+        await withPublisherIdentity(login, id, async () => {
+            const connection = githubFixture();
+            await assert.rejects(
+                publishAiReview({ ...fixture(), ...connection, publish: true }),
+                /publisher.*identity/i,
+            );
+            assert.equal(connection.writes.length, 0);
+        });
+    }
+});
+
+test("actual issue response author must match both trusted fields before subsequent writes", async () => {
+    await withPublisherIdentity("omg-repair[bot]", "123456", async () => {
+        for (const author of [
+            { login: "omg-repair[bot]", id: 7 },
+            { login: "other[bot]", id: 123456 },
+        ]) {
+            const connection = githubFixture();
+            connection.state.author = author;
+            await assert.rejects(
+                publishAiReview({ ...fixture(), ...connection, publish: true }),
+                /publisher.*identity/i,
+            );
+            assert.deepEqual(
+                connection.writes.map((entry) => entry.route),
+                ["/repos/omg-cli/omg/issues"],
+            );
+        }
+    });
+});
+
+test("an App publication is accepted only with actual matching issue and PR response authors", async () => {
+    await withPublisherIdentity("omg-repair[bot]", "123456", async () => {
+        const connection = githubFixture();
+        connection.state.author = { login: "omg-repair[bot]", id: 123456 };
+        assert.equal(
+            (await publishAiReview({ ...fixture(), ...connection, publish: true })).action,
+            "published",
+        );
+        const wrongPull = githubFixture();
+        wrongPull.state.author = connection.state.author;
+        wrongPull.state.pullAuthor = { login: "omg-repair[bot]", id: 7 };
+        await assert.rejects(
+            publishAiReview({ ...fixture(), ...wrongPull, publish: true }),
+            /publisher.*identity/i,
+        );
+    });
+});
+
+test("model proposal fields cannot choose the trusted publication actor", async () => {
+    await withPublisherIdentity(undefined, undefined, async () => {
+        const connection = githubFixture();
+        connection.state.author = { login: "omg-repair[bot]", id: 123456 };
+        await assert.rejects(
+            publishAiReview({
+                ...fixture(),
+                ...connection,
+                publish: true,
+                publisherAuthor: connection.state.author,
+            }),
+            /publisher.*identity/i,
+        );
+    });
+});
+
+test("only the trusted publisher job supplies the explicit actor policy", () => {
+    const workflow = Bun.YAML.parse(
+        readFileSync(new URL("../../.github/workflows/ai-review.yml", import.meta.url), "utf8"),
+    );
+    assert.deepEqual(workflow.jobs.publish.env, {
+        OMG_CI_PUBLISHER_LOGIN: "${{ vars.OMG_CI_PUBLISHER_LOGIN }}",
+        OMG_CI_PUBLISHER_ID: "${{ vars.OMG_CI_PUBLISHER_ID }}",
+    });
+    assert.equal(workflow.jobs.review.env?.OMG_CI_PUBLISHER_LOGIN, undefined);
+    assert.equal(workflow.jobs.review.env?.OMG_CI_PUBLISHER_ID, undefined);
+    assert.equal(workflow.on.workflow_dispatch.inputs.publish.default, false);
 });
