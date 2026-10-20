@@ -2197,28 +2197,19 @@ where
 mod tests {
     #[tokio::test]
     async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
-        for (url, expected_host) in [
-            (
-                "https://example.com/private-path?token=private-token",
-                "example.com",
-            ),
-            ("https://example.com?token=private-token", "example.com"),
-            ("https://example.com#private-fragment", "example.com"),
-            (
-                "https://private-user:private-password@example.com/archive",
-                "example.com",
-            ),
-            ("invalid-private-url", "unknown-host"),
+        for url in [
+            "https://example.com/private-path?token=private-token",
+            "https://example.com?token=private-token",
+            "https://example.com#private-fragment",
+            "https://private-user:private-password@example.com/archive",
+            "invalid-private-url",
         ] {
-            assert_runtime_download_logs_are_redacted(url, expected_host).await?;
+            assert_runtime_download_logs_are_redacted(url).await?;
         }
         Ok(())
     }
 
-    async fn assert_runtime_download_logs_are_redacted(
-        host_url: &str,
-        expected_host: &str,
-    ) -> anyhow::Result<()> {
+    async fn assert_runtime_download_logs_are_redacted(host_url: &str) -> anyhow::Result<()> {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2325,6 +2316,11 @@ mod tests {
                     .expect("numeric heartbeat field")
             };
             assert_eq!(number("attempt"), 1, "{progress}");
+            let expected_host = if host_url == "invalid-private-url" {
+                "unknown-host"
+            } else {
+                "example.com"
+            };
             assert_eq!(value("host").trim_matches('"'), expected_host, "{progress}");
             assert_eq!(number("bytes_received"), number("downloaded"), "{progress}");
             assert!(number("bytes_received") <= 1, "{progress}");
