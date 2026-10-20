@@ -64,12 +64,13 @@ test("preparation preserves protected source, parents and correct dependency met
         "group.js": { uid: 10001, gid: 0, mode: 0o100644 },
         "link.js": { uid: 0, gid: 0, mode: 0o120777 },
         "tracked.txt": { uid: 0, gid: 0, mode: 0o100444 },
+        "deep-audit.tsv": { uid: 0, gid: 0, mode: 0o100444 },
         "tracked-executable.mjs": { uid: 0, gid: 0, mode: 0o100555 },
       };
       const stat = (file) => {
         const name = normalize(file).split("/").at(-1);
         return {
-          ...(["/workspace", "/workspace/src"].includes(normalize(file)) ? { uid: 0, gid: 0, mode: 0o40755 } : fixtures[name] ?? { uid: 10001, gid: 10001, mode: 0o40755 }),
+          ...(["/workspace", "/workspace/src", "/workspace/.audit"].includes(normalize(file)) ? { uid: 0, gid: 0, mode: 0o40755 } : fixtures[name] ?? { uid: 10001, gid: 10001, mode: 0o40755 }),
           isDirectory: () => !Object.hasOwn(fixtures, name),
           isSymbolicLink: () => name === "link.js",
           isFile: () => Object.hasOwn(fixtures, name) && name !== "link.js",
@@ -77,25 +78,26 @@ test("preparation preserves protected source, parents and correct dependency met
       };
       Object.assign(fs, {
         lstatSync: stat,
-        readdirSync: (file) => normalize(file) === "/workspace" ? ["node_modules", "src"] : normalize(file) === "/workspace/src" ? ["tracked.txt", "tracked-executable.mjs"] : normalize(file) === "/workspace/node_modules" ? Object.keys(fixtures) : [],
+        readdirSync: (file) => normalize(file) === "/workspace" ? ["node_modules", "src", ".audit"] : normalize(file) === "/workspace/src" ? ["tracked.txt", "tracked-executable.mjs"] : normalize(file) === "/workspace/.audit" ? ["deep-audit.tsv"] : normalize(file) === "/workspace/node_modules" ? Object.keys(fixtures) : [],
         chownSync: (file, uid, gid) => writes.push(["chown", normalize(file), uid, gid]),
         chmodSync: (file, mode) => writes.push(["chmod", normalize(file), mode]),
         mkdirSync: (file) => created.push(normalize(file)),
-        readFileSync: (file, ...args) => (normalize(file).endsWith("/target/tracked.txt") || normalize(file).includes("/src/")) ? Buffer.from("tracked fixture") : originalRead(file, ...args),
+        readFileSync: (file, ...args) => (normalize(file).endsWith("/target/tracked.txt") || normalize(file).includes("/src/") || normalize(file).includes("/.audit/")) ? Buffer.from("tracked fixture") : originalRead(file, ...args),
       });
       syncBuiltinESMExports();
       Object.defineProperty(process, "platform", { value: "linux" });
       process.getuid = () => 0;
       const { preparePortable } = await import(${JSON.stringify(modulePath)});
-      const context = preparePortable(path.normalize("/workspace"), ["src/tracked.txt", "src/tracked-executable.mjs"], { protectedRoots: [] });
+      const context = preparePortable(path.normalize("/workspace"), ["src/tracked.txt", "src/tracked-executable.mjs", ".audit/deep-audit.tsv"], { protectedRoots: [] });
       context.assertSource();
-      assert.deepEqual(writes.filter(([, file]) => file === "/workspace" || file === "/workspace/src" || file.startsWith("/workspace/src/")), []);
+      assert.deepEqual(writes.filter(([, file]) => file === "/workspace" || file === "/workspace/src" || file.startsWith("/workspace/src/") || file === "/workspace/.audit" || file.startsWith("/workspace/.audit/")), []);
       assert.deepEqual(writes.filter(([, file]) => file === dependency), []);
       const forFile = (name) => writes.filter(([, file]) => file === "/workspace/node_modules/" + name);
       assert.deepEqual(forFile("special.js"), [["chmod", "/workspace/node_modules/special.js", 0o644]]);
       assert.deepEqual(forFile("owner.js"), [["chown", "/workspace/node_modules/owner.js", 10001, 10001]]);
       assert.deepEqual(forFile("group.js"), [["chown", "/workspace/node_modules/group.js", 10001, 10001]]);
       assert.deepEqual(forFile("link.js"), []);
+      assert.ok(!created.includes("/workspace/.audit"));
       assert.ok(created.includes("/workspace/target"));
       assert.ok(writes.some(([operation, file, uid, gid]) => operation === "chown" && file === "/workspace/target" && uid === 10001 && gid === 10001));
       assert.ok(writes.some(([operation, file, mode]) => operation === "chmod" && file === "/workspace/target" && mode === 0o755));

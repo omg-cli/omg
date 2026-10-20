@@ -145,7 +145,6 @@ export function preparePortable(
         "node_modules",
         "target",
         ".ci-cargo",
-        ".audit",
         "services/cloud-ci/node_modules",
         "services/cloud-ci/dist",
         "services/cloud-ci/.wrangler",

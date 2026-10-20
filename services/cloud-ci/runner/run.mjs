@@ -91,7 +91,7 @@ switch (process.argv[2]) {
     case "rust-portable-tests":
         for (const features of rustProfiles) {
             const label = features.replaceAll(",", "-");
-            const surface = `/workspace/.audit/cloud-rust-${label}`;
+            const surface = `/workspace/target/cloud-rust-${label}`;
             await run("python3", ["scripts/run-native-contracts.py", "--features", features], {
                 GITHUB_RUN_ID: process.env.OMG_RUN_ID,
                 GITHUB_RUN_ATTEMPT: process.env.OMG_RUN_ATTEMPT,
