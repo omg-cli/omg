@@ -81,3 +81,11 @@ The original failed PR merge's exact ancestry was replayed for the debt ratchet 
 The updated OMG verifier Worker was deployed as version `1e4d4ec6-2ed3-4413-9197-9dc9eda2c151`. Wrangler reported no changes to the existing container application or its image. The image remains manifest `sha256:7d7c8bc89570da1e1234a3596758db6d3d046ba969eccc56ea1e9937166f47a3`, from runner source `2d4a40a4590111fd6b7c9c94bd0ff80479959a2a`. Worker code revision and embedded runner revision are separate identities. A deployed Worker and passing health response do not establish a completed hosted workload.
 
 The coder was redeployed from the same reviewed source after the byte-exact skill relocation as version `4d8deeb2-e78f-4958-869b-49c0632dc473`. The inspector remains version `f88ad40b-a903-4432-80d4-83337987731c`. Redeployment did not provision a new DO or reuse CodeLoud credentials. Post-deployment probes verify authentication and request rejection, not actual model inference.
+
+## Linux JUnit fixture correction
+
+Commit `2a024ea2f5cf68fb1328a42f4b14c6b5689b4521` fixes the actual failure found by the new GitHub orchestration check. Bun emits GitHub `<properties>` when the relevant environment variables exist. The old negative fixture replaced the first self-closing XML tag, which became a property, and injected an unrelated closing testcase tag. This caused the same SAX line 4, column 137 failure on the hosted runner and in the bounded Linux reproduction.
+
+The test now supplies controlled GitHub metadata only to its emitter child, asserts the literal commit property precedes the testcase, targets a real self-closing testcase and proves the replacement occurred. Every semantic negative still must parse successfully before the admission function rejects it. The production parser and all existing rejection assertions remain unchanged. Linux Bun 1.4.2 passes all four focused cases; the full local verifier suite passes all 80 tests, with all three service TypeScript checks passing. Apply this correction to CodeLoud's matching fixture as well. [Bun JUnit metadata](https://bun.sh/docs/test/reporters).
+
+The 238 pipeline tests are separate from the product test-behavior audit. Their passing results do not prove every product test or increase that audit's completed-method count. Fresh hosted checks on the final PR head remain required.

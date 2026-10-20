@@ -42,3 +42,5 @@ Suggested question to Cloudflare, not sent by this job:
 > For our active Tier 3 $10,000 Startup award, please confirm that Containers CPU/memory/disk/egress, Artifacts operations and storage, any managed container-registry storage, and the Workers Paid monthly subscription deduct from the same award. Please identify any excluded SKU or additional cap. We already understand the $2,500 Workers AI subcap and the R2 ceiling. Please also confirm whether any Sandbox or Worker Loader charge is billed separately from those covered primitives.
 
 The user can supply their account ID privately when sending that question. No support message, payment, subscription change or credit-policy change was made here.
+
+Cloudflare's newer [Git-platform announcement](https://blog.cloudflare.com/next-git-platform-on-cloudflare) explicitly says Artifacts usage billing begins October 15, 2026. Thus beta availability must not be treated as free usage. The announcement does not establish how this account's Startup award maps to those billed SKUs.
