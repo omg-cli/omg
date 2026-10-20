@@ -2282,6 +2282,19 @@ mod tests {
         let observe = async {
             // Keep real socket setup independent of virtual-clock scheduling.
             captured.body_started.notified().await;
+            let partial = fs::read_dir(directory.path())?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".download-"))
+                })
+                .expect("owned partial download exists before body progress");
+            while fs::metadata(&partial)?.len() == 0 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(fs::metadata(&partial)?.len(), 1);
             tokio::time::pause();
             tokio::time::advance(std::time::Duration::from_secs(31)).await;
             captured.progress.notified().await;
@@ -2324,6 +2337,7 @@ mod tests {
             assert_eq!(value("host").trim_matches('"'), expected_host, "{progress}");
             assert_eq!(number("bytes_received"), number("downloaded"), "{progress}");
             assert!(number("bytes_received") <= 1, "{progress}");
+            assert_eq!(number("bytes_received"), 1, "{progress}");
             assert!(number("elapsed_ms") >= 30_000, "{progress}");
             tokio::time::resume();
             release.send(()).unwrap();
