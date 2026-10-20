@@ -263,7 +263,7 @@ impl BudgetedSink {
     /// Explicit budget: production callers pass [`MAX_DECOMPRESSED_BYTES`],
     /// tests pass a small budget so the abort path is exercisable without
     /// gigabyte allocations.
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "debian", feature = "debian-pure")))]
     pub(crate) fn with_budget(budget: u64) -> Self {
         Self {
             buf: Vec::new(),
@@ -272,7 +272,7 @@ impl BudgetedSink {
     }
 
     /// Test-only: exposes the accumulated buffer for size assertions.
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "debian", feature = "debian-pure")))]
     pub(crate) fn into_inner(self) -> Vec<u8> {
         self.buf
     }
