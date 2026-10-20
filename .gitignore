@@ -18,6 +18,11 @@ cargo.lock
 # be committed so npm ci verifies integrity of the wrangler dependency tree)
 omg.lock
 bun.lock
+!/bun.lock
+!/services/cloud-ci/bun.lock
+!/services/cloud-ci/runner/bun.lock
+!/services/ci-inspector/bun.lock
+!/services/ci-coder/bun.lock
 package-lock.json
 !.github/deps/release-tools/package-lock.json
 
