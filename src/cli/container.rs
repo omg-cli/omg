@@ -844,7 +844,10 @@ mod tests {
 
         let digest = go_tarball_digest(&metadata, "https://go.dev/dl/go1.22.5.linux-amd64.tar.gz")
             .expect("digest found");
-        assert!(digest.starts_with("ca"), "{digest}");
+        assert_eq!(
+            digest,
+            "caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
 
         let error = go_tarball_digest(&metadata, "https://go.dev/dl/go9.9.9.linux-amd64.tar.gz")
             .expect_err("unknown version must fail");
