@@ -263,7 +263,7 @@ impl BudgetedSink {
     /// Explicit budget: production callers pass [`MAX_DECOMPRESSED_BYTES`],
     /// tests pass a small budget so the abort path is exercisable without
     /// gigabyte allocations.
-    #[cfg(all(test, any(feature = "debian", feature = "debian-pure")))]
+    #[cfg(test)]
     pub(crate) fn with_budget(budget: u64) -> Self {
         Self {
             buf: Vec::new(),
@@ -272,7 +272,7 @@ impl BudgetedSink {
     }
 
     /// Test-only: exposes the accumulated buffer for size assertions.
-    #[cfg(all(test, any(feature = "debian", feature = "debian-pure")))]
+    #[cfg(test)]
     pub(crate) fn into_inner(self) -> Vec<u8> {
         self.buf
     }
@@ -4975,6 +4975,24 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(output.len() <= 16);
+    }
+
+    #[test]
+    fn budgeted_sink_stops_growing_at_the_budget() {
+        let mut sink = BudgetedSink::with_budget(16);
+
+        let ok = sink.write(b"payload123").unwrap();
+        let cumulative = sink
+            .write(b"1234567")
+            .expect_err("a write must fit the remaining budget");
+        assert_eq!(cumulative.kind(), std::io::ErrorKind::InvalidData);
+        let error = sink.write(&[0u8; 32]).expect_err("budget must abort");
+
+        assert_eq!(ok, 10);
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let payload = sink.into_inner();
+        assert_eq!(payload.len(), 10);
+        assert_eq!(payload, b"payload123");
     }
 
     #[test]
