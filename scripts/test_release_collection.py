@@ -35,7 +35,7 @@ class ReleaseCollection(unittest.TestCase):
                     payload = platform.encode()
                     (root / 'release' / name).write_bytes(payload)
                     (root / 'release' / (name + '.sha256')).write_text(
-                        f'{hashlib.sha256(payload).hexdigest()}  {name}\n')
+                        f'{hashlib.sha256(payload).hexdigest()}  {name}\n', encoding='utf-8', newline='\n')
                 (root / 'release/omg-v1.2.3.cdx.json').write_text('{"bomFormat":"CycloneDX"}')
                 result = subprocess.run([BASH, '-eu', '-c', validation], cwd=root,
                                         env=dict(os.environ, VERSION='1.2.3'),
@@ -132,7 +132,7 @@ class ReleaseCollection(unittest.TestCase):
                     payload = platform.encode()
                     (artifacts / name).write_bytes(payload)
                     (artifacts / (name + '.sha256')).write_text(
-                        f'{hashlib.sha256(payload).hexdigest()}  {name}\n')
+                        f'{hashlib.sha256(payload).hexdigest()}  {name}\n', encoding='utf-8', newline='\n')
                 trixie = 'omg-v1.2.3-x86_64-linux-debian-trixie.tar.gz'
                 if case == 'duplicate-trixie':
                     (artifacts / 'duplicate').mkdir()
@@ -146,7 +146,7 @@ class ReleaseCollection(unittest.TestCase):
                 destination = root / 'release'
                 result = subprocess.run(
                     [BASH, str(ROOT / 'scripts/collect-release-artifacts.sh'),
-                     '1.2.3', str(artifacts), str(destination)],
+                     '1.2.3', artifacts.as_posix(), destination.as_posix()],
                     capture_output=True, text=True, timeout=15)
                 if case == 'complete':
                     self.assertEqual(result.returncode, 0, result.stderr)
