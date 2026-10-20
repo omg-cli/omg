@@ -483,6 +483,54 @@ mod tests {
             repo: "core".to_string(),
         }];
         assert!(update_official_only_dry_run(&updates).is_ok());
+
+        const CHILD: &str = "OMG_DRY_RUN_PREVIEW_OUTPUT_CHILD";
+        const NAME: &str =
+            "cli::packages::common::tests::dry_run_preview_reports_unknown_download_size";
+        if std::env::var(CHILD).as_deref() == Ok(NAME) {
+            crate::cli::modern_ui::configure_output(0, false);
+            println!("DRY_RUN_PREVIEW_BEGIN {NAME}");
+            assert!(update_official_only_dry_run(&updates).is_ok());
+            println!("DRY_RUN_PREVIEW_END {NAME}");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                NAME,
+                "--nocapture",
+                "--color",
+                "never",
+                "--test-threads=1",
+            ])
+            .env(CHILD, NAME)
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("capture actual dry-run preview");
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 preview output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.len() + stderr.len() <= 64 * 1024,
+            "preview capture exceeded bound:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            output.status.success()
+                && stdout
+                    .matches("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                    .count()
+                    == 1,
+            "preview child failed ({}):\n{stdout}\n{stderr}",
+            output.status
+        );
+        let begin = format!("DRY_RUN_PREVIEW_BEGIN {NAME}\n");
+        let end = format!("DRY_RUN_PREVIEW_END {NAME}\n");
+        assert_eq!(stdout.matches(&begin).count(), 1, "{stdout}");
+        assert_eq!(stdout.matches(&end).count(), 1, "{stdout}");
+        let (_, printed) = stdout.split_once(&begin).expect("preview begin frame");
+        let (printed, _) = printed.split_once(&end).expect("preview end frame");
+        assert!(printed.contains("example 1.0 → 2.0 (core)"), "{printed}");
+        assert!(printed.contains("1 update available"), "{printed}");
+        assert!(!printed.contains("Download size:"), "{printed}");
     }
 
     #[test]
