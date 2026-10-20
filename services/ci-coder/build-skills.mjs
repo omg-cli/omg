@@ -9,7 +9,7 @@ const canonical = (value) => JSON.stringify(value, (_, item) =>
     : item);
 
 // Retain the original CodeLoud package registry and append the required Rust guidance.
-export async function buildSkills({ rust, tdd, destination = path.join(import.meta.dir, "skills") }) {
+export async function buildSkills({ rust, tdd, destination = path.resolve(import.meta.dir, "../../vendor/ci-coder-skills") }) {
   const bundle = JSON.parse(await readFile(path.join(destination, "bundle.json"), "utf8"));
   for (const file of Object.values(bundle.files)) {
     if (Buffer.byteLength(file.content) !== file.bytes || digest(file.content) !== file.sha256)
@@ -31,7 +31,7 @@ export async function buildSkills({ rust, tdd, destination = path.join(import.me
   }
   await include(tdd, "tdd", "SKILL.md", "6.4.2");
   await include(path.resolve(tdd, "../.."), "tdd", "LICENSE", "6.4.2");
-  const adapter = await readFile(path.join(destination, "workerd/ADAPTER.md"));
+  const adapter = await readFile(path.join(import.meta.dir, "skills/workerd/ADAPTER.md"));
   bundle.files["workerd/ADAPTER.md"] = { content: adapter.toString("utf8"), sha256: digest(adapter),
     bytes: adapter.length, source: "omg-workerd-adapter@1" };
   bundle.packages = { ...bundle.packages, rust: "1.1.2", tdd: "6.4.2" };

@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode/plugin";
 import type { SessionContext } from "@opencode/plugin/promise/session";
 import { Skill } from "@opencode/schema/skill";
 import { Schema } from "effect";
-import bundledSkills from "../skills/bundle.json";
+import bundledSkills from "../../../vendor/ci-coder-skills/bundle.json";
 
 export type SkillBundle = {
   version: number;

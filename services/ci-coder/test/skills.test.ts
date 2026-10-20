@@ -6,7 +6,7 @@ import {
   registerRequiredSkillContexts,
   type SkillBundle,
 } from "../src/skills";
-import bundle from "../skills/bundle.json";
+import bundle from "../../../vendor/ci-coder-skills/bundle.json";
 
 const sourceBundle: SkillBundle = bundle;
 
