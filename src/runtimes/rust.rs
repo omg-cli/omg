@@ -2048,6 +2048,11 @@ mod tests {
         assert!(
             triple.contains("linux") || triple.contains("darwin") || triple.contains("windows")
         );
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        assert_eq!(
+            RustToolchainSpec::parse("stable").unwrap().name(),
+            "stable-x86_64-unknown-linux-gnu"
+        );
     }
 
     #[test]

@@ -3093,7 +3093,11 @@ mod tests {
 
         assert!(frontend.is_file());
         assert!(database.is_file());
+        assert!(!external_record_lock_available(&frontend));
+        assert!(!external_record_lock_available(&database));
         drop(guard);
+        assert!(external_record_lock_available(&frontend));
+        assert!(external_record_lock_available(&database));
     }
 
     #[test]
