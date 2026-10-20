@@ -35,12 +35,17 @@ for (const partialSkips of [false, true]) {
           )};
           const emit = (source) => {
             writeFileSync(fixture, source);
-            const child = spawnSync(process.execPath, ["test", fixture, "--reporter=junit", "--reporter-outfile=" + report]);
+            const child = spawnSync(process.execPath, ["test", fixture, "--reporter=junit", "--reporter-outfile=" + report], {
+              env: { ...process.env, GITHUB_SHA: "a".repeat(40), GITHUB_RUN_ID: "123", GITHUB_SERVER_URL: "https://github.com", GITHUB_REPOSITORY: "omg-cli/omg" },
+            });
             return { status: child.status, stderr: child.stderr, raw: readFileSync(report, "utf8") };
           };
           const emitted = emit(source);
           assert.equal(emitted.status, 0, emitted.stderr.toString());
           const raw = emitted.raw;
+          const commitProperty = '<property name="commit" value="' + "a".repeat(40) + '" />';
+          assert.ok(raw.includes(commitProperty));
+          assert.ok(raw.indexOf(commitProperty) < raw.indexOf("<testcase "));
           const document = await parseStringPromise(raw);
           assert.equal(Object.getPrototypeOf(document.testsuites), null);
           const summary = assertUnitExecution(document);
@@ -48,7 +53,9 @@ for (const partialSkips of [false, true]) {
           assert.equal(summary.skipped, ${JSON.stringify(partialSkips ? "3" : "0")});
           assert.equal(summary.failures, "0");
           assert.equal(Object.hasOwn(summary, "errors"), false);
-          for (const malformed of [raw.replace('tests="${partialSkips ? "4" : "1"}"', 'tests="99"'), raw.replace('failures="0"', 'failures="1"'), raw.replace('skipped="${partialSkips ? "3" : "0"}"', 'skipped="99"'), raw.split("\\n").filter(line => !line.includes('name="actual executed case"')).join("\\n"), raw.replace(' />', '><error>fixture setup failure</error></testcase>')]) {
+          const setupFailure = raw.replace(/(<testcase [^>]*?) *\\/>/, "$1><error>fixture setup failure</error></testcase>");
+          assert.notEqual(setupFailure, raw);
+          for (const malformed of [raw.replace('tests="${partialSkips ? "4" : "1"}"', 'tests="99"'), raw.replace('failures="0"', 'failures="1"'), raw.replace('skipped="${partialSkips ? "3" : "0"}"', 'skipped="99"'), raw.split("\\n").filter(line => !line.includes('name="actual executed case"')).join("\\n"), setupFailure]) {
             const parsed = await parseStringPromise(malformed);
             assert.throws(() => assertUnitExecution(parsed));
           }
