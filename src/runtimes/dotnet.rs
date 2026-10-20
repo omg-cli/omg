@@ -394,7 +394,11 @@ mod tests {
     #[test]
     fn channel_sdks_flag_preview_releases() {
         let versions = parse_channel_sdks(&fixture_channel(), true);
-        assert!(versions.iter().all(|version| version.prerelease));
+        let actual: Vec<_> = versions
+            .iter()
+            .map(|version| (version.version.as_str(), version.prerelease))
+            .collect();
+        assert_eq!(actual, vec![("9.0.317", true), ("9.0.316", true)]);
     }
 
     #[test]

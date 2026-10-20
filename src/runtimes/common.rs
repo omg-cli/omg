@@ -2288,6 +2288,43 @@ mod tests {
             let logs = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
             assert!(logs.contains("Runtime download body progress"), "{logs}");
             assert!(!logs.contains("Runtime download body complete"));
+            let progress = logs
+                .lines()
+                .find(|line| line.contains("Runtime download body progress"))
+                .expect("complete heartbeat event");
+            let fields: Vec<_> = progress
+                .split_whitespace()
+                .filter_map(|token| token.split_once('='))
+                .collect();
+            for name in [
+                "attempt",
+                "host",
+                "bytes_received",
+                "downloaded",
+                "elapsed_ms",
+            ] {
+                assert_eq!(
+                    fields.iter().filter(|(key, _)| *key == name).count(),
+                    1,
+                    "{progress}"
+                );
+            }
+            let value = |name: &str| fields.iter().find(|(key, _)| *key == name).unwrap().1;
+            let number = |name: &str| {
+                value(name)
+                    .parse::<u128>()
+                    .expect("numeric heartbeat field")
+            };
+            assert_eq!(number("attempt"), 1, "{progress}");
+            let expected_host = if host_url == "invalid-private-url" {
+                "unknown-host"
+            } else {
+                "example.com"
+            };
+            assert_eq!(value("host").trim_matches('"'), expected_host, "{progress}");
+            assert_eq!(number("bytes_received"), number("downloaded"), "{progress}");
+            assert!(number("bytes_received") <= 1, "{progress}");
+            assert!(number("elapsed_ms") >= 30_000, "{progress}");
             tokio::time::resume();
             release.send(()).unwrap();
             Ok::<_, anyhow::Error>(())
