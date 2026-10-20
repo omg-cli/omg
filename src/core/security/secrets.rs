@@ -703,7 +703,13 @@ mod tests {
     #[test]
     fn test_placeholder_ignored() {
         let scanner = SecretScanner::new();
-        let content = "api_key = 'your_api_key_here'";
+        assert_eq!(
+            scanner
+                .scan_content("apikey = 'abcd1234test567890efgh'", "config.py")
+                .len(),
+            1
+        );
+        let content = "api_key = 'your_api_key_here'\napi_key = 'your_api_key_here_0000'";
         let findings = scanner.scan_content(content, "config.py");
 
         assert!(findings.is_empty(), "Should ignore placeholder values");
@@ -712,11 +718,22 @@ mod tests {
     #[test]
     fn placeholder_prefixes_are_independently_ignored() {
         let scanner = SecretScanner::new();
+        assert_eq!(
+            scanner
+                .scan_content("apikey = 'abcd1234test567890efgh'", "config.py")
+                .len(),
+            1
+        );
         for prefix in ["your_", "my_", "example_", "sample_", "placeholder_"] {
             let content = format!("api_key = '{prefix}api_key_here'");
             assert!(
                 scanner.scan_content(&content, "config.py").is_empty(),
                 "{prefix}"
+            );
+            let content = format!("api_key = '{prefix}api_key_here_0000'");
+            assert!(
+                scanner.scan_content(&content, "config.py").is_empty(),
+                "{prefix} long value"
             );
         }
     }
@@ -924,7 +941,13 @@ mod tests {
     #[test]
     fn exact_placeholder_values_are_still_skipped() {
         let scanner = SecretScanner::new();
-        let content = "api_key = 'YOUR_API_KEY_HERE'\napi_key = example";
+        assert_eq!(
+            scanner
+                .scan_content("apikey = 'abcd1234test567890efgh'", "config.py")
+                .len(),
+            1
+        );
+        let content = "api_key = 'YOUR_API_KEY_HERE'\napi_key = example\npassword = placeholder";
         let findings = scanner.scan_content(content, "config.py");
 
         assert!(

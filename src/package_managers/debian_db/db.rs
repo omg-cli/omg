@@ -687,21 +687,6 @@ fn required_mtime(path: &Path) -> Result<std::time::SystemTime> {
         .with_context(|| format!("Failed to read mtime {}", path.display()))
 }
 
-#[cfg(test)]
-fn optional_mtime(path: &Path) -> Result<Option<std::time::SystemTime>> {
-    match fs::metadata(path) {
-        Ok(meta) => {
-            Ok(Some(meta.modified().with_context(|| {
-                format!("Failed to read mtime {}", path.display())
-            })?))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("Failed to read mtime {}", path.display()))
-        }
-    }
-}
-
 fn hydrate_index_cache(
     cache: &mut DebianIndexCache,
     index: DebianPackageIndex,
@@ -4493,16 +4478,16 @@ mod tests {
     }
 
     #[test]
-    fn optional_mtime_missing_file_is_none() {
-        let mtime = optional_mtime(Path::new("/no/such/extended_states"))
-            .expect("missing extended_states mtime is optional");
-        assert!(mtime.is_none());
+    fn optional_file_identity_missing_file_is_none() {
+        let identity = DpkgFileIdentity::read(Path::new("/no/such/extended_states"))
+            .expect("missing extended_states identity is optional");
+        assert!(identity.is_none());
     }
 
     #[test]
-    fn optional_mtime_rejects_unreadable_existing() {
+    fn optional_file_identity_rejects_unreadable_existing() {
         if crate::config::Settings::rerun_test_unprivileged(
-            "package_managers::debian_db::db::tests::optional_mtime_rejects_unreadable_existing",
+            "package_managers::debian_db::db::tests::optional_file_identity_rejects_unreadable_existing",
         ) {
             return;
         }
@@ -4523,10 +4508,10 @@ mod tests {
             std::fs::metadata(&nested).expect_err("fixture must enforce permission denial");
         assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
         println!(
-            "[omg-permission-fixture] test=package_managers::debian_db::db::tests::optional_mtime_rejects_unreadable_existing uid={} errno=PermissionDenied",
+            "[omg-permission-fixture] test=package_managers::debian_db::db::tests::optional_file_identity_rejects_unreadable_existing uid={} errno=PermissionDenied",
             nix::unistd::geteuid()
         );
-        let result = optional_mtime(&nested);
+        let result = DpkgFileIdentity::read(&nested);
         std::fs::set_permissions(dir.path(), original).expect("restore parent");
         let error = result.expect_err("unreadable existing extended_states must not look missing");
         assert!(
@@ -4536,7 +4521,7 @@ mod tests {
             "production must retain the permission denial: {error:#}"
         );
         assert!(
-            error.to_string().contains("Failed to read mtime"),
+            error.to_string().contains("Failed to inspect"),
             "got: {error}"
         );
     }

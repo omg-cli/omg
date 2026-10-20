@@ -2197,6 +2197,11 @@ where
 mod tests {
     #[tokio::test]
     async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "runtimes::common::tests::runtime_download_reports_stalled_body_without_exposing_urls",
+        ) {
+            return Ok(());
+        }
         for url in [
             "https://example.com/private-path?token=private-token",
             "https://example.com?token=private-token",
@@ -2282,6 +2287,21 @@ mod tests {
         let observe = async {
             // Keep real socket setup independent of virtual-clock scheduling.
             captured.body_started.notified().await;
+            let partial = fs::read_dir(directory.path())?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<_>>>()?
+                .into_iter()
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".download-"))
+                })
+                .expect("owned partial download exists before body progress");
+            let mut partial_bytes = 0;
+            while partial_bytes == 0 {
+                tokio::task::yield_now().await;
+                partial_bytes = fs::metadata(&partial)?.len();
+            }
+            assert_eq!(partial_bytes, 1);
             tokio::time::pause();
             tokio::time::advance(std::time::Duration::from_secs(31)).await;
             captured.progress.notified().await;
@@ -2324,6 +2344,7 @@ mod tests {
             assert_eq!(value("host").trim_matches('"'), expected_host, "{progress}");
             assert_eq!(number("bytes_received"), number("downloaded"), "{progress}");
             assert!(number("bytes_received") <= 1, "{progress}");
+            assert_eq!(number("bytes_received"), 1, "{progress}");
             assert!(number("elapsed_ms") >= 30_000, "{progress}");
             tokio::time::resume();
             release.send(()).unwrap();
@@ -2338,7 +2359,10 @@ mod tests {
         assert_eq!(fs::read(&temporary)?, b"abcd");
         assert_eq!(digest, hex::encode(Sha256::digest(b"abcd")));
         let logs = String::from_utf8(captured.bytes.lock().unwrap().clone())?;
-        assert!(logs.contains("request started") && logs.contains("body complete"));
+        assert!(
+            logs.contains("request started") && logs.contains("body complete"),
+            "{logs}"
+        );
         assert!(logs.contains("downloaded=4"));
         for secret in [
             "private-path",
@@ -4990,6 +5014,24 @@ mod tests {
 
         assert_eq!(ok, 10);
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let payload = sink.into_inner();
+        assert_eq!(payload.len(), 10);
+        assert_eq!(payload, b"payload123");
+    }
+
+    #[test]
+    fn budgeted_writer_rejects_excess_without_growing_output() {
+        let mut sink = BudgetedWriter::new(Vec::new(), 16);
+
+        let ok = sink.write(b"payload123").unwrap();
+        let cumulative = sink
+            .write(b"1234567")
+            .expect_err("a write must fit the remaining budget");
+        assert_eq!(cumulative.kind(), std::io::ErrorKind::Other);
+        let error = sink.write(&[0u8; 32]).expect_err("budget must abort");
+
+        assert_eq!(ok, 10);
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
         let payload = sink.into_inner();
         assert_eq!(payload.len(), 10);
         assert_eq!(payload, b"payload123");

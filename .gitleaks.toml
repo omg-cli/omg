@@ -32,3 +32,10 @@ condition = "AND"
 regexTarget = "line"
 regexes = ['''^\s*prefix-key: "v2-macos-dependencies"\s*$''']
 paths = ['''^\.github/workflows/ci\.yml$''']
+
+[[rules.allowlists]]
+description = "Synthetic positive-control input for SecretScanner tests"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''^\s*\.scan_content\(\"apikey = 'abcd1234test567890efgh'\", \"config\.py\"\)\s*$''']
+paths = ['''^src/core/security/secrets\.rs$''']
