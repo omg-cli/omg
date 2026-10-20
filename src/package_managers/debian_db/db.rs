@@ -3302,7 +3302,7 @@ mod tests {
     }
 
     #[test]
-    fn fst_identity_preserves_case_collision_policy_and_ignores_input_order() {
+    fn fst_identity_preserves_case_collision_policy_and_ignores_input_order() -> Result<()> {
         let names = [("Bash", 0), ("bash", 1), ("Zsh", 2)];
         let expected = FstMappingId::from_names([("bash", 1), ("zsh", 2)]);
         assert_eq!(FstMappingId::from_names(names), expected);
@@ -3311,6 +3311,22 @@ mod tests {
             FstMappingId::from_names([("bash", 0), ("zsh", 2)]),
             expected
         );
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("index.fst");
+        let canonical = Map::from_iter([("bash", 1), ("zsh", 2)])?;
+        fs::write(&path, canonical.into_fst().into_inner())?;
+        let canonical = FstIndex::open(&path)?;
+        assert_eq!(canonical.map.get("bash"), Some(1));
+        assert_eq!(canonical.map.get("zsh"), Some(2));
+        assert_eq!(canonical.mapping, expected);
+
+        let changed = Map::from_iter([("bash", 0), ("zsh", 2)])?;
+        fs::write(&path, changed.into_fst().into_inner())?;
+        let changed = FstIndex::open(&path)?;
+        assert_eq!(changed.map.get("bash"), Some(0));
+        assert_ne!(changed.mapping, expected);
+        Ok(())
     }
 
     /// Serializes every test that mutates process-global `OMG_TEST_MODE`;
