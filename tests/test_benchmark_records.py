@@ -274,8 +274,12 @@ class BenchmarkAdmissionTests(unittest.TestCase):
         self.assertTrue(self.recorder.validate_results(self.source))
 
     def test_rejects_oversized_measurement_file(self) -> None:
-        (self.source / "search.json").write_bytes(b" " * 1048577)
-        self.assertTrue(self.recorder.validate_results(self.source))
+        payload = {"results": [measurement("OMG", 0.2)], "padding": " " * 1048576}
+        (self.source / "search.json").write_text(json.dumps(payload), encoding="utf-8")
+        self.assertEqual(
+            self.recorder.validate_results(self.source),
+            ["search: measurement file exceeds 1 MiB"],
+        )
 
     def test_missing_hyperfine_never_runs_substitute_timer(self) -> None:
         tools = self.source / "tools"
@@ -641,6 +645,8 @@ class HeadlineResolutionTests(unittest.TestCase):
         )
         daemon = self.recorder.daemon_result(payload)
         self.assertIsNotNone(daemon)
+        self.assertEqual(cast(dict[str, object], daemon)["command"], "OMG (Daemon)")
+        self.assertEqual(cast(dict[str, object], daemon)["mean"], 0.2)
 
     def test_native_result_is_not_the_omg_driver(self) -> None:
         payload = cast(
