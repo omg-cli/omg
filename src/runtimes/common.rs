@@ -2197,6 +2197,11 @@ where
 mod tests {
     #[tokio::test]
     async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "runtimes::common::tests::runtime_download_reports_stalled_body_without_exposing_urls",
+        ) {
+            return Ok(());
+        }
         for url in [
             "https://example.com/private-path?token=private-token",
             "https://example.com?token=private-token",
@@ -2354,7 +2359,10 @@ mod tests {
         assert_eq!(fs::read(&temporary)?, b"abcd");
         assert_eq!(digest, hex::encode(Sha256::digest(b"abcd")));
         let logs = String::from_utf8(captured.bytes.lock().unwrap().clone())?;
-        assert!(logs.contains("request started") && logs.contains("body complete"));
+        assert!(
+            logs.contains("request started") && logs.contains("body complete"),
+            "{logs}"
+        );
         assert!(logs.contains("downloaded=4"));
         for secret in [
             "private-path",
