@@ -1161,17 +1161,63 @@ mod tests {
             .await
             .expect("fixture listener");
         let address = listener.local_addr().expect("fixture address");
+        fn check_fixture_write(
+            result: std::io::Result<()>,
+            oversized: bool,
+        ) -> std::io::Result<()> {
+            match result {
+                Err(error)
+                    if oversized
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ) =>
+                {
+                    Ok(())
+                }
+                result => result,
+            }
+        }
+        assert!(check_fixture_write(Ok(()), false).is_ok());
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+        ] {
+            assert!(check_fixture_write(Err(kind.into()), true).is_ok());
+            assert_eq!(
+                check_fixture_write(Err(kind.into()), false)
+                    .unwrap_err()
+                    .kind(),
+                kind
+            );
+        }
+        assert_eq!(
+            check_fixture_write(Err(std::io::ErrorKind::Other.into()), true)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Other
+        );
+        let oversized_body = format!("[{}]", " ".repeat(16 * 1024 * 1024 - 1));
+        assert_eq!(oversized_body.len(), 16 * 1024 * 1024 + 1);
+        let oversized_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{oversized_body}",
+            oversized_body.len()
+        );
         let server = tokio::spawn(async move {
-            for response in [
-                b"HTTP/1.1 200 OK\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n"
-                    .as_slice(),
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]".as_slice(),
+            for (response, oversized) in [
+                (oversized_response.as_bytes(), true),
+                (
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+                        .as_slice(),
+                    false,
+                ),
             ] {
                 let (mut stream, _) = listener.accept().await.expect("fixture connection");
                 let mut request = [0; 2048];
                 let bytes_read = stream.read(&mut request).await.expect("read request");
                 assert!(bytes_read > 0, "empty request");
-                stream.write_all(response).await.expect("write response");
+                check_fixture_write(stream.write_all(response).await, oversized)
+                    .expect("fixture response write");
             }
         });
         let verifier = SlsaVerifier {

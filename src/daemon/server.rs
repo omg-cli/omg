@@ -1533,6 +1533,22 @@ mod tests {
             .send(vec![0u8; MAX_REQUEST_SIZE + 1].into())
             .await
             .expect_err("a 1 MiB write cap would reject the new response budget");
+
+        // Pin the documented request cap independently of MAX_REQUEST_SIZE.
+        // Reuse the actual configured encoder without writing to a full socket.
+        let mut encoded = tokio_util::bytes::BytesMut::new();
+        let error = tokio_util::codec::Encoder::encode(
+            framed_write.encoder_mut(),
+            tokio_util::bytes::Bytes::from(vec![0u8; 1_048_577]),
+            &mut encoded,
+        )
+        .expect_err("configured request codec must reject literal 1 MiB plus one byte");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "frame size too big");
+        assert!(
+            encoded.is_empty(),
+            "rejected payload must emit no frame bytes"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

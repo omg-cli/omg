@@ -1058,5 +1058,19 @@ mod tests {
         } else {
             assert!(!target.contains("linux-gnu"));
         }
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        {
+            assert!(PythonManager::asset_matches_version(
+                "cpython-3.12.0+20231002-x86_64-unknown-linux-gnu-install_only.tar.gz",
+                "3.12.0",
+                &target,
+            ));
+            assert!(!PythonManager::asset_matches_version(
+                "cpython-3.12.0+20231002-aarch64-unknown-linux-gnu-install_only.tar.gz",
+                "3.12.0",
+                &target,
+            ));
+        }
     }
 }
