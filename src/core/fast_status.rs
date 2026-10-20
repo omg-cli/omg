@@ -185,6 +185,9 @@ mod tests {
         let path = dir.path().join("invalid.bin");
 
         let mut status = FastStatus::new(100, 50, 0, 0);
+        status.write_to_file(&path).unwrap();
+        let read = FastStatus::read_from_file(&path).expect("fresh valid status must be readable");
+        assert_eq!(read.total_packages, 100);
         status.magic = 0xDEAD_BEEF;
         status.write_to_file(&path).unwrap();
 
@@ -197,6 +200,9 @@ mod tests {
         let path = dir.path().join("future.bin");
 
         let mut status = FastStatus::new(100, 50, 0, 0);
+        status.write_to_file(&path).unwrap();
+        let read = FastStatus::read_from_file(&path).expect("fresh valid status must be readable");
+        assert_eq!(read.total_packages, 100);
         status.timestamp = u64::MAX;
         status.write_to_file(&path).unwrap();
 
@@ -209,6 +215,9 @@ mod tests {
         let path = dir.path().join("stale.bin");
 
         let mut status = FastStatus::new(100, 50, 0, 0);
+        status.write_to_file(&path).unwrap();
+        let read = FastStatus::read_from_file(&path).expect("fresh valid status must be readable");
+        assert_eq!(read.total_packages, 100);
         status.timestamp = 0; // Way in the past
         status.write_to_file(&path).unwrap();
 

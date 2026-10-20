@@ -137,6 +137,101 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertEqual(self.compare(), {"deleted_summary_found": 2, "deleted_summary_hit": 2,
                                         "deleted_mapped": 2, "deleted_mapped_hit": 2})
 
+    def shared_brace_compare(self, mutate=None, after=None):
+        old = b"fn unrelated() {\n  unavailable();\n}\nfn obsolete() {\n  exercise();\n}\nfn retained() {\n  keep();\n}\n"
+        new = b"fn unrelated() {\n  unavailable();\n}\nfn retained() {\n  keep();\n}\n"
+        before = [(2, 0), (4, 3), (5, 3), (6, 3), (8, 1), (9, 1)]
+        after = [(2, 0), (5, 1), (6, 1)] if after is None else after
+        def owners(br, hr):
+            br["data"][0]["functions"] = [
+                {"name": "obsolete", "filenames": ["/src/example.rs"],
+                 "regions": [[line, 1, line, 2, 3, 0, 0, 0] for line in (4, 5, 6)]},
+                {"name": "retained", "filenames": ["/src/example.rs"],
+                 "regions": [[line, 1, line, 2, count, 0, 0, 0]
+                             for line, count in before if line not in (4, 5, 6)]}]
+            if mutate:
+                mutate(br, hr)
+        return self.compare(before=before, after=after, mutate=owners,
+                            sources=({"example.rs": old}, {"example.rs": new}))
+
+    def test_deleted_helper_brace_is_not_an_unrelated_retained_brace(self):
+        self.assertEqual(self.shared_brace_compare(), {
+            "deleted_summary_found": 3, "deleted_summary_hit": 3,
+            "deleted_mapped": 3, "deleted_mapped_hit": 3})
+
+    def test_shared_brace_without_deleted_owner_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.shared_brace_compare(mutate=lambda b, h: b["data"][0]["functions"].pop(0))
+
+    def test_shared_brace_with_retained_owner_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.shared_brace_compare(mutate=lambda b, h: h["data"][0]["functions"].append(
+                copy.deepcopy(b["data"][0]["functions"][0])))
+
+    def test_shared_brace_with_duplicate_owner_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.shared_brace_compare(mutate=lambda b, h: b["data"][0]["functions"].append(
+                copy.deepcopy(b["data"][0]["functions"][0])))
+
+    def test_shared_brace_with_non_deleted_owner_region_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.shared_brace_compare(mutate=lambda b, h: b["data"][0]["functions"][0]["regions"].append(
+                [8, 1, 8, 2, 1, 0, 0, 0]))
+
+    def test_shared_brace_with_unmapped_owner_span_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.shared_brace_compare(mutate=lambda b, h: b["data"][0]["functions"][0]["regions"][0].__setitem__(2, 7))
+
+    def test_shared_brace_does_not_excuse_real_retained_loss(self):
+        with self.assertRaises(ValueError):
+            self.shared_brace_compare(after=[(2, 0), (5, 0), (6, 1)])
+
+    def multiline_boundary_compare(self, mutate=None):
+        old = b'fn unrelated() {\n  unavailable();\n}\nfn obsolete() {\n  exercise(\n    "x");\n}\nfn retained() {\n  keep();\n}\nfn obsolete_test() {\n  cases(\n    "x");\n}\n'
+        new = b"fn unrelated() {\n  unavailable();\n}\nfn retained() {\n  keep();\n}\n"
+        tail = b"fn tail() {\n" + b"".join(f"  tail{i}();\n".encode() for i in range(8)) + b"}\n"
+        before = [(2, 0)] + [(line, 1) for line in (*range(4, 15), 16)]
+        after = [(2, 0)] + [(line, 1) for line in (4, 5, 6, 8)]
+        def function(name, regions):
+            return {"name": name, "filenames": ["/src/example.rs"], "regions": regions}
+        def line(number):
+            return [number, 1, number, 2, 1, 0, 0, 0]
+        br, hr = self.regions(before, False), self.regions(after, False)
+        br["data"][0]["files"][0]["summary"]["lines"] = {"count": 14, "covered": 13}
+        br["data"][0]["functions"] = [
+            function("obsolete", [line(4), [5, 1, 6, 8, 1, 0, 0, 0], line(7)]),
+            function("closure", [line(5)]),
+            function("retained", [line(n) for n in (8, 9, 10)]),
+            function("obsolete_test", [line(11), [12, 1, 13, 8, 1, 0, 0, 0], line(14)]),
+            function("tail", [line(16)])]
+        hr["data"][0]["functions"] = [
+            function("retained", [line(n) for n in (4, 5, 6)]), function("tail", [line(8)])]
+        if mutate:
+            mutate(br, hr)
+        def lcov(rows, found, hit):
+            return "SF:/src/example.rs\n" + "".join(f"DA:{n},{c}\n" for n, c in rows) + f"LF:{found}\nLH:{hit}\nend_of_record\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bp, hp, bg, hg = (root / name for name in ("b", "h", "br.gz", "hr.gz"))
+            bp.write_text(lcov(before, 14, 13)); hp.write_text(lcov(after, 5, 4))
+            bg.write_bytes(gzip.compress(json.dumps(br).encode())); hg.write_bytes(gzip.compress(json.dumps(hr).encode()))
+            return coverage.require_source_no_regression(
+                coverage.read_coverage(bp), coverage.read_coverage(hp), bg, hg,
+                {"example.rs": old + tail}, {"example.rs": new + tail})
+
+    def test_multiline_deletion_restores_retained_boundary_and_counts_both_surfaces(self):
+        self.assertEqual(self.multiline_boundary_compare(), {
+            "deleted_summary_found": 9, "deleted_summary_hit": 9,
+            "deleted_mapped": 8, "deleted_mapped_hit": 8})
+
+    def test_multiline_expansion_region_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.multiline_boundary_compare(mutate=lambda b, h: b["data"][0]["functions"][0]["regions"][1].__setitem__(6, 1))
+
+    def test_multiline_end_column_one_is_not_inclusively_expanded(self):
+        with self.assertRaises(ValueError):
+            self.multiline_boundary_compare(mutate=lambda b, h: b["data"][0]["functions"][0]["regions"][1].__setitem__(3, 1))
+
     def test_retained_loss_is_fatal_despite_compensating_gain(self):
         with self.assertRaisesRegex(ValueError, "Retained covered line"):
             self.compare(after=[(1, 0), (2, 1), (3, 1), (4, 0)])
@@ -208,9 +303,9 @@ class SourceAwareCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported region schema"):
             self.compare(mutate=lambda b, h: b.update(version="future"))
 
-    def test_multi_line_deleted_region_is_not_approximated(self):
+    def test_multi_line_deleted_region_cannot_include_retained_source(self):
         with self.assertRaisesRegex(ValueError, "Unsupported deleted region"):
-            self.compare(mutate=lambda b, h: b["data"][0]["functions"][-1]["regions"][0].__setitem__(2, 2))
+            self.compare(mutate=lambda b, h: b["data"][0]["functions"][-1]["regions"][0].__setitem__(2, 3))
 
     def test_ambiguous_repository_source_is_fatal(self):
         with self.assertRaisesRegex(ValueError, "Ambiguous or missing"):

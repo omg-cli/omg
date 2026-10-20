@@ -181,6 +181,18 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     hf, hs = region_evidence(head_regions, head, head_sources)
     if bs.keys() != hs.keys():
         raise ValueError("Added or removed coverage file requires explicit review")
+    head_owners = {}
+    for function in hf:
+        head_owners.setdefault(function["name"], []).append(function)
+    head_names = set(head_owners)
+    base_name_counts = {}
+    base_files = {path: canonical_source(path, base_sources) for path in base.sections}
+    head_files = {path: canonical_source(path, head_sources) for path in head.sections}
+    owners_by_file = {}
+    for function in bf:
+        base_name_counts[function["name"]] = base_name_counts.get(function["name"], 0) + 1
+        for name in {base_files[path] for path in function["filenames"] if path in base_files}:
+            owners_by_file.setdefault(name, []).append(function)
     removed = {}; deleted_mapped = deleted_hit = 0
     for name in bs:
         old = base_sources[name].decode("utf-8").splitlines()
@@ -202,8 +214,60 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 gone.update(range(a + 1, b + 1))
             # Replacement is not proven deletion. Its old counts stay in the
             # strict base ratios, and its new uncovered mappings are refused.
+        anchored = {}
+        for owner in owners_by_file.get(name, []):
+            matches = head_owners.get(owner["name"], [])
+            if base_name_counts[owner["name"]] != 1 or len(matches) != 1:
+                continue
+            current = matches[0]
+            if (len(owner["filenames"]) != 1 or len(current["filenames"]) != 1
+                    or base_files.get(owner["filenames"][0]) != name
+                    or head_files.get(current["filenames"][0]) != name
+                    or not owner["regions"] or not current["regions"]
+                    or any(region[5:] != [0, 0, 0] for region in owner["regions"] + current["regions"])):
+                continue
+            start, end = min(r[0] for r in owner["regions"]), max(r[2] for r in owner["regions"])
+            newstart, newend = min(r[0] for r in current["regions"]), max(r[2] for r in current["regions"])
+            if not (1 <= start <= end <= len(old) and 1 <= newstart <= newend <= len(new)):
+                raise ValueError("Function owner exceeds exact source blob")
+            if old[start - 1:end] == new[newstart - 1:newend]:
+                for oldline, newline in zip(range(start, end + 1), range(newstart, newend + 1)):
+                    if oldline in anchored and anchored[oldline] != newline:
+                        raise ValueError("Ambiguous retained function owner")
+                    anchored[oldline] = newline
+        gone.difference_update(anchored)
+        anchored_new = set(anchored.values())
+        for oldline, newline in list(retained.items()):
+            if oldline in anchored:
+                continue
+            displaced = newline in anchored_new
+            lost = before.get(oldline, 0) > 0 and newline not in after
+            if displaced or lost:
+                if old[oldline - 1].strip() == "}" and oldline - 1 in gone:
+                    owners = [function for function in owners_by_file.get(name, []) if any(
+                        base_files.get(function["filenames"][region[5]]) == name
+                        and region[0] <= oldline <= region[2]
+                        for region in function["regions"])]
+                    if len(owners) == 1:
+                        owner = owners[0]
+                        if (base_name_counts[owner["name"]] == 1 and owner["name"] not in head_names
+                                and len(owner["filenames"]) == 1 and all(
+                                    len(region) == 8 and region[0] <= region[2]
+                                    and (region[0] == region[2] or region[3] > 1)
+                                    and region[5:] == [0, 0, 0]
+                                    and type(region[4]) is int and region[4] >= 0
+                                    and all(line in before and (line == oldline or line in gone)
+                                            for line in range(region[0], region[2] + 1))
+                                    for region in owner["regions"])):
+                            gone.add(oldline)
+                            del retained[oldline]
+                            continue
+                raise ValueError("Retained covered line lost coverage or mapping")
+        retained.update(anchored)
+        if len(set(retained.values())) != len(retained):
+            raise ValueError("Ambiguous retained source correspondence")
         for oldline, newline in retained.items():
-            if oldline in before and before[oldline] > 0 and after.get(newline, 0) == 0:
+            if before.get(oldline, 0) > 0 and after.get(newline, 0) == 0:
                 raise ValueError("Retained covered line lost coverage or mapping")
         retained_new = set(retained.values())
         uncovered = next((line for line, count in after.items()
@@ -218,10 +282,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         require_no_regression(base, head)
         return {"deleted_summary_found": 0, "deleted_summary_hit": 0,
                 "deleted_mapped": 0, "deleted_mapped_hit": 0}
-    head_names = {f["name"] for f in hf}; deleted_found = deleted_summary_hit = 0
-    base_name_counts = {}
-    for function in bf:
-        base_name_counts[function["name"]] = base_name_counts.get(function["name"], 0) + 1
+    deleted_found = deleted_summary_hit = 0
     accounted = {name: set() for name in bs}
     deleted_summaries = {name: [0, 0] for name in bs}
     deleted_geometries = set()
@@ -233,24 +294,29 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 # LLVM JSON includes functions excluded from its file/LCOV surface.
                 # They cannot authorize any subtraction from selected file summaries.
                 continue
-            name = canonical_source(filenames[region[5]], base_sources)
+            name = base_files[filenames[region[5]]]
             if any(line in removed.get(name, set()) for line in range(region[0], region[2] + 1)):
                 touched.append(region)
         if not touched:
             continue
         if base_name_counts[function["name"]] != 1 or function["name"] in head_names or len(filenames) != 1 or len(touched) != len(regions):
             raise ValueError("Deleted region has retained or ambiguous function owner")
-        name = canonical_source(filenames[0], base_sources); counts = {}
+        name = base_files[filenames[0]]; counts = {}
         geometry = (name, tuple(sorted(tuple(region[:4] + region[5:]) for region in regions)))
         if geometry in deleted_geometries:
             raise ValueError("Duplicate deleted region owner geometry")
         deleted_geometries.add(geometry)
         for region in regions:
-            if len(region) != 8 or region[0] != region[2] or region[7] != 0 or region[5] != 0 or region[6] != 0 or region[0] not in removed[name]:
+            if (len(region) != 8 or region[0] > region[2]
+                    or (region[0] != region[2] and region[3] <= 1)
+                    or region[5:] != [0, 0, 0]
+                    or any(line not in removed[name] or line not in bs[name]["counts"]
+                           for line in range(region[0], region[2] + 1))):
                 raise ValueError("Unsupported deleted region attribution")
             if type(region[4]) is not int or region[4] < 0:
                 raise ValueError("Invalid region count")
-            counts[region[0]] = max(counts.get(region[0], 0), region[4])
+            for line in range(region[0], region[2] + 1):
+                counts[line] = max(counts.get(line, 0), region[4])
         deleted_found += len(counts); deleted_summary_hit += sum(count > 0 for count in counts.values())
         deleted_summaries[name][0] += len(counts)
         deleted_summaries[name][1] += sum(count > 0 for count in counts.values())

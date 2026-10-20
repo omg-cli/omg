@@ -302,29 +302,6 @@ fn supported_distro_label(distro: Distro) -> Option<&'static str> {
     }
 }
 
-/// Whether a lists-dir entry is a package index the apt backend can parse:
-/// the name carries `_Packages` and the encoding is one
-/// `package_managers::debian_db` reads (uncompressed, lz4, gz, xz).
-/// InRelease metadata, lock files, and pdiff fragments do not count.
-#[cfg(test)]
-fn is_apt_packages_index(path: &std::path::Path) -> bool {
-    let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    apt_lists_entry_has_index(filename)
-}
-
-/// Whether a lists directory holds at least one parseable package index.
-#[cfg(test)]
-fn apt_lists_have_packages(lists: &std::path::Path) -> bool {
-    lists.is_dir()
-        && std::fs::read_dir(lists).is_ok_and(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .any(|entry| is_apt_packages_index(&entry.path()))
-        })
-}
-
 /// Check content from one bounded, read-only snapshot per native input.
 fn check_debian_infra() -> usize {
     if crate::core::paths::test_mode() {
@@ -627,22 +604,6 @@ async fn query_homebrew_path(
         "Homebrew returned an invalid path"
     );
     Ok(std::path::PathBuf::from(value))
-}
-
-/// Whether an APT lists entry carries a package index. Modern APT acquires
-/// compressed indexes (`_Packages.lz4`, `.gz`, `.xz` depending on
-/// server/config — see #299), so the compression suffix must be stripped
-/// before testing the `_Packages` stem. `InRelease`/`Release` files alone
-/// are not indexes.
-#[cfg(test)]
-fn apt_lists_entry_has_index(file_name: &str) -> bool {
-    file_name.ends_with("_Packages")
-        || file_name.rsplit_once('.').is_some_and(|(name, encoding)| {
-            name.ends_with("_Packages")
-                && ["lz4", "gz", "xz"]
-                    .iter()
-                    .any(|supported| encoding.eq_ignore_ascii_case(supported))
-        })
 }
 
 /// Check the Arch Linux infrastructure the ALPM backend depends on:
@@ -2143,23 +2104,6 @@ mod tests {
     }
 
     #[test]
-    fn apt_index_detection_accepts_plain_and_compressed_entries() {
-        // Citations: #299 evidence — bookworm lists carry *_Packages.lz4 +
-        // InRelease; .gz/.xz depend on server/config.
-        assert!(apt_lists_entry_has_index(
-            "deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages"
-        ));
-        assert!(apt_lists_entry_has_index(
-            "deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages.lz4"
-        ));
-        assert!(apt_lists_entry_has_index("mirror_Packages.gz"));
-        assert!(apt_lists_entry_has_index("mirror_Packages.xz"));
-        assert!(!apt_lists_entry_has_index("deb.debian.org_InRelease"));
-        assert!(!apt_lists_entry_has_index("lock"));
-        assert!(!apt_lists_entry_has_index("partial"));
-    }
-
-    #[test]
     fn non_success_non_redirect_mirror_status_is_an_issue() {
         assert!(mirror_status_is_issue(
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
@@ -2323,64 +2267,6 @@ mod tests {
         assert_eq!(parse_test_distro("rhel"), Distro::Fedora);
         assert_eq!(parse_test_distro("darwin"), Distro::MacOS);
         assert_eq!(parse_test_distro("nonsense"), Distro::Unknown);
-    }
-
-    /// #299: stock Debian/Ubuntu ships compressed indexes
-    /// (`*_Packages.lz4`, no uncompressed `*_Packages`), which the apt
-    /// backend parses — doctor must accept the same files it depends on.
-    #[test]
-    fn compressed_packages_indexes_count_as_healthy() {
-        let dir = tempfile::TempDir::new().expect("isolated lists dir");
-        for name in [
-            "deb.debian.org_debian_dists_bookworm_InRelease",
-            "deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages.lz4",
-            "lock",
-        ] {
-            std::fs::write(dir.path().join(name), b"").expect("fixture file");
-        }
-        assert!(apt_lists_have_packages(dir.path()));
-
-        let dir = tempfile::TempDir::new().expect("isolated lists dir");
-        for name in [
-            "mirror_dists_noble_main_binary-amd64_Packages.gz",
-            "mirror_dists_noble_main_binary-amd64_Packages.xz",
-            "mirror_dists_noble_main_binary-amd64_Packages",
-        ] {
-            std::fs::write(dir.path().join(name), b"").expect("fixture file");
-        }
-        assert!(apt_lists_have_packages(dir.path()));
-    }
-
-    #[test]
-    fn dotted_host_packages_indexes_count_as_healthy() {
-        for suffix in ["", ".lz4", ".gz", ".xz", ".LZ4", ".GZ", ".XZ"] {
-            let dir = tempfile::TempDir::new().expect("isolated lists dir");
-            let name =
-                format!("deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages{suffix}");
-            std::fs::write(dir.path().join(name), b"").expect("index fixture");
-            assert!(apt_lists_have_packages(dir.path()), "suffix {suffix:?}");
-        }
-    }
-
-    /// InRelease metadata, lock files, and pdiff fragments are not package
-    /// indexes; an empty or index-free lists dir stays an issue.
-    #[test]
-    fn non_index_lists_content_stays_an_issue() {
-        let dir = tempfile::TempDir::new().expect("isolated lists dir");
-        assert!(!apt_lists_have_packages(dir.path()));
-        for name in [
-            "deb.debian.org_debian_dists_bookworm_InRelease",
-            "lock",
-            "partial",
-            "mirror_main_binary-amd64_Packages.diff_Index",
-            "deb.debian.org_main_binary-amd64_Packages.bz2",
-            "deb.debian.org_main_binary-amd64_Packages.diff.gz",
-            "mirror_main_binary-amd64_Packages_backup",
-            "mirror_main_binary-amd64_Packages.gz.bak",
-        ] {
-            std::fs::write(dir.path().join(name), b"").expect("fixture file");
-        }
-        assert!(!apt_lists_have_packages(dir.path()));
     }
 
     // W3-A-03: exit contract — 0 issues is Ok (exit 0); any issue count is
@@ -2624,6 +2510,186 @@ mod tests {
 #[cfg(all(test, any(feature = "debian", feature = "debian-pure")))]
 mod debian_native_health_tests {
     use super::check_debian_infra_at;
+
+    fn doctor_index_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempfile::tempdir().expect("owned doctor fixture");
+        let status = root.path().join("status");
+        let lists = root.path().join("lists");
+        std::fs::write(
+            &status,
+            "Package: fixture\nVersion: 1\nArchitecture: amd64\nStatus: hold ok installed\n",
+        )
+        .expect("valid owned dpkg status");
+        std::fs::create_dir(&lists).expect("owned APT lists");
+        (root, status, lists)
+    }
+
+    fn write_valid_doctor_index(path: &std::path::Path) {
+        use std::io::Write;
+
+        let paragraph = b"Package: fixture\nVersion: 1\nArchitecture: amd64\n\n";
+        let bytes = match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("lz4") => {
+                let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                encoder.write_all(paragraph).expect("encode LZ4 paragraph");
+                encoder.finish().expect("finish LZ4 frame")
+            }
+            Some("gz") => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(paragraph).expect("encode gzip paragraph");
+                encoder.finish().expect("finish gzip stream")
+            }
+            Some("xz") => {
+                let mut bytes = Vec::new();
+                lzma_rs::xz_compress(&mut std::io::Cursor::new(paragraph), &mut bytes)
+                    .expect("encode XZ paragraph");
+                bytes
+            }
+            _ => paragraph.to_vec(),
+        };
+        std::fs::write(path, bytes).expect("write valid owned APT index");
+    }
+
+    #[test]
+    fn apt_index_detection_accepts_plain_and_compressed_entries() {
+        for (name, compressed) in [
+            (
+                "deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages",
+                false,
+            ),
+            (
+                "deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages.lz4",
+                true,
+            ),
+            ("mirror_Packages.gz", true),
+            ("mirror_Packages.xz", true),
+        ] {
+            let (_root, status, lists) = doctor_index_fixture();
+            let path = lists.join(name);
+            std::fs::write(&path, b"").expect("original empty index fixture");
+            assert_eq!(
+                check_debian_infra_at(&status, &lists),
+                usize::from(compressed),
+                "empty {name}"
+            );
+            write_valid_doctor_index(&path);
+            assert_eq!(check_debian_infra_at(&status, &lists), 0, "valid {name}");
+        }
+        for name in ["deb.debian.org_InRelease", "lock", "partial"] {
+            let (_root, status, lists) = doctor_index_fixture();
+            std::fs::write(lists.join(name), b"").expect("original non-index fixture");
+            assert_eq!(
+                check_debian_infra_at(&status, &lists),
+                1,
+                "non-index {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_packages_indexes_count_as_healthy() {
+        let (_root, status, lists) = doctor_index_fixture();
+        for name in [
+            "deb.debian.org_debian_dists_bookworm_InRelease",
+            "deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages.lz4",
+            "lock",
+        ] {
+            std::fs::write(lists.join(name), b"").expect("original fixture file");
+        }
+        assert_eq!(
+            check_debian_infra_at(&status, &lists),
+            1,
+            "empty LZ4 is not a readable index"
+        );
+        write_valid_doctor_index(
+            &lists.join("deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages.lz4"),
+        );
+        assert_eq!(check_debian_infra_at(&status, &lists), 0);
+
+        let (_root, status, lists) = doctor_index_fixture();
+        for name in [
+            "mirror_dists_noble_main_binary-amd64_Packages.gz",
+            "mirror_dists_noble_main_binary-amd64_Packages.xz",
+            "mirror_dists_noble_main_binary-amd64_Packages",
+        ] {
+            std::fs::write(lists.join(name), b"").expect("original fixture file");
+        }
+        assert_eq!(
+            check_debian_infra_at(&status, &lists),
+            1,
+            "empty compressed streams are unhealthy"
+        );
+        for name in [
+            "mirror_dists_noble_main_binary-amd64_Packages.gz",
+            "mirror_dists_noble_main_binary-amd64_Packages.xz",
+        ] {
+            write_valid_doctor_index(&lists.join(name));
+        }
+        assert_eq!(
+            check_debian_infra_at(&status, &lists),
+            0,
+            "valid compressed streams and plain empty index"
+        );
+    }
+
+    #[test]
+    fn dotted_host_packages_indexes_count_as_healthy() {
+        for suffix in ["", ".lz4", ".gz", ".xz", ".LZ4", ".GZ", ".XZ"] {
+            let (_root, status, lists) = doctor_index_fixture();
+            let name =
+                format!("deb.debian.org_debian_dists_bookworm_main_binary-amd64_Packages{suffix}");
+            let path = lists.join(&name);
+            std::fs::write(&path, b"").expect("original index fixture");
+            assert_eq!(
+                check_debian_infra_at(&status, &lists),
+                usize::from(!suffix.is_empty()),
+                "empty suffix {suffix:?}"
+            );
+            write_valid_doctor_index(&path);
+            assert_eq!(
+                check_debian_infra_at(&status, &lists),
+                0,
+                "valid suffix {suffix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_index_lists_content_stays_an_issue() {
+        let (_root, status, lists) = doctor_index_fixture();
+        let control = lists.join("control_Packages.gz");
+        write_valid_doctor_index(&control);
+        assert_eq!(
+            check_debian_infra_at(&status, &lists),
+            0,
+            "valid index positive control"
+        );
+        std::fs::remove_file(control).expect("retire owned positive control");
+        assert_eq!(
+            check_debian_infra_at(&status, &lists),
+            1,
+            "original empty lists case"
+        );
+        for name in [
+            "deb.debian.org_debian_dists_bookworm_InRelease",
+            "lock",
+            "partial",
+            "mirror_main_binary-amd64_Packages.diff_Index",
+            "deb.debian.org_main_binary-amd64_Packages.bz2",
+            "deb.debian.org_main_binary-amd64_Packages.diff.gz",
+            "mirror_main_binary-amd64_Packages_backup",
+            "mirror_main_binary-amd64_Packages.gz.bak",
+        ] {
+            std::fs::write(lists.join(name), b"").expect("original non-index fixture");
+        }
+        assert_eq!(check_debian_infra_at(&status, &lists), 1);
+    }
 
     #[test]
     fn debian_health_labels_satisfy_the_guest_output_oracle() -> anyhow::Result<()> {
