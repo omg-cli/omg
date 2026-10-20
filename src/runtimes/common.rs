@@ -2197,19 +2197,28 @@ where
 mod tests {
     #[tokio::test]
     async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
-        for url in [
-            "https://example.com/private-path?token=private-token",
-            "https://example.com?token=private-token",
-            "https://example.com#private-fragment",
-            "https://private-user:private-password@example.com/archive",
-            "invalid-private-url",
+        for (url, expected_host) in [
+            (
+                "https://example.com/private-path?token=private-token",
+                "example.com",
+            ),
+            ("https://example.com?token=private-token", "example.com"),
+            ("https://example.com#private-fragment", "example.com"),
+            (
+                "https://private-user:private-password@example.com/archive",
+                "example.com",
+            ),
+            ("invalid-private-url", "unknown-host"),
         ] {
-            assert_runtime_download_logs_are_redacted(url).await?;
+            assert_runtime_download_logs_are_redacted(url, expected_host).await?;
         }
         Ok(())
     }
 
-    async fn assert_runtime_download_logs_are_redacted(host_url: &str) -> anyhow::Result<()> {
+    async fn assert_runtime_download_logs_are_redacted(
+        host_url: &str,
+        expected_host: &str,
+    ) -> anyhow::Result<()> {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2288,6 +2297,38 @@ mod tests {
             let logs = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
             assert!(logs.contains("Runtime download body progress"), "{logs}");
             assert!(!logs.contains("Runtime download body complete"));
+            let progress = logs
+                .lines()
+                .find(|line| line.contains("Runtime download body progress"))
+                .expect("complete heartbeat event");
+            let fields: Vec<_> = progress
+                .split_whitespace()
+                .filter_map(|token| token.split_once('='))
+                .collect();
+            for name in [
+                "attempt",
+                "host",
+                "bytes_received",
+                "downloaded",
+                "elapsed_ms",
+            ] {
+                assert_eq!(
+                    fields.iter().filter(|(key, _)| *key == name).count(),
+                    1,
+                    "{progress}"
+                );
+            }
+            let value = |name: &str| fields.iter().find(|(key, _)| *key == name).unwrap().1;
+            let number = |name: &str| {
+                value(name)
+                    .parse::<u128>()
+                    .expect("numeric heartbeat field")
+            };
+            assert_eq!(number("attempt"), 1, "{progress}");
+            assert_eq!(value("host").trim_matches('"'), expected_host, "{progress}");
+            assert_eq!(number("bytes_received"), number("downloaded"), "{progress}");
+            assert!(number("bytes_received") <= 1, "{progress}");
+            assert!(number("elapsed_ms") >= 30_000, "{progress}");
             tokio::time::resume();
             release.send(()).unwrap();
             Ok::<_, anyhow::Error>(())
