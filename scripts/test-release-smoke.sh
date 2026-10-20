@@ -359,7 +359,7 @@ cat > "$probe_package/omg" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
   --version) printf 'omg 9.9.9\n' ;;
-  search) printf '  tree 1.0\n' ;;
+  search) printf '%s\n' "${FAKE_SEARCH_OUTPUT-  tree 1.0}"; exit "${FAKE_SEARCH_EXIT:-0}" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -369,6 +369,23 @@ probe_env=(OMG_SMOKE_PROBE_KIND=search-tree OMG_PROBE_VERSION_NUM=9.9.9
   OMG_PROBE_BIN=omg-v9.9.9-x86_64-linux-arch/omg OMG_PROBE_INDEX_CMD=true
   OMG_PROBE_REMOVED_ASSERT=true OMG_PROBE_ROOT="$probe_root")
 assert_rc 0 env "${probe_env[@]}" bash "$probe"
+fedora_probe_package="$probe_root/omg-v9.9.9-x86_64-linux-fedora"
+mkdir -p "$fedora_probe_package"
+cp "$probe_package/omg" "$probe_package/omgd" "$fedora_probe_package/"
+fedora_probe_env=("${probe_env[@]}" OMG_PROBE_BIN=omg-v9.9.9-x86_64-linux-fedora/omg)
+export FAKE_SEARCH_OUTPUT='  tree.x86_64 2.2.1-4.fc44  Official'
+assert_rc 0 env "${fedora_probe_env[@]}" bash "$probe"
+assert_rc 1 env "${probe_env[@]}" bash "$probe"
+for search_row in '  tree-sitter.x86_64 1.0 Official' '  tree.aarch64 1.0 Official' \
+  '  nottree.x86_64 1.0 Official' '  tree.x86_64-extra 1.0 Official' \
+  '  note tree.x86_64 1.0 Official' '  tree.evil 1.0 Official' \
+  '  foreign/tree.x86_64 1.0 Official' '  tree.x86_64' ''; do
+  export FAKE_SEARCH_OUTPUT="$search_row"
+  assert_rc 1 env "${fedora_probe_env[@]}" bash "$probe"
+done
+export FAKE_SEARCH_OUTPUT='  tree.x86_64 2.2.1-4.fc44  Official' FAKE_SEARCH_EXIT=1
+assert_rc 1 env "${fedora_probe_env[@]}" bash "$probe"
+unset FAKE_SEARCH_OUTPUT FAKE_SEARCH_EXIT
 printf '#!/usr/bin/env bash\nprintf "omgd 9.9.8\\n"\n' > "$probe_package/omgd"
 assert_rc 1 env "${probe_env[@]}" bash "$probe"
 rm "$probe_package/omgd"

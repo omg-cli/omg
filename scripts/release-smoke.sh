@@ -357,7 +357,14 @@ case "$OMG_SMOKE_PROBE_KIND" in
   search-tree)
     search_output="$("$bin" search tree)" || exit 1
     printf '%s\n' "$search_output"
-    grep -Eqi '^[[:space:]]+tree[[:space:]]' <<< "$search_output"
+    search_name=tree
+    case "$OMG_PROBE_BIN" in
+      *-x86_64-linux-fedora/omg) search_name=tree.x86_64 ;;
+    esac
+    awk -v package="$search_name" '
+      /^[[:space:]]/ && $1 == package && NF >= 2 { found = 1 }
+      END { exit !found }
+    ' <<< "$search_output"
     ;;
   install-tree)
     "$bin" install --yes tree || exit 1
