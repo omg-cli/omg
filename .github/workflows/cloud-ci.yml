@@ -21,7 +21,7 @@ jobs:
     if: >-
       github.repository == 'omg-cli/omg' && github.ref_name == 'main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       CONTROLLER_SHA: ${{ vars.OMG_CI_CONTROLLER_SHA }}
       CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

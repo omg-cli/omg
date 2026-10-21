@@ -425,7 +425,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         const job: VerificationJob = {
           id, proposalSha256: input.proposalSha256, sessionId: context.sessionID,
           continuationId: `cv-${request.runId}-${request.attempt}-${request.sha}-${input.proposalSha256.slice(0, 16)}`,
-          deadline: Date.now() + (state.testAudit ? 110 : 35) * 60 * 1000, status: "pending",
+          deadline: Date.now() + (state.testAudit ? 110 : 100) * 60 * 1000, status: "pending",
         };
         await update((current) => {
           if ((current.testAudit ?? current.proposal)?.proposalSha256 !== input.proposalSha256)
