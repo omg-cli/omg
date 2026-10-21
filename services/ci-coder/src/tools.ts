@@ -86,7 +86,7 @@ async function ciJson(
       method: body ? "POST" : "GET",
       headers: { Authorization: `Bearer ${env.CI_API_TOKEN}`, "Content-Type": "application/json" },
       body,
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
     },
   );
@@ -140,7 +140,7 @@ export async function pollCodingVerification(
   const load = (key: string) => {
     const [kind, , name] = key.split("/");
     return env.CI_SERVICE.fetch(`https://omg-cloud-ci.latham.workers.dev/runs/${id}/${kind}/${name}`, {
-      headers:{Authorization:`Bearer ${env.CI_API_TOKEN}`},signal,redirect:"error"});
+      headers:{Authorization:`Bearer ${env.CI_API_TOKEN}`},signal,redirect:"manual"});
   };
   if (state.testAudit) {
     await verifyCloudTestAudit(receipt, ciRequest, policy, load);
@@ -179,7 +179,7 @@ export async function pollCodingVerification(
       {
         headers: { Authorization: `Bearer ${env.CI_API_TOKEN}` },
         signal: signal,
-        redirect: "error",
+        redirect: "manual",
       },
     );
   });
