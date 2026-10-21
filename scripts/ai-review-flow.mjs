@@ -23,6 +23,7 @@ import {
     verifyCloudCiObjects,
     parseCloudCiRequest,
     cloudCiPlanSha256,
+    admitCloudCiRuntime,
 } from "./cloud-ci-evidence.mjs";
 import { expectedCloudChecks } from "../services/cloud-ci/runner/plan.mjs";
 import {
@@ -904,6 +905,7 @@ async function createController(github, controllerRevision) {
     const config = await protectedConfig("omg-cloud-ci.json");
     const policy = ciPolicy(config);
     const token = await secret(config.tokenFile);
+    admitCloudCiRuntime(await fetchJson(new URL("/health", config.endpoint), token));
     const coder = await protectedConfig("omg-ci-coder.json");
     const codingEndpoint = coderEndpoint(coder);
     const codingToken = await secret(coder.tokenFile);
