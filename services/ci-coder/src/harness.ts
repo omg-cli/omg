@@ -190,7 +190,7 @@ export class Coder extends DurableObject<Env> {
       ...identity,
       status: outcome.status,
       reason:
-        outcome.status === "unanswered" ? "Agent operation did not complete successfully" : null,
+        outcome.status === "unanswered" ? outcome.reason ?? "Agent operation did not complete successfully" : null,
       result: outcome.status === "done" ? await readCodingResult(this.ctx.storage) : null,
       initialOperation: { operationId: id, status: initialOutcome.status },
       continuation,
