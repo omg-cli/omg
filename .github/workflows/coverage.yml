@@ -192,7 +192,7 @@ jobs:
       - name: Generate function coverage evidence
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         run: |
-          LLVM_COV_FLAGS='-show-functions src/core/security/audit.rs' \
+          LLVM_COV_FLAGS='-show-functions -sources src/core/security/audit.rs' \
             cargo llvm-cov report > coverage-functions.txt
           test -s coverage-functions.txt
 
