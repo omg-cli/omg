@@ -89,7 +89,14 @@ export const testAuditToolSchema = z.strictObject({
     ]),
     assertion: z.strictObject({
         line: z.number().int().positive().safe(),
-        source: z.string().min(1).max(2000).optional(),
+        source: z
+            .string()
+            .min(1)
+            .max(2000)
+            .describe(
+                "One physical assertion line, already rustfmt-stable; omit messages that would wrap; a rustfmt diff is setup failure, not proof",
+            )
+            .optional(),
     }),
     fault: z.strictObject({
         path: z.string().max(240),
