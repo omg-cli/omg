@@ -1,163 +1,22 @@
-name: AI source review
-
-run-name: ${{ inputs.scope == 'test-audit' && format('Test audit {0} {1} {2}', inputs.audit_parent || 'initial', inputs.audit_sha || github.sha, inputs.audit_cursor || '0') || github.workflow }}
+name: Replay verified audit publication 39629747963
 
 on:
   workflow_dispatch:
-    inputs:
-      branch:
-        description: Trusted branch to review at its current exact head
-        type: choice
-        options: [main]
-        default: main
-        required: true
-      publish:
-        description: Publish unconfirmed findings with verified fix PRs for human review
-        type: boolean
-        default: false
-      scope:
-        description: Review current changes, one immutable source audit page, or pending runtime evidence
-        type: choice
-        options: [changes, source-audit, runtime-events, test-audit]
-        default: changes
-      audit_sha:
-        description: Exact commit for a resumed source audit
-        type: string
-      audit_digest:
-        description: Immutable Git tree inventory digest for a resumed audit
-        type: string
-      audit_cursor:
-        description: Next bounded source audit page cursor
-        type: string
-      audit_parent:
-        description: Prior durable audit run and attempt
-        type: string
-      audit_manifest:
-        description: Exact campaign manifest digest for a continuation
-        type: string
-      audit_resnapshot:
-        description: Trusted parent continuation at a renewed exact main source
-        type: boolean
-        default: false
-  schedule:
-    - cron: '23 6 * * 1'
-    - cron: '*/15 * * * *'
-    - cron: '11 */6 * * *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: omg-ai-review-global
+  group: omg-audit-publication-39629747963
   cancel-in-progress: false
-  queue: max
 
 env:
   WRANGLER_SEND_METRICS: "false"
   CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
 
 jobs:
-  review:
-    if: >-
-      github.repository == 'omg-cli/omg' &&
-      github.ref_name == 'main' &&
-      github.event.schedule != '11 */6 * * *' &&
-      (github.event_name == 'schedule' ||
-       (github.event_name == 'workflow_dispatch' && github.event.inputs.branch == 'main'))
-    runs-on: ubuntu-24.04
-    timeout-minutes: ${{ inputs.scope == 'test-audit' && 210 || 150 }}
-    permissions:
-      contents: read
-      actions: read
-    outputs:
-      controller-sha: ${{ steps.review.outputs.controller-sha }}
-      publish: ${{ steps.review.outputs.publish }}
-      verified: ${{ steps.review.outputs.verified }}
-      audit-next: ${{ steps.review.outputs.audit-next }}
-      runtime-ack: ${{ steps.review.outputs.runtime-ack }}
-      test-audit: ${{ steps.review.outputs.test-audit }}
-    steps:
-      - name: Validate immutable review controller
-        env:
-          CONTROLLER_SHA: ${{ vars.OMG_CI_CONTROLLER_SHA }}
-        shell: bash
-        run: '[[ "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]'
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          ref: ${{ vars.OMG_CI_CONTROLLER_SHA }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify trusted controller Bun
-        shell: bash
-        run: |
-          set -euo pipefail
-          tools="$RUNNER_TEMP/omg-bun-1.4.2"
-          mkdir -m 700 -p "$tools"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
-            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
-          unzip -q "$tools/bun.zip" -d "$tools"
-          directory="$tools/bun-linux-x64"
-          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
-          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
-          printf '%s\n' "$directory" >> "$GITHUB_PATH"
-      - name: Create private OMG service configuration
-        env:
-          OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
-          OMG_CI_INSPECTOR_TOKEN: ${{ secrets.OMG_CI_INSPECTOR_TOKEN }}
-          OMG_CI_CODER_TOKEN: ${{ secrets.OMG_CI_CODER_TOKEN }}
-          OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
-          OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
-          OMG_CI_CODER_SKILL_BUNDLE_SHA256: ${{ vars.OMG_CI_CODER_SKILL_BUNDLE_SHA256 }}
-        run: |
-          bun run - <<'JS'
-          import { mkdirSync, writeFileSync } from "node:fs";
-          import { homedir } from "node:os";
-          import path from "node:path";
-          const root = path.join(homedir(), "ci");
-          const services = [
-            ["omg-cloud-ci", "OMG_CI_API_TOKEN", "https://omg-cloud-ci.latham.workers.dev/"],
-            ["omg-ci-inspector", "OMG_CI_INSPECTOR_TOKEN", "https://omg-ci-inspector.latham.workers.dev/"],
-            ["omg-ci-coder", "OMG_CI_CODER_TOKEN", "https://omg-ci-coder.latham.workers.dev/"],
-          ];
-          const { OMG_CI_IMAGE_DIGEST: imageDigest, OMG_CI_VERIFIER_REVISION: verifierRevision,
-            OMG_CI_CODER_SKILL_BUNDLE_SHA256: bundleSha256 } = process.env;
-          if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest ?? "") ||
-              !/^[a-f0-9]{40}$/.test(verifierRevision ?? "") ||
-              !/^[a-f0-9]{64}$/.test(bundleSha256 ?? "")) throw new Error("Missing immutable OMG deployment pins");
-          for (const [, variable] of services)
-            if (!/^[^\s]{32,512}$/.test(process.env[variable] ?? "")) throw new Error(`Missing dedicated OMG credential: ${variable}`);
-          mkdirSync(root, { mode: 0o700 });
-          for (const [name, variable, endpoint] of services) {
-            const tokenFile = path.join(root, `${name}.token`);
-            writeFileSync(tokenFile, process.env[variable], { mode: 0o600, flag: "wx" });
-            writeFileSync(path.join(root, `${name}.json`), JSON.stringify({ endpoint, tokenFile,
-              ...(name === "omg-cloud-ci" ? { imageDigest, verifierRevision } : {}),
-              ...(name === "omg-ci-coder" ? { bundleSha256 } : {}),
-            }), { mode: 0o600, flag: "wx" });
-          }
-          JS
-      - name: Install trusted controller dependencies
-        run: bun install --frozen-lockfile --ignore-scripts
-      - name: Install trusted review schema dependencies
-        run: bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
-      - name: Install trusted coding schema dependencies
-        run: bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
-      - name: Install trusted verifier schema dependencies
-        run: bun install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts
-      - name: Collect, review and independently verify exact source
-        id: review
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bun scripts/ai-review-flow.mjs collect .audit/ai-review
-
-      - name: Remove private OMG service configuration
-        if: always()
-        shell: bash
-        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json"
-
   publish:
-    needs: review
-    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && needs.review.result == 'success' && needs.review.outputs.verified != '0'
+    if: github.repository == 'omg-cli/omg' && github.event_name == 'workflow_dispatch' && github.ref_name == 'codex/cloud-publication-proof-replay'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -169,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          ref: ${{ needs.review.outputs.controller-sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Verify trusted controller Bun
         shell: bash
@@ -228,13 +87,7 @@ jobs:
         run: bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
       - name: Install trusted verifier schema dependencies
         run: bun install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts
-      - name: Re-fetch server proof and preview publication
-        if: needs.review.outputs.publish != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bun scripts/ai-review-flow.mjs publish .audit/ai-review
       - name: Require dedicated OMG GitHub App configuration
-        if: needs.review.outputs.publish == 'true'
         env:
           APP_CLIENT_ID: ${{ vars.OMG_CI_PUBLISHER_APP_CLIENT_ID }}
           APP_PRIVATE_KEY: ${{ secrets.OMG_CI_PUBLISHER_APP_PRIVATE_KEY }}
@@ -245,8 +98,28 @@ jobs:
           test -n "$APP_PRIVATE_KEY"
           [[ "$OMG_CI_PUBLISHER_LOGIN" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]
           [[ "$OMG_CI_PUBLISHER_ID" =~ ^[1-9][0-9]*$ ]]
+      - name: Verify original successful review job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/omg-cli/omg/actions/runs/39629747963/attempts/2 > "$RUNNER_TEMP/original-attempt.json"
+          gh api 'repos/omg-cli/omg/actions/runs/39629747963/attempts/2/jobs?per_page=100' > "$RUNNER_TEMP/original-jobs.json"
+          bun - <<'JS'
+          import assert from "node:assert/strict";
+          const run = await Bun.file(process.env.RUNNER_TEMP + "/original-attempt.json").json();
+          const jobs = (await Bun.file(process.env.RUNNER_TEMP + "/original-jobs.json").json()).jobs;
+          assert.equal(run.id, 39629747963);
+          assert.equal(run.run_attempt, 2);
+          assert.equal(run.repository.full_name, "omg-cli/omg");
+          assert.equal(run.event, "workflow_dispatch");
+          assert.equal(run.head_branch, "main");
+          assert.equal(run.head_sha, "31bbddd87936e27f908789c29f3b203a9754612a");
+          assert.equal(run.path, ".github/workflows/ai-review.yml");
+          assert.equal(run.status, "completed");
+          assert.equal(jobs.filter(job => job.name === "review" && job.conclusion === "success").length, 1);
+          JS
       - name: Mint repository-scoped OMG publisher token
-        if: needs.review.outputs.publish == 'true'
         id: publisher-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
         with:
@@ -258,94 +131,13 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
       - name: Re-fetch server proof and publish issues with verified fix PRs
-        if: needs.review.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in 1 2 3; do
-            if bun scripts/ai-review-flow.mjs publish .audit/ai-review --publish; then exit 0; fi
-            if [ "$attempt" -lt 3 ]; then sleep 10; fi
-          done
-          exit 1
+          bun scripts/replay-test-audit-39629747963.mjs --publish
       - name: Remove private OMG service configuration
         if: always()
         shell: bash
         run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json"
-
-  continue:
-    needs: [review, publish]
-    if: >-
-      always() &&
-      ((github.event_name == 'schedule' && github.event.schedule == '11 */6 * * *') ||
-       (needs.review.result == 'success' &&
-        (needs.publish.result == 'success' || needs.publish.result == 'skipped' ||
-         (needs.review.outputs.test-audit == 'true' && needs.publish.result == 'failure')) &&
-        (needs.review.outputs.audit-next == 'true' || needs.review.outputs.runtime-ack == 'true')))
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          ref: ${{ needs.review.outputs.controller-sha || vars.OMG_CI_CONTROLLER_SHA }}
-          persist-credentials: false
-      - name: Verify trusted controller Bun
-        shell: bash
-        run: |
-          set -euo pipefail
-          tools="$RUNNER_TEMP/omg-bun-1.4.2"
-          mkdir -m 700 -p "$tools"
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
-            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
-          unzip -q "$tools/bun.zip" -d "$tools"
-          directory="$tools/bun-linux-x64"
-          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
-          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
-          printf '%s\n' "$directory" >> "$GITHUB_PATH"
-      - name: Create private review record configuration
-        env:
-          OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
-          OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
-          OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
-        run: |
-          bun run - <<'JS'
-          import { mkdirSync, writeFileSync } from "node:fs";
-          import { homedir } from "node:os";
-          import path from "node:path";
-          const root = path.join(homedir(), "ci");
-          const { OMG_CI_API_TOKEN: token, OMG_CI_IMAGE_DIGEST: imageDigest, OMG_CI_VERIFIER_REVISION: verifierRevision } = process.env;
-          if (!/^[^\s]{32,512}$/.test(token ?? "")) throw new Error("Missing dedicated OMG credential");
-          mkdirSync(root, { mode: 0o700 });
-          const tokenFile = path.join(root, "omg-cloud-ci.token");
-          writeFileSync(tokenFile, token, { mode: 0o600, flag: "wx" });
-          writeFileSync(path.join(root, "omg-cloud-ci.json"), JSON.stringify({
-            endpoint: "https://omg-cloud-ci.latham.workers.dev/", tokenFile, imageDigest, verifierRevision,
-          }), { mode: 0o600, flag: "wx" });
-          JS
-      - name: Install trusted controller dependencies
-        run: bun install --frozen-lockfile --ignore-scripts
-      - name: Install trusted review schema dependencies
-        run: bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
-      - name: Install trusted coding schema dependencies
-        run: bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
-      - name: Install trusted verifier schema dependencies
-        run: bun install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts
-      - name: Continue exact source audit after durable review and publication
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PUBLICATION_RESULT: ${{ needs.publish.result }}
-          RECOVERY_TICK: ${{ github.event_name == 'schedule' && github.event.schedule == '11 */6 * * *' }}
-        run: |
-          if [ "$RECOVERY_TICK" = true ]; then
-            bun scripts/ai-review-flow.mjs recover .audit/ai-review
-          else
-            bun scripts/ai-review-flow.mjs continue .audit/ai-review
-          fi
-      - name: Remove private review record configuration
-        if: always()
-        shell: bash
-        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json"
