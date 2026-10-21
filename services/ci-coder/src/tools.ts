@@ -10,6 +10,7 @@ import { createCoderProposal, type CoderProposal } from "./proposal.js";
 import { sourceReviewProposalSchema } from "../../ci-inspector/src/review-contract";
 import { verifyPublicationProof } from "../../../scripts/ai-review-proof.mjs";
 import { verifyCloudCiObjects } from "../../../scripts/cloud-ci-evidence.mjs";
+import { createDependencyTool, dependencyLockRange, type DependencyPlan } from "./dependency";
 
 type Json = z.infer<ReturnType<typeof z.json>>;
 
@@ -27,6 +28,7 @@ export type CodingState = {
   calls: number;
   reads: ReadRange[];
   proposal?: CoderProposal;
+  dependencyPlan?: DependencyPlan;
   testAudit?: Pick<CoderTestAudit,"proposal"|"proposalSha256">;
   verification?: { proposalSha256: string; id: string; receipt: Json };
   verifiedDigests: string[];
@@ -258,6 +260,8 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           } : {}),
           hypothesis: request.hypothesis ?? null,
           candidateIndex: request.candidateIndex ?? null,
+          ...(request.dependencyTask ? {dependencyTask:request.dependencyTask,
+            lockRanges:request.dependencyTask.targets.map(target=>({...target,...dependencyLockRange(request.source.sourceFiles.find(file=>file.path==="Cargo.lock")!.content,target)}))} : {}),
         });
       },
     },
@@ -320,6 +324,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       async execute(input: z.infer<typeof sourceReviewProposalSchema>, context: ToolContext) {
         const request = await enter(context);
         if (request.testAuditTask) throw new Error("Use the separate existing-test audit tools");
+        if(request.dependencyTask) throw new Error("Use the separate dependency planning tool");
         const { repository, sha, branch, runId, attempt, source } = request;
 
         const proposal = createCoderProposal(
@@ -357,6 +362,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         });
       },
     },
+    propose_dependency_updates: createDependencyTool(enter, update),
     propose_test_strengthening: {
       input: testAuditToolSchema,
       description: "Audit the selected test against an evidence-only source fault. For an adequate test use existing-test-sensitivity with unchanged bytes; strengthening inserts one assertion. Never publish the fault.",
@@ -497,6 +503,7 @@ export function createCodingTools(
         editor.add({ name: "read_source", ...actions.read_source });
         editor.add({ name: "read_skill", ...actions.read_skill });
         editor.add({ name: "propose_fix", ...actions.propose_fix });
+        editor.add({ name: "propose_dependency_updates", ...actions.propose_dependency_updates });
         editor.add({ name: "propose_test_strengthening", ...actions.propose_test_strengthening });
         editor.add({ name: "verify_patch", ...actions.verify_patch });
         editor.add({ name: "export_proposal", ...actions.export_proposal });
