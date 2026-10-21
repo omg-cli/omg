@@ -42,7 +42,7 @@ test("portable execution drops identity and does not inherit controller credenti
     }
 });
 
-test("preparation preserves protected source, parents and correct dependency metadata without write syscalls", () => {
+test("preparation enables owned fixtures while preserving protected source and dependency metadata", () => {
     const modulePath = new URL("../runner/portable-process.mjs", import.meta.url).href;
 
     const child = spawnSync("node", [
@@ -90,7 +90,7 @@ test("preparation preserves protected source, parents and correct dependency met
       const { preparePortable } = await import(${JSON.stringify(modulePath)});
       const context = preparePortable(path.normalize("/workspace"), ["src/tracked.txt", "src/tracked-executable.mjs", ".audit/deep-audit.tsv"], { protectedRoots: [] });
       context.assertSource();
-      assert.deepEqual(writes.filter(([, file]) => file === "/workspace" || file === "/workspace/src" || file.startsWith("/workspace/src/") || file === "/workspace/.audit" || file.startsWith("/workspace/.audit/")), []);
+      assert.deepEqual(writes.filter(([, file]) => file === "/workspace" || file === "/workspace/src" || file.startsWith("/workspace/src/") || file === "/workspace/.audit" || file.startsWith("/workspace/.audit/")), [["chmod", "/workspace", 0o1777]]);
       assert.deepEqual(writes.filter(([, file]) => file === dependency), []);
       const forFile = (name) => writes.filter(([, file]) => file === "/workspace/node_modules/" + name);
       assert.deepEqual(forFile("special.js"), [["chmod", "/workspace/node_modules/special.js", 0o644]]);

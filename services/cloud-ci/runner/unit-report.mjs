@@ -35,3 +35,24 @@ function namedNodes(node, name) {
     key === name ? (Array.isArray(value) ? value : [value]) : namedNodes(value, name),
   );
 }
+
+export function summarizeUnitFailures(document) {
+  const failed = namedNodes(document, "testcase").filter(
+    (item) => Object.hasOwn(item, "failure") || Object.hasOwn(item, "error"),
+  );
+  const failures = failed.slice(0, 8).map((item) => {
+    const detail = (item.failure ?? item.error)?.[0];
+    return {
+      name: String(item.$?.name ?? "").slice(0, 300),
+      classname: String(item.$?.classname ?? "").slice(0, 300),
+      message: String(detail?.$?.message ?? "").slice(0, 1000),
+      output: String(typeof detail === "string" ? detail : detail?._ ?? "").slice(0, 1500),
+    };
+  });
+  const summary = { failed: failed.length, omitted: failed.length - failures.length, failures };
+  while (Buffer.byteLength(JSON.stringify(summary)) > 12000 && failures.length) {
+    failures.pop();
+    summary.omitted++;
+  }
+  return summary;
+}

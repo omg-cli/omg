@@ -18,7 +18,7 @@ export function portableOptions(workspace, home, env = {}) {
         gid: 10001,
         detached: true,
         env: {
-            PATH: "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
+            PATH: "/opt/omg-python/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
             HOME: home,
             TMPDIR: `${home}/tmp`,
             CI: "true",
@@ -129,7 +129,9 @@ export function preparePortable(
 
         if (info.uid !== 0 || info.gid !== 0) chownSync(parent, 0, 0);
 
-        if ((info.mode & 0o7777) !== 0o755) chmodSync(parent, 0o755);
+        const mode = parent === workspace ? 0o1777 : 0o755;
+
+        if ((info.mode & 0o7777) !== mode) chmodSync(parent, mode);
     }
 
     visit(workspace, (file, info) => {
