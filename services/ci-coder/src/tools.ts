@@ -11,6 +11,7 @@ import { sourceReviewProposalSchema } from "../../ci-inspector/src/review-contra
 import { verifyPublicationProof } from "../../../scripts/ai-review-proof.mjs";
 import { verifyCloudCiObjects } from "../../../scripts/cloud-ci-evidence.mjs";
 import { createDependencyTool, dependencyLockRange, type DependencyPlan } from "./dependency";
+import { testAuditContext, createSourceSearch } from "./source-navigation";
 
 type Json = z.infer<ReturnType<typeof z.json>>;
 
@@ -240,7 +241,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           repository: request.repository,
           sha: request.sha,
           changedPaths: request.source.changedPaths,
-          files: request.source.sourceFiles.map(({ path, blobSha }) => ({ path, blobSha })),
+          files: request.source.sourceFiles.map(({ path, blobSha, content }) => ({ path, blobSha, lines:content.split("\n").length })),
         });
       },
     },
@@ -251,7 +252,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       async execute(_input: z.infer<typeof noInput>, context: ToolContext) {
         const request = await enter(context);
 
-        return output({
+        return output(z.json().parse({
           diff: request.source.diff,
           ciFailures: request.source.ciFailures,
           ...(request.source.runtimeEvidence ? {
@@ -262,9 +263,11 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           candidateIndex: request.candidateIndex ?? null,
           ...(request.dependencyTask ? {dependencyTask:request.dependencyTask,
             lockRanges:request.dependencyTask.targets.map(target=>({...target,...dependencyLockRange(request.source.sourceFiles.find(file=>file.path==="Cargo.lock")!.content,target)}))} : {}),
-        });
+          ...testAuditContext(request),
+        }));
       },
     },
+    find_source: createSourceSearch(enter),
     read_source: {
       input: z.strictObject({
         path: z.string().min(1).max(300),
@@ -501,6 +504,7 @@ export function createCodingTools(
         editor.add({ name: "list_sources", ...actions.list_sources });
         editor.add({ name: "read_context", ...actions.read_context });
         editor.add({ name: "read_source", ...actions.read_source });
+        editor.add({ name: "find_source", ...actions.find_source });
         editor.add({ name: "read_skill", ...actions.read_skill });
         editor.add({ name: "propose_fix", ...actions.propose_fix });
         editor.add({ name: "propose_dependency_updates", ...actions.propose_dependency_updates });
