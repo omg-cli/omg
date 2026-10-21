@@ -37,6 +37,8 @@ export default {async fetch(request,env){
   }};
   async function run(options){
     const name=options.name;
+    assert.equal(options.config.timeout,name==='rust-portable-tests'?2_400_000:1_200_000);
+    assert.equal(options.config.commandTimeoutMs,name==='rust-portable-tests'?2_370_000:1_170_000);
     if(mode==='parallel-failure' && name==='script-contracts') throw new Error('fixture script command failed');
     if(mode==='parallel-failure' && name==='rust-portable-tests') await new Promise(resolve=>setTimeout(resolve,20));
     assert.equal(options.env.OMG_DIAGNOSTIC_RUN_ID,id);

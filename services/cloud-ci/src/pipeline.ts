@@ -16,6 +16,7 @@ import {
     inapplicableCloudChecks,
     planIdentity,
     runSourceFormat,
+    rustTimeouts,
 } from "../runner/plan.mjs";
 import { z } from "zod";
 import { backupTransferMode } from "./backup-policy";
@@ -32,6 +33,7 @@ const config = {
     commandTimeoutMs: 1_170_000,
     snapshotRetentionSeconds: 86_400,
 };
+const rustConfig = { ...config, timeout: rustTimeouts.step, commandTimeoutMs: rustTimeouts.command };
 
 const reportSchema = z.strictObject({
     name: z.enum([
@@ -252,7 +254,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                 const result: CheckResult = await deps.runner({
                     name: "regression-red-green",
                     command: "node /opt/omg-ci/run.mjs regression-red-green",
-                    config,
+                    config: rustConfig,
                     env: {
                         OMG_CI_LEAF_STEP: "regression-red-green",
                         OMG_EXPECTED_SHA: request.sha,
@@ -295,7 +297,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                         const result: CheckResult = await deps.runner({
                             name,
                             command: `node /opt/omg-ci/run.mjs ${name}`,
-                            config,
+                            config: name === "rust-portable-tests" ? rustConfig : config,
                             env,
                         });
 

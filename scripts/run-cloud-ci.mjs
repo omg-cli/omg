@@ -63,7 +63,7 @@ const started = await start.json();
 if (started.id !== expectedId || started.sha !== sha)
     throw new Error("Cloudflare CI start identity mismatch.");
 
-const deadline = Date.now() + 35 * 60 * 1000;
+const deadline = Date.now() + 60 * 60 * 1000;
 let previousStatus;
 
 for (;;) {

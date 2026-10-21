@@ -940,7 +940,7 @@ async function createController(github, controllerRevision) {
             );
 
             if (started.id !== id) throw new Error("Coding operation start identity mismatch.");
-            const deadline = Date.now() + (testAuditTask ? 120 : 45) * 60 * 1000;
+            const deadline = Date.now() + (testAuditTask ? 120 : 110) * 60 * 1000;
 
             for (;;) {
                 const state = await fetchJson(
@@ -990,7 +990,7 @@ async function createController(github, controllerRevision) {
 
                     if (started.id !== id || started.sha !== sha)
                         throw new Error("Formatting run identity mismatch.");
-                    const deadline = Date.now() + 40 * 60 * 1000;
+                    const deadline = Date.now() + 60 * 60 * 1000;
 
                     for (;;) {
                         if (Date.now() >= deadline)

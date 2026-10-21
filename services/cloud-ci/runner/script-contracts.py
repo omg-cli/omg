@@ -4,6 +4,7 @@ from pathlib import Path
 import unittest
 
 NATIVE_TEST_IDS = frozenset({
+    'test_gitignore_audit_artifacts.GitignoreAuditArtifacts.test_audit_record_is_tracked',
     'test_export_qemu_evidence.DescriptorTests.test_root_owned_diagnostics_export_for_runner_without_changing_source',
     'test_qemu_doctor_turbo_oracle.CapabilityOracleTests.test_changed_copy_refuses_even_when_write_clears_capabilities',
     'test_qemu_doctor_turbo_oracle.CapabilityOracleTests.test_changed_original_refuses',
