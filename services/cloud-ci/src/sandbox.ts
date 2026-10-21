@@ -1,12 +1,13 @@
 import { CiSandbox as NativeCiSandbox } from "@cloudflare/ci/worker";
 import { PhaseDiagnostics, type StopDetails } from "./phase-diagnostics";
 import { backupTransferMode, leafSnapshotOptions } from "./backup-policy";
-import { retainUnitReport } from "./unit-report-retention";
+import { retainRunnerLog, retainUnitReport } from "./unit-report-retention";
 
 export class CiSandbox extends NativeCiSandbox {
   private phases?: PhaseDiagnostics;
   private fuseExitCode?: number;
   private reportRunId?: string;
+  private diagnosticRunId?: string;
   private leafStep?: string;
   private get diagnostics() {
     return (this.phases ??= new PhaseDiagnostics(this.ctx.id.toString(), (key, value) =>
@@ -90,6 +91,7 @@ export class CiSandbox extends NativeCiSandbox {
         ? args[1]?.env?.OMG_REPORT_RUN_ID
         : undefined;
     this.leafStep = args[1]?.env?.OMG_CI_LEAF_STEP;
+    this.diagnosticRunId = args[1]?.env?.OMG_DIAGNOSTIC_RUN_ID;
 
     return this.trace("process-start", () => super.startProcess(...args));
   }
@@ -111,6 +113,20 @@ export class CiSandbox extends NativeCiSandbox {
   override destroy() {
     return this.trace("destroy", async () => {
       try {
+        if (this.diagnosticRunId && this.leafStep) {
+          for (const stream of ["stdout", "stderr"]) {
+            const status = await retainRunnerLog(this.diagnosticRunId, this.leafStep, stream, {
+              listFiles: (path) => super.listFiles(path),
+              readReport: async () => (
+                await super.readFile(`/tmp/ci-step.${stream === "stdout" ? "out" : "err"}`, {
+                  encoding: "none",
+                })
+              ).content,
+            }, this.env.BACKUP_BUCKET);
+            if (status !== "saved")
+              console.warn(JSON.stringify({ event: "runner_log_unavailable", stream, status }));
+          }
+        }
         if (this.reportRunId) {
           const status = await retainUnitReport(
             this.reportRunId,

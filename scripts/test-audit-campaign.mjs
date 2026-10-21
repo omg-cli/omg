@@ -274,17 +274,20 @@ export async function parentPublicationResult(github, parentRef, report) {
     )
         throw new Error("Invalid parent attempt");
     const [id, attempt] = parentRef.split("-");
-    const metadata = await github.request(
-        "GET",
-        `/repos/omg-cli/omg/actions/runs/${id}/attempts/${attempt}`,
-    );
+    const [metadata, workflow] = await Promise.all([
+        github.request("GET", `/repos/omg-cli/omg/actions/runs/${id}/attempts/${attempt}`),
+        github.request("GET", "/repos/omg-cli/omg/actions/workflows/ai-review.yml"),
+    ]);
     if (
         String(metadata.id) !== id ||
         metadata.run_attempt !== Number(attempt) ||
         metadata.head_sha !== (report.triggerSha ?? report.sha) ||
         metadata.head_branch !== "main" ||
         metadata.path !== ".github/workflows/ai-review.yml" ||
-        metadata.name !== "AI source review" ||
+        !Number.isSafeInteger(workflow.id) || workflow.id < 1 ||
+        metadata.workflow_id !== workflow.id ||
+        workflow.path !== ".github/workflows/ai-review.yml" ||
+        workflow.name !== "AI source review" ||
         metadata.repository?.full_name !== "omg-cli/omg" ||
         !["workflow_dispatch", "schedule"].includes(metadata.event)
     )
