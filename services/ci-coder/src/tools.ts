@@ -96,6 +96,54 @@ async function ciJson(
   return z.json().parse(await response.json());
 }
 
+const FAILURE_LOG_BYTES = 8192;
+
+async function readBoundedText(response: Response, limit: number) {
+  const reader = response.body?.getReader();
+  if (!reader) return { text: "", bytes: 0 };
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (bytes < limit) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      const take = chunk.value.subarray(0, limit - bytes);
+      chunks.push(take);
+      bytes += take.byteLength;
+    }
+    if (bytes >= limit) await reader.cancel();
+  } finally {
+    reader.releaseLock();
+  }
+  const joined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { text: new TextDecoder().decode(joined), bytes };
+}
+
+// Bounded, authenticated, same-origin failure log for one exact terminal job id. Its text is untrusted data.
+async function failureLogDetail(env: ActionsOptions["env"], id: string, signal: AbortSignal) {
+  try {
+    const response = await env.CI_SERVICE.fetch(
+      `https://omg-cloud-ci.latham.workers.dev/runs/${id}/logs/failure.txt`,
+      {
+        method: "GET",
+        headers: { Authorization: `Bearer ${env.CI_API_TOKEN}` },
+        redirect: "manual",
+        signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+      },
+    );
+    if (!response.ok) return `unavailable (HTTP ${response.status})`;
+    const { text, bytes } = await readBoundedText(response, FAILURE_LOG_BYTES);
+    return `(untrusted data, ${bytes} bytes read):\n${text}`;
+  } catch {
+    return "unavailable (log request failed)";
+  }
+}
+
 // Each call runs in one fresh authenticated status request, never a long model-tool loop.
 // https://developers.cloudflare.com/workers/runtime-apis/bindings/service-bindings/#limits
 export async function pollCodingVerification(
@@ -119,8 +167,11 @@ export async function pollCodingVerification(
     const status = z.object({ id: z.literal(id), sha: z.literal(request.sha),
       status: z.enum(["queued", "running", "waiting", "paused", "complete", "errored", "terminated", "unknown"]),
     }).parse(await ciJson(env, `/runs/${id}`, signal));
-    if (["errored", "terminated", "unknown"].includes(status.status))
-      throw new Error(`Coding verification ended ${status.status}`);
+    if (["errored", "terminated"].includes(status.status)) {
+      const detail = await failureLogDetail(env, job.id, signal);
+      throw new Error(`Coding verification ended ${status.status}; verifier failure log ${detail}`);
+    }
+    if (status.status === "unknown") throw new Error("Coding verification ended unknown");
     if (status.status !== "complete") return job;
   const receipt = await ciJson(env, `/runs/${id}/receipt`, signal);
 
