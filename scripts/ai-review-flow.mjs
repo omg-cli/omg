@@ -357,16 +357,21 @@ export async function runReviewFlow({ target, io }) {
     }
     if (precollected?.sourceRange?.kind === "test-audit" && precollected.entries.length === 0)
         return runTestAuditPage({collected:precollected,sha,branch,formatting:{status:"not-required",reason:"no-admitted-test-task"},publishRequested:target.publish,io});
-    if (precollected && precollected.entries.length === 0)
+    if (precollected && precollected.entries.length === 0) {
+        const formatting = target.upstream
+            ? await io.format(sha, branch, target.upstream)
+            : { status: "not-required", reason: "no-admitted-source" };
         return {
             repository: SOURCE_REPOSITORY, branch, sha, baseSha: precollected.baseSha,
-            sourceRange: precollected.sourceRange, status: "no-reviewable-source",
-            formatting: { status: "not-required", reason: "no-admitted-source" },
+            sourceRange: precollected.sourceRange,
+            status: target.upstream && formatting.status !== "passed" ? "format-blocked" : "no-reviewable-source",
+            formatting,
             suppliedPaths: [], readPaths: [], unreviewedPaths: precollected.unreviewedPaths,
             batches: [], publications: [], candidateOutcomes: [], publishRequested: target.publish,
             ...(precollected.runtimeEvents ? { runtimeEvents: precollected.runtimeEvents } : {}),
             coverageMeaning: "No model inference or native verification was started because no source was admitted.",
         };
+    }
     const formatting = await io.format(sha, branch, target.upstream);
 
     if (formatting.status !== "passed")
