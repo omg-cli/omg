@@ -6,7 +6,7 @@ COPY services/cloud-ci/runner/ /opt/omg-ci/runner/
 COPY services/cloud-ci/verifier.mjs /opt/omg-ci/verifier.mjs
 COPY scripts/rust-source-policy.mjs /scripts/rust-source-policy.mjs
 COPY scripts/prepare-node-test-fixture.py /scripts/prepare-node-test-fixture.py
-RUN python3 /scripts/prepare-node-test-fixture.py --destination /opt/omg-node-test-fixture && chown -R 10001:10001 /opt/omg-node-test-fixture && setpriv --reuid=10001 --regid=10001 --clear-groups python3 /scripts/prepare-node-test-fixture.py --destination /opt/omg-node-test-fixture
+RUN setpriv --reuid=10001 --regid=10001 --clear-groups python3 /scripts/prepare-node-test-fixture.py --destination /opt/omg-node-test-fixture
 RUN chmod -R a+rX,go-w /opt/omg-ci /scripts
 RUN node /opt/omg-ci/verification-envelope-smoke.mjs
 RUN node /opt/omg-ci/frozen-rust-inputs-smoke.mjs
