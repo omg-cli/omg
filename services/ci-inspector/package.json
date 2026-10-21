@@ -1,0 +1,24 @@
+{
+  "name": "@codeloud/ci-inspector",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "build": "wrangler deploy --dry-run --outdir dist"
+  },
+  "dependencies": {
+    "@cloudflare/codemode": "0.5.5",
+    "ai": "7.0.146",
+    "workers-ai-provider": "4.0.1",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261019.1",
+    "@types/bun": "1.4.3",
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2",
+    "wrangler": "4.151.2"
+  },
+  "packageManager": "bun@1.4.2"
+}

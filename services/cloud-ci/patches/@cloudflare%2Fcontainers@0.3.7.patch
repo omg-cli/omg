@@ -1,0 +1,9 @@
+diff --git a/dist/lib/container.d.ts b/dist/lib/container.d.ts
+index 83e084ff646b52054db0f389652531880491518d..a35abce95fff73e015fc4b7aaf3681331ba81135 100644
+--- a/dist/lib/container.d.ts
++++ b/dist/lib/container.d.ts
+@@ -1,3 +1,4 @@
++import type { Request, Response } from "@cloudflare/workers-types/index.ts";
+ import type { ContainerOptions, ContainerStartOptions, ContainerStartConfigOptions, Schedule, StopParams, State, WaitOptions, CancellationOptions, StartAndWaitForPortsOptions } from '../types';
+ import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
+ export type OutboundHandlerContext<Params = unknown> = {

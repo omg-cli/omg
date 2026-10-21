@@ -1,0 +1,275 @@
+diff --git a/src/ci/runners/runner.ts b/src/ci/runners/runner.ts
+index aa6068d..117060d 100644
+--- a/src/ci/runners/runner.ts
++++ b/src/ci/runners/runner.ts
+@@ -1 +1,2 @@
+-// Copyright (c) 2026 Cloudflare, Inc.
++import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
++// Copyright (c) 2026 Cloudflare, Inc.
+@@ -23,2 +24,3 @@ export type RunOutput = {
+-  preview: { stdout: string; stderr: string };
+-};
++  preview: { stdout: string; stderr: string };
++  logSizes?: { stdout: number; stderr: number };
++};
+diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
+index 4fb4a42..c5a62a8 100644
+--- a/src/ci/runners/sandbox.ts
++++ b/src/ci/runners/sandbox.ts
+@@ -1 +1,4 @@
+-// Copyright (c) 2026 Cloudflare, Inc.
++import type * as Workers from "@cloudflare/workers-types/index.ts";
++type ReadableStream<R> = Workers.ReadableStream<R>;
++declare const ReadableStream: typeof Workers.ReadableStream;
++// Copyright (c) 2026 Cloudflare, Inc.
+@@ -104,3 +107,3 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+-      });
+-      const rawLogs = await readLogs(sandbox);
+-      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
++      });
++      const { logs: rawLogs, sizes: logSizes } = await readLogs(sandbox);
++      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
+@@ -110,3 +113,3 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+-      if (streams.length === 0) {
+-        return { exitCode, logs: rawLogs, preview, snapshot };
+-      }
++      if (streams.length === 0) {
++        return { exitCode, logs: rawLogs, logSizes, preview, snapshot };
++      }
+@@ -135,2 +138,3 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+-        snapshot,
+-      };
++        snapshot,
++        logSizes,
++      };
+@@ -150,4 +154,7 @@ async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
+-  return {
+-    stdout: await readLog(sandbox, STDOUT_FILE, sizes.get(STDOUT_FILE) ?? 0),
+-    stderr: await readLog(sandbox, STDERR_FILE, sizes.get(STDERR_FILE) ?? 0),
+-  };
++  return {
++    logs: {
++      stdout: await readLog(sandbox, STDOUT_FILE, sizes.get(STDOUT_FILE) ?? 0),
++      stderr: await readLog(sandbox, STDERR_FILE, sizes.get(STDERR_FILE) ?? 0),
++    },
++    sizes: { stdout: sizes.get(STDOUT_FILE) ?? 0, stderr: sizes.get(STDERR_FILE) ?? 0 },
++  };
+@@ -161,3 +168,3 @@ async function readLog(
+-  if (size > INLINE_LOG_BYTES) {
+-    return sandbox.readFileStream(file);
+-  }
++  if (size > INLINE_LOG_BYTES) {
++    return (await sandbox.readFile(file, { encoding: 'none' })).content;
++  }
+@@ -205,9 +212,4 @@ function withCleanup(
+-  const reader = stream.getReader();
+-  let released = false;
+-  const releaseOnce = async () => {
+-    if (!released) {
+-      released = true;
+-      await release();
+-    }
+-  };
+-  return new ReadableStream<Uint8Array>({
++  const reader = stream.getReader();
++  let releasePromise: Promise<void> | undefined;
++  const releaseOnce = () => (releasePromise ??= release());
++  return new ReadableStream<Uint8Array>({
+@@ -217,4 +219,4 @@ function withCleanup(
+-        if (result.done) {
+-          controller.close();
+-          await releaseOnce();
+-        } else {
++        if (result.done) {
++          await releaseOnce();
++          controller.close();
++        } else {
+@@ -223,4 +225,4 @@ function withCleanup(
+-      } catch (error) {
+-        controller.error(error);
+-        await releaseOnce();
+-      }
++      } catch (error) {
++        await releaseOnce();
++        controller.error(error);
++      }
+diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
+index 2d70c69..56dfa0e 100644
+--- a/src/ci/step-notification.ts
++++ b/src/ci/step-notification.ts
+@@ -15,2 +15,3 @@ export type StepExecution = {
+-  preview: { stdout: string; stderr: string };
+-  // The restorable workspace backup (always produced on success), kept separate
++  preview: { stdout: string; stderr: string };
++  logSizes?: { stdout: number; stderr: number };
++  // The restorable workspace backup (always produced on success), kept separate
+@@ -77,2 +78,3 @@ export async function withStepNotification(
+-      logs: completed.logs,
+-      snapshot: completed.snapshot,
++      logs: completed.logs,
++      logSizes: completed.logSizes,
++      snapshot: completed.snapshot,
+diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
+index 9603fd2..805a719 100644
+--- a/src/ci/capabilities.ts
++++ b/src/ci/capabilities.ts
+@@ -193,2 +193,3 @@ async function executeStep(
+-    logs: result.logs,
+-    preview: result.preview,
++    logs: result.logs,
++    logSizes: result.logSizes,
++    preview: result.preview,
+diff --git a/src/pipeline/types.ts b/src/pipeline/types.ts
+index a1f5ff3..1dff707 100644
+--- a/src/pipeline/types.ts
++++ b/src/pipeline/types.ts
+@@ -1 +1,2 @@
+-// Copyright (c) 2026 Cloudflare, Inc.
++import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
++// Copyright (c) 2026 Cloudflare, Inc.
+@@ -138,2 +139,3 @@ export type CiRunStepInput = {
+-export type CiRunStepOutput = {
+-  exitCode: number;
++export type CiRunStepOutput = {
++  logSizes?: { stdout: number; stderr: number };
++  exitCode: number;
+diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
+index a0ac164..5fe4524 100644
+--- a/src/pipeline/ci-workflow.ts
++++ b/src/pipeline/ci-workflow.ts
+@@ -27,2 +27,3 @@ import { runCiStep } from '../ci/capabilities';
+-import { RunnerGroup } from './runner-group';
+-
++import { RunnerGroup } from './runner-group';
++import { persistLogs, restoreLogs } from './persisted-logs';
++
+@@ -147,4 +148,4 @@ export abstract class CIWorkflow<
+-        return step
+-          .do(options.name, config.workflow, (ctx) =>
+-            runCiStep(this.env, provider, {
+-              ...runContext,
++        return step
++          .do(options.name, config.workflow, async (ctx) => {
++            const output = await runCiStep(this.env, provider, {
++              ...runContext,
+@@ -162,6 +163,12 @@ export abstract class CIWorkflow<
+-              secrets: options.secrets,
+-            })
+-          )
+-          .then((output) =>
+-            Object.freeze({
+-              ...output,
++              secrets: options.secrets,
++            });
++            return persistLogs(
++              this.env.BACKUP_BUCKET,
++              `logs/${event.instanceId}/native/${crypto.randomUUID()}`,
++              output
++            );
++          })
++          .then(async (stored) => {
++            const output = await restoreLogs(this.env.BACKUP_BUCKET, stored);
++            return Object.freeze({
++              ...output,
+@@ -169,4 +176,4 @@ export abstract class CIWorkflow<
+-                invoke(nextOptions, output.snapshot),
+-            })
+-          );
+-      });
++                invoke(nextOptions, output.snapshot),
++            });
++          });
++      });
+diff --git a/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
+new file mode 100644
+index 0000000..b1d457f
+--- /dev/null
++++ b/src/pipeline/persisted-logs.ts
+@@ -0,0 +1,87 @@
++import type * as Workers from '@cloudflare/workers-types/index.ts';
++import type { CiRunStepOutput } from './types';
++
++declare const FixedLengthStream: typeof Workers.FixedLengthStream;
++
++type StoredLog = string | { r2Key: string };
++type StoredOutput = Omit<CiRunStepOutput, 'logs'> & {
++  logs: { stdout: StoredLog; stderr: StoredLog };
++};
++
++export async function persistLogs(
++  bucket: R2Bucket,
++  prefix: string,
++  output: CiRunStepOutput
++): Promise<StoredOutput> {
++  const results = await Promise.allSettled([
++    storeLog(bucket, `${prefix}/stdout`, output.logs.stdout, output.logSizes?.stdout),
++    storeLog(bucket, `${prefix}/stderr`, output.logs.stderr, output.logSizes?.stderr),
++  ]);
++  const [stdout, stderr] = results;
++  if (stdout.status === 'rejected') throw stdout.reason;
++  if (stderr.status === 'rejected') throw stderr.reason;
++  return { ...output, logs: { stdout: stdout.value, stderr: stderr.value } };
++}
++
++async function storeLog(
++  bucket: R2Bucket,
++  r2Key: string,
++  log: CiRunStepOutput['logs']['stdout'],
++  size: number | undefined
++): Promise<StoredLog> {
++  if (typeof log === 'string') return log;
++  if (size === undefined || !Number.isSafeInteger(size) || size < 0) {
++    await log.cancel().catch(() => {});
++    throw new Error('Streamed CI log has no valid byte length');
++  }
++  const body = new FixedLengthStream(size);
++  const reader = log.getReader();
++  const writer = body.writable.getWriter();
++  const transfer = (async () => {
++    try {
++      for (;;) {
++        const chunk = await reader.read();
++        if (chunk.done) break;
++        await writer.write(chunk.value);
++      }
++      await writer.close();
++    } catch (error) {
++      await writer.abort(error).catch(() => {});
++      throw error;
++    } finally {
++      await reader.cancel().catch(() => {});
++      writer.releaseLock();
++    }
++  })();
++  const upload = Promise.resolve().then(() => bucket.put(r2Key, body.readable, {
++    httpMetadata: { contentType: 'application/octet-stream' },
++  })).catch(async (error) => {
++    await body.readable.cancel(error).catch(() => {});
++    throw error;
++  });
++  const [transferred, uploaded] = await Promise.allSettled([transfer, upload]);
++  if (uploaded.status === 'rejected') throw uploaded.reason;
++  if (transferred.status === 'rejected') throw transferred.reason;
++  return { r2Key };
++}
++
++export async function restoreLogs(
++  bucket: R2Bucket,
++  output: StoredOutput
++): Promise<CiRunStepOutput> {
++  const stdout = await loadLog(bucket, output.logs.stdout);
++  try {
++    const stderr = await loadLog(bucket, output.logs.stderr);
++    return { ...output, logs: { stdout, stderr } };
++  } catch (error) {
++    if (typeof stdout !== 'string') await stdout.cancel().catch(() => {});
++    throw error;
++  }
++}
++
++async function loadLog(bucket: R2Bucket, log: StoredLog) {
++  if (typeof log === 'string') return log;
++  const object = await bucket.get(log.r2Key);
++  if (!object) throw new Error('Persisted CI log is missing');
++  return object.body;
++}

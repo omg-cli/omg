@@ -1,0 +1,31 @@
+{
+  "name": "omg-cloud-ci",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test test",
+    "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json && tsc --noEmit -p type-tests/tsconfig.json",
+    "build": "wrangler deploy --dry-run"
+  },
+  "dependencies": {
+    "@cloudflare/ci": "0.2.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261019.1",
+    "@types/bun": "1.4.3",
+    "@types/node": "26.6.5",
+    "typescript": "6.0.3",
+    "wrangler": "4.151.3",
+    "xml2js": "0.5.0"
+  },
+  "overrides": {
+    "@cloudflare/sandbox": "0.12.12"
+  },
+  "patchedDependencies": {
+    "@cloudflare/containers@0.3.7": "patches/@cloudflare%2Fcontainers@0.3.7.patch",
+    "@cloudflare/sandbox@0.12.12": "patches/@cloudflare%2Fsandbox@0.12.12.patch",
+    "@cloudflare/ci@0.2.0": "patches/@cloudflare%2Fci@0.2.0.patch",
+    "capnweb@0.8.0": "patches/capnweb@0.8.0.patch"
+  }
+}

@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!runner/
+!runner/**
+runner/node_modules
+!verifier.mjs

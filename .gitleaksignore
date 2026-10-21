@@ -1,3 +1,6 @@
 # Two inert key-header test strings in this historical commit were matched across
 # intervening Rust source. They contain no key material. Keep future findings scanned.
 e9a2f51a054035318e907496baa05d13c8d39416:src/core/security/secrets.rs:private-key:727
+
+# Verified source SHA-256 provenance for CodeLoud f4371c4 test/api.test.ts; not a credential.
+bfff4883f4fa39c54bbb98473535e642c9cb128d:services/ci-coder/port-origin.json:generic-api-key:21

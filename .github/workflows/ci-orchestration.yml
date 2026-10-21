@@ -1,0 +1,65 @@
+name: CI orchestration contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-orchestration-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+  CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
+
+jobs:
+  contracts:
+    name: Orchestration tests, types and dry builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24.21.0"
+          package-manager-cache: false
+      - name: Install verified Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          mkdir -m 700 -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          directory="$tools/bun-linux-x64"
+          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - name: Install frozen orchestration dependencies
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
+      - name: Test courier, verifier, inspector and coder contracts
+        run: |
+          bun run test:cloud-ci
+          bun run --cwd services/cloud-ci test
+          bun run --cwd services/ci-inspector test
+          bun run --cwd services/ci-coder test
+      - name: Check all service TypeScript contexts
+        run: bun run check:cloud-ci
+      - name: Dry build all services without deployment
+        run: |
+          bun run --cwd services/cloud-ci build
+          bun run --cwd services/ci-inspector build
+          bun run --cwd services/ci-coder build
