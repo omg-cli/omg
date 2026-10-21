@@ -3,12 +3,16 @@ import { PhaseDiagnostics, type StopDetails } from "./phase-diagnostics";
 import { backupTransferMode, leafSnapshotOptions } from "./backup-policy";
 import { retainRunnerLog, retainUnitReport } from "./unit-report-retention";
 
+type RunnerMetadata = {
+  reportRunId?: string;
+  diagnosticRunId?: string;
+  leafStep?: string;
+};
+const metadataKey = "omg:runner-metadata";
+
 export class CiSandbox extends NativeCiSandbox {
   private phases?: PhaseDiagnostics;
   private fuseExitCode?: number;
-  private reportRunId?: string;
-  private diagnosticRunId?: string;
-  private leafStep?: string;
   private get diagnostics() {
     return (this.phases ??= new PhaseDiagnostics(this.ctx.id.toString(), (key, value) =>
       this.env.BACKUP_BUCKET.put(key, value, { httpMetadata: { contentType: "application/json" } }),
@@ -81,19 +85,21 @@ export class CiSandbox extends NativeCiSandbox {
   override createBackup(options: Parameters<NativeCiSandbox["createBackup"]>[0]) {
     const localBucket = backupTransferMode(this.env) === "binding-rpc" ? true : options.localBucket;
 
-    return this.trace("backup", () =>
-      super.createBackup({ ...options, localBucket, ...leafSnapshotOptions(this.leafStep) }),
-    );
+    return this.trace("backup", async () => {
+      const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
+      return super.createBackup({ ...options, localBucket, ...leafSnapshotOptions(metadata?.leafStep) });
+    });
   }
   override startProcess(...args: Parameters<NativeCiSandbox["startProcess"]>) {
-    this.reportRunId =
-      args[1]?.env?.OMG_CI_LEAF_STEP === "rust-portable-tests"
-        ? args[1]?.env?.OMG_REPORT_RUN_ID
-        : undefined;
-    this.leafStep = args[1]?.env?.OMG_CI_LEAF_STEP;
-    this.diagnosticRunId = args[1]?.env?.OMG_DIAGNOSTIC_RUN_ID;
-
-    return this.trace("process-start", () => super.startProcess(...args));
+    const env = args[1]?.env;
+    return this.trace("process-start", async () => {
+      await this.ctx.storage.put<RunnerMetadata>(metadataKey, {
+        reportRunId: env?.OMG_CI_LEAF_STEP === "rust-portable-tests" ? env?.OMG_REPORT_RUN_ID : undefined,
+        leafStep: env?.OMG_CI_LEAF_STEP,
+        diagnosticRunId: env?.OMG_DIAGNOSTIC_RUN_ID,
+      });
+      return super.startProcess(...args);
+    });
   }
   override streamProcessLogs(...args: Parameters<NativeCiSandbox["streamProcessLogs"]>) {
     return this.trace("process-log-stream-open", () => super.streamProcessLogs(...args));
@@ -113,9 +119,10 @@ export class CiSandbox extends NativeCiSandbox {
   override destroy() {
     return this.trace("destroy", async () => {
       try {
-        if (this.diagnosticRunId && this.leafStep) {
+        const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
+        if (metadata?.diagnosticRunId && metadata.leafStep) {
           for (const stream of ["stdout", "stderr"]) {
-            const status = await retainRunnerLog(this.diagnosticRunId, this.leafStep, stream, {
+            const status = await retainRunnerLog(metadata.diagnosticRunId, metadata.leafStep, stream, {
               listFiles: (path) => super.listFiles(path),
               readReport: async () => (
                 await super.readFile(`/tmp/ci-step.${stream === "stdout" ? "out" : "err"}`, {
@@ -127,9 +134,9 @@ export class CiSandbox extends NativeCiSandbox {
               console.warn(JSON.stringify({ event: "runner_log_unavailable", stream, status }));
           }
         }
-        if (this.reportRunId) {
+        if (metadata?.reportRunId) {
           const status = await retainUnitReport(
-            this.reportRunId,
+            metadata.reportRunId,
             {
               listFiles: (path) => super.listFiles(path),
               readReport: async () =>
