@@ -3,6 +3,7 @@ import { readFileSync, existsSync, writeFileSync, lstatSync } from "node:fs";
 import { pruneRestoredSource } from "./source-tree.mjs";
 import { runServiceCheck, rustProfiles, toolchain } from "./plan.mjs";
 import { preparePortable, runPortable } from "./portable-process.mjs";
+import { applyTestAudit } from "./audit-verifier.mjs";
 import {
     applyValidatedProposal,
     verificationContext,
@@ -35,15 +36,17 @@ pruneRestoredSource("/workspace", tracked);
 // A read-only gitdir pointer permits existing source-identity helpers without leaking GIT_DIR into their subprocess fixtures.
 writeFileSync("/workspace/.git", "gitdir: /tmp/ci-source/.git\n", { flag: "wx", mode: 0o444 });
 const request = process.argv[2] === "install" ? null : verificationRequest();
-if (request && process.argv[2] !== "regression-red-green")
-    await applyValidatedProposal(request.verification.proposal, verificationContext(request));
+if (request && !["regression-red-green", "test-audit-four-state", "test-audit-sensitivity"].includes(process.argv[2])) {
+    if (request.testAudit) await applyTestAudit(request.testAudit.proposal, verificationContext(request));
+    else await applyValidatedProposal(request.verification.proposal, verificationContext(request));
+}
 const portable =
-    process.argv[2] === "regression-red-green"
+    ["regression-red-green", "test-audit-four-state", "test-audit-sensitivity"].includes(process.argv[2])
         ? null
         : preparePortable("/workspace", [
               ...tracked,
               ".git",
-              ...(request?.verification.proposal.changes
+              ...(request?.verification?.proposal.changes
                   .filter((change) => change.originalBlobSha === null)
                   .map((change) => change.path) ?? []),
           ]);
@@ -127,6 +130,8 @@ switch (process.argv[2]) {
         await runServiceCheck(process.argv[2], { exists: existsSync, run });
         break;
     case "regression-red-green":
+    case "test-audit-four-state":
+    case "test-audit-sensitivity":
         if (!request) throw new Error("Regression request required");
         await runRegression(request);
         break;

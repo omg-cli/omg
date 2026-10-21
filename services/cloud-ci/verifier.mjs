@@ -13,6 +13,7 @@ import {
     rustReport,
 } from "./runner/rust-evidence.mjs";
 import { assertRustSourceChange } from "../../scripts/rust-source-policy.mjs";
+import { freezeRustInputs } from "./runner/frozen-rust-inputs.mjs";
 
 const text = (max) => Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(max));
 const sha40 = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/));
@@ -91,7 +92,7 @@ const canonical = (value) =>
             : item,
     );
 
-function git(directory, args) {
+export function git(directory, args) {
     const result = spawnSync(
         "git",
         ["-c", "maintenance.auto=false", "-c", "gc.auto=0", "-C", directory, ...args],
@@ -108,7 +109,7 @@ function git(directory, args) {
     return result.stdout;
 }
 
-async function confinedFile(workspace, relative) {
+export async function confinedFile(workspace, relative) {
     const resolved = path.resolve(workspace, relative);
 
     if (!resolved.startsWith(`${workspace}${path.sep}`))
@@ -134,12 +135,13 @@ export async function executeRustRegression({
     home,
     reportFile,
     trackedPaths,
+    existingTest = false,
+    target = "",
 }) {
     const context = preparePortable(workspace, trackedPaths, { home });
     const args = [
         "test",
-        "--test",
-        file.split("/").at(-1).slice(0, -3),
+        ...(existingTest && target === "lib" ? ["--lib"] : ["--test", file.split("/").at(-1).slice(0, -3)]),
         "--no-run",
         "--message-format=json",
         "--no-default-features",
@@ -155,18 +157,20 @@ export async function executeRustRegression({
         {},
         { maxOutput: 32 * 1024 * 1024, timeoutMs: 900000 },
     );
-    const artifact = discoverRustTestArtifact(compiler.stdout, file);
+    const artifact = discoverRustTestArtifact(compiler.stdout, file, { existingTest, target });
     await confinedFile(workspace, path.relative(workspace, artifact.executable));
     const info = await lstat(artifact.executable);
     if (!info.isFile() || info.isSymbolicLink())
         throw new Error("Cargo executable is not a regular owned artifact");
     const executableSha256 = sha256(await readFile(artifact.executable));
+    const frozenInputs = await freezeRustInputs(workspace);
     const listing = await runPortable(context, artifact.executable, [
         "--list",
         "--format",
         "terse",
     ]);
-    const catalog = parseRustCatalog(listing.stdout, testName);
+    const catalog = parseRustCatalog(listing.stdout, testName, { existingTest });
+    await frozenInputs.assertUnchanged();
     const execution = await runPortable(
         context,
         artifact.executable,
@@ -176,6 +180,7 @@ export async function executeRustRegression({
     );
     if (sha256(await readFile(artifact.executable)) !== executableSha256)
         throw new Error("Executed Rust artifact changed");
+    await frozenInputs.assertUnchanged();
     const source = await readFile(path.join(workspace, file), "utf8");
     const parsed = parseRustExecution({ ...execution, testName, file, source, catalog });
     const recipe = {
@@ -193,7 +198,7 @@ export async function executeRustRegression({
         sourceSha256: sha256(source),
         recipeSha256: sha256(canonical(recipe)),
     };
-    const report = rustReport(result, { artifact, recipe, catalog, compiler, execution });
+    const report = rustReport(result, { artifact, recipe, catalog, listing, compiler, execution });
     await writeFile(reportFile, report.content, { flag: "wx", mode: 0o600 });
     return report.result;
 }

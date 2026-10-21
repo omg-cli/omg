@@ -5,6 +5,8 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { Schema } from "effect";
 import { assertRustSourceChange } from "../../../scripts/rust-source-policy.mjs";
+import { testAuditPhasesFor } from "./test-audit.mjs";
+import { decodeVerificationEnvironment } from "./verification-envelope.mjs";
 
 const hash = (content) => createHash("sha256").update(content).digest("hex");
 
@@ -177,15 +179,12 @@ export async function applyValidatedProposal(proposal, context) {
 }
 
 export function verificationRequest() {
-    const encoded = process.env.OMG_VERIFICATION;
-
-    if (!encoded) return null;
-
-    if (Buffer.byteLength(encoded) > 65536) throw new Error("Verification payload exceeds 64 KiB");
-    const request = JSON.parse(encoded);
+    const request = decodeVerificationEnvironment(process.env);
+    if (!request) return null;
 
     if (
-        !request.verification ||
+        (!request.verification && !request.testAudit) ||
+        (request.verification && request.testAudit) ||
         request.sha !== process.env.OMG_EXPECTED_SHA ||
         !Number.isSafeInteger(Number(request.runId)) ||
         Number(request.runId) <= 0 ||
@@ -202,13 +201,13 @@ export function verificationContext(request) {
         repository: request.repository,
         branch: request.ref.slice(11),
         baseSha: request.sha,
-        verifierRevision: request.verification.verifierRevision,
+        verifierRevision: (request.testAudit ?? request.verification).verifierRevision,
         runId: Number(request.runId),
         runAttempt: Number(request.attempt),
         workspace: "/workspace",
         gitDirectory: "/tmp/ci-source",
         reportDirectory: `/tmp/ci-review-reports/${randomUUID()}`,
-        regression: request.verification.regression,
+        ...(request.verification ? { regression: request.verification.regression } : {}),
     };
 }
 
@@ -220,7 +219,7 @@ export async function runRegression(request) {
     const proposalFile = path.join(directory, "proposal.json");
     const contextFile = path.join(directory, "context.json");
     const receiptFile = path.join(directory, "receipt.json");
-    await writeFile(proposalFile, JSON.stringify(request.verification.proposal), {
+    await writeFile(proposalFile, JSON.stringify((request.testAudit ?? request.verification).proposal), {
         flag: "wx",
         mode: 0o600,
     });
@@ -229,11 +228,11 @@ export async function runRegression(request) {
 
     const result = spawnSync(
         process.execPath,
-        ["/opt/omg-ci/verifier.mjs", proposalFile, contextFile, receiptFile],
+        [request.testAudit ? "/opt/omg-ci/runner/audit-verifier.mjs" : "/opt/omg-ci/verifier.mjs", proposalFile, contextFile, receiptFile],
         {
             env: { ...process.env, OMG_CI_VERIFIER_SANDBOX: "1" },
             stdio: "inherit",
-            timeout: 1_900_000,
+            timeout: request.testAudit ? 3_800_000 : 1_900_000,
         },
     );
 
@@ -245,9 +244,9 @@ export async function runRegression(request) {
     if (Buffer.byteLength(receipt) > 65536)
         throw new Error("Verifier receipt exceeds its byte budget");
 
-    for (const phase of ["baseline", "patched"])
+    for (const phase of request.testAudit ? testAuditPhasesFor(request.testAudit.proposal) : ["baseline", "patched"])
         console.log(
-            `OMG_REPORT=${JSON.stringify({ name: `regression-${phase}.json`, content: await readFile(path.join(context.reportDirectory, `${phase}.json`), "utf8") })}`,
+            `OMG_REPORT=${JSON.stringify({ name: `${request.testAudit ? "test-audit" : "regression"}-${phase}.json`, content: await readFile(path.join(context.reportDirectory, `${phase}.json`), "utf8") })}`,
         );
-    console.log(`OMG_VERIFICATION=${JSON.stringify(JSON.parse(receipt))}`);
+    console.log(`${request.testAudit ? "OMG_TEST_AUDIT" : "OMG_VERIFICATION"}=${JSON.stringify(JSON.parse(receipt))}`);
 }
