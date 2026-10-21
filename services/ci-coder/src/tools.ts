@@ -434,7 +434,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
     propose_dependency_updates: createDependencyTool((context) => enter(context, true), update),
     propose_test_strengthening: {
       input: testAuditToolSchema,
-      description: "Audit the selected test against an evidence-only source fault. For an adequate test use existing-test-sensitivity with unchanged bytes; strengthening inserts one assertion. Never publish the fault.",
+      description: "Audit the selected test against one evidence-only source fault. Prefer existing-test-strengthening when a plausible uncovered observable behavior supports one inserted assertion. Existing-test-sensitivity with unchanged bytes is also acceptable when the selected fault is caught by the existing assertion within existing budgets; it need not prove that no gap exists. Sensitivity has two states and earns verified-sensitivity credit without export; strengthening has four states and exports only the strengthened test. Never manufacture a fault, assertion or patch, and never publish the fault.",
       async execute(input: z.infer<typeof testAuditToolSchema>, context: ToolContext) {
         const request = await enter(context, true);
         const testAudit = buildTestAuditProposal(request, input);
