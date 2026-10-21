@@ -3,7 +3,7 @@ import { summarizeUnitFailures } from "./unit-report.mjs";
 import { spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, lstatSync } from "node:fs";
 import { pruneRestoredSource } from "./source-tree.mjs";
-import { runServiceCheck, rustProfiles, rustTimeouts, toolchain } from "./plan.mjs";
+import { runServiceCheck, rustProfiles, rustTimeouts, scriptTimeouts, toolchain } from "./plan.mjs";
 import { preparePortable, runPortable } from "./portable-process.mjs";
 import { applyTestAudit } from "./audit-verifier.mjs";
 import {
@@ -54,7 +54,8 @@ const portable =
           ]);
 const run = async (command, args, env = {}) =>
     runPortable(portable, command, args, env, {
-        timeoutMs: process.argv[2] === "rust-portable-tests" ? rustTimeouts.child : 1_170_000,
+        timeoutMs: process.argv[2] === "rust-portable-tests" ? rustTimeouts.child
+            : process.argv[2] === "script-contracts" ? scriptTimeouts.child : 1_170_000,
         onOutput: (name, chunk) => process[name].write(chunk),
     });
 const report = (name, file) => {

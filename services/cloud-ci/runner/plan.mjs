@@ -36,12 +36,14 @@ export const rustProfiles = [
     { features: "debian-pure", platform: "debian-pure" },
 ];
 export const rustTimeouts = { step: 2_400_000, command: 2_370_000, child: 2_340_000 };
+export const scriptTimeouts = { step: 2_400_000, command: 2_370_000, child: 2_340_000 };
 export const planIdentity = JSON.stringify({
     version: 1,
     repository: "omg-cli/omg",
     cloudCiChecks,
     rustProfiles,
     rustTimeouts,
+    scriptTimeouts,
     toolchain,
     scriptContracts: {
         partition: "exact-native-ids-v2",

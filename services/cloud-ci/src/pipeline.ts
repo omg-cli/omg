@@ -17,6 +17,7 @@ import {
     planIdentity,
     runSourceFormat,
     rustTimeouts,
+    scriptTimeouts,
 } from "../runner/plan.mjs";
 import { z } from "zod";
 import { backupTransferMode } from "./backup-policy";
@@ -34,6 +35,7 @@ const config = {
     snapshotRetentionSeconds: 86_400,
 };
 const rustConfig = { ...config, timeout: rustTimeouts.step, commandTimeoutMs: rustTimeouts.command };
+const scriptConfig = { ...config, timeout: scriptTimeouts.step, commandTimeoutMs: scriptTimeouts.command };
 
 const reportSchema = z.strictObject({
     name: z.enum([
@@ -297,7 +299,8 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                         const result: CheckResult = await deps.runner({
                             name,
                             command: `node /opt/omg-ci/run.mjs ${name}`,
-                            config: name === "rust-portable-tests" ? rustConfig : config,
+                            config: name === "rust-portable-tests" ? rustConfig
+                                : name === "script-contracts" ? scriptConfig : config,
                             env,
                         });
 

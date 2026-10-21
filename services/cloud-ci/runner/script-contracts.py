@@ -48,7 +48,7 @@ def main():
         "nativeCommand": "make ci-workflow-quick",
         "nativeAcceptance": False,
     }, sort_keys=True), flush=True)
-    return 0 if unittest.TextTestRunner(verbosity=1).run(selected).wasSuccessful() else 1
+    return 0 if unittest.TextTestRunner(verbosity=2).run(selected).wasSuccessful() else 1
 
 if __name__ == "__main__":
     raise SystemExit(main())
