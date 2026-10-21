@@ -25,6 +25,8 @@ The Wrangler configuration binds Workers AI, the `Coder` Durable Object, and the
 
 The trusted courier reads `~/ci/omg-ci-coder.json`. It contains `endpoint`, an absolute protected `tokenFile`, and the expected `bundleSha256`. Keep equivalent protected configuration on each authorized courier. No customer key belongs in this file.
 
+The task context includes the selected existing test and bounded definition windows, so a recovered session can locate its target again. Source listings include line counts. `find_source` returns at most twenty literal-match locations from one supplied immutable file; it grants no source-read evidence. The agent must use the existing `read_source` tool before citing or proposing a change. Tool-call, source-size, skill and verification limits are unchanged. This uses the existing [OpenCode plugin tool interface](https://developers.cloudflare.com/agents/harnesses/opencode/); it adds no shell or repository-wide file access.
+
 ```sh
 bun services/ci-coder/test/harness-runtime.mjs <exact-commit> <main> <isolated-probe-id> <attempt>
 ```
