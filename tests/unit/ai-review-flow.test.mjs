@@ -176,9 +176,9 @@ test("weekly workflow chains bounded pages only through a separate trusted dispa
     assert.equal(finalize.env.PUBLICATION_RESULT, "${{ needs.publish.result }}");
 });
 
-test("actionlint queue compatibility applies only to two serialized trusted workflows", () => {
+test("actionlint queue compatibility applies only to the serialized trusted workflows", () => {
     const config = Bun.YAML.parse(readFileSync(new URL("../../.github/actionlint.yaml", import.meta.url), "utf8"));
-    const paths = [".github/workflows/ai-review.yml", ".github/workflows/ai-fix-review.yml"];
+    const paths = [".github/workflows/cloud-ci.yml", ".github/workflows/ai-review.yml", ".github/workflows/ai-fix-review.yml"];
     const diagnostic = 'unexpected key "queue" for "concurrency" section. expected one of "cancel-in-progress", "group"';
     assert.deepEqual(Object.keys(config), ["paths"]);
     assert.deepEqual(Object.keys(config.paths), paths);
