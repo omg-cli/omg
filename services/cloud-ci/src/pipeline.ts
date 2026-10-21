@@ -19,6 +19,8 @@ import {
 } from "../runner/plan.mjs";
 import { z } from "zod";
 import { backupTransferMode } from "./backup-policy";
+import { parseTestAuditEvidence, testAuditStateEntries } from "./test-audit-contract";
+import { encodeVerificationEnvironment } from "../runner/verification-envelope.mjs";
 
 declare const Response: typeof import("@cloudflare/workers-types/index.ts").Response;
 
@@ -38,6 +40,7 @@ const reportSchema = z.strictObject({
 
         "regression-baseline.json",
         "regression-patched.json",
+        "test-audit-oldIntact.json", "test-audit-oldFault.json", "test-audit-strongerFault.json", "test-audit-strongerIntact.json",
     ]),
     content: z.string().max(20_000_000),
 });
@@ -74,17 +77,19 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
         const requiredChecks = expectedCloudChecks(request.ref);
 
         if (
-            request.verification &&
+            (request.verification || request.testAudit) &&
             (!/^[a-f0-9]{40}$/.test(this.env.CI_VERIFIER_REVISION ?? "") ||
-                request.verification.verifierRevision !== this.env.CI_VERIFIER_REVISION)
+                (request.testAudit ?? request.verification)?.verifierRevision !== this.env.CI_VERIFIER_REVISION)
         )
             throw new Error("Requested verifier differs from trusted deployed revision");
 
-        const verificationEnv: Record<string, string> = request.verification
-            ? { OMG_VERIFICATION: JSON.stringify(request) }
+        const verificationEnv: Record<string, string> = request.verification || request.testAudit
+            ? encodeVerificationEnvironment(request)
             : {};
 
         let regression: ReturnType<typeof parseVerificationEvidence> | null = null;
+        let testAudit: ReturnType<typeof parseTestAuditEvidence> | null = null;
+        const auditCheck = request.testAudit?.proposal.purpose === "existing-test-sensitivity" ? "test-audit-sensitivity" : "test-audit-four-state";
 
         const records: {
             name: string;
@@ -110,8 +115,14 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                     await this.env.BACKUP_BUCKET.put(`${prefix}.stderr`, stderr);
                     const reports: { name: string; key: string; sha256: string }[] = [];
                     let verification: ReturnType<typeof parseVerificationEvidence> | null = null;
+                    let audit: ReturnType<typeof parseTestAuditEvidence> | null = null;
 
                     for (const line of stdout.split("\n")) {
+                        if (line.startsWith("OMG_TEST_AUDIT=")) {
+                            if (name !== auditCheck || audit)
+                                throw new Error("Unexpected or duplicate existing-test audit evidence");
+                            audit = parseTestAuditEvidence(request, JSON.parse(line.slice("OMG_TEST_AUDIT=".length)));
+                        }
                         if (line.startsWith("OMG_VERIFICATION=")) {
                             if (name !== "regression-red-green" || verification)
                                 throw new Error("Unexpected or duplicate regression evidence");
@@ -149,12 +160,19 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                                 "Regression reports are missing or differ from verified evidence",
                             );
                     }
+                    if (name === auditCheck) {
+                        if (!audit || reports.length !== testAuditStateEntries(audit).length || testAuditStateEntries(audit).some(({ phase, evidence }) =>
+                            reports.find((report) => report.name === `test-audit-${phase}.json`)?.sha256 !==
+                            evidence.reportSha256))
+                            throw new Error("Four-state audit reports are missing or differ from exact evidence");
+                    }
 
                     return {
                         stdoutSha256: await digest(stdout),
                         stderrSha256: await digest(stderr),
                         reports,
                         verification,
+                        audit,
                     };
                 },
             );
@@ -168,6 +186,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
             });
 
             if (name === "regression-red-green") regression = evidence.verification;
+            if (name === auditCheck) testAudit = evidence.audit;
         };
 
         try {
@@ -243,6 +262,15 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                     throw new Error("Regression runner returned a nonzero exit");
                 await save("regression-red-green", result);
             }
+            if (request.testAudit) {
+                const result: CheckResult = await deps.runner({
+                    name: auditCheck, command: `node /opt/omg-ci/run.mjs ${auditCheck}`,
+                    config: { ...config, timeout: 4_000_000, commandTimeoutMs: 3_970_000 },
+                    env: { OMG_EXPECTED_SHA: request.sha, OMG_RUN_ID: request.runId, OMG_RUN_ATTEMPT: request.attempt, ...verificationEnv },
+                });
+                if (result.exitCode !== 0) throw new Error("Existing-test audit runner returned a nonzero exit");
+                await save(auditCheck, result);
+            }
 
             const pending = requiredChecks.slice(2);
 
@@ -275,6 +303,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
             }
 
             let verificationReceipt = null;
+            const testAuditReceipt = request.testAudit ? parseTestAuditEvidence(request, testAudit) : null;
 
             if (request.verification) {
                 const verified = parseVerificationEvidence(request, regression);
@@ -320,11 +349,15 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                             ...request,
                             conclusion: "success",
                             verificationReceipt,
+                            ...(request.testAudit ? {
+                                testAuditReceipt,
+                                testAuditReports: records.find((record) => record.name === auditCheck)?.reports ?? [],
+                            } : {}),
                             verificationReports:
                                 records.find((record) => record.name === "regression-red-green")
                                     ?.reports ?? [],
                             checks: records
-                                .filter((record) => record.name !== "regression-red-green")
+                                .filter((record) => !["regression-red-green", auditCheck].includes(record.name))
                                 .toSorted(
                                     (left, right) =>
                                         requiredChecks.indexOf(left.name) -

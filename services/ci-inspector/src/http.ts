@@ -36,7 +36,7 @@ export async function authorized(
 export async function readBoundedJson(
   request: Pick<InspectionRequest, "body">,
   maximumBytes: number,
-): Promise<{ kind: "value"; value: unknown } | { kind: "error"; status: number; error: string }> {
+): Promise<{ kind: "value"; value: unknown; byteLength: number } | { kind: "error"; status: number; error: string }> {
   const reader = request.body?.getReader();
 
   if (!reader) return { kind: "error", status: 400, error: "Missing snapshot" };
@@ -77,7 +77,7 @@ export async function readBoundedJson(
       new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
     );
 
-    return { kind: "value", value };
+    return { kind: "value", value, byteLength: size };
   } catch {
     return { kind: "error", status: 400, error: "Invalid JSON" };
   }

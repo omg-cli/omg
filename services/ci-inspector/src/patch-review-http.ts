@@ -12,10 +12,12 @@ export async function handlePatchReview(request: InspectionRequest, env: { CI_IN
   if (request.method !== "POST") return respond({ error: "Method not allowed" }, 405);
   if (!await authorized(request, env.CI_INSPECTOR_TOKEN)) return respond({ error: "Unauthorized" }, 401);
   if (!request.headers.get("content-type")?.startsWith("application/json")) return respond({ error: "Expected application/json" }, 415);
-  const body = await readBoundedJson(request, 128 * 1024);
+  const body = await readBoundedJson(request, 1024 * 1024);
   if (body.kind === "error") return respond({ error: body.error }, body.status);
   const parsed = patchReviewInputSchema.safeParse(body.value);
   if (!parsed.success) return respond({ error: "Invalid complete patch" }, 400);
+  if (parsed.data.purpose === "fix-approval" && body.byteLength > 128 * 1024)
+    return respond({ error: "Complete patch too large" }, 413);
   try {
     const input = parsed.data;
     const inference = await infer(input);

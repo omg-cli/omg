@@ -1,3 +1,4 @@
+import { createTestAuditProposal } from "../services/ci-coder/src/test-audit.ts";
 import { proposalDigest } from "./ai-review-publication.mjs";
 import { operationIdentity } from "../services/ci-coder/src/request.ts";
 import { Schema } from "effect";
@@ -56,6 +57,23 @@ export function admitCoderResult(response, request, policy) {
     )
         throw new Error("Coding runtime or server-recorded mandatory skill delivery mismatch.");
 
+    if (state.testAudit) {
+        if (!request.testAuditTask || state.proposal) throw new Error("Mixed existing-test and repair proposal.");
+        const audit = createTestAuditProposal(request, state.testAudit.proposal);
+        const digest = audit.proposalSha256;
+        const id = `cl-${request.runId}-${request.attempt}-${request.sha}-ta-${digest.slice(0,16)}`;
+        const continuationId = `cv-${request.runId}-${request.attempt}-${request.sha}-${digest.slice(0,16)}`;
+        if (state.testAudit.proposalSha256 !== digest || state.verification?.proposalSha256 !== digest || state.verification.id !== id ||
+            response.initialOperation?.operationId !== response.id || !["done","unanswered"].includes(response.initialOperation?.status) ||
+            response.continuation?.operationId !== continuationId || response.continuation.parentOperationId !== response.id ||
+            response.continuation.sessionId !== state.sessionId || response.continuation.proposalSha256 !== digest ||
+            response.continuation.verificationId !== id || response.continuation.status !== "done" ||
+            state.verificationJob?.status !== "verified" || state.verificationJob.id !== id || state.verificationJob.proposalSha256 !== digest ||
+            state.verificationJob.sessionId !== state.sessionId || state.verificationJob.continuationId !== continuationId)
+            throw new Error("Existing-test audit lacks its exact completed verification continuation.");
+        return {...audit,readPaths:[...new Set(state.reads.map(read=>read.path))]};
+    }
+    if (request.testAuditTask && state.proposal) throw new Error("Existing-test task cannot export a production repair.");
     if (!state.proposal) return null;
     const adapted = state.proposal;
     const digest = proposalDigest(adapted.proposal);

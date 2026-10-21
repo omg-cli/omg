@@ -1,6 +1,7 @@
 import { assertRustSourceChange } from "./rust-source-policy.mjs";
 import { createHash } from "node:crypto";
 import { Schema } from "effect";
+import { readmitTestAuditProof, admitTestAuditSources, testAuditPublicationBodies, testAuditPublicationProposal } from "./test-audit-publication.mjs";
 
 export const REVIEW_REPOSITORY = "omg-cli/omg";
 const sha40 = Schema.String.check(Schema.isPattern(/^[a-f0-9]{40}$/));
@@ -358,7 +359,19 @@ async function listRecords(github, resource) {
     throw new Error("Publication inventory exceeds bounded pagination.");
 }
 
-async function loadSources(github, proposal) {
+function sourceBlobBytes(blob, maximumBytes, expectedSha) {
+    const encodedLimit = maximumBytes === undefined ? 180000 : Math.ceil(maximumBytes / 3) * 4 + 16384;
+    if (blob.encoding !== "base64" || !Schema.is(Schema.String)(blob.content) || blob.content.length > encodedLimit)
+        throw new Error("Invalid or oversized source blob.");
+    const bytes = Buffer.from(blob.content, "base64");
+    if (maximumBytes !== undefined && (bytes.length > maximumBytes ||
+        bytes.toString("base64") !== blob.content.replace(/[\r\n]/g, "") ||
+        createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex") !== expectedSha))
+        throw new Error("Audit source bytes exceed their bound or differ from the immutable Git blob.");
+    return bytes;
+}
+
+async function loadSources(github, proposal, extraPaths = [], maximumBytes) {
     const commit = await github.request("GET", `${prefix}/git/commits/${proposal.baseSha}`);
     const tree = await github.request("GET", `${prefix}/git/trees/${commit.tree.sha}?recursive=1`);
 
@@ -369,6 +382,7 @@ async function loadSources(github, proposal) {
     for (const file of new Set([
         proposal.finding.path,
         ...proposal.changes.map((change) => change.path),
+        ...extraPaths,
     ])) {
         const entry = tree.tree.find((item) => item.path === file);
 
@@ -378,13 +392,7 @@ async function loadSources(github, proposal) {
             throw new Error("Source is not a regular text blob.");
         const blob = await github.request("GET", `${prefix}/git/blobs/${entry.sha}`);
 
-        if (
-            blob.encoding !== "base64" ||
-            !Schema.is(Schema.String)(blob.content) ||
-            blob.content.length > 180000
-        )
-            throw new Error("Invalid or oversized source blob.");
-        const bytes = Buffer.from(blob.content, "base64");
+        const bytes = sourceBlobBytes(blob, maximumBytes, entry.sha);
         const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
         sources.set(file, { sha: entry.sha, mode: entry.mode, content });
     }
@@ -392,7 +400,7 @@ async function loadSources(github, proposal) {
     return { sources, treeSha: commit.tree.sha, treeEntries: tree.tree };
 }
 
-async function verifyExistingBranch(github, ref, proposal, treeEntries, issue) {
+async function verifyExistingBranch(github, ref, proposal, treeEntries, issue, maximumBytes) {
     const commit = await github.request("GET", `${prefix}/git/commits/${ref.object.sha}`);
 
     if (
@@ -423,12 +431,7 @@ async function verifyExistingBranch(github, ref, proposal, treeEntries, issue) {
             throw new Error("Existing branch changed file modes.");
         const blob = await github.request("GET", `${prefix}/git/blobs/${entry.sha}`);
 
-        if (
-            blob.encoding !== "base64" ||
-            !Schema.is(Schema.String)(blob.content) ||
-            blob.content.length > 180000 ||
-            sha256(Buffer.from(blob.content, "base64")) !== change.sha256
-        )
+        if (sha256(sourceBlobBytes(blob, maximumBytes, entry.sha)) !== change.sha256)
             throw new Error("Existing branch content differs from verified proposal.");
         expected.set(change.path, entry);
     }
@@ -459,7 +462,6 @@ export async function publishAiReview({
     requiredChecks,
     publish = false,
 }) {
-    const publisher = configuredPublisher();
     const proposal = decode(proposalSchema, input);
     const { sources, treeSha, treeEntries } = await loadSources(github, proposal);
 
@@ -472,6 +474,24 @@ export async function publishAiReview({
     });
 
     const bodies = publicationBodies(admitted);
+    return publishAdmittedReview({ proposal, admitted, bodies, github, treeSha, treeEntries, publish });
+}
+
+export async function publishTestAuditReview({ request, receipt, policy, load, github, publish = false }) {
+    const proof = await readmitTestAuditProof({ request, receipt, policy, load });
+    const { sources, treeSha, treeEntries } = await loadTestAuditPublicationSources(github, proof.audit);
+    const admitted = admitTestAuditSources(proof, sources);
+    return publishAdmittedReview({ proposal: admitted.proposal, admitted, bodies: testAuditPublicationBodies(admitted),
+        github, treeSha, treeEntries, publish });
+}
+
+export function loadTestAuditPublicationSources(github, audit) {
+    const proposal = testAuditPublicationProposal(audit);
+    return loadSources(github, proposal, [audit.proposal.fault.path], 256 * 1024);
+}
+
+async function publishAdmittedReview({ proposal, admitted, bodies, github, treeSha, treeEntries, publish }) {
+    const publisher = configuredPublisher();
 
     const [issues, pulls] = await Promise.all([
         listRecords(github, "issues"),
@@ -523,13 +543,13 @@ export async function publishAiReview({
     );
 
     const resumedCommit = existingRef
-        ? await verifyExistingBranch(github, existingRef, proposal, treeEntries, issue)
+        ? await verifyExistingBranch(github, existingRef, proposal, treeEntries, issue, admitted.audit ? 256 * 1024 : undefined)
         : null;
 
     const openedIssue =
         issue ??
         (await github.request("POST", `${prefix}/issues`, {
-            title: `[Unconfirmed AI finding] ${proposal.finding.title}`,
+            title: `[${admitted.audit ? "AI test strengthening" : "Unconfirmed AI finding"}] ${proposal.finding.title}`,
             body: bodies.issue,
         }));
 
@@ -571,7 +591,7 @@ export async function publishAiReview({
     await checkHead();
 
     const openedPull = await github.request("POST", `${prefix}/pulls`, {
-        title: `[Unconfirmed AI repair] ${proposal.finding.title}`,
+        title: `[${admitted.audit ? "AI test strengthening" : "Unconfirmed AI repair"}] ${proposal.finding.title}`,
         body: `${bodies.pullRequest}\n\nIssue: ${openedIssue.html_url}`,
         head: admitted.headBranch,
         base: proposal.branch,

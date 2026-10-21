@@ -1,3 +1,9 @@
+import { planTestAuditContinuation,admitTestAuditParent,testAuditTarget,parentPublicationResult,listTestAuditChildren,admitDuplicateTestAudit,dispatchTestAuditPlan,recoverTestAuditCampaign,findDuplicateTestAuditRecord } from "./test-audit-campaign.mjs";
+import { collectTestAuditPage,testAuditManifestDigest } from "./test-audit-inventory.mjs";
+import { runTestAuditPage, testAuditContinuation } from "./test-audit-flow.mjs";
+import { verifyCloudTestAudit } from "./cloud-test-audit-evidence.mjs";
+import { testAuditDigest } from "../services/cloud-ci/src/test-audit-contract.ts";
+import { publishTestAuditReview } from "./ai-review-publication.mjs";
 import { execFile } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -174,13 +180,15 @@ export function reviewTarget(eventName, event) {
     if (eventName === "workflow_dispatch") {
         const input = event.inputs ?? {};
 
-        if (Object.keys(input).some((key) => !["branch", "publish", "scope", "audit_sha", "audit_digest", "audit_cursor", "audit_parent"].includes(key)))
+        if (Object.keys(input).some((key) => !["branch", "publish", "scope", "audit_sha", "audit_digest", "audit_cursor", "audit_parent", "audit_manifest", "audit_resnapshot"].includes(key)))
             throw new Error("Unknown manual review input.");
 
         if (![undefined, false, true, "false", "true"].includes(input.publish))
             throw new Error("Invalid publication input.");
 
-        if (![undefined, "changes", "source-audit", "runtime-events"].includes(input.scope)) throw new Error("Unknown review scope.");
+        if (![undefined, "changes", "source-audit", "runtime-events", "test-audit"].includes(input.scope)) throw new Error("Unknown review scope.");
+        if(input.scope === "test-audit")return testAuditTarget(input);
+        if(input.audit_manifest||![undefined,false,"false", ""].includes(input.audit_resnapshot))throw new Error("Campaign inputs require test-audit scope");
         const auditInputs = [input.audit_sha, input.audit_digest, input.audit_cursor, input.audit_parent];
         if (input.scope === "source-audit") {
             const cursor = Number(input.audit_cursor || "0");
@@ -316,7 +324,7 @@ export async function runReviewFlow({ target, io }) {
     const head = exactSha(await io.head(branch));
 
     if (target.sha !== null && target.sha !== head) {
-        if (target.range?.kind !== "audit" && !target.queuedTrigger) throw new Error("Review target is stale.");
+        if (!["audit", "test-audit"].includes(target.range?.kind) && !target.queuedTrigger) throw new Error("Review target is stale.");
         return {
             repository: SOURCE_REPOSITORY, branch, sha: exactSha(target.sha), currentSha: head, baseSha: target.sha,
             ...(target.range ? { sourceRange: { ...target.range, sha: target.sha } } : {}), status: "incomplete-stale",
@@ -329,7 +337,7 @@ export async function runReviewFlow({ target, io }) {
         };
     }
     const sha = head;
-    const precollected = ["audit", "runtime"].includes(target.range?.kind)
+    const precollected = ["audit", "runtime", "test-audit"].includes(target.range?.kind)
         ? await io.collect(sha, branch, target.range, { reserve: target.publish === true }) : undefined;
     if (precollected?.replayRef) {
         try {
@@ -346,6 +354,8 @@ export async function runReviewFlow({ target, io }) {
             };
         }
     }
+    if (precollected?.sourceRange?.kind === "test-audit" && precollected.entries.length === 0)
+        return runTestAuditPage({collected:precollected,sha,branch,formatting:{status:"not-required",reason:"no-admitted-test-task"},publishRequested:target.publish,io});
     if (precollected && precollected.entries.length === 0)
         return {
             repository: SOURCE_REPOSITORY, branch, sha, baseSha: precollected.baseSha,
@@ -415,6 +425,8 @@ export async function runReviewFlow({ target, io }) {
         };
     }
 
+    if (collected.sourceRange?.kind === "test-audit")
+        return runTestAuditPage({collected,sha,branch,formatting,publishRequested:target.publish,io});
     const partition = partitionReviewSources(collected.entries);
 
     const result = {
@@ -712,7 +724,9 @@ export async function collectAuditSources(sha, range, directory = root) {
     };
 }
 
-export function sourceAuditContinuation(report, currentSha, runId, attempt) {
+export function sourceAuditContinuation(report, currentSha, runId, attempt, publicationResult) {
+    if(report.sourceRange?.kind === "test-audit" && report.sourceRange?.manifestDigest) return planTestAuditContinuation(report,currentSha,runId,attempt,publicationResult);
+    if (report.sourceRange?.kind === "test-audit") return testAuditContinuation(report,currentSha,runId,attempt);
     if (report.repository !== SOURCE_REPOSITORY || report.branch !== "main")
         throw new Error("Unexpected audit continuation repository.");
     exactSha(report.sha);
@@ -740,10 +754,11 @@ export function sourceAuditContinuation(report, currentSha, runId, attempt) {
     };
 }
 
-export function admitAuditResume(target, parent, revision) {
+export function admitAuditResume(target, parent, revision, campaign) {
+    if(target.range?.kind === "test-audit" && parent.sourceRange?.manifestDigest) return admitTestAuditParent(target,parent,revision,campaign?.manifestDigest,campaign?.publicationResult);
     if (!/^[1-9][0-9]{0,19}-[1-9][0-9]{0,5}$/.test(target.auditParent ?? "") ||
         parent.controllerRevision !== revision || parent.sha !== target.sha ||
-        parent.sourceRange?.inventoryDigest !== target.range.inventoryDigest ||
+        parent.sourceRange?.kind !== target.range.kind || parent.sourceRange?.inventoryDigest !== target.range.inventoryDigest ||
         parent.sourceRange?.nextCursor !== target.range.cursor || parent.publishRequested !== target.publish ||
         !["passed", "not-required"].includes(parent.formatting?.status))
         throw new Error("Audit parent record identity mismatch.");
@@ -757,9 +772,36 @@ export function admitAuditResume(target, parent, revision) {
     return { ...target, upstream: { runId: parent.formatting.runId, attempt: parent.formatting.attempt } };
 }
 
+export function runtimeReviewCanAcknowledge(report) {
+    return report?.publishRequested === true && !report.runtimeUnresolved &&
+        ["reviewed", "publication-replay"].includes(report.status) && report.sourceRange?.intake === "sentry-runtime" &&
+        report.formatting?.status === "passed" && Array.isArray(report.runtimeEvents) &&
+        report.runtimeEvents.length > 0 && report.runtimeEvents.length <= 3 &&
+        report.runtimeEvents.every(event => /^[1-9][0-9]{0,19}$/.test(event?.projectId ?? "") &&
+            /^[a-f0-9]{32}$/.test(event?.eventId ?? "") && /^[a-f0-9]{64}$/.test(event?.bodySha256 ?? "")) &&
+        Array.isArray(report.batches) && report.batches.length > 0 &&
+        report.batches.every(batch => {
+            try {
+                const response = validateReviewReceipt(batch.sourceInput, batch.modelResponse);
+                return ["repository", "sha", "branch"].every(key => batch.sourceInput[key] === report[key]) &&
+                    batch.sourceInput.sourceFiles.length > 0 &&
+                    batch.sourceInput.sourceFiles.every(file => response.readPaths.includes(file.path));
+            } catch {
+                return false;
+            }
+        }) &&
+        Array.isArray(report.suppliedPaths) && report.suppliedPaths.length > 0 &&
+        Array.isArray(report.readPaths) && report.readPaths.length > 0 &&
+        report.suppliedPaths.every(file => report.readPaths.includes(file)) &&
+        Array.isArray(report.unreviewedPaths) && report.unreviewedPaths.length === 0 &&
+        Array.isArray(report.publications) && report.publications.length <= 3 &&
+        Array.isArray(report.candidateOutcomes) && report.candidateOutcomes.length === report.publications.length &&
+        report.candidateOutcomes.every(candidate => candidate?.outcome === "verified-for-publication");
+}
+
 export async function finalizeRuntimeReview({ report, publicationResult, acknowledge }) {
     if (report.runtimeUnresolved) throw new Error("Canonical runtime publication remains unresolved; evidence stays pending.");
-    if (report.publishRequested !== true || !Array.isArray(report.publications) ||
+    if (!runtimeReviewCanAcknowledge(report) ||
         (publicationResult !== "success" && !(publicationResult === "skipped" && report.publications.length === 0)))
         throw new Error("Runtime publication did not finish successfully; evidence remains pending.");
     await acknowledge();
@@ -876,6 +918,50 @@ async function createController(github, controllerRevision) {
     )
         throw new Error("Exact GitHub run identity is required.");
 
+    const code = async (input, review, candidateIndex, testAuditTask) => {
+            const request = parseCodingRequest({
+                repository: input.repository,
+                sha: input.sha,
+                branch: input.branch,
+                runId,
+                attempt,
+                source: input,
+                ...(testAuditTask ? {testAuditTask} : {hypothesis:review,candidateIndex}),
+            });
+
+            const id = operationIdentity(request);
+
+            const started = await fetchJson(
+                new URL("/operations", codingEndpoint),
+                codingToken,
+                JSON.stringify(request),
+            );
+
+            if (started.id !== id) throw new Error("Coding operation start identity mismatch.");
+            const deadline = Date.now() + (testAuditTask ? 120 : 45) * 60 * 1000;
+
+            for (;;) {
+                const state = await fetchJson(
+                    new URL(`/operations/${id}`, codingEndpoint),
+                    codingToken,
+                    undefined,
+                    testAuditTask ? 2 * 1024 * 1024 : 512 * 1024,
+                );
+
+                if (state.id !== id) throw new Error("Coding operation status identity mismatch.");
+
+                if (state.status === "done") {
+                    const adapted = admitCoderResult(state, request, codingPolicy);
+
+                    return adapted ? { ...adapted, coding: { id, request } } : null;
+                }
+
+                if (!["queued", "running"].includes(state.status) || Date.now() >= deadline)
+                    throw new Error("Coding operation did not complete; publication refused.");
+                await setTimeout(5000);
+            }
+    };
+
     return {
         head,
         controllerRevision,
@@ -969,6 +1055,13 @@ async function createController(github, controllerRevision) {
             }
         },
         collect: async (sha, _branch, range, options) => {
+            if(range?.kind === "test-audit") {
+                const manifest=JSON.parse(await readFile(path.join(root,"config/test-audit-backlog.json"),"utf8"));
+                const page=await collectTestAuditPage({sha,manifest,cursor:range.cursor,pageSize:1,inventoryDigest:range.inventoryDigest,manifestDigest:range.resnapshotOf?range.manifestDigest:undefined,directory:root});
+                const entries=page.rows.filter(row=>row.status==="selected").map(row=>({...row.request.source.sourceFiles[0],size:Buffer.byteLength(row.request.source.sourceFiles[0].content)}));
+                return {baseSha:sha,entries,rows:page.rows,unreviewedPaths:page.rows.filter(row=>row.status==="held").map(row=>({path:row.id,reason:row.reason})),
+                    sourceRange:{kind:"test-audit",sha,manifestDigest:testAuditManifestDigest(manifest),...(range.resnapshotOf?{resnapshotOf:range.resnapshotOf,qualification:range.qualification}:{}),inventoryDigest:page.inventoryDigest,cursor:page.cursor,nextCursor:page.nextCursor,totalPaths:page.total,pagePaths:page.rows.length,pageSize:1}};
+            }
             if (range?.kind !== "runtime") return collectSources(github, sha, range);
             const collected = await collectRuntimeSources({ github, sha, directory: root, endpoint: config.endpoint, token,
                 request: fetchJson, reviewRef: { runId, attempt, sha, controllerRevision }, ...options });
@@ -986,49 +1079,17 @@ async function createController(github, controllerRevision) {
             return collected;
         },
         review: (input) => fetchJson(endpoint, inspectorToken, JSON.stringify(input), 128 * 1024),
-        adapt: async (input, review, candidateIndex) => {
-            const request = parseCodingRequest({
-                repository: input.repository,
-                sha: input.sha,
-                branch: input.branch,
-                runId,
-                attempt,
-                source: input,
-                hypothesis: review,
-                candidateIndex,
-            });
-
-            const id = operationIdentity(request);
-
-            const started = await fetchJson(
-                new URL("/operations", codingEndpoint),
-                codingToken,
-                JSON.stringify(request),
-            );
-
-            if (started.id !== id) throw new Error("Coding operation start identity mismatch.");
-            const deadline = Date.now() + 45 * 60 * 1000;
-
-            for (;;) {
-                const state = await fetchJson(
-                    new URL(`/operations/${id}`, codingEndpoint),
-                    codingToken,
-                    undefined,
-                    512 * 1024,
-                );
-
-                if (state.id !== id) throw new Error("Coding operation status identity mismatch.");
-
-                if (state.status === "done") {
-                    const adapted = admitCoderResult(state, request, codingPolicy);
-
-                    return adapted ? { ...adapted, coding: { id, request } } : null;
-                }
-
-                if (!["queued", "running"].includes(state.status) || Date.now() >= deadline)
-                    throw new Error("Coding operation did not complete; publication refused.");
-                await setTimeout(5000);
-            }
+        adapt: (input,review,candidateIndex) => code(input,review,candidateIndex),
+        audit: async (row) => {
+            const adapted=await code(row.request.source,undefined,undefined,row.task);
+            if(!adapted)return null;
+            const request={repository:SOURCE_REPOSITORY,sha:row.request.sha,ref:"refs/heads/main",runId,attempt,
+                testAudit:{proposal:adapted.proposal,verifierRevision:policy.verifierRevision}};
+            const id=`cl-${runId}-${attempt}-${request.sha}-ta-${testAuditDigest(adapted.proposal).slice(0,16)}`;
+            const receipt=await fetchJson(new URL(`/runs/${id}/receipt`,config.endpoint),token,undefined,2*1024*1024);
+            await verifyCloudTestAudit(receipt,request,policy,(key)=>fetch(new URL(`/runs/${id}/${key.split("/")[0]}/${key.split("/")[2]}`,config.endpoint),{
+                headers:{authorization:`Bearer ${token}`},redirect:"error",signal:AbortSignal.timeout(30000)}));
+            return {request,id,coderOperationId:adapted.coding.id,coding:adapted.coding,readPaths:adapted.readPaths};
         },
         mirror: async (sha) => {
             await execute("bun", ["scripts/cloud-ci-mirror.mjs", sha]);
@@ -1121,14 +1182,14 @@ export async function main(args = process.argv.slice(2)) {
     const [mode, directory, flag] = args;
 
     if (
-        !["collect", "publish", "continue"].includes(mode) ||
+        !["collect", "publish", "continue", "recover"].includes(mode) ||
         !directory ||
         (flag !== undefined && flag !== "--publish") ||
         args.length > 3 ||
         (mode !== "publish" && flag)
     )
         throw new Error(
-            "Usage: bun scripts/ai-review-flow.mjs <collect|publish|continue> <output-directory> [--publish]",
+            "Usage: bun scripts/ai-review-flow.mjs <collect|publish|continue|recover> <output-directory> [--publish]",
         );
     const github = createGhClient();
     const revision = exactSha((await git(["rev-parse", "HEAD"])).trim());
@@ -1136,13 +1197,32 @@ export async function main(args = process.argv.slice(2)) {
     if (mode === "collect") {
         const event = await document(process.env.GITHUB_EVENT_PATH);
         let target = pinReviewTarget(reviewTarget(process.env.GITHUB_EVENT_NAME, event), process.env.GITHUB_SHA);
+        let campaignManifest;
+        if(target.range?.kind === "test-audit") {
+            campaignManifest=JSON.parse(await readFile(path.join(root,"config/test-audit-backlog.json"),"utf8"));
+            const digest=testAuditManifestDigest(campaignManifest);
+            if(target.range.manifestDigest && target.range.manifestDigest!==digest)throw new Error("Campaign manifest drift");
+            if(target.range.cursor>=campaignManifest.rows.length)throw new Error("Campaign cursor outside manifest");
+            target={...target,range:{...target.range,sha:target.sha,manifestDigest:digest,totalPaths:campaignManifest.rows.length,pageSize:1,pagePaths:1,nextCursor:target.range.cursor+1<campaignManifest.rows.length?target.range.cursor+1:null}};
+        }
         if (target.auditParent) {
             const config = await protectedConfig("omg-cloud-ci.json");
             ciPolicy(config);
             const parent = await fetchJson(new URL(`/review-records/${target.auditParent}`, config.endpoint), await secret(config.tokenFile), undefined, 2 * 1024 * 1024);
-            target = admitAuditResume(target, parent, revision);
+            target = admitAuditResume(target, parent, revision, campaignManifest?{
+                manifestDigest:testAuditManifestDigest(campaignManifest),publicationResult:await parentPublicationResult(github,target.auditParent,parent)}:undefined);
         }
-        const report = await runReviewFlow({ target, io: await createController(github, revision) });
+        let report;
+        if(campaignManifest){
+            const config=await protectedConfig("omg-cloud-ci.json"),token=await secret(config.tokenFile);
+            const prior=await findDuplicateTestAuditRecord({github,target,revision,manifestDigest:testAuditManifestDigest(campaignManifest),currentRunId:process.env.GITHUB_RUN_ID,
+                loadRecord:(ref)=>fetchJson(new URL(`/review-records/${ref}`,config.endpoint),token,undefined,2*1024*1024)});
+            if(prior) report={repository:SOURCE_REPOSITORY,branch:"main",sha:target.sha,baseSha:target.sha,status:"duplicate-noop",sourceRange:target.range,
+                formatting:{status:"not-started",reason:"equivalent-campaign-row-already-recorded"},suppliedPaths:[],readPaths:[],unreviewedPaths:[],batches:[],publications:[],candidateOutcomes:[],testAudits:[],publishRequested:target.publish,
+                duplicateOf:prior,coverageMeaning:"Duplicate campaign intake performed no inference, verification, continuation or coverage credit."};
+        }
+        report ??= await runReviewFlow({ target, io: await createController(github, revision) });
+        if(campaignManifest){report.campaignParent=target.auditParent??null;report.triggerSha=exactSha(process.env.GITHUB_SHA);report.campaignRun={runId:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT};}
         report.controllerRevision = revision;
         await mkdir(directory, { recursive: true });
         await writeFile(path.join(directory, "review.json"), `${JSON.stringify(report)}\n`, {
@@ -1172,7 +1252,7 @@ export async function main(args = process.argv.slice(2)) {
                 supplied: report.suppliedPaths.length,
                 read: report.readPaths.length,
                 unreviewed: report.unreviewedPaths.length,
-                verifiedCandidates: report.publications.length,
+                verifiedCandidates: report.publications.length + (report.testAudits?.filter(audit=>audit.request.testAudit.proposal.purpose === "existing-test-strengthening").length ?? 0),
                 publishRequested: report.publishRequested,
             })}\n`,
         );
@@ -1180,7 +1260,7 @@ export async function main(args = process.argv.slice(2)) {
         if (process.env.GITHUB_OUTPUT)
             await writeFile(
                 process.env.GITHUB_OUTPUT,
-                `controller-sha=${revision}\npublish=${report.publishRequested}\nverified=${report.publications.length}\naudit-next=${report.sourceRange?.kind === "audit" && report.sourceRange?.intake !== "sentry-runtime" && report.sourceRange.nextCursor !== null && ["reviewed", "no-reviewable-source"].includes(report.status)}\nruntime-ack=${report.publishRequested === true && !report.runtimeUnresolved && report.runtimeEvents?.length > 0}\n`,
+                `controller-sha=${revision}\npublish=${report.publishRequested}\nverified=${report.publications.length + (report.testAudits?.filter(audit=>audit.request.testAudit.proposal.purpose === "existing-test-strengthening").length ?? 0)}\naudit-next=${["audit","test-audit"].includes(report.sourceRange?.kind) && report.sourceRange?.intake !== "sentry-runtime" && (report.sourceRange.nextCursor !== null || report.sourceRange.kind === "test-audit") && (report.sourceRange.kind === "test-audit" ? ["reviewed","incomplete-stale","format-blocked"].includes(report.status) : ["reviewed", "no-reviewable-source"].includes(report.status))}\ntest-audit=${report.sourceRange?.kind === "test-audit"}\nruntime-ack=${runtimeReviewCanAcknowledge(report)}\n`,
                 { flag: "a" },
             );
 
@@ -1197,6 +1277,19 @@ export async function main(args = process.argv.slice(2)) {
     if (!/^[1-9][0-9]{0,19}$/.test(runId ?? "") || !/^[1-9][0-9]{0,5}$/.test(attempt ?? ""))
         throw new Error("Invalid review run identity.");
 
+    const dispatchAudit=async(inputs)=>{
+        const args=["api","--hostname","github.com","--method","POST",`${prefix}/actions/workflows/ai-review.yml/dispatches`,"-f","ref=main"];
+        for(const[key,value]of Object.entries(inputs))args.push("-f",`inputs[${key}]=${value}`);
+        await execute("gh",args);
+    };
+    if(mode === "recover"){
+        const manifest=JSON.parse(await readFile(path.join(root,"config/test-audit-backlog.json"),"utf8"));
+        const currentSha=exactSha((await github.request("GET",`${prefix}/git/ref/heads/main`)).object.sha);
+        const recovered=await recoverTestAuditCampaign({github,currentSha,revision,manifestDigest:testAuditManifestDigest(manifest),currentRunId:runId,dispatch:dispatchAudit,
+            loadRecord:(ref)=>fetchJson(new URL(`/review-records/${ref}`,config.endpoint),token,undefined,2*1024*1024)});
+        process.stdout.write(`${JSON.stringify(recovered)}\n`);return;
+    }
+
     const report = await fetchJson(
         new URL(`/review-records/${runId}-${attempt}`, config.endpoint),
         token,
@@ -1208,7 +1301,7 @@ export async function main(args = process.argv.slice(2)) {
         report.controllerRevision !== revision ||
         report.repository !== SOURCE_REPOSITORY ||
         !Array.isArray(report.publications) ||
-        report.publications.length > 3
+        report.publications.length > 3 || (report.testAudits !== undefined && (!Array.isArray(report.testAudits) || report.testAudits.length > 2))
     )
         throw new Error("Publication artifact has an untrusted controller identity.");
 
@@ -1233,7 +1326,11 @@ export async function main(args = process.argv.slice(2)) {
             return;
         }
         const currentSha = exactSha((await github.request("GET", `${prefix}/git/ref/heads/main`)).object.sha);
-        const continuation = sourceAuditContinuation(report, currentSha, runId, attempt);
+        const continuation = sourceAuditContinuation(report, currentSha, runId, attempt, process.env.PUBLICATION_RESULT);
+        if(report.sourceRange?.kind === "test-audit"){
+            const dispatched=await dispatchTestAuditPlan({github,plan:continuation,dispatch:dispatchAudit,currentRunId:runId});
+            process.stdout.write(`${JSON.stringify(dispatched)}\n`);return;
+        }
         if (continuation.status === "continue") {
             const args = ["api", "--hostname", "github.com", "--method", "POST", `${prefix}/actions/workflows/ai-review.yml/dispatches`, "-f", "ref=main"];
             for (const [key, value] of Object.entries(continuation.inputs)) args.push("-f", `inputs[${key}]=${value}`);
@@ -1335,6 +1432,25 @@ export async function main(args = process.argv.slice(2)) {
                 publish: flag === "--publish",
             }),
         );
+    }
+
+    for(const audit of report.testAudits ?? []) {
+        if(audit.request?.testAudit?.proposal?.purpose === "existing-test-sensitivity")continue;
+        const {request,id,coding}=audit;
+        const expectedId=`cl-${runId}-${attempt}-${report.sha}-ta-${testAuditDigest(request.testAudit.proposal).slice(0,16)}`;
+        if(id!==expectedId || request.runId!==runId || request.attempt!==attempt || request.sha!==report.sha || request.ref!=="refs/heads/main")
+            throw new Error("Test audit publication request identity mismatch.");
+        const codingRequest=parseCodingRequest(coding?.request);
+        if(!codingRequest.testAuditTask || coding.id!==audit.coderOperationId || coding.id!==operationIdentity(codingRequest) ||
+            codingRequest.sha!==report.sha || codingRequest.runId!==runId || codingRequest.attempt!==attempt)
+            throw new Error("Test audit lacks exact coding provenance.");
+        const state=await fetchJson(new URL(`/operations/${coding.id}`,codingEndpoint),codingToken,undefined,2*1024*1024);
+        const coded=admitCoderResult(state,codingRequest,codingPolicy);
+        if(!coded || coded.proposalSha256!==testAuditDigest(request.testAudit.proposal))throw new Error("Test audit coder proposal changed.");
+        const receipt=await fetchJson(new URL(`/runs/${id}/receipt`,config.endpoint),token,undefined,2*1024*1024);
+        results.push(await publishTestAuditReview({github,request,receipt,policy:ciPolicy(config),publish:flag==="--publish",
+            load:(key)=>fetch(new URL(`/runs/${id}/${key.split("/")[0]}/${key.split("/")[2]}`,config.endpoint),{
+                headers:{authorization:`Bearer ${token}`},redirect:"error",signal:AbortSignal.timeout(30000)})}));
     }
 
     process.stdout.write(`${JSON.stringify({ publish: flag === "--publish", results })}\n`);

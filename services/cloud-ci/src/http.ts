@@ -4,6 +4,7 @@ import { reviewRecords } from "./review-records";
 import { diagnosticsHttp } from "./diagnostics-http";
 import { receiveSentry, sentryRecords, type SentryBindings } from "./sentry-intake";
 import { cloudCiChecks } from "../runner/plan.mjs";
+import { testAuditReportNames } from "../runner/test-audit.mjs";
 import {
     nativeParams,
     parseStart,
@@ -102,11 +103,11 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
     if (["/runs", "/source-token"].includes(url.pathname) && request.method === "POST") {
         let input;
         let document: unknown;
+        let size = 0;
 
         try {
             const reader = request.body?.getReader();
             const chunks: Uint8Array[] = [];
-            let size = 0;
 
             if (reader) {
                 try {
@@ -116,7 +117,7 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
                         if (chunk.done) break;
                         size += chunk.value.byteLength;
 
-                        if (size > (url.pathname === "/source-token" ? 2048 : 65536)) {
+                        if (size > (url.pathname === "/source-token" ? 2048 : 1024 * 1024)) {
                             await reader.cancel();
 
                             return json({ error: "CI request too large" }, 413);
@@ -140,9 +141,13 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
             const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
             document = JSON.parse(text || (url.pathname === "/source-token" ? "{}" : "null"));
 
-            if (url.pathname === "/runs") input = parseStart(document);
+            if (url.pathname === "/runs") {
+                input = parseStart(document);
+                if (size > (input.testAudit ? 1024 * 1024 : 65536)) return json({ error: "CI request too large" }, 413);
+            }
             else z.strictObject({}).parse(document);
         } catch {
+            if (size > 65536) return json({ error: "CI request too large" }, 413);
             return json({ error: "Invalid CI request" }, 400);
         }
 
@@ -198,7 +203,7 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
     }
 
     const match =
-        /^\/runs\/(cl-[1-9][0-9]{0,19}-[1-9][0-9]{0,5}-[a-f0-9]{40}(?:-v-[a-f0-9]{16})?)(?:\/(.*))?$/.exec(
+        /^\/runs\/(cl-[1-9][0-9]{0,19}-[1-9][0-9]{0,5}-[a-f0-9]{40}(?:-(?:v|ta)-[a-f0-9]{16})?)(?:\/(.*))?$/.exec(
             url.pathname,
         );
 
@@ -217,6 +222,10 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
             "failure.txt",
             "regression-red-green.stdout",
             "regression-red-green.stderr",
+            "test-audit-four-state.stdout",
+            "test-audit-four-state.stderr",
+            "test-audit-sensitivity.stdout",
+            "test-audit-sensitivity.stderr",
             ...cloudCiChecks.flatMap((check) => [`${check}.stdout`, `${check}.stderr`]),
         ]);
 
@@ -243,6 +252,7 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
 
                 "regression-baseline.json",
                 "regression-patched.json",
+                ...testAuditReportNames,
             ].includes(name)
         )
             return json({ error: "Not found" }, 404);

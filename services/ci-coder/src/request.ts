@@ -7,10 +7,19 @@ import {
   verifySourceBlobs,
 } from "../../ci-inspector/src/review-contract";
 
+export const testAuditTaskSchema = z.strictObject({
+  path: z.string().regex(/^(?:tests\/[A-Za-z0-9_-]+|src\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_.-]+)\.rs$/),
+  target: z.literal("lib").optional(),
+  testName: z.string().max(200).regex(/^[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*$/),
+  originalBlobSha: z.string().regex(/^[a-f0-9]{40}$/),
+}).refine((task) => task.target === "lib" ? task.path.startsWith("src/") : task.path.startsWith("tests/"), "Test target and path differ");
+
 const runNumber = z
   .string()
   .regex(/^[1-9][0-9]{0,19}$/)
   .refine((value) => Number.isSafeInteger(Number(value)));
+
+const auditSourceSchema=sourceReviewInputSchema.safeExtend({sourceFiles:z.array(sourceReviewInputSchema.shape.sourceFiles.element.extend({content:z.string().max(256*1024)})).min(1).max(12)});
 
 export const codingRequestSchema = z
   .strictObject({
@@ -19,7 +28,8 @@ export const codingRequestSchema = z
     branch: z.literal("main"),
     runId: runNumber,
     attempt: z.string().regex(/^[1-9][0-9]{0,5}$/),
-    source: sourceReviewInputSchema,
+    source: z.union([sourceReviewInputSchema,auditSourceSchema]),
+    testAuditTask: testAuditTaskSchema.optional(),
     hypothesis: sourceReviewProposalSchema.optional(),
     candidateIndex: z.number().int().min(0).max(2).optional(),
   })
@@ -31,6 +41,17 @@ export const codingRequestSchema = z
     "Source identity mismatch",
   )
   .superRefine((request, context) => {
+    if (!request.testAuditTask && !sourceReviewInputSchema.safeParse(request.source).success)
+      context.addIssue({code:"custom",path:["source"],message:"Ordinary repair source exceeds its existing limits"});
+    if (request.testAuditTask) {
+      const task = request.testAuditTask;
+      if(request.source.sourceFiles.some(file=>new TextEncoder().encode(file.content).length>256*1024))
+        context.addIssue({code:"custom",path:["source"],message:"Audit source exceeds 256 KiB"});
+      if (request.hypothesis || request.candidateIndex !== undefined || !request.source.auditPaths ||
+          request.source.changedPaths.length || request.source.diff ||
+          !request.source.sourceFiles.some((file) => file.path === task.path && file.blobSha === task.originalBlobSha))
+        context.addIssue({ code: "custom", path: ["testAuditTask"], message: "Test audit requires an exact supplied existing test and no repair hypothesis" });
+    }
     if (request.hypothesis?.kind === "candidates") {
       if (
         request.candidateIndex === undefined ||
@@ -77,6 +98,7 @@ export const operationIdentity = (request: CodingRequest) => {
         source: request.source,
         hypothesis: request.hypothesis ?? null,
         candidateIndex: request.candidateIndex ?? null,
+        ...(request.testAuditTask ? {testAuditTask: request.testAuditTask} : {}),
       }),
     )
     .digest("hex");

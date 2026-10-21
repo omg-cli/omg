@@ -1,8 +1,10 @@
 import { test, expect, mock } from "bun:test";
+import { createHash } from "node:crypto";
 
 let structuredMessages;
 let sourceRequest;
 let sourceWindowContent;
+let patchSystem;
 mock.module("@cloudflare/codemode", () => ({ DynamicWorkerExecutor: class {} }));
 mock.module("@cloudflare/codemode/ai", () => ({ createCodeTool: ({ tools }) => tools }));
 mock.module("workers-ai-provider", () => ({ createWorkersAI: () => () => ({}) }));
@@ -12,6 +14,7 @@ mock.module("ai", () => ({
     generateText: async (request) => {
         if (request.tools) {
             if (request.tools.codemode.readCompletePatch) {
+                patchSystem = request.system;
                 await request.tools.codemode.readCompletePatch.execute();
             } else {
                 sourceRequest = request;
@@ -41,6 +44,36 @@ test("structured independent review receives the whole actual patch when CodeMod
     const result = await reviewPatch(input, { AI: {}, LOADER: {}, CI_INSPECTOR_TOKEN: "unused" });
     expect(result.readCompletePatch).toBe(true);
     expect(JSON.parse(structuredMessages.at(-1).content).retrievedPatch).toEqual(input);
+});
+
+test("strengthening semantic review sees the controlled fault and all four states even when CodeMode discards them", async () => {
+    const { reviewPatch } = await import("../../services/ci-inspector/src/review.ts");
+    const { testAuditDigest } = await import("../../services/cloud-ci/src/test-audit-contract.ts");
+    const hash = (content) => createHash("sha256").update(content).digest("hex");
+    const before = "#[test]\nfn value() {\n let actual = read_value();\n assert!(actual > 0);\n}\n";
+    const after = before.replace("}\n", " assert_eq!(actual, 2);\n}\n");
+    const proposal = { purpose: "existing-test-strengthening", repository: "omg-cli/omg", branch: "main", baseSha: "a".repeat(40),
+        test: { path: "tests/value.rs", testName: "value", originalBlobSha: createHash("sha1").update(`blob ${Buffer.byteLength(before)}\0${before}`).digest("hex"),
+            originalContent: before, newContent: after, sha256: hash(after), assertionLine: 5 },
+        fault: { path: "src/value.rs", originalBlobSha: "f".repeat(40), oldContentQuote: "2", newContent: "pub const VALUE:u32=1;", sha256: hash("pub const VALUE:u32=1;") } };
+    const common = { testName: "value", exitCode: 0, tests: 1, failures: 0, errors: 0, skipped: 0,
+        reportSha256: hash("report"), stdoutSha256: hash("out"), stderrSha256: hash("err"), catalogSha256: hash("catalog"),
+        executableSha256: hash("exe"), compilerMessagesSha256: hash("compiler"), sourceSha256: hash(before), recipeSha256: hash("recipe") };
+    const receipt = { purpose: proposal.purpose, repository: proposal.repository, branch: proposal.branch, baseSha: proposal.baseSha,
+        proposalSha256: testAuditDigest(proposal), verifierRevision: "e".repeat(40), runId: 123, runAttempt: 1,
+        oldIntact: common, oldFault: common, strongerIntact: { ...common, sourceSha256: hash(after) },
+        strongerFault: { ...common, sourceSha256: hash(after), exitCode: 101, failures: 1, assertionFile: proposal.test.path, assertionLine: 5,
+            assertionSourceSha256: hash(" assert_eq!(actual, 2);"), assertionFailure: "assertion `left == right` failed" },
+        protectedPathsUnchanged: true, faultRestored: true, changedPaths: [proposal.test.path], fileHashes: [{ path: proposal.test.path, sha256: proposal.test.sha256 }] };
+    const { originalContent, newContent, ...testIdentity } = proposal.test;
+    const input = { purpose: "test-strengthening-approval", repository: proposal.repository, branch: proposal.branch, baseSha: proposal.baseSha,
+        headSha: "b".repeat(40), headTreeSha: "c".repeat(40), proposalSha256: testAuditDigest(proposal),
+        patch: [{ path: proposal.test.path, before: originalContent, after: newContent }], audit: { test: testIdentity, fault: proposal.fault, receipt } };
+    await reviewPatch(input, { AI: {}, LOADER: {}, CI_INSPECTOR_TOKEN: "unused" });
+    expect(JSON.parse(structuredMessages.at(-1).content).retrievedPatch).toEqual(input);
+    expect(patchSystem).toContain("old/fault GREEN");
+    expect(patchSystem).toContain("evidence-only");
+    expect(patchSystem).toContain("never certification of an entire test suite");
 });
 
 test("actual source-model request includes historical runtime error types and frame-centered current source", async () => {

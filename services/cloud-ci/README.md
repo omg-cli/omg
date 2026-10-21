@@ -32,11 +32,24 @@ The response identifies the run and its status/receipt routes. Poll `GET /runs/<
 
 The portable Rust reports are `rust-pgp-license-junit.xml` and `rust-debian-pure-junit.xml`. This is not CodeLoud's renderer/browser/channel or Windows plan. The toolchain includes Rust 1.95.0 and pinned Bun/Node versions; `runner/plan.mjs` is the source of truth.
 
-Verification requests add the fixed `regression-red-green` recipe. It requires one named new Rust regression to fail with an observed assertion on the original source, then pass after the validated repair, with the proposal applied to all required portable runners. Compiler, setup, missing-test and timeout failures are not behavioral RED. Receipts bind both raw regression reports to their summary hashes; coder and publisher fetch/hash those objects before admission. Existing-test strengthening remains held until its four-state recipe is integrated, and dependency changes require their own receipts.
+Verification requests add the fixed `regression-red-green` recipe. It requires one named new Rust regression to fail with an observed assertion on the original source, then pass after the validated repair, with the proposal applied to all required portable runners. Compiler, setup, missing-test and timeout failures are not behavioral RED. Receipts bind both raw regression reports to their summary hashes; coder and publisher fetch/hash those objects before admission. Dependency changes require their own receipts.
+
+## Existing-test verification
+
+The separate `testAudit` request is mutually exclusive with repair `verification`. It binds the exact original Git source and selects one existing root integration test or qualified `omg_lib` test. The [audit contract](src/test-audit-contract.ts) defines two purposes:
+
+- `existing-test-sensitivity` executes only original/intact GREEN and original/fault intended assertion 101. It records sensitivity to the selected fault, with no changed paths or publication authority.
+- `existing-test-strengthening` requires old/intact GREEN, old/fault GREEN, stronger/fault intended assertion 101 and stronger/intact GREEN. It preserves all original test bytes and adds one assertion inside the selected function.
+
+The controlled fault remains private and is restored. Normal portable checks receive intact production source and, for strengthening, only the stronger test. Receipts and raw reports use a distinct `-ta-` run identity. Consumers refetch the named reports and validate their actual compiler, catalog, execution and digest joins. A historical name or selected source file earns no current execution credit. Unsupported or native-only cases remain held. See [the queue and interpretation rules](../../docs/operations/cloudflare-autonomous-repair.md#existing-test-audit).
+
+Audit-only source files allow up to 256 KiB of UTF-8 bytes each, with a 1 MiB request envelope. Full bytes cross the trusted process boundary in at most 88 base64 chunks of 16,000 characters. Normal repair collection remains limited to 24,000-byte sources and 64 KiB CI requests. The coder's audit state cap is 1.5 MiB; private review records have a separate 2 MiB cap. Oversized input fails admission rather than being truncated.
 
 ## Execution and storage boundaries
 
 Candidate commands run as UID/GID 10001 with a scrubbed environment, protected tracked source and explicit writable build/cache directories (`runner/portable-process.mjs`). This boundary does not disable network access. JUnit and exit codes are test observations, not independent proof that an arbitrary generated assertion describes a real product defect. Native/QEMU lifecycle and platform acceptance remain separate.
+
+For selected Rust verification, the root controller freezes compiled artifacts and dependency inputs after Cargo completes and before both test listing and execution. It verifies their filesystem identities after each invocation. Scratch under the test's HOME/tmp remains writable. The existing preparation step reopens build caches for the next compilation. Docker build smokes exercise the Linux UID boundary and the near-limit environment transport; they do not execute or certify retained OMG tests.
 
 Only the dependency phase is cached. Its key includes the image, trusted plan, source ref, command and relevant manifest/lockfile inputs. Before uncached checks, the trusted runner removes restored source absent from the exact commit while preserving explicit dependency directories.
 

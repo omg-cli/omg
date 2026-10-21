@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
 import type { CiParams, CloudflareArtifacts } from "@cloudflare/ci";
+import { testAuditSchema, testAuditDigest } from "./test-audit-contract";
 import {
     boundedText,
     sha40,
@@ -27,10 +28,13 @@ const startSchema = z
         runId: z.string().regex(/^[1-9][0-9]{0,19}$/),
         attempt: z.string().regex(/^[1-9][0-9]{0,5}$/),
         verification: verificationSchema.optional(),
+        testAudit: testAuditSchema.optional(),
     })
     .refine((request) => {
         const verification = request.verification;
 
+        if (request.testAudit) return !verification && Number.isSafeInteger(Number(request.runId)) &&
+            request.testAudit.proposal.baseSha === request.sha && request.ref === "refs/heads/main";
         if (!verification) return true;
 
         return (
@@ -42,8 +46,8 @@ const startSchema = z
         );
     }, "Verification identity mismatch")
     .refine(
-        (request) => new TextEncoder().encode(JSON.stringify(request)).length <= 65536,
-        "CI request exceeds 64 KiB",
+        (request) => new TextEncoder().encode(JSON.stringify(request)).length <= (request.testAudit ? 1024 * 1024 : 65536),
+        "CI request exceeds its purpose byte budget",
     );
 
 export type StartRequest = z.infer<typeof startSchema>;
@@ -70,6 +74,7 @@ export const proposalDigest = (proposal: NonNullable<StartRequest["verification"
         .digest("hex");
 
 const verificationSuffix = (request: StartRequest) =>
+    request.testAudit ? `-ta-${testAuditDigest(request.testAudit.proposal).slice(0, 16)}` :
     request.verification ? `-v-${proposalDigest(request.verification.proposal).slice(0, 16)}` : "";
 
 export const runIdentity = (request: StartRequest) =>

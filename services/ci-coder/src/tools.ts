@@ -1,3 +1,5 @@
+import { createTestAuditProposal, buildTestAuditProposal, testAuditToolSchema, type CoderTestAudit } from "./test-audit";
+import { verifyCloudTestAudit } from "../../../scripts/cloud-test-audit-evidence.mjs";
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
 import type { DurableObjectStorage } from "@cloudflare/workers-types";
@@ -25,6 +27,7 @@ export type CodingState = {
   calls: number;
   reads: ReadRange[];
   proposal?: CoderProposal;
+  testAudit?: Pick<CoderTestAudit,"proposal"|"proposalSha256">;
   verification?: { proposalSha256: string; id: string; receipt: Json };
   verifiedDigests: string[];
   verificationJob?: VerificationJob;
@@ -104,15 +107,15 @@ export async function pollCodingVerification(
   if (!job || job.status !== "pending") return job;
   try {
     if (Date.now() >= job.deadline) throw new Error("Coding verification deadline exceeded");
-    const proposal = state.proposal;
+    const proposal = state.testAudit ?? state.proposal;
     if (!proposal || proposal.proposalSha256 !== job.proposalSha256)
       throw new Error("Proposal changed during verification");
     const request = await getRequest();
     const id = job.id;
     const ciRequest = { repository: request.repository, sha: request.sha,
       ref: `refs/heads/${request.branch}`, runId: request.runId, attempt: request.attempt,
-      verification: { proposal: proposal.proposal, regression: proposal.regression,
-        verifierRevision: env.CI_VERIFIER_REVISION } };
+      ...(state.testAudit ? {testAudit:{proposal:state.testAudit.proposal,verifierRevision:env.CI_VERIFIER_REVISION}} :
+        {verification:{proposal:state.proposal!.proposal,regression:state.proposal!.regression,verifierRevision:env.CI_VERIFIER_REVISION}}) };
     const status = z.object({ id: z.literal(id), sha: z.literal(request.sha),
       status: z.enum(["queued", "running", "waiting", "paused", "complete", "errored", "terminated", "unknown"]),
     }).parse(await ciJson(env, `/runs/${id}`, signal));
@@ -134,6 +137,14 @@ export async function pollCodingVerification(
     verifierRevision: env.CI_VERIFIER_REVISION,
   };
 
+  const load = (key: string) => {
+    const [kind, , name] = key.split("/");
+    return env.CI_SERVICE.fetch(`https://omg-cloud-ci.latham.workers.dev/runs/${id}/${kind}/${name}`, {
+      headers:{Authorization:`Bearer ${env.CI_API_TOKEN}`},signal,redirect:"error"});
+  };
+  if (state.testAudit) {
+    await verifyCloudTestAudit(receipt, ciRequest, policy, load);
+  } else {
   verifyPublicationProof(receipt, ciRequest, policy, proposal, sources);
 
   const admitted = z
@@ -172,10 +183,11 @@ export async function pollCodingVerification(
       },
     );
   });
+  }
   await update((current) => {
     if (current.verificationJob?.id !== job.id || current.verificationJob.status !== "pending")
       return current;
-    if (current.proposal?.proposalSha256 !== job.proposalSha256)
+    if ((current.testAudit ?? current.proposal)?.proposalSha256 !== job.proposalSha256)
       throw new Error("Proposal changed during verification");
 
     return {
@@ -307,6 +319,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         "Propose exactly one evidenced repair with exact unique replacements and one new regression test. Does not publish or execute code.",
       async execute(input: z.infer<typeof sourceReviewProposalSchema>, context: ToolContext) {
         const request = await enter(context);
+        if (request.testAuditTask) throw new Error("Use the separate existing-test audit tools");
         const { repository, sha, branch, runId, attempt, source } = request;
 
         const proposal = createCoderProposal(
@@ -344,6 +357,20 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         });
       },
     },
+    propose_test_strengthening: {
+      input: testAuditToolSchema,
+      description: "Audit the selected test against an evidence-only source fault. For an adequate test use existing-test-sensitivity with unchanged bytes; strengthening inserts one assertion. Never publish the fault.",
+      async execute(input: z.infer<typeof testAuditToolSchema>, context: ToolContext) {
+        const request = await enter(context);
+        const testAudit = buildTestAuditProposal(request, input);
+        await update((state) => {
+          if (![testAudit.proposal.test.path,input.fault.path].every((path) => state.reads.some((read) => read.path === path)))
+            throw new Error("Read the test and fault source before proposing strengthening");
+          return {...state,testAudit:{proposal:testAudit.proposal,proposalSha256:testAudit.proposalSha256},proposal:undefined,verification:undefined,verificationJob:undefined};
+        });
+        return output({proposalSha256:testAudit.proposalSha256,handover:testAudit.handover});
+      },
+    },
     verify_patch: {
       input: hashInput,
       description:
@@ -352,7 +379,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         const request = await enter(context);
 
         const state = await update((current) => {
-          if (!current.proposal || current.proposal.proposalSha256 !== input.proposalSha256)
+          if (!(current.testAudit ?? current.proposal) || (current.testAudit ?? current.proposal)?.proposalSha256 !== input.proposalSha256)
             throw new Error("Verification proposal is stale or missing");
 
           const digests = current.verifiedDigests.includes(input.proposalSha256)
@@ -364,7 +391,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           return { ...current, verifiedDigests: digests };
         });
 
-        const proposal = state.proposal;
+        const proposal = state.testAudit ?? state.proposal;
 
         if (!proposal) throw new Error("Verification proposal is missing");
 
@@ -374,10 +401,8 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           return output({ status: job.status, id: job.id, proposalSha256: job.proposalSha256 });
         }
 
-        const verification = {
-          proposal: proposal.proposal,
-          regression: proposal.regression,
-          verifierRevision: env.CI_VERIFIER_REVISION,
+        const verification = state.testAudit ? undefined : {
+          proposal: state.proposal!.proposal, regression: state.proposal!.regression, verifierRevision: env.CI_VERIFIER_REVISION,
         };
 
         const ciRequest = {
@@ -386,10 +411,12 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           ref: `refs/heads/${request.branch}`,
           runId: request.runId,
           attempt: request.attempt,
-          verification,
+          ...(state.testAudit ? {testAudit:{proposal:state.testAudit.proposal,verifierRevision:env.CI_VERIFIER_REVISION}} : {verification}),
         };
 
-        const id = `cl-${request.runId}-${request.attempt}-${request.sha}-v-${proposal.proposalSha256.slice(0, 16)}`;
+        if (state.testAudit && new TextEncoder().encode(JSON.stringify(ciRequest)).length > 1024 * 1024)
+          throw new Error("Existing-test audit request exceeds 1 MiB after exact byte reconstruction");
+        const id = `cl-${request.runId}-${request.attempt}-${request.sha}-${state.testAudit ? "ta" : "v"}-${proposal.proposalSha256.slice(0, 16)}`;
 
         const started = z
           .object({ id: z.literal(id), sha: z.literal(request.sha) })
@@ -398,10 +425,10 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         const job: VerificationJob = {
           id, proposalSha256: input.proposalSha256, sessionId: context.sessionID,
           continuationId: `cv-${request.runId}-${request.attempt}-${request.sha}-${input.proposalSha256.slice(0, 16)}`,
-          deadline: Date.now() + 35 * 60 * 1000, status: "pending",
+          deadline: Date.now() + (state.testAudit ? 110 : 35) * 60 * 1000, status: "pending",
         };
         await update((current) => {
-          if (current.proposal?.proposalSha256 !== input.proposalSha256)
+          if ((current.testAudit ?? current.proposal)?.proposalSha256 !== input.proposalSha256)
             throw new Error("Proposal changed during verification start");
           return { ...current, verificationJob: job };
         });
@@ -414,11 +441,11 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       description:
         "Export a verified exact proposal with required skill provenance. Publishing still uses the separate trusted GitHub controller.",
       async execute(input: z.infer<typeof hashInput>, context: ToolContext) {
-        await enter(context);
+        const request=await enter(context);
         const state = await update((current) => current);
 
         if (
-          state.proposal?.proposalSha256 !== input.proposalSha256 ||
+          (state.testAudit ?? state.proposal)?.proposalSha256 !== input.proposalSha256 ||
           state.verification?.proposalSha256 !== input.proposalSha256
         )
           throw new Error("An exact verified proposal is required before export");
@@ -426,7 +453,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         const delivery = skills.assertDelivered(context.sessionID);
 
         return output({
-          proposal: state.proposal,
+          ...(state.testAudit ? {testAuditHandover:createTestAuditProposal(request,state.testAudit.proposal).handover} : {proposal:state.proposal!}),
           verification: state.verification,
           skillBundleSha256: delivery.bundleSha256,
           sessionId: delivery.sessionId,
@@ -446,6 +473,8 @@ export function updateCodingResult(
 ) {
   return storage.transaction(async (transaction) => {
     const state = change((await transaction.get<CodingState>("coding-result")) ?? emptyState());
+    if(state.testAudit && new TextEncoder().encode(JSON.stringify(state)).length > 1.5 * 1024 * 1024)
+      throw new Error("Existing-test audit state exceeds 1.5 MiB storage budget");
     await transaction.put("coding-result", state);
     return state;
   });
@@ -468,6 +497,7 @@ export function createCodingTools(
         editor.add({ name: "read_source", ...actions.read_source });
         editor.add({ name: "read_skill", ...actions.read_skill });
         editor.add({ name: "propose_fix", ...actions.propose_fix });
+        editor.add({ name: "propose_test_strengthening", ...actions.propose_test_strengthening });
         editor.add({ name: "verify_patch", ...actions.verify_patch });
         editor.add({ name: "export_proposal", ...actions.export_proposal });
       });

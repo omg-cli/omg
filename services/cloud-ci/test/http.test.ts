@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { fetchCi } from "../src/http";
 import { receiptKey, requestKey, runIdentity, parseStart } from "../src/contract";
+import { createHash } from "node:crypto";
 
 const input = parseStart({
   repository: "omg-cli/omg",
@@ -22,6 +23,12 @@ test("authenticated verification evidence remains readable after a failed workfl
     ["logs/regression-red-green.stderr", "trusted verifier stderr"],
     ["reports/regression-baseline.json", '<testsuites name="baseline"/>'],
     ["reports/regression-patched.json", '<testsuites name="patched"/>'],
+    ["reports/test-audit-oldIntact.json", '{"phase":"oldIntact"}'],
+    ["reports/test-audit-oldFault.json", '{"phase":"oldFault"}'],
+    ["reports/test-audit-strongerFault.json", '{"phase":"strongerFault"}'],
+    ["reports/test-audit-strongerIntact.json", '{"phase":"strongerIntact"}'],
+    ["logs/test-audit-four-state.stdout", "trusted four-state stdout"],
+    ["logs/test-audit-four-state.stderr", "trusted four-state stderr"],
   ]);
 
   for (const [suffix, content] of contents) {
@@ -132,6 +139,36 @@ function fixture() {
     },
   };
 }
+
+test("audit evidence routes preserve the purpose-bound run suffix and restrict named objects", async () => {
+  const f = fixture();
+  const auditId = `${id}-ta-${"b".repeat(16)}`;
+  f.objects.set(requestKey(auditId), JSON.stringify(input));
+  f.objects.set(`reports/${auditId}/test-audit-oldIntact.json`, '{"phase":"oldIntact"}');
+  const response = await f.send(`/runs/${auditId}/reports/test-audit-oldIntact.json`, undefined);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ phase: "oldIntact" });
+  expect((await f.send(`/runs/${auditId}/reports/test-audit-unlisted.json`, undefined)).status).toBe(404);
+  expect((await f.send(`/runs/${auditId}/reports/test-audit-oldIntact.json`, undefined, "wrong")).status).toBe(401);
+});
+
+test("only test audits may carry a full source envelope above 64 KiB", async () => {
+  const f = fixture();
+  const original = `${"// retained source context\n".repeat(1500)}#[test]\nfn value() {\n assert!(true);\n}\n`;
+  const stronger = original.replace(" assert!(true);", " assert_eq!(1, 1);\n assert!(true);");
+  const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+  const request = { ...input, testAudit: { verifierRevision: "c".repeat(40), proposal: {
+    purpose: "existing-test-strengthening", repository: "omg-cli/omg", branch: "main", baseSha: input.sha,
+    test: { path: "tests/value.rs", testName: "value", originalBlobSha: createHash("sha1").update(`blob ${Buffer.byteLength(original)}\0${original}`).digest("hex"),
+      originalContent: original, newContent: stronger, sha256: hash(stronger), assertionLine: 1503 },
+    fault: { path: "src/value.rs", originalBlobSha: "d".repeat(40), oldContentQuote: "2", newContent: "pub const VALUE:u32=1;", sha256: hash("pub const VALUE:u32=1;") },
+  } } };
+  expect(Buffer.byteLength(JSON.stringify(request))).toBeGreaterThan(65536);
+  expect((await f.send("/runs", JSON.stringify(request))).status).toBe(202);
+  expect(f.creations).toBe(1);
+  expect((await f.send("/runs", JSON.stringify(input) + " ".repeat(65536))).status).toBe(413);
+  expect((await f.send("/runs", JSON.stringify(request) + " ".repeat(1024 * 1024))).status).toBe(413);
+});
 
 test("a missing get() instance creates the first run instead of escaping as HTTP 500", async () => {
   const f = fixture();

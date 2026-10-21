@@ -158,21 +158,21 @@ test("runtime polling with no source events never starts formatting CI or model 
 
 test("weekly workflow chains bounded pages only through a separate trusted dispatch job", () => {
     const workflow = Bun.YAML.parse(readFileSync(new URL("../../.github/workflows/ai-review.yml", import.meta.url), "utf8"));
-    assert.deepEqual(workflow.on.schedule, [{ cron: "23 6 * * 1" }, { cron: "*/15 * * * *" }]);
+    assert.deepEqual(workflow.on.schedule, [{ cron: "23 6 * * 1" }, { cron: "*/15 * * * *" }, {cron:"11 */6 * * *"}]);
     assert.equal(workflow.concurrency.group, "omg-ai-review-global");
     assert.equal(workflow.concurrency.queue, "max");
-    assert.deepEqual(workflow.on.workflow_dispatch.inputs.scope.options, ["changes", "source-audit", "runtime-events"]);
+    assert.deepEqual(workflow.on.workflow_dispatch.inputs.scope.options, ["changes", "source-audit", "runtime-events", "test-audit"]);
     assert.match(workflow.jobs.review.if, /github.event_name == 'schedule'/);
     const continuation = workflow.jobs.continue;
     assert.deepEqual(continuation.needs, ["review", "publish"]);
     assert.deepEqual(continuation.permissions, { contents: "read", actions: "write" });
     assert.match(continuation.if, /needs.publish.result == 'success'/);
     assert.match(continuation.if, /needs.publish.result == 'skipped'/);
-    assert.equal(continuation.steps.some((step) => step.run === "bun scripts/ai-review-flow.mjs continue .audit/ai-review"), true);
+    assert.equal(continuation.steps.some((step) => step.run?.includes("bun scripts/ai-review-flow.mjs continue .audit/ai-review")), true);
     assert.equal(JSON.stringify(continuation).includes("APP_PRIVATE_KEY"), false);
     assert.equal(JSON.stringify(continuation).includes("OMG_CI_CODER_TOKEN"), false);
     assert.match(continuation.if, /outputs.runtime-ack == 'true'/);
-    const finalize = continuation.steps.find((step) => step.run === "bun scripts/ai-review-flow.mjs continue .audit/ai-review");
+    const finalize = continuation.steps.find((step) => step.run?.includes("bun scripts/ai-review-flow.mjs continue .audit/ai-review"));
     assert.equal(finalize.env.PUBLICATION_RESULT, "${{ needs.publish.result }}");
 });
 
@@ -199,7 +199,14 @@ test("actionlint queue compatibility applies only to two serialized trusted work
 test("runtime evidence is acknowledged only after successful actual publication or an empty candidate set", async () => {
     assert.equal(typeof reviewFlow.finalizeRuntimeReview, "function");
     const acknowledged = [];
-    const report = { publishRequested: true, publications: [{ proposal: {} }], runtimeEvents: [{ eventId: "a".repeat(32) }] };
+    const identity = { repository: "omg-cli/omg", sha, branch: "main" };
+    const report = { ...identity, status: "reviewed", publishRequested: true, sourceRange: { intake: "sentry-runtime" },
+        formatting: { status: "passed" }, batches: [{ sourceInput: { ...identity, sourceFiles: [{ path: "src/value.rs" }] },
+            modelResponse: { ...identity, model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017", publication: "requires-verifier",
+                codeExecutions: 1, sourceToolCalls: 1, readDiff: false, suppliedPaths: ["src/value.rs"], readPaths: ["src/value.rs"] } }],
+        suppliedPaths: ["src/value.rs"], readPaths: ["src/value.rs"], unreviewedPaths: [],
+        candidateOutcomes: [{ outcome: "verified-for-publication" }], publications: [{ proposal: {} }],
+        runtimeEvents: [{ projectId: "1", eventId: "a".repeat(32), bodySha256: "b".repeat(64) }] };
     const acknowledge = async () => { acknowledged.push("ack"); };
     for (const publicationResult of ["failure", "cancelled", "skipped", undefined]) {
         await assert.rejects(() => reviewFlow.finalizeRuntimeReview({ report, publicationResult, acknowledge }), /publication/i);
@@ -208,7 +215,7 @@ test("runtime evidence is acknowledged only after successful actual publication 
     await assert.rejects(() => reviewFlow.finalizeRuntimeReview({ report: { ...report, publishRequested: false }, publicationResult: "success", acknowledge }), /publication/i);
     assert.deepEqual(acknowledged, []);
     await reviewFlow.finalizeRuntimeReview({ report, publicationResult: "success", acknowledge });
-    await reviewFlow.finalizeRuntimeReview({ report: { ...report, publications: [] }, publicationResult: "skipped", acknowledge });
+    await reviewFlow.finalizeRuntimeReview({ report: { ...report, publications: [], candidateOutcomes: [] }, publicationResult: "skipped", acknowledge });
     assert.deepEqual(acknowledged, ["ack", "ack"]);
 });
 
@@ -597,7 +604,7 @@ test("workflow isolates write permission and excludes generated branches from th
         assert.match(setup.run, /mode: 0o600/);
     }
     assert.match(workflow.jobs.publish.if, /github.event_name == 'workflow_dispatch'/);
-    assert.equal(workflow.jobs.review.permissions, undefined);
+    assert.deepEqual(workflow.jobs.review.permissions,{contents:"read",actions:"read"});
     assert.deepEqual(workflow.jobs.publish.permissions, {
         contents: "read",
         actions: "read",

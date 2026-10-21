@@ -28,6 +28,7 @@ export async function verifyCloudCiObjects(receipt, load) {
             ...check.reports,
         ]),
         ...(receipt.verificationReports ?? []),
+        ...(receipt.testAuditReports ?? []),
     ];
     for (const object of objects) {
         const response = await load(object.key);
@@ -71,6 +72,8 @@ const proof = Schema.Struct({
 });
 
 export function verifyCloudCiReceipt(receipt, expected, policy) {
+    if (!policy.testAuditSha256 && (receipt.testAuditReceipt || receipt.testAuditReports?.length))
+        throw new Error("Existing-test audit evidence requires separate admission.");
     const request = parseCloudCiRequest(expected);
 
     for (const [key, value] of Object.entries(request))
@@ -105,7 +108,9 @@ export function verifyCloudCiReceipt(receipt, expected, policy) {
 
     if (policy.proposalSha256 !== undefined && !/^[a-f0-9]{64}$/.test(policy.proposalSha256))
         throw new Error("Cloudflare CI proposal identity is invalid.");
-    const id = `cl-${request.runId}-${request.attempt}-${request.sha}${policy.proposalSha256 ? `-v-${policy.proposalSha256.slice(0, 16)}` : ""}`;
+    if (policy.testAuditSha256 !== undefined && (!/^[a-f0-9]{64}$/.test(policy.testAuditSha256) || policy.proposalSha256))
+        throw new Error("Cloudflare CI audit identity is invalid.");
+    const id = `cl-${request.runId}-${request.attempt}-${request.sha}${policy.testAuditSha256 ? `-ta-${policy.testAuditSha256.slice(0, 16)}` : policy.proposalSha256 ? `-v-${policy.proposalSha256.slice(0, 16)}` : ""}`;
 
     for (const check of receipt.checks) {
         if (

@@ -4,6 +4,7 @@ import { proposalDigest, sha256, canonicalJson } from "./ai-review-publication.m
 import { verifyPublicationProof } from "./ai-review-proof.mjs";
 import { verifyCloudCiObjects } from "./cloud-ci-evidence.mjs";
 import { patchReviewInputSchema, patchReviewDigest, admitPatchReview } from "../services/ci-inspector/src/patch-review-contract.ts";
+import { reviewTestAuditFix } from "./test-audit-fix-review.mjs";
 
 const repository = "omg-cli/omg";
 const requiredChecks = [
@@ -97,6 +98,8 @@ export async function reviewAiFix({ github, services, number, expectedHead, publ
     const getChecks = () => list(github, `${prefix}/commits/${expectedHead}/check-runs?filter=latest`, "check_runs");
     const currentMain = async () => (await github.request("GET", `${prefix}/git/ref/heads/main`)).object.sha;
     const pull = await getPull();
+    if (/^Proof purpose: existing-test-strengthening$/m.test(pull.body ?? ""))
+        return reviewTestAuditFix({ github, services, number, expectedHead, publisher, policy, approve, pull });
     const checkCandidate = (pull, checks) => {
         const decision = decideAiFixReview({ pull, expectedHead, publisher, checks });
         if (decision.action === "reject") throw new Error(decision.reason);
