@@ -46,7 +46,7 @@ export const codingRequestSchema = z
   .superRefine((request, context) => {
     if (request.diagnosisTask && (request.testAuditTask || request.dependencyTask || request.hypothesis || request.candidateIndex !== undefined || !request.source.auditPaths))
       context.addIssue({code: "custom", message: "Read-only diagnosis requires an immutable audit snapshot and no coding task"});
-    if (!request.testAuditTask && !request.dependencyTask && !sourceReviewInputSchema.safeParse(request.source).success)
+    if (!request.testAuditTask && !request.dependencyTask && !request.diagnosisTask && !sourceReviewInputSchema.safeParse(request.source).success)
       context.addIssue({code:"custom",path:["source"],message:"Ordinary repair source exceeds its existing limits"});
     if(request.dependencyTask) {
       const lock=request.source.sourceFiles.find(file=>file.path==="Cargo.lock");

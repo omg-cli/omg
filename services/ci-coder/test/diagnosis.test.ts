@@ -26,6 +26,13 @@ test("diagnosis binds immutable evidence and cannot be confused with a coding ta
     assert.throws(() => parseCodingRequest({...input, testAuditTask: {path: "src/value.rs", testName: "case", target: "lib", originalBlobSha: "b".repeat(40)}}));
 });
 
+test("large diagnostic source remains read-only and cannot enter ordinary repair admission", () => {
+    const content = "// source evidence\n".repeat(2000);
+    const source = {...input.source, sourceFiles: [{path: input.source.auditPaths[0], content, blobSha: gitBlobSha(content)}]};
+    assert.doesNotThrow(() => parseCodingRequest({...input, source}), "Diagnostic reads use the existing bounded audit source envelope");
+    assert.throws(() => parseCodingRequest({...input, source, diagnosisTask: undefined}));
+});
+
 test("cloud diagnosis reads evidence but cannot propose, verify or export a repair", async () => {
     assert.doesNotThrow(() => parseCodingRequest(input), "Read-only diagnostic task should be admitted");
     const request = parseCodingRequest(input), skills = await createRequiredSkillsPlugin(), sessionID = Session.ID.create();
