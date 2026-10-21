@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { createHash } from "node:crypto";
 import * as publication from "../../scripts/ai-review-publication.mjs";
+import { ciPolicy } from "../../scripts/ai-review-proof.mjs";
 import { testAuditProofFixture } from "./fixtures/test-audit-proof.mjs";
 import { testAuditPublicationProposal } from "../../scripts/test-audit-publication.mjs";
 import { runReviewFlow, reviewRecord } from "../../scripts/ai-review-flow.mjs";
@@ -213,4 +214,16 @@ test("an interrupted 200 KiB audit publication resumes its identical owned branc
     };
     expect((await publication.publishTestAuditReview({ ...proof, github: state.github, publish: true })).action).toBe("published");
     expect(state.calls.filter(call => call.method === "POST").map(call => call.route.split("/").at(-1))).toEqual(["pulls"]);
+});
+
+test("shared ci policy preserves the trusted endpoint through actual test-audit publication", async () => {
+    const proof = testAuditProofFixture();
+    const state = githubFixture(proof);
+    const loaded = [];
+    const result = await publication.publishTestAuditReview({ ...proof, policy: ciPolicy(proof.policy),
+        github: state.github, load: (key) => { loaded.push(key); return proof.load(key); }, publish: true });
+    expect(result.action).toBe("published");
+    expect(loaded).toHaveLength(proof.objects.size);
+    const pull = state.calls.find((call) => call.method === "POST" && call.route.endsWith("/pulls"));
+    expect(pull.body.body).toContain("Proof purpose: existing-test-strengthening");
 });

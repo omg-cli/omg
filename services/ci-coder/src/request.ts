@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
+import { dependencyTaskSchema, dependencyLockRange } from "./dependency";
 import {
   sourceReviewInputSchema,
   sourceReviewProposalSchema,
@@ -30,6 +31,7 @@ export const codingRequestSchema = z
     attempt: z.string().regex(/^[1-9][0-9]{0,5}$/),
     source: z.union([sourceReviewInputSchema,auditSourceSchema]),
     testAuditTask: testAuditTaskSchema.optional(),
+    dependencyTask: dependencyTaskSchema.optional(),
     hypothesis: sourceReviewProposalSchema.optional(),
     candidateIndex: z.number().int().min(0).max(2).optional(),
   })
@@ -41,8 +43,20 @@ export const codingRequestSchema = z
     "Source identity mismatch",
   )
   .superRefine((request, context) => {
-    if (!request.testAuditTask && !sourceReviewInputSchema.safeParse(request.source).success)
+    if (!request.testAuditTask && !request.dependencyTask && !sourceReviewInputSchema.safeParse(request.source).success)
       context.addIssue({code:"custom",path:["source"],message:"Ordinary repair source exceeds its existing limits"});
+    if(request.dependencyTask) {
+      const lock=request.source.sourceFiles.find(file=>file.path==="Cargo.lock");
+      if(request.testAuditTask || request.hypothesis || request.candidateIndex!==undefined ||
+        request.source.changedPaths.length || request.source.diff || !request.source.auditPaths ||
+        request.source.sourceFiles.length!==2 || !lock ||
+        !request.source.sourceFiles.some(file=>file.path==="Cargo.toml") || !request.source.ciFailures.length)
+        context.addIssue({code:"custom",path:["dependencyTask"],message:"Dependency repair requires exact lockfile, manifest and failure evidence only"});
+      if(lock) for(const target of request.dependencyTask.targets) {
+        try { dependencyLockRange(lock.content,target); }
+        catch {context.addIssue({code:"custom",path:["dependencyTask"],message:"Dependency target differs from exact source"});}
+      }
+    }
     if (request.testAuditTask) {
       const task = request.testAuditTask;
       if(request.source.sourceFiles.some(file=>new TextEncoder().encode(file.content).length>256*1024))
@@ -99,6 +113,7 @@ export const operationIdentity = (request: CodingRequest) => {
         hypothesis: request.hypothesis ?? null,
         candidateIndex: request.candidateIndex ?? null,
         ...(request.testAuditTask ? {testAuditTask: request.testAuditTask} : {}),
+        ...(request.dependencyTask ? {dependencyTask: request.dependencyTask} : {}),
       }),
     )
     .digest("hex");

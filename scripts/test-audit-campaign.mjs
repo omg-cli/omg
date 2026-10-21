@@ -266,7 +266,12 @@ export function testAuditTarget(input) {
         ...(hasParent ? { auditParent: input.audit_parent } : {}),
     };
 }
-export async function parentPublicationResult(github, parentRef, report) {
+export async function parentPublicationResult(
+    github,
+    parentRef,
+    report,
+    { wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {},
+) {
     if (
         !run.test(parentRef) ||
         `${report.campaignRun?.runId}-${report.campaignRun?.attempt}` !==
@@ -292,24 +297,55 @@ export async function parentPublicationResult(github, parentRef, report) {
         !["workflow_dispatch", "schedule"].includes(metadata.event)
     )
         throw new Error("Campaign parent workflow identity mismatch");
-    const result = await github.request(
-        "GET",
-        `/repos/omg-cli/omg/actions/runs/${id}/attempts/${attempt}/jobs?per_page=100`,
-    );
-    const reviews = result.jobs?.filter((job) => job.name === "review"),
-        publish = result.jobs?.filter((job) => job.name === "publish");
-    if (
-        reviews?.length !== 1 ||
-        reviews[0].conclusion !== "success" ||
-        reviews[0].status !== "completed" ||
-        publish?.length !== 1 ||
-        publish[0].status !== "completed" ||
-        !["success", "skipped", "failure", "cancelled", "timed_out"].includes(
-            publish[0].conclusion,
-        )
-    )
-        throw new Error("Campaign parent jobs are not terminal");
-    return publish[0].conclusion;
+    const retryDelaysMs = [1000, 2000, 4000, 8000, 14000];
+    const describe = (jobs) =>
+        jobs.length
+            ? jobs
+                  .map(
+                      (job) =>
+                          `${job?.status ?? "unknown"}/${job?.conclusion ?? "none"}`,
+                  )
+                  .join(",")
+            : "missing";
+    for (let retry = 0; ; retry++) {
+        const result = await github.request(
+            "GET",
+            `/repos/omg-cli/omg/actions/runs/${id}/attempts/${attempt}/jobs?per_page=100`,
+        );
+        if (!Array.isArray(result.jobs))
+            throw new Error("Campaign parent jobs inventory unavailable");
+        const reviews = result.jobs.filter((job) => job?.name === "review"),
+            publish = result.jobs.filter((job) => job?.name === "publish");
+        if (reviews.length > 1 || publish.length > 1)
+            throw new Error("Campaign parent job identity is ambiguous");
+        if (reviews.length === 1 && reviews[0].status === "completed") {
+            if (reviews[0].conclusion !== "success")
+                throw new Error(
+                    `Campaign parent review did not succeed: ${describe(reviews)}`,
+                );
+            if (publish.length === 1 && publish[0].status === "completed") {
+                if (
+                    ![
+                        "success",
+                        "skipped",
+                        "failure",
+                        "cancelled",
+                        "timed_out",
+                    ].includes(publish[0].conclusion)
+                )
+                    throw new Error(
+                        `Campaign parent publish conclusion is not accepted: ${describe(publish)}`,
+                    );
+                return publish[0].conclusion;
+            }
+        }
+        const observed = `review=${describe(reviews)} publish=${describe(publish)}`;
+        if (retry >= retryDelaysMs.length)
+            throw new Error(
+                `Campaign parent jobs are not terminal after bounded wait: ${observed}`,
+            );
+        await wait(retryDelaysMs[retry]);
+    }
 }
 export async function dispatchTestAuditPlan({
     github,
