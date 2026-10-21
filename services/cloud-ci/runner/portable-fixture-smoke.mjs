@@ -8,10 +8,13 @@ assert.equal(process.platform, "linux");
 assert.equal(process.getuid(), 0);
 const workspace = await mkdtemp("/tmp/omg-portable-fixtures-");
 const home = path.join(workspace, "home");
-const tracked = ["Cargo.toml", "src/lib.rs"];
+const tracked = ["Cargo.toml", "src/lib.rs", "docs/guide.md", "scripts/probe.py"];
 try {
     await mkdir(path.join(workspace, "src"));
-    for (const file of tracked) await writeFile(path.join(workspace, file), "preserved source");
+    for (const file of tracked) {
+        await mkdir(path.dirname(path.join(workspace, file)), { recursive: true });
+        await writeFile(path.join(workspace, file), "preserved source");
+    }
     const context = preparePortable(workspace, tracked, { home, protectedRoots: ["/opt/omg-ci"] });
     const program = `
         import assert from 'node:assert/strict';
@@ -23,8 +26,20 @@ try {
         const fixture=mkdtempSync(path.join(workspace,'.owned-fixture-'));
         writeFileSync(path.join(fixture,'config'),'fixture');
         rmSync(fixture,{recursive:true});
+        for (const directory of ['docs','scripts']) {
+            const nested=mkdtempSync(path.join(workspace,directory,'.owned-fixture-'));
+            writeFileSync(path.join(nested,'data'),'fixture');
+            rmSync(nested,{recursive:true});
+        }
         const denied=operation=>assert.throws(operation,error=>['EACCES','EPERM'].includes(error.code));
         for(const file of ${JSON.stringify(tracked)})denied(()=>writeFileSync(file,'changed'));
+
+        for (const file of ['docs/guide.md','scripts/probe.py']) {
+            denied(()=>unlinkSync(file));
+            denied(()=>renameSync(file,file+'.replaced'));
+            denied(()=>chmodSync(file,0o666));
+        }
+        denied(()=>renameSync('scripts','replacement-scripts'));
         denied(()=>unlinkSync('Cargo.toml'));
         denied(()=>renameSync('Cargo.toml','replacement.toml'));
         denied(()=>renameSync('src','replacement-src'));
