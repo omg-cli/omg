@@ -84,3 +84,12 @@ test("cloud diagnosis reads evidence but cannot propose, verify or export a repa
     await assert.rejects(actions.export_proposal.execute({proposalSha256: "d".repeat(64)}, context), /read-only diagnosis/);
     assert.equal(state.verificationJob, undefined);
 });
+import { diagnosticFailureMetadata } from "../src/runtime";
+
+test("diagnostic failure metadata exposes bounded errors without transcripts or credentials", () => {
+  const secret = "private-token";
+  assert.deepEqual(diagnosticFailureMetadata({finish: "error", error: {type: "ProviderError", status: 429, message: `Bearer ${secret} ${secret}`}}, [secret]), {
+    finish: "error", error: {type: "ProviderError", status: 429, message: "Bearer [REDACTED] [REDACTED]"},
+  });
+  assert.equal(diagnosticFailureMetadata({error: {type: "Error", message: "x".repeat(4000)}}, []).error?.message?.length, 2000);
+});

@@ -20,6 +20,7 @@ import {
   assertRuntimeIdentity,
   parseRuntimeIdentity,
   retryDecision,
+  diagnosticFailureMetadata,
 } from "./runtime.js";
 
 export class Coder extends DurableObject<Env> {
@@ -200,7 +201,14 @@ export class Coder extends DurableObject<Env> {
       continuation,
       runtime,
       skillsDelivery: await this.ctx.storage.get("skills-delivery"),
-      ...(request.diagnosisTask ? {diagnosis: outcome.text ?? null} : {}),
+      ...(request.diagnosisTask ? {
+        diagnosis: outcome.text ?? null,
+        failureMetadata: outcome.status === "unanswered"
+          ? (await this.harness.messages({session: outcome.session}))
+              .filter(message => message.type === "assistant" || message.type === "idle")
+              .slice(-8).map(message => diagnosticFailureMetadata(message, [this.env.CI_API_TOKEN]))
+          : undefined,
+      } : {}),
     };
   }
 }
