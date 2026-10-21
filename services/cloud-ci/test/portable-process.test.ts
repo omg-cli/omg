@@ -11,6 +11,7 @@ test("portable execution drops identity and does not inherit controller credenti
             GITHUB_RUN_ID: "123",
             GH_TOKEN: "fixture-injected-secret",
             NODE_OPTIONS: "--import=untrusted",
+            OMG_NODE_TEST_FIXTURE: "/untrusted/node",
             GIT_CONFIG_COUNT: "1",
             GIT_CONFIG_KEY_0: "safe.directory",
             GIT_CONFIG_VALUE_0: "*",
@@ -23,6 +24,7 @@ test("portable execution drops identity and does not inherit controller credenti
         expect(options.env).toMatchObject({ GITHUB_RUN_ID: "123" });
         expect(Object.hasOwn(options.env, "GH_TOKEN")).toBe(false);
         expect(Object.hasOwn(options.env, "NODE_OPTIONS")).toBe(false);
+        expect(options.env.OMG_NODE_TEST_FIXTURE).toBe("/opt/omg-node-test-fixture/node");
         expect(options.env).toMatchObject({
             GIT_CONFIG_NOSYSTEM: "1",
             GIT_CONFIG_GLOBAL: "/dev/null",

@@ -32,6 +32,7 @@ export function portableOptions(workspace, home, env = {}) {
             CARGO_PROFILE_TEST_DEBUG: "0",
             RUST_BACKTRACE: "0",
             PYTHONDONTWRITEBYTECODE: "1",
+            OMG_NODE_TEST_FIXTURE: "/opt/omg-node-test-fixture/node",
             // Exact protected checkout exception; temporary fixture repositories keep normal Git discovery.
             GIT_CONFIG_NOSYSTEM: "1",
             GIT_CONFIG_GLOBAL: "/dev/null",

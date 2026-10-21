@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+    rustProfiles,
     cloudCiChecks,
     expectedCloudChecks,
     expectedCloudReports,
@@ -46,4 +47,15 @@ test("only present trusted services run check/build/test in order", async () => 
         runServiceCheck("source-script-injected", { exists: () => true }),
     ).rejects.toThrow();
     await expect(runServiceCheck("ci-coder-service", { exists: () => false })).rejects.toThrow();
+});
+
+test("each cloud Rust profile has the existing native surface policy for both binaries", async () => {
+    const manifest = await Bun.file(new URL("../../../tests/contracts/manifest.json", import.meta.url)).json() as {
+        surface_digests: { platform: string; features: string[]; binary: string }[];
+    };
+    for (const profile of rustProfiles) {
+        const selected = manifest.surface_digests.filter((row) =>
+            row.platform === profile.platform && row.features.toSorted().join(",") === profile.features?.split(",").sort().join(","));
+        expect(selected.map((row) => row.binary).sort()).toEqual(["omg", "omgd"]);
+    }
 });

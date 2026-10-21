@@ -96,7 +96,7 @@ switch (process.argv[2]) {
         await run("cargo", ["fmt", "--all", "--", "--check"]);
         break;
     case "rust-portable-tests":
-        for (const features of rustProfiles) {
+        for (const { features, platform } of rustProfiles) {
             const label = features.replaceAll(",", "-");
             const surface = `/workspace/target/cloud-rust-${label}`;
             try {
@@ -104,7 +104,7 @@ switch (process.argv[2]) {
                     GITHUB_RUN_ID: process.env.OMG_RUN_ID,
                     GITHUB_RUN_ATTEMPT: process.env.OMG_RUN_ATTEMPT,
                     OMG_CONTRACT_SOURCE_SHA: sha,
-                    OMG_CONTRACT_PLATFORM: "portable",
+                    OMG_CONTRACT_PLATFORM: platform,
                     OMG_CONTRACT_SURFACE_OUT: surface,
                 });
             } catch (error) {
