@@ -1,68 +1,160 @@
+diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
+index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..805a7197614a9206619845e994e567850cbe41dd 100644
+--- a/src/ci/capabilities.ts
++++ b/src/ci/capabilities.ts
+@@ -191,6 +191,7 @@ async function executeStep(
+   return {
+     exitCode: result.exitCode,
+     logs: result.logs,
++    logSizes: result.logSizes,
+     preview: result.preview,
+     snapshot: result.snapshot,
+     cacheHit: false,
 diff --git a/src/ci/runners/runner.ts b/src/ci/runners/runner.ts
-index aa6068d..117060d 100644
+index aa6068d5ab399caf3f018e5c7c4a691da57931a7..117060dd04b5f72ec259d7aeecd4b374ecbef775 100644
 --- a/src/ci/runners/runner.ts
 +++ b/src/ci/runners/runner.ts
-@@ -1 +1,2 @@
--// Copyright (c) 2026 Cloudflare, Inc.
+@@ -1,3 +1,4 @@
 +import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
-+// Copyright (c) 2026 Cloudflare, Inc.
-@@ -23,2 +24,3 @@ export type RunOutput = {
--  preview: { stdout: string; stderr: string };
--};
-+  preview: { stdout: string; stderr: string };
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
+ 
+@@ -21,6 +22,7 @@ export type RunOutput = {
+     stderr: string | ReadableStream<Uint8Array>;
+   };
+   preview: { stdout: string; stderr: string };
 +  logSizes?: { stdout: number; stderr: number };
-+};
+ };
+ 
+ export type RunStepResult<S> = RunOutput & {
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
-index 4fb4a42..c5a62a8 100644
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca276fea7895 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
-@@ -1 +1,4 @@
--// Copyright (c) 2026 Cloudflare, Inc.
+@@ -1,2 +1,5 @@
 +import type * as Workers from "@cloudflare/workers-types/index.ts";
 +type ReadableStream<R> = Workers.ReadableStream<R>;
 +declare const ReadableStream: typeof Workers.ReadableStream;
-+// Copyright (c) 2026 Cloudflare, Inc.
-@@ -104,3 +107,3 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
--      });
--      const rawLogs = await readLogs(sandbox);
--      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
-+      });
-+      const { logs: rawLogs, sizes: logSizes } = await readLogs(sandbox);
-+      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
-@@ -110,3 +113,3 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
--      if (streams.length === 0) {
--        return { exitCode, logs: rawLogs, preview, snapshot };
--      }
-+      if (streams.length === 0) {
-+        return { exitCode, logs: rawLogs, logSizes, preview, snapshot };
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
+@@ -86,7 +89,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+           autoCleanup: false,
+         }
+       );
+-      const { exitCode } = await proc.waitForExit(
+-        input.timeoutMs ?? COMMAND_TIMEOUT_MS
++      let processId: string;
++      try {
++        processId = proc.id;
++      } finally {
++        if (Symbol.dispose in proc) {
++          const dispose = proc[Symbol.dispose];
++          if (typeof dispose === 'function') dispose.call(proc);
++        }
 +      }
-@@ -135,2 +138,3 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
--        snapshot,
--      };
-+        snapshot,
++      const exitCode = await waitForProcessExit(
++        sandbox, processId, input.timeoutMs ?? COMMAND_TIMEOUT_MS
+       );
+       const preview = await readPreviews(sandbox);
+@@ -102,13 +114,13 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+         ttl: input.ttlSeconds,
+         localBucket,
+       });
+-      const rawLogs = await readLogs(sandbox);
++      const { logs: rawLogs, sizes: logSizes } = await readLogs(sandbox);
+       const streams = [rawLogs.stdout, rawLogs.stderr].filter(
+         (value): value is ReadableStream<Uint8Array> =>
+           typeof value !== 'string'
+       );
+       if (streams.length === 0) {
+-        return { exitCode, logs: rawLogs, preview, snapshot };
++        return { exitCode, logs: rawLogs, logSizes, preview, snapshot };
+       }
+ 
+       let remainingStreams = streams.length;
+@@ -133,6 +145,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+         },
+         preview,
+         snapshot,
 +        logSizes,
-+      };
-@@ -150,4 +154,7 @@ async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
--  return {
+       };
+     } finally {
+       if (!cleanupTransferredToStreams) {
+@@ -142,13 +155,59 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+   }
+ }
+ 
++async function waitForProcessExit(
++  sandbox: ReturnType<typeof getSandbox>,
++  id: string,
++  timeoutMs: number,
++): Promise<number> {
++  const deadline = Date.now() + timeoutMs;
++  const timedOut = () => new Error('CI process completion timed out');
++  for (;;) {
++    const remaining = deadline - Date.now();
++    if (remaining <= 0) throw timedOut();
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    const process = await Promise.race([
++      sandbox.getProcess(id).then(process => {
++        try {
++          return process ? { id: process.id, status: process.status, exitCode: process.exitCode } : null;
++        } finally {
++          if (process && Symbol.dispose in process) {
++            const dispose = process[Symbol.dispose];
++            if (typeof dispose === 'function') dispose.call(process);
++          }
++        }
++      }),
++      new Promise<never>((_, reject) => {
++        timer = setTimeout(() => reject(timedOut()), remaining);
++      }),
++    ]).finally(() => clearTimeout(timer));
++    if (Date.now() > deadline) throw timedOut();
++    if (!process || process.id !== id) throw new Error('CI process identity unavailable');
++    const { status, exitCode } = process;
++    if (status !== 'starting' && status !== 'running') {
++      if (!['completed', 'failed', 'killed', 'error'].includes(status)) {
++        throw new Error('CI process returned an unknown state');
++      }
++      if (typeof exitCode !== 'number' || !Number.isSafeInteger(exitCode) || exitCode < 0 ||
++          (exitCode === 0 && status !== 'completed')) {
++        throw new Error('CI process terminal exit code unavailable');
++      }
++      return exitCode;
++    }
++    await new Promise(resolve => setTimeout(resolve, Math.min(1000, Math.max(0, deadline - Date.now()))));
++  }
++}
++
+ async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
+   const listing = await sandbox.listFiles('/tmp');
+   const sizes = new Map(
+     listing.files.map((file) => [file.absolutePath, file.size])
+   );
+   return {
 -    stdout: await readLog(sandbox, STDOUT_FILE, sizes.get(STDOUT_FILE) ?? 0),
 -    stderr: await readLog(sandbox, STDERR_FILE, sizes.get(STDERR_FILE) ?? 0),
--  };
-+  return {
 +    logs: {
 +      stdout: await readLog(sandbox, STDOUT_FILE, sizes.get(STDOUT_FILE) ?? 0),
 +      stderr: await readLog(sandbox, STDERR_FILE, sizes.get(STDERR_FILE) ?? 0),
 +    },
 +    sizes: { stdout: sizes.get(STDOUT_FILE) ?? 0, stderr: sizes.get(STDERR_FILE) ?? 0 },
-+  };
-@@ -161,3 +168,3 @@ async function readLog(
--  if (size > INLINE_LOG_BYTES) {
+   };
+ }
+@@ -159,7 +218,7 @@ async function readLog(
+   size: number
+ ): Promise<string | ReadableStream<Uint8Array>> {
+   if (size > INLINE_LOG_BYTES) {
 -    return sandbox.readFileStream(file);
--  }
-+  if (size > INLINE_LOG_BYTES) {
 +    return (await sandbox.readFile(file, { encoding: 'none' })).content;
-+  }
-@@ -205,9 +212,4 @@ function withCleanup(
--  const reader = stream.getReader();
+   }
+   return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
+ }
+@@ -203,26 +262,21 @@ function withCleanup(
+   release: () => Promise<void>
+ ) {
+   const reader = stream.getReader();
 -  let released = false;
 -  const releaseOnce = async () => {
 -    if (!released) {
@@ -70,96 +162,77 @@ index 4fb4a42..c5a62a8 100644
 -      await release();
 -    }
 -  };
--  return new ReadableStream<Uint8Array>({
-+  const reader = stream.getReader();
 +  let releasePromise: Promise<void> | undefined;
 +  const releaseOnce = () => (releasePromise ??= release());
-+  return new ReadableStream<Uint8Array>({
-@@ -217,4 +219,4 @@ function withCleanup(
--        if (result.done) {
+   return new ReadableStream<Uint8Array>({
+     async pull(controller) {
+       try {
+         const result = await reader.read();
+         if (result.done) {
 -          controller.close();
--          await releaseOnce();
--        } else {
-+        if (result.done) {
-+          await releaseOnce();
+           await releaseOnce();
 +          controller.close();
-+        } else {
-@@ -223,4 +225,4 @@ function withCleanup(
--      } catch (error) {
+         } else {
+           controller.enqueue(result.value);
+         }
+       } catch (error) {
 -        controller.error(error);
--        await releaseOnce();
--      }
-+      } catch (error) {
-+        await releaseOnce();
+         await releaseOnce();
 +        controller.error(error);
-+      }
+       }
+     },
+     async cancel(reason) {
 diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
-index 2d70c69..56dfa0e 100644
+index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..56dfa0e52e8ace474e1838fff56987018730d9f1 100644
 --- a/src/ci/step-notification.ts
 +++ b/src/ci/step-notification.ts
-@@ -15,2 +15,3 @@ export type StepExecution = {
--  preview: { stdout: string; stderr: string };
--  // The restorable workspace backup (always produced on success), kept separate
-+  preview: { stdout: string; stderr: string };
+@@ -13,6 +13,7 @@ export type StepExecution = {
+   exitCode: number;
+   logs: CiRunnerLogs;
+   preview: { stdout: string; stderr: string };
 +  logSizes?: { stdout: number; stderr: number };
-+  // The restorable workspace backup (always produced on success), kept separate
-@@ -77,2 +78,3 @@ export async function withStepNotification(
--      logs: completed.logs,
--      snapshot: completed.snapshot,
-+      logs: completed.logs,
+   // The restorable workspace backup (always produced on success), kept separate
+   // from the cache pointer below: `snapshot` is the thing you restore,
+   // `cachePointer` is only bookkeeping for the deterministic cache indirection.
+@@ -75,6 +76,7 @@ export async function withStepNotification(
+     return {
+       exitCode: completed.exitCode,
+       logs: completed.logs,
 +      logSizes: completed.logSizes,
-+      snapshot: completed.snapshot,
-diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
-index 9603fd2..805a719 100644
---- a/src/ci/capabilities.ts
-+++ b/src/ci/capabilities.ts
-@@ -193,2 +193,3 @@ async function executeStep(
--    logs: result.logs,
--    preview: result.preview,
-+    logs: result.logs,
-+    logSizes: result.logSizes,
-+    preview: result.preview,
-diff --git a/src/pipeline/types.ts b/src/pipeline/types.ts
-index a1f5ff3..1dff707 100644
---- a/src/pipeline/types.ts
-+++ b/src/pipeline/types.ts
-@@ -1 +1,2 @@
--// Copyright (c) 2026 Cloudflare, Inc.
-+import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
-+// Copyright (c) 2026 Cloudflare, Inc.
-@@ -138,2 +139,3 @@ export type CiRunStepInput = {
--export type CiRunStepOutput = {
--  exitCode: number;
-+export type CiRunStepOutput = {
-+  logSizes?: { stdout: number; stderr: number };
-+  exitCode: number;
+       snapshot: completed.snapshot,
+       cachePointer: completed.cachePointer,
+     };
 diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
-index a0ac164..5fe4524 100644
+index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a548874c2402f 100644
 --- a/src/pipeline/ci-workflow.ts
 +++ b/src/pipeline/ci-workflow.ts
-@@ -27,2 +27,3 @@ import { runCiStep } from '../ci/capabilities';
--import { RunnerGroup } from './runner-group';
--
-+import { RunnerGroup } from './runner-group';
+@@ -25,6 +25,7 @@ import {
+ import type { Bindings } from '../env';
+ import { runCiStep } from '../ci/capabilities';
+ import { RunnerGroup } from './runner-group';
 +import { persistLogs, restoreLogs } from './persisted-logs';
-+
-@@ -147,4 +148,4 @@ export abstract class CIWorkflow<
--        return step
+ 
+ const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
+ const DEFAULT_STEP_CONFIG = {
+@@ -145,8 +146,8 @@ export abstract class CIWorkflow<
+       runners.run(options, inherited, () => {
+         const config = resolveRunnerConfig(options);
+         return step
 -          .do(options.name, config.workflow, (ctx) =>
 -            runCiStep(this.env, provider, {
--              ...runContext,
-+        return step
 +          .do(options.name, config.workflow, async (ctx) => {
 +            const output = await runCiStep(this.env, provider, {
-+              ...runContext,
-@@ -162,6 +163,12 @@ export abstract class CIWorkflow<
--              secrets: options.secrets,
+               ...runContext,
+               label: options.name,
+               attempt: ctx.attempt,
+@@ -160,15 +161,21 @@ export abstract class CIWorkflow<
+               cachePaths: options.cache?.inputs,
+               env: options.env,
+               secrets: options.secrets,
 -            })
 -          )
 -          .then((output) =>
 -            Object.freeze({
--              ...output,
-+              secrets: options.secrets,
 +            });
 +            return persistLogs(
 +              this.env.BACKUP_BUCKET,
@@ -170,19 +243,19 @@ index a0ac164..5fe4524 100644
 +          .then(async (stored) => {
 +            const output = await restoreLogs(this.env.BACKUP_BUCKET, stored);
 +            return Object.freeze({
-+              ...output,
-@@ -169,4 +176,4 @@ export abstract class CIWorkflow<
--                invoke(nextOptions, output.snapshot),
+               ...output,
+               runner: (nextOptions: RunnerOptions) =>
+                 invoke(nextOptions, output.snapshot),
 -            })
 -          );
--      });
-+                invoke(nextOptions, output.snapshot),
 +            });
 +          });
-+      });
-diff --git a/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
+       });
+ 
+     // CI ctx object
+diff --git a/node_modules/@cloudflare/ci/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
 new file mode 100644
-index 0000000..b1d457f
+index 0000000000000000000000000000000000000000..b1d457fb27d03f19c024702588041d05160f60c7
 --- /dev/null
 +++ b/src/pipeline/persisted-logs.ts
 @@ -0,0 +1,87 @@
@@ -273,3 +346,20 @@ index 0000000..b1d457f
 +  if (!object) throw new Error('Persisted CI log is missing');
 +  return object.body;
 +}
+diff --git a/src/pipeline/types.ts b/src/pipeline/types.ts
+index a1f5ff3aa8c30350300f3bd8d1f25cbc850aff65..1dff7079eca079ff2d96b9309e1ffd93826b6b16 100644
+--- a/src/pipeline/types.ts
++++ b/src/pipeline/types.ts
+@@ -1,3 +1,4 @@
++import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
+ // Copyright (c) 2026 Cloudflare, Inc.
+ // SPDX-License-Identifier: Apache-2.0
+ 
+@@ -136,6 +137,7 @@ export type CiRunStepInput = {
+ };
+ 
+ export type CiRunStepOutput = {
++  logSizes?: { stdout: number; stderr: number };
+   exitCode: number;
+   logs: CiRunnerLogs;
+   // The workspace backup the sandbox writes after every successful runner. The
