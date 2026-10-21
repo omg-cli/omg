@@ -2,6 +2,7 @@ import { test } from "bun:test";
 import assert from "node:assert/strict";
 import {
     planTestAuditContinuation,
+    parentPublicationResult,
     admitTestAuditParent,
     testAuditRunTitle,
 } from "../../scripts/test-audit-campaign.mjs";
@@ -276,6 +277,7 @@ test("recovery rereads exact terminal workflow attempt, advances confirmed work 
             head_branch: "main",
             path: ".github/workflows/ai-review.yml",
             name: "AI source review",
+            workflow_id: 391232924,
             repository: { full_name: "omg-cli/omg" },
             event: "workflow_dispatch",
         };
@@ -302,6 +304,8 @@ test("recovery rereads exact terminal workflow attempt, advances confirmed work 
                             },
                         ],
                     };
+                if (route === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")
+                    return {id:391232924,name:"AI source review",path:".github/workflows/ai-review.yml"};
                 if (route.includes("/attempts/1")) return metadata;
                 return { workflow_runs: [prior] };
             },
@@ -326,4 +330,24 @@ test("recovery rereads exact terminal workflow attempt, advances confirmed work 
             assert.equal(dispatched.length, 0);
         }
     }
+});
+
+
+test("campaign continuation admits a titled run only from the bound workflow identity", async () => {
+    const report=fixture();
+    const workflow={id:391232924,name:"AI source review",path:".github/workflows/ai-review.yml"};
+    const metadata={id:42,run_attempt:1,head_sha:a,head_branch:"main",path:workflow.path,name:testAuditRunTitle("initial",a,3),workflow_id:workflow.id,repository:{full_name:"omg-cli/omg"},event:"workflow_dispatch"};
+    const jobs={jobs:[{name:"review",conclusion:"success",status:"completed"},{name:"publish",conclusion:"skipped",status:"completed"}]};
+    const api=(runData,workflowData)=>({async request(method,path){
+        assert.equal(method,"GET");
+        if(path === "/repos/omg-cli/omg/actions/runs/42/attempts/1")return runData;
+        if(path === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")return workflowData;
+        if(path === "/repos/omg-cli/omg/actions/runs/42/attempts/1/jobs?per_page=100")return jobs;
+        assert.fail(`Unexpected route ${path}`);
+    }});
+    assert.equal(await parentPublicationResult(api(metadata,workflow),"42-1",report),"skipped");
+    for(const changed of [{workflow_id:391232925},{head_sha:b},{head_branch:"other"},{path:".github/workflows/other.yml"},{repository:{full_name:"other/repo"}},{run_attempt:2},{event:"pull_request"}])
+        await assert.rejects(parentPublicationResult(api({...metadata,...changed},workflow),"42-1",report),/workflow identity mismatch/);
+    for(const changed of [{id:0},{name:"Other workflow"},{path:".github/workflows/other.yml"}])
+        await assert.rejects(parentPublicationResult(api(metadata,{...workflow,...changed}),"42-1",report),/workflow identity mismatch/);
 });

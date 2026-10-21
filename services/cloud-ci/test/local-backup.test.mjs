@@ -36,8 +36,9 @@ await Promise.resolve(
       async onStop() {}
       async onActivityExpired() {}
       async startProcess() {}
-      async listFiles() {
+      async listFiles(directory) {
         this.calls.push("list");
+        if(directory === "/tmp") return {success:true,files:["out","err"].map(extension=>({absolutePath:"/tmp/ci-step."+extension,type:"file",size:5}))};
 
         return {
           success: true,
@@ -48,6 +49,10 @@ await Promise.resolve(
       }
       async readFile(path, options) {
         this.calls.push("read");
+        if(path === "/tmp/ci-step.out" || path === "/tmp/ci-step.err") {
+          if(this.failRead) throw new Error("private provider detail");
+          return {content:new ReadableStream({start(controller){controller.enqueue(new Uint8Array([60,255,0,38,62]));controller.close();}})};
+        }
         expect(path).toBe("/tmp/omg-ci-unit-evidence/report.xml");
         expect(options).toEqual({ encoding: "none" });
 
@@ -233,4 +238,26 @@ test("lifecycle diagnostics retain bounded stop reason and exit code before SDK 
   const body = evidence.get(`diagnostics/sandboxes/${"a".repeat(64)}.json`);
   expect(body).toContain('"stop":{"reason":"exit","exitCode":137}');
   expect(body).toContain('"phase":"activity-expired"');
+});
+
+
+test("real adapter retains raw runner diagnostics before destroy without accepting them as proof", async () => {
+  const id=`cl-123-1-${"a".repeat(40)}-ta-${"b".repeat(16)}`;
+  for(const failure of ["none","read","write"]){
+    const sandbox=new CiSandbox();
+    sandbox.failRead=failure === "read";
+    const stored=new Map();
+    sandbox.env.BACKUP_BUCKET.put=async(key,body)=>{
+      if(!key.startsWith("diagnostics/runner-logs/"))return {};
+      if(failure === "write")throw new Error("private storage detail");
+      sandbox.calls.push("put");
+      stored.set(key,new Uint8Array(await new Response(body).arrayBuffer()));
+      return {};
+    };
+    await sandbox.startProcess("trusted wrapped command",{env:{OMG_DIAGNOSTIC_RUN_ID:id,OMG_CI_LEAF_STEP:"script-contracts"}});
+    await sandbox.destroy();
+    expect(sandbox.calls.at(-1)).toBe("destroy");
+    expect([...stored.keys()].sort()).toEqual(failure === "none"?[`diagnostics/runner-logs/${id}/script-contracts.stderr`,`diagnostics/runner-logs/${id}/script-contracts.stdout`]:[]);
+    for(const value of stored.values())expect(value).toEqual(new Uint8Array([60,255,0,38,62]));
+  }
 });

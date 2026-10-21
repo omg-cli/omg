@@ -37,6 +37,8 @@ export default {async fetch(request,env){
   }};
   async function run(options){
     const name=options.name;
+    assert.equal(options.env.OMG_DIAGNOSTIC_RUN_ID,id);
+    assert.equal(options.env.OMG_CI_LEAF_STEP,name);
     const reports=name==='rust-portable-tests'?reportNames.map(name=>'OMG_REPORT='+JSON.stringify({name,content:xml})).join('\\n')+'\\n':'';
     const stdout=raw+reports, stderr='stderr-'+raw;
     expected.set(name,{stdout,stderr});

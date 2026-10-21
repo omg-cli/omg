@@ -17,6 +17,8 @@ try {
         import assert from 'node:assert/strict';
         import {mkdtempSync,writeFileSync,unlinkSync,renameSync,chmodSync,statSync,rmSync} from 'node:fs';
         import path from 'node:path';
+        import {userInfo} from 'node:os';
+        assert.deepEqual({...userInfo()},{uid:10001,gid:10001,username:'omg-ci-candidate',homedir:'/tmp/omg-portable-home',shell:'/usr/sbin/nologin'});
         const workspace=process.cwd();
         const fixture=mkdtempSync(path.join(workspace,'.owned-fixture-'));
         writeFileSync(path.join(fixture,'config'),'fixture');
