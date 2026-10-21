@@ -1,7 +1,7 @@
 import { CiSandbox as NativeCiSandbox } from "@cloudflare/ci/worker";
 import { PhaseDiagnostics, type StopDetails } from "./phase-diagnostics";
 import { backupTransferMode, leafSnapshotOptions } from "./backup-policy";
-import { retainRunnerLog, retainUnitReport } from "./unit-report-retention";
+import { releaseTerminalOwner, retainRunnerLog, retainSandboxEvidence, retainUnitReport } from "./unit-report-retention";
 
 type RunnerMetadata = {
   reportRunId?: string;
@@ -115,6 +115,30 @@ export class CiSandbox extends NativeCiSandbox {
   }
   override onActivityExpired() {
     return this.trace("activity-expired", () => super.onActivityExpired());
+  }
+  override async alarm(...args: Parameters<NativeCiSandbox["alarm"]>) {
+    await releaseTerminalOwner({
+      readOwner: async () => (await this.ctx.storage.get<RunnerMetadata>(metadataKey))?.diagnosticRunId,
+      lookup: async (owner) => {
+        const instance = await this.env.CI_WORKFLOW.get(owner);
+        const status = await instance.status();
+
+        return { id: instance.id, status: status.status };
+      },
+      retain: async () => {
+        const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
+
+        return retainSandboxEvidence(
+          metadata,
+          { listFiles: (path) => super.listFiles(path) },
+          async (path) => (await super.readFile(path, { encoding: "none" })).content,
+          this.env.BACKUP_BUCKET,
+        );
+      },
+      destroy: () => this.trace("destroy", () => super.destroy()),
+      delegate: () => super.alarm(...args),
+      warn: (event) => console.warn(JSON.stringify({ ...event, sandboxId: this.ctx.id.toString() })),
+    });
   }
   override destroy() {
     return this.trace("destroy", async () => {
