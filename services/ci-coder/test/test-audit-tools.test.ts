@@ -1,4 +1,5 @@
 import { test, expect } from "bun:test";
+import { gitBlobSha } from "../../../scripts/ai-review-candidate.mjs";
 import { testAuditProofFixture } from "../../../tests/unit/fixtures/test-audit-proof.mjs";
 import { Session } from "@opencode/schema/session";
 import {
@@ -136,4 +137,59 @@ test("existing-test tools start only a separate bounded audit and cannot export 
     );
     expect(exported.testAuditHandover.changes).toHaveLength(1);
     expect(JSON.stringify(exported.testAuditHandover)).not.toContain("fault");
+});
+
+test("existing-test tool rejects an in-boundary fault without starting CI", async () => {
+    const { request: raw } = auditFixture();
+    const source = "pub const VALUE: u32 = 1;\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn checks_value() {\n        assert_eq!(super::VALUE, 1);\n    }\n}\n";
+    const request = parseCodingRequest({
+        ...raw,
+        source: {
+            ...raw.source,
+            sourceFiles: raw.source.sourceFiles.map((file) =>
+                file.path === "src/value.rs"
+                    ? { ...file, content: source, blobSha: gitBlobSha(source) }
+                    : file,
+            ),
+        },
+    });
+    const skills = await createRequiredSkillsPlugin();
+    const sessionID = Session.ID.create();
+    skills.contextHook({ sessionID, system: [] });
+    const context = { sessionID, signal: new AbortController().signal };
+    let state: CodingState = { calls: 0, reads: [], verifiedDigests: [] };
+    const calls: unknown[] = [];
+    const actions = createCodingActions({
+        getRequest: async () => request,
+        skills,
+        update: async (change) => (state = change(state)),
+        env: {
+            CI_API_TOKEN: "x".repeat(32),
+            CI_IMAGE_DIGEST: `sha256:${"c".repeat(64)}`,
+            CI_VERIFIER_REVISION: "d".repeat(40),
+            CI_SERVICE: {
+                fetch: async (input, init) => {
+                    calls.push({ input: String(input), init });
+                    return Response.json({ id: "unexpected", sha: request.sha });
+                },
+            },
+        },
+    });
+    for (const path of ["tests/value.rs", "src/value.rs"])
+        await actions.read_source.execute({ path, start: 1, lines: 80 }, context);
+    await expect(
+        actions.propose_test_strengthening.execute(
+            {
+                purpose: "existing-test-sensitivity",
+                assertion: { line: 4 },
+                fault: {
+                    path: "src/value.rs",
+                    oldQuote: "assert_eq!(super::VALUE, 1);",
+                    replacement: "assert_eq!(super::VALUE, 2);",
+                },
+            },
+            context,
+        ),
+    ).rejects.toThrow("Automatic repairs cannot change existing Rust tests");
+    expect(calls).toHaveLength(0);
 });

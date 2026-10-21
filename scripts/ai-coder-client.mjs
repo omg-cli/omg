@@ -63,13 +63,18 @@ export function admitCoderResult(response, request, policy) {
         const digest = audit.proposalSha256;
         const id = `cl-${request.runId}-${request.attempt}-${request.sha}-ta-${digest.slice(0,16)}`;
         const continuationId = `cv-${request.runId}-${request.attempt}-${request.sha}-${digest.slice(0,16)}`;
-        if (state.testAudit.proposalSha256 !== digest || state.verification?.proposalSha256 !== digest || state.verification.id !== id ||
+        if (state.testAudit.proposalSha256 !== digest ||
             response.initialOperation?.operationId !== response.id || !["done","unanswered"].includes(response.initialOperation?.status) ||
             response.continuation?.operationId !== continuationId || response.continuation.parentOperationId !== response.id ||
             response.continuation.sessionId !== state.sessionId || response.continuation.proposalSha256 !== digest ||
-            response.continuation.verificationId !== id || response.continuation.status !== "done" ||
-            state.verificationJob?.status !== "verified" || state.verificationJob.id !== id || state.verificationJob.proposalSha256 !== digest ||
+            response.continuation.verificationId !== id ||
+            response.continuation.status !== "done" ||
+            state.verificationJob?.id !== id || state.verificationJob.proposalSha256 !== digest ||
             state.verificationJob.sessionId !== state.sessionId || state.verificationJob.continuationId !== continuationId)
+            throw new Error("Existing-test audit lacks its exact completed verification continuation.");
+        if (state.verificationJob.status === "failed")
+            throw new Error(`Existing-test audit verification failed for the exact proposal: ${state.verificationJob.reason}`);
+        if (state.verificationJob.status !== "verified" || state.verification?.proposalSha256 !== digest || state.verification.id !== id)
             throw new Error("Existing-test audit lacks its exact completed verification continuation.");
         return {...audit,readPaths:[...new Set(state.reads.map(read=>read.path))]};
     }
@@ -80,9 +85,6 @@ export function admitCoderResult(response, request, policy) {
 
     if (
         adapted.proposalSha256 !== digest ||
-        state.verification?.proposalSha256 !== digest ||
-        state.verification.id !==
-            `cl-${request.runId}-${request.attempt}-${request.sha}-v-${digest.slice(0, 16)}` ||
         adapted.proposal.baseSha !== request.sha ||
         adapted.proposal.branch !== request.branch ||
         adapted.proposal.repository !== request.repository
@@ -92,6 +94,7 @@ export function admitCoderResult(response, request, policy) {
     const continuationId = `cv-${request.runId}-${request.attempt}-${request.sha}-${digest.slice(0, 16)}`;
     const continuation = response.continuation;
     const job = state.verificationJob;
+    const verificationId = `cl-${request.runId}-${request.attempt}-${request.sha}-v-${digest.slice(0, 16)}`;
     if (
         response.initialOperation?.operationId !== response.id ||
         !["done", "unanswered"].includes(response.initialOperation?.status) ||
@@ -99,13 +102,22 @@ export function admitCoderResult(response, request, policy) {
         continuation.parentOperationId !== response.id ||
         continuation.sessionId !== state.sessionId ||
         continuation.proposalSha256 !== digest ||
-        continuation.verificationId !== state.verification.id ||
+        continuation.verificationId !== verificationId ||
         continuation.status !== "done" ||
-        job?.status !== "verified" ||
-        job.id !== state.verification.id ||
+        job?.id !== verificationId ||
         job.proposalSha256 !== digest ||
         job.sessionId !== state.sessionId ||
         job.continuationId !== continuationId
+    )
+        throw new Error(
+            "Coding verification continuation was not completed for the original session.",
+        );
+    if (job.status === "failed")
+        throw new Error(`Coding verification failed for the exact proposal: ${job.reason}`);
+    if (
+        job.status !== "verified" ||
+        state.verification?.proposalSha256 !== digest ||
+        state.verification.id !== verificationId
     )
         throw new Error(
             "Coding verification continuation was not completed for the original session.",

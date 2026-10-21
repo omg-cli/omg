@@ -5,6 +5,7 @@ import {
     testAuditDigest,
 } from "../../cloud-ci/src/test-audit-contract";
 import { gitBlobSha } from "../../../scripts/ai-review-candidate.mjs";
+import { assertRustSourceChange } from "../../../scripts/rust-source-policy.mjs";
 import type { CodingRequest } from "./request";
 
 export function createTestAuditProposal(
@@ -48,6 +49,11 @@ export function createTestAuditProposal(
         throw new Error(
             "Existing-test audit original source differs from supplied snapshot",
         );
+    assertRustSourceChange(
+        proposal.fault.path,
+        originalFault.content,
+        proposal.fault.newContent,
+    );
     return {
         proposal,
         proposalSha256: testAuditDigest(proposal),
