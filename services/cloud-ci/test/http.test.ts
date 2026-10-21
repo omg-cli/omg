@@ -2,6 +2,19 @@ import { expect, test } from "bun:test";
 import { fetchCi } from "../src/http";
 import { receiptKey, requestKey, runIdentity, parseStart } from "../src/contract";
 import { createHash } from "node:crypto";
+import { planIdentity } from "../runner/plan.mjs";
+
+test("authenticated health exposes the exact runtime plan without starting a workflow", async () => {
+  const state = fixture();
+  const response = await state.send("/health", undefined);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    ok: true, engine: "@cloudflare/ci@0.2.0",
+    planSha256: createHash("sha256").update(planIdentity).digest("hex"),
+  });
+  expect((await state.send("/health", undefined, "wrong-token")).status).toBe(401);
+  expect(state.creations).toBe(0);
+});
 
 const input = parseStart({
   repository: "omg-cli/omg",

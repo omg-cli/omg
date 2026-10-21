@@ -1,9 +1,10 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import type * as Workers from "@cloudflare/workers-types/index.ts";
 import { reviewRecords } from "./review-records";
 import { diagnosticsHttp } from "./diagnostics-http";
 import { receiveSentry, sentryRecords, type SentryBindings } from "./sentry-intake";
-import { cloudCiChecks } from "../runner/plan.mjs";
+import { cloudCiChecks, planIdentity } from "../runner/plan.mjs";
 import { testAuditReportNames } from "../runner/test-audit.mjs";
 import {
     nativeParams,
@@ -98,7 +99,7 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
         return reviewRecords(request, env.BACKUP_BUCKET);
 
     if (url.pathname === "/health" && request.method === "GET")
-        return json({ ok: true, engine: "@cloudflare/ci@0.2.0" });
+        return json({ ok: true, engine: "@cloudflare/ci@0.2.0", planSha256: createHash("sha256").update(planIdentity).digest("hex") });
 
     if (["/runs", "/source-token"].includes(url.pathname) && request.method === "POST") {
         let input;

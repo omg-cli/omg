@@ -31,13 +31,26 @@ export const toolchain = {
     nativeCi: "0.2.0",
     sandbox: "0.12.12",
 };
-export const rustProfiles = ["pgp,license", "debian-pure"];
+export const rustProfiles = [
+    { features: "pgp,license", platform: "portable" },
+    { features: "debian-pure", platform: "debian-pure" },
+];
+export const rustTimeouts = { step: 2_400_000, command: 2_370_000, child: 2_340_000 };
+export const scriptTimeouts = { step: 2_400_000, command: 2_370_000, child: 2_340_000 };
 export const planIdentity = JSON.stringify({
     version: 1,
     repository: "omg-cli/omg",
     cloudCiChecks,
     rustProfiles,
+    rustTimeouts,
+    scriptTimeouts,
     toolchain,
+    scriptContracts: {
+        partition: "exact-native-ids-v2",
+        nativeGate: "Workflow checks",
+        nativeCommand: "make ci-workflow-quick",
+        nativeAcceptance: false,
+    },
     verification: {
         check: "regression-red-green",
         maximumRequestBytes: 65536,

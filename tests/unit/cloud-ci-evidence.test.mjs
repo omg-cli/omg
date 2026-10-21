@@ -236,3 +236,12 @@ describe("Cloudflare CI proof admission", () => {
         ).toThrow("plan");
     });
 });
+import * as cloudEvidence from "../../scripts/cloud-ci-evidence.mjs";
+
+test("runtime plan preflight rejects a different or missing plan before CI starts", () => {
+    expect(typeof cloudEvidence.admitCloudCiRuntime).toBe("function");
+    const runtime = { ok: true, engine: "@cloudflare/ci@0.2.0", planSha256: cloudEvidence.cloudCiPlanSha256 };
+    expect(() => cloudEvidence.admitCloudCiRuntime(runtime)).not.toThrow();
+    for (const value of [null, {}, { ...runtime, planSha256: "0".repeat(64) }, { ...runtime, ok: false }])
+        expect(() => cloudEvidence.admitCloudCiRuntime(value)).toThrow("Cloudflare CI runtime plan differs from the trusted controller.");
+});

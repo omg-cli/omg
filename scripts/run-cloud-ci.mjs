@@ -6,6 +6,7 @@ import {
     parseCloudCiRequest,
     verifyCloudCiReceipt,
     verifyCloudCiObjects,
+    admitCloudCiRuntime,
 } from "./cloud-ci-evidence.mjs";
 
 const [sha, branch, runId, attempt, output] = process.argv.slice(2);
@@ -40,6 +41,12 @@ if (token.length < 32 || /[\r\n]/.test(token)) throw new Error("Invalid CI crede
 
 const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
 
+const runtime = await fetch(new URL("/health", endpoint), {
+    headers, redirect: "error", signal: AbortSignal.timeout(30000),
+});
+if (!runtime.ok) throw new Error(`Cloudflare CI preflight failed: HTTP ${runtime.status}.`);
+admitCloudCiRuntime(await runtime.json());
+
 const start = await fetch(new URL("/runs", endpoint), {
     method: "POST",
     headers,
@@ -56,7 +63,7 @@ const started = await start.json();
 if (started.id !== expectedId || started.sha !== sha)
     throw new Error("Cloudflare CI start identity mismatch.");
 
-const deadline = Date.now() + 35 * 60 * 1000;
+const deadline = Date.now() + 60 * 60 * 1000;
 let previousStatus;
 
 for (;;) {

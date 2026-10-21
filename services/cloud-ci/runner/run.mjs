@@ -1,7 +1,9 @@
+import { parseStringPromise } from "xml2js";
+import { summarizeUnitFailures } from "./unit-report.mjs";
 import { spawnSync } from "node:child_process";
 import { readFileSync, existsSync, writeFileSync, lstatSync } from "node:fs";
 import { pruneRestoredSource } from "./source-tree.mjs";
-import { runServiceCheck, rustProfiles, toolchain } from "./plan.mjs";
+import { runServiceCheck, rustProfiles, rustTimeouts, scriptTimeouts, toolchain } from "./plan.mjs";
 import { preparePortable, runPortable } from "./portable-process.mjs";
 import { applyTestAudit } from "./audit-verifier.mjs";
 import {
@@ -52,13 +54,17 @@ const portable =
           ]);
 const run = async (command, args, env = {}) =>
     runPortable(portable, command, args, env, {
+        timeoutMs: process.argv[2] === "rust-portable-tests" ? rustTimeouts.child
+            : process.argv[2] === "script-contracts" ? scriptTimeouts.child : 1_170_000,
         onOutput: (name, chunk) => process[name].write(chunk),
     });
 const report = (name, file) => {
     const info = lstatSync(file);
     if (!info.isFile() || info.isSymbolicLink() || info.size > 20_000_000)
         throw new Error("Invalid bounded report artifact");
-    console.log(`OMG_REPORT=${JSON.stringify({ name, content: readFileSync(file, "utf8") })}`);
+    const content = readFileSync(file, "utf8");
+    console.log(`OMG_REPORT=${JSON.stringify({ name, content })}`);
+    return content;
 };
 console.log(
     JSON.stringify({
@@ -92,31 +98,32 @@ switch (process.argv[2]) {
         await run("cargo", ["fmt", "--all", "--", "--check"]);
         break;
     case "rust-portable-tests":
-        for (const features of rustProfiles) {
+        for (const { features, platform } of rustProfiles) {
             const label = features.replaceAll(",", "-");
             const surface = `/workspace/target/cloud-rust-${label}`;
-            await run("python3", ["scripts/run-native-contracts.py", "--features", features], {
-                GITHUB_RUN_ID: process.env.OMG_RUN_ID,
-                GITHUB_RUN_ATTEMPT: process.env.OMG_RUN_ATTEMPT,
-                OMG_CONTRACT_SOURCE_SHA: sha,
-                OMG_CONTRACT_PLATFORM: "portable",
-                OMG_CONTRACT_SURFACE_OUT: surface,
-            });
+            try {
+                await run("python3", ["scripts/run-native-contracts.py", "--features", features], {
+                    GITHUB_RUN_ID: process.env.OMG_RUN_ID,
+                    GITHUB_RUN_ATTEMPT: process.env.OMG_RUN_ATTEMPT,
+                    OMG_CONTRACT_SOURCE_SHA: sha,
+                    OMG_CONTRACT_PLATFORM: platform,
+                    OMG_CONTRACT_SURFACE_OUT: surface,
+                });
+            } catch (error) {
+                try {
+                    const content = report(`rust-${label}-junit.xml`, `${surface}/execution/junit.xml`);
+                    console.error(`OMG_RUST_FAILURES=${JSON.stringify(summarizeUnitFailures(await parseStringPromise(content)))}`);
+                } catch (reportError) {
+                    console.error(`Rust failure report unavailable: ${String(reportError).slice(0, 500)}`);
+                }
+                throw error;
+            }
             report(`rust-${label}-junit.xml`, `${surface}/execution/junit.xml`);
         }
         break;
     case "script-contracts":
         await run("make", ["check-shell-syntax"]);
-        await run("python3", [
-            "-B",
-            "-m",
-            "unittest",
-            "discover",
-            "-s",
-            "scripts",
-            "-p",
-            "test_*.py",
-        ]);
+        await run("python3", ["-B", "/opt/omg-ci/script-contracts.py"]);
         for (const file of [
             "tests/test_benchmark_records.py",
             "tests/test_terminal_update_notice.py",

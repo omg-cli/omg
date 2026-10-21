@@ -1,13 +1,18 @@
 import { CiSandbox as NativeCiSandbox } from "@cloudflare/ci/worker";
 import { PhaseDiagnostics, type StopDetails } from "./phase-diagnostics";
 import { backupTransferMode, leafSnapshotOptions } from "./backup-policy";
-import { retainUnitReport } from "./unit-report-retention";
+import { retainRunnerLog, retainUnitReport } from "./unit-report-retention";
+
+type RunnerMetadata = {
+  reportRunId?: string;
+  diagnosticRunId?: string;
+  leafStep?: string;
+};
+const metadataKey = "omg:runner-metadata";
 
 export class CiSandbox extends NativeCiSandbox {
   private phases?: PhaseDiagnostics;
   private fuseExitCode?: number;
-  private reportRunId?: string;
-  private leafStep?: string;
   private get diagnostics() {
     return (this.phases ??= new PhaseDiagnostics(this.ctx.id.toString(), (key, value) =>
       this.env.BACKUP_BUCKET.put(key, value, { httpMetadata: { contentType: "application/json" } }),
@@ -80,18 +85,21 @@ export class CiSandbox extends NativeCiSandbox {
   override createBackup(options: Parameters<NativeCiSandbox["createBackup"]>[0]) {
     const localBucket = backupTransferMode(this.env) === "binding-rpc" ? true : options.localBucket;
 
-    return this.trace("backup", () =>
-      super.createBackup({ ...options, localBucket, ...leafSnapshotOptions(this.leafStep) }),
-    );
+    return this.trace("backup", async () => {
+      const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
+      return super.createBackup({ ...options, localBucket, ...leafSnapshotOptions(metadata?.leafStep) });
+    });
   }
   override startProcess(...args: Parameters<NativeCiSandbox["startProcess"]>) {
-    this.reportRunId =
-      args[1]?.env?.OMG_CI_LEAF_STEP === "rust-portable-tests"
-        ? args[1]?.env?.OMG_REPORT_RUN_ID
-        : undefined;
-    this.leafStep = args[1]?.env?.OMG_CI_LEAF_STEP;
-
-    return this.trace("process-start", () => super.startProcess(...args));
+    const env = args[1]?.env;
+    return this.trace("process-start", async () => {
+      await this.ctx.storage.put<RunnerMetadata>(metadataKey, {
+        reportRunId: env?.OMG_CI_LEAF_STEP === "rust-portable-tests" ? env?.OMG_REPORT_RUN_ID : undefined,
+        leafStep: env?.OMG_CI_LEAF_STEP,
+        diagnosticRunId: env?.OMG_DIAGNOSTIC_RUN_ID,
+      });
+      return super.startProcess(...args);
+    });
   }
   override streamProcessLogs(...args: Parameters<NativeCiSandbox["streamProcessLogs"]>) {
     return this.trace("process-log-stream-open", () => super.streamProcessLogs(...args));
@@ -111,9 +119,40 @@ export class CiSandbox extends NativeCiSandbox {
   override destroy() {
     return this.trace("destroy", async () => {
       try {
-        if (this.reportRunId) {
+        const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
+        const streams: { stream: string; status: string }[] = [];
+        if (metadata?.diagnosticRunId && metadata.leafStep) {
+          for (const stream of ["stdout", "stderr"]) {
+            const status = await retainRunnerLog(metadata.diagnosticRunId, metadata.leafStep, stream, {
+              listFiles: (path) => super.listFiles(path),
+              readReport: async () => (
+                await super.readFile(`/tmp/ci-step.${stream === "stdout" ? "out" : "err"}`, {
+                  encoding: "none",
+                })
+              ).content,
+            }, this.env.BACKUP_BUCKET);
+            streams.push({ stream, status });
+            if (status !== "saved")
+              console.warn(JSON.stringify({ event: "runner_log_unavailable", stream, status }));
+          }
+        }
+        try {
+          await this.env.BACKUP_BUCKET.put(
+            `diagnostics/sandboxes/${this.ctx.id.toString()}-retention.json`,
+            JSON.stringify({
+              metadataPresent: Boolean(metadata),
+              runIdentityPresent: Boolean(metadata?.diagnosticRunId),
+              leafIdentityPresent: Boolean(metadata?.leafStep),
+              streams,
+            }),
+            { httpMetadata: { contentType: "application/json" } },
+          );
+        } catch {
+          console.warn(JSON.stringify({ event: "runner_retention_diagnostic_unavailable" }));
+        }
+        if (metadata?.reportRunId) {
           const status = await retainUnitReport(
-            this.reportRunId,
+            metadata.reportRunId,
             {
               listFiles: (path) => super.listFiles(path),
               readReport: async () =>

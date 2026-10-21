@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import * as sourceEvidence from "../../scripts/review-source-evidence.mjs";
 import {
     parseSourceReviewArguments,
@@ -177,6 +178,32 @@ test("source review reuses only the protected dedicated inspector hostname", () 
         () => sourceReviewEndpoint({ endpoint: "https://other.example/inspect" }),
         /dedicated/,
     );
+});
+
+test("workflow-generated Inspector configurations resolve to the source review route", () => {
+    for (const workflow of ["ai-review.yml", "cloud-ci.yml"]) {
+        const text = readFileSync(new URL(`../../.github/workflows/${workflow}`, import.meta.url), "utf8");
+        const endpoints = [...text.matchAll(/\["omg-ci-inspector",\s*"OMG_CI_INSPECTOR_TOKEN",\s*"([^"]+)"\]/g)];
+        assert.ok(endpoints.length > 0, `${workflow} supplies an Inspector configuration`);
+        for (const [, endpoint] of endpoints) {
+            assert.doesNotThrow(() => {
+                assert.equal(sourceReviewEndpoint({ endpoint }).href,
+                    "https://omg-ci-inspector.latham.workers.dev/review");
+            }, `${workflow} must reach the dedicated source review route`);
+        }
+    }
+});
+
+test("Inspector base URL normalization preserves every endpoint restriction", () => {
+    for (const endpoint of [
+        "http://omg-ci-inspector.latham.workers.dev/",
+        "https://other.example/",
+        "https://omg-ci-inspector.latham.workers.dev/unexpected",
+        "https://omg-ci-inspector.latham.workers.dev/?query=1",
+        "https://omg-ci-inspector.latham.workers.dev/#fragment",
+        "https://user:password@omg-ci-inspector.latham.workers.dev/",
+        "https://omg-ci-inspector.latham.workers.dev:8443/",
+    ]) assert.throws(() => sourceReviewEndpoint({ endpoint }), /dedicated/);
 });
 
 test("source evidence rejects a substituted Git blob even when its claimed identity matches inventory", () => {

@@ -115,21 +115,29 @@ class FedoraSetupSourceTests(unittest.TestCase):
                         " print('setup refused: image metalinks and fatal repository failures required',file=sys.stderr)\n"
                         " sys.exit(42)\n"
                         "if '--nogpgcheck' in args:\n"
-                        " sys.exit(43)\n",
+                        " sys.exit(43)\n"
+                        "disabled=[arg.split('=',1)[1] for arg in args if arg.startswith('--disable-repo=')]\n"
+                        "if any(repo != 'fedora-cisco-openh264' for repo in disabled):\n"
+                        " sys.exit(45)\n"
+                        "if os.environ['DNF_UNAVAILABLE_REPO'] not in disabled:\n"
+                        " sys.exit(44)\n",
                         encoding="utf-8",
                     )
                     executable.chmod(0o755)
                     receipt = root / "call.json"
-                    result = subprocess.run(
-                        ["bash", "-e", "-c", command],
-                        cwd=root,
-                        env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", DNF_CALL=str(receipt)),
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                        check=False,
-                    )
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for unavailable in ["fedora-cisco-openh264", "fedora", "updates"]:
+                        with self.subTest(unavailable=unavailable):
+                            result = subprocess.run(
+                                ["bash", "-e", "-c", command],
+                                cwd=root,
+                                env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
+                                         DNF_CALL=str(receipt), DNF_UNAVAILABLE_REPO=unavailable),
+                                capture_output=True,
+                                text=True,
+                                timeout=10,
+                                check=False,
+                            )
+                            self.assertEqual(result.returncode, 0 if unavailable == "fedora-cisco-openh264" else 44, result.stderr)
                     arguments = json.loads(receipt.read_text(encoding="utf-8"))
                     package_index = arguments.index("--setopt=install_weak_deps=False") + 1
                     expected = ["git", "clang", "cmake", "openssl-devel", "pkgconfig", "findutils", "curl"]
@@ -213,7 +221,7 @@ class FedoraSetupSourceTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, exit_code, result.stderr)
                     self.assertEqual(json.loads(receipt.read_text(encoding="utf-8")), [
-                        "--setopt=*.skip_if_unavailable=False", "install", "-y",
+                        "--setopt=*.skip_if_unavailable=False", "--disable-repo=fedora-cisco-openh264", "install", "-y",
                         "--setopt=install_weak_deps=False", "tree", "createrepo_c", "gnupg2",
                     ])
                     provision = json.loads((root / "target/fedora-ignored/provision.json").read_text(encoding="utf-8"))

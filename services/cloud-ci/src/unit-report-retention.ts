@@ -1,23 +1,65 @@
 import type { CiSandbox } from "@cloudflare/ci/worker";
 import type * as Workers from "@cloudflare/workers-types/index.ts";
+import { cloudCiChecks } from "../runner/plan.mjs";
+
+type EvidenceSource = Pick<CiSandbox, "listFiles"> & {
+  readReport(): Promise<Workers.ReadableStream<Uint8Array>>;
+};
+type RetentionStatus =
+  | "saved"
+  | "invalid-identity"
+  | "missing"
+  | "unsafe"
+  | "oversized"
+  | "unavailable";
+const runIdPattern = /^cl-[1-9][0-9]{0,19}-[1-9][0-9]{0,5}-[a-f0-9]{40}(?:-(?:v|ta)-[a-f0-9]{16})?$/;
 
 export async function retainUnitReport(
   runId: string,
-  sandbox: Pick<CiSandbox, "listFiles"> & {
-    readReport(): Promise<Workers.ReadableStream<Uint8Array>>;
-  },
+  sandbox: EvidenceSource,
   bucket: Pick<R2Bucket, "put">,
-): Promise<"saved" | "invalid-identity" | "missing" | "unsafe" | "oversized" | "unavailable"> {
-  if (!/^cl-[1-9][0-9]{0,19}-[1-9][0-9]{0,5}-[a-f0-9]{40}(?:-v-[a-f0-9]{16})?$/.test(runId))
-    return "invalid-identity";
+): Promise<RetentionStatus> {
+  if (!runIdPattern.test(runId)) return "invalid-identity";
+  return retainFile({
+    directory: "/tmp/omg-ci-unit-evidence",
+    file: "/tmp/omg-ci-unit-evidence/report.xml",
+    key: `reports/${runId}/portable-units.xml`,
+    contentType: "application/xml",
+  }, sandbox, bucket);
+}
 
+export async function retainRunnerLog(
+  runId: string,
+  step: string,
+  stream: string,
+  sandbox: EvidenceSource,
+  bucket: Pick<R2Bucket, "put">,
+): Promise<RetentionStatus> {
+  if (
+    !runIdPattern.test(runId) ||
+    ![...cloudCiChecks, "regression-red-green", "test-audit-four-state", "test-audit-sensitivity"].includes(step) ||
+    (stream !== "stdout" && stream !== "stderr")
+  ) return "invalid-identity";
+  return retainFile({
+    directory: "/tmp",
+    file: `/tmp/ci-step.${stream === "stdout" ? "out" : "err"}`,
+    key: `diagnostics/runner-logs/${runId}/${step}.${stream}`,
+    contentType: "text/plain; charset=utf-8",
+  }, sandbox, bucket);
+}
+
+async function retainFile(
+  paths: { directory: string; file: string; key: string; contentType: string },
+  sandbox: EvidenceSource,
+  bucket: Pick<R2Bucket, "put">,
+): Promise<RetentionStatus> {
   try {
-    const listing = await sandbox.listFiles("/tmp/omg-ci-unit-evidence");
+    const listing = await sandbox.listFiles(paths.directory);
 
     if (!listing.success) return "unavailable";
 
     const file = listing.files.find(
-      (entry) => entry.absolutePath === "/tmp/omg-ci-unit-evidence/report.xml",
+      (entry) => entry.absolutePath === paths.file,
     );
 
     if (!file) return "missing";
@@ -49,8 +91,8 @@ export async function retainUnitReport(
         body.set(chunk.value, offset);
       }
 
-      await bucket.put(`reports/${runId}/portable-units.xml`, body, {
-        httpMetadata: { contentType: "application/xml" },
+      await bucket.put(paths.key, body, {
+        httpMetadata: { contentType: paths.contentType },
       });
 
       return "saved";

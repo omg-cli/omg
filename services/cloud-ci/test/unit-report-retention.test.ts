@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type * as Workers from "@cloudflare/workers-types/index.ts";
-import { retainUnitReport } from "../src/unit-report-retention";
+import { retainRunnerLog, retainUnitReport } from "../src/unit-report-retention";
 import { candidateReportStatus } from "../runner/unit-report-evidence.mjs";
 
 declare const ReadableStream: typeof Workers.ReadableStream;
@@ -171,4 +171,39 @@ test("candidate source admission denies hard links, root-owned files and oversiz
   expect(candidateReportStatus({ ...regular, uid: 0 })).toBe("unsafe");
   expect(candidateReportStatus({ ...regular, isFile: () => false })).toBe("unsafe");
   expect(candidateReportStatus({ ...regular, size: 20_000_001 })).toBe("oversized");
+});
+
+
+test("raw runner logs retain exact bytes only in the private diagnostic namespace", async () => {
+  for (const stream of ["stdout", "stderr"]) {
+    const bytes = new Uint8Array([60,255,0,38,62]);
+    const f = fixture("file", bytes.length, bytes);
+    const sandbox = {
+      ...f.sandbox,
+      async listFiles(directory: string) {
+        expect(directory).toBe("/tmp");
+        const listing = await f.sandbox.listFiles();
+        return {...listing, files: listing.files.map(file=>({...file,absolutePath:`/tmp/ci-step.${stream === "stdout" ? "out" : "err"}`}))};
+      },
+    };
+    const auditId = `${id}-ta-${"b".repeat(16)}`;
+    expect(await retainRunnerLog(auditId,"test-audit-four-state",stream,sandbox,f.bucket)).toBe("saved");
+    expect(f.writes).toEqual([{key:`diagnostics/runner-logs/${auditId}/test-audit-four-state.${stream}`,content:bytes,contentType:"text/plain; charset=utf-8"}]);
+  }
+});
+
+test("raw runner log admission rejects invalid metadata and unsafe files before reading", async () => {
+  for (const [runId,step,stream] of [["../outside","script-contracts","stdout"],[id,"../outside","stdout"],[id,"script-contracts","../outside"],[id,"unknown","stderr"]]) {
+    const f=fixture();
+    expect(await retainRunnerLog(runId,step,stream,f.sandbox,f.bucket)).toBe("invalid-identity");
+    expect(f.reads()).toBe(0);
+    expect(f.writes).toEqual([]);
+  }
+  for (const [type,size,status] of [["symlink",1,"unsafe"],["file",20_000_001,"oversized"]] as const) {
+    const f=fixture(type,size);
+    const sandbox={...f.sandbox,async listFiles(){const listing=await f.sandbox.listFiles();return {...listing,files:listing.files.map(file=>({...file,absolutePath:"/tmp/ci-step.err"}))};}};
+    expect(await retainRunnerLog(id,"script-contracts","stderr",sandbox,f.bucket)).toBe(status);
+    expect(f.reads()).toBe(0);
+    expect(f.writes).toEqual([]);
+  }
 });

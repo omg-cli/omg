@@ -20,6 +20,11 @@ export const parseCloudCiRequest = Schema.decodeUnknownSync(start);
 export const cloudCiChecks = expectedCloudChecks("refs/heads/main");
 export const cloudCiPlanSha256 = createHash("sha256").update(planIdentity).digest("hex");
 
+export function admitCloudCiRuntime(runtime) {
+    if (runtime?.ok !== true || runtime.engine !== "@cloudflare/ci@0.2.0" || runtime.planSha256 !== cloudCiPlanSha256)
+        throw new Error("Cloudflare CI runtime plan differs from the trusted controller.");
+}
+
 export async function verifyCloudCiObjects(receipt, load) {
     const objects = [
         ...receipt.checks.flatMap((check) => [

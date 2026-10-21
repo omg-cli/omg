@@ -16,6 +16,8 @@ import {
     inapplicableCloudChecks,
     planIdentity,
     runSourceFormat,
+    rustTimeouts,
+    scriptTimeouts,
 } from "../runner/plan.mjs";
 import { z } from "zod";
 import { backupTransferMode } from "./backup-policy";
@@ -32,6 +34,8 @@ const config = {
     commandTimeoutMs: 1_170_000,
     snapshotRetentionSeconds: 86_400,
 };
+const rustConfig = { ...config, timeout: rustTimeouts.step, commandTimeoutMs: rustTimeouts.command };
+const scriptConfig = { ...config, timeout: scriptTimeouts.step, commandTimeoutMs: scriptTimeouts.command };
 
 const reportSchema = z.strictObject({
     name: z.enum([
@@ -83,9 +87,10 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
         )
             throw new Error("Requested verifier differs from trusted deployed revision");
 
-        const verificationEnv: Record<string, string> = request.verification || request.testAudit
-            ? encodeVerificationEnvironment(request)
-            : {};
+        const executionEnv: Record<string, string> = {
+            ...(request.verification || request.testAudit ? encodeVerificationEnvironment(request) : {}),
+            OMG_DIAGNOSTIC_RUN_ID: event.instanceId,
+        };
 
         let regression: ReturnType<typeof parseVerificationEvidence> | null = null;
         let testAudit: ReturnType<typeof parseTestAuditEvidence> | null = null;
@@ -196,6 +201,8 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                 config,
                 env: {
                     OMG_CI_IMAGE: this.env.CI_IMAGE_DIGEST,
+                    OMG_DIAGNOSTIC_RUN_ID: event.instanceId,
+                    OMG_CI_LEAF_STEP: "frozen-dependencies",
                     OMG_RUN_ID: request.runId,
                     OMG_RUN_ATTEMPT: request.attempt,
                     OMG_CI_PLAN: planSha256,
@@ -240,7 +247,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                 OMG_RUN_ID: request.runId,
                 OMG_RUN_ATTEMPT: request.attempt,
                 OMG_CI_LEAF_STEP: "source-format",
-                ...verificationEnv,
+                ...executionEnv,
             });
 
             await save("source-format", formatted);
@@ -249,12 +256,13 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                 const result: CheckResult = await deps.runner({
                     name: "regression-red-green",
                     command: "node /opt/omg-ci/run.mjs regression-red-green",
-                    config,
+                    config: rustConfig,
                     env: {
+                        OMG_CI_LEAF_STEP: "regression-red-green",
                         OMG_EXPECTED_SHA: request.sha,
                         OMG_RUN_ID: request.runId,
                         OMG_RUN_ATTEMPT: request.attempt,
-                        ...verificationEnv,
+                        ...executionEnv,
                     },
                 });
 
@@ -266,7 +274,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                 const result: CheckResult = await deps.runner({
                     name: auditCheck, command: `node /opt/omg-ci/run.mjs ${auditCheck}`,
                     config: { ...config, timeout: 4_000_000, commandTimeoutMs: 3_970_000 },
-                    env: { OMG_EXPECTED_SHA: request.sha, OMG_RUN_ID: request.runId, OMG_RUN_ATTEMPT: request.attempt, ...verificationEnv },
+                    env: { OMG_CI_LEAF_STEP: auditCheck, OMG_EXPECTED_SHA: request.sha, OMG_RUN_ID: request.runId, OMG_RUN_ATTEMPT: request.attempt, ...executionEnv },
                 });
                 if (result.exitCode !== 0) throw new Error("Existing-test audit runner returned a nonzero exit");
                 await save(auditCheck, result);
@@ -275,14 +283,14 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
             const pending = requiredChecks.slice(2);
 
             for (let index = 0; index < pending.length; index += 2) {
-                await Promise.all(
+                const outcomes = await Promise.allSettled(
                     pending.slice(index, index + 2).map(async (name) => {
                         const env: NonNullable<RunnerOptions["env"]> = {
                             OMG_EXPECTED_SHA: request.sha,
                             OMG_RUN_ID: request.runId,
                             OMG_RUN_ATTEMPT: request.attempt,
                             OMG_CI_LEAF_STEP: name,
-                            ...verificationEnv,
+                            ...executionEnv,
                         };
 
                         env.OMG_RUN_ID = request.runId;
@@ -291,7 +299,8 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                         const result: CheckResult = await deps.runner({
                             name,
                             command: `node /opt/omg-ci/run.mjs ${name}`,
-                            config,
+                            config: name === "rust-portable-tests" ? rustConfig
+                                : name === "script-contracts" ? scriptConfig : config,
                             env,
                         });
 
@@ -300,6 +309,8 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                         await save(name, result);
                     }),
                 );
+                for (const outcome of outcomes)
+                    if (outcome.status === "rejected") throw outcome.reason;
             }
 
             let verificationReceipt = null;

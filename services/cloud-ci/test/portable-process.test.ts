@@ -11,9 +11,11 @@ test("portable execution drops identity and does not inherit controller credenti
             GITHUB_RUN_ID: "123",
             GH_TOKEN: "fixture-injected-secret",
             NODE_OPTIONS: "--import=untrusted",
+            OMG_NODE_TEST_FIXTURE: "/untrusted/node",
             GIT_CONFIG_COUNT: "1",
             GIT_CONFIG_KEY_0: "safe.directory",
             GIT_CONFIG_VALUE_0: "*",
+            PYTHONPATH: "/untrusted/modules",
         });
 
         expect(options.uid).toBe(10001);
@@ -23,6 +25,8 @@ test("portable execution drops identity and does not inherit controller credenti
         expect(options.env).toMatchObject({ GITHUB_RUN_ID: "123" });
         expect(Object.hasOwn(options.env, "GH_TOKEN")).toBe(false);
         expect(Object.hasOwn(options.env, "NODE_OPTIONS")).toBe(false);
+        expect(options.env.OMG_NODE_TEST_FIXTURE).toBe("/opt/omg-node-test-fixture/node");
+        expect(options.env.PYTHONPATH).toBe("/workspace");
         expect(options.env).toMatchObject({
             GIT_CONFIG_NOSYSTEM: "1",
             GIT_CONFIG_GLOBAL: "/dev/null",
@@ -42,7 +46,7 @@ test("portable execution drops identity and does not inherit controller credenti
     }
 });
 
-test("preparation preserves protected source, parents and correct dependency metadata without write syscalls", () => {
+test("preparation enables owned fixtures while preserving protected source and dependency metadata", () => {
     const modulePath = new URL("../runner/portable-process.mjs", import.meta.url).href;
 
     const child = spawnSync("node", [
@@ -90,7 +94,7 @@ test("preparation preserves protected source, parents and correct dependency met
       const { preparePortable } = await import(${JSON.stringify(modulePath)});
       const context = preparePortable(path.normalize("/workspace"), ["src/tracked.txt", "src/tracked-executable.mjs", ".audit/deep-audit.tsv"], { protectedRoots: [] });
       context.assertSource();
-      assert.deepEqual(writes.filter(([, file]) => file === "/workspace" || file === "/workspace/src" || file.startsWith("/workspace/src/") || file === "/workspace/.audit" || file.startsWith("/workspace/.audit/")), []);
+      assert.deepEqual(writes.filter(([, file]) => file === "/workspace" || file === "/workspace/src" || file.startsWith("/workspace/src/") || file === "/workspace/.audit" || file.startsWith("/workspace/.audit/")), [["chmod", "/workspace", 0o1777]]);
       assert.deepEqual(writes.filter(([, file]) => file === dependency), []);
       const forFile = (name) => writes.filter(([, file]) => file === "/workspace/node_modules/" + name);
       assert.deepEqual(forFile("special.js"), [["chmod", "/workspace/node_modules/special.js", 0o644]]);

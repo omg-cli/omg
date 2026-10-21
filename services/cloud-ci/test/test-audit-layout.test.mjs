@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, mkdir, readdir, copyFile, symlink, rm, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, copyFile, chmod, symlink, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -25,6 +25,7 @@ test("trusted audit executor imports in source and both exact Docker COPY layout
         await symlink(path.join(sourceRoot, "node_modules"), path.join(image, "node_modules"), "junction");
         const flattened = path.join(image, "audit-verifier.mjs");
         const intact = await readFile(flattened, "utf8");
+        await chmod(flattened, 0o600);
         await writeFile(flattened, intact.replace(/^const verifierRelative = .+;$/m, 'const verifierRelative = "../verifier.mjs";'));
         const fault = spawnSync("node", ["--input-type=module", "-e", `await import(${JSON.stringify(pathToFileURL(flattened).href)})`],
             { encoding: "utf8", timeout: 20000, windowsHide: true });

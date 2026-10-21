@@ -242,7 +242,7 @@ export function sourceReviewEndpoint(value) {
     if (
         endpoint.protocol !== "https:" ||
         !/^omg-ci-inspector\.[a-z0-9-]+\.workers\.dev$/.test(endpoint.hostname) ||
-        !["/inspect", "/review"].includes(endpoint.pathname) ||
+        !["/", "/inspect", "/review"].includes(endpoint.pathname) ||
         endpoint.search ||
         endpoint.hash ||
         endpoint.username ||

@@ -269,6 +269,22 @@ test("fresh status requests recover pending verification with one check and pres
   assert.equal(f.serviceCalls(), terminalCalls);
 });
 
+test("cold Rust verification can remain pending beyond the old 35 minute deadline", async () => {
+  const f = await fixture(true, "running", "valid");
+  await f.actions.read_source.execute({ path: "src/value.rs", start: 1, lines: 1 }, f.context);
+  await f.actions.propose_fix.execute(f.candidate, f.context);
+  const proposalSha256 = f.state().proposal?.proposalSha256;
+  if (!proposalSha256) throw new Error("Fixture proposal missing");
+  await f.actions.verify_patch.execute({ proposalSha256 }, f.context);
+  const now = Date.now;
+  Date.now = () => now() + 36 * 60 * 1000;
+  try {
+    assert.equal((await f.poll())?.status, "pending");
+  } finally {
+    Date.now = now;
+  }
+});
+
 test("verification starts durably without polling in a model tool invocation", async () => {
   const f = await fixture(true, "complete", "valid");
   await f.actions.read_source.execute({ path: "src/value.rs", start: 1, lines: 1 }, f.context);

@@ -10,6 +10,22 @@ As of 2026-10-20, the owner has deployed `omg-cloud-ci`, `omg-ci-coder` and `omg
 
 The actual image digest and verifier revision are pinned in `wrangler.jsonc` and must agree with the coder and trusted courier policy. A copied CodeLoud digest or earlier successful receipt is not evidence for a new OMG image or source revision.
 
+### Admit a completed image rollout
+
+Pause new courier admissions and wait for active backends to finish before deploying an image. Keep admissions paused until the readiness check succeeds. [Cloudflare deployment success starts a rollout](https://developers.cloudflare.com/containers/configuration/rollouts/); old instances can still serve requests until replacement finishes. Durable Object storage survives that replacement, so saved metadata alone cannot prove a command still has its original filesystem.
+
+After deployment, run this check from the repository root with the expected digest from `wrangler.jsonc`:
+
+```sh
+python3 scripts/check-cloud-ci-rollout.py \
+  --image-digest 'sha256:<expected manifest digest>' \
+  --evidence-dir '<private evidence directory>'
+```
+
+The check uses the existing `CLOUDFLARE_API_TOKEN`. A local operator can instead pass `--wrangler-auth-file <existing Wrangler config/default.toml>` to reuse OAuth. It creates no credentials and performs only authenticated reads. Exit code zero requires a completed rollout, the intended image and application version, completed steps, a fully updated fleet, and a second matching readback. No running container slots are required. Missing evidence, an active or superseding rollout, or a changed target holds admission. A deployment with no container change must still match its existing completed target.
+
+After this gate succeeds, run the existing authenticated plan preflight, then resume courier admissions. This is an operator deployment check; the CI Worker and candidate runners receive no new administrative credentials. It does not certify passing tests or replace the final receipt verifier.
+
 ## Authenticated API and source identity
 
 `POST /runs` accepts `{repository:"omg-cli/omg",sha:"<40 lowercase hex>",ref:"refs/heads/main",runId:"123",attempt:"1"}`. Only `main` is admitted. Mirror the exact Git object before sending the request. Owner application routes require `Authorization: Bearer <CI_API_TOKEN>`; the schema in `src/contract.ts` is authoritative. The Sentry webhook uses its own signature authentication described below.

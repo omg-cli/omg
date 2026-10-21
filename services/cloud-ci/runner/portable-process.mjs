@@ -18,7 +18,7 @@ export function portableOptions(workspace, home, env = {}) {
         gid: 10001,
         detached: true,
         env: {
-            PATH: "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
+            PATH: "/opt/omg-python/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
             HOME: home,
             TMPDIR: `${home}/tmp`,
             CI: "true",
@@ -32,6 +32,8 @@ export function portableOptions(workspace, home, env = {}) {
             CARGO_PROFILE_TEST_DEBUG: "0",
             RUST_BACKTRACE: "0",
             PYTHONDONTWRITEBYTECODE: "1",
+            PYTHONPATH: workspace,
+            OMG_NODE_TEST_FIXTURE: "/opt/omg-node-test-fixture/node",
             // Exact protected checkout exception; temporary fixture repositories keep normal Git discovery.
             GIT_CONFIG_NOSYSTEM: "1",
             GIT_CONFIG_GLOBAL: "/dev/null",
@@ -129,7 +131,9 @@ export function preparePortable(
 
         if (info.uid !== 0 || info.gid !== 0) chownSync(parent, 0, 0);
 
-        if ((info.mode & 0o7777) !== 0o755) chmodSync(parent, 0o755);
+        const mode = [workspace, path.join(workspace, "docs"), path.join(workspace, "scripts")].includes(parent) ? 0o1777 : 0o755;
+
+        if ((info.mode & 0o7777) !== mode) chmodSync(parent, mode);
     }
 
     visit(workspace, (file, info) => {
@@ -170,10 +174,15 @@ export function preparePortable(
     chownSync(home, 10001, 10001);
     chownSync(`${home}/tmp`, 10001, 10001);
 
+    const rootEntries = new Set(readdirSync(workspace));
+
     return {
         workspace,
         home,
         assertSource() {
+            for (const entry of readdirSync(workspace))
+                if (!rootEntries.has(entry) && !lstatSync(path.join(workspace, entry)).isDirectory())
+                    throw new Error("Portable command added an unexpected root file");
             for (const [file, hash] of source)
                 if (fingerprint(file) !== hash)
                     throw new Error("Portable command changed tracked source");

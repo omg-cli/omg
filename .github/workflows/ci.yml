@@ -423,7 +423,7 @@ jobs:
             features: fedora,pgp,license
             setup: |
               timeout -k 10s 12m dnf \
-                --setopt='*.skip_if_unavailable=False' \
+                --setopt='*.skip_if_unavailable=False' --disable-repo=fedora-cisco-openh264 \
                 install -y --setopt=install_weak_deps=False \
                 git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
                 rpm dnf sqlite yum-utils fedora-release
@@ -1007,7 +1007,7 @@ jobs:
           mkdir -p target/fedora-ignored
           started=$(date +%s)
           status=0
-          timeout --kill-after=5s 90s dnf --setopt='*.skip_if_unavailable=False' \
+          timeout --kill-after=5s 90s dnf --setopt='*.skip_if_unavailable=False' --disable-repo=fedora-cisco-openh264 \
             install -y --setopt=install_weak_deps=False tree createrepo_c gnupg2 \
             > target/fedora-ignored/provision.stdout 2> target/fedora-ignored/provision.stderr || status=$?
           elapsed=$(($(date +%s)-started))

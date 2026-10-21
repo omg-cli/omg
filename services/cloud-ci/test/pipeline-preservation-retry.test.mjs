@@ -24,7 +24,7 @@ export default {async fetch(request,env){
   const bucket={
     get:(...args)=>env.BUCKET.get(...args),
     async put(key,value,options){
-      if(key===failKey && (mode==='permanent'||failures===0)){failures++;throw new Error('fixture transient R2 PUT failure');}
+      if(mode!=='parallel-failure' && key===failKey && (mode==='permanent'||failures===0)){failures++;throw new Error('fixture transient R2 PUT failure');}
       return env.BUCKET.put(key,value,options);
     },
   };
@@ -37,6 +37,13 @@ export default {async fetch(request,env){
   }};
   async function run(options){
     const name=options.name;
+    const heavy=['rust-portable-tests','script-contracts'].includes(name);
+    assert.equal(options.config.timeout,heavy?2_400_000:1_200_000);
+    assert.equal(options.config.commandTimeoutMs,heavy?2_370_000:1_170_000);
+    if(mode==='parallel-failure' && name==='script-contracts') throw new Error('fixture script command failed');
+    if(mode==='parallel-failure' && name==='rust-portable-tests') await new Promise(resolve=>setTimeout(resolve,20));
+    assert.equal(options.env.OMG_DIAGNOSTIC_RUN_ID,id);
+    assert.equal(options.env.OMG_CI_LEAF_STEP,name);
     const reports=name==='rust-portable-tests'?reportNames.map(name=>'OMG_REPORT='+JSON.stringify({name,content:xml})).join('\\n')+'\\n':'';
     const stdout=raw+reports, stderr='stderr-'+raw;
     expected.set(name,{stdout,stderr});
@@ -88,7 +95,7 @@ export default {async fetch(request,env){
     });
     expect(built.success, built.logs.join("\n")).toBe(true);
     const worker = await built.outputs[0].text();
-    const modes = ["stdout", "stderr", "report", "inline", "permanent"];
+    const modes = ["stdout", "stderr", "report", "inline", "permanent", "parallel-failure"];
     const program = `import {createRequire} from 'node:module';
 const require=createRequire(${JSON.stringify(new URL("../node_modules/wrangler/package.json", import.meta.url).href)});
 const {Miniflare,convertV4MiniflareOptions}=require('miniflare');
@@ -110,6 +117,17 @@ try{const results=await Promise.race([deadline,(async()=>{const results=[];for(c
             expect(result.status).toBe(500);
             expect(result.body.receipt.conclusion).toBe("failure");
             expect(result.body.failures).toBe(3);
+        } else if (result.mode === "parallel-failure") {
+            expect(result.status).toBe(500);
+            expect(result.body.receipt.conclusion).toBe("failure");
+            expect(result.body.error).toContain("fixture script command failed");
+            expect(result.body.receipt.checks.map(check => check.name)).toEqual([
+                "frozen-dependencies", "source-format", "rust-portable-tests",
+            ]);
+            expect(result.body.receipt.checks.every(check => check.exitCode === 0)).toBe(true);
+            expect(result.body.receipt.checks.at(-1).reports.map(report => report.name)).toEqual([
+                "rust-pgp-license-junit.xml", "rust-debian-pure-junit.xml",
+            ]);
         } else {
             expect(result.status, JSON.stringify(result.body)).toBe(200);
             expect(result.body.checks).toBe(7);

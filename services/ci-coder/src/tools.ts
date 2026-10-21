@@ -86,7 +86,7 @@ async function ciJson(
       method: body ? "POST" : "GET",
       headers: { Authorization: `Bearer ${env.CI_API_TOKEN}`, "Content-Type": "application/json" },
       body,
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
     },
   );
@@ -140,7 +140,7 @@ export async function pollCodingVerification(
   const load = (key: string) => {
     const [kind, , name] = key.split("/");
     return env.CI_SERVICE.fetch(`https://omg-cloud-ci.latham.workers.dev/runs/${id}/${kind}/${name}`, {
-      headers:{Authorization:`Bearer ${env.CI_API_TOKEN}`},signal,redirect:"error"});
+      headers:{Authorization:`Bearer ${env.CI_API_TOKEN}`},signal,redirect:"manual"});
   };
   if (state.testAudit) {
     await verifyCloudTestAudit(receipt, ciRequest, policy, load);
@@ -179,7 +179,7 @@ export async function pollCodingVerification(
       {
         headers: { Authorization: `Bearer ${env.CI_API_TOKEN}` },
         signal: signal,
-        redirect: "error",
+        redirect: "manual",
       },
     );
   });
@@ -425,7 +425,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         const job: VerificationJob = {
           id, proposalSha256: input.proposalSha256, sessionId: context.sessionID,
           continuationId: `cv-${request.runId}-${request.attempt}-${request.sha}-${input.proposalSha256.slice(0, 16)}`,
-          deadline: Date.now() + (state.testAudit ? 110 : 35) * 60 * 1000, status: "pending",
+          deadline: Date.now() + (state.testAudit ? 110 : 100) * 60 * 1000, status: "pending",
         };
         await update((current) => {
           if ((current.testAudit ?? current.proposal)?.proposalSha256 !== input.proposalSha256)

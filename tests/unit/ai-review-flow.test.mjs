@@ -109,6 +109,46 @@ test("audit resume admits all-held pages and reuses only passed exact formatting
     assert.throws(() => reviewFlow.admitAuditResume(target, { ...parent, formatting: { ...parent.formatting, sha: "e".repeat(40) } }, parent.controllerRevision), /format/i);
 });
 
+test("held audit pages retain revalidated formatting for the next immutable page", async () => {
+    const upstream = { runId: "40", attempt: "2" };
+    const formatting = { status: "passed", ...upstream, sha, ref: "refs/heads/main" };
+    const result = await runReviewFlow({
+        target: { branch: "main", sha, publish: true, upstream, range: { kind: "audit", cursor: 48 } },
+        io: {
+            head: async () => sha,
+            collect: async () => ({ baseSha: sha, entries: [], unreviewedPaths: [],
+                sourceRange: { kind: "audit", sha, inventoryDigest: "b".repeat(64), cursor: 48, pagePaths: 48, totalPaths: 100, nextCursor: 96 } }),
+            format: async (sourceSha, branch, inherited) => {
+                assert.equal(sourceSha, sha);
+                assert.equal(branch, "main");
+                assert.deepEqual(inherited, upstream);
+                return formatting;
+            },
+        },
+    });
+    assert.equal(result.status, "no-reviewable-source");
+    assert.deepEqual(result.formatting, formatting);
+    const next = reviewFlow.sourceAuditContinuation(result, sha, "42", "1");
+    assert.equal(next.status, "continue");
+    const target = reviewTarget("workflow_dispatch", { repository, inputs: next.inputs });
+    assert.deepEqual(reviewFlow.admitAuditResume(target, { ...result, controllerRevision: "d".repeat(40) }, "d".repeat(40)).upstream, upstream);
+});
+
+test("held audit pages stop when inherited formatting fails revalidation", async () => {
+    const result = await runReviewFlow({
+        target: { branch: "main", sha, publish: true, upstream: { runId: "40", attempt: "2" }, range: { kind: "audit", cursor: 48 } },
+        io: {
+            head: async () => sha,
+            collect: async () => ({ baseSha: sha, entries: [], unreviewedPaths: [],
+                sourceRange: { kind: "audit", sha, inventoryDigest: "b".repeat(64), cursor: 48, pagePaths: 48, totalPaths: 100, nextCursor: 96 } }),
+            format: async () => ({ status: "blocked", reason: "source-format-evidence-unavailable-or-rejected" }),
+        },
+    });
+    assert.equal(result.status, "format-blocked");
+    assert.equal(result.formatting.status, "blocked");
+    assert.deepEqual(reviewFlow.sourceAuditContinuation(result, sha, "42", "1"), { status: "incomplete-review-blocked" });
+});
+
 test("audit flow sends exact immutable files without diff semantics and records partial model reads", async () => {
     const source = entry(0);
     const held = { path: "notes.txt", reason: "unsupported-source-type" };
@@ -176,9 +216,9 @@ test("weekly workflow chains bounded pages only through a separate trusted dispa
     assert.equal(finalize.env.PUBLICATION_RESULT, "${{ needs.publish.result }}");
 });
 
-test("actionlint queue compatibility applies only to two serialized trusted workflows", () => {
+test("actionlint queue compatibility applies only to the serialized trusted workflows", () => {
     const config = Bun.YAML.parse(readFileSync(new URL("../../.github/actionlint.yaml", import.meta.url), "utf8"));
-    const paths = [".github/workflows/ai-review.yml", ".github/workflows/ai-fix-review.yml"];
+    const paths = [".github/workflows/cloud-ci.yml", ".github/workflows/ai-review.yml", ".github/workflows/ai-fix-review.yml"];
     const diagnostic = 'unexpected key "queue" for "concurrency" section. expected one of "cancel-in-progress", "group"';
     assert.deepEqual(Object.keys(config), ["paths"]);
     assert.deepEqual(Object.keys(config.paths), paths);

@@ -23,6 +23,7 @@ import {
     verifyCloudCiObjects,
     parseCloudCiRequest,
     cloudCiPlanSha256,
+    admitCloudCiRuntime,
 } from "./cloud-ci-evidence.mjs";
 import { expectedCloudChecks } from "../services/cloud-ci/runner/plan.mjs";
 import {
@@ -356,16 +357,21 @@ export async function runReviewFlow({ target, io }) {
     }
     if (precollected?.sourceRange?.kind === "test-audit" && precollected.entries.length === 0)
         return runTestAuditPage({collected:precollected,sha,branch,formatting:{status:"not-required",reason:"no-admitted-test-task"},publishRequested:target.publish,io});
-    if (precollected && precollected.entries.length === 0)
+    if (precollected && precollected.entries.length === 0) {
+        const formatting = target.upstream
+            ? await io.format(sha, branch, target.upstream)
+            : { status: "not-required", reason: "no-admitted-source" };
         return {
             repository: SOURCE_REPOSITORY, branch, sha, baseSha: precollected.baseSha,
-            sourceRange: precollected.sourceRange, status: "no-reviewable-source",
-            formatting: { status: "not-required", reason: "no-admitted-source" },
+            sourceRange: precollected.sourceRange,
+            status: target.upstream && formatting.status !== "passed" ? "format-blocked" : "no-reviewable-source",
+            formatting,
             suppliedPaths: [], readPaths: [], unreviewedPaths: precollected.unreviewedPaths,
             batches: [], publications: [], candidateOutcomes: [], publishRequested: target.publish,
             ...(precollected.runtimeEvents ? { runtimeEvents: precollected.runtimeEvents } : {}),
             coverageMeaning: "No model inference or native verification was started because no source was admitted.",
         };
+    }
     const formatting = await io.format(sha, branch, target.upstream);
 
     if (formatting.status !== "passed")
@@ -904,6 +910,7 @@ async function createController(github, controllerRevision) {
     const config = await protectedConfig("omg-cloud-ci.json");
     const policy = ciPolicy(config);
     const token = await secret(config.tokenFile);
+    admitCloudCiRuntime(await fetchJson(new URL("/health", config.endpoint), token));
     const coder = await protectedConfig("omg-ci-coder.json");
     const codingEndpoint = coderEndpoint(coder);
     const codingToken = await secret(coder.tokenFile);
@@ -938,7 +945,7 @@ async function createController(github, controllerRevision) {
             );
 
             if (started.id !== id) throw new Error("Coding operation start identity mismatch.");
-            const deadline = Date.now() + (testAuditTask ? 120 : 45) * 60 * 1000;
+            const deadline = Date.now() + (testAuditTask ? 120 : 110) * 60 * 1000;
 
             for (;;) {
                 const state = await fetchJson(
@@ -988,7 +995,7 @@ async function createController(github, controllerRevision) {
 
                     if (started.id !== id || started.sha !== sha)
                         throw new Error("Formatting run identity mismatch.");
-                    const deadline = Date.now() + 40 * 60 * 1000;
+                    const deadline = Date.now() + 60 * 60 * 1000;
 
                     for (;;) {
                         if (Date.now() >= deadline)

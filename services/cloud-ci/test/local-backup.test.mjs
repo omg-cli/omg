@@ -10,6 +10,11 @@ await Promise.resolve(
       failRead = false;
       probeExitCode = 0;
       ctx = {
+        storage: {
+          values: new Map(),
+          async put(key, value) { this.values.set(key, structuredClone(value)); },
+          async get(key) { return structuredClone(this.values.get(key)); },
+        },
         id: { toString: () => "a".repeat(64) },
         waitUntil(value) {
           pending.push(value);
@@ -36,8 +41,9 @@ await Promise.resolve(
       async onStop() {}
       async onActivityExpired() {}
       async startProcess() {}
-      async listFiles() {
+      async listFiles(directory) {
         this.calls.push("list");
+        if(directory === "/tmp") return {success:true,files:["out","err"].map(extension=>({absolutePath:"/tmp/ci-step."+extension,type:"file",size:5}))};
 
         return {
           success: true,
@@ -48,6 +54,10 @@ await Promise.resolve(
       }
       async readFile(path, options) {
         this.calls.push("read");
+        if(path === "/tmp/ci-step.out" || path === "/tmp/ci-step.err") {
+          if(this.failRead) throw new Error("private provider detail");
+          return {content:new ReadableStream({start(controller){controller.enqueue(new Uint8Array([60,255,0,38,62]));controller.close();}})};
+        }
         expect(path).toBe("/tmp/omg-ci-unit-evidence/report.xml");
         expect(options).toEqual({ encoding: "none" });
 
@@ -233,4 +243,87 @@ test("lifecycle diagnostics retain bounded stop reason and exit code before SDK 
   const body = evidence.get(`diagnostics/sandboxes/${"a".repeat(64)}.json`);
   expect(body).toContain('"stop":{"reason":"exit","exitCode":137}');
   expect(body).toContain('"phase":"activity-expired"');
+});
+
+
+test("real adapter retains raw runner diagnostics before destroy without accepting them as proof", async () => {
+  const id=`cl-123-1-${"a".repeat(40)}-ta-${"b".repeat(16)}`;
+  for(const failure of ["none","read","write"]){
+    const sandbox=new CiSandbox();
+    sandbox.failRead=failure === "read";
+    const stored=new Map();
+    sandbox.env.BACKUP_BUCKET.put=async(key,body)=>{
+      if(!key.startsWith("diagnostics/runner-logs/"))return {};
+      if(failure === "write")throw new Error("private storage detail");
+      sandbox.calls.push("put");
+      stored.set(key,new Uint8Array(await new Response(body).arrayBuffer()));
+      return {};
+    };
+    await sandbox.startProcess("trusted wrapped command",{env:{OMG_DIAGNOSTIC_RUN_ID:id,OMG_CI_LEAF_STEP:"script-contracts"}});
+    await sandbox.destroy();
+    expect(sandbox.calls.at(-1)).toBe("destroy");
+    expect([...stored.keys()].sort()).toEqual(failure === "none"?[`diagnostics/runner-logs/${id}/script-contracts.stderr`,`diagnostics/runner-logs/${id}/script-contracts.stdout`]:[]);
+    for(const value of stored.values())expect(value).toEqual(new Uint8Array([60,255,0,38,62]));
+  }
+});
+
+
+test.each(["frozen-dependencies", "script-contracts"])("recreated adapter preserves %s logs and snapshot policy", async (stage) => {
+  const id = `cl-456-1-${"c".repeat(40)}`;
+    const first = new CiSandbox();
+    await first.startProcess("trusted wrapped command", { env: {
+      OMG_DIAGNOSTIC_RUN_ID: id, OMG_CI_LEAF_STEP: stage,
+    } });
+    const restarted = new CiSandbox();
+    restarted.ctx.storage = first.ctx.storage;
+    const stored = new Map();
+    restarted.env.BACKUP_BUCKET.put = async (key, body) => {
+      if (key.startsWith("diagnostics/runner-logs/"))
+        stored.set(key, new Uint8Array(await new Response(body).arrayBuffer()));
+      return {};
+    };
+    const backup = await restarted.createBackup({ path: "/workspace" });
+    expect(backup.excludes).toEqual(stage === "frozen-dependencies" ? undefined : ["*", ".*"]);
+    await restarted.destroy();
+    expect([...stored.keys()].sort()).toEqual([
+      `diagnostics/runner-logs/${id}/${stage}.stderr`,
+      `diagnostics/runner-logs/${id}/${stage}.stdout`,
+    ]);
+    for (const bytes of stored.values()) expect(bytes).toEqual(new Uint8Array([60,255,0,38,62]));
+    expect(restarted.calls.at(-1)).toBe("destroy");
+});
+
+test.each(["missing-metadata", "saved", "unavailable"])("teardown records %s diagnostic custody without accepting test proof", async (mode) => {
+  const sandbox = new CiSandbox();
+  sandbox.failRead = mode === "unavailable";
+  if (mode !== "missing-metadata") {
+    await sandbox.startProcess("private command", { env: {
+      OMG_DIAGNOSTIC_RUN_ID: `cl-789-1-${"d".repeat(40)}`,
+      OMG_CI_LEAF_STEP: "source-format", PRIVATE_VALUE: "private-credential",
+    } });
+  }
+  await sandbox.destroy();
+  const body = evidence.get(`diagnostics/sandboxes/${"a".repeat(64)}-retention.json`);
+  expect(body).toBeDefined();
+  expect(JSON.parse(body)).toEqual({
+    metadataPresent: mode !== "missing-metadata",
+    runIdentityPresent: mode !== "missing-metadata",
+    leafIdentityPresent: mode !== "missing-metadata",
+    streams: mode === "missing-metadata" ? [] : [
+      { stream: "stdout", status: mode }, { stream: "stderr", status: mode },
+    ],
+  });
+  expect(body).not.toContain("private command");
+  expect(body).not.toContain("private-credential");
+  expect(sandbox.calls.at(-1)).toBe("destroy");
+});
+
+test("an unavailable retention diagnostic cannot prevent sandbox destruction", async () => {
+  const sandbox = new CiSandbox();
+  sandbox.env.BACKUP_BUCKET.put = async (key) => {
+    if (key.endsWith("-retention.json")) throw new Error("private provider detail");
+    return {};
+  };
+  await sandbox.destroy();
+  expect(sandbox.calls.at(-1)).toBe("destroy");
 });
