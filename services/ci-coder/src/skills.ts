@@ -17,6 +17,7 @@ const required = [
   "ponytail/skills/ponytail/SKILL.md",
   "workerd/ADAPTER.md",
   "rust/SKILL.md",
+  "rust-async/SKILL.md",
   "tdd/SKILL.md",
 ];
 
@@ -67,6 +68,7 @@ export async function assertRequiredSkillsBundle(bundle: SkillBundle = bundledSk
     bundle.packages.pstack !== "0.15.2+codex.20260922221615" ||
     bundle.packages.ponytail !== "5.3.2" ||
     bundle.packages.rust !== "1.1.2" ||
+    bundle.packages["rust-async"] !== "156b7a5e7a8b93642628a339ee4039c925b34c7f" ||
     bundle.packages.tdd !== "6.4.2" ||
     JSON.stringify(bundle.required) !== JSON.stringify(required) ||
     bundle.bundleSha256 !== bundledSkills.bundleSha256
@@ -79,7 +81,7 @@ export async function assertRequiredSkillsBundle(bundle: SkillBundle = bundledSk
 
   for (const [id, file] of Object.entries(bundle.files)) {
     if (
-      !/^(?:pstack|ponytail|workerd|rust|tdd)\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+$/.test(id) ||
+      !/^(?:pstack|ponytail|workerd|rust|rust-async|tdd)\/(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+$/.test(id) ||
       id.split("/").some((segment) => segment === "." || segment === "..")
     )
       throw new Error("Invalid skill registry path");
@@ -128,7 +130,7 @@ export async function createRequiredSkillsPlugin(bundle: SkillBundle = bundledSk
             editor.add(
               Schema.decodeUnknownSync(Skill.Info)({
                 id: `omg-required-${index}`,
-                name: id === "rust/SKILL.md" ? "rust-best-practices" : id === "tdd/SKILL.md" ? "test-driven-development" : index === 0 ? "poteto-mode" : "ponytail",
+                name: id === "rust/SKILL.md" ? "rust-best-practices" : id === "rust-async/SKILL.md" ? "rust-async-patterns" : id === "tdd/SKILL.md" ? "test-driven-development" : index === 0 ? "poteto-mode" : "ponytail",
                 description: "Mandatory versioned coding guidance",
                 autoinvoke: true,
                 path: `/__omg_skills/${id}`,

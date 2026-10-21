@@ -1,7 +1,8 @@
 import { handleInspection } from "./http";
 import { inspectSnapshot, type InspectorEnv } from "./inspect";
 import { handleSourceReview } from "./review-http";
-import { reviewSource } from "./review";
+import { handlePatchReview } from "./patch-review-http";
+import { reviewPatch, reviewSource } from "./review";
 import type {
   ExportedHandler,
   Request,
@@ -15,7 +16,9 @@ function isWorkerResponse(response: Response): response is Response & WorkerResp
 export default {
   async fetch(request: Request, env: InspectorEnv) {
     const response =
-      new URL(request.url).pathname === "/review"
+      new URL(request.url).pathname === "/patch-review"
+        ? await handlePatchReview(request, env, (input) => reviewPatch(input, env))
+        : new URL(request.url).pathname === "/review"
         ? await handleSourceReview(request, env, (input) => reviewSource(input, env))
         : await handleInspection(request, env, (snapshot) => inspectSnapshot(snapshot, env));
 

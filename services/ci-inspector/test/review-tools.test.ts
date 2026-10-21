@@ -12,6 +12,17 @@ const input = sourceReviewInputSchema.parse({
   ciFailures: [{ job: "Unit", step: "Test", log: "actual assertion" }],
 });
 
+test("source audit metadata reports audited paths and an empty real diff", async () => {
+  const audit = sourceReviewInputSchema.parse({
+    ...input, changedPaths: [], diff: "", auditPaths: ["src/value.mjs"],
+  });
+  const tools = sourceReviewTools(audit);
+  expect(await tools.listChangedFiles.execute({})).toMatchObject({
+    changedPaths: [], auditPaths: ["src/value.mjs"],
+  });
+  expect((await tools.readDiff.execute({ offset: 0, limit: 10 })).content).toBe("");
+});
+
 test("source review has only bounded supplied-data read tools", async () => {
   let reads = 0;
 

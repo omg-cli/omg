@@ -1,0 +1,77 @@
+name: Independent AI fix review
+
+on:
+  workflow_run:
+    workflows: [CI, Code Coverage, CI orchestration contracts]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pull_number:
+        description: Exact App-authored fix PR number to independently review
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omg-independent-fix-review
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  review:
+    if: >-
+      github.repository == 'omg-cli/omg' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24.21.0"
+          package-manager-cache: false
+      - name: Install verified Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/omg-review-bun"
+          mkdir -m 700 "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$tools/bun-linux-x64/bun" | sha256sum -c -
+          printf '%s\n' "$tools/bun-linux-x64" >> "$GITHUB_PATH"
+      - name: Install trusted controller dependencies
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+      - name: Independently review the exact published patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
+          OMG_CI_INSPECTOR_TOKEN: ${{ secrets.OMG_CI_INSPECTOR_TOKEN }}
+          OMG_CI_CONTROLLER_SHA: ${{ vars.OMG_CI_CONTROLLER_SHA }}
+          OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
+          OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+          OMG_CI_PUBLISHER_LOGIN: ${{ vars.OMG_CI_PUBLISHER_LOGIN }}
+          OMG_CI_PUBLISHER_ID: ${{ vars.OMG_CI_PUBLISHER_ID }}
+        run: bun scripts/ai-fix-review-runner.mjs --approve
+      - name: Preserve independent exact-patch verdict
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: independent-fix-review
+          path: ${{ runner.temp }}/ai-fix-review.json
+          if-no-files-found: ignore
+          retention-days: 30

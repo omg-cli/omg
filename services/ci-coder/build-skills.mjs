@@ -9,7 +9,7 @@ const canonical = (value) => JSON.stringify(value, (_, item) =>
     : item);
 
 // Retain the original CodeLoud package registry and append the required Rust guidance.
-export async function buildSkills({ rust, tdd, destination = path.resolve(import.meta.dir, "../../vendor/ci-coder-skills") }) {
+export async function buildSkills({ rust, rustAsync, tdd, destination = path.resolve(import.meta.dir, "../../vendor/ci-coder-skills") }) {
   const bundle = JSON.parse(await readFile(path.join(destination, "bundle.json"), "utf8"));
   for (const file of Object.values(bundle.files)) {
     if (Buffer.byteLength(file.content) !== file.bytes || digest(file.content) !== file.sha256)
@@ -19,11 +19,15 @@ export async function buildSkills({ rust, tdd, destination = path.resolve(import
     const bytes = await readFile(path.join(root, relative));
     const id = `${namespace}/${relative.replaceAll(path.sep, "/")}`;
     const origin = namespace === "rust" ? `rust-best-practices@${version}`
+      : namespace === "rust-async" ? `wshobson/agents@${version}/plugins/systems-programming/skills/rust-async-patterns`
       : relative === "LICENSE" ? `superpowers@${version}`
       : `superpowers@${version}/skills/test-driven-development`;
     bundle.files[id] = { content: bytes.toString("utf8"), sha256: digest(bytes), bytes: bytes.length,
       source: `${origin}/${relative.replaceAll(path.sep, "/")}#sha256=${digest(bytes)}` };
   }
+  const rustAsyncVersion = "156b7a5e7a8b93642628a339ee4039c925b34c7f";
+  await include(rustAsync, "rust-async", "SKILL.md", rustAsyncVersion);
+  await include(rustAsync, "rust-async", "references/details.md", rustAsyncVersion);
   await include(rust, "rust", "SKILL.md", "1.1.2");
   for (const entry of await readdir(path.join(rust, "references"), { withFileTypes: true })) {
     if (entry.isSymbolicLink() || !entry.isFile()) throw new Error("Unexpected Rust reference type");
@@ -34,9 +38,9 @@ export async function buildSkills({ rust, tdd, destination = path.resolve(import
   const adapter = await readFile(path.join(import.meta.dir, "skills/workerd/ADAPTER.md"));
   bundle.files["workerd/ADAPTER.md"] = { content: adapter.toString("utf8"), sha256: digest(adapter),
     bytes: adapter.length, source: "omg-workerd-adapter@1" };
-  bundle.packages = { ...bundle.packages, rust: "1.1.2", tdd: "6.4.2" };
+  bundle.packages = { ...bundle.packages, rust: "1.1.2", "rust-async": rustAsyncVersion, tdd: "6.4.2" };
   bundle.required = ["pstack/skills/poteto-mode/SKILL.md", "ponytail/skills/ponytail/SKILL.md",
-    "workerd/ADAPTER.md", "rust/SKILL.md", "tdd/SKILL.md"];
+    "workerd/ADAPTER.md", "rust/SKILL.md", "rust-async/SKILL.md", "tdd/SKILL.md"];
   const metadata = Object.fromEntries(Object.entries(bundle.files).map(([id, file]) =>
     [id, { sha256: file.sha256, bytes: file.bytes, source: file.source }]));
   const manifest = { version: 1, packages: bundle.packages, required: bundle.required, files: metadata };
@@ -47,7 +51,7 @@ export async function buildSkills({ rust, tdd, destination = path.resolve(import
 }
 
 if (import.meta.main) {
-  const [rust, tdd] = process.argv.slice(2);
-  if (!rust || !tdd) throw new Error("Usage: bun build-skills.mjs <rust-skill-root> <tdd-skill-root>");
-  console.log(JSON.stringify(await buildSkills({ rust, tdd })));
+  const [rust, rustAsync, tdd] = process.argv.slice(2);
+  if (!rust || !rustAsync || !tdd) throw new Error("Usage: bun build-skills.mjs <rust-skill-root> <rust-async-skill-root> <tdd-skill-root>");
+  console.log(JSON.stringify(await buildSkills({ rust, rustAsync, tdd })));
 }

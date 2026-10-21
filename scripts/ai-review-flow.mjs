@@ -7,9 +7,10 @@ import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { Schema } from "effect";
 import { collectCandidateSources } from "./ai-review-candidate.mjs";
+import { collectRuntimeSources, acknowledgeRuntimeSources } from "./sentry-review-input.mjs";
 import { admitCoderResult, coderEndpoint } from "./ai-coder-client.mjs";
 import { parseCodingRequest, operationIdentity } from "../services/ci-coder/src/request.ts";
-import { proposalDigest, publishAiReview } from "./ai-review-publication.mjs";
+import { proposalDigest, publishAiReview, sha256, canonicalJson } from "./ai-review-publication.mjs";
 import { ciPolicy, verifyPublicationProof } from "./ai-review-proof.mjs";
 import { createGhClient } from "./publish-ai-review.mjs";
 import {
@@ -23,6 +24,7 @@ import {
     sourceChanges,
     isReviewSourcePath,
     createSourceReviewEvidence,
+    createSourceAuditEvidence,
     sourceReviewEndpoint,
 } from "./review-source-evidence.mjs";
 import { validateReviewProposal } from "../services/ci-inspector/src/review-contract.ts";
@@ -121,6 +123,13 @@ export function reviewTarget(eventName, event) {
     if (event.repository?.full_name !== SOURCE_REPOSITORY)
         throw new Error("Unexpected review repository.");
 
+    if (eventName === "schedule") {
+        if (event.schedule === "*/15 * * * *")
+            return { branch: "main", sha: null, publish: true, range: { kind: "runtime" } };
+        if (event.schedule !== undefined && event.schedule !== "23 6 * * 1") throw new Error("Unknown review schedule.");
+        return { branch: "main", sha: null, publish: true, range: { kind: "audit", cursor: 0 } };
+    }
+
     if (eventName === "push") {
         if (event.deleted || !event.ref?.startsWith("refs/heads/"))
             throw new Error("Unsupported review branch.");
@@ -165,11 +174,33 @@ export function reviewTarget(eventName, event) {
     if (eventName === "workflow_dispatch") {
         const input = event.inputs ?? {};
 
-        if (Object.keys(input).some((key) => !["branch", "publish"].includes(key)))
+        if (Object.keys(input).some((key) => !["branch", "publish", "scope", "audit_sha", "audit_digest", "audit_cursor", "audit_parent"].includes(key)))
             throw new Error("Unknown manual review input.");
 
         if (![undefined, false, true, "false", "true"].includes(input.publish))
             throw new Error("Invalid publication input.");
+
+        if (![undefined, "changes", "source-audit", "runtime-events"].includes(input.scope)) throw new Error("Unknown review scope.");
+        const auditInputs = [input.audit_sha, input.audit_digest, input.audit_cursor, input.audit_parent];
+        if (input.scope === "source-audit") {
+            const cursor = Number(input.audit_cursor || "0");
+            if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor % 48 ||
+                (cursor === 0 ? auditInputs.some((value) => value && value !== "0") :
+                    !/^[a-f0-9]{64}$/.test(input.audit_digest ?? "") ||
+                    !/^[1-9][0-9]{0,19}-[1-9][0-9]{0,5}$/.test(input.audit_parent ?? "")))
+                throw new Error("Invalid source audit cursor or parent identity.");
+            return {
+                branch: branchName(input.branch), sha: cursor ? exactSha(input.audit_sha) : null,
+                publish: input.publish === true || input.publish === "true",
+                range: { kind: "audit", cursor, ...(cursor ? { inventoryDigest: input.audit_digest } : {}) },
+                ...(cursor ? { auditParent: input.audit_parent } : {}),
+            };
+        }
+        if (auditInputs.some(Boolean)) throw new Error("Audit inputs require source-audit scope.");
+        if (input.scope === "runtime-events") return {
+            branch: branchName(input.branch), sha: null, publish: input.publish === true || input.publish === "true",
+            range: { kind: "runtime" },
+        };
 
         return {
             branch: branchName(input.branch),
@@ -179,6 +210,11 @@ export function reviewTarget(eventName, event) {
     }
 
     throw new Error("Unsupported review event.");
+}
+
+export function pinReviewTarget(target, triggerSha) {
+    exactSha(triggerSha);
+    return target.sha === null ? { ...target, sha: triggerSha, queuedTrigger: true } : target;
 }
 
 export function partitionReviewSources(entries) {
@@ -197,14 +233,14 @@ export function partitionReviewSources(entries) {
 
         if (!isReviewSourcePath(entry.path)) reason = "unsupported-source-type";
         else if (Buffer.byteLength(entry.content) > 24000) reason = "source-byte-budget-exceeded";
-        else if (Buffer.byteLength(entry.diff) > 64000) reason = "diff-byte-budget-exceeded";
+        else if (Buffer.byteLength(entry.diff ?? "") > 64000) reason = "diff-byte-budget-exceeded";
 
         if (reason) {
             unreviewedPaths.push({ path: entry.path, reason });
             continue;
         }
 
-        if (batch.length === 12 || bytes + Buffer.byteLength(entry.diff) > 64000) {
+        if (batch.length === 12 || bytes + Buffer.byteLength(entry.diff ?? "") > 64000) {
             batches.push(batch);
             batch = [];
             bytes = 0;
@@ -216,7 +252,7 @@ export function partitionReviewSources(entries) {
         }
 
         batch.push(entry);
-        bytes += Buffer.byteLength(entry.diff);
+        bytes += Buffer.byteLength(entry.diff ?? "");
     }
 
     if (batch.length) batches.push(batch);
@@ -279,8 +315,47 @@ export async function runReviewFlow({ target, io }) {
     const branch = branchName(target.branch);
     const head = exactSha(await io.head(branch));
 
-    if (target.sha !== null && target.sha !== head) throw new Error("Review target is stale.");
+    if (target.sha !== null && target.sha !== head) {
+        if (target.range?.kind !== "audit" && !target.queuedTrigger) throw new Error("Review target is stale.");
+        return {
+            repository: SOURCE_REPOSITORY, branch, sha: exactSha(target.sha), currentSha: head, baseSha: target.sha,
+            ...(target.range ? { sourceRange: { ...target.range, sha: target.sha } } : {}), status: "incomplete-stale",
+            formatting: { status: "not-started", reason: "audit-snapshot-no-longer-current" },
+            suppliedPaths: [], readPaths: [], unreviewedPaths: [], batches: [], publications: [], candidateOutcomes: [],
+            publishRequested: target.publish,
+            coverageMeaning: target.queuedTrigger
+                ? "The queued trigger snapshot is incomplete because current main changed before this run began."
+                : "The immutable audit snapshot is incomplete because current main changed before this page began.",
+        };
+    }
     const sha = head;
+    const precollected = ["audit", "runtime"].includes(target.range?.kind)
+        ? await io.collect(sha, branch, target.range) : undefined;
+    if (precollected?.replayRef) {
+        try {
+            return { ...admitRuntimeReplay({ original: precollected.replayReport, replayRef: precollected.replayRef,
+                runtimeEvents: precollected.runtimeEvents, sha, controllerRevision: io.controllerRevision }), publishRequested: target.publish };
+        } catch (error) {
+            return {
+                repository: SOURCE_REPOSITORY, branch, sha, baseSha: sha, status: "runtime-replay-held", runtimeUnresolved: true,
+                runtimeEvents: precollected.runtimeEvents, replayOf: precollected.replayRef,
+                formatting: { status: "not-started", reason: "canonical-runtime-publication-unresolved" },
+                suppliedPaths: [], readPaths: [], unreviewedPaths: precollected.unreviewedPaths ?? [],
+                batches: [], publications: [], candidateOutcomes: [], publishRequested: target.publish,
+                coverageMeaning: error instanceof Error ? error.message : "Canonical runtime publication remains unresolved.",
+            };
+        }
+    }
+    if (precollected && precollected.entries.length === 0)
+        return {
+            repository: SOURCE_REPOSITORY, branch, sha, baseSha: precollected.baseSha,
+            sourceRange: precollected.sourceRange, status: "no-reviewable-source",
+            formatting: { status: "not-required", reason: "no-admitted-source" },
+            suppliedPaths: [], readPaths: [], unreviewedPaths: precollected.unreviewedPaths,
+            batches: [], publications: [], candidateOutcomes: [], publishRequested: target.publish,
+            ...(precollected.runtimeEvents ? { runtimeEvents: precollected.runtimeEvents } : {}),
+            coverageMeaning: "No model inference or native verification was started because no source was admitted.",
+        };
     const formatting = await io.format(sha, branch, target.upstream);
 
     if (formatting.status !== "passed")
@@ -288,17 +363,21 @@ export async function runReviewFlow({ target, io }) {
             repository: SOURCE_REPOSITORY,
             branch,
             sha,
-            baseSha: null,
+            baseSha: precollected?.baseSha ?? null,
+            ...(precollected ? { sourceRange: precollected.sourceRange } : {}),
             status: "format-blocked",
             formatting,
             suppliedPaths: [],
             readPaths: [],
-            unreviewedPaths: [],
+            unreviewedPaths: precollected ? [...precollected.unreviewedPaths,
+                ...precollected.entries.map(({ path }) => ({ path, reason: "source-format-blocked" }))] : [],
             batches: [],
             publications: [],
             candidateOutcomes: [],
             coverageMeaning:
-                "Source inventory and model review were not started because formatting evidence was not admitted.",
+                precollected
+                    ? "Source inventory was collected, but model review was blocked because formatting evidence was not admitted."
+                    : "Source inventory and model review were not started because formatting evidence was not admitted.",
             publishRequested: target.publish,
         };
 
@@ -311,7 +390,7 @@ export async function runReviewFlow({ target, io }) {
     let collected;
 
     try {
-        collected = await io.collect(sha, branch, range);
+        collected = precollected ?? await io.collect(sha, branch, range);
     } catch (error) {
         if (!(error instanceof Error) || !error.message.startsWith("Source coverage is blocked:"))
             throw error;
@@ -353,13 +432,18 @@ export async function runReviewFlow({ target, io }) {
         publications: [],
         candidateOutcomes: [],
         publishRequested: target.publish,
+        ...(collected.runtimeEvents ? { runtimeEvents: collected.runtimeEvents } : {}),
     };
 
     let candidateCount = 0;
     let mirrored = false;
 
     for (const entries of partition.batches) {
-        const evidence = createSourceReviewEvidence({
+        const evidence = collected.sourceRange?.kind === "audit" ? createSourceAuditEvidence({
+            sha, branch,
+            sourceFiles: entries.map(({ path, blobSha, content }) => ({ path, blobSha, content })),
+            runtimeEvidence: collected.runtimeEvidence,
+        }) : createSourceReviewEvidence({
             sha,
             baseSha: collected.baseSha,
             branch,
@@ -441,6 +525,7 @@ const git = async (args) =>
 
 export async function collectSources(github, sha, range, directory = root) {
     exactSha(sha);
+    if (range?.kind === "audit") return collectAuditSources(sha, range, directory);
 
     const sourceExecute = (binary, args, encoding = "utf8") =>
         command(binary, args, {
@@ -582,6 +667,118 @@ export async function collectSources(github, sha, range, directory = root) {
     };
 }
 
+export async function collectAuditSources(sha, range, directory = root) {
+    exactSha(sha);
+    if (!Number.isSafeInteger(range.cursor) || range.cursor < 0 || range.cursor % 48)
+        throw new Error("Invalid audit cursor.");
+    const sourceGit = async (args, encoding = "utf8") => (await command("git", ["--no-pager", "--literal-pathspecs", ...args], {
+        cwd: directory, encoding, timeout: 180000, maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+    })).stdout;
+    if ((await sourceGit(["rev-parse", `${sha}^{commit}`])).trim() !== sha) throw new Error("Audit source commit unavailable.");
+    const inventory = await sourceGit(["ls-tree", "-r", "-z", "-l", sha]);
+    const inventoryDigest = sha256(inventory);
+    if (range.inventoryDigest && range.inventoryDigest !== inventoryDigest) throw new Error("Audit inventory digest mismatch.");
+    const files = inventory.split("\0");
+    if (files.pop() !== "" || !files.length || files.length > 10000 || range.cursor >= files.length)
+        throw new Error("Audit inventory or cursor is outside its bounded tree.");
+    const entries = [];
+    const unreviewedPaths = [];
+    const page = files.slice(range.cursor, range.cursor + 48);
+    for (const record of page) {
+        const match = /^([0-7]{6}) (blob|commit) ([a-f0-9]{40}) +([0-9]+|-)\t([\s\S]+)$/.exec(record);
+        if (!match) throw new Error("Malformed audit tree entry.");
+        const [, mode, type, blobSha, sizeText, file] = match;
+        let reason;
+        if (!["100644", "100755"].includes(mode) || type !== "blob") reason = "nonregular-source";
+        else if (file.includes("\\") || /[\x00-\x1f\x7f]/.test(file) || file.startsWith("/") ||
+            file.split("/").some((segment) => !segment || segment === "." || segment === "..")) reason = "invalid-source-path";
+        else if (!isReviewSourcePath(file)) reason = "unsupported-source-type";
+        else if (Number(sizeText) > 24000) reason = "source-byte-budget-exceeded";
+        if (reason) { unreviewedPaths.push({ path: file, reason }); continue; }
+        const bytes = await sourceGit(["cat-file", "blob", blobSha], null);
+        if (bytes.includes(0)) { unreviewedPaths.push({ path: file, reason: "binary-source" }); continue; }
+        let content;
+        try { content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes); }
+        catch { unreviewedPaths.push({ path: file, reason: "invalid-utf8-source" }); continue; }
+        entries.push({ path: file, blobSha, content });
+    }
+    return {
+        baseSha: sha, entries, unreviewedPaths,
+        sourceRange: { kind: "audit", sha, inventoryDigest, cursor: range.cursor,
+            nextCursor: range.cursor + page.length < files.length ? range.cursor + page.length : null,
+            totalPaths: files.length, pagePaths: page.length, eligiblePaths: entries.length, heldPaths: unreviewedPaths.length },
+    };
+}
+
+export function sourceAuditContinuation(report, currentSha, runId, attempt) {
+    if (report.repository !== SOURCE_REPOSITORY || report.branch !== "main")
+        throw new Error("Unexpected audit continuation repository.");
+    exactSha(report.sha);
+    exactSha(currentSha);
+    if (!["reviewed", "no-reviewable-source"].includes(report.status))
+        return { status: "incomplete-review-blocked" };
+    const range = report.sourceRange;
+    if (range?.kind !== "audit" || range.intake === "sentry-runtime") return { status: "not-a-weekly-audit" };
+    if (range.sha !== report.sha || !/^[a-f0-9]{64}$/.test(range.inventoryDigest ?? "") ||
+        !Number.isSafeInteger(range.cursor) || range.cursor < 0 || range.cursor % 48 ||
+        !Number.isSafeInteger(range.totalPaths) || range.totalPaths < 1 || range.totalPaths > 10000 ||
+        range.cursor >= range.totalPaths || range.pagePaths !== Math.min(48, range.totalPaths - range.cursor) ||
+        range.nextCursor !== (range.cursor + range.pagePaths < range.totalPaths ? range.cursor + range.pagePaths : null))
+        throw new Error("Audit continuation cursor or inventory mismatch.");
+    if (currentSha !== report.sha)
+        return { status: "incomplete-stale", remainingPaths: range.totalPaths - range.cursor - range.pagePaths };
+    if (range.nextCursor === null) return { status: "inventory-exhausted" };
+    if (!/^[1-9][0-9]{0,19}$/.test(runId ?? "") || !/^[1-9][0-9]{0,5}$/.test(attempt ?? ""))
+        throw new Error("Invalid audit continuation run identity.");
+    return {
+        status: "continue",
+        inputs: { branch: "main", scope: "source-audit", publish: String(report.publishRequested === true),
+            audit_sha: report.sha, audit_digest: range.inventoryDigest, audit_cursor: String(range.nextCursor),
+            audit_parent: `${runId}-${attempt}` },
+    };
+}
+
+export function admitAuditResume(target, parent, revision) {
+    if (!/^[1-9][0-9]{0,19}-[1-9][0-9]{0,5}$/.test(target.auditParent ?? "") ||
+        parent.controllerRevision !== revision || parent.sha !== target.sha ||
+        parent.sourceRange?.inventoryDigest !== target.range.inventoryDigest ||
+        parent.sourceRange?.nextCursor !== target.range.cursor || parent.publishRequested !== target.publish ||
+        !["passed", "not-required"].includes(parent.formatting?.status))
+        throw new Error("Audit parent record identity mismatch.");
+    const continuation = sourceAuditContinuation(parent, target.sha, ...target.auditParent.split("-"));
+    if (continuation.status !== "continue") throw new Error("Audit parent did not authorize continuation.");
+    if (parent.formatting.status !== "passed") return target;
+    if (parent.formatting.sha !== target.sha || parent.formatting.ref !== "refs/heads/main" ||
+        !/^[1-9][0-9]{0,19}$/.test(parent.formatting.runId ?? "") ||
+        !/^[1-9][0-9]{0,5}$/.test(parent.formatting.attempt ?? ""))
+        throw new Error("Audit formatting identity mismatch.");
+    return { ...target, upstream: { runId: parent.formatting.runId, attempt: parent.formatting.attempt } };
+}
+
+export async function finalizeRuntimeReview({ report, publicationResult, acknowledge }) {
+    if (report.runtimeUnresolved) throw new Error("Canonical runtime publication remains unresolved; evidence stays pending.");
+    if (report.publishRequested !== true || !Array.isArray(report.publications) ||
+        (publicationResult !== "success" && !(publicationResult === "skipped" && report.publications.length === 0)))
+        throw new Error("Runtime publication did not finish successfully; evidence remains pending.");
+    await acknowledge();
+    return { status: "runtime-evidence-acknowledged" };
+}
+
+export function admitRuntimeReplay({ original, replayRef, runtimeEvents, sha, controllerRevision, publications }) {
+    if (!/^[1-9][0-9]{0,19}$/.test(replayRef?.runId ?? "") || !/^[1-9][0-9]{0,5}$/.test(replayRef?.attempt ?? "") ||
+        (replayRef.sha !== undefined && replayRef.sha !== sha) ||
+        (replayRef.controllerRevision !== undefined && replayRef.controllerRevision !== controllerRevision) ||
+        original?.repository !== SOURCE_REPOSITORY || original.branch !== "main" || original.sha !== sha ||
+        original.controllerRevision !== controllerRevision || original.publishRequested !== true || original.runtimeUnresolved ||
+        !["reviewed", "no-reviewable-source"].includes(original.status) || original.sourceRange?.intake !== "sentry-runtime" ||
+        !Array.isArray(original.publications) || original.publications.length > 3 ||
+        !Array.isArray(runtimeEvents) || runtimeEvents.length === 0 || runtimeEvents.length > 3 ||
+        canonicalJson(original.runtimeEvents) !== canonicalJson(runtimeEvents) ||
+        (publications !== undefined && canonicalJson(original.publications) !== canonicalJson(publications)))
+        throw new Error("Canonical runtime publication source, controller or event identity differs; unresolved evidence must not be replaced.");
+    return { ...original, status: "publication-replay", replayOf: replayRef };
+}
+
 async function document(file, maximum = 512 * 1024) {
     const bytes = await readFile(file);
 
@@ -648,12 +845,12 @@ async function fetchJson(url, token, body, maximum = 256 * 1024) {
 
     text += decoder.decode();
 
-    if (!response.ok) throw new Error(`Service request failed: HTTP ${response.status}.`);
+    if (!response.ok) throw Object.assign(new Error(`Service request failed: HTTP ${response.status}.`), { status: response.status });
 
     return JSON.parse(text);
 }
 
-async function createController(github) {
+async function createController(github, controllerRevision) {
     const head = async (branch) =>
         exactSha((await github.request("GET", `${prefix}/git/ref/heads/${branch}`)).object.sha);
 
@@ -679,6 +876,7 @@ async function createController(github) {
 
     return {
         head,
+        controllerRevision,
         format: async (sha, branch, upstream) => {
             const request = parseCloudCiRequest({
                 repository: SOURCE_REPOSITORY,
@@ -768,7 +966,23 @@ async function createController(github) {
                 };
             }
         },
-        collect: (sha, _branch, range) => collectSources(github, sha, range),
+        collect: async (sha, _branch, range) => {
+            if (range?.kind !== "runtime") return collectSources(github, sha, range);
+            const collected = await collectRuntimeSources({ github, sha, directory: root, endpoint: config.endpoint, token,
+                request: fetchJson, reviewRef: { runId, attempt, sha, controllerRevision } });
+            if (collected.replayRef) {
+                const { runId: originalRun, attempt: originalAttempt } = collected.replayRef;
+                if (!/^[1-9][0-9]{0,19}$/.test(originalRun ?? "") || !/^[1-9][0-9]{0,5}$/.test(originalAttempt ?? ""))
+                    throw new Error("Invalid canonical runtime review reference.");
+                try {
+                    collected.replayReport = await fetchJson(new URL(`/review-records/${originalRun}-${originalAttempt}`, config.endpoint), token, undefined, 2 * 1024 * 1024);
+                } catch (error) {
+                    if (!(error instanceof Error) || error.status !== 404) throw error;
+                    collected.replayReport = null;
+                }
+            }
+            return collected;
+        },
         review: (input) => fetchJson(endpoint, inspectorToken, JSON.stringify(input), 128 * 1024),
         adapt: async (input, review, candidateIndex) => {
             const request = parseCodingRequest({
@@ -905,22 +1119,28 @@ export async function main(args = process.argv.slice(2)) {
     const [mode, directory, flag] = args;
 
     if (
-        !["collect", "publish"].includes(mode) ||
+        !["collect", "publish", "continue"].includes(mode) ||
         !directory ||
         (flag !== undefined && flag !== "--publish") ||
         args.length > 3 ||
-        (mode === "collect" && flag)
+        (mode !== "publish" && flag)
     )
         throw new Error(
-            "Usage: bun scripts/ai-review-flow.mjs <collect|publish> <output-directory> [--publish]",
+            "Usage: bun scripts/ai-review-flow.mjs <collect|publish|continue> <output-directory> [--publish]",
         );
     const github = createGhClient();
     const revision = exactSha((await git(["rev-parse", "HEAD"])).trim());
 
     if (mode === "collect") {
         const event = await document(process.env.GITHUB_EVENT_PATH);
-        const target = reviewTarget(process.env.GITHUB_EVENT_NAME, event);
-        const report = await runReviewFlow({ target, io: await createController(github) });
+        let target = pinReviewTarget(reviewTarget(process.env.GITHUB_EVENT_NAME, event), process.env.GITHUB_SHA);
+        if (target.auditParent) {
+            const config = await protectedConfig("omg-cloud-ci.json");
+            ciPolicy(config);
+            const parent = await fetchJson(new URL(`/review-records/${target.auditParent}`, config.endpoint), await secret(config.tokenFile), undefined, 2 * 1024 * 1024);
+            target = admitAuditResume(target, parent, revision);
+        }
+        const report = await runReviewFlow({ target, io: await createController(github, revision) });
         report.controllerRevision = revision;
         await mkdir(directory, { recursive: true });
         await writeFile(path.join(directory, "review.json"), `${JSON.stringify(report)}\n`, {
@@ -958,7 +1178,7 @@ export async function main(args = process.argv.slice(2)) {
         if (process.env.GITHUB_OUTPUT)
             await writeFile(
                 process.env.GITHUB_OUTPUT,
-                `controller-sha=${revision}\npublish=${report.publishRequested}\nverified=${report.publications.length}\n`,
+                `controller-sha=${revision}\npublish=${report.publishRequested}\nverified=${report.publications.length}\naudit-next=${report.sourceRange?.kind === "audit" && report.sourceRange?.intake !== "sentry-runtime" && report.sourceRange.nextCursor !== null && ["reviewed", "no-reviewable-source"].includes(report.status)}\nruntime-ack=${report.publishRequested === true && !report.runtimeUnresolved && report.runtimeEvents?.length > 0}\n`,
                 { flag: "a" },
             );
 
@@ -990,6 +1210,37 @@ export async function main(args = process.argv.slice(2)) {
     )
         throw new Error("Publication artifact has an untrusted controller identity.");
 
+    let proofRunId = runId;
+    let proofAttempt = attempt;
+    if (report.replayOf) {
+        const { runId: originalRun, attempt: originalAttempt } = report.replayOf;
+        if (!/^[1-9][0-9]{0,19}$/.test(originalRun ?? "") || !/^[1-9][0-9]{0,5}$/.test(originalAttempt ?? ""))
+            throw new Error("Invalid canonical runtime publication reference.");
+        const original = await fetchJson(new URL(`/review-records/${originalRun}-${originalAttempt}`, config.endpoint), token, undefined, 2 * 1024 * 1024);
+        admitRuntimeReplay({ original, replayRef: report.replayOf, runtimeEvents: report.runtimeEvents,
+            sha: report.sha, controllerRevision: revision, publications: report.publications });
+        proofRunId = originalRun;
+        proofAttempt = originalAttempt;
+    }
+
+    if (mode === "continue") {
+        if (report.runtimeEvents?.length) {
+            const finalized = await finalizeRuntimeReview({ report, publicationResult: process.env.PUBLICATION_RESULT,
+                acknowledge: () => acknowledgeRuntimeSources({ endpoint: config.endpoint, token, report, runId, attempt, request: fetchJson }) });
+            process.stdout.write(`${JSON.stringify(finalized)}\n`);
+            return;
+        }
+        const currentSha = exactSha((await github.request("GET", `${prefix}/git/ref/heads/main`)).object.sha);
+        const continuation = sourceAuditContinuation(report, currentSha, runId, attempt);
+        if (continuation.status === "continue") {
+            const args = ["api", "--hostname", "github.com", "--method", "POST", `${prefix}/actions/workflows/ai-review.yml/dispatches`, "-f", "ref=main"];
+            for (const [key, value] of Object.entries(continuation.inputs)) args.push("-f", `inputs[${key}]=${value}`);
+            await execute("gh", args);
+        }
+        process.stdout.write(`${JSON.stringify(continuation)}\n`);
+        return;
+    }
+
     if (flag === "--publish" && report.publishRequested !== true)
         throw new Error("This review did not authorize publication.");
     const results = [];
@@ -1004,8 +1255,8 @@ export async function main(args = process.argv.slice(2)) {
 
         if (
             id !== expectedId ||
-            request.runId !== process.env.GITHUB_RUN_ID ||
-            request.attempt !== process.env.GITHUB_RUN_ATTEMPT ||
+            request.runId !== proofRunId ||
+            request.attempt !== proofAttempt ||
             proposal.baseSha !== report.sha ||
             proposal.branch !== report.branch ||
             proposalDigest(request.verification.proposal) !== proposalDigest(proposal)
@@ -1018,8 +1269,8 @@ export async function main(args = process.argv.slice(2)) {
             coding.id !== operationIdentity(codingRequest) ||
             codingRequest.sha !== proposal.baseSha ||
             codingRequest.branch !== proposal.branch ||
-            codingRequest.runId !== runId ||
-            codingRequest.attempt !== attempt
+            codingRequest.runId !== proofRunId ||
+            codingRequest.attempt !== proofAttempt
         )
             throw new Error("Publication lacks exact skill-required coding provenance.");
 

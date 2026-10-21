@@ -39,6 +39,7 @@ export function sourceReviewTools(
 
         return {
           changedPaths: input.changedPaths,
+          ...(input.auditPaths ? { auditPaths: input.auditPaths } : {}),
           files: input.sourceFiles.map(({ path, blobSha, content }) => ({
             path,
             blobSha,

@@ -2,7 +2,7 @@
 
 This handoff describes improvements made in OMG after adapting the CodeLoud pipeline. The review is dated October 20, 2026. CodeLoud was inspected read-only and remains unchanged at the last observed owner revision `ed8cd06cda8cf65118f03718e50442f6d4cdda5a`. Review the current owner checkout before applying anything.
 
-The OMG implementation is in [PR 974](https://github.com/omg-cli/omg/pull/974). It preserves CodeLoud's Workers/Workflow/Sandbox/OpenCode architecture and separate trusted publisher. Human approval, merge and release remain required. Do not copy OMG resource names, credentials, image pins or Rust acceptance settings into CodeLoud.
+The OMG implementation is in [PR 974](https://github.com/omg-cli/omg/pull/974). It preserves CodeLoud's Workers/Workflow/Sandbox/OpenCode architecture and separate trusted publisher. Independent review and approval gate generated fixes; merge and release remain separate. The subsequent [weekly review, Sentry intake and independent approval paths](cloudflare-autonomous-repair.md) require their own hosted activation evidence. Do not copy OMG resource names, credentials, image pins or Rust acceptance settings into CodeLoud.
 
 ## Improvements to transfer
 

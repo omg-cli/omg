@@ -80,6 +80,18 @@ test("candidate adapter binds exact source bytes and constructs the unique repla
     assert.equal(result.regression.testName, "value_returns_two");
 });
 
+test("candidate adapter accepts honest source audits and rejects mismatched audit inventory", () => {
+    const value = fixture();
+    value.input.changedPaths = [];
+    value.input.auditPaths = ["src/value.rs"];
+    assert.equal(adaptReviewCandidate(value).proposal.finding.path, "src/value.rs");
+    value.input.auditPaths = ["src/other.rs"];
+    assert.throws(() => adaptReviewCandidate(value), /audit/i);
+    value.input.auditPaths = ["src/value.rs"];
+    value.input.diff = "+fabricated";
+    assert.throws(() => adaptReviewCandidate(value), /audit/i);
+});
+
 for (const [name, mutate] of [
     [
         "stale source blob",

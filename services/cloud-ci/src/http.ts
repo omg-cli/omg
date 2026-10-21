@@ -2,6 +2,7 @@ import { z } from "zod";
 import type * as Workers from "@cloudflare/workers-types/index.ts";
 import { reviewRecords } from "./review-records";
 import { diagnosticsHttp } from "./diagnostics-http";
+import { receiveSentry, sentryRecords, type SentryBindings } from "./sentry-intake";
 import { cloudCiChecks } from "../runner/plan.mjs";
 import {
     nativeParams,
@@ -30,7 +31,7 @@ declare const Response: typeof Workers.Response;
 const json = <T>(value: T, status = 200) =>
     Response.json(value, { status, headers: { "Cache-Control": "no-store" } });
 
-type HttpBindings = {
+type HttpBindings = Omit<SentryBindings, "BACKUP_BUCKET"> & {
     CI_API_TOKEN: string;
     ARTIFACTS: {
         get(name: string): Promise<{
@@ -41,12 +42,13 @@ type HttpBindings = {
         }>;
     };
     BACKUP_BUCKET: {
+        delete?(key: string): Promise<void>;
         list?(options: {
             prefix: string;
             limit: number;
             cursor?: string;
         }): Promise<{ objects: { key: string }[]; truncated: boolean; cursor?: string }>;
-        get(key: string): Promise<{ text(): Promise<string>; body: Workers.BodyInit } | null>;
+        get(key: string): Promise<{ text(): Promise<string>; body: Workers.BodyInit; etag?: string } | null>;
         put(key: string, value: string, options?: R2PutOptions): Promise<object | null>;
     };
     CI_WORKFLOW: {
@@ -56,6 +58,8 @@ type HttpBindings = {
 };
 
 export async function fetchCi(request: Request, env: HttpBindings): Promise<Response> {
+    if (new URL(request.url).pathname === "/sentry/events" && request.method === "POST")
+        return receiveSentry(request, env);
     const authorization = request.headers.get("Authorization") ?? "";
 
     const hashes = await Promise.all(
@@ -82,6 +86,9 @@ export async function fetchCi(request: Request, env: HttpBindings): Promise<Resp
 
 async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
     const url = new URL(request.url);
+
+    if (url.pathname === "/sentry/poll" || url.pathname === "/sentry/events" || url.pathname.startsWith("/sentry/events/"))
+        return sentryRecords(request, env.BACKUP_BUCKET);
 
     if (url.pathname.startsWith("/diagnostics/"))
         return diagnosticsHttp(request, env.BACKUP_BUCKET);

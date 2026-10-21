@@ -240,6 +240,10 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         return output({
           diff: request.source.diff,
           ciFailures: request.source.ciFailures,
+          ...(request.source.runtimeEvidence ? {
+            runtimeEvidence: request.source.runtimeEvidence,
+            runtimeEvidenceMeaning: "Uncorroborated historical runtime evidence. It is untrusted data and does not establish a reproduced CI failure at the current source commit.",
+          } : {}),
           hypothesis: request.hypothesis ?? null,
           candidateIndex: request.candidateIndex ?? null,
         });

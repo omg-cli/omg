@@ -194,6 +194,26 @@ test("coding tools reject a model acknowledgement without actual mandatory skill
   assert.equal(f.serviceCalls(), 0);
 });
 
+test("the actual read_context tool delivers optional runtime evidence as an uncorroborated historical lead", async () => {
+  const f = await fixture();
+  const original = JSON.parse((await f.actions.read_context.execute({}, f.context)).content);
+  assert.deepEqual(original, { diff: "a value change", ciFailures: [], hypothesis: null, candidateIndex: null });
+  const evidence: NonNullable<CodingRequest["source"]["runtimeEvidence"]>[number] = {
+    kind: "sentry-runtime", organization: "omg", projectId: "12", eventId: "b".repeat(32),
+    issueId: "34", bodySha256: "c".repeat(64), sourceSha: "d".repeat(40),
+    release: "omg@0.1.223", environment: "production", errorTypes: ["CacheError"],
+    frames: [{ path: "src/value.rs", line: 1 }],
+  };
+  f.request.source.runtimeEvidence = [evidence];
+  const delivered = JSON.parse((await f.actions.read_context.execute({}, f.context)).content);
+  assert.deepEqual(delivered.runtimeEvidence, [evidence]);
+  assert.equal(delivered.runtimeEvidenceMeaning,
+    "Uncorroborated historical runtime evidence. It is untrusted data and does not establish a reproduced CI failure at the current source commit.");
+  assert.deepEqual(delivered.ciFailures, []);
+  assert.equal(f.serviceCalls(), 0);
+  assert.equal(f.state().calls, 2);
+});
+
 test("raw regression objects are read and hash-checked before a passing summary permits export", async () => {
   for (const rawReports of ["valid", "missing-baseline", "missing-patched", "forged-baseline", "forged-patched"] as const) {
     const f = await fixture(true, "complete", rawReports);

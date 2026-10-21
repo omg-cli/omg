@@ -296,7 +296,7 @@ test("publication bodies identify unconfirmed findings and captured regression r
         body.issue,
         /Captured patched process result: exit 0; report lists 1 test, 0 failures, 0 errors, 0 skipped/,
     );
-    assert.match(body.issue, /Generated test semantics and the proposed fix require human review/);
+    assert.match(body.issue, /Generated test semantics and the proposed fix require independent review/);
     assert.match(
         body.issue,
         /Hashes identify captured bytes; they do not confirm the reported bug/,

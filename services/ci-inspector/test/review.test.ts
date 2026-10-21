@@ -40,6 +40,21 @@ const candidate = {
   },
 };
 
+test("source audits preserve honest input identity and accept only exact audited source evidence", () => {
+  const audit = { ...input, changedPaths: [], diff: "", auditPaths: ["src/value.mjs"] };
+  expect(sourceReviewInputSchema.parse(audit)).toEqual(audit);
+  expect(validateReviewProposal(sourceReviewInputSchema.parse(audit), proposal())).toEqual(proposal());
+  expect(sourceReviewInputSchema.safeParse({ ...audit, auditPaths: ["src/other.mjs"] }).success).toBe(false);
+  expect(sourceReviewInputSchema.safeParse({ ...audit, changedPaths: ["src/value.mjs"] }).success).toBe(false);
+  expect(sourceReviewInputSchema.safeParse({ ...audit, diff: "+fabricated" }).success).toBe(false);
+  expect(sourceReviewInputSchema.safeParse({ ...input, changedPaths: [] }).success).toBe(false);
+  expect(sourceReviewInputSchema.parse(input)).toEqual(input);
+  expect(sourceReviewInputSchema.parse(input)).not.toHaveProperty("auditPaths");
+  expect(() => validateReviewProposal(sourceReviewInputSchema.parse(audit), proposal({
+    evidence: [{ ...candidate.evidence[0], quote: "fabricated source" }],
+  }))).toThrow("Evidence quote");
+});
+
 function proposal(update: Partial<typeof candidate> = {}) {
   return {
     kind: "candidates",

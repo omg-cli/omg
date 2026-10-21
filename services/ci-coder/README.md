@@ -2,7 +2,7 @@
 
 This private Worker runs OpenCode in a SQLite Durable Object with direct Workers AI inference. Its only coding tools read an immutable Git snapshot, propose a bounded repair, and request independent Cloudflare CI execution. GitHub credentials stay in the separate trusted publisher.
 
-Potato Mode, Ponytail, Rust best practices and TDD are mandatory. The bundled original skill files retain provenance, hashes and licenses. The runtime validates the bundle before creating a session and injects the required instructions into the SDK's context, compaction and generation hooks. Every coding tool requires actual delivery to its session. A model saying it used the skills is insufficient.
+Potato Mode, Ponytail, Rust best practices, Rust async patterns and TDD are mandatory. The bundled original skill files retain provenance, hashes and licenses. The runtime validates the bundle before creating a session and injects the required instructions into the SDK's context, compaction and generation hooks. Every coding tool requires actual delivery to its session. A model saying it used the skills is insufficient.
 
 Operations bind the repository, exact commit, branch, run, attempt, source snapshot and hypothesis. Retries reuse the same operation identity. A different skills bundle, image or verifier cannot silently resume an existing operation.
 
@@ -17,7 +17,7 @@ bun run --cwd services/ci-coder test
 bun run --cwd services/ci-coder build
 ```
 
-`bun services/ci-coder/build-skills.mjs <rust-skill-root> <tdd-skill-root>` appends the pinned Rust/TDD sources to the retained CodeLoud registry and regenerates its hashes. Review and commit the resulting manifest and bundle together.
+`bun services/ci-coder/build-skills.mjs <rust-skill-root> <rust-async-skill-root> <tdd-skill-root>` appends the pinned Rust, Rust async and TDD sources to the retained CodeLoud registry and regenerates its hashes. Review and commit the resulting manifest and bundle together.
 
 ## Deploy and probe
 

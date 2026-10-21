@@ -100,6 +100,26 @@ export function isReviewSourcePath(file) {
     );
 }
 
+export function createSourceAuditEvidence({ sha, branch, sourceFiles, runtimeEvidence }) {
+    const sourceInput = sourceReviewInputSchema.parse({
+        repository: SOURCE_REPOSITORY, sha, branch, changedPaths: [], diff: "",
+        auditPaths: sourceFiles.map((file) => file.path), sourceFiles,
+        ...(runtimeEvidence ? { runtimeEvidence } : {}),
+    });
+    for (const file of sourceInput.sourceFiles) {
+        const bytes = Buffer.from(file.content);
+        if (bytes.length > 24000 || bytes.includes(0) || createHash("sha1")
+            .update(`blob ${bytes.length}\0`).update(bytes).digest("hex") !== file.blobSha)
+            throw new Error("Audit source differs from exact bounded Git blob.");
+    }
+    return {
+        repository: SOURCE_REPOSITORY, sha, baseSha: sha, branch, sourceInput,
+        suppliedPaths: sourceInput.auditPaths, reviewedPaths: [], readDiff: false,
+        unreviewedPaths: sourceInput.auditPaths.map((path) => ({ path, reason: "not-read-by-model" })),
+        coverageMeaning: "Source audit receipts attest actual excerpts, not complete file or repository coverage.",
+    };
+}
+
 export function createSourceReviewEvidence(value) {
     const input = Schema.decodeUnknownSync(collection)(value);
 

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import * as sourceEvidence from "../../scripts/review-source-evidence.mjs";
 import {
     parseSourceReviewArguments,
     createSourceReviewEvidence,
@@ -9,6 +10,21 @@ import {
 
 const sha = "a".repeat(40);
 const baseSha = "b".repeat(40);
+
+test("source audit evidence carries exact blobs without inventing changed paths or a diff", () => {
+    assert.equal(typeof sourceEvidence.createSourceAuditEvidence, "function");
+    const content = "pub const audited: bool = true;\n";
+    const blobSha = createHash("sha1").update(`blob ${Buffer.byteLength(content)}\0${content}`).digest("hex");
+    const value = { sha, branch: "main", sourceFiles: [{ path: "src/audit.rs", blobSha, content }] };
+    const evidence = sourceEvidence.createSourceAuditEvidence(value);
+    assert.deepEqual(evidence.sourceInput.changedPaths, []);
+    assert.equal(evidence.sourceInput.diff, "");
+    assert.deepEqual(evidence.sourceInput.auditPaths, ["src/audit.rs"]);
+    assert.deepEqual(evidence.suppliedPaths, ["src/audit.rs"]);
+    assert.deepEqual(evidence.reviewedPaths, []);
+    value.sourceFiles[0].blobSha = baseSha;
+    assert.throws(() => sourceEvidence.createSourceAuditEvidence(value), /blob/i);
+});
 
 function fixture(content = 'pub const value: usize = "café";\n', file = "src/value.rs") {
     const bytes = Buffer.from(content);

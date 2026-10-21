@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { runtimeEvidenceSchema } from "./runtime-evidence";
 
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
 
@@ -24,7 +25,9 @@ export const sourceReviewInputSchema = z
         repository: z.literal("omg-cli/omg"),
         sha,
         branch: z.string().min(1).max(200),
-        changedPaths: z.array(path).min(1).max(30),
+        changedPaths: z.array(path).max(30),
+        auditPaths: z.array(path).min(1).max(12).optional(),
+        runtimeEvidence: z.array(runtimeEvidenceSchema).min(1).max(3).optional(),
         diff: z.string().max(64000),
         sourceFiles: z
             .array(z.strictObject({ path, blobSha: sha, content: z.string().max(24000) }))
@@ -49,6 +52,17 @@ export const sourceReviewInputSchema = z
             new Set(input.changedPaths).size !== input.changedPaths.length
         )
             context.addIssue({ code: "custom", message: "Duplicate paths" });
+
+        if (input.auditPaths) {
+            if (
+                input.changedPaths.length !== 0 || input.diff !== "" ||
+                new Set(input.auditPaths).size !== input.auditPaths.length ||
+                input.auditPaths.length !== paths.length ||
+                input.auditPaths.some((file) => !paths.includes(file))
+            ) context.addIssue({ code: "custom", message: "Audit paths must exactly match supplied source with no fabricated changes" });
+        } else if (input.changedPaths.length === 0) {
+            context.addIssue({ code: "custom", message: "Changed paths are required outside a source audit" });
+        }
     });
 
 const evidence = z.strictObject({
@@ -118,8 +132,8 @@ export function validateReviewProposal(
     if (proposal.kind === "no-findings") return proposal;
 
     for (const [index, candidate] of proposal.candidates.entries()) {
-        if (!candidate.evidence.some((item) => input.changedPaths.includes(item.path)))
-            throw new Error("Evidence must include a changed path");
+        if (!candidate.evidence.some((item) => (input.auditPaths ?? input.changedPaths).includes(item.path)))
+            throw new Error("Evidence must include a changed or audited path");
 
         for (const item of candidate.evidence) {
             const file = input.sourceFiles.find((source) => source.path === item.path);

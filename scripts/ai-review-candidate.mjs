@@ -1,6 +1,7 @@
 import { assertRustSourceChange } from "./rust-source-policy.mjs";
 import { createHash } from "node:crypto";
 import { Schema } from "effect";
+import { runtimeEvidenceSchema } from "../services/ci-inspector/src/runtime-evidence.ts";
 import { findingKey, proposalSchema, sha256, REVIEW_REPOSITORY } from "./ai-review-publication.mjs";
 
 const text = (limit) => Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(limit));
@@ -21,7 +22,9 @@ const inputSchema = Schema.Struct({
     repository: Schema.Literal(REVIEW_REPOSITORY),
     sha: sha40,
     branch: Schema.Literal("main"),
-    changedPaths: Schema.Array(text(300)).check(Schema.isMinLength(1), Schema.isMaxLength(30)),
+    changedPaths: Schema.Array(text(300)).check(Schema.isMaxLength(30)),
+    auditPaths: Schema.optional(Schema.Array(text(300)).check(Schema.isMinLength(1), Schema.isMaxLength(12))),
+    runtimeEvidence: Schema.optional(Schema.Array(Schema.Unknown).check(Schema.isMinLength(1), Schema.isMaxLength(3))),
     diff: Schema.String.check(Schema.isMaxLength(64000)),
     sourceFiles: Schema.Array(sourceFile).check(Schema.isMinLength(1), Schema.isMaxLength(12)),
     ciFailures: Schema.Array(
@@ -93,6 +96,18 @@ export function adaptReviewCandidate({
 }) {
     const input = parse(inputSchema, rawInput);
     const review = parse(reviewSchema, rawReview);
+    for (const evidence of input.runtimeEvidence ?? []) runtimeEvidenceSchema.parse(evidence);
+
+    const paths = input.sourceFiles.map((file) => file.path);
+    if (input.auditPaths) {
+        if (input.changedPaths.length || input.diff !== "" ||
+            new Set(input.auditPaths).size !== input.auditPaths.length ||
+            input.auditPaths.length !== paths.length ||
+            input.auditPaths.some((file) => !paths.includes(file)))
+            throw new Error("Audit paths must exactly match supplied source without changes.");
+    } else if (!input.changedPaths.length) {
+        throw new Error("Changed paths are required outside a source audit.");
+    }
 
     if (
         !Number.isSafeInteger(candidateIndex) ||
@@ -123,8 +138,9 @@ export function adaptReviewCandidate({
 
     const candidate = review.candidates[candidateIndex];
 
-    if (!candidate.evidence.some((item) => input.changedPaths.includes(item.path)))
-        throw new Error("Finding must cite changed source.");
+    const reviewPaths = input.auditPaths ?? input.changedPaths;
+    if (!candidate.evidence.some((item) => reviewPaths.includes(item.path)))
+        throw new Error("Finding must cite changed or audited source.");
 
     for (const evidence of candidate.evidence) {
         const file = original.get(evidence.path);
@@ -175,7 +191,7 @@ export function adaptReviewCandidate({
         );
     }
 
-    const anchor = candidate.evidence.find((item) => input.changedPaths.includes(item.path));
+    const anchor = candidate.evidence.find((item) => reviewPaths.includes(item.path));
 
     const finding = {
         title: candidate.title,
@@ -229,7 +245,7 @@ export function adaptReviewCandidate({
     return { proposal, regression: { path: testPath, testName: modelTest.expectedTestName } };
 }
 
-export async function collectCandidateSources({ github, sha, paths }) {
+export async function collectCandidateSources({ github, sha, paths, onHeld }) {
     parse(sha40, sha);
     parse(Schema.Array(text(300)).check(Schema.isMinLength(1), Schema.isMaxLength(16)), paths);
     const prefix = `/repos/${REVIEW_REPOSITORY}`;
@@ -246,6 +262,14 @@ export async function collectCandidateSources({ github, sha, paths }) {
 
         if (!entry) continue;
 
+        if (onHeld && (entry.mode !== "100644" || entry.type !== "blob")) {
+            onHeld(path, "nonregular-source");
+            continue;
+        }
+        if (onHeld && Number.isSafeInteger(entry.size) && entry.size > 24000) {
+            onHeld(path, "source-byte-budget-exceeded");
+            continue;
+        }
         if (entry.mode !== "100644" || entry.type !== "blob")
             throw new Error("Review source must be a regular blob.");
         parse(sha40, entry.sha);
@@ -256,9 +280,19 @@ export async function collectCandidateSources({ github, sha, paths }) {
             { encoding: blob.encoding, content: blob.content },
         );
 
-        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(
-            Buffer.from(content.content, "base64"),
-        );
+        const bytes = Buffer.from(content.content, "base64");
+        if (onHeld && (bytes.length > 24000 || bytes.includes(0))) {
+            onHeld(path, bytes.length > 24000 ? "source-byte-budget-exceeded" : "binary-source");
+            continue;
+        }
+        let decoded;
+        try {
+            decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        } catch (error) {
+            if (!onHeld || !(error instanceof TypeError)) throw error;
+            onHeld(path, "invalid-utf8-source");
+            continue;
+        }
 
         if (gitBlobSha(decoded) !== entry.sha)
             throw new Error("Git blob bytes do not match their identity.");

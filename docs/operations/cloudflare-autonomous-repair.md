@@ -1,0 +1,49 @@
+# OMG cloud repair operation
+
+This document describes the repair paths added after the original Cloudflare CI adaptation. Source implementation, deployed configuration, and end-to-end acceptance are separate gates. An installed GitHub App or a passing unit suite does not establish a working unattended repair.
+
+## Cloud model and required skills
+
+Cloud inference uses Workers AI model `@cf/deepseek-ai/deepseek-v4.1-flash-1017`. The coding harness selects high reasoning. Local Codex model settings do not configure Cloudflare. The model is documented in the [Workers AI catalog](https://developers.cloudflare.com/workers-ai/models/deepseek-v4.1-flash-1017/).
+
+The pinned coding bundle includes Potato Mode, Ponytail, Rust best practices, Rust async patterns, and TDD. Bundle validation checks every source file hash. Mandatory guidance is delivered again when OpenCode generates or compacts context. A changed bundle requires a coder deployment and matching trusted bundle pin before a new operation starts.
+
+## Source review and runtime leads
+
+The weekly source review inventories one immutable main tree. Bounded pages distinguish source supplied to the model, source actually read, and files held for an unsupported type or size. A continuation uses the previous private review record and the same tree identity. If main advances, the old snapshot is incomplete; it is not credited as a complete review of the new tree.
+
+GitHub's default concurrency queue retains only one pending run and replaces it when another arrives. Weekly continuation and runtime polling must not silently replace each other. GitHub documents `queue: max` for up to 100 pending runs with cancellation disabled. Queue capacity remains finite. See [workflow concurrency](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
+
+Runtime polling first checks the private Sentry queue. An empty queue starts no native checks or inference. Sentry evidence identifies the observed release separately from the current source snapshot. An older or unknown event source SHA is a historical lead, not proof of a current defect.
+
+A runtime incident reserves its review owner before source inspection. If publication fails after verification, later polling replays the original durable result and proof identities. It cannot replace that work with a new no-findings result. A claim without a durable record can be recovered only after a definite record-not-found response and independent confirmation that the exact original GitHub attempt completed. Round-robin polling preserves stale unresolved work without blocking later incidents.
+
+Runtime evidence contains identifiers, release attribution, and bounded owned Rust stack frames. It excludes raw request bodies, user messages, breadcrumbs, credentials, and arbitrary fetch URLs. A source path missing from current main is recorded as held. Runtime evidence remains separate from CI failures and cannot substitute for a regression that fails at its intended assertion.
+
+The public `POST /sentry/events` endpoint accepts only a correctly signed event from the configured Sentry project. It verifies the HMAC against the original bounded body before parsing. Private evidence reads and acknowledgments require the existing verifier credential. An acknowledgment must name an existing durable review record containing the same event ID and body hash. The final coordinator acknowledges an event after publication succeeds or the durable review requires no publication. Duplicate delivery does not authorize duplicate repair work. See [Sentry webhook verification](https://docs.sentry.io/integrations/integration-platform/webhooks/) and [Workers Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/).
+
+Sentry configuration uses `SENTRY_ORG_SLUG`, `SENTRY_PROJECT_SLUG`, `SENTRY_PROJECT_ID`, `SENTRY_ENVIRONMENT`, and secret `SENTRY_WEBHOOK_SECRET` on the OMG verifier Worker. Missing configuration disables public intake. The existing `OMG_SMOKE_SENTRY_DSN` belongs to smoke reporting and is not repurposed for application errors.
+
+## Publication and independent approval
+
+The publisher uses the dedicated `omg-ci-publisher` App, installed only on `omg-cli/omg`. Its short-lived token has Contents, Issues, and Pull requests write permissions. Only the trusted publisher receives that token. OpenCode receives no GitHub write credential. The official token action revokes the token in its post-job step. See [GitHub App workflow authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow).
+
+Independent approval uses a different GitHub identity. It refetches the original private publication record, validates raw verifier objects and the entire published Git tree, and requires successful checks for the exact PR head. It admits QEMU artifacts through the existing inventory and source checks. It then requests an explicit patch verdict from a fresh DeepSeek review and binds the verdict to the base, head, tree, proposal, and complete patch. An insufficient-evidence verdict cannot become an approval. GitHub does not permit an author to approve its own PR. See [PR review rules](https://docs.github.com/en/pull-requests/how-tos/review-pull-requests/reviewing-proposed-changes-in-a-pull-request).
+
+Approval targets an exact commit and does not merge or release it. Existing native, coverage, QEMU, assertion, and lint gates remain required. A new source-review finding is unconfirmed until the separate verifier admits its reproduction and repair.
+
+Publication retries at most three times within the same job, preserving its run attempt and idempotent issue/PR identities. Runtime polling can recover an unfinished canonical publication. A weekly page that exhausts publication retries stops; use **Re-run all jobs** for that run. **Re-run failed jobs** alone increments the attempt without recreating its successful earlier review record. This is an availability limit, not authorization to bypass a proof check.
+
+The native SDK currently initializes only in the opt-in `omgd` daemon. Release builds default to Sentry environment `production`; debug builds default to `development` unless `SENTRY_ENVIRONMENT` is set. The intake allows the configured production environment. General CLI error capture and exact commit tagging need separate native implementation and verification. Do not claim those paths from a webhook fixture. See the [Rust SDK environment defaults](https://github.com/getsentry/sentry-rust/blob/0.49.0/sentry/src/defaults.rs).
+
+## Activation evidence
+
+Before enabling unattended operation, retain all of the following evidence:
+
+1. The actual merged main commit containing the registered workflows and all three services. GitHub requires a dispatch workflow on the default branch. See [workflow event requirements](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
+2. Worker version IDs, immutable controller, image manifest, embedded verifier revision, and skill bundle hash. Keep Worker and container revisions distinct.
+3. A complete hosted deterministic run with its expected check inventory and independently verified report and log hashes.
+4. A real OpenCode-generated repair, intended baseline assertion failure, patched success, App-authored fix PR, and independent exact-head approval after native and QEMU checks.
+5. A signed application event accepted by the configured Sentry project, durable private queue receipt, review record, and successful acknowledgment. A synthetic webhook test proves only the handler unless the actual hosted path is also exercised.
+
+CodeLoud resources, credentials, source, and deployments remain independent. Startup credit coverage and any unconfirmed billable SKU are tracked in [the billing evidence](cloudflare-startup-credit-coverage.md).

@@ -13,6 +13,26 @@ on:
         description: Publish unconfirmed findings with verified fix PRs for human review
         type: boolean
         default: false
+      scope:
+        description: Review current changes, one immutable source audit page, or pending runtime evidence
+        type: choice
+        options: [changes, source-audit, runtime-events]
+        default: changes
+      audit_sha:
+        description: Exact commit for a resumed source audit
+        type: string
+      audit_digest:
+        description: Immutable Git tree inventory digest for a resumed audit
+        type: string
+      audit_cursor:
+        description: Next bounded source audit page cursor
+        type: string
+      audit_parent:
+        description: Prior durable audit run and attempt
+        type: string
+  schedule:
+    - cron: '23 6 * * 1'
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: read
@@ -20,6 +40,7 @@ permissions:
 concurrency:
   group: omg-ai-review-global
   cancel-in-progress: false
+  queue: max
 
 env:
   WRANGLER_SEND_METRICS: "false"
@@ -29,14 +50,17 @@ jobs:
   review:
     if: >-
       github.repository == 'omg-cli/omg' &&
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.branch == 'main' && github.ref_name == 'main'
+      github.ref_name == 'main' &&
+      (github.event_name == 'schedule' ||
+       (github.event_name == 'workflow_dispatch' && github.event.inputs.branch == 'main'))
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     outputs:
       controller-sha: ${{ steps.review.outputs.controller-sha }}
       publish: ${{ steps.review.outputs.publish }}
       verified: ${{ steps.review.outputs.verified }}
+      audit-next: ${{ steps.review.outputs.audit-next }}
+      runtime-ack: ${{ steps.review.outputs.runtime-ack }}
     steps:
       - name: Validate immutable review controller
         env:
@@ -116,13 +140,11 @@ jobs:
 
   publish:
     needs: review
-    if: github.event_name == 'workflow_dispatch' && needs.review.result == 'success' && needs.review.outputs.verified != '0'
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && needs.review.result == 'success' && needs.review.outputs.verified != '0'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+      contents: read
       actions: read
     env:
       OMG_CI_PUBLISHER_LOGIN: ${{ vars.OMG_CI_PUBLISHER_LOGIN }}
@@ -192,24 +214,108 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: bun scripts/ai-review-flow.mjs publish .audit/ai-review
-      - name: Require explicit GitHub publication credentials policy
+      - name: Require dedicated OMG GitHub App configuration
         if: needs.review.outputs.publish == 'true'
         env:
-          PUBLISHER_TOKEN: ${{ secrets.OMG_CI_PUBLISHER_TOKEN }}
-          TOKEN_PR_CREATION_ENABLED: ${{ vars.OMG_CI_GITHUB_TOKEN_PR_CREATION_ENABLED }}
+          APP_CLIENT_ID: ${{ vars.OMG_CI_PUBLISHER_APP_CLIENT_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.OMG_CI_PUBLISHER_APP_PRIVATE_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "$PUBLISHER_TOKEN" ] && [ "$TOKEN_PR_CREATION_ENABLED" != true ]; then
-            echo 'Publication blocked: configure a dedicated OMG publisher token or explicitly enable GitHub Actions PR creation and its required approval policy.' >&2
-            exit 1
-          fi
+          test -n "$APP_CLIENT_ID"
+          test -n "$APP_PRIVATE_KEY"
+          [[ "$OMG_CI_PUBLISHER_LOGIN" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]
+          [[ "$OMG_CI_PUBLISHER_ID" =~ ^[1-9][0-9]*$ ]]
+      - name: Mint repository-scoped OMG publisher token
+        if: needs.review.outputs.publish == 'true'
+        id: publisher-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          client-id: ${{ vars.OMG_CI_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.OMG_CI_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: omg-cli
+          repositories: omg
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
       - name: Re-fetch server proof and publish issues with verified fix PRs
         if: needs.review.outputs.publish == 'true'
         env:
-          GH_TOKEN: ${{ secrets.OMG_CI_PUBLISHER_TOKEN || github.token }}
-        run: bun scripts/ai-review-flow.mjs publish .audit/ai-review --publish
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if bun scripts/ai-review-flow.mjs publish .audit/ai-review --publish; then exit 0; fi
+            if [ "$attempt" -lt 3 ]; then sleep 10; fi
+          done
+          exit 1
       - name: Remove private OMG service configuration
         if: always()
         shell: bash
         run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json"
+
+  continue:
+    needs: [review, publish]
+    if: >-
+      always() && needs.review.result == 'success' &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
+      (needs.review.outputs.audit-next == 'true' || needs.review.outputs.runtime-ack == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.review.outputs.controller-sha }}
+          persist-credentials: false
+      - name: Verify trusted controller Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          mkdir -m 700 -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          directory="$tools/bun-linux-x64"
+          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - name: Create private review record configuration
+        env:
+          OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
+          OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
+          OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+        run: |
+          bun run - <<'JS'
+          import { mkdirSync, writeFileSync } from "node:fs";
+          import { homedir } from "node:os";
+          import path from "node:path";
+          const root = path.join(homedir(), "ci");
+          const { OMG_CI_API_TOKEN: token, OMG_CI_IMAGE_DIGEST: imageDigest, OMG_CI_VERIFIER_REVISION: verifierRevision } = process.env;
+          if (!/^[^\s]{32,512}$/.test(token ?? "")) throw new Error("Missing dedicated OMG credential");
+          mkdirSync(root, { mode: 0o700 });
+          const tokenFile = path.join(root, "omg-cloud-ci.token");
+          writeFileSync(tokenFile, token, { mode: 0o600, flag: "wx" });
+          writeFileSync(path.join(root, "omg-cloud-ci.json"), JSON.stringify({
+            endpoint: "https://omg-cloud-ci.latham.workers.dev/", tokenFile, imageDigest, verifierRevision,
+          }), { mode: 0o600, flag: "wx" });
+          JS
+      - name: Install trusted controller dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install trusted review schema dependencies
+        run: bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+      - name: Install trusted coding schema dependencies
+        run: bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
+      - name: Continue exact source audit after durable review and publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_RESULT: ${{ needs.publish.result }}
+        run: bun scripts/ai-review-flow.mjs continue .audit/ai-review
+      - name: Remove private review record configuration
+        if: always()
+        shell: bash
+        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json"

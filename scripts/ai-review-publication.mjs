@@ -272,7 +272,7 @@ export function publicationBodies({ proposal, receipt, evidenceDigest }) {
 
     const evidence = [
         marker,
-        "Unconfirmed AI finding. Generated test semantics and the proposed fix require human review.",
+        "Unconfirmed AI finding. Generated test semantics and the proposed fix require independent review.",
         "Model-reported impact (unconfirmed):",
         item.summary,
         `Source: ${sourceUrl}`,
@@ -291,8 +291,8 @@ export function publicationBodies({ proposal, receipt, evidenceDigest }) {
         `Patched report SHA-256: ${receipt.patched.reportSha256}`,
         `Proposal SHA-256: ${receipt.proposalSha256}`,
         `Receipt SHA-256: ${evidenceDigest}`,
-        "Hashes identify captured bytes; they do not confirm the reported bug or authenticate the generated test's meaning. Human review must confirm that the assertion exercises the intended behavior and that the proposed change fixes it.",
-        "Human approval is required. No automatic merge or deployment. Windows/native acceptance remains unproven.",
+        "Hashes identify captured bytes; they do not confirm the reported bug or authenticate the generated test's meaning. Independent review must confirm that the assertion exercises the intended behavior and that the proposed change fixes it.",
+        "Independent approval is required before merge. No automatic merge or deployment. Windows/native acceptance remains unproven.",
         ...receipt.portableChecks.map(
             (check) =>
                 `${check.name}: exit ${check.exitCode}; report SHA-256 ${check.reportSha256}`,

@@ -4,13 +4,15 @@
     "pstack": "0.15.2+codex.20260922221615",
     "ponytail": "5.3.2",
     "rust": "1.1.2",
-    "tdd": "6.4.2"
+    "tdd": "6.4.2",
+    "rust-async": "156b7a5e7a8b93642628a339ee4039c925b34c7f"
   },
   "required": [
     "pstack/skills/poteto-mode/SKILL.md",
     "ponytail/skills/ponytail/SKILL.md",
     "workerd/ADAPTER.md",
     "rust/SKILL.md",
+    "rust-async/SKILL.md",
     "tdd/SKILL.md"
   ],
   "files": {
@@ -723,7 +725,17 @@
       "sha256": "a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400",
       "bytes": 1070,
       "source": "superpowers@6.4.2/LICENSE#sha256=a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400"
+    },
+    "rust-async/SKILL.md": {
+      "sha256": "8e9a951c21bb1ee671dd2e7391b193e8e3d362b95ef29c470915837d73bf87df",
+      "bytes": 2679,
+      "source": "wshobson/agents@156b7a5e7a8b93642628a339ee4039c925b34c7f/plugins/systems-programming/skills/rust-async-patterns/SKILL.md#sha256=8e9a951c21bb1ee671dd2e7391b193e8e3d362b95ef29c470915837d73bf87df"
+    },
+    "rust-async/references/details.md": {
+      "sha256": "cd8a987c59cf704b7a2145e0dea6891b10194e7304b894bd14a5692d9fdfa76d",
+      "bytes": 9904,
+      "source": "wshobson/agents@156b7a5e7a8b93642628a339ee4039c925b34c7f/plugins/systems-programming/skills/rust-async-patterns/references/details.md#sha256=cd8a987c59cf704b7a2145e0dea6891b10194e7304b894bd14a5692d9fdfa76d"
     }
   },
-  "bundleSha256": "69369a422ef797ac7972192b922581b8290bd6e84b4fec67a1d98f1c1e7a8be6"
+  "bundleSha256": "70e815c270587051e08a86641f2b7a5baafe0e689b1277aadcaa128368c8fc15"
 }
