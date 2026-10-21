@@ -55,6 +55,21 @@ export function diagnosticFailureMetadata(
   };
 }
 
+export function diagnosticNeedsReport(text: string | null | undefined): boolean {
+  if (!text?.trim()) return true;
+  let report: unknown;
+  try {
+    report = JSON.parse(text);
+  } catch {
+    return true;
+  }
+  if (typeof report !== "object" || report === null || Array.isArray(report)) return true;
+  const candidate = report as Record<string, unknown>;
+  return !Array.isArray(candidate.findings)
+    || !Array.isArray(candidate.edits)
+    || !Array.isArray(candidate.tests);
+}
+
 export const RATE_LIMIT_RETRY_DELAY_MS = 60_000;
 
 export type SessionRetryEvent = {

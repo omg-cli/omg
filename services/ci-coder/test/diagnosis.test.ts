@@ -84,7 +84,7 @@ test("cloud diagnosis reads evidence but cannot propose, verify or export a repa
     await assert.rejects(actions.export_proposal.execute({proposalSha256: "d".repeat(64)}, context), /read-only diagnosis/);
     assert.equal(state.verificationJob, undefined);
 });
-import { diagnosticFailureMetadata } from "../src/runtime";
+import { diagnosticFailureMetadata, diagnosticNeedsReport } from "../src/runtime";
 
 test("diagnostic failure metadata exposes bounded errors without transcripts or credentials", () => {
   const secret = "private-token";
@@ -92,4 +92,16 @@ test("diagnostic failure metadata exposes bounded errors without transcripts or 
     finish: "error", error: {type: "ProviderError", status: 429, message: "Bearer [REDACTED] [REDACTED]"},
   });
   assert.equal(diagnosticFailureMetadata({error: {type: "Error", message: "x".repeat(4000)}}, []).error?.message?.length, 2000);
+});
+
+test("diagnostic continuation rejects non-report done text", () => {
+  const valid = '{"findings":[],"edits":[],"tests":[]}';
+  const sp = String.fromCharCode(32), nl = String.fromCharCode(10), tab = String.fromCharCode(9);
+  const needs = diagnosticNeedsReport;
+  assert.equal(needs(valid), false);
+  assert.equal(needs(sp + nl + valid + nl + sp), false);
+  assert.equal(needs(undefined), true);
+  assert.equal(needs(null), true);
+  const invalid = ["", sp + nl + tab, nl, "I hit the step limit before I could produce the final answer; draft Python script was not emitted.", "not json", "null", "[]", String.fromCharCode(34) + "text" + String.fromCharCode(34), "42", "{}", '{"findings":[],"edits":[]}', '{"findings":{},"edits":[],"tests":[]}'];
+  for (const text of invalid) assert.equal(needs(text), true, text);
 });

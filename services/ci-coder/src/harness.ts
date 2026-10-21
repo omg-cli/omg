@@ -21,6 +21,7 @@ import {
   parseRuntimeIdentity,
   retryDecision,
   diagnosticFailureMetadata,
+  diagnosticNeedsReport,
 } from "./runtime.js";
 
 export class Coder extends DurableObject<Env> {
@@ -169,7 +170,7 @@ export class Coder extends DurableObject<Env> {
           .slice(-8).map(message => diagnosticFailureMetadata(message, [this.env.CI_API_TOKEN]))
       : undefined;
     let outcome = initialOutcome;
-    if (request.diagnosisTask && ((initialOutcome.status === "done" && !initialOutcome.text) ||
+    if (request.diagnosisTask && ((initialOutcome.status === "done" && diagnosticNeedsReport(initialOutcome.text)) ||
         (initialOutcome.status === "unanswered" && (initialOutcome.reason?.includes("inference request per min rate reached") ||
           failureMetadata?.some(message => message.error?.type === "output-limit"))))) {
       await this.ctx.storage.put("diagnosis-reporting", true);
