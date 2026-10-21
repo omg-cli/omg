@@ -11,7 +11,7 @@ function owned(value,kind){if(mode==='plain-process')return value;let disposed=f
 const sandbox={
  async exec(command){return {exitCode:0,stdout:'preview',stderr:''};},
  async startProcess(){starts++;return owned({id:'fixture-process',waitForExit:async()=>{streamCalls++;if(mode==='exit-stream-disposed')throw new Error('WritableStream RPC stub was disposed without calling close()');return {exitCode:0};}},'start');},
- async getProcess(id){assert.equal(id,'fixture-process');polls++;if(mode==='process-read-failure')throw new Error('fixture status RPC failed');if(mode==='process-read-hang')return new Promise(()=>{});if(mode==='process-missing')return null;
+ async getProcess(id){assert.equal(id,'fixture-process');polls++;if(mode==='process-read-failure')throw new Error('fixture status RPC failed');if(mode==='process-read-hang')return new Promise(()=>{});if(mode==='process-missing'||(mode==='process-transient-missing'&&polls===1))return null;
  const result=mode==='process-timeout'?{id,status:'running'}:mode==='process-nonzero'?{id,status:'failed',exitCode:7}:mode==='process-signal'?{id,status:'killed',exitCode:null}:mode==='process-invalid-zero'?{id,status:'failed',exitCode:0}:mode==='process-unknown'?{id,status:'unknown'}:mode==='process-identity'?{id:'other-process',status:'completed',exitCode:0}:mode==='exit-stream-disposed'&&polls===1?{id,status:'running'}:{id,status:'completed',exitCode:0};
  if(mode==='process-read-late')await new Promise(resolve=>setTimeout(resolve,30));
  resolvedPolls++;return owned(result,'poll');},
@@ -48,7 +48,7 @@ let checkpoint;
 class Fixture extends CIWorkflow{
  static getProvider(){return provider;}
  async pipeline(event,step,ci){
-   const output=await ci.runner({name:'large-unit-output',command:'trusted fixture',config:{commandTimeoutMs:mode==='process-timeout'||mode==='process-read-hang'||mode==='process-read-late'?5:10000}});
+   const output=await ci.runner({name:'large-unit-output',command:'trusted fixture',config:{commandTimeoutMs:mode==='process-timeout'||mode==='process-read-hang'||mode==='process-read-late'||mode==='process-missing'?5:10000}});
    assert.equal(output.snapshot.id,'actual-snapshot');
    for(const log of [output.logs.stdout,output.logs.stderr]){
      if(mode==='inline')assert.equal(log,'small');
@@ -72,9 +72,9 @@ if(mode==='process-read-late')await new Promise(resolve=>setTimeout(resolve,50))
 assert.equal(starts,1,'a status wait must never restart the command');
 assert.equal(startDisposals,mode==='plain-process'?0:1,'start result capabilities must be released');
 assert.equal(pollDisposals,mode==='plain-process'?0:resolvedPolls,'every resolved poll result must release its capabilities, including after timeout');
-if(mode==='ok'||mode==='inline'||mode==='exit-stream-disposed'||mode==='plain-process'){
+if(mode==='ok'||mode==='inline'||mode==='exit-stream-disposed'||mode==='plain-process'||mode==='process-transient-missing'){
  assert.equal(failure,undefined,failure?.stack);
- if(mode==='exit-stream-disposed'){assert.equal(streamCalls,0);assert.equal(polls,2);}
+ if(mode==='exit-stream-disposed'||mode==='process-transient-missing'){assert.equal(streamCalls,0);assert.equal(polls,2);}
  assert.equal(objects.size,mode==='inline'?0:2);assert.equal(destroyed,true);
  assert.ok(events.indexOf('destroy')<events.indexOf('checkpoint'));
  for(const value of objects.values())assert.deepEqual(value,bytes);
@@ -86,10 +86,9 @@ if(mode==='ok'||mode==='inline'||mode==='exit-stream-disposed'||mode==='plain-pr
  if(mode==='write-failure'||mode==='partial-write-failure')assert.match(failure.message,/write failed/i);
  if(mode==='partial-write-failure')assert.equal(objects.size,1);
  if(mode==='read-failure')assert.match(failure.message,/read failed/i);
- if(mode==='process-missing')assert.equal(failure.message,'large-unit-output failed: CI process identity unavailable (expected string, received missing)');
  if(mode==='process-identity')assert.equal(failure.message,'large-unit-output failed: CI process identity unavailable (expected string, received string)');
  if(mode==='process-read-failure')assert.match(failure.message,/status RPC failed/i);
- if(mode==='process-timeout'||mode==='process-read-hang'||mode==='process-read-late')assert.match(failure.message,/timed out/i);
+ if(mode==='process-timeout'||mode==='process-read-hang'||mode==='process-read-late'||mode==='process-missing')assert.match(failure.message,/timed out/i);
  if(mode.startsWith('process-'))assert.equal(objects.size,0,'unconfirmed completion must not publish logs or a snapshot');
 }
 return Response.json({mode,destroyed,objects:objects.size,events});
@@ -107,6 +106,7 @@ for (const modes of [
   ],
   ["exit-stream-disposed", "process-nonzero", "process-signal", "process-invalid-zero"],
   [
+    "process-transient-missing",
     "process-missing",
     "process-read-failure",
     "process-read-hang",
