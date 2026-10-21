@@ -23,6 +23,26 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_function_report_is_isolated_and_requires_nonempty_output(self):
+        script = step_script('coverage.yml', 'Generate function coverage evidence')
+        exporter = """
+        cargo() {
+            test "$*" = 'llvm-cov report' || return 99
+            test "$REPORT_STATUS" = 0 || return "$REPORT_STATUS"
+            test "$SILENT" = 1 || printf '%s' 'audit.rs functions'
+        }
+        """
+        for status, silent, expected in ((0, '0', 0), (23, '0', 23), (1, '0', 1), (0, '1', 1)):
+            with self.subTest(report_status=status, silent=silent), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run(
+                    [BASH, '-e', '-c', textwrap.dedent(exporter) + script], cwd=directory,
+                    env=dict(os.environ, REPORT_STATUS=str(status), SILENT=silent),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if expected == 0:
+                    self.assertEqual((Path(directory) / 'coverage-functions.txt').read_text().strip(), 'audit.rs functions')
+
     def test_coverage_region_evidence_preserves_export_and_failure(self):
         script = step_script('coverage.yml', 'Generate region evidence')
         for export_status in (0, 23):
