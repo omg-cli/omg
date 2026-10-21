@@ -15,13 +15,18 @@ test("dependency workflow excludes non-main dispatch and untrusted audit events 
     const github = {
         repository: "omg-cli/omg",
         ref_name: "main",
+        ref: "refs/heads/main",
         event_name: "workflow_dispatch",
         event: {},
     };
     assert.equal(allowed(github, { task: "dependencies" }), true);
     assert.equal(
         allowed(
-            { ...github, ref_name: "untrusted-branch" },
+            {
+                ...github,
+                ref_name: "untrusted-branch",
+                ref: "refs/heads/untrusted-branch",
+            },
             { task: "dependencies" },
         ),
         false,
@@ -34,6 +39,10 @@ test("dependency workflow excludes non-main dispatch and untrusted audit events 
         false,
     );
     assert.equal(allowed(github, { task: "portable" }), false);
+    assert.equal(
+        allowed({ ...github, ref: "refs/tags/main" }, { task: "dependencies" }),
+        false,
+    );
     const run = {
         conclusion: "failure",
         event: "push",
