@@ -49,7 +49,7 @@ jobs:
   mutation:
     name: Mutation shard (${{ matrix.shard }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: ${{ (github.event_name == 'workflow_dispatch' && inputs.baseline-only == true) && 45 || 120 }}
     env:
       # Two mutation workers must not each inherit build.jobs=5.
       # https://doc.rust-lang.org/cargo/reference/config.html#buildjobs
@@ -64,6 +64,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Install Rust toolchain
@@ -96,11 +97,39 @@ jobs:
       - name: Install shell contract dependencies
         run: |
           sudo apt-get update --error-on=any
-          sudo apt-get install -y --no-install-recommends zsh fish python3-venv
+          sudo apt-get install -y --no-install-recommends zsh fish python3-venv strace
+
+      - name: Bind diagnostic source
+        if: github.event_name == 'workflow_dispatch' && inputs.baseline-only == true
+        run: |
+          mkdir -p diagnostic
+          git rev-parse HEAD | tee diagnostic/source-sha.txt
+          git diff --exit-code 510b20f8dd7069df4376e5322c535ac69b8fac5d HEAD -- . ':(exclude).github/workflows/mutation.yml'
+          printf '%s\n' '510b20f8dd7069df4376e5322c535ac69b8fac5d' > diagnostic/baseline-source-sha.txt
+
+      - name: Compile unchanged portable baseline before tracing
+        if: github.event_name == 'workflow_dispatch' && inputs.baseline-only == true
+        run: cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast --no-run
 
       - name: Validate portable mutation baseline
-        if: github.event_name == 'pull_request' || inputs.baseline-only == true
-        run: cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast
+        if: (github.event_name == 'pull_request' || inputs.baseline-only == true) && success()
+        timeout-minutes: 40
+        run: |
+          mkdir -p diagnostic
+          set +e
+          RUST_BACKTRACE=1 strace -ff -tt -yy -e trace=flock,clone,clone3,execve,close -o diagnostic/strace cargo test --package omg --no-default-features --features pgp,license --locked --no-fail-fast 2>&1 | tee diagnostic/baseline.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "$status"
+
+      - name: Upload diagnostic baseline evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.baseline-only == true
+        with:
+          name: baseline-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diagnostic/
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Install cargo-mutants
         if: github.event_name != 'pull_request' && inputs.baseline-only != true
