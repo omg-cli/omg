@@ -35,6 +35,8 @@ The probe reads actual Git objects and checks durable runtime identity, skill de
 
 Publication separately re-fetches the coding result, Cloudflare verifier receipt, original Git objects and hashed evidence. Only an exact verified repair can produce a regular PR. Merging, approval, deployment and releases remain human-controlled. The existing OMG native/QEMU gates remain required.
 
+An authenticated operation with `diagnosisTask: true` reads an immutable audit snapshot and actual failure logs, then returns the OpenCode final answer as `diagnosis`. It cannot propose, verify or export a repair, and cannot be combined with a coding task. This makes runner failures observable without treating a model's suggested edits as verified code. It uses the existing [OpenCode operation result](https://developers.cloudflare.com/agents/harnesses/opencode/) and unchanged skill, model and source-read gates.
+
 See the [adaptation research](../../docs/operations/cloudflare-ci-adaptation-research.md) and [activation questions](../../docs/operations/cloudflare-ci-research-open-questions.md) for the handoff basis and limits.
 
 ## Reuse in another repository

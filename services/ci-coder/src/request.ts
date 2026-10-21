@@ -32,6 +32,7 @@ export const codingRequestSchema = z
     source: z.union([sourceReviewInputSchema,auditSourceSchema]),
     testAuditTask: testAuditTaskSchema.optional(),
     dependencyTask: dependencyTaskSchema.optional(),
+    diagnosisTask: z.literal(true).optional(),
     hypothesis: sourceReviewProposalSchema.optional(),
     candidateIndex: z.number().int().min(0).max(2).optional(),
   })
@@ -43,6 +44,8 @@ export const codingRequestSchema = z
     "Source identity mismatch",
   )
   .superRefine((request, context) => {
+    if (request.diagnosisTask && (request.testAuditTask || request.dependencyTask || request.hypothesis || request.candidateIndex !== undefined || !request.source.auditPaths))
+      context.addIssue({code: "custom", message: "Read-only diagnosis requires an immutable audit snapshot and no coding task"});
     if (!request.testAuditTask && !request.dependencyTask && !sourceReviewInputSchema.safeParse(request.source).success)
       context.addIssue({code:"custom",path:["source"],message:"Ordinary repair source exceeds its existing limits"});
     if(request.dependencyTask) {
@@ -114,6 +117,7 @@ export const operationIdentity = (request: CodingRequest) => {
         candidateIndex: request.candidateIndex ?? null,
         ...(request.testAuditTask ? {testAuditTask: request.testAuditTask} : {}),
         ...(request.dependencyTask ? {dependencyTask: request.dependencyTask} : {}),
+        ...(request.diagnosisTask ? {diagnosisTask: true} : {}),
       }),
     )
     .digest("hex");

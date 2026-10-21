@@ -212,9 +212,10 @@ export async function pollCodingVerification(
 }
 
 export function createCodingActions({ getRequest, env, skills, update }: ActionsOptions) {
-  async function enter(context: ToolContext) {
+  async function enter(context: ToolContext, mutation = false) {
     const delivery = skills.assertDelivered(context.sessionID);
     const request = await getRequest();
+    if (mutation && request.diagnosisTask) throw new Error("Operation is a read-only diagnosis");
     await update((state) => {
       if (state.calls >= 96) throw new Error("Coding tool budget exhausted");
 
@@ -325,7 +326,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       description:
         "Propose exactly one evidenced repair with exact unique replacements and one new regression test. Does not publish or execute code.",
       async execute(input: z.infer<typeof sourceReviewProposalSchema>, context: ToolContext) {
-        const request = await enter(context);
+        const request = await enter(context, true);
         if (request.testAuditTask) throw new Error("Use the separate existing-test audit tools");
         if(request.dependencyTask) throw new Error("Use the separate dependency planning tool");
         const { repository, sha, branch, runId, attempt, source } = request;
@@ -365,12 +366,12 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         });
       },
     },
-    propose_dependency_updates: createDependencyTool(enter, update),
+    propose_dependency_updates: createDependencyTool((context) => enter(context, true), update),
     propose_test_strengthening: {
       input: testAuditToolSchema,
       description: "Audit the selected test against an evidence-only source fault. For an adequate test use existing-test-sensitivity with unchanged bytes; strengthening inserts one assertion. Never publish the fault.",
       async execute(input: z.infer<typeof testAuditToolSchema>, context: ToolContext) {
-        const request = await enter(context);
+        const request = await enter(context, true);
         const testAudit = buildTestAuditProposal(request, input);
         await update((state) => {
           if (![testAudit.proposal.test.path,input.fault.path].every((path) => state.reads.some((read) => read.path === path)))
@@ -385,7 +386,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       description:
         "Run the exact proposed repair through independent Cloudflare CI and regression checks. Waits for actual terminal evidence.",
       async execute(input: z.infer<typeof hashInput>, context: ToolContext) {
-        const request = await enter(context);
+        const request = await enter(context, true);
 
         const state = await update((current) => {
           if (!(current.testAudit ?? current.proposal) || (current.testAudit ?? current.proposal)?.proposalSha256 !== input.proposalSha256)
@@ -450,7 +451,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       description:
         "Export a verified exact proposal with required skill provenance. Publishing still uses the separate trusted GitHub controller.",
       async execute(input: z.infer<typeof hashInput>, context: ToolContext) {
-        const request=await enter(context);
+        const request=await enter(context, true);
         const state = await update((current) => current);
 
         if (
