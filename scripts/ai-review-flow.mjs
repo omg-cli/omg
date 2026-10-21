@@ -330,7 +330,7 @@ export async function runReviewFlow({ target, io }) {
     }
     const sha = head;
     const precollected = ["audit", "runtime"].includes(target.range?.kind)
-        ? await io.collect(sha, branch, target.range) : undefined;
+        ? await io.collect(sha, branch, target.range, { reserve: target.publish === true }) : undefined;
     if (precollected?.replayRef) {
         try {
             return { ...admitRuntimeReplay({ original: precollected.replayReport, replayRef: precollected.replayRef,
@@ -366,6 +366,8 @@ export async function runReviewFlow({ target, io }) {
             baseSha: precollected?.baseSha ?? null,
             ...(precollected ? { sourceRange: precollected.sourceRange } : {}),
             status: "format-blocked",
+            ...(precollected?.runtimeEvents ? { runtimeEvents: precollected.runtimeEvents,
+                modelInferencePerformed: false, nativeVerificationPerformed: false } : {}),
             formatting,
             suppliedPaths: [],
             readPaths: [],
@@ -966,10 +968,10 @@ async function createController(github, controllerRevision) {
                 };
             }
         },
-        collect: async (sha, _branch, range) => {
+        collect: async (sha, _branch, range, options) => {
             if (range?.kind !== "runtime") return collectSources(github, sha, range);
             const collected = await collectRuntimeSources({ github, sha, directory: root, endpoint: config.endpoint, token,
-                request: fetchJson, reviewRef: { runId, attempt, sha, controllerRevision } });
+                request: fetchJson, reviewRef: { runId, attempt, sha, controllerRevision }, ...options });
             if (collected.replayRef) {
                 const { runId: originalRun, attempt: originalAttempt } = collected.replayRef;
                 if (!/^[1-9][0-9]{0,19}$/.test(originalRun ?? "") || !/^[1-9][0-9]{0,5}$/.test(originalAttempt ?? ""))

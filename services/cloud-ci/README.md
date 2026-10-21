@@ -48,7 +48,7 @@ Only the dependency phase is cached. Its key includes the image, trusted plan, s
 
 From this directory, run `bun install --frozen-lockfile --ignore-scripts`, `bun test`, `bun run check` and `bun run build`. Build is a Wrangler dry-run, not deployment. Image rebuilding requires the reviewed Docker/Sandbox toolchain. Resource creation, credentials, image rollout and hosted acceptance remain owner operations.
 
-No automatic approval, merge, release or product deployment is authorized by a verification receipt. The separate trusted publisher may create a regular fix PR for human review only after exact-source and independent proof admission.
+A verification receipt alone does not authorize approval, merge, release or product deployment. The separate trusted publisher creates a regular fix PR only after exact-source and independent proof admission. The [independent approval workflow](../../docs/operations/cloudflare-autonomous-repair.md#publication-and-independent-approval) requires a fresh patch verdict and successful native, coverage and QEMU evidence for the exact PR head. It does not merge or release the PR.
 
 ## Sentry runtime evidence
 

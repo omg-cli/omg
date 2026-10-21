@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import { createHash } from "node:crypto";
 import { runtimeServer } from "./fixtures/runtime-server.mjs";
 import { collectRuntimeSources } from "../../scripts/sentry-review-input.mjs";
+import { runReviewFlow } from "../../scripts/ai-review-flow.mjs";
 
 const sha = "a".repeat(40);
 const reviewRef = { runId: "123", attempt: "1", sha, controllerRevision: "e".repeat(40) };
@@ -65,6 +66,60 @@ test("actual signed intake, durable poll and helper reservation move past stale 
   expect(wrapped.replayRef).toEqual(activeReview);
   expect(server.objects.has(`sentry/events/789/${firstId}.json`)).toBe(true);
   expect(server.requests.some(({ path, method }) => path === "/sentry/poll" && method === "POST")).toBe(true);
+});
+
+test("runtime preview reads evidence without claiming work or moving the durable poll cursor", async () => {
+  const server = runtimeServer();
+  const eventId = "b".repeat(32);
+  await server.signedSend(eventPayload(eventId));
+  const preview = await collectRuntimeSources({ ...server, github: githubSource(), sha, reviewRef, reserve: false });
+  expect(preview.entries).toEqual([{ path: "src/value.rs", blobSha, content }]);
+  expect(JSON.parse(server.objects.get(`sentry/pending/789/${eventId}.json`))).not.toHaveProperty("activeReview");
+  expect(server.objects.has("sentry/poll-cursor.json")).toBe(false);
+  expect(server.requests.some(({ method }) => method === "POST")).toBe(false);
+  await runReviewFlow({ target: { branch: "main", sha, publish: false, range: { kind: "runtime" } }, io: {
+    head: async () => sha,
+    collect: (_sha, _branch, _range, options) => collectRuntimeSources({ ...server, github: githubSource(), sha, reviewRef, ...options }),
+    format: async () => ({ status: "blocked", reason: "formatting unavailable" }),
+  } });
+  expect(JSON.parse(server.objects.get(`sentry/pending/789/${eventId}.json`))).not.toHaveProperty("activeReview");
+  expect(server.objects.has("sentry/poll-cursor.json")).toBe(false);
+  const claimed = await collectRuntimeSources({ ...server, github: githubSource(), sha, reviewRef });
+  expect(claimed.runtimeEvents).toEqual(preview.runtimeEvents);
+});
+
+test("an exact completed pre-inference format block can be reclaimed without deleting its durable record", async () => {
+  const server = runtimeServer();
+  const eventId = "b".repeat(32);
+  await server.signedSend(eventPayload(eventId));
+  const blocked = await runReviewFlow({ target: { branch: "main", sha, publish: true, range: { kind: "runtime" } }, io: {
+    head: async () => sha,
+    collect: (_sha, _branch, _range, options) => collectRuntimeSources({ ...server, github: githubSource(), sha, reviewRef, ...options }),
+    format: async () => ({ status: "blocked", reason: "formatting unavailable" }),
+  } });
+  expect(blocked.runtimeEvents).toHaveLength(1);
+  expect(blocked.modelInferencePerformed).toBe(false);
+  blocked.controllerRevision = reviewRef.controllerRevision;
+  await server.request(new URL("/review-records/123-1", server.endpoint), server.token,
+    JSON.stringify({ repository: "omg-cli/omg", runId: "123", attempt: "1", report: blocked }));
+  const originalRecord = server.objects.get("reviews/123-1/review.json");
+  const source = githubSource();
+  let metadataCalls = 0;
+  const github = { request: (method, route) => {
+    if (route === "/repos/omg-cli/omg/actions/runs/123/attempts/1") {
+      metadataCalls++;
+      return Promise.resolve({ id: 123, run_attempt: 1, status: "completed", conclusion: "success",
+        repository: { full_name: "omg-cli/omg" }, path: ".github/workflows/ai-review.yml", head_branch: "main", head_sha: sha });
+    }
+    return source.request(method, route);
+  } };
+  const nextRef = { ...reviewRef, runId: "124" };
+  const recovered = await collectRuntimeSources({ ...server, github, sha, reviewRef: nextRef });
+  expect(metadataCalls).toBe(1);
+  expect(recovered.entries).toEqual([{ path: "src/value.rs", blobSha, content }]);
+  expect(JSON.parse(server.objects.get(`sentry/pending/789/${eventId}.json`)).activeReview).toEqual(nextRef);
+  expect(server.objects.get("reviews/123-1/review.json")).toBe(originalRecord);
+  expect(server.objects.has(`sentry/events/789/${eventId}.json`)).toBe(true);
 });
 
 test("a source-provider crash leaves a real reservation that another run cannot silently replace", async () => {

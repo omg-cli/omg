@@ -176,3 +176,34 @@ test("running or mismatched original attempts retain the reservation and provide
     await expect(collectRuntimeSources(unavailable)).rejects.toThrow("Provider outage");
     expect(unavailable.calls.some((call) => call.url.endsWith("/reserve"))).toBe(false);
 });
+
+test("format-block recovery requires explicit no-inference proof and the exact terminal original attempt", async () => {
+    const activeReview = { ...reviewRef, runId: "999" };
+    const report = { repository: "omg-cli/omg", branch: "main", sha,
+        controllerRevision: activeReview.controllerRevision, status: "format-blocked",
+        formatting: { status: "blocked" }, sourceRange: { intake: "sentry-runtime" }, publishRequested: true,
+        modelInferencePerformed: false, nativeVerificationPerformed: false,
+        publications: [], batches: [], candidateOutcomes: [], readPaths: [],
+        runtimeEvents: [{ projectId: event.projectId, eventId: event.eventId, bodySha256: event.bodySha256 }] };
+    for (const [change, attempt, expectedRecovery] of [
+        [{}, {}, true], [{}, { status: "in_progress" }, false], [{}, { run_attempt: 2 }, false],
+        [{ publications: [{ verified: true }] }, {}, false], [{ modelInferencePerformed: true }, {}, false],
+        [{ modelInferencePerformed: undefined }, {}, false], [{ nativeVerificationPerformed: true }, {}, false],
+        [{ batches: [{}] }, {}, false], [{ readPaths: ["src/value.rs"] }, {}, false],
+        [{ status: "reviewed" }, {}, false], [{ publishRequested: false }, {}, false],
+        [{ sha: "f".repeat(40) }, {}, false], [{ runtimeEvents: [{ ...report.runtimeEvents[0], bodySha256: "f".repeat(64) }] }, {}, false],
+    ]) {
+        const input = fixture([{ ...event, activeReview }]);
+        const originalRequest = input.request;
+        input.request = (url, ...args) => String(url).includes("/review-records/")
+            ? Promise.resolve({ ...report, ...change }) : originalRequest(url, ...args);
+        const originalGithub = input.github.request;
+        input.github.request = (method, route) => route.includes("/actions/runs/")
+            ? Promise.resolve({ id: 999, run_attempt: 1, status: "completed", head_sha: sha,
+                head_branch: "main", path: ".github/workflows/ai-review.yml", repository: { full_name: "omg-cli/omg" }, ...attempt })
+            : originalGithub(method, route);
+        const result = await collectRuntimeSources(input);
+        expect(Boolean(result.replayRef)).toBe(!expectedRecovery);
+        expect(input.calls.some((call) => call.url.endsWith("/reserve"))).toBe(expectedRecovery);
+    }
+});

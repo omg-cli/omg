@@ -1,5 +1,6 @@
 import { collectCandidateSources } from "./ai-review-candidate.mjs";
 import { runtimeEvidencePageSchema, runtimeReviewRefSchema } from "../services/ci-inspector/src/runtime-evidence.ts";
+import { canRecoverRuntimeBeforeInference } from "../services/ci-inspector/src/runtime-recovery.ts";
 
 function serviceEndpoint(endpoint) {
     const url = new URL(endpoint);
@@ -8,10 +9,10 @@ function serviceEndpoint(endpoint) {
     return url;
 }
 
-async function recoverableReservation({ activeReview, github, url, token, request }) {
+async function recoverableReservation({ activeReview, event, github, url, token, request }) {
     try {
-        await request(new URL(`/review-records/${activeReview.runId}-${activeReview.attempt}`, url), token, undefined, 2 * 1024 * 1024);
-        return false;
+        const report = await request(new URL(`/review-records/${activeReview.runId}-${activeReview.attempt}`, url), token, undefined, 2 * 1024 * 1024);
+        if (!canRecoverRuntimeBeforeInference(report, activeReview, event)) return false;
     } catch (error) {
         if (error.status !== 404) throw error;
     }
@@ -21,7 +22,7 @@ async function recoverableReservation({ activeReview, github, url, token, reques
         run.path === ".github/workflows/ai-review.yml" && run.head_branch === "main" && run.head_sha === activeReview.sha;
 }
 
-export async function collectRuntimeSources({ github, sha, endpoint, token, request, reviewRef }) {
+export async function collectRuntimeSources({ github, sha, endpoint, token, request, reviewRef, reserve = true }) {
     if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error("Invalid runtime review source identity.");
     const owner = runtimeReviewRefSchema.parse(reviewRef);
     if (owner.sha !== sha) throw new Error("Runtime reservation source mismatch.");
@@ -29,21 +30,24 @@ export async function collectRuntimeSources({ github, sha, endpoint, token, requ
     const runtimeEvidence = [];
     let cursor = null;
     for (let page = 0; page < 5; page++) {
-        const query = new URL("/sentry/poll", url);
+        const query = new URL(reserve ? "/sentry/poll" : "/sentry/events", url);
         query.searchParams.set("limit", "1");
-        const result = runtimeEvidencePageSchema.parse(await request(query, token, "{}", 128 * 1024));
+        if (!reserve && cursor) query.searchParams.set("cursor", cursor);
+        const result = runtimeEvidencePageSchema.parse(await request(query, token, reserve ? "{}" : undefined, 128 * 1024));
         const selected = result.events[0];
         if (selected) {
             const { activeReview, ...evidence } = selected;
             const runtimeEvents = [{ projectId: evidence.projectId, eventId: evidence.eventId, bodySha256: evidence.bodySha256 }];
             if (activeReview && JSON.stringify(activeReview) !== JSON.stringify(owner) &&
-                !await recoverableReservation({ activeReview, github, url, token, request }))
+                (!reserve || !await recoverableReservation({ activeReview, event: evidence, github, url, token, request })))
                 return { baseSha: sha, sourceRange: { kind: "audit", baseSha: sha, headSha: sha, intake: "sentry-runtime" },
                     entries: [], unreviewedPaths: [], runtimeEvents, runtimeEvidence: [evidence], replayRef: activeReview };
-            const reservation = await request(new URL(`/sentry/events/${evidence.projectId}/${evidence.eventId}/reserve`, url), token,
-                JSON.stringify({ bodySha256: evidence.bodySha256, activeReview: owner, expectedActiveReview: activeReview ?? null }), 16384);
-            if (JSON.stringify(runtimeReviewRefSchema.parse(reservation.activeReview)) !== JSON.stringify(owner))
-                throw new Error("Runtime reservation response identity mismatch.");
+            if (reserve) {
+                const reservation = await request(new URL(`/sentry/events/${evidence.projectId}/${evidence.eventId}/reserve`, url), token,
+                    JSON.stringify({ bodySha256: evidence.bodySha256, activeReview: owner, expectedActiveReview: activeReview ?? null }), 16384);
+                if (JSON.stringify(runtimeReviewRefSchema.parse(reservation.activeReview)) !== JSON.stringify(owner))
+                    throw new Error("Runtime reservation response identity mismatch.");
+            }
             runtimeEvidence.push(evidence);
         }
         cursor = result.cursor;

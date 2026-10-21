@@ -159,6 +159,32 @@ test("unknown Sentry organizations, projects and environments cannot dispatch ru
   }
 });
 
+test("Sentry test-notification sample tags cannot bypass the production environment policy", async () => {
+  // Sentry get_test_notification_event_data loads a platform sample and adds sample_event=yes,
+  // but neither its native sample nor the JavaScript fallback sets an environment.
+  const sample = { ...payload.data.event, environment: undefined,
+    tags: [["sample_event", "yes"]],
+    exception: { values: [{ type: "TestError", stacktrace: {
+      frames: [{ filename: "sample.rs", lineno: null, in_app: true }],
+    } }] },
+  };
+  for (const environment of [undefined, null, "staging"]) {
+    const state = fixture();
+    expect((await state.send(JSON.stringify({ ...payload,
+      data: { event: { ...sample, environment } },
+    }))).status).toBe(403);
+    expect(state.objects.size).toBe(0);
+  }
+  const state = fixture();
+  const response = await state.send(JSON.stringify({ ...payload,
+    data: { event: { ...sample, tags: [["environment", "production"]] } },
+  }));
+  expect(response.status).toBe(202);
+  expect(await response.json()).toMatchObject({ status: "queued", holdReason: "missing-rust-frames" });
+  const listed = runtimeEvidencePageSchema.parse(await (await state.read()).json());
+  expect(listed.events[0]).toMatchObject({ environment: "production", frames: [] });
+});
+
 test("Sentry intake fails closed without account configuration and bounds streamed payloads", async () => {
   const state = fixture();
   state.env.SENTRY_WEBHOOK_SECRET = "";
@@ -351,6 +377,39 @@ test("concurrent initial runtime reservations admit only one review owner", asyn
     activeReview: { ...activeReview, runId: "877" },
   })]);
   expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+});
+
+test("reclaiming a format-blocked reservation requires exact pre-inference evidence and preserves the immutable report", async () => {
+  const state = fixture();
+  await state.send();
+  const event = runtimeEvidenceSchema.parse(await (await state.read(`/sentry/events/789/${eventId}`)).json());
+  const activeReview = { runId: "876", attempt: "1", sha: "a".repeat(40), controllerRevision: "d".repeat(40) };
+  await state.reserve({ bodySha256: event.bodySha256, activeReview, expectedActiveReview: null });
+  const report = { repository: "omg-cli/omg", branch: "main", sha: activeReview.sha,
+    controllerRevision: activeReview.controllerRevision, status: "format-blocked", formatting: { status: "blocked" },
+    sourceRange: { intake: "sentry-runtime" }, publishRequested: true,
+    modelInferencePerformed: false, nativeVerificationPerformed: false,
+    publications: [], batches: [], candidateOutcomes: [], readPaths: [],
+    runtimeEvents: [{ projectId: event.projectId, eventId, bodySha256: event.bodySha256 }] };
+  const request = { bodySha256: event.bodySha256, activeReview: { ...activeReview, runId: "877" }, expectedActiveReview: activeReview };
+  for (const change of [
+    { publications: [{ verified: true }] }, { modelInferencePerformed: undefined }, { modelInferencePerformed: true },
+    { nativeVerificationPerformed: true }, { batches: [{}] }, { status: "reviewed" }, { publishRequested: false },
+    { controllerRevision: "f".repeat(40) }, { runtimeEvents: [{ ...report.runtimeEvents[0], bodySha256: "f".repeat(64) }] },
+  ]) {
+    state.objects.set("reviews/876-1/review.json", JSON.stringify({ repository: "omg-cli/omg", runId: "876", attempt: "1",
+      report: { ...report, ...change } }));
+    expect((await state.reserve(request)).status).toBe(409);
+    expect(runtimeEvidencePageSchema.parse(await (await state.read()).json()).events[0].activeReview).toEqual(activeReview);
+  }
+  const encoded = JSON.stringify({ repository: "omg-cli/omg", runId: "876", attempt: "1", report });
+  state.objects.set("reviews/876-1/review.json", encoded);
+  const responses = await Promise.all([state.reserve(request), state.reserve({ ...request,
+    activeReview: { ...activeReview, runId: "878" },
+  })]);
+  expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+  expect(state.objects.get("reviews/876-1/review.json")).toBe(encoded);
+  expect(state.objects.has(`sentry/events/789/${eventId}.json`)).toBe(true);
 });
 
 async function addSecondEvent(state: Awaited<ReturnType<typeof fixture>>) {

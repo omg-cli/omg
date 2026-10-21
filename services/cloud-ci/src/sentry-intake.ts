@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type * as Workers from "@cloudflare/workers-types/index.ts";
 import { runtimeEvidenceSchema, runtimeReviewRefSchema, type RuntimeEvidence } from "../../ci-inspector/src/runtime-evidence";
+import { canRecoverRuntimeBeforeInference, runtimePreInferenceReportSchema } from "../../ci-inspector/src/runtime-recovery";
 
 type Request = globalThis.Request | Workers.Request;
 type Response = Workers.Response;
@@ -372,8 +373,15 @@ async function reserveRuntimeReview(request: Request, bucket: Bucket, event: Run
     return json({ activeReview: reference.activeReview });
   if (JSON.stringify(reference.activeReview ?? null) !== JSON.stringify(reservation.expectedActiveReview))
     return json({ error: "Runtime review reservation conflict" }, 409);
-  if (reference.activeReview && await bucket.get(`reviews/${reference.activeReview.runId}-${reference.activeReview.attempt}/review.json`))
-    return json({ error: "Existing durable runtime review must be resumed" }, 409);
+  if (reference.activeReview) {
+    const previous = await bucket.get(`reviews/${reference.activeReview.runId}-${reference.activeReview.attempt}/review.json`);
+    if (previous) {
+      const record = reviewSchema.extend({ report: runtimePreInferenceReportSchema }).safeParse(JSON.parse(await previous.text()));
+      if (!record.success || record.data.runId !== reference.activeReview.runId || record.data.attempt !== reference.activeReview.attempt ||
+          !canRecoverRuntimeBeforeInference(record.data.report, reference.activeReview, event))
+        return json({ error: "Existing durable runtime review must be resumed" }, 409);
+    }
+  }
   const written = await bucket.put(key, JSON.stringify({ ...reference, activeReview: reservation.activeReview }), {
     onlyIf: { etagMatches: pending.etag }, httpMetadata: { contentType: "application/json" },
   });
