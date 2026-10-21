@@ -14,6 +14,9 @@ export type RetentionStatus =
   | "unavailable";
 export const runIdPattern = /^cl-[1-9][0-9]{0,19}-[1-9][0-9]{0,5}-[a-f0-9]{40}(?:-(?:v|ta)-[a-f0-9]{16})?$/;
 
+const baseRunId = (runId: string) => runId.replace(/-(?:v|ta)-[a-f0-9]{16}$/, "");
+export const runIdMatchesOwner = (runId: string, owner: string) => baseRunId(runId) === baseRunId(owner);
+
 export async function retainUnitReport(
   runId: string,
   sandbox: EvidenceSource,
@@ -124,8 +127,12 @@ export async function retainSandboxEvidence(
   sandbox: Pick<CiSandbox, "listFiles">,
   read: (path: string) => Promise<Workers.ReadableStream<Uint8Array>>,
   bucket: Pick<R2Bucket, "put">,
+  owner?: string,
 ): Promise<{ retained: boolean; failures: EvidenceFailure[] }> {
   const failures: EvidenceFailure[] = [];
+
+  if (metadata?.diagnosticRunId && !metadata.leafStep)
+    failures.push({ evidence: "runner-log:leaf-step", status: "missing" });
 
   if (metadata?.diagnosticRunId && metadata.leafStep) {
     for (const stream of ["stdout", "stderr"] as const) {
@@ -145,14 +152,17 @@ export async function retainSandboxEvidence(
   }
 
   if (metadata?.reportRunId) {
-    const status = await retainUnitReport(
-      metadata.reportRunId,
-      {
-        listFiles: (path) => sandbox.listFiles(path),
-        readReport: () => read("/tmp/omg-ci-unit-evidence/report.xml"),
-      },
-      bucket,
-    );
+    const status =
+      owner && !runIdMatchesOwner(metadata.reportRunId, owner)
+        ? "invalid-identity"
+        : await retainUnitReport(
+            metadata.reportRunId,
+            {
+              listFiles: (path) => sandbox.listFiles(path),
+              readReport: () => read("/tmp/omg-ci-unit-evidence/report.xml"),
+            },
+            bucket,
+          );
 
     if (blocksRelease(status, false)) failures.push({ evidence: "unit-report", status });
   }
@@ -174,6 +184,8 @@ export async function releaseTerminalOwner(options: {
   readOwner: () => Promise<string | undefined>;
   lookup: (owner: string) => Promise<{ id: string; status: string }>;
   retain: (owner: string) => Promise<{ retained: boolean; failures: EvidenceFailure[] }>;
+  acquire?: (owner: string) => void | Promise<void>;
+  release?: () => void;
   destroy: () => Promise<void>;
   delegate: () => Promise<void>;
   warn: (event: Record<string, unknown>) => void;
@@ -209,27 +221,33 @@ export async function releaseTerminalOwner(options: {
     return "retained-active";
   }
 
-  const retention = await options.retain(owner);
+  await options.acquire?.(owner);
 
-  if (!retention.retained) {
-    options.warn({ event: "sandbox_evidence_retention_failed", owner, failures: retention.failures });
-    throw new Error(
-      `Sandbox evidence retention failed: ${retention.failures
-        .map((failure) => `${failure.evidence}:${failure.status}`)
-        .join(",")}`,
-    );
+  try {
+    const claimedOwner = await options.readOwner();
+
+    if (claimedOwner !== owner) {
+      options.warn({ event: "sandbox_owner_changed", owner, durableOwner: claimedOwner });
+      await options.delegate();
+
+      return "retained-owner-changed";
+    }
+
+    const retention = await options.retain(owner);
+
+    if (!retention.retained) {
+      options.warn({ event: "sandbox_evidence_retention_failed", owner, failures: retention.failures });
+      throw new Error(
+        `Sandbox evidence retention failed: ${retention.failures
+          .map((failure) => `${failure.evidence}:${failure.status}`)
+          .join(",")}`,
+      );
+    }
+
+    await options.destroy();
+
+    return "released";
+  } finally {
+    options.release?.();
   }
-
-  const durableOwner = await options.readOwner();
-
-  if (durableOwner !== owner) {
-    options.warn({ event: "sandbox_owner_changed", owner, durableOwner });
-    await options.delegate();
-
-    return "retained-owner-changed";
-  }
-
-  await options.destroy();
-
-  return "released";
 }

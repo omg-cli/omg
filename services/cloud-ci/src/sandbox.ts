@@ -1,7 +1,13 @@
 import { CiSandbox as NativeCiSandbox } from "@cloudflare/ci/worker";
 import { PhaseDiagnostics, type StopDetails } from "./phase-diagnostics";
 import { backupTransferMode, leafSnapshotOptions } from "./backup-policy";
-import { releaseTerminalOwner, retainRunnerLog, retainSandboxEvidence, retainUnitReport } from "./unit-report-retention";
+import {
+  releaseTerminalOwner,
+  retainRunnerLog,
+  retainSandboxEvidence,
+  retainUnitReport,
+  runIdPattern,
+} from "./unit-report-retention";
 
 type RunnerMetadata = {
   reportRunId?: string;
@@ -13,6 +19,7 @@ const metadataKey = "omg:runner-metadata";
 export class CiSandbox extends NativeCiSandbox {
   private phases?: PhaseDiagnostics;
   private fuseExitCode?: number;
+  private cleanupOwner?: string;
   private get diagnostics() {
     return (this.phases ??= new PhaseDiagnostics(this.ctx.id.toString(), (key, value) =>
       this.env.BACKUP_BUCKET.put(key, value, { httpMetadata: { contentType: "application/json" } }),
@@ -93,10 +100,18 @@ export class CiSandbox extends NativeCiSandbox {
   override startProcess(...args: Parameters<NativeCiSandbox["startProcess"]>) {
     const env = args[1]?.env;
     return this.trace("process-start", async () => {
+      if (this.cleanupOwner)
+        throw new Error(`Sandbox is releasing terminal owner ${this.cleanupOwner}`);
+      const diagnosticRunId = env?.OMG_DIAGNOSTIC_RUN_ID;
+      const reportRunId =
+        env?.OMG_CI_LEAF_STEP === "rust-portable-tests"
+          ? env?.OMG_REPORT_RUN_ID ??
+            (diagnosticRunId && runIdPattern.test(diagnosticRunId) ? diagnosticRunId : undefined)
+          : undefined;
       await this.ctx.storage.put<RunnerMetadata>(metadataKey, {
-        reportRunId: env?.OMG_CI_LEAF_STEP === "rust-portable-tests" ? env?.OMG_REPORT_RUN_ID : undefined,
+        reportRunId,
         leafStep: env?.OMG_CI_LEAF_STEP,
-        diagnosticRunId: env?.OMG_DIAGNOSTIC_RUN_ID,
+        diagnosticRunId,
       });
       return super.startProcess(...args);
     });
@@ -117,28 +132,52 @@ export class CiSandbox extends NativeCiSandbox {
     return this.trace("activity-expired", () => super.onActivityExpired());
   }
   override async alarm(...args: Parameters<NativeCiSandbox["alarm"]>) {
-    await releaseTerminalOwner({
-      readOwner: async () => (await this.ctx.storage.get<RunnerMetadata>(metadataKey))?.diagnosticRunId,
-      lookup: async (owner) => {
-        const instance = await this.env.CI_WORKFLOW.get(owner);
-        const status = await instance.status();
+    try {
+      await releaseTerminalOwner({
+        readOwner: async () => (await this.ctx.storage.get<RunnerMetadata>(metadataKey))?.diagnosticRunId,
+        lookup: async (owner) => {
+          const instance = await this.env.CI_WORKFLOW.get(owner);
+          const status = await instance.status();
 
-        return { id: instance.id, status: status.status };
-      },
-      retain: async () => {
-        const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
+          return { id: instance.id, status: status.status };
+        },
+        acquire: (owner) => {
+          this.cleanupOwner = owner;
+        },
+        release: () => {
+          this.cleanupOwner = undefined;
+        },
+        retain: async (owner) => {
+          const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
 
-        return retainSandboxEvidence(
-          metadata,
-          { listFiles: (path) => super.listFiles(path) },
-          async (path) => (await super.readFile(path, { encoding: "none" })).content,
-          this.env.BACKUP_BUCKET,
-        );
-      },
-      destroy: () => this.trace("destroy", () => super.destroy()),
-      delegate: () => super.alarm(...args),
-      warn: (event) => console.warn(JSON.stringify({ ...event, sandboxId: this.ctx.id.toString() })),
-    });
+          if (metadata?.diagnosticRunId !== owner)
+            return {
+              retained: false,
+              failures: [{ evidence: "runner-metadata:owner", status: "invalid-identity" as const }],
+            };
+
+          return retainSandboxEvidence(
+            metadata,
+            { listFiles: (path) => super.listFiles(path) },
+            async (path) => (await super.readFile(path, { encoding: "none" })).content,
+            this.env.BACKUP_BUCKET,
+            owner,
+          );
+        },
+        destroy: () => this.trace("destroy", () => super.destroy()),
+        delegate: () => super.alarm(...args),
+        warn: (event) => console.warn(JSON.stringify({ ...event, sandboxId: this.ctx.id.toString() })),
+      });
+    } catch (error) {
+      console.warn(
+        JSON.stringify({
+          event: "sandbox_cleanup_rescheduled",
+          sandboxId: this.ctx.id.toString(),
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    }
   }
   override destroy() {
     return this.trace("destroy", async () => {
