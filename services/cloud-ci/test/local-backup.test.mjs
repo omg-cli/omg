@@ -10,6 +10,11 @@ await Promise.resolve(
       failRead = false;
       probeExitCode = 0;
       ctx = {
+        storage: {
+          values: new Map(),
+          async put(key, value) { this.values.set(key, structuredClone(value)); },
+          async get(key) { return structuredClone(this.values.get(key)); },
+        },
         id: { toString: () => "a".repeat(64) },
         waitUntil(value) {
           pending.push(value);
@@ -260,4 +265,30 @@ test("real adapter retains raw runner diagnostics before destroy without accepti
     expect([...stored.keys()].sort()).toEqual(failure === "none"?[`diagnostics/runner-logs/${id}/script-contracts.stderr`,`diagnostics/runner-logs/${id}/script-contracts.stdout`]:[]);
     for(const value of stored.values())expect(value).toEqual(new Uint8Array([60,255,0,38,62]));
   }
+});
+
+
+test.each(["frozen-dependencies", "script-contracts"])("recreated adapter preserves %s logs and snapshot policy", async (stage) => {
+  const id = `cl-456-1-${"c".repeat(40)}`;
+    const first = new CiSandbox();
+    await first.startProcess("trusted wrapped command", { env: {
+      OMG_DIAGNOSTIC_RUN_ID: id, OMG_CI_LEAF_STEP: stage,
+    } });
+    const restarted = new CiSandbox();
+    restarted.ctx.storage = first.ctx.storage;
+    const stored = new Map();
+    restarted.env.BACKUP_BUCKET.put = async (key, body) => {
+      if (key.startsWith("diagnostics/runner-logs/"))
+        stored.set(key, new Uint8Array(await new Response(body).arrayBuffer()));
+      return {};
+    };
+    const backup = await restarted.createBackup({ path: "/workspace" });
+    expect(backup.excludes).toEqual(stage === "frozen-dependencies" ? undefined : ["*", ".*"]);
+    await restarted.destroy();
+    expect([...stored.keys()].sort()).toEqual([
+      `diagnostics/runner-logs/${id}/${stage}.stderr`,
+      `diagnostics/runner-logs/${id}/${stage}.stdout`,
+    ]);
+    for (const bytes of stored.values()) expect(bytes).toEqual(new Uint8Array([60,255,0,38,62]));
+    expect(restarted.calls.at(-1)).toBe("destroy");
 });
