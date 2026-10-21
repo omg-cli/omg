@@ -14,6 +14,8 @@ The weekly source review inventories one immutable main tree. Bounded pages dist
 
 GitHub's default concurrency queue retains only one pending run and replaces it when another arrives. Weekly continuation and runtime polling must not silently replace each other. GitHub documents `queue: max` for up to 100 pending runs with cancellation disabled. Queue capacity remains finite. See [workflow concurrency](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
 
+The standalone Cloudflare verification and AI review workflows share `omg-ai-review-global`. Each full CI run uses two parallel Sandbox checks, so the shared queue prevents another full run from competing for the two configured container slots.
+
 Runtime polling first checks the private Sentry queue. An empty queue starts no native checks or inference. Sentry evidence identifies the observed release separately from the current source snapshot. An older or unknown event source SHA is a historical lead, not proof of a current defect.
 
 A runtime incident reserves its review owner before source inspection. If publication fails after verification, later polling replays the original durable result and proof identities. It cannot replace that work with a new no-findings result. A claim without a durable record can be recovered only after a definite record-not-found response and independent confirmation that the exact original GitHub attempt completed. Round-robin polling preserves stale unresolved work without blocking later incidents.

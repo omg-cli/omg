@@ -7,8 +7,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: cloud-ci-${{ github.event.pull_request.number || github.ref }}
+  group: omg-ai-review-global
   cancel-in-progress: false
+  queue: max
 
 env:
   WRANGLER_SEND_METRICS: "false"
