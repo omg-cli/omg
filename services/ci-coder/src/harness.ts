@@ -19,6 +19,7 @@ import {
   codingRuntimeIdentity,
   assertRuntimeIdentity,
   parseRuntimeIdentity,
+  retryDecision,
 } from "./runtime.js";
 
 export class Coder extends DurableObject<Env> {
@@ -54,7 +55,8 @@ export class Coder extends DurableObject<Env> {
             event.options.maxTokens = 6000;
           });
           await context.session.hook("retry", (event) => {
-            if (event.attempt >= 2) event.decision = { retry: false };
+            const decision = retryDecision(event);
+            if (decision) event.decision = decision;
           });
         },
       });
@@ -159,7 +161,8 @@ export class Coder extends DurableObject<Env> {
     if (pending) return { ...identity, status: pending.status };
     const initialOutcome = await this.harness.wait(id);
     let outcome = initialOutcome;
-    if (request.diagnosisTask && initialOutcome.status === "done" && !initialOutcome.text) {
+    if (request.diagnosisTask && ((initialOutcome.status === "done" && !initialOutcome.text) ||
+        (initialOutcome.status === "unanswered" && initialOutcome.reason?.includes("inference request per min rate reached")))) {
       await this.ctx.storage.put("diagnosis-reporting", true);
       const report = await continueCodingDiagnosis({operationId: id, sessionId: state.sessionId, harness: this.harness});
       if (report.status === "pending") return {...identity, status: "running"};

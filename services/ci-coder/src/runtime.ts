@@ -39,3 +39,21 @@ export function assertRuntimeIdentity(
 }
 
 export const parseRuntimeIdentity = (text: string) => identitySchema.parse(JSON.parse(text));
+
+export const RATE_LIMIT_RETRY_DELAY_MS = 60_000;
+
+export type SessionRetryEvent = {
+  attempt: number;
+  error: { type: string; message: string; status?: number };
+};
+
+export function retryDecision(
+  event: SessionRetryEvent,
+): { retry: false } | { retry: true; delay: number } | null {
+  if (event.attempt >= 2) return { retry: false };
+  if (event.error.status === 429)
+    return { retry: true, delay: RATE_LIMIT_RETRY_DELAY_MS };
+  if (event.error.status === undefined && /rate limit/i.test(event.error.message))
+    return { retry: true, delay: RATE_LIMIT_RETRY_DELAY_MS };
+  return null;
+}
