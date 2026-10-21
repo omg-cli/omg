@@ -250,7 +250,7 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a5488
                ...runContext,
                label: options.name,
                attempt: ctx.attempt,
-@@ -160,15 +161,21 @@ export abstract class CIWorkflow<
+@@ -160,15 +161,33 @@ export abstract class CIWorkflow<
                cachePaths: options.cache?.inputs,
                env: options.env,
                secrets: options.secrets,
@@ -259,11 +259,23 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a5488
 -          .then((output) =>
 -            Object.freeze({
 +            });
-+            return persistLogs(
++            const stored = await persistLogs(
 +              this.env.BACKUP_BUCKET,
 +              `logs/${event.instanceId}/native/${crypto.randomUUID()}`,
 +              output
 +            );
++            try {
++              console.log(JSON.stringify({
++                event: 'ci-checkpoint-reached',
++                step: options.name.slice(0, 64),
++                stdout: typeof stored.logs.stdout === 'string' ? 'inline' : 'r2',
++                stderr: typeof stored.logs.stderr === 'string' ? 'inline' : 'r2',
++                snapshot: stored.snapshot != null,
++              }));
++            } catch {
++              console.error('ci-checkpoint-telemetry-failed');
++            }
++            return stored;
 +          })
 +          .then(async (stored) => {
 +            const output = await restoreLogs(this.env.BACKUP_BUCKET, stored);

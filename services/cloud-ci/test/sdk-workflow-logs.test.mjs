@@ -81,7 +81,7 @@ if(mode==='process-read-late')await new Promise(resolve=>setTimeout(resolve,50))
 assert.equal(starts,1,'a status wait must never restart the command');
 assert.equal(startDisposals,mode==='plain-process'?0:1,'start result capabilities must be released');
 assert.equal(pollDisposals,mode==='plain-process'?0:resolvedPolls,'every resolved poll result must release its capabilities, including after timeout');
-if(mode==='ok'||mode==='inline'||mode==='exit-stream-disposed'||mode==='plain-process'||mode==='process-transient-missing'||mode==='process-retry-completed'){
+if(mode==='ok'||mode==='inline'||mode==='telemetry-throw'||mode==='exit-stream-disposed'||mode==='plain-process'||mode==='process-transient-missing'||mode==='process-retry-completed'){
  assert.equal(failure,undefined,failure?.stack);
  if(mode==='exit-stream-disposed'||mode==='process-transient-missing'||mode==='process-retry-completed'){assert.equal(streamCalls,0);assert.equal(polls,2);}
  assert.equal(objects.size,mode==='inline'?0:2);assert.equal(destroyed,true);
@@ -107,13 +107,14 @@ if(mode==='ok'||mode==='inline'||mode==='exit-stream-disposed'||mode==='plain-pr
  if(mode==='process-read-hang')assert.match(failure.message,/polls=1, missing=0, lastStatus=unobserved/);
  if(mode.startsWith('process-'))assert.equal(objects.size,0,'unconfirmed completion must not publish logs or a snapshot');
 }
-return Response.json({mode,destroyed,objects:objects.size,events});
+return Response.json({mode,destroyed,objects:objects.size,events,telemetry});
 `;
 
 for (const modes of [
   [
     "ok",
     "inline",
+    "telemetry-throw",
     "missing",
     "write-failure",
     "partial-write-failure",
@@ -143,7 +144,7 @@ for (const modes of [
       new URL("../node_modules/@cloudflare/ci/src/pipeline/ci-workflow.ts", import.meta.url),
     );
 
-    const source = `import assert from 'node:assert/strict';\nimport { OperationInterruptedError } from "@cloudflare/sandbox";\nimport {CIWorkflow} from ${JSON.stringify(sdk)};\nexport default {async fetch(request,env){try {\n${fixture.replace("MODE", "new URL(request.url).pathname.slice(1)")}\n}catch(error){return new Response(error.stack,{status:500});}}};`;
+    const source = `import assert from 'node:assert/strict';\nimport { OperationInterruptedError } from "@cloudflare/sandbox";\nimport {CIWorkflow} from ${JSON.stringify(sdk)};\nexport default {async fetch(request,env){const requestMode=new URL(request.url).pathname.slice(1);const originalLog=console.log;const telemetry=[];console.log=requestMode==='telemetry-throw'?()=>{throw new Error('fixture telemetry failure');}:(...args)=>{telemetry.push(args);};try {\n${fixture.replace("MODE", "requestMode")}\n}catch(error){return new Response(error.stack,{status:500});}finally{console.log=originalLog;}}};`;
 
     const built = await Bun.build({
       entrypoints: ["fixture:entry"],
@@ -208,7 +209,27 @@ try{const results=[];for(const mode of ${JSON.stringify(modes)}){const r=await m
 
     for (const result of results) {
       expect(result.status, `${result.mode}: ${result.body}`).toBe(200);
-      expect(JSON.parse(result.body).destroyed).toBe(true);
+      const body = JSON.parse(result.body);
+      expect(body.destroyed, result.mode).toBe(true);
+      if (["ok", "inline", "exit-stream-disposed", "plain-process", "process-transient-missing", "process-retry-completed"].includes(result.mode)) {
+        expect(body.telemetry.length, result.mode).toBe(1);
+        const [line] = body.telemetry[0];
+        expect(typeof line, result.mode).toBe("string");
+        expect(line.length, result.mode).toBeLessThanOrEqual(256);
+        expect(JSON.parse(line), result.mode).toEqual({
+          event: "ci-checkpoint-reached",
+          step: "large-unit-output",
+          stdout: result.mode === "inline" ? "inline" : "r2",
+          stderr: result.mode === "inline" ? "inline" : "r2",
+          snapshot: true,
+        });
+      } else if (result.mode === "telemetry-throw") {
+        expect(body.telemetry.length, result.mode).toBe(0);
+      } else if (result.mode === "missing") {
+        expect(body.telemetry.length, result.mode).toBe(1);
+      } else {
+        expect(body.telemetry.length, result.mode).toBe(0);
+      }
     }
   });
 }
