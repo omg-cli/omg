@@ -2097,7 +2097,10 @@ mod tests {
                             AuditEventType::PackageInstall,
                             AuditSeverity::Info,
                             "firefox",
-                            &format!("concurrent writer {writer_index} event {event_index}"),
+                            &format!(
+                                "concurrent writer {writer_index} event {event_index} {}",
+                                "x".repeat(MAX_AUDIT_FIELD_BYTES)
+                            ),
                         )
                         .unwrap();
                 }
@@ -2106,6 +2109,12 @@ mod tests {
         for writer in writers {
             writer.join().expect("audit writer panicked");
         }
+
+        let file_len = std::fs::metadata(&log_path).unwrap().len();
+        assert!(
+            file_len > u64::try_from(MAX_AUDIT_ENTRY_BYTES + 2).unwrap_or(u64::MAX),
+            "concurrent fixture must exceed the audit tail window: {file_len}"
+        );
 
         let report = AuditLogger::new_in(log_path)
             .unwrap()
