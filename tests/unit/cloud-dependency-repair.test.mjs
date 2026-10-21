@@ -1,5 +1,65 @@
 import assert from "node:assert/strict";
 import { test } from "bun:test";
+
+test("dependency workflow excludes non-main dispatch and untrusted audit events before secrets", async () => {
+    const workflow = Bun.YAML.parse(
+        await Bun.file(
+            new URL("../../.github/workflows/cloud-ci.yml", import.meta.url),
+        ).text(),
+    );
+    const allowed = new Function(
+        "github",
+        "inputs",
+        `return (${workflow.jobs["dependency-verify"].if.replaceAll("==", "===")});`,
+    );
+    const github = {
+        repository: "omg-cli/omg",
+        ref_name: "main",
+        event_name: "workflow_dispatch",
+        event: {},
+    };
+    assert.equal(allowed(github, { task: "dependencies" }), true);
+    assert.equal(
+        allowed(
+            { ...github, ref_name: "untrusted-branch" },
+            { task: "dependencies" },
+        ),
+        false,
+    );
+    assert.equal(
+        allowed(
+            { ...github, repository: "other/repo" },
+            { task: "dependencies" },
+        ),
+        false,
+    );
+    assert.equal(allowed(github, { task: "portable" }), false);
+    const run = {
+        conclusion: "failure",
+        event: "push",
+        head_branch: "main",
+        head_repository: { full_name: "omg-cli/omg" },
+    };
+    const audit = {
+        ...github,
+        event_name: "workflow_run",
+        event: { workflow_run: run },
+    };
+    assert.equal(allowed(audit, {}), true);
+    for (const change of [
+        { conclusion: "success" },
+        { event: "pull_request" },
+        { head_branch: "fork" },
+        { head_repository: { full_name: "fork/omg" } },
+    ])
+        assert.equal(
+            allowed(
+                { ...audit, event: { workflow_run: { ...run, ...change } } },
+                {},
+            ),
+            false,
+        );
+});
 import {
     admitLockChange,
     admitAuditPair,

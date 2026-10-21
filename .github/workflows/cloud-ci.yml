@@ -161,7 +161,7 @@ jobs:
   dependency-verify:
     name: Verify cloud dependency repair
     if: >-
-      github.repository == 'omg-cli/omg' &&
+      github.repository == 'omg-cli/omg' && github.ref_name == 'main' &&
       ((github.event_name == 'workflow_dispatch' && inputs.task == 'dependencies') ||
        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure' &&
         github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' &&
@@ -222,7 +222,7 @@ jobs:
   dependency-publish:
     name: Publish verified cloud dependency PR
     needs: dependency-verify
-    if: needs.dependency-verify.outputs.ready == 'true'
+    if: github.ref_name == 'main' && needs.dependency-verify.outputs.ready == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
