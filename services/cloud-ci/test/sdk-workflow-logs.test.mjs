@@ -89,6 +89,9 @@ if(mode==='ok'||mode==='inline'||mode==='exit-stream-disposed'||mode==='plain-pr
  if(mode==='process-identity')assert.equal(failure.message,'large-unit-output failed: CI process identity unavailable (expected string, received string)');
  if(mode==='process-read-failure')assert.match(failure.message,/status RPC failed/i);
  if(mode==='process-timeout'||mode==='process-read-hang'||mode==='process-read-late'||mode==='process-missing')assert.match(failure.message,/timed out/i);
+ if(mode==='process-timeout')assert.match(failure.message,/polls=[1-9][0-9]*, missing=0, lastStatus=running/);
+ if(mode==='process-missing')assert.match(failure.message,/polls=[1-9][0-9]*, missing=[1-9][0-9]*, lastStatus=missing/);
+ if(mode==='process-read-hang')assert.match(failure.message,/polls=1, missing=0, lastStatus=unobserved/);
  if(mode.startsWith('process-'))assert.equal(objects.size,0,'unconfirmed completion must not publish logs or a snapshot');
 }
 return Response.json({mode,destroyed,objects:objects.size,events});

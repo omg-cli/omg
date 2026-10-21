@@ -292,3 +292,38 @@ test.each(["frozen-dependencies", "script-contracts"])("recreated adapter preser
     for (const bytes of stored.values()) expect(bytes).toEqual(new Uint8Array([60,255,0,38,62]));
     expect(restarted.calls.at(-1)).toBe("destroy");
 });
+
+test.each(["missing-metadata", "saved", "unavailable"])("teardown records %s diagnostic custody without accepting test proof", async (mode) => {
+  const sandbox = new CiSandbox();
+  sandbox.failRead = mode === "unavailable";
+  if (mode !== "missing-metadata") {
+    await sandbox.startProcess("private command", { env: {
+      OMG_DIAGNOSTIC_RUN_ID: `cl-789-1-${"d".repeat(40)}`,
+      OMG_CI_LEAF_STEP: "source-format", PRIVATE_VALUE: "private-credential",
+    } });
+  }
+  await sandbox.destroy();
+  const body = evidence.get(`diagnostics/sandboxes/${"a".repeat(64)}-retention.json`);
+  expect(body).toBeDefined();
+  expect(JSON.parse(body)).toEqual({
+    metadataPresent: mode !== "missing-metadata",
+    runIdentityPresent: mode !== "missing-metadata",
+    leafIdentityPresent: mode !== "missing-metadata",
+    streams: mode === "missing-metadata" ? [] : [
+      { stream: "stdout", status: mode }, { stream: "stderr", status: mode },
+    ],
+  });
+  expect(body).not.toContain("private command");
+  expect(body).not.toContain("private-credential");
+  expect(sandbox.calls.at(-1)).toBe("destroy");
+});
+
+test("an unavailable retention diagnostic cannot prevent sandbox destruction", async () => {
+  const sandbox = new CiSandbox();
+  sandbox.env.BACKUP_BUCKET.put = async (key) => {
+    if (key.endsWith("-retention.json")) throw new Error("private provider detail");
+    return {};
+  };
+  await sandbox.destroy();
+  expect(sandbox.calls.at(-1)).toBe("destroy");
+});

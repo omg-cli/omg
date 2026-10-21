@@ -120,6 +120,7 @@ export class CiSandbox extends NativeCiSandbox {
     return this.trace("destroy", async () => {
       try {
         const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
+        const streams: { stream: string; status: string }[] = [];
         if (metadata?.diagnosticRunId && metadata.leafStep) {
           for (const stream of ["stdout", "stderr"]) {
             const status = await retainRunnerLog(metadata.diagnosticRunId, metadata.leafStep, stream, {
@@ -130,9 +131,24 @@ export class CiSandbox extends NativeCiSandbox {
                 })
               ).content,
             }, this.env.BACKUP_BUCKET);
+            streams.push({ stream, status });
             if (status !== "saved")
               console.warn(JSON.stringify({ event: "runner_log_unavailable", stream, status }));
           }
+        }
+        try {
+          await this.env.BACKUP_BUCKET.put(
+            `diagnostics/sandboxes/${this.ctx.id.toString()}-retention.json`,
+            JSON.stringify({
+              metadataPresent: Boolean(metadata),
+              runIdentityPresent: Boolean(metadata?.diagnosticRunId),
+              leafIdentityPresent: Boolean(metadata?.leafStep),
+              streams,
+            }),
+            { httpMetadata: { contentType: "application/json" } },
+          );
+        } catch {
+          console.warn(JSON.stringify({ event: "runner_retention_diagnostic_unavailable" }));
         }
         if (metadata?.reportRunId) {
           const status = await retainUnitReport(

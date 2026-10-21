@@ -28,16 +28,17 @@ index aa6068d5ab399caf3f018e5c7c4a691da57931a7..117060dd04b5f72ec259d7aeecd4b374
 
  export type RunStepResult<S> = RunOutput & {
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
-index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca276fea7895 100644
+index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d81e765fc 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
-@@ -1,2 +1,5 @@
+@@ -1,3 +1,6 @@
 +import type * as Workers from "@cloudflare/workers-types/index.ts";
 +type ReadableStream<R> = Workers.ReadableStream<R>;
 +declare const ReadableStream: typeof Workers.ReadableStream;
  // Copyright (c) 2026 Cloudflare, Inc.
  // SPDX-License-Identifier: Apache-2.0
-@@ -86,7 +89,16 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+
+@@ -86,8 +89,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -56,6 +57,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 +        sandbox, processId, input.timeoutMs ?? COMMAND_TIMEOUT_MS
        );
        const preview = await readPreviews(sandbox);
+
 @@ -102,13 +114,13 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          ttl: input.ttlSeconds,
          localBucket,
@@ -80,7 +82,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
        };
      } finally {
        if (!cleanupTransferredToStreams) {
-@@ -142,13 +155,61 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -142,14 +155,70 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    }
  }
 
@@ -90,11 +92,15 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 +  timeoutMs: number,
 +): Promise<number> {
 +  const deadline = Date.now() + timeoutMs;
-+  const timedOut = () => new Error('CI process completion timed out');
++  let polls = 0;
++  let missing = 0;
++  let lastStatus = 'unobserved';
++  const timedOut = () => new Error(`CI process completion timed out (polls=${polls}, missing=${missing}, lastStatus=${lastStatus})`);
 +  for (;;) {
 +    const remaining = deadline - Date.now();
 +    if (remaining <= 0) throw timedOut();
 +    let timer: ReturnType<typeof setTimeout> | undefined;
++    polls++;
 +    const process = await Promise.race([
 +      sandbox.getProcess(id).then(process => {
 +        try {
@@ -114,6 +120,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 +    if (process) {
 +      if (process.id !== id) throw new Error(`CI process identity unavailable (expected ${typeof id}, received ${typeof process.id})`);
 +      const { status, exitCode } = process;
++      lastStatus = ['starting', 'running', 'completed', 'failed', 'killed', 'error'].includes(status) ? status : 'invalid';
 +      if (status !== 'starting' && status !== 'running') {
 +        if (!['completed', 'failed', 'killed', 'error'].includes(status)) {
 +          throw new Error('CI process returned an unknown state');
@@ -124,6 +131,9 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 +        }
 +        return exitCode;
 +      }
++    } else {
++      missing++;
++      lastStatus = 'missing';
 +    }
 +    await new Promise(resolve => setTimeout(resolve, Math.min(1000, Math.max(0, deadline - Date.now()))));
 +  }
@@ -144,7 +154,8 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 +    sizes: { stdout: sizes.get(STDOUT_FILE) ?? 0, stderr: sizes.get(STDERR_FILE) ?? 0 },
    };
  }
-@@ -159,7 +220,7 @@ async function readLog(
+
+@@ -159,7 +228,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -153,7 +164,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -203,26 +264,21 @@ function withCleanup(
+@@ -203,26 +272,21 @@ function withCleanup(
    release: () => Promise<void>
  ) {
    const reader = stream.getReader();
