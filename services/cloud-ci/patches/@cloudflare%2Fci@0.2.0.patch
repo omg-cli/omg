@@ -18,14 +18,14 @@ index aa6068d5ab399caf3f018e5c7c4a691da57931a7..117060dd04b5f72ec259d7aeecd4b374
 +import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
  // Copyright (c) 2026 Cloudflare, Inc.
  // SPDX-License-Identifier: Apache-2.0
- 
+
 @@ -21,6 +22,7 @@ export type RunOutput = {
      stderr: string | ReadableStream<Uint8Array>;
    };
    preview: { stdout: string; stderr: string };
 +  logSizes?: { stdout: number; stderr: number };
  };
- 
+
  export type RunStepResult<S> = RunOutput & {
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca276fea7895 100644
@@ -70,7 +70,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 -        return { exitCode, logs: rawLogs, preview, snapshot };
 +        return { exitCode, logs: rawLogs, logSizes, preview, snapshot };
        }
- 
+
        let remainingStreams = streams.length;
 @@ -133,6 +145,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          },
@@ -83,7 +83,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 @@ -142,13 +155,59 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    }
  }
- 
+
 +async function waitForProcessExit(
 +  sandbox: ReturnType<typeof getSandbox>,
 +  id: string,
@@ -211,7 +211,7 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a5488
  import { runCiStep } from '../ci/capabilities';
  import { RunnerGroup } from './runner-group';
 +import { persistLogs, restoreLogs } from './persisted-logs';
- 
+
  const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
  const DEFAULT_STEP_CONFIG = {
 @@ -145,8 +146,8 @@ export abstract class CIWorkflow<
@@ -251,7 +251,7 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a5488
 +            });
 +          });
        });
- 
+
      // CI ctx object
 diff --git a/node_modules/@cloudflare/ci/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
 new file mode 100644
@@ -354,10 +354,10 @@ index a1f5ff3aa8c30350300f3bd8d1f25cbc850aff65..1dff7079eca079ff2d96b9309e1ffd93
 +import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
  // Copyright (c) 2026 Cloudflare, Inc.
  // SPDX-License-Identifier: Apache-2.0
- 
+
 @@ -136,6 +137,7 @@ export type CiRunStepInput = {
  };
- 
+
  export type CiRunStepOutput = {
 +  logSizes?: { stdout: number; stderr: number };
    exitCode: number;
