@@ -173,10 +173,15 @@ export function preparePortable(
     chownSync(home, 10001, 10001);
     chownSync(`${home}/tmp`, 10001, 10001);
 
+    const rootEntries = new Set(readdirSync(workspace));
+
     return {
         workspace,
         home,
         assertSource() {
+            for (const entry of readdirSync(workspace))
+                if (!rootEntries.has(entry) && !lstatSync(path.join(workspace, entry)).isDirectory())
+                    throw new Error("Portable command added an unexpected root file");
             for (const [file, hash] of source)
                 if (fingerprint(file) !== hash)
                     throw new Error("Portable command changed tracked source");

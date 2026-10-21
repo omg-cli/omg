@@ -35,6 +35,11 @@ try {
     });
     assert.equal(result.status, 0, result.error?.message ?? result.stderr);
     context.assertSource();
+    const extra = spawnSync(process.execPath, ["--input-type=module", "-e",
+        "import {writeFileSync} from 'node:fs'; writeFileSync('build.rs', 'leftover compilation configuration');"],
+        { ...portableOptions(workspace, home), encoding: "utf8", timeout: 10000 });
+    assert.equal(extra.status, 0, extra.stderr);
+    assert.throws(() => context.assertSource(), /Portable command added an unexpected root file/);
     console.log("Candidate-owned relative fixtures work; tracked source cannot be changed or replaced");
 } finally {
     await rm(workspace, { recursive: true, force: true });
