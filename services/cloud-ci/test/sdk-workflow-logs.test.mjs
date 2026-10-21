@@ -86,6 +86,8 @@ if(mode==='ok'||mode==='inline'||mode==='exit-stream-disposed'||mode==='plain-pr
  if(mode==='write-failure'||mode==='partial-write-failure')assert.match(failure.message,/write failed/i);
  if(mode==='partial-write-failure')assert.equal(objects.size,1);
  if(mode==='read-failure')assert.match(failure.message,/read failed/i);
+ if(mode==='process-missing')assert.equal(failure.message,'large-unit-output failed: CI process identity unavailable (expected string, received missing)');
+ if(mode==='process-identity')assert.equal(failure.message,'large-unit-output failed: CI process identity unavailable (expected string, received string)');
  if(mode==='process-read-failure')assert.match(failure.message,/status RPC failed/i);
  if(mode==='process-timeout'||mode==='process-read-hang'||mode==='process-read-late')assert.match(failure.message,/timed out/i);
  if(mode.startsWith('process-'))assert.equal(objects.size,0,'unconfirmed completion must not publish logs or a snapshot');

@@ -111,7 +111,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 +      }),
 +    ]).finally(() => clearTimeout(timer));
 +    if (Date.now() > deadline) throw timedOut();
-+    if (!process || process.id !== id) throw new Error('CI process identity unavailable');
++    if (!process || process.id !== id) throw new Error(`CI process identity unavailable (expected ${typeof id}, received ${process ? typeof process.id : 'missing'})`);
 +    const { status, exitCode } = process;
 +    if (status !== 'starting' && status !== 'running') {
 +      if (!['completed', 'failed', 'killed', 'error'].includes(status)) {
