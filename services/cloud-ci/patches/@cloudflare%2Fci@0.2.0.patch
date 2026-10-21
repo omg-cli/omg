@@ -80,7 +80,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
        };
      } finally {
        if (!cleanupTransferredToStreams) {
-@@ -142,13 +155,59 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -142,13 +155,61 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    }
  }
 
@@ -111,17 +111,19 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 +      }),
 +    ]).finally(() => clearTimeout(timer));
 +    if (Date.now() > deadline) throw timedOut();
-+    if (!process || process.id !== id) throw new Error(`CI process identity unavailable (expected ${typeof id}, received ${process ? typeof process.id : 'missing'})`);
-+    const { status, exitCode } = process;
-+    if (status !== 'starting' && status !== 'running') {
-+      if (!['completed', 'failed', 'killed', 'error'].includes(status)) {
-+        throw new Error('CI process returned an unknown state');
++    if (process) {
++      if (process.id !== id) throw new Error(`CI process identity unavailable (expected ${typeof id}, received ${typeof process.id})`);
++      const { status, exitCode } = process;
++      if (status !== 'starting' && status !== 'running') {
++        if (!['completed', 'failed', 'killed', 'error'].includes(status)) {
++          throw new Error('CI process returned an unknown state');
++        }
++        if (typeof exitCode !== 'number' || !Number.isSafeInteger(exitCode) || exitCode < 0 ||
++            (exitCode === 0 && status !== 'completed')) {
++          throw new Error('CI process terminal exit code unavailable');
++        }
++        return exitCode;
 +      }
-+      if (typeof exitCode !== 'number' || !Number.isSafeInteger(exitCode) || exitCode < 0 ||
-+          (exitCode === 0 && status !== 'completed')) {
-+        throw new Error('CI process terminal exit code unavailable');
-+      }
-+      return exitCode;
 +    }
 +    await new Promise(resolve => setTimeout(resolve, Math.min(1000, Math.max(0, deadline - Date.now()))));
 +  }
@@ -142,7 +144,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
 +    sizes: { stdout: sizes.get(STDOUT_FILE) ?? 0, stderr: sizes.get(STDERR_FILE) ?? 0 },
    };
  }
-@@ -159,7 +218,7 @@ async function readLog(
+@@ -159,7 +220,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -151,7 +153,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..7ca24fd1f240923e639a38fe3f79ca27
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -203,26 +262,21 @@ function withCleanup(
+@@ -203,26 +264,21 @@ function withCleanup(
    release: () => Promise<void>
  ) {
    const reader = stream.getReader();
