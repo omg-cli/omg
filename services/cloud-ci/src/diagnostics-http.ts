@@ -116,12 +116,14 @@ export async function diagnosticsHttp(
       if (listed.objects.length > 50 || (listed.truncated && !listed.cursor))
         throw new Error("Invalid diagnostic listing");
 
-      const ids = listed.objects.map((object) => {
+      const ids = listed.objects.flatMap((object) => {
+        if (/^diagnostics\/sandboxes\/[a-f0-9]{64}-retention\.json$/.test(object.key)) return [];
+
         const match = /^diagnostics\/sandboxes\/([a-f0-9]{64})\.json$/.exec(object.key);
 
         if (!match) throw new Error("Invalid diagnostic key");
 
-        return match[1];
+        return [match[1]];
       });
 
       return json({
