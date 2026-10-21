@@ -2,12 +2,21 @@ name: Cloudflare verification
 
 on:
   workflow_dispatch:
+    inputs:
+      task:
+        description: Run portable verification or a cloud-selected dependency repair
+        type: choice
+        options: [portable, dependencies]
+        default: portable
+  workflow_run:
+    workflows: [Security Audit]
+    types: [completed]
 
 permissions:
   contents: read
 
 concurrency:
-  group: omg-ai-review-global
+  group: ${{ (github.event_name == 'workflow_run' || inputs.task == 'dependencies') && 'omg-cloud-dependencies' || 'omg-ai-review-global' }}
   cancel-in-progress: false
   queue: max
 
@@ -19,7 +28,8 @@ jobs:
   portable:
     name: Cloudflare portable checks
     if: >-
-      github.repository == 'omg-cli/omg' && github.ref_name == 'main'
+      github.repository == 'omg-cli/omg' && github.ref_name == 'main' &&
+      github.event_name == 'workflow_dispatch' && inputs.task != 'dependencies'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:
@@ -147,3 +157,127 @@ jobs:
         if: always()
         shell: bash
         run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json"
+
+  dependency-verify:
+    name: Verify cloud dependency repair
+    if: >-
+      github.repository == 'omg-cli/omg' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.task == 'dependencies') ||
+       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure' &&
+        github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == 'omg-cli/omg'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      ready: ${{ steps.verify.outputs.ready }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install verified Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          mkdir -m 700 -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          directory="$tools/bun-linux-x64"
+          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.95.0"
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: Install frozen controller dependencies
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
+      - name: Ask cloud OpenCode and verify exact dependency repair
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OMG_CI_CODER_TOKEN: ${{ secrets.OMG_CI_CODER_TOKEN }}
+          OMG_CI_CODER_SKILL_BUNDLE_SHA256: ${{ vars.OMG_CI_CODER_SKILL_BUNDLE_SHA256 }}
+          OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
+          OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+        run: bun scripts/cloud-dependency-repair.mjs verify .audit/dependency-proof
+      - name: Retain cloud plan and raw before/after evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dependency-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .audit/dependency-proof/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+
+  dependency-publish:
+    name: Publish verified cloud dependency PR
+    needs: dependency-verify
+    if: needs.dependency-verify.outputs.ready == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    env:
+      OMG_CI_PUBLISHER_LOGIN: ${{ vars.OMG_CI_PUBLISHER_LOGIN }}
+      OMG_CI_PUBLISHER_ID: ${{ vars.OMG_CI_PUBLISHER_ID }}
+      OMG_CI_CODER_SKILL_BUNDLE_SHA256: ${{ vars.OMG_CI_CODER_SKILL_BUNDLE_SHA256 }}
+      OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
+      OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install verified Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          mkdir -m 700 -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          directory="$tools/bun-linux-x64"
+          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - name: Install frozen controller dependencies
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: dependency-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .audit/dependency-proof
+      - name: Independently re-fetch cloud result and admit exact evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OMG_CI_CODER_TOKEN: ${{ secrets.OMG_CI_CODER_TOKEN }}
+        run: bun scripts/cloud-dependency-repair.mjs readmit .audit/dependency-proof
+      - name: Mint repository-scoped OMG publisher token
+        id: publisher-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          client-id: ${{ vars.OMG_CI_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.OMG_CI_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: omg-cli
+          repositories: omg
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Publish only the verified lockfile for human review
+        env:
+          GH_TOKEN: ${{ steps.publisher-token.outputs.token }}
+          OMG_CI_CODER_TOKEN: ${{ secrets.OMG_CI_CODER_TOKEN }}
+        run: bun scripts/cloud-dependency-repair.mjs publish .audit/dependency-proof
