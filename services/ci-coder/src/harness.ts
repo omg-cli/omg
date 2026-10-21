@@ -13,7 +13,7 @@ import {
   type CodingRequest,
 } from "./request.js";
 import { createRequiredSkillsPlugin, requiredSkillsManifest } from "./skills.js";
-import { createCodingTools, readCodingResult, pollCodingVerification, updateCodingResult, continueCodingVerification } from "./tools.js";
+import { createCodingTools, readCodingResult, pollCodingVerification, updateCodingResult, continueCodingVerification, continueCodingDiagnosis } from "./tools.js";
 import {
   CODING_MODEL,
   codingRuntimeIdentity,
@@ -81,7 +81,10 @@ export class Coder extends DurableObject<Env> {
   private readonly lifecycle = Lifecycle.install(this).use(this.harness);
 
   private async getRequest() {
-    return parseCodingRequest(await this.ctx.storage.get("request"));
+    const request = parseCodingRequest(await this.ctx.storage.get("request"));
+    if (request.diagnosisTask && await this.ctx.storage.get("diagnosis-reporting"))
+      throw new Error("Diagnostic reporting must use already-read evidence; tool access is closed");
+    return request;
   }
 
   async start(rawRequest: CodingRequest) {
@@ -156,6 +159,12 @@ export class Coder extends DurableObject<Env> {
     if (pending) return { ...identity, status: pending.status };
     const initialOutcome = await this.harness.wait(id);
     let outcome = initialOutcome;
+    if (request.diagnosisTask && initialOutcome.status === "done" && !initialOutcome.text) {
+      await this.ctx.storage.put("diagnosis-reporting", true);
+      const report = await continueCodingDiagnosis({operationId: id, sessionId: state.sessionId, harness: this.harness});
+      if (report.status === "pending") return {...identity, status: "running"};
+      outcome = report.outcome;
+    }
     let continuation;
     const runtime = parseRuntimeIdentity(
       (await this.ctx.storage.get<string>("runtime-identity")) ?? "null",

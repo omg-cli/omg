@@ -77,6 +77,20 @@ const output = (value: Json) => ({ content: JSON.stringify(value) });
 const noInput = z.strictObject({});
 const hashInput = z.strictObject({ proposalSha256: z.string().regex(/^[a-f0-9]{64}$/) });
 
+export async function continueCodingDiagnosis({operationId, sessionId, harness}: {
+  operationId: string;
+  sessionId: string | undefined;
+  harness: Pick<OpenCodeHarness, "submit" | "pending" | "wait">;
+}) {
+  if (!sessionId) throw new Error("Diagnostic reporting session missing");
+  const id = `${operationId}-report`;
+  await harness.submit("Return your diagnostic findings, applicable proposed edits and executable test code as JSON using only the evidence already read. Tool access is now closed. State unsupported conclusions explicitly; no claim of verified repair or test proof is allowed.",
+    {operationId: id, session: sessionId, whenBusy: "followUp"});
+  const pending = (await harness.pending()).find(operation => operation.operationId === id);
+  if (pending) return {status: "pending", pending} as const;
+  return {status: "completed", outcome: await harness.wait(id), operationId: id} as const;
+}
+
 async function ciJson(
   env: ActionsOptions["env"],
   pathname: string,

@@ -3,6 +3,8 @@ import { test } from "bun:test";
 import { Session } from "@opencode/schema/session";
 import { parseCodingRequest, operationIdentity } from "../src/request";
 import { createCodingActions, type CodingState } from "../src/tools";
+import * as codingTools from "../src/tools";
+import type { OpenCodeHarness } from "agents/harness/opencode";
 import { createRequiredSkillsPlugin } from "../src/skills";
 import { gitBlobSha } from "../../../scripts/ai-review-candidate.mjs";
 
@@ -31,6 +33,28 @@ test("large diagnostic source remains read-only and cannot enter ordinary repair
     const source = {...input.source, sourceFiles: [{path: input.source.auditPaths[0], content, blobSha: gitBlobSha(content)}]};
     assert.doesNotThrow(() => parseCodingRequest({...input, source}), "Diagnostic reads use the existing bounded audit source envelope");
     assert.throws(() => parseCodingRequest({...input, source, diagnosisTask: undefined}));
+});
+
+test("a diagnostic without a final answer resumes once in the original session for reporting", async () => {
+    assert.equal(typeof codingTools.continueCodingDiagnosis, "function", "A settled diagnostic must produce a report instead of silently losing its result");
+    const submitted: {id?: string; session?: string}[] = [];
+    let pending = true;
+    const harness: Pick<OpenCodeHarness, "submit" | "pending" | "wait"> = {
+        submit: async (_prompt: string, options: {operationId?: string; session?: string}) => {
+            submitted.push({id: options.operationId, session: options.session});
+            return {operationId: options.operationId ?? "", session: options.session ?? "", accepted: submitted.length === 1};
+        },
+        pending: async () => pending ? [{operationId: "cl-example-report", session: "ses_root", status: "running"}] : [],
+        wait: async () => ({operationId: "cl-example-report", session: "ses_root", status: "done", text: '{"findings": []}'}),
+    };
+    const first = await codingTools.continueCodingDiagnosis({operationId: "cl-example", sessionId: "ses_root", harness});
+    assert.equal(first.status, "pending");
+    pending = false;
+    const second = await codingTools.continueCodingDiagnosis({operationId: "cl-example", sessionId: "ses_root", harness});
+    assert.equal(second.status, "completed");
+    if (second.status !== "completed") throw new Error("Final report missing");
+    assert.equal(second.outcome.text, '{"findings": []}');
+    assert.deepEqual(submitted, [{id: "cl-example-report", session: "ses_root"}, {id: "cl-example-report", session: "ses_root"}]);
 });
 
 test("cloud diagnosis reads evidence but cannot propose, verify or export a repair", async () => {
