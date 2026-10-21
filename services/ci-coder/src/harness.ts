@@ -28,6 +28,7 @@ export class Coder extends DurableObject<Env> {
   private readonly harness = new OpenCodeHarness({
     opencode: async ({ storage }) => {
       const skills = await createRequiredSkillsPlugin();
+      const maxTokens = parseCodingRequest(await this.ctx.storage.get("request")).diagnosisTask ? 24000 : 6000;
       const runtime = codingRuntimeIdentity(this.env, skills.bundleSha256);
       assertRuntimeIdentity(await this.ctx.storage.get<string>("runtime-identity"), runtime);
       await this.ctx.storage.put("runtime-identity", JSON.stringify(runtime));
@@ -43,17 +44,17 @@ export class Coder extends DurableObject<Env> {
           await context.session.hook("context", async (event) => {
             const delivery = skills.assertDelivered(event.sessionID);
             await this.ctx.storage.put("skills-delivery", delivery);
-            event.options.maxTokens = 6000;
+            event.options.maxTokens = maxTokens;
           });
           await context.session.hook("compaction", async (event) => {
             const delivery = skills.assertDelivered(event.sessionID);
             await this.ctx.storage.put("skills-delivery", delivery);
-            event.options.maxTokens = 6000;
+            event.options.maxTokens = maxTokens;
           });
           await context.session.hook("generate", async (event) => {
             const delivery = skills.assertDelivered(event.sessionID);
             await this.ctx.storage.put("skills-delivery", delivery);
-            event.options.maxTokens = 6000;
+            event.options.maxTokens = maxTokens;
           });
           await context.session.hook("retry", (event) => {
             const decision = retryDecision(event);
@@ -162,9 +163,15 @@ export class Coder extends DurableObject<Env> {
 
     if (pending) return { ...identity, status: pending.status };
     const initialOutcome = await this.harness.wait(id);
+    const failureMetadata = request.diagnosisTask && initialOutcome.status === "unanswered"
+      ? (await this.harness.messages({session: initialOutcome.session}))
+          .filter(message => message.type === "assistant" || message.type === "idle")
+          .slice(-8).map(message => diagnosticFailureMetadata(message, [this.env.CI_API_TOKEN]))
+      : undefined;
     let outcome = initialOutcome;
     if (request.diagnosisTask && ((initialOutcome.status === "done" && !initialOutcome.text) ||
-        (initialOutcome.status === "unanswered" && initialOutcome.reason?.includes("inference request per min rate reached")))) {
+        (initialOutcome.status === "unanswered" && (initialOutcome.reason?.includes("inference request per min rate reached") ||
+          failureMetadata?.some(message => message.error?.type === "output-limit"))))) {
       await this.ctx.storage.put("diagnosis-reporting", true);
       const report = await continueCodingDiagnosis({operationId: id, sessionId: initialOutcome.session, harness: this.harness});
       if (report.status === "pending") return {...identity, status: "running"};
@@ -203,11 +210,7 @@ export class Coder extends DurableObject<Env> {
       skillsDelivery: await this.ctx.storage.get("skills-delivery"),
       ...(request.diagnosisTask ? {
         diagnosis: outcome.text ?? null,
-        failureMetadata: outcome.status === "unanswered"
-          ? (await this.harness.messages({session: outcome.session}))
-              .filter(message => message.type === "assistant" || message.type === "idle")
-              .slice(-8).map(message => diagnosticFailureMetadata(message, [this.env.CI_API_TOKEN]))
-          : undefined,
+        failureMetadata,
       } : {}),
     };
   }
