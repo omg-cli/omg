@@ -41,6 +41,12 @@ export const planIdentity = JSON.stringify({
     cloudCiChecks,
     rustProfiles,
     toolchain,
+    scriptContracts: {
+        partition: "exact-native-ids-v1",
+        nativeGate: "Workflow checks",
+        nativeCommand: "make ci-workflow-quick",
+        nativeAcceptance: false,
+    },
     verification: {
         check: "regression-red-green",
         maximumRequestBytes: 65536,

@@ -279,7 +279,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
             const pending = requiredChecks.slice(2);
 
             for (let index = 0; index < pending.length; index += 2) {
-                await Promise.all(
+                const outcomes = await Promise.allSettled(
                     pending.slice(index, index + 2).map(async (name) => {
                         const env: NonNullable<RunnerOptions["env"]> = {
                             OMG_EXPECTED_SHA: request.sha,
@@ -304,6 +304,8 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                         await save(name, result);
                     }),
                 );
+                for (const outcome of outcomes)
+                    if (outcome.status === "rejected") throw outcome.reason;
             }
 
             let verificationReceipt = null;

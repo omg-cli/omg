@@ -130,7 +130,7 @@ export function preparePortable(
 
         if (info.uid !== 0 || info.gid !== 0) chownSync(parent, 0, 0);
 
-        const mode = parent === workspace ? 0o1777 : 0o755;
+        const mode = [workspace, path.join(workspace, "docs"), path.join(workspace, "scripts")].includes(parent) ? 0o1777 : 0o755;
 
         if ((info.mode & 0o7777) !== mode) chmodSync(parent, mode);
     }

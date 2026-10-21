@@ -14,6 +14,7 @@ RUN curl -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-l
 RUN curl -fsSL https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.148/cargo-nextest-0.9.148-x86_64-unknown-linux-musl.tar.gz -o /tmp/nextest.tar.gz && echo 'bf92cb81450872d960ffa13857a83084d557ec0cdc141663d263bb23ef756f97  /tmp/nextest.tar.gz' | sha256sum -c - && tar -xzf /tmp/nextest.tar.gz -C /usr/local/cargo/bin && rm /tmp/nextest.tar.gz && cargo nextest --version
 RUN chmod -R a+rX,go-w /usr/local/cargo /usr/local/rustup
 RUN /usr/sbin/groupadd --gid 10001 omg-ci-candidate && /usr/sbin/useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp/omg-portable-home --shell /usr/sbin/nologin omg-ci-candidate
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client systemd && rm -rf /var/lib/apt/lists/* && test -x /usr/bin/ssh && test -x /usr/bin/journalctl && git config --system --add safe.directory /workspace
 COPY services/cloud-ci/runner/package.json services/cloud-ci/runner/bun.lock /opt/omg-ci/
 RUN cd /opt/omg-ci && bun install --frozen-lockfile --ignore-scripts
 COPY services/cloud-ci/runner/ /opt/omg-ci/

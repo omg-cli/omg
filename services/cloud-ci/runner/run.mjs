@@ -121,16 +121,7 @@ switch (process.argv[2]) {
         break;
     case "script-contracts":
         await run("make", ["check-shell-syntax"]);
-        await run("python3", [
-            "-B",
-            "-m",
-            "unittest",
-            "discover",
-            "-s",
-            "scripts",
-            "-p",
-            "test_*.py",
-        ]);
+        await run("python3", ["-B", "/opt/omg-ci/script-contracts.py"]);
         for (const file of [
             "tests/test_benchmark_records.py",
             "tests/test_terminal_update_notice.py",
