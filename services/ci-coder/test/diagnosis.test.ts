@@ -28,6 +28,14 @@ test("diagnosis binds immutable evidence and cannot be confused with a coding ta
     assert.throws(() => parseCodingRequest({...input, testAuditTask: {path: "src/value.rs", testName: "case", target: "lib", originalBlobSha: "b".repeat(40)}}));
 });
 
+test("authenticated diagnostic questions are explicit and bind the durable operation identity", () => {
+    const first = {...input, diagnosisTask: {question: "Correct the observed production helper admission failure without weakening test protection."}};
+    assert.doesNotThrow(() => parseCodingRequest(first), "An operator task must be separate from untrusted failure logs");
+    const second = {...input, diagnosisTask: {question: "Report a coverage failure without changing the acceptance gate."}};
+    assert.notEqual(operationIdentity(parseCodingRequest(first)), operationIdentity(parseCodingRequest(second)));
+    assert.throws(() => parseCodingRequest({...input, diagnosisTask: {question: ""}}));
+});
+
 test("large diagnostic source remains read-only and cannot enter ordinary repair admission", () => {
     const content = "// source evidence\n".repeat(2000);
     const source = {...input.source, sourceFiles: [{path: input.source.auditPaths[0], content, blobSha: gitBlobSha(content)}]};
