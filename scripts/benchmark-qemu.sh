@@ -14,6 +14,7 @@ arch=
 print_pins=false
 benchmark=false
 transaction_samples=0
+transaction_producer_started=false
 inventory_tiers=
 inventory_mutations=false
 inventory_isolation=false
@@ -1372,6 +1373,7 @@ if [[ "$benchmark" == true && "$rc" == 0 ]]; then
 fi
 if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
   transaction_rc=0
+  transaction_producer_started=true
   timeout --kill-after=10s 21600 docker exec -w /work "$controller" bash /work/qemu-transactions.sh \
     "$distro" "$tag" "$arch" "$transaction_samples" "$firmware" "$ssh_service" \
     "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" \
@@ -1623,15 +1625,30 @@ fi
 # boot-scoped kernel/crash identity only, never raw cores or process environments.
 health_rc=0
 health_serial="$work/guest/serial.log"
-if [[ "$transaction_samples" != 0 ]]; then
-  health_serial="$work/transactions/resume-serial.log"
+active_guest_boot=
+if [[ "$transaction_samples" != 0 && "$transaction_producer_started" == true ]]; then
+  health_serial=
+  receipt="$work/transactions/active-guest.json"
+  if [[ -f "$receipt" && ! -L "$receipt" && $(wc -c < "$receipt") -le 4096 ]] &&
+     jq -e '. as $r | ($r|keys)==["boot_id","schema_version","serial","state"] and
+            $r.schema_version==1 and $r.state=="restored" and
+            $r.serial=="transactions/resume-serial.log" and
+            ($r.boot_id|type)=="string" and
+            ($r.boot_id|test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"))' \
+       "$receipt" >/dev/null 2>> "$work/health-validation.log"; then
+    health_serial="$work/transactions/resume-serial.log"
+    active_guest_boot=$(jq -r '.boot_id' "$receipt")
+  else
+    printf 'Transaction run did not prove a restored active guest\n' >> "$work/health-validation.log"
+    health_rc=120
+  fi
 fi
 timeout --kill-after=5s 30s docker exec -i -w /work/guest "$controller" \
   ssh -i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 \
     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
     -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts \
     bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id \
-  > "$work/guest-boot-id.txt" 2> "$work/health-validation.log" || health_rc=$?
+  > "$work/guest-boot-id.txt" 2>> "$work/health-validation.log" || health_rc=$?
 health_boot_id=$(tr -d '\r\n' < "$work/guest-boot-id.txt")
 timeout --kill-after=5s 60s docker exec -i -w /work/guest "$controller" \
   ssh -i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 \
@@ -1640,6 +1657,10 @@ timeout --kill-after=5s 60s docker exec -i -w /work/guest "$controller" \
     bench@127.0.0.1 sudo -n python3 - collect \
   < "$here/check-qemu-health.py" > "$work/guest-health.json" 2>> "$work/health-validation.log" || health_rc=$?
 timeout 15 docker inspect --format '{{json .State}}' "$controller" > "$work/controller-health.json" 2>> "$work/health-validation.log" || health_rc=120
+if [[ "$health_rc" == 0 && -n "$active_guest_boot" && "$active_guest_boot" != "$health_boot_id" ]]; then
+  printf 'Active guest boot identity changed before health admission\n' >> "$work/health-validation.log"
+  health_rc=120
+fi
 if [[ "$health_rc" == 0 ]]; then
   python3 "$here/check-qemu-health.py" verify --guest "$work/guest-health.json" \
     --serial "$health_serial" --controller "$work/controller-health.json" --boot-id "$health_boot_id" \

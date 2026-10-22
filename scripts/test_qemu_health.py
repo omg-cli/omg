@@ -269,6 +269,38 @@ docker() {
                     transactions=1, producer_started=True, receipt=receipt)
                 self.assertEqual(result.returncode, 120, result.stderr)
 
+    def test_producer_receipt_write_is_atomic_and_failure_stops_launch(self):
+        if not shutil.which("jq"):
+            self.skipTest("jq validates the active-guest receipt")
+        source = Path(__file__).with_name("qemu-transactions.sh").read_text()
+        begin = source.index("write_active_guest() {")
+        end = source.index("\n}\n", begin) + 3
+        writer = source[begin:end]
+        boot = "00000000-1111-2222-3333-555555555555"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "prepare-remove-boot-id.txt").write_text(boot + "\n")
+            accepted = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\noutput=$PWD\n" + writer +
+                 f"\nwrite_active_guest restored transactions/resume-serial.log {boot}\n"],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            receipt = json.loads((root / "active-guest.json").read_text())
+            self.assertEqual(receipt, {"schema_version": 1, "state": "restored",
+                                       "serial": "transactions/resume-serial.log",
+                                       "boot_id": boot})
+            self.assertFalse((root / "active-guest.json.next").exists())
+            (root / "active-guest.json.next").mkdir()
+            call = source[source.index("write_active_guest original"):]
+            call = call[:call.index("\n")]
+            rejected = subprocess.run(
+                ["bash", "-c", "set -u\noutput=$PWD\n" + writer + "\n" + call +
+                 "\nprintf 'continued\\n'\n"],
+                cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(rejected.returncode, 1, rejected.stderr)
+            self.assertNotIn("continued", rejected.stdout)
+            self.assertEqual(json.loads((root / "active-guest.json").read_text()), receipt)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
