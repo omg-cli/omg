@@ -1292,8 +1292,11 @@ export async function main(args = process.argv.slice(2)) {
     if(mode === "recover"){
         const manifest=JSON.parse(await readFile(path.join(root,"config/test-audit-backlog.json"),"utf8"));
         const currentSha=exactSha((await github.request("GET",`${prefix}/git/ref/heads/main`)).object.sha);
-        const recovered=await recoverTestAuditCampaign({github,currentSha,revision,manifestDigest:testAuditManifestDigest(manifest),currentRunId:runId,dispatch:dispatchAudit,
-            loadRecord:(ref)=>fetchJson(new URL(`/review-records/${ref}`,config.endpoint),token,undefined,2*1024*1024)});
+        const recovered=await recoverTestAuditCampaign({github,currentSha,revision,manifestDigest:testAuditManifestDigest(manifest),currentRunId:runId,currentRunAttempt:attempt,dispatch:dispatchAudit,
+            loadRecord:(ref)=>fetchJson(new URL(`/review-records/${ref}`,config.endpoint),token,undefined,2*1024*1024),
+            loadIntent:(ref)=>fetchJson(new URL(`/review-records/${ref}/recovery-intent`,config.endpoint),token,undefined,64*1024),
+            storeIntent:(ref,body)=>fetchJson(new URL(`/review-records/${ref}/recovery-intent`,config.endpoint),token,JSON.stringify(body),64*1024),
+            rerun:(id)=>execute("gh",["api","--hostname","github.com","--method","POST",`${prefix}/actions/runs/${id}/rerun`])});
         process.stdout.write(`${JSON.stringify(recovered)}\n`);return;
     }
 

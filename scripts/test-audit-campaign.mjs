@@ -370,6 +370,319 @@ export async function dispatchTestAuditPlan({
     await dispatch(inputs);
     return { ...plan, status: "dispatched" };
 }
+export const MAX_RECOVERY_ATTEMPTS = 3;
+export function missingRecordIntent({
+    title,
+    child,
+    revision,
+    manifestDigest,
+    ownerRunId,
+    ownerAttempt,
+}) {
+    const match =
+        /^Test audit ([1-9][0-9]{0,19}-[1-9][0-9]{0,5}) ([a-f0-9]{40}) ([0-9]+)$/.exec(
+            title ?? "",
+        );
+    if (!match) return { held: "recovery-requires-title-named-parent" };
+    const [, parent, source, cursorText] = match;
+    const cursor = Number(cursorText);
+    const childRef = `${child.id}-${child.run_attempt}`;
+    if (
+        !run.test(parent) ||
+        parent === childRef ||
+        parent.split("-")[0] === String(child.id) ||
+        source !== child.head_sha
+    )
+        return { held: "recovery-lineage-mismatch" };
+    if (!Number.isSafeInteger(cursor) || cursor < 1)
+        return { held: "recovery-cursor-mismatch" };
+    if (
+        !run.test(`${ownerRunId}-${ownerAttempt}`) ||
+        !sha.test(source) ||
+        !sha.test(revision) ||
+        !digest.test(manifestDigest)
+    )
+        throw new Error("Invalid recovery intent identity");
+    return {
+        intent: {
+            repository: "omg-cli/omg",
+            kind: "admission-retry-intent",
+            runId: String(child.id),
+            attempt: String(child.run_attempt),
+            ownerRunId,
+            ownerAttempt,
+            parent,
+            sha: source,
+            cursor,
+            controllerRevision: revision,
+            manifestDigest,
+        },
+    };
+}
+export async function recoverMissingTestAuditRecord({
+    github,
+    child,
+    title,
+    revision,
+    manifestDigest,
+    ownerRunId,
+    ownerAttempt,
+    loadRecord,
+    loadIntent,
+    storeIntent,
+    rerun,
+}) {
+    if (
+        ![loadRecord, loadIntent, storeIntent, rerun].every(
+            (fn) => typeof fn === "function",
+        )
+    )
+        throw new Error(
+            "Missing-record recovery requires parent, intent storage and rerun callers",
+        );
+    const parentRef = `${child.id}-${child.run_attempt}`;
+    if (child.status !== "completed")
+        return { status: "campaign-already-active", runId: String(child.id) };
+    if (!["failure", "cancelled", "timed_out"].includes(child.conclusion))
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "missing-record-attempt-is-not-a-failed-attempt",
+        };
+    if (Number(child.run_attempt) >= MAX_RECOVERY_ATTEMPTS)
+        return {
+            status: "campaign-recovery-attempts-exhausted",
+            parent: parentRef,
+        };
+    const planned = missingRecordIntent({
+        title,
+        child,
+        revision,
+        manifestDigest,
+        ownerRunId,
+        ownerAttempt,
+    });
+    if (planned.held)
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: planned.held,
+        };
+    const intent = planned.intent;
+    const owner = `${ownerRunId}-${ownerAttempt}`;
+    const reread = async () => {
+        const [metadata, workflow] = await Promise.all([
+            github.request("GET", `/repos/omg-cli/omg/actions/runs/${child.id}`),
+            github.request(
+                "GET",
+                "/repos/omg-cli/omg/actions/workflows/ai-review.yml",
+            ),
+        ]);
+        if (
+            String(metadata.id) !== String(child.id) ||
+            metadata.head_sha !== intent.sha ||
+            metadata.head_branch !== "main" ||
+            metadata.path !== ".github/workflows/ai-review.yml" ||
+            metadata.repository?.full_name !== "omg-cli/omg" ||
+            metadata.display_title !== title ||
+            metadata.event !== "workflow_dispatch" ||
+            !Number.isSafeInteger(metadata.run_attempt) ||
+            metadata.run_attempt < 1 ||
+            metadata.run_attempt > 999999 ||
+            ![
+                "queued",
+                "in_progress",
+                "completed",
+                "requested",
+                "waiting",
+                "pending",
+            ].includes(metadata.status) ||
+            (metadata.status === "completed"
+                ? ![
+                      "success",
+                      "failure",
+                      "cancelled",
+                      "timed_out",
+                      "action_required",
+                      "neutral",
+                      "skipped",
+                      "stale",
+                  ].includes(metadata.conclusion)
+                : metadata.conclusion != null) ||
+            !Number.isSafeInteger(workflow.id) ||
+            workflow.id < 1 ||
+            metadata.workflow_id !== workflow.id ||
+            workflow.path !== ".github/workflows/ai-review.yml" ||
+            workflow.name !== "AI source review"
+        )
+            throw new Error("Campaign run workflow identity mismatch");
+        return metadata;
+    };
+    const reconcile = async (existing) => {
+        if (
+            existing.kind !== "admission-retry-intent" ||
+            existing.repository !== "omg-cli/omg" ||
+            existing.runId !== String(child.id) ||
+            existing.attempt !== String(child.run_attempt) ||
+            existing.parent !== intent.parent ||
+            existing.sha !== intent.sha ||
+            existing.cursor !== intent.cursor ||
+            existing.controllerRevision !== revision ||
+            existing.manifestDigest !== manifestDigest
+        )
+            throw new Error("Recovery intent identity mismatch");
+        const observed = await reread();
+        const priorOwner = `${existing.ownerRunId}-${existing.ownerAttempt}`;
+        if (
+            Number(observed.run_attempt) > Number(child.run_attempt) ||
+            observed.status !== "completed"
+        )
+            return {
+                status: "campaign-recovery-reconciled",
+                parent: parentRef,
+                current: `${observed.id}-${observed.run_attempt}`,
+                owner: priorOwner,
+            };
+        if (priorOwner !== owner)
+            return {
+                status: "campaign-recovery-intent-conflict",
+                parent: parentRef,
+                owner: priorOwner,
+                qualification:
+                    "Another recovery attempt owns the durable rerun intent. This run does not issue a second rerun.",
+            };
+        return {
+            status: "campaign-recovery-unknown",
+            parent: parentRef,
+            owner: priorOwner,
+            qualification:
+                "This run already won the durable intent but the child attempt did not advance. The earlier POST outcome is unknown and is not repeated.",
+        };
+    };
+    let existing = null;
+    try {
+        existing = await loadIntent(parentRef);
+    } catch (error) {
+        if (error.status !== 404) throw error;
+    }
+    if (existing) return reconcile(existing);
+    let parentRecord;
+    try {
+        parentRecord = await loadRecord(intent.parent);
+    } catch (error) {
+        if (error.status === 404)
+            return {
+                status: "campaign-recovery-held",
+                parent: parentRef,
+                reason: "title-named-parent-record-missing",
+            };
+        throw error;
+    }
+    if (
+        parentRecord.repository !== "omg-cli/omg" ||
+        parentRecord.branch !== "main" ||
+        parentRecord.controllerRevision !== revision ||
+        parentRecord.sourceRange?.manifestDigest !== manifestDigest
+    )
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "title-named-parent-lineage-mismatch",
+        };
+    let publicationResult;
+    try {
+        publicationResult = await parentPublicationResult(
+            github,
+            intent.parent,
+            parentRecord,
+        );
+    } catch (error) {
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "title-named-parent-not-terminal-successful",
+            qualification:
+                error instanceof Error
+                    ? error.message
+                    : "Parent review or publication is not terminal.",
+        };
+    }
+    const plan = planTestAuditContinuation(
+        parentRecord,
+        intent.sha,
+        ...intent.parent.split("-"),
+        publicationResult,
+    );
+    if (
+        plan.status !== "continue" ||
+        Number(plan.inputs.audit_cursor) !== intent.cursor ||
+        plan.inputs.audit_parent !== intent.parent
+    )
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "title-named-parent-did-not-authorize-this-cursor",
+        };
+    const current = await reread();
+    if (
+        current.status !== "completed" ||
+        Number(current.run_attempt) !== Number(child.run_attempt) ||
+        !["failure", "cancelled", "timed_out"].includes(current.conclusion)
+    )
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "child-state-changed-before-mutation",
+        };
+    let won;
+    try {
+        won = await storeIntent(parentRef, intent);
+    } catch (error) {
+        if (error.status === 409)
+            return {
+                status: "campaign-recovery-intent-conflict",
+                parent: parentRef,
+                owner,
+            };
+        throw error;
+    }
+    if (won?.stored !== true)
+        throw new Error("Recovery intent was not acknowledged");
+    if (won.created !== true) {
+        let claimed = null;
+        try {
+            claimed = await loadIntent(parentRef);
+        } catch (error) {
+            if (error.status !== 404) throw error;
+        }
+        if (claimed) return reconcile(claimed);
+        return {
+            status: "campaign-recovery-intent-held",
+            parent: parentRef,
+            owner,
+            qualification:
+                "The durable intent already existed but could not be read back, so this run does not issue a second rerun.",
+        };
+    }
+    try {
+        await rerun(String(child.id));
+    } catch {
+        return {
+            status: "campaign-recovery-unknown",
+            parent: parentRef,
+            owner,
+            qualification:
+                "The rerun request outcome is unknown. The durable intent prevents a blind repeat; the next recovery reconciles the child attempt.",
+        };
+    }
+    return {
+        status: "campaign-recovery-rerun-requested",
+        parent: parentRef,
+        owner,
+        qualification:
+            "GitHub's rerun endpoint has no compare-and-swap. A concurrent rerun between the recheck and this request can advance the attempt first; the next recovery reconciles by attempt identity.",
+    };
+}
 export async function recoverTestAuditCampaign({
     github,
     currentSha,
@@ -378,6 +691,10 @@ export async function recoverTestAuditCampaign({
     loadRecord,
     dispatch,
     currentRunId,
+    currentRunAttempt,
+    loadIntent,
+    storeIntent,
+    rerun,
 }) {
     const currentCampaignRun = async (item) => {
         const id = String(item.id ?? "");
@@ -450,10 +767,19 @@ export async function recoverTestAuditCampaign({
                 report = await loadRecord(parentRef);
             } catch (error) {
                 if (error.status === 404)
-                    return {
-                        status: "campaign-record-missing",
-                        parent: parentRef,
-                    };
+                    return recoverMissingTestAuditRecord({
+                        github,
+                        child: metadata,
+                        title: item.display_title,
+                        revision,
+                        manifestDigest,
+                        ownerRunId: String(currentRunId),
+                        ownerAttempt: currentRunAttempt,
+                        loadRecord,
+                        loadIntent,
+                        storeIntent,
+                        rerun,
+                    });
                 throw error;
             }
             if (report.status === "duplicate-noop") continue;
