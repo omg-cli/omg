@@ -19,6 +19,10 @@ await Promise.resolve(
         waitUntil(value) {
           pending.push(value);
         },
+        blockConcurrencyWhile(callback) {
+          this.initialization = callback();
+          return this.initialization;
+        },
       };
       env = {
         BACKUP_BUCKET: {
@@ -30,18 +34,22 @@ await Promise.resolve(
         },
       };
       async createBackup(options) {
+        await this.ctx.initialization;
         return options;
       }
       async restoreBackup(backup) {
+        await this.ctx.initialization;
         return backup;
       }
       async execWithSessionToken(command) {
+        await this.ctx.initialization;
         return { exitCode: this.probeExitCode, command };
       }
-      async onStop() {}
-      async onActivityExpired() {}
-      async startProcess() {}
+      async onStop() { await this.ctx.initialization; }
+      async onActivityExpired() { await this.ctx.initialization; }
+      async startProcess() { await this.ctx.initialization; }
       async listFiles(directory) {
+        await this.ctx.initialization;
         this.calls.push("list");
         if(directory === "/tmp") return {success:true,files:["out","err"].map(extension=>({absolutePath:"/tmp/ci-step."+extension,type:"file",size:5}))};
 
@@ -53,6 +61,7 @@ await Promise.resolve(
         };
       }
       async readFile(path, options) {
+        await this.ctx.initialization;
         this.calls.push("read");
         if(path === "/tmp/ci-step.out" || path === "/tmp/ci-step.err") {
           if(this.failRead) throw new Error("private provider detail");
@@ -73,6 +82,7 @@ await Promise.resolve(
         };
       }
       async destroy() {
+        await this.ctx.initialization;
         this.calls.push("destroy");
       }
     },

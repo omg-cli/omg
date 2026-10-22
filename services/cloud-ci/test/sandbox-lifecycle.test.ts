@@ -176,3 +176,30 @@ test('Rust report fallback retains before destroy', async () => {
   expect(env.bucket.writes.map((w) => w.key)).toContain(`reports/${run}/portable-units.xml`);
   expect(s.destroys).toHaveLength(1);
 });
+
+test('recreated sandbox hydrates the persisted teardown fence before starting', async () => {
+  const ctx = new Context(); const env = new EnvFixture(); const first = make(ctx, env); await ctx.settle();
+  await first.destroy();
+  expect(ctx.storage.values.get(teardownKey)).toBe(true);
+  const recreated = make(ctx, env); await ctx.settle();
+  await expect(Promise.resolve().then(() => recreated.startProcess('true', { env: { OMG_CI_LEAF_STEP: 'script-contracts' } }))).rejects.toThrow('Runner teardown refuses container start');
+  expect(recreated.starts).toEqual([]);
+  expect(recreated.destroys).toEqual([]);
+});
+
+test('owner lookup failure reschedules cleanup without fencing or destroying', async () => {
+  for (const mode of ['lookup', 'status'] as const) {
+    const ctx = new Context(); const env = new EnvFixture(); const s = make(ctx, env); await ctx.settle();
+    const owner = `${id}-ta-${'b'.repeat(16)}`;
+    await ctx.storage.put(metadataKey, { diagnosticRunId: owner, leafStep: 'script-contracts' });
+    if (mode === 'lookup') env.workflow.get = async () => { throw new Error('private provider detail'); };
+    else env.workflow.beforeStatus = async () => { throw new Error('private provider detail'); };
+    await alarm(s);
+    expect(s.destroys).toEqual([]);
+    expect(s.delegated).toEqual([]);
+    expect(ctx.storage.alarms).toHaveLength(1);
+    const delay = ctx.storage.alarms[0]! - Date.now();
+    expect(delay).toBeGreaterThan(59_000); expect(delay).toBeLessThanOrEqual(60_000);
+    expect(ctx.storage.values.has(teardownKey)).toBe(false);
+  }
+});
