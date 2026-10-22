@@ -173,6 +173,80 @@ printf '%s %s\\n' "$first" "$second"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
 
+    def _run_fedora_makecache(self, attempts, copy_fail=False):
+        source = (Path(__file__).resolve().parent / 'benchmark-qemu.sh').read_text()
+        case_begin = source.index('case "$distro" in\n  arch) sudo -n pacman -Syu')
+        helpers = ''
+        if 'fedora_makecache_class() {' in source:
+            helpers = source[source.index('fedora_makecache_class() {', 0, case_begin):case_begin]
+        arm_begin = source.index('  fedora)', case_begin)
+        arm_end = source.index(';;', arm_begin) + 2
+        arm = source[arm_begin:arm_end]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'evidence').mkdir()
+            for number, (code, text) in enumerate(attempts, 1):
+                (root / f'attempt-{number}.txt').write_text(text)
+                (root / f'attempt-{number}.rc').write_text(str(code))
+            script = f'''set -euo pipefail
+distro=fedora
+copy_fail={str(copy_fail).lower()}
+attempts=0
+trap 'printf "%s" "$attempts" > attempts-count.txt' EXIT
+sudo() {{ shift; "$@"; }}
+dnf() {{
+  attempts=$((attempts+1))
+  if [[ -f "attempt-$attempts.txt" ]]; then
+    cat "attempt-$attempts.txt"
+    return "$(cat "attempt-$attempts.rc")"
+  fi
+  printf 'unexpected extra attempt\n'
+  return 1
+}}
+sleep() {{ :; }}
+cp() {{
+  if [[ "$copy_fail" == true ]]; then return 1; fi
+  command cp "$@"
+}}
+{helpers}
+case "$distro" in
+{arm}
+esac
+echo "attempts=$attempts"
+'''
+            result = subprocess.run(['bash', '-c', script], cwd=root,
+                                    capture_output=True, text=True, timeout=20)
+            files = {path.relative_to(root).as_posix(): path.read_text()
+                     for path in sorted(root.rglob('*')) if path.is_file()}
+            return result, files
+
+    def test_fedora_makecache_retries_only_transient_failures_and_keeps_evidence(self):
+        transient = ('Status code: 500\n'
+                     'Curl error (23): Failed writing received data to disk/application\n'
+                     'Connection reset by peer\n')
+        cases = (
+            ('transient recovery', [(1, transient), (0, 'Metadata cache created.\n')], False, 0, 2),
+            ('exhaustion', [(1, transient), (1, transient), (1, transient)], False, 120, 3),
+            ('curl23 only', [(1, 'Curl error (23): Failed writing received data to disk/application\n')],
+             False, 120, 1),
+            ('permanent only', [(1, 'GPG check FAILED\n')], False, 120, 1),
+            ('mixed permanent and transient', [(1, transient + 'GPG check FAILED\n')], False, 120, 1),
+            ('failed evidence copy', [(0, 'Metadata cache created.\n')], True, 120, 1),
+        )
+        for name, attempts, copy_fail, expected_rc, expected_attempts in cases:
+            with self.subTest(case=name):
+                result, files = self._run_fedora_makecache(attempts, copy_fail)
+                self.assertEqual(result.returncode, expected_rc, result.stderr)
+                self.assertEqual(files.get('attempts-count.txt'), str(expected_attempts))
+                self.assertEqual(files.get('evidence/index-update-1.txt'), attempts[0][1])
+                for number in range(1, expected_attempts + 1):
+                    self.assertIn(f'evidence/index-update-{number}.txt', files)
+                if expected_rc == 0:
+                    self.assertEqual(files.get('evidence/index-update.txt'), attempts[-1][1])
+                elif copy_fail:
+                    self.assertNotIn('evidence/index-update.txt', files)
+                else:
+                    self.assertEqual(files.get('evidence/index-update.txt'), attempts[0][1])
 
 if __name__ == '__main__':
     unittest.main()
