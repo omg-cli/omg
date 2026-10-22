@@ -16,6 +16,9 @@ class CargoFixtureTests(unittest.TestCase):
         begin = source.index('verify_preparation_health() {')
         end = source.index('\n: > "$output/boot-ids.txt"', begin)
         preparation = source[begin:end]
+        writer_begin = source.index('write_active_guest() {')
+        writer_end = source.index('\n}\n', writer_begin) + 3
+        writer = source[writer_begin:writer_end]
         for failed_operation, mode in ((None, 'clean'), ('remove', 'crash'), ('install', 'crash'),
                                        ('remove', 'mismatch'), ('install', 'incomplete'),
                                        ('remove', 'missing'), ('install', 'transport')):
@@ -60,7 +63,7 @@ freeze_base() { printf 'freeze:%s\\n' "$2" >> events; }
 qemu-img() { :; }
 start_clone() { active=install; printf 'Linux version 6.12\\n' > "$3"; }
 ''' + f'failed_operation={shlex.quote(failed_operation or "none")}\nmode={shlex.quote(mode)}\n'
-                script += preparation.replace('/work/', str(root) + '/')
+                script += writer + '\n' + preparation.replace('/work/', str(root) + '/')
                 script += '\nprintf "healthy-resume\\n" >> events\n'
                 result = subprocess.run(['bash', '-c', script], cwd=root,
                                         capture_output=True, text=True, timeout=10)
@@ -69,6 +72,10 @@ start_clone() { active=install; printf 'Linux version 6.12\\n' > "$3"; }
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(events, ['stop:remove', 'freeze:remove', 'stop:install',
                                               'freeze:install', 'healthy-resume'])
+                    self.assertEqual(json.loads((root / 'transactions/active-guest.json').read_text()),
+                                     {'schema_version': 1, 'state': 'trial',
+                                      'serial': 'transactions/prepare-install-serial.log',
+                                      'boot_id': '00000000-1111-2222-3333-666666666666'})
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(events, [] if failed_operation == 'remove' else

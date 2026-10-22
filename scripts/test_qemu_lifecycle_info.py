@@ -16,7 +16,8 @@ class GuestInfoParityTests(unittest.TestCase):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
         start = source.index('case "$distro" in\n  arch) sudo -n pacman -Syu')
         stop = source.index('\ninstalled() {', start)
-        commands = source[start:stop]
+        helpers = source[source.index('fedora_makecache_class() {', 0, start):start]
+        commands = helpers + source[start:stop]
         start = source.index('"$bin" info tree > evidence/omg-info.txt')
         stop = source.index('\n# Exercise both direct daemon startup', start)
         boundary = source[start:stop]
