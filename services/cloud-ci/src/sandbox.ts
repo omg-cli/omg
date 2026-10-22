@@ -41,6 +41,10 @@ export class CiSandbox extends NativeCiSandbox {
     this.assertStartAllowed();
   }
 
+  protected assertExecutionAllowed() {
+    this.assertStartAllowed();
+  }
+
   private async fenceTeardown() {
     this.teardown = true;
     await this.ctx.storage.put(teardownKey, true);
