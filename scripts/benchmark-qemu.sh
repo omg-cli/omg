@@ -1009,10 +1009,6 @@ if [[ "$distro" == debian-trixie ]]; then
 fi
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
-# Fedora mirror metadata fails transiently while GPG, disk and permission
-# failures are permanent. Retry only transport-class failures, keep every
-# attempt log and the first failure, and never report success after a failed
-# evidence copy. No DNF retry option is invented.
 fedora_makecache_class() {
   local log=$1
   [[ -r "$log" ]] || return 1

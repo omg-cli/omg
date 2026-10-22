@@ -379,6 +379,45 @@ export async function recoverTestAuditCampaign({
     dispatch,
     currentRunId,
 }) {
+    const currentCampaignRun = async (item) => {
+        const id = String(item.id ?? "");
+        if (!/^[1-9][0-9]{0,19}$/.test(id))
+            throw new Error("Campaign run identity is malformed");
+        const [metadata, workflow] = await Promise.all([
+            github.request("GET", `/repos/omg-cli/omg/actions/runs/${id}`),
+            github.request(
+                "GET",
+                "/repos/omg-cli/omg/actions/workflows/ai-review.yml",
+            ),
+        ]);
+        if (
+            String(metadata.id) !== id ||
+            metadata.display_title !== item.display_title ||
+            metadata.head_sha !== item.head_sha ||
+            metadata.head_branch !== "main" ||
+            metadata.path !== ".github/workflows/ai-review.yml" ||
+            metadata.repository?.full_name !== "omg-cli/omg" ||
+            metadata.event !== "workflow_dispatch" ||
+            ![
+                "queued",
+                "in_progress",
+                "completed",
+                "requested",
+                "waiting",
+                "pending",
+            ].includes(metadata.status) ||
+            !Number.isSafeInteger(metadata.run_attempt) ||
+            metadata.run_attempt < 1 ||
+            metadata.run_attempt > 999999 ||
+            !Number.isSafeInteger(workflow.id) ||
+            workflow.id < 1 ||
+            metadata.workflow_id !== workflow.id ||
+            workflow.path !== ".github/workflows/ai-review.yml" ||
+            workflow.name !== "AI source review"
+        )
+            throw new Error("Campaign run workflow identity mismatch");
+        return metadata;
+    };
     for (let page = 1; page <= 5; page++) {
         const response = await github.request(
             "GET",
@@ -399,12 +438,13 @@ export async function recoverTestAuditCampaign({
                 item.repository?.full_name !== "omg-cli/omg"
             )
                 continue;
-            if (item.status !== "completed")
+            const metadata = await currentCampaignRun(item);
+            const parentRef = `${item.id}-${metadata.run_attempt}`;
+            if (metadata.status !== "completed")
                 return {
                     status: "campaign-already-active",
-                    runId: String(item.id),
+                    runId: String(metadata.id),
                 };
-            const parentRef = `${item.id}-${item.run_attempt}`;
             let report;
             try {
                 report = await loadRecord(parentRef);
@@ -434,7 +474,7 @@ export async function recoverTestAuditCampaign({
                 report,
                 currentSha,
                 String(item.id),
-                String(item.run_attempt),
+                String(metadata.run_attempt),
                 publicationResult,
             );
             return dispatchTestAuditPlan({

@@ -306,6 +306,7 @@ test("recovery rereads exact terminal workflow attempt, advances confirmed work 
                     };
                 if (route === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")
                     return {id:391232924,name:"AI source review",path:".github/workflows/ai-review.yml"};
+                if (route === "/repos/omg-cli/omg/actions/runs/42") return prior;
                 if (route.includes("/attempts/1")) return metadata;
                 return { workflow_runs: [prior] };
             },
@@ -576,4 +577,328 @@ test("parent admission propagates jobs API errors without waiting", async () => 
     );
     assert.equal(jobs, 1);
     assert.equal(waits, 0);
+});
+
+test("recovery uses the direct current run attempt instead of stale list attempt metadata", async () => {
+    const title = testAuditRunTitle("initial", a, 3);
+    const listRun = {
+        id: 42,
+        run_attempt: 1,
+        status: "completed",
+        display_title: title,
+        head_sha: a,
+        head_branch: "main",
+        path: ".github/workflows/ai-review.yml",
+        repository: { full_name: "omg-cli/omg" },
+    };
+    const current = {
+        ...listRun,
+        run_attempt: 2,
+        event: "workflow_dispatch",
+        workflow_id: 391232924,
+    };
+    const workflow = {
+        id: 391232924,
+        name: "AI source review",
+        path: ".github/workflows/ai-review.yml",
+    };
+    const reports = {
+        "42-1": {
+            ...fixture(),
+            campaignRun: { runId: "42", attempt: "1" },
+        },
+        "42-2": {
+            ...fixture(),
+            campaignRun: { runId: "42", attempt: "2" },
+        },
+    };
+    const jobs = {
+        jobs: [
+            { name: "review", status: "completed", conclusion: "success" },
+            { name: "publish", status: "completed", conclusion: "skipped" },
+        ],
+    };
+    const loads = [];
+    const dispatched = [];
+    const github = {
+        async request(method, route) {
+            assert.equal(method, "GET");
+            if (route.includes("head_sha=")) return { workflow_runs: [] };
+            if (route === "/repos/omg-cli/omg/actions/runs/42") return current;
+            if (route === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")
+                return workflow;
+            if (route === "/repos/omg-cli/omg/actions/runs/42/attempts/1")
+                return { ...current, run_attempt: 1 };
+            if (route === "/repos/omg-cli/omg/actions/runs/42/attempts/2")
+                return current;
+            if (
+                route ===
+                "/repos/omg-cli/omg/actions/runs/42/attempts/1/jobs?per_page=100"
+            )
+                return jobs;
+            if (
+                route ===
+                "/repos/omg-cli/omg/actions/runs/42/attempts/2/jobs?per_page=100"
+            )
+                return jobs;
+            if (route.includes("/runs?event=workflow_dispatch"))
+                return { workflow_runs: [listRun] };
+            assert.fail(`Unexpected route ${route}`);
+        },
+    };
+    const result = await recoverTestAuditCampaign({
+        github,
+        currentSha: b,
+        revision: controller,
+        manifestDigest: manifest,
+        currentRunId: "50",
+        loadRecord: async (ref) => {
+            loads.push(ref);
+            return reports[ref];
+        },
+        dispatch: async (inputs) => dispatched.push(inputs),
+    });
+    assert.equal(result.status, "dispatched");
+    assert.deepEqual(loads, ["42-2"]);
+    assert.equal(dispatched.length, 1);
+    assert.equal(dispatched[0].audit_parent, "42-2");
+    assert.equal(dispatched[0].audit_resnapshot, "true");
+});
+
+test("recovery holds a live direct run despite a stale terminal list row", async () => {
+    const title = testAuditRunTitle("initial", a, 3);
+    const listRun = {
+        id: 42,
+        run_attempt: 1,
+        status: "completed",
+        display_title: title,
+        head_sha: a,
+        head_branch: "main",
+        path: ".github/workflows/ai-review.yml",
+        repository: { full_name: "omg-cli/omg" },
+    };
+    const current = {
+        ...listRun,
+        status: "in_progress",
+        event: "workflow_dispatch",
+        workflow_id: 391232924,
+    };
+    const workflow = {
+        id: 391232924,
+        name: "AI source review",
+        path: ".github/workflows/ai-review.yml",
+    };
+    const metadata = { ...current, run_attempt: 1 };
+    const jobs = {
+        jobs: [
+            { name: "review", status: "completed", conclusion: "success" },
+            { name: "publish", status: "completed", conclusion: "skipped" },
+        ],
+    };
+    let loads = 0;
+    let dispatches = 0;
+    const github = {
+        async request(method, route) {
+            assert.equal(method, "GET");
+            if (route === "/repos/omg-cli/omg/actions/runs/42") return current;
+            if (route === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")
+                return workflow;
+            if (route === "/repos/omg-cli/omg/actions/runs/42/attempts/1")
+                return metadata;
+            if (
+                route ===
+                "/repos/omg-cli/omg/actions/runs/42/attempts/1/jobs?per_page=100"
+            )
+                return jobs;
+            if (route.includes("/runs?event=workflow_dispatch"))
+                return { workflow_runs: [listRun] };
+            assert.fail(`Unexpected route ${route}`);
+        },
+    };
+    const result = await recoverTestAuditCampaign({
+        github,
+        currentSha: a,
+        revision: controller,
+        manifestDigest: manifest,
+        currentRunId: "50",
+        loadRecord: async () => {
+            loads++;
+            return fixture();
+        },
+        dispatch: async () => {
+            dispatches++;
+        },
+    });
+    assert.deepEqual(result, {
+        status: "campaign-already-active",
+        runId: "42",
+    });
+    assert.equal(loads, 0);
+    assert.equal(dispatches, 0);
+});
+
+test("recovery rejects foreign or malformed direct run provenance without dispatch", async () => {
+    const title = testAuditRunTitle("initial", a, 3);
+    const listRun = {
+        id: 42,
+        run_attempt: 1,
+        status: "completed",
+        display_title: title,
+        head_sha: a,
+        head_branch: "main",
+        path: ".github/workflows/ai-review.yml",
+        repository: { full_name: "omg-cli/omg" },
+    };
+    const current = {
+        ...listRun,
+        event: "workflow_dispatch",
+        workflow_id: 391232924,
+    };
+    const workflow = {
+        id: 391232924,
+        name: "AI source review",
+        path: ".github/workflows/ai-review.yml",
+    };
+    const metadata = { ...current, run_attempt: 1 };
+    const jobs = {
+        jobs: [
+            { name: "review", status: "completed", conclusion: "success" },
+            { name: "publish", status: "completed", conclusion: "skipped" },
+        ],
+    };
+    const attempt = async (direct, item = listRun, workflowOverride = workflow) => {
+        let loads = 0;
+        let dispatches = 0;
+        const github = {
+            async request(method, route) {
+                assert.equal(method, "GET");
+                if (route === "/repos/omg-cli/omg/actions/runs/42")
+                    return direct;
+                if (route === "/repos/omg-cli/omg/actions/runs/0")
+                    return { ...direct, id: 0, run_attempt: 0 };
+                if (route === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")
+                    return workflowOverride;
+                if (route === "/repos/omg-cli/omg/actions/runs/42/attempts/1")
+                    return metadata;
+                if (
+                    route ===
+                    "/repos/omg-cli/omg/actions/runs/42/attempts/1/jobs?per_page=100"
+                )
+                    return jobs;
+                if (route.includes("/runs?event=workflow_dispatch"))
+                    return { workflow_runs: [item] };
+                assert.fail(`Unexpected route ${route}`);
+            },
+        };
+        await assert.rejects(
+            recoverTestAuditCampaign({
+                github,
+                currentSha: a,
+                revision: controller,
+                manifestDigest: manifest,
+                currentRunId: "50",
+                loadRecord: async () => {
+                    loads++;
+                    throw Object.assign(new Error("missing"), {
+                        status: 404,
+                    });
+                },
+                dispatch: async () => {
+                    dispatches++;
+                },
+            }),
+            /Campaign run (?:workflow )?identity/,
+        );
+        assert.equal(loads, 0);
+        assert.equal(dispatches, 0);
+    };
+    await attempt({ ...current, repository: { full_name: "other/repo" } });
+    await attempt({ ...current, workflow_id: 391232925 });
+    await attempt({ ...current, head_sha: b });
+    await attempt({ ...current, head_branch: "other" });
+    await attempt({ ...current, run_attempt: 0 });
+    await attempt(current, listRun, { ...workflow, name: "Other workflow" });
+    await attempt(current, listRun, {
+        ...workflow,
+        path: ".github/workflows/other.yml",
+    });
+    await attempt(current, { ...listRun, id: 0 });
+});
+
+test("recovery dispatches a valid same-source terminal continuation from direct metadata", async () => {
+    const title = testAuditRunTitle("initial", a, 3);
+    const listRun = {
+        id: 42,
+        run_attempt: 1,
+        status: "completed",
+        display_title: title,
+        head_sha: a,
+        head_branch: "main",
+        path: ".github/workflows/ai-review.yml",
+        repository: { full_name: "omg-cli/omg" },
+    };
+    const current = {
+        ...listRun,
+        event: "workflow_dispatch",
+        workflow_id: 391232924,
+    };
+    const workflow = {
+        id: 391232924,
+        name: "AI source review",
+        path: ".github/workflows/ai-review.yml",
+    };
+    const report = fixture();
+    const loads = [];
+    const dispatched = [];
+    const github = {
+        async request(method, route) {
+            assert.equal(method, "GET");
+            if (route.includes("head_sha=")) return { workflow_runs: [] };
+            if (route === "/repos/omg-cli/omg/actions/runs/42") return current;
+            if (route === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")
+                return workflow;
+            if (route === "/repos/omg-cli/omg/actions/runs/42/attempts/1")
+                return current;
+            if (
+                route ===
+                "/repos/omg-cli/omg/actions/runs/42/attempts/1/jobs?per_page=100"
+            )
+                return {
+                    jobs: [
+                        {
+                            name: "review",
+                            status: "completed",
+                            conclusion: "success",
+                        },
+                        {
+                            name: "publish",
+                            status: "completed",
+                            conclusion: "skipped",
+                        },
+                    ],
+                };
+            if (route.includes("/runs?event=workflow_dispatch"))
+                return { workflow_runs: [listRun] };
+            assert.fail(`Unexpected route ${route}`);
+        },
+    };
+    const result = await recoverTestAuditCampaign({
+        github,
+        currentSha: a,
+        revision: controller,
+        manifestDigest: manifest,
+        currentRunId: "50",
+        loadRecord: async (ref) => {
+            loads.push(ref);
+            return report;
+        },
+        dispatch: async (inputs) => dispatched.push(inputs),
+    });
+    assert.equal(result.status, "dispatched");
+    assert.deepEqual(loads, ["42-1"]);
+    assert.equal(dispatched.length, 1);
+    assert.equal(dispatched[0].audit_cursor, "4");
+    assert.equal(dispatched[0].audit_sha, a);
+    assert.equal(dispatched[0].audit_resnapshot, undefined);
+    assert.equal(dispatched[0].audit_digest, report.sourceRange.inventoryDigest);
 });
