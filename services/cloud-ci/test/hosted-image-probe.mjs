@@ -160,19 +160,74 @@ async function main() {
             rawDigest: createHash("sha256").update(Buffer.from(manifest.Raw ?? "", "base64")).digest("hex"),
             dockerVersion: version.status === 0 ? version.stdout.trim() : null,
             driver: driver.status === 0 ? driver.stdout.trim() : null })}`);
-        if (configDigest !== localId) throw new Error("Image probe registry config digest mismatch");
-        if (!/^sha256:[a-f0-9]{64}$/.test(manifestDigest ?? "")) throw new Error("Image probe registry manifest digest was not exact");
-        const rawManifest = Buffer.from(manifest.Raw ?? "", "base64");
-        if (createHash("sha256").update(rawManifest).digest("hex") !== manifestDigest.slice(7)) throw new Error("Image probe raw manifest digest mismatch");
-        if (JSON.parse(rawManifest.toString("utf8"))?.config?.digest !== localId) throw new Error("Image probe raw manifest config mismatch");
         const linked = spawnSync("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", tag], { encoding: "utf8", env: dockerEnv });
         if (linked.error || linked.status !== 0) throw inspectFailure("local registry linkage", linked);
-        if (!JSON.parse(linked.stdout).includes(`${REGISTRY_HOST}/${accountId}/omg-cloud-ci@${manifestDigest}`)) throw new Error("Image probe local registry linkage missing");
+        validateImageIdentity({
+            localId,
+            image,
+            manifest,
+            backend: driver.status === 0 ? driver.stdout.trim() : null,
+            registryReference: `${REGISTRY_HOST}/${accountId}/omg-cloud-ci`,
+            repoDigests: JSON.parse(linked.stdout),
+        });
         console.log(JSON.stringify({ source: sha, digest: manifestDigest, config: configDigest, count: frozen.files.length }));
     } finally {
         rmSync(dockerConfig, { recursive: true, force: true });
         rmSync(context, { recursive: true, force: true });
     }
+}
+
+const DIGEST = /^sha256:[a-f0-9]{64}$/;
+const SINGLE = new Set(["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"]);
+const LEGACY = new Set(["overlay2", "aufs", "btrfs", "devicemapper", "vfs", "zfs"]);
+
+function digest(value, label) {
+    if (typeof value !== "string" || !DIGEST.test(value)) throw new Error("Image probe " + label + " was not exact");
+    return value;
+}
+
+function backendOf(driver) {
+    if (typeof driver !== "string") throw new Error("Image probe storage backend evidence missing");
+    if (driver.includes("io.containerd.snapshotter.v1")) return "containerd";
+    if (LEGACY.has(driver.split("/", 1)[0])) return "legacy";
+    throw new Error("Image probe storage backend was not recognized");
+}
+
+export function validateImageIdentity({ localId, image, manifest, backend, registryReference, repoDigests }) {
+    if (!image || typeof image !== "object" || Array.isArray(image)) throw new Error("Image probe local image metadata missing");
+    if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) throw new Error("Image probe registry manifest was not a single object");
+    if (typeof registryReference !== "string" || !registryReference || registryReference.includes("@")) throw new Error("Image probe registry reference was not exact");
+    const storage = backendOf(backend);
+    digest(localId, "local image id");
+    if (image.Id !== localId) throw new Error("Image probe local image metadata id mismatch");
+    const remote = manifest.Descriptor;
+    if (!remote || typeof remote !== "object" || Array.isArray(remote) || !SINGLE.has(remote.mediaType)) throw new Error("Image probe registry descriptor was not a single image manifest");
+    const manifestDigest = digest(remote.digest, "registry manifest digest");
+    const configs = [manifest.SchemaV2Manifest?.config?.digest, manifest.OCIManifest?.config?.digest].filter((value) => value !== undefined);
+    if (configs.length === 0) throw new Error("Image probe registry config digest was not exact");
+    const configDigest = digest(configs[0], "registry config digest");
+    if (configs.some((value) => digest(value, "registry config digest") !== configDigest)) throw new Error("Image probe registry config digest mismatch");
+    if (typeof manifest.Raw !== "string" || !manifest.Raw || manifest.Raw.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(manifest.Raw)) throw new Error("Image probe registry raw manifest was not base64");
+    const bytes = Buffer.from(manifest.Raw, "base64");
+    let raw;
+    try { raw = JSON.parse(bytes.toString("utf8")); } catch { throw new Error("Image probe raw manifest was not JSON"); }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || Array.isArray(raw.manifests) || !raw.config) throw new Error("Image probe raw manifest was not a single image manifest");
+    if ("sha256:" + createHash("sha256").update(bytes).digest("hex") !== manifestDigest) throw new Error("Image probe raw manifest digest mismatch");
+    const rawConfig = digest(raw.config.digest, "raw manifest config digest");
+    if (rawConfig !== configDigest) throw new Error("Image probe raw manifest config mismatch");
+    const local = image.Descriptor;
+    if (local !== undefined && local !== null) {
+        if (typeof local !== "object" || Array.isArray(local) || !SINGLE.has(local.mediaType)) throw new Error("Image probe local image descriptor was not a single image manifest");
+        if (digest(local.digest, "local image descriptor digest") !== manifestDigest) throw new Error("Image probe local image descriptor digest mismatch");
+        if (local.annotations?.["config.digest"] !== undefined && digest(local.annotations["config.digest"], "local image descriptor config digest") !== configDigest) throw new Error("Image probe local image descriptor config mismatch");
+    }
+    if (storage === "containerd") {
+        if (!local) throw new Error("Image probe local image descriptor missing");
+        if (localId !== manifestDigest) throw new Error("Image probe containerd identity mismatch");
+    } else if (localId !== configDigest) throw new Error("Image probe local image id config mismatch");
+    if (!Array.isArray(repoDigests) || !repoDigests.every((value) => typeof value === "string")) throw new Error("Image probe local registry linkage was malformed");
+    if (!repoDigests.includes(registryReference + "@" + manifestDigest)) throw new Error("Image probe local registry linkage missing");
+    return { digest: manifestDigest, config: configDigest, repoDigest: registryReference + "@" + manifestDigest };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
