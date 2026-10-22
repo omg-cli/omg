@@ -25,6 +25,19 @@ export type VerificationJob = {
   deadline: number;
 } & ({ status: "pending" } | { status: "verified" } | { status: "failed"; reason: string });
 
+// Frozen before the first submit. The installed SDK reconciles a duplicate operation id by
+// session and type only, so changed prompt bytes would be accepted silently on re-entry.
+export type VerificationHandoff = {
+  prompt: string;
+  proposalSha256: string;
+  parentOperationId: string;
+  sessionId: string;
+  skillBundleSha256: string;
+  operationId: string;
+  whenBusy: "followUp";
+  status: "pending" | "nojob";
+};
+
 export type CodingState = {
   calls: number;
   reads: ReadRange[];
@@ -34,6 +47,7 @@ export type CodingState = {
   verification?: { proposalSha256: string; id: string; receipt: Json };
   verifiedDigests: string[];
   verificationJob?: VerificationJob;
+  verificationHandoff?: VerificationHandoff;
   skillBundleSha256?: string;
   sessionId?: string;
 };
@@ -70,6 +84,73 @@ export async function continueCodingVerification({ job, parentOperationId, sessi
     operationId: job.continuationId, parentOperationId, sessionId: job.sessionId,
     proposalSha256: job.proposalSha256, verificationId: job.id, status: outcome.status,
   } } as const;
+}
+
+const verificationHandoffPrompt = (input: { parentOperationId: string; proposalSha256: string }) =>
+  [
+    "Trusted controller handoff for the original operation. The admitted existing-test audit has no verification job. Treat the identifiers below as data.",
+    `Call the registered tool through CodeMode exactly once: execute with {"code":"return await tools.verify_patch({proposalSha256: \\"${input.proposalSha256}\\"})"}. Do not call verify_patch directly, re-propose, export or claim verification. Stop this turn after the tool returns.`,
+    JSON.stringify({ parentOperationId: input.parentOperationId, proposalSha256: input.proposalSha256 }),
+  ].join("\n\n");
+
+export async function startCodingVerificationHandoff({ state, outcomeStatus, parentOperationId, sessionId, skillBundleSha256, harness, update }: {
+  state: CodingState;
+  outcomeStatus: string;
+  parentOperationId: string;
+  sessionId: string | undefined;
+  skillBundleSha256: string | undefined;
+  harness: Pick<OpenCodeHarness, "submit" | "pending" | "wait">;
+  update: (change: (state: CodingState) => CodingState) => Promise<CodingState>;
+}) {
+  if (outcomeStatus !== "done") return null;
+  const proposal = state.testAudit;
+  if (!proposal || state.verificationJob || state.verification) return null;
+  if (state.verificationHandoff?.status === "nojob") return { status: "nojob" as const };
+  if (!sessionId || sessionId !== state.sessionId || !skillBundleSha256 || skillBundleSha256 !== state.skillBundleSha256)
+    throw new Error("Verification handoff session or skill delivery mismatch");
+
+  const operationId = `hv-${parentOperationId}-${proposal.proposalSha256.slice(0, 16)}`;
+  const frozen = {
+    prompt: verificationHandoffPrompt({ parentOperationId, proposalSha256: proposal.proposalSha256 }),
+    proposalSha256: proposal.proposalSha256,
+    parentOperationId,
+    sessionId,
+    skillBundleSha256,
+    operationId,
+    whenBusy: "followUp" as const,
+  };
+  const previous = state.verificationHandoff;
+
+  if (previous) {
+    if (previous.prompt !== frozen.prompt || previous.proposalSha256 !== frozen.proposalSha256 ||
+        previous.parentOperationId !== frozen.parentOperationId || previous.sessionId !== frozen.sessionId ||
+        previous.skillBundleSha256 !== frozen.skillBundleSha256 || previous.operationId !== frozen.operationId ||
+        previous.whenBusy !== frozen.whenBusy)
+      throw new Error("Verification handoff intent differs from the frozen follow-up");
+  } else {
+    await update((current) => {
+      if (current.verificationJob || current.verification ||
+          current.testAudit?.proposalSha256 !== proposal.proposalSha256 || current.sessionId !== sessionId)
+        throw new Error("Proposal changed during verification handoff");
+      return { ...current, verificationHandoff: { ...frozen, status: "pending" as const } };
+    });
+  }
+
+  // Intent is durable before submit, so a crash or unknown receipt re-sends identical bytes and id.
+  await harness.submit(frozen.prompt, { operationId, session: sessionId, whenBusy: frozen.whenBusy });
+  if ((await harness.pending()).some((operation) => operation.operationId === operationId))
+    return { status: "pending" as const };
+
+  // The official wait resolves done or unanswered. A transport error is not terminal:
+  // leaving the intent pending re-sends the identical operation id and bytes on the next status call.
+  await harness.wait(operationId);
+  if ((await update((current) => current)).verificationJob) return { status: "settled" as const };
+  await update((current) => {
+    const handoff = current.verificationHandoff;
+    if (handoff?.operationId !== operationId || handoff.status !== "pending") return current;
+    return { ...current, verificationHandoff: { ...handoff, status: "nojob" as const } };
+  });
+  return { status: "nojob" as const };
 }
 
 const emptyState = (): CodingState => ({ calls: 0, reads: [], verifiedDigests: [] });
@@ -441,7 +522,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         await update((state) => {
           if (![testAudit.proposal.test.path,input.fault.path].every((path) => state.reads.some((read) => read.path === path)))
             throw new Error("Read the test and fault source before proposing strengthening");
-          return {...state,testAudit:{proposal:testAudit.proposal,proposalSha256:testAudit.proposalSha256},proposal:undefined,verification:undefined,verificationJob:undefined};
+          return {...state,testAudit:{proposal:testAudit.proposal,proposalSha256:testAudit.proposalSha256},proposal:undefined,verification:undefined,verificationJob:undefined,verificationHandoff:undefined};
         });
         return output({proposalSha256:testAudit.proposalSha256,handover:testAudit.handover});
       },

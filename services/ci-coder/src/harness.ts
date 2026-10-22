@@ -13,7 +13,7 @@ import {
   type CodingRequest,
 } from "./request.js";
 import { createRequiredSkillsPlugin, requiredSkillsManifest } from "./skills.js";
-import { createCodingTools, readCodingResult, pollCodingVerification, updateCodingResult, continueCodingVerification, continueCodingDiagnosis } from "./tools.js";
+import { createCodingTools, readCodingResult, pollCodingVerification, updateCodingResult, continueCodingVerification, startCodingVerificationHandoff, continueCodingDiagnosis } from "./tools.js";
 import {
   CODING_MODEL,
   codingRuntimeIdentity,
@@ -197,6 +197,24 @@ export class Coder extends DurableObject<Env> {
       continuation = continued.continuation;
       const latest = (await readCodingResult(this.ctx.storage)).verificationJob;
       if (latest?.continuationId !== job.continuationId) return { ...identity, status: "running" };
+    } else if (request.testAuditTask) {
+      const delivered = await this.ctx.storage.get<{ sessionId: string; bundleSha256: string }>("skills-delivery");
+      const handoff = await startCodingVerificationHandoff({
+        state: await readCodingResult(this.ctx.storage),
+        outcomeStatus: outcome.status,
+        parentOperationId: id,
+        sessionId: delivered?.sessionId,
+        skillBundleSha256: delivered?.bundleSha256,
+        harness: this.harness,
+        update: (change) => updateCodingResult(this.ctx.storage, change),
+      });
+      if (handoff?.status === "pending" || handoff?.status === "settled")
+        return { ...identity, status: "running" };
+      if (handoff?.status === "nojob")
+        return { ...identity, status: "unanswered",
+          reason: "Verification handoff completed without a verification job",
+          initialOperation: { operationId: id, status: initialOutcome.status },
+          runtime, skillsDelivery: await this.ctx.storage.get("skills-delivery") };
     }
 
     return {
