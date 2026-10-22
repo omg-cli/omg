@@ -147,6 +147,19 @@ async function main() {
         try { manifest = JSON.parse(remote.stdout); } catch { throw new Error("Image probe registry manifest was not JSON"); }
         const configDigest = manifest?.SchemaV2Manifest?.config?.digest ?? manifest?.OCIManifest?.config?.digest;
         const manifestDigest = manifest?.Descriptor?.digest;
+        const identity = spawnSync("docker", ["image", "inspect", "--format", "{{json .}}", tag], { encoding: "utf8", env: dockerEnv });
+        if (identity.error || identity.status !== 0) throw inspectFailure("local identity metadata", identity);
+        const image = JSON.parse(identity.stdout);
+        const version = spawnSync("docker", ["version", "--format", "{{.Client.Version}}/{{.Server.Version}}"], { encoding: "utf8", env: dockerEnv });
+        const driver = spawnSync("docker", ["info", "--format", "{{.Driver}}/{{json .DriverStatus}}"], { encoding: "utf8", env: dockerEnv });
+        console.log(`IMAGE_PROBE_IDENTITY=${JSON.stringify({ source: sha, localId,
+            localDescriptor: image.Descriptor ?? null, localRepoDigests: image.RepoDigests,
+            os: image.Os, architecture: image.Architecture,
+            remoteShape: Array.isArray(manifest) ? "array" : "object", remoteKeys: Object.keys(manifest),
+            configDigest: configDigest ?? null, manifestDigest: manifestDigest ?? null,
+            rawDigest: createHash("sha256").update(Buffer.from(manifest.Raw ?? "", "base64")).digest("hex"),
+            dockerVersion: version.status === 0 ? version.stdout.trim() : null,
+            driver: driver.status === 0 ? driver.stdout.trim() : null })}`);
         if (configDigest !== localId) throw new Error("Image probe registry config digest mismatch");
         if (!/^sha256:[a-f0-9]{64}$/.test(manifestDigest ?? "")) throw new Error("Image probe registry manifest digest was not exact");
         const rawManifest = Buffer.from(manifest.Raw ?? "", "base64");
