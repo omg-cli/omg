@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, copyFileSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,27 +62,68 @@ export async function authenticate(accountId, token, registryHost, dockerConfig,
     if (login.status !== 0) throw new Error(`Registry login failed with exit ${login.status}`);
 }
 
+export function frozenInputs(root, source) {
+    const runnerRoot = path.join(root, "services/cloud-ci/runner");
+    const files = [];
+    for (const rel of readdirSync(runnerRoot, { recursive: true })) {
+        const file = path.join(runnerRoot, rel);
+        const stat = lstatSync(file);
+        if (stat.isDirectory()) continue;
+        if (!stat.isFile()) throw new Error("Image probe runner entry is not a regular file");
+        files.push({ source: `services/cloud-ci/runner/${rel}`, targets: [`/opt/omg-ci/${rel}`, `/opt/omg-ci/runner/${rel}`], sha256: createHash("sha256").update(readFileSync(file)).digest("hex") });
+    }
+    if (files.length === 0) throw new Error("Image probe found no frozen files");
+    for (const [file, target] of [
+        ["services/cloud-ci/verifier.mjs", "/opt/omg-ci/verifier.mjs"],
+        ["scripts/rust-source-policy.mjs", "/scripts/rust-source-policy.mjs"],
+        ["scripts/prepare-node-test-fixture.py", "/scripts/prepare-node-test-fixture.py"],
+    ]) files.push({ source: file, targets: [target], sha256: createHash("sha256").update(readFileSync(path.join(root, file))).digest("hex") });
+    return { source, files };
+}
+
+export function frozenAssertion({ source, files }, root = "/") {
+    const script = `import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+const root = ${JSON.stringify(root)};
+const files = ${JSON.stringify(files)};
+for (const file of files) for (const target of file.targets)
+    assert.equal(createHash("sha256").update(readFileSync(path.join(root, target))).digest("hex"), file.sha256, target);
+console.log(JSON.stringify({ source: ${JSON.stringify(source)}, count: files.length }));`;
+    return { script, run: `RUN --network=none ${JSON.stringify(["node", "--input-type=module", "-e", script])}` };
+}
+
+function inspectFailure(label, result) {
+    const stderr = typeof result.stderr === "string" ? result.stderr : result.stderr?.toString("utf8") ?? "";
+    return new Error(`Image probe ${label} failed ${JSON.stringify({ status: result.status ?? null, code: result.error?.code ?? null, signal: result.signal ?? null, stderr: stderr.slice(0, 512) })}`);
+}
+
 async function main() {
     const service = fileURLToPath(new URL("..", import.meta.url));
     const repo = path.resolve(service, "../..");
     const context = mkdtempSync(path.join(tmpdir(), "omg-image-probe-"));
     const dockerConfig = mkdtempSync(path.join(tmpdir(), "omg-image-probe-docker-"));
+    const dockerEnv = { ...process.env, DOCKER_CONFIG: dockerConfig };
     try {
         const revision = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" });
         if (revision.status !== 0 || !/^[a-f0-9]{40}\s*$/.test(revision.stdout))
             throw new Error("Image probe requires an exact Git revision");
         const sha = revision.stdout.trim();
         const archive = spawnSync("git", ["archive", sha,
-            "services/cloud-ci/runner", "services/cloud-ci/verifier.mjs",
+            "services/cloud-ci/runner", "services/cloud-ci/verifier.mjs", "services/cloud-ci/Dockerfile",
             "scripts/rust-source-policy.mjs", "scripts/prepare-node-test-fixture.py"],
             { cwd: repo, maxBuffer: 8 * 1024 * 1024 });
         if (archive.status !== 0) throw new Error("Image probe source archive failed");
         const extracted = spawnSync("tar", ["-x", "-C", context], { input: archive.stdout });
         if (extracted.status !== 0) throw new Error("Image probe context extraction failed");
-        copyFileSync(path.join(service, "Dockerfile"), path.join(context, "Dockerfile"));
+        copyFileSync(path.join(context, "services/cloud-ci/Dockerfile"), path.join(context, "Dockerfile"));
         const from = /^FROM\s+(\S+)/m.exec(readFileSync(path.join(context, "Dockerfile"), "utf8"));
         if (!from || !from[1].startsWith(`${REGISTRY_HOST}/`))
             throw new Error(`Image probe requires a pinned ${REGISTRY_HOST} FROM image`);
+        const frozen = frozenInputs(context, sha);
+        appendFileSync(path.join(context, "Dockerfile"), `\n${frozenAssertion(frozen).run}\n`);
+        console.log(`IMAGE_PROBE_FROZEN=${JSON.stringify({ source: sha, count: frozen.files.length })}`);
         const token = process.env.CLOUDFLARE_API_TOKEN;
         const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
         if (!token || !accountId) throw new Error("Image probe requires Workers Builds registry credentials");
@@ -91,45 +132,17 @@ async function main() {
         const build = spawnSync(process.execPath, [
             path.join(service, "node_modules/wrangler/bin/wrangler.js"),
             "containers", "build", context, "--tag", `omg-cloud-ci:${sha}`,
-        ], { cwd: service, stdio: "inherit", env: { ...process.env, DOCKER_CONFIG: dockerConfig } });
+        ], { cwd: service, stdio: "inherit", env: dockerEnv });
         if (build.status !== 0) throw new Error(`Image probe failed with exit ${build.status}`);
         const tag = `omg-cloud-ci:${sha}`;
-        const runnerRoot = path.join(context, "services/cloud-ci/runner");
-        const files = [];
-        for (const rel of readdirSync(runnerRoot, { recursive: true })) {
-            const source = path.join(runnerRoot, rel);
-            const stat = lstatSync(source);
-            if (stat.isDirectory()) continue;
-            if (!stat.isFile()) throw new Error("Image probe runner entry is not a regular file");
-            const sha256 = createHash("sha256").update(readFileSync(source)).digest("hex");
-            files.push({ source: `services/cloud-ci/runner/${rel}`, targets: [`/opt/omg-ci/${rel}`, `/opt/omg-ci/runner/${rel}`], sha256 });
-        }
-        if (files.length === 0) throw new Error("Image probe found no frozen files");
-        for (const [source, target] of [
-            ["services/cloud-ci/verifier.mjs", "/opt/omg-ci/verifier.mjs"],
-            ["scripts/rust-source-policy.mjs", "/scripts/rust-source-policy.mjs"],
-            ["scripts/prepare-node-test-fixture.py", "/scripts/prepare-node-test-fixture.py"],
-        ]) files.push({ source, targets: [target], sha256: createHash("sha256").update(readFileSync(path.join(context, source))).digest("hex") });
-        const compareScript = `import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-const files = ${JSON.stringify(files)};
-for (const file of files) for (const target of file.targets)
-    assert.equal(createHash("sha256").update(readFileSync(target)).digest("hex"), file.sha256, target);
-console.log(JSON.stringify({ count: files.length }));`;
-        const compare = spawnSync("docker", ["run", "--rm", "-i", "--network", "none", "--entrypoint", "node", tag, "--input-type=module", "-"], { input: compareScript, encoding: "utf8" });
-        if (compare.error || compare.status !== 0) throw new Error("Image probe installed file comparison failed");
-        let compared;
-        try { compared = JSON.parse(compare.stdout); } catch { throw new Error("Image probe installed file comparison output was not JSON"); }
-        if (compared?.count !== files.length) throw new Error("Image probe installed file comparison count mismatch");
-        const push = spawnSync(process.execPath, [path.join(service, "node_modules/wrangler/bin/wrangler.js"), "containers", "push", tag], { cwd: service, stdio: "inherit", env: { ...process.env, DOCKER_CONFIG: dockerConfig } });
+        const push = spawnSync(process.execPath, [path.join(service, "node_modules/wrangler/bin/wrangler.js"), "containers", "push", tag], { cwd: service, stdio: "inherit", env: dockerEnv });
         if (push.error || push.status !== 0) throw new Error(`Image probe push failed with exit ${push.status}`);
-        const local = spawnSync("docker", ["image", "inspect", "--format", "{{.Id}}", tag], { encoding: "utf8" });
-        if (local.error || local.status !== 0) throw new Error("Image probe local image inspection failed");
+        const local = spawnSync("docker", ["image", "inspect", "--format", "{{.Id}}", tag], { encoding: "utf8", env: dockerEnv });
+        if (local.error || local.status !== 0) throw inspectFailure("local image inspection", local);
         const localId = local.stdout.trim();
         if (!/^sha256:[a-f0-9]{64}$/.test(localId)) throw new Error("Image probe local image id was not exact");
-        const remote = spawnSync("docker", ["manifest", "inspect", "--verbose", `${REGISTRY_HOST}/${accountId}/omg-cloud-ci:${sha}`], { encoding: "utf8", env: { ...process.env, DOCKER_CONFIG: dockerConfig } });
-        if (remote.error || remote.status !== 0) throw new Error("Image probe registry manifest inspection failed");
+        const remote = spawnSync("docker", ["manifest", "inspect", "--verbose", `${REGISTRY_HOST}/${accountId}/omg-cloud-ci:${sha}`], { encoding: "utf8", env: dockerEnv });
+        if (remote.error || remote.status !== 0) throw inspectFailure("registry manifest inspection", remote);
         let manifest;
         try { manifest = JSON.parse(remote.stdout); } catch { throw new Error("Image probe registry manifest was not JSON"); }
         const configDigest = manifest?.SchemaV2Manifest?.config?.digest ?? manifest?.OCIManifest?.config?.digest;
@@ -139,9 +152,10 @@ console.log(JSON.stringify({ count: files.length }));`;
         const rawManifest = Buffer.from(manifest.Raw ?? "", "base64");
         if (createHash("sha256").update(rawManifest).digest("hex") !== manifestDigest.slice(7)) throw new Error("Image probe raw manifest digest mismatch");
         if (JSON.parse(rawManifest.toString("utf8"))?.config?.digest !== localId) throw new Error("Image probe raw manifest config mismatch");
-        const linked = spawnSync("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", tag], { encoding: "utf8" });
-        if (linked.error || linked.status !== 0 || !JSON.parse(linked.stdout).includes(`${REGISTRY_HOST}/${accountId}/omg-cloud-ci@${manifestDigest}`)) throw new Error("Image probe local registry linkage missing");
-        console.log(JSON.stringify({ source: sha, digest: manifestDigest, config: configDigest, count: files.length }));
+        const linked = spawnSync("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", tag], { encoding: "utf8", env: dockerEnv });
+        if (linked.error || linked.status !== 0) throw inspectFailure("local registry linkage", linked);
+        if (!JSON.parse(linked.stdout).includes(`${REGISTRY_HOST}/${accountId}/omg-cloud-ci@${manifestDigest}`)) throw new Error("Image probe local registry linkage missing");
+        console.log(JSON.stringify({ source: sha, digest: manifestDigest, config: configDigest, count: frozen.files.length }));
     } finally {
         rmSync(dockerConfig, { recursive: true, force: true });
         rmSync(context, { recursive: true, force: true });
