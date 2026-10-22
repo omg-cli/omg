@@ -16,7 +16,7 @@ export function ciPolicy(config) {
     )
         throw new Error("Expected an exact commit SHA.");
 
-    return { imageDigest: config.imageDigest, verifierRevision: config.verifierRevision };
+    return { endpoint: config.endpoint, imageDigest: config.imageDigest, verifierRevision: config.verifierRevision };
 }
 
 export function verifyPublicationProof(receipt, request, config, adapted, sources) {

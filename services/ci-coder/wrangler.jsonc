@@ -2,6 +2,7 @@
   "name": "omg-ci-coder",
   "account_id": "f1e95b3e1b502cf366dfc81a863695fa",
   "main": "src/index.ts",
+  "minify": true,
   "compatibility_date": "2026-10-20",
   "compatibility_flags": ["nodejs_compat"],
   "ai": { "binding": "AI", "remote": true },

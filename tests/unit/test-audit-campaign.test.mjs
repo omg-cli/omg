@@ -351,3 +351,229 @@ test("campaign continuation admits a titled run only from the bound workflow ide
     for(const changed of [{id:0},{name:"Other workflow"},{path:".github/workflows/other.yml"}])
         await assert.rejects(parentPublicationResult(api(metadata,{...workflow,...changed}),"42-1",report),/workflow identity mismatch/);
 });
+
+const parentJobsApi = (metadata, workflow, responses) => {
+    const calls = { jobs: 0 };
+    return {
+        calls,
+        async request(method, path) {
+            assert.equal(method, "GET");
+            if (path === "/repos/omg-cli/omg/actions/runs/42/attempts/1")
+                return metadata;
+            if (path === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")
+                return workflow;
+            if (
+                path ===
+                "/repos/omg-cli/omg/actions/runs/42/attempts/1/jobs?per_page=100"
+            ) {
+                const response =
+                    responses[Math.min(calls.jobs, responses.length - 1)];
+                calls.jobs++;
+                return response;
+            }
+            assert.fail(`Unexpected route ${path}`);
+        },
+    };
+};
+const parentWorkflow = {
+    id: 391232924,
+    name: "AI source review",
+    path: ".github/workflows/ai-review.yml",
+};
+const parentMetadata = {
+    id: 42,
+    run_attempt: 1,
+    head_sha: a,
+    head_branch: "main",
+    path: parentWorkflow.path,
+    name: testAuditRunTitle("initial", a, 3),
+    workflow_id: parentWorkflow.id,
+    repository: { full_name: "omg-cli/omg" },
+    event: "workflow_dispatch",
+};
+const parentJob = (name, status, conclusion) => ({
+    name,
+    status,
+    conclusion,
+});
+
+test("parent admission waits through a pending review and missing publish before admitting terminal jobs", async () => {
+    const waits = [];
+    const api = parentJobsApi(parentMetadata, parentWorkflow, [
+        {
+            jobs: [
+                parentJob("review", "in_progress", null),
+                parentJob("continue", "completed", "success"),
+            ],
+        },
+        {
+            jobs: [
+                parentJob("review", "completed", "success"),
+                parentJob("publish", "completed", "skipped"),
+                parentJob("continue", "completed", "success"),
+            ],
+        },
+    ]);
+    assert.equal(
+        await parentPublicationResult(api, "42-1", fixture(), {
+            wait: async (ms) => waits.push(ms),
+        }),
+        "skipped",
+    );
+    assert.equal(api.calls.jobs, 2);
+    assert.deepEqual(waits, [1000]);
+});
+
+test("parent admission waits for a missing publish job then admits its terminal conclusion", async () => {
+    const waits = [];
+    const api = parentJobsApi(parentMetadata, parentWorkflow, [
+        {
+            jobs: [parentJob("review", "completed", "success")],
+        },
+        {
+            jobs: [
+                parentJob("review", "completed", "success"),
+                parentJob("publish", "completed", "success"),
+            ],
+        },
+    ]);
+    assert.equal(
+        await parentPublicationResult(api, "42-1", fixture(), {
+            wait: async (ms) => waits.push(ms),
+        }),
+        "success",
+    );
+    assert.equal(api.calls.jobs, 2);
+    assert.deepEqual(waits, [1000]);
+});
+
+test("parent admission fails after a bounded wait and reports observed nonterminal statuses", async () => {
+    const waits = [];
+    const api = parentJobsApi(parentMetadata, parentWorkflow, [
+        { jobs: [parentJob("review", "in_progress", null)] },
+    ]);
+    await assert.rejects(
+        parentPublicationResult(api, "42-1", fixture(), {
+            wait: async (ms) => waits.push(ms),
+        }),
+        /not terminal after bounded wait: review=in_progress\/none publish=missing/,
+    );
+    assert.equal(api.calls.jobs, 6);
+    assert.equal(waits.length, 5);
+    assert.ok(waits.reduce((total, ms) => total + ms, 0) <= 30000);
+});
+
+test("parent admission rejects a terminal failed review without retrying", async () => {
+    const waits = [];
+    const api = parentJobsApi(parentMetadata, parentWorkflow, [
+        {
+            jobs: [
+                parentJob("review", "completed", "failure"),
+                parentJob("publish", "completed", "skipped"),
+            ],
+        },
+    ]);
+    await assert.rejects(
+        parentPublicationResult(api, "42-1", fixture(), {
+            wait: async (ms) => waits.push(ms),
+        }),
+        /review did not succeed/,
+    );
+    assert.equal(api.calls.jobs, 1);
+    assert.equal(waits.length, 0);
+});
+
+test("parent admission rejects ambiguous duplicate job identities without retrying", async () => {
+    const waits = [];
+    const api = parentJobsApi(parentMetadata, parentWorkflow, [
+        {
+            jobs: [
+                parentJob("review", "completed", "success"),
+                parentJob("review", "completed", "success"),
+                parentJob("publish", "completed", "skipped"),
+            ],
+        },
+    ]);
+    await assert.rejects(
+        parentPublicationResult(api, "42-1", fixture(), {
+            wait: async (ms) => waits.push(ms),
+        }),
+        /ambiguous/,
+    );
+    assert.equal(api.calls.jobs, 1);
+    assert.equal(waits.length, 0);
+});
+
+test("parent admission fails invalid parent workflow metadata before any jobs retry", async () => {
+    const waits = [];
+    const api = parentJobsApi(
+        { ...parentMetadata, workflow_id: parentWorkflow.id + 1 },
+        parentWorkflow,
+        [
+            {
+                jobs: [
+                    parentJob("review", "completed", "success"),
+                    parentJob("publish", "completed", "skipped"),
+                ],
+            },
+        ],
+    );
+    await assert.rejects(
+        parentPublicationResult(api, "42-1", fixture(), {
+            wait: async (ms) => waits.push(ms),
+        }),
+        /workflow identity mismatch/,
+    );
+    assert.equal(api.calls.jobs, 0);
+    assert.equal(waits.length, 0);
+});
+
+test("parent admission admits an already terminal parent without any wait", async () => {
+    const waits = [];
+    const api = parentJobsApi(parentMetadata, parentWorkflow, [
+        {
+            jobs: [
+                parentJob("review", "completed", "success"),
+                parentJob("publish", "completed", "skipped"),
+                parentJob("continue", "completed", "success"),
+            ],
+        },
+    ]);
+    assert.equal(
+        await parentPublicationResult(api, "42-1", fixture(), {
+            wait: async (ms) => waits.push(ms),
+        }),
+        "skipped",
+    );
+    assert.equal(api.calls.jobs, 1);
+    assert.equal(waits.length, 0);
+});
+
+test("parent admission propagates jobs API errors without waiting", async () => {
+    let jobs = 0,
+        waits = 0;
+    const api = {
+        async request(method, path) {
+            assert.equal(method, "GET");
+            if (path.endsWith("/jobs?per_page=100")) {
+                jobs++;
+                throw Object.assign(new Error("jobs unavailable"), {
+                    status: 503,
+                });
+            }
+            if (path === "/repos/omg-cli/omg/actions/runs/42/attempts/1")
+                return parentMetadata;
+            if (path === "/repos/omg-cli/omg/actions/workflows/ai-review.yml")
+                return parentWorkflow;
+            assert.fail(`Unexpected route ${path}`);
+        },
+    };
+    await assert.rejects(
+        parentPublicationResult(api, "42-1", fixture(), {
+            wait: async () => waits++,
+        }),
+        /jobs unavailable/,
+    );
+    assert.equal(jobs, 1);
+    assert.equal(waits, 0);
+});
