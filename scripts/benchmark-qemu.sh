@@ -1009,6 +1009,44 @@ if [[ "$distro" == debian-trixie ]]; then
 fi
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
+# Fedora mirror metadata fails transiently while GPG, disk and permission
+# failures are permanent. Retry only transport-class failures, keep every
+# attempt log and the first failure, and never report success after a failed
+# evidence copy. No DNF retry option is invented.
+fedora_makecache_class() {
+  local log=$1
+  [[ -r "$log" ]] || return 1
+  if grep -Eqi 'GPG check FAILED|signature verification failed|Public key for .* is not installed|Import of key\(s\) didn.t help|No space left on device|Read-only file system|Disk quota exceeded|Permission denied|Operation not permitted|Status code: 40[134]' "$log"; then
+    printf 'permanent\n'
+    return 0
+  fi
+  if grep -Eqi 'Status code: 5(00|02|03|04)|Curl error \((6|7|28|35|52|56)\)|Connection reset by peer|Connection timed out|Temporary failure in name resolution|Could not resolve host|Network is unreachable|Timeout was reached' "$log"; then
+    printf 'transient\n'
+    return 0
+  fi
+  printf 'permanent\n'
+  return 0
+}
+fedora_makecache() {
+  local attempt rc=0 log
+  for attempt in 1 2 3; do
+    log="evidence/index-update-$attempt.txt"
+    : > "$log" || return 1
+    sudo -n dnf -y makecache > "$log" 2>&1
+    rc=$?
+    if (( rc == 0 )); then
+      cp -- "$log" evidence/index-update.txt || return 1
+      return 0
+    fi
+    if (( attempt == 1 )); then
+      cp -- "$log" evidence/index-update.txt || return 1
+    fi
+    [[ "$(fedora_makecache_class "$log")" == transient ]] || return 1
+    (( attempt < 3 )) || break
+    sleep 5
+  done
+  return 1
+}
 case "$distro" in
   arch) sudo -n pacman -Syu --noconfirm >evidence/arch-system-upgrade.txt 2>&1 || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
   debian|debian-trixie|ubuntu)
@@ -1020,7 +1058,10 @@ case "$distro" in
     sudo -n apt-get update > evidence/index-update.txt 2>&1 || exit 120
     native=(apt-cache --no-all-versions show tree)
     version_cmd=(dpkg-query -W '-f=${Version}\n' tree) ;;
-  fedora) sudo -n dnf -y makecache > evidence/index-update.txt 2>&1 || exit 120; native=(rpm -qi tree); version_cmd=(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' tree) ;;
+  fedora)
+    fedora_makecache || exit 120
+    native=(rpm -qi tree)
+    version_cmd=(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' tree) ;;
 esac
 installed() {
   case "$distro" in arch) pacman -Q tree ;; debian|debian-trixie|ubuntu) [[ $(dpkg-query -W '-f=${Status}' tree 2>/dev/null) == 'install ok installed' ]] ;; fedora) rpm -q tree ;; esac
