@@ -90,6 +90,12 @@ class HealthTests(unittest.TestCase):
                         "Kernel panic - not syncing: resumed guest\n" if serial_fatal
                         else "Linux version 6.12\n"
                     )
+                    if transactions != 0:
+                        (root / "transactions/active-guest.json").write_text(json.dumps(dict(
+                            schema_version=1, state="restored",
+                            serial="transactions/resume-serial.log",
+                            boot_id=("00000000-1111-2222-3333-666666666666" if stale_boot
+                                     else "00000000-1111-2222-3333-555555555555"))))
                     boot = "00000000-1111-2222-3333-555555555555"
                     observed = "00000000-1111-2222-3333-666666666666" if stale_boot else boot
                     (root / "receipt.json").write_text(json.dumps(dict(
@@ -130,6 +136,7 @@ docker() {
                     import shlex
                     setup += f"here={shlex.quote(str(Path(__file__).resolve().parent))}\n"
                     setup += f"transaction_samples={transactions}\n"
+                    setup += f"transaction_producer_started={str(transactions != 0).lower()}\n"
                     setup += f"boot_probe_failure={str(boot_probe_failure).lower()}\n"
                     setup += f"collector_refusal={str(collector_refusal).lower()}\n"
                     setup += f"fixture_python={shlex.quote(sys.executable)}\n"
@@ -145,6 +152,122 @@ docker() {
                                          "QEMU health evidence failed admission: unsupported kernel crash handler: "
                                          "bytes=11 sha256=28526ed217ac6eade404fdec538653f6d2e4d37bf378cb64d1806402aaf7713d\n")
                         self.assertIn("Final guest/controller health failed admission", result.stderr)
+
+    def run_final_driver(self, *, transactions, producer_started, receipt,
+                         original_serial="Linux version 6.12\n",
+                         resume_serial="Linux version 6.12\n",
+                         resume_exists=True,
+                         live_boot="00000000-1111-2222-3333-555555555555", rc=0):
+        if not shutil.which("jq"):
+            self.skipTest("jq validates the active-guest receipt")
+        source = Path(__file__).with_name("benchmark-qemu.sh").read_text()
+        begin = source.index("health_rc=0\n")
+        end = source.index("# Verdict map:", begin)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "guest").mkdir()
+            (root / "transactions").mkdir()
+            (root / "guest/serial.log").write_text(original_serial)
+            if resume_exists:
+                (root / "transactions/resume-serial.log").write_text(resume_serial)
+            if receipt is not None:
+                (root / "transactions/active-guest.json").write_text(json.dumps(receipt))
+            (root / "guest-health.json.fixture").write_text(json.dumps(dict(
+                self.payload, boot_id=live_boot, crash_channel=channel_fixture(live_boot))))
+            import shlex
+            setup = (
+                'set -euo pipefail\n'
+                'work="$PWD"\n'
+                f'here={shlex.quote(str(Path(__file__).resolve().parent))}\n'
+                'controller=fixture\n'
+                f'rc={rc}\n'
+                f'transaction_samples={transactions}\n'
+                f'transaction_producer_started={str(producer_started).lower()}\n'
+                'timeout() { [[ "$1" == --kill-after=* ]] && shift; shift; "$@"; }\n'
+                'docker() {\n'
+                '  if [[ "$1" == inspect ]]; then\n'
+                '    printf \'{"Running":true,"OOMKilled":false,"ExitCode":0}\\n\'\n'
+                '  elif [[ "$*" == *collect* ]]; then\n'
+                '    cat guest-health.json.fixture\n'
+                '  else\n'
+                f'    printf \'%s\\n\' {shlex.quote(live_boot)}\n'
+                '  fi\n'
+                '}\n'
+            )
+            return subprocess.run(
+                ["bash", "-c", setup + source[begin:end] +
+                 '\nprintf "serial=%s\\n" "$health_serial"\nexit "$rc"\n'],
+                cwd=root, capture_output=True, text=True, timeout=10)
+
+    def test_unstarted_transaction_run_inspects_original_boot(self):
+        result = self.run_final_driver(
+            transactions=1, producer_started=False, receipt=None, rc=120,
+            resume_serial="Kernel panic - not syncing: unstarted producer\n")
+        self.assertEqual(result.returncode, 120, result.stderr)
+        self.assertNotIn("Final guest/controller health failed admission", result.stderr)
+        self.assertRegex(result.stdout, r"serial=.*/guest/serial\.log\n")
+        self.assertNotIn("resume-serial.log", result.stdout)
+
+    def test_started_transaction_without_restored_guest_fails_closed(self):
+        boot = "00000000-1111-2222-3333-555555555555"
+        for state, serial, boot_id in (
+            ("original", "guest/serial.log", boot),
+            ("trial", "transactions/trials/install-omg-001/serial.log", boot),
+            ("stopped", None, None),
+        ):
+            with self.subTest(state=state):
+                result = self.run_final_driver(
+                    transactions=1, producer_started=True,
+                    receipt={"schema_version": 1, "state": state,
+                             "serial": serial, "boot_id": boot_id})
+                self.assertEqual(result.returncode, 120, result.stderr)
+                self.assertIn("Final guest/controller health failed admission", result.stderr)
+                self.assertRegex(result.stdout, r"serial=\n")
+
+    def test_restored_receipt_admits_resume_serial_only(self):
+        boot = "00000000-1111-2222-3333-555555555555"
+        result = self.run_final_driver(
+            transactions=1, producer_started=True,
+            receipt={"schema_version": 1, "state": "restored",
+                     "serial": "transactions/resume-serial.log", "boot_id": boot},
+            original_serial="Kernel panic - not syncing: superseded boot\n",
+            live_boot=boot)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"serial=.*/transactions/resume-serial\.log\n")
+
+    def test_restored_receipt_with_missing_serial_fails(self):
+        boot = "00000000-1111-2222-3333-555555555555"
+        result = self.run_final_driver(
+            transactions=1, producer_started=True, resume_exists=False,
+            receipt={"schema_version": 1, "state": "restored",
+                     "serial": "transactions/resume-serial.log", "boot_id": boot},
+            live_boot=boot)
+        self.assertEqual(result.returncode, 120, result.stderr)
+        self.assertIn("Final guest/controller health failed admission", result.stderr)
+
+    def test_restored_receipt_with_stale_boot_fails(self):
+        result = self.run_final_driver(
+            transactions=1, producer_started=True,
+            receipt={"schema_version": 1, "state": "restored",
+                     "serial": "transactions/resume-serial.log",
+                     "boot_id": "00000000-1111-2222-3333-666666666666"})
+        self.assertEqual(result.returncode, 120, result.stderr)
+        self.assertIn("Final guest/controller health failed admission", result.stderr)
+
+    def test_unknown_or_mismatched_receipt_fails_closed(self):
+        boot = "00000000-1111-2222-3333-555555555555"
+        valid = {"schema_version": 1, "state": "restored",
+                 "serial": "transactions/resume-serial.log", "boot_id": boot}
+        variants = (None, dict(valid, schema_version=2), dict(valid, state="unknown"),
+                    dict(valid, serial="guest/serial.log"),
+                    dict(valid, serial="transactions/../guest/serial.log"),
+                    dict(valid, boot_id="not-a-boot"), dict(valid, extra=True),
+                    {key: value for key, value in valid.items() if key != "boot_id"})
+        for receipt in variants:
+            with self.subTest(receipt=receipt):
+                result = self.run_final_driver(
+                    transactions=1, producer_started=True, receipt=receipt)
+                self.assertEqual(result.returncode, 120, result.stderr)
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
