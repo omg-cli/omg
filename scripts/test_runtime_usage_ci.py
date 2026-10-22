@@ -1,10 +1,12 @@
 """Admission and workflow negatives; fixtures do not prove runtime installs."""
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -289,6 +291,151 @@ class AdmissionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'ordinary'):
                     USAGE.initialize(state, {})
             self.assertFalse(state.exists())
+
+
+class OwnerRefreshTests(unittest.TestCase):
+    """Admit-level regressions for the bounded producer metadata refresh."""
+
+    COMMIT = dict(sha='a' * 40, tree=dict(sha='c' * 40), parents=[])
+
+    class Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.sleeps = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    def admitted_bundle(self):
+        base = 'omg-v0.0.0-x86_64-linux-ubuntu'
+        binaries = {'omg': b'omg-binary', 'omgd': b'omgd-binary'}
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode='w:gz') as tar:
+            for name, data in binaries.items():
+                entry = tarfile.TarInfo(base + '/' + name)
+                entry.size = len(data)
+                tar.addfile(entry, io.BytesIO(data))
+        provenance = dict(archive=base + '.tar.gz',
+                          binaries={name: hashlib.sha256(data).hexdigest()
+                                    for name, data in binaries.items()})
+        return provenance, {provenance['archive']: stream.getvalue()}
+
+    def private_state(self, directory):
+        state = Path(directory)
+        (state / 'bin').mkdir()
+        (state / 'evidence').mkdir()
+        return state
+
+    def run_admit(self, state, responses, bundle=None):
+        clock, calls, seen = self.Clock(), [], {}
+
+        def api(path):
+            calls.append(path)
+            if len(calls) > len(responses):
+                raise AssertionError('unexpected metadata read: ' + path)
+            return responses[len(calls) - 1]
+
+        provenance, files = bundle if bundle is not None else (None, None)
+        with patch.object(USAGE, 'checked_state', return_value=EXPECTED), \
+                patch.object(USAGE.native, 'command_output', side_effect=['a' * 40, 'c' * 40]), \
+                patch.object(USAGE.native, 'api_json', side_effect=api), \
+                patch.object(USAGE.native, 'download_artifact', return_value=b'fixture') as download, \
+                patch.object(USAGE.native, 'validate_bundle', return_value=(provenance, files)) as validate, \
+                patch.object(USAGE.time, 'monotonic', clock.monotonic), \
+                patch.object(USAGE.time, 'sleep', clock.sleep):
+            try:
+                USAGE.admit(state, {})
+            except ValueError as error:
+                seen['error'] = error
+        seen.update(clock=clock, calls=calls, download=download, validate=validate)
+        return seen
+
+    def test_pending_owner_refresh_admits_only_after_terminal_success(self):
+        pending = dict(JOB, status='in_progress', conclusion=None)
+        responses = [RUN, self.COMMIT, dict(jobs=[pending]), dict(jobs=[JOB]), RUN,
+                     dict(artifacts=[ARTIFACT]), RUN]
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.private_state(directory)
+            seen = self.run_admit(state, responses, self.admitted_bundle())
+            self.assertNotIn('error', seen)
+            self.assertEqual(seen['clock'].sleeps, [2])
+            self.assertEqual(seen['calls'], [
+                'repos/omg-cli/omg/actions/runs/123',
+                'repos/omg-cli/omg/git/commits/' + 'a' * 40,
+                'repos/omg-cli/omg/actions/runs/123/attempts/1/jobs?per_page=100&page=1',
+                'repos/omg-cli/omg/actions/runs/123/attempts/1/jobs?per_page=100&page=1',
+                'repos/omg-cli/omg/actions/runs/123',
+                'repos/omg-cli/omg/actions/runs/123/artifacts?per_page=100&page=1',
+                'repos/omg-cli/omg/actions/runs/123'])
+            seen['download'].assert_called_once()
+            seen['validate'].assert_called_once()
+            self.assertEqual(sorted(path.name for path in (state / 'bin').iterdir()), ['omg', 'omgd'])
+            admitted = json.loads((state / 'evidence/admission.json').read_text())
+            self.assertEqual(admitted['refreshedProducer'], RUN)
+            self.assertEqual(admitted['provenance']['binaries'],
+                             self.admitted_bundle()[0]['binaries'])
+
+    def test_nonterminal_owner_exhausts_bounded_refresh_without_admission(self):
+        pending = dict(JOB, status='in_progress', conclusion=None)
+        responses = [RUN, self.COMMIT] + [dict(jobs=[pending])] * 8
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.private_state(directory)
+            seen = self.run_admit(state, responses)
+            self.assertIsInstance(seen.get('error'), ValueError, 'exhaustion must fail admission')
+            self.assertRegex(str(seen['error']), 'admission deadline')
+            self.assertGreater(len(seen['clock'].sleeps), 0)
+            self.assertEqual(seen['clock'].sleeps, [2, 4, 8, 8, 8])
+            self.assertLessEqual(sum(seen['clock'].sleeps), USAGE.OWNER_REFRESH_SECONDS)
+            seen['download'].assert_not_called()
+            seen['validate'].assert_not_called()
+            self.assertFalse(any('/artifacts' in path for path in seen['calls']))
+            self.assertFalse((state / 'evidence/admission.json').exists())
+            self.assertEqual(list((state / 'bin').iterdir()), [])
+
+    def test_terminal_failure_owner_is_not_retried(self):
+        pending = dict(JOB, status='in_progress', conclusion=None)
+        failed = dict(JOB, conclusion='failure')
+        responses = [RUN, self.COMMIT, dict(jobs=[pending]), dict(jobs=[failed]), RUN,
+                     dict(artifacts=[ARTIFACT])]
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.private_state(directory)
+            seen = self.run_admit(state, responses)
+            self.assertIsInstance(seen.get('error'), ValueError, 'failed producer must fail admission')
+            self.assertRegex(str(seen['error']), 'did not succeed')
+            self.assertEqual(seen['clock'].sleeps, [2])
+            self.assertEqual(len([path for path in seen['calls'] if '/attempts/' in path]), 2)
+            seen['download'].assert_not_called()
+            seen['validate'].assert_not_called()
+            self.assertEqual(list((state / 'bin').iterdir()), [])
+
+    def test_foreign_missing_or_ambiguous_owner_never_waits(self):
+        pending = dict(JOB, status='in_progress', conclusion=None)
+        cases = [
+            ('foreign Ubuntu producer identity',
+             [RUN, self.COMMIT, dict(jobs=[dict(pending, run_attempt=2)])]),
+            ('foreign Ubuntu producer identity',
+             [RUN, self.COMMIT, dict(jobs=[dict(pending, head_sha='b' * 40)])]),
+            ('foreign Ubuntu producer identity',
+             [RUN, self.COMMIT, dict(jobs=[dict(pending, run_id=124)])]),
+            ('did not succeed',
+             [RUN, self.COMMIT, dict(jobs=[]), dict(artifacts=[ARTIFACT])]),
+            ('ambiguous Ubuntu producer',
+             [RUN, self.COMMIT, dict(jobs=[pending, pending])]),
+        ]
+        for message, responses in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                state = self.private_state(directory)
+                seen = self.run_admit(state, responses)
+                self.assertIsInstance(seen.get('error'), ValueError, 'rejected producer must fail admission')
+                self.assertRegex(str(seen['error']), message)
+                self.assertEqual(seen['clock'].sleeps, [])
+                seen['download'].assert_not_called()
+                seen['validate'].assert_not_called()
+                self.assertEqual(list((state / 'bin').iterdir()), [])
 
 
 class WorkflowTests(unittest.TestCase):
