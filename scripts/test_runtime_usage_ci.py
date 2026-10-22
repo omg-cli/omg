@@ -330,14 +330,39 @@ class OwnerRefreshTests(unittest.TestCase):
         (state / 'evidence').mkdir()
         return state
 
+    @staticmethod
+    def response_route(path):
+        path = path.split('?', 1)[0]
+        if path.endswith('/jobs'):
+            return 'jobs'
+        if path.endswith('/artifacts'):
+            return 'artifacts'
+        if '/git/commits/' in path:
+            return 'commit'
+        return 'run'
+
+    @staticmethod
+    def payload_route(payload):
+        for key in ('jobs', 'artifacts'):
+            if key in payload:
+                return key
+        return 'commit' if 'parents' in payload else 'run'
+
     def run_admit(self, state, responses, bundle=None):
         clock, calls, seen = self.Clock(), [], {}
+        queues = {}
+        for payload in responses:
+            queues.setdefault(self.payload_route(payload), []).append(payload)
+        # Old admit() lists artifacts before it inspects the Ubuntu owner, so
+        # serve a valid listing instead of letting that order look malformed.
+        queues.setdefault('artifacts', [dict(artifacts=[ARTIFACT])])
 
         def api(path):
             calls.append(path)
-            if len(calls) > len(responses):
+            queue = queues.get(self.response_route(path))
+            if not queue:
                 raise AssertionError('unexpected metadata read: ' + path)
-            return responses[len(calls) - 1]
+            return queue.pop(0)
 
         provenance, files = bundle if bundle is not None else (None, None)
         with patch.object(USAGE, 'checked_state', return_value=EXPECTED), \
