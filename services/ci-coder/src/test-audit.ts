@@ -54,6 +54,15 @@ export function createTestAuditProposal(
         originalFault.content,
         proposal.fault.newContent,
     );
+    if (
+        proposal.test.path === proposal.fault.path &&
+        (proposal.test.target !== "lib" ||
+            originalFault.content.split("\n").length !==
+                proposal.fault.newContent.split("\n").length)
+    )
+        throw new Error(
+            "Same-file fault must preserve test line positions and use the library target",
+        );
     return {
         proposal,
         proposalSha256: testAuditDigest(proposal),

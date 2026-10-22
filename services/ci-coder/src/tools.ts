@@ -522,6 +522,8 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         await update((state) => {
           if (![testAudit.proposal.test.path,input.fault.path].every((path) => state.reads.some((read) => read.path === path)))
             throw new Error("Read the test and fault source before proposing strengthening");
+          if (state.verifiedDigests.length >= 2 && !state.verifiedDigests.includes(testAudit.proposalSha256))
+            throw new Error("Coding verification budget exhausted");
           return {...state,testAudit:{proposal:testAudit.proposal,proposalSha256:testAudit.proposalSha256},proposal:undefined,verification:undefined,verificationJob:undefined,verificationHandoff:undefined};
         });
         return output({proposalSha256:testAudit.proposalSha256,handover:testAudit.handover});
