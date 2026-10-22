@@ -139,6 +139,7 @@ export async function executeRustRegression({
     target = "",
 }) {
     const context = preparePortable(workspace, trackedPaths, { home });
+    const phase = path.basename(reportFile, ".json");
     const args = [
         "test",
         ...(existingTest && target === "lib" ? ["--lib"] : ["--test", file.split("/").at(-1).slice(0, -3)]),
@@ -155,7 +156,11 @@ export async function executeRustRegression({
         "cargo",
         args,
         {},
-        { maxOutput: 32 * 1024 * 1024, timeoutMs: 900000 },
+        {
+            maxOutput: 32 * 1024 * 1024,
+            timeoutMs: 900000,
+            label: `${phase}:compile`,
+        },
     );
     const artifact = discoverRustTestArtifact(compiler.stdout, file, { existingTest, target });
     await confinedFile(workspace, path.relative(workspace, artifact.executable));
@@ -164,11 +169,13 @@ export async function executeRustRegression({
         throw new Error("Cargo executable is not a regular owned artifact");
     const executableSha256 = sha256(await readFile(artifact.executable));
     const frozenInputs = await freezeRustInputs(workspace);
-    const listing = await runPortable(context, artifact.executable, [
-        "--list",
-        "--format",
-        "terse",
-    ]);
+    const listing = await runPortable(
+        context,
+        artifact.executable,
+        ["--list", "--format", "terse"],
+        {},
+        { label: `${phase}:catalog` },
+    );
     const catalog = parseRustCatalog(listing.stdout, testName, { existingTest });
     await frozenInputs.assertUnchanged();
     const execution = await runPortable(
@@ -176,7 +183,12 @@ export async function executeRustRegression({
         artifact.executable,
         [testName, "--exact", "--nocapture", "--test-threads=1"],
         {},
-        { timeoutMs: 30000, maxOutput: 1024 * 1024, allowedExitCodes: [0, 101] },
+        {
+            timeoutMs: 30000,
+            maxOutput: 1024 * 1024,
+            allowedExitCodes: [0, 101],
+            label: `${phase}:execute`,
+        },
     );
     if (sha256(await readFile(artifact.executable)) !== executableSha256)
         throw new Error("Executed Rust artifact changed");

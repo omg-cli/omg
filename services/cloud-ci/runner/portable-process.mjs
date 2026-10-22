@@ -209,6 +209,28 @@ function candidatePids() {
     return result;
 }
 
+function boundedDiagnosticText(value, maxBytes) {
+    const ellipsis = "…";
+    const ellipsisBytes = Buffer.byteLength(ellipsis);
+    let text = "";
+    let size = 2;
+
+    for (const character of String(value)) {
+        const escaped = JSON.stringify(character).slice(1, -1);
+        const escapedBytes = Buffer.byteLength(escaped);
+
+        if (size + escapedBytes + ellipsisBytes > maxBytes) {
+            text += ellipsis;
+            break;
+        }
+
+        text += escaped;
+        size += escapedBytes;
+    }
+
+    return `"${text}"`;
+}
+
 export async function runPortable(
     context,
     command,
@@ -219,6 +241,7 @@ export async function runPortable(
         maxOutput = 8 * 1024 * 1024,
         onOutput = () => {},
         allowedExitCodes = [0],
+        label = command,
     } = {},
 ) {
     if (process.platform !== "linux" || process.getuid() !== 0)
@@ -234,7 +257,28 @@ export async function runPortable(
 
     let failure;
     let bytes = 0;
+    const started = Date.now();
     const output = { stdout: [], stderr: [] };
+    const diagnose = (reason) => {
+        const tail = (chunks) =>
+            boundedDiagnosticText(
+                Buffer.concat(chunks).subarray(-2048).toString("utf8"),
+                2048,
+            );
+
+        // Worst case: 256 + 256 + 1024 + 2048 + 2048 plus fixed keys stays under 8192 bytes.
+        return [
+            `${reason}:`,
+            `label=${boundedDiagnosticText(label, 256)}`,
+            `command=${boundedDiagnosticText(command, 256)}`,
+            `args=${boundedDiagnosticText(JSON.stringify(args), 1024)}`,
+            `timeoutMs=${timeoutMs}`,
+            `elapsedMs=${Date.now() - started}`,
+            `bytes=${bytes}`,
+            `stdoutTail=${tail(output.stdout)}`,
+            `stderrTail=${tail(output.stderr)}`,
+        ].join(" ");
+    };
 
     const stop = () => {
         if (child.pid) {
@@ -268,7 +312,7 @@ export async function runPortable(
             bytes += chunk.length;
 
             if (bytes > maxOutput) {
-                failure = new Error("Portable output exceeded byte budget");
+                failure = new Error(diagnose("Portable output exceeded byte budget"));
                 stop();
             } else {
                 output[name].push(chunk);
@@ -277,7 +321,7 @@ export async function runPortable(
         });
 
     const timer = setTimeout(() => {
-        failure = new Error("Portable command timed out");
+        failure = new Error(diagnose("Portable command timed out"));
         stop();
     }, timeoutMs);
 
