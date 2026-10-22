@@ -150,7 +150,7 @@ test('retention failure reschedules and keeps the fence', async () => {
   expect(ctx.storage.alarms).toHaveLength(1);
   const delay = ctx.storage.alarms[0]! - Date.now();
   expect(delay).toBeGreaterThan(59_000); expect(delay).toBeLessThanOrEqual(60_000);
-  await expect(s.startProcess('true', { env: { OMG_CI_LEAF_STEP: 'script-contracts' } })).rejects.toThrow('Runner teardown refuses container start');
+  await expect(Promise.resolve().then(() => s.startProcess('true', { env: { OMG_CI_LEAF_STEP: 'script-contracts' } }))).rejects.toThrow('Runner teardown refuses container start');
 });
 
 test('active owner delegates without fencing', async () => {
