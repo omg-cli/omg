@@ -128,11 +128,15 @@ for (const modes of [
     "process-retry-nonretryable",
     "process-retry-exhausted",
     "process-retry-missing",
+  ],
+  [
     "process-retry-identity",
     "process-missing",
     "process-read-failure",
     "process-read-hang",
     "process-read-late",
+  ],
+  [
     "plain-process",
     "process-timeout",
     "process-unknown",
