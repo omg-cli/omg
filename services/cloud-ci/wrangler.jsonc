@@ -11,7 +11,7 @@
   "containers": [
     {
       "class_name": "CiSandbox",
-      "image": "registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci@sha256:dfb7e0d31575c26da7aec6bdb0558694962437158df2f55baad7a3bab3711d91",
+      "image": "registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci@sha256:22c2f3c4cc5dc6d895bcb7a60e095c11de9fd2fde50289432ae0967d465f0740",
       "max_instances": 2,
       "instance_type": "standard-4",
       "rollout_step_percentage": 100,
@@ -22,8 +22,8 @@
   "workflows": [{ "name": "omg-cloud-ci", "binding": "CI_WORKFLOW", "class_name": "CI" }],
   "r2_buckets": [{ "binding": "BACKUP_BUCKET", "bucket_name": "omg-ci-private" }],
   "vars": {
-    "CI_VERIFIER_REVISION": "a378030f0718b099431f8dcf4ffaeae4286bd158",
-    "CI_IMAGE_DIGEST": "sha256:dfb7e0d31575c26da7aec6bdb0558694962437158df2f55baad7a3bab3711d91",
+    "CI_VERIFIER_REVISION": "f1d5a4b505551161b4bd1569bbaf919d04ab7f51",
+    "CI_IMAGE_DIGEST": "sha256:22c2f3c4cc5dc6d895bcb7a60e095c11de9fd2fde50289432ae0967d465f0740",
     "BACKUP_BUCKET_NAME": "omg-ci-private",
     "CLOUDFLARE_ACCOUNT_ID": "f1e95b3e1b502cf366dfc81a863695fa",
     "SENTRY_ORG_SLUG": "pyro112189",

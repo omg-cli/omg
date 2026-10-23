@@ -56,6 +56,15 @@ set_result() {
     "$output/results.json" > "$output/results.next.json" || return "$?"
   mv "$output/results.next.json" "$output/results.json" || return "$?"
 }
+write_active_guest() {
+  local state=$1 serial=$2 boot=$3
+  jq -n --arg state "$state" --arg serial "$serial" --arg boot "$boot" \
+    '{schema_version:1,state:$state,
+      serial:(if $serial=="" then null else $serial end),
+      boot_id:(if $boot=="" then null else $boot end)}' \
+    > "$output/active-guest.json.next" || return 1
+  mv -- "$output/active-guest.json.next" "$output/active-guest.json" || return 1
+}
 finish() {
   local code=$?
   trap - EXIT
@@ -149,12 +158,12 @@ stop_guest() {
   remote_argv sudo -n sync
   remote_argv sudo -n systemctl poweroff || true
   for ((attempt=0;attempt<120;attempt++)); do
-    if [[ ! -r "/proc/$pid/stat" ]]; then rm -f qemu.pid; return 0; fi
+    if [[ ! -r "/proc/$pid/stat" ]]; then rm -f qemu.pid; write_active_guest stopped "" "" || return 1; return 0; fi
     if ! state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null); then
-      if [[ ! -e "/proc/$pid" ]]; then rm -f qemu.pid; return 0; fi
+      if [[ ! -e "/proc/$pid" ]]; then rm -f qemu.pid; write_active_guest stopped "" "" || return 1; return 0; fi
       sleep 1; continue
     fi
-    if [[ "$state" == Z || "$state" == X ]]; then rm -f qemu.pid; return 0; fi
+    if [[ "$state" == Z || "$state" == X ]]; then rm -f qemu.pid; write_active_guest stopped "" "" || return 1; return 0; fi
     sleep 1
   done
   printf 'QEMU did not stop; refusing to snapshot an active image\n' >&2
@@ -248,6 +257,7 @@ verify_preparation_health() {
 # not described as cold, and no guest boot or SSH time enters Hyperfine.
 preparation_step=remove-boot-identity
 remote_argv cat /proc/sys/kernel/random/boot_id > "$output/prepare-remove-boot-id.txt"
+write_active_guest original guest/serial.log "$(<"$output/prepare-remove-boot-id.txt")" || exit 1
 preparation_step=automatic-updates
 case "$distro" in
   debian|debian-trixie|ubuntu)
@@ -285,6 +295,7 @@ preparation_step=prepare-install-boot
 start_clone "$disks/prepare-install.qcow2" "$disks/prepare-vars.fd" "$output/prepare-install-serial.log" "$output/prepare-install-boot.log"
 preparation_step=install-boot-identity
 remote_argv cat /proc/sys/kernel/random/boot_id > "$output/prepare-install-boot-id.txt"
+write_active_guest trial transactions/prepare-install-serial.log "$(<"$output/prepare-install-boot-id.txt")" || exit 1
 preparation_step=prepare-install
 native_change remove > "$output/prepare-install.log" 2>&1
 preparation_step=install-repository-state
@@ -322,6 +333,7 @@ for operation in install remove; do
         printf 'Repeated boot identity: reset not proven\n' >&2; exit 1
       fi
       printf '%s\n' "$boot_id" >> "$output/boot-ids.txt"
+      write_active_guest trial "transactions/trials/$current_id/serial.log" "$boot_id" || exit 1
       jq --arg id "$current_id" --arg boot "$boot_id" --arg digest "$digest" \
         'map(if .id==$id then .boot_id=$boot | .base_sha256=$digest else . end)' \
         "$output/results.json" > "$output/results.next.json"
@@ -394,6 +406,9 @@ phase=restore
 qemu-img create -f qcow2 -F qcow2 -b "$disks/install-base.qcow2" "$disks/resume.qcow2" > "$output/resume-disk.log"
 if [[ "${boot_args[0]}" == uefi ]]; then cp "$disks/install-vars.fd" "$disks/resume.fd"; fi
 start_clone "$disks/resume.qcow2" "$disks/resume.fd" "$output/resume-serial.log" "$output/resume-boot.log"
+resume_boot_id=$(remote_argv cat /proc/sys/kernel/random/boot_id)
+[[ "$resume_boot_id" =~ ^[0-9a-f-]{36}$ ]] || exit 1
+write_active_guest restored transactions/resume-serial.log "$resume_boot_id" || exit 1
 phase=complete
 jq -e --argjson expected "$((samples*4))" \
   'length==$expected and all(.[];.result=="PASS") and ([.[].boot_id]|unique|length)==$expected' \

@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
 import type * as Workers from "@cloudflare/workers-types/index.ts";
-import { retainRunnerLog, retainUnitReport } from "../src/unit-report-retention";
+import {
+  releaseTerminalOwner,
+  retainRunnerLog,
+  retainSandboxEvidence,
+  retainUnitReport,
+} from "../src/unit-report-retention";
 import { candidateReportStatus } from "../runner/unit-report-evidence.mjs";
 
 declare const ReadableStream: typeof Workers.ReadableStream;
@@ -206,4 +211,161 @@ test("raw runner log admission rejects invalid metadata and unsafe files before 
     expect(f.reads()).toBe(0);
     expect(f.writes).toEqual([]);
   }
+});
+
+function logFixture(type: "file" | "symlink", size = report.length) {
+  const f = fixture(type, size);
+
+  return {
+    ...f,
+    sandbox: {
+      ...f.sandbox,
+      async listFiles(directory: string) {
+        expect(directory).toBe("/tmp");
+        const listing = await f.sandbox.listFiles();
+        const base = listing.files[0]!;
+
+        return {
+          ...listing,
+          files: ["out", "err"].map((stream) => ({
+            ...base,
+            name: `ci-step.${stream}`,
+            absolutePath: `/tmp/ci-step.${stream}`,
+            relativePath: `ci-step.${stream}`,
+          })),
+        };
+      },
+    },
+  };
+}
+
+test("terminal release keeps the container when actual runner-log retention is unsafe", async () => {
+  const f = logFixture("symlink");
+  const owner = `${id}-ta-${"b".repeat(16)}`;
+  let destroyed = 0;
+
+  await expect(
+    releaseTerminalOwner({
+      readOwner: async () => owner,
+      lookup: async (instanceId) => ({ id: instanceId, status: "complete" }),
+      retain: () =>
+        retainSandboxEvidence(
+          { diagnosticRunId: owner, leafStep: "test-audit-four-state" },
+          f.sandbox,
+          () => f.sandbox.readReport(),
+          f.bucket,
+        ),
+      destroy: async () => {
+        destroyed++;
+      },
+      delegate: async () => {},
+      warn: () => {},
+    }),
+  ).rejects.toThrow("runner-log:stdout:unsafe");
+
+  expect(destroyed).toBe(0);
+  expect(f.writes).toEqual([]);
+});
+
+test("terminal release keeps the container when an existing report is unsafe", async () => {
+  const f = fixture("symlink", 1);
+  const owner = `${id}-v-${"b".repeat(16)}`;
+  let destroyed = 0;
+
+  await expect(
+    releaseTerminalOwner({
+      readOwner: async () => owner,
+      lookup: async (instanceId) => ({ id: instanceId, status: "errored" }),
+      retain: () =>
+        retainSandboxEvidence({ reportRunId: owner }, f.sandbox, () => f.sandbox.readReport(), f.bucket),
+      destroy: async () => {
+        destroyed++;
+      },
+      delegate: async () => {},
+      warn: () => {},
+    }),
+  ).rejects.toThrow("unit-report:unsafe");
+
+  expect(destroyed).toBe(0);
+});
+
+test("terminal release never deletes an owner reassigned while the workflow lookup is pending", async () => {
+  const f = fixture();
+  const owner = `${id}-v-${"b".repeat(16)}`;
+  const replacement = `${id}-v-${"c".repeat(16)}`;
+  let ownerReads = 0;
+  let destroyed = 0;
+  let delegated = 0;
+
+  const result = await releaseTerminalOwner({
+    readOwner: async () => (++ownerReads === 1 ? owner : replacement),
+    lookup: async (instanceId) => {
+      await Promise.resolve();
+
+      return { id: instanceId, status: "complete" };
+    },
+    retain: () =>
+      retainSandboxEvidence({ reportRunId: owner }, f.sandbox, () => f.sandbox.readReport(), f.bucket),
+    destroy: async () => {
+      destroyed++;
+    },
+    delegate: async () => {
+      delegated++;
+    },
+    warn: () => {},
+  });
+
+  expect(result).toBe("retained-owner-changed");
+  expect(destroyed).toBe(0);
+  expect(delegated).toBe(1);
+});
+
+test("terminal release preserves a live owner without retaining or deleting", async () => {
+  const f = fixture();
+  const owner = `${id}-v-${"b".repeat(16)}`;
+  let destroyed = 0;
+  let delegated = 0;
+
+  const result = await releaseTerminalOwner({
+    readOwner: async () => owner,
+    lookup: async (instanceId) => ({ id: instanceId, status: "running" }),
+    retain: () =>
+      retainSandboxEvidence({ reportRunId: owner }, f.sandbox, () => f.sandbox.readReport(), f.bucket),
+    destroy: async () => {
+      destroyed++;
+    },
+    delegate: async () => {
+      delegated++;
+    },
+    warn: () => {},
+  });
+
+  expect(result).toBe("retained-active");
+  expect(destroyed).toBe(0);
+  expect(delegated).toBe(1);
+  expect(f.writes).toEqual([]);
+});
+
+test("terminal release destroys only after actual retention saves the report", async () => {
+  const f = fixture();
+  const owner = `${id}-v-${"b".repeat(16)}`;
+  let destroyed = 0;
+
+  const result = await releaseTerminalOwner({
+    readOwner: async () => owner,
+    lookup: async (instanceId) => ({ id: instanceId, status: "complete" }),
+    retain: () =>
+      retainSandboxEvidence({ reportRunId: owner }, f.sandbox, () => f.sandbox.readReport(), f.bucket),
+    destroy: async () => {
+      destroyed++;
+    },
+    delegate: async () => {
+      throw new Error("delegate must not run");
+    },
+    warn: () => {},
+  });
+
+  expect(result).toBe("released");
+  expect(destroyed).toBe(1);
+  expect(f.writes.map((write) => write.key)).toEqual([`reports/${owner}/portable-units.xml`]);
 });

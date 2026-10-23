@@ -31,14 +31,15 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d81e765fc 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
-@@ -1,3 +1,6 @@
+@@ -1,3 +1,7 @@
 +import type * as Workers from "@cloudflare/workers-types/index.ts";
++import { OperationInterruptedError } from "@cloudflare/sandbox";
 +type ReadableStream<R> = Workers.ReadableStream<R>;
 +declare const ReadableStream: typeof Workers.ReadableStream;
  // Copyright (c) 2026 Cloudflare, Inc.
  // SPDX-License-Identifier: Apache-2.0
 
-@@ -86,8 +89,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -86,8 +90,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
            autoCleanup: false,
          }
        );
@@ -58,7 +59,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d
        );
        const preview = await readPreviews(sandbox);
 
-@@ -102,13 +114,13 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -102,13 +115,13 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          ttl: input.ttlSeconds,
          localBucket,
        });
@@ -74,7 +75,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d
        }
 
        let remainingStreams = streams.length;
-@@ -133,6 +145,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -133,6 +146,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
          },
          preview,
          snapshot,
@@ -82,7 +83,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d
        };
      } finally {
        if (!cleanupTransferredToStreams) {
-@@ -142,14 +155,70 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
+@@ -142,14 +156,81 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
    }
  }
 
@@ -96,26 +97,37 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d
 +  let missing = 0;
 +  let lastStatus = 'unobserved';
 +  const timedOut = () => new Error(`CI process completion timed out (polls=${polls}, missing=${missing}, lastStatus=${lastStatus})`);
++  const retryLimit = 2;
 +  for (;;) {
-+    const remaining = deadline - Date.now();
-+    if (remaining <= 0) throw timedOut();
-+    let timer: ReturnType<typeof setTimeout> | undefined;
-+    polls++;
-+    const process = await Promise.race([
-+      sandbox.getProcess(id).then(process => {
-+        try {
-+          return process ? { id: process.id, status: process.status, exitCode: process.exitCode } : null;
-+        } finally {
-+          if (process && Symbol.dispose in process) {
-+            const dispose = process[Symbol.dispose];
-+            if (typeof dispose === 'function') dispose.call(process);
-+          }
++    let process: { id: string; status: string; exitCode: number | null | undefined } | null = null;
++    for (let attempt = 0; ; attempt++) {
++      const remaining = deadline - Date.now();
++      if (remaining <= 0) throw timedOut();
++      let timer: ReturnType<typeof setTimeout> | undefined;
++      polls++;
++      try {
++        process = await Promise.race([
++          sandbox.getProcess(id).then(process => {
++            try {
++              return process ? { id: process.id, status: process.status, exitCode: process.exitCode } : null;
++            } finally {
++              if (process && Symbol.dispose in process) {
++                const dispose = process[Symbol.dispose];
++                if (typeof dispose === 'function') dispose.call(process);
++              }
++            }
++          }),
++          new Promise<never>((_, reject) => {
++            timer = setTimeout(() => reject(timedOut()), remaining);
++          }),
++        ]).finally(() => clearTimeout(timer));
++        break;
++      } catch (error) {
++        if (!(error instanceof OperationInterruptedError) || error.context.retryable !== true || attempt >= retryLimit) {
++          throw error;
 +        }
-+      }),
-+      new Promise<never>((_, reject) => {
-+        timer = setTimeout(() => reject(timedOut()), remaining);
-+      }),
-+    ]).finally(() => clearTimeout(timer));
++      }
++    }
 +    if (Date.now() > deadline) throw timedOut();
 +    if (process) {
 +      if (process.id !== id) throw new Error(`CI process identity unavailable (expected ${typeof id}, received ${typeof process.id})`);
@@ -155,7 +167,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d
    };
  }
 
-@@ -159,7 +228,7 @@ async function readLog(
+@@ -159,7 +240,7 @@ async function readLog(
    size: number
  ): Promise<string | ReadableStream<Uint8Array>> {
    if (size > INLINE_LOG_BYTES) {
@@ -164,7 +176,7 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d
    }
    return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
  }
-@@ -203,26 +272,21 @@ function withCleanup(
+@@ -203,26 +284,21 @@ function withCleanup(
    release: () => Promise<void>
  ) {
    const reader = stream.getReader();
@@ -238,7 +250,7 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a5488
                ...runContext,
                label: options.name,
                attempt: ctx.attempt,
-@@ -160,15 +161,21 @@ export abstract class CIWorkflow<
+@@ -160,15 +161,33 @@ export abstract class CIWorkflow<
                cachePaths: options.cache?.inputs,
                env: options.env,
                secrets: options.secrets,
@@ -247,11 +259,23 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a5488
 -          .then((output) =>
 -            Object.freeze({
 +            });
-+            return persistLogs(
++            const stored = await persistLogs(
 +              this.env.BACKUP_BUCKET,
 +              `logs/${event.instanceId}/native/${crypto.randomUUID()}`,
 +              output
 +            );
++            try {
++              console.log(JSON.stringify({
++                event: 'ci-checkpoint-reached',
++                step: options.name.slice(0, 64),
++                stdout: typeof stored.logs.stdout === 'string' ? 'inline' : 'r2',
++                stderr: typeof stored.logs.stderr === 'string' ? 'inline' : 'r2',
++                snapshot: stored.snapshot != null,
++              }));
++            } catch {
++              console.error('ci-checkpoint-telemetry-failed');
++            }
++            return stored;
 +          })
 +          .then(async (stored) => {
 +            const output = await restoreLogs(this.env.BACKUP_BUCKET, stored);

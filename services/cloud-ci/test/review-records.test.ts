@@ -154,3 +154,69 @@ test("missing and corrupt stored records cannot become successful reports", asyn
   f.records.set("reviews/123-1/review.json", JSON.stringify({ ...envelope, runId: "456" }));
   expect((await f.send()).status).toBe(503);
 });
+
+const intent = {
+  repository: "omg-cli/omg",
+  kind: "admission-retry-intent",
+  runId: "123",
+  attempt: "1",
+  ownerRunId: "500",
+  ownerAttempt: "1",
+  parent: "99-1",
+  sha: "a".repeat(40),
+  cursor: 18,
+  controllerRevision: "d".repeat(40),
+  manifestDigest: "c".repeat(64),
+};
+
+const sendIntent = (f: ReturnType<typeof fixture>, body?: string) =>
+  reviewRecords(
+    new Request("https://fixture.test/review-records/123-1/recovery-intent", {
+      method: body === undefined ? "GET" : "POST",
+      body,
+    }),
+    f.bucket,
+  );
+
+test("recovery intent is claimed once, reported with its creation flag, and never becomes a report", async () => {
+  const f = fixture();
+  expect((await sendIntent(f)).status).toBe(404);
+  expect((await sendIntent(f, JSON.stringify({ ...intent, extra: true }))).status).toBe(400);
+  expect((await sendIntent(f, JSON.stringify({ ...intent, attempt: "2" }))).status).toBe(400);
+  const created = await sendIntent(f, JSON.stringify(intent));
+  expect(created.status).toBe(200);
+  expect(await created.json()).toEqual({ stored: true, created: true });
+  expect([...f.records.keys()]).toEqual(["reviews/123-1/recovery-intent.json"]);
+  expect(await (await sendIntent(f)).json()).toEqual(intent);
+  const repeated = await sendIntent(f, JSON.stringify(intent));
+  expect(repeated.status).toBe(200);
+  expect(await repeated.json()).toEqual({ stored: true, created: false });
+  expect((await sendIntent(f, JSON.stringify({ ...intent, ownerRunId: "501" }))).status).toBe(409);
+  expect((await f.send()).status).toBe(404);
+});
+
+test("concurrent identical recovery intents elect exactly one creator", async () => {
+  const f = fixture();
+  const responses = await Promise.all([
+    sendIntent(f, JSON.stringify(intent)),
+    sendIntent(f, JSON.stringify(intent)),
+  ]);
+  expect(responses.map((response) => response.status)).toEqual([200, 200]);
+  const bodies = await Promise.all(responses.map((response) => response.json()));
+  expect(bodies).toHaveLength(2);
+  expect(bodies).toEqual(
+    expect.arrayContaining([
+      { stored: true, created: true },
+      { stored: true, created: false },
+    ]),
+  );
+  expect(f.records.size).toBe(1);
+});
+
+test("review records stay stored-only while intents report creation", async () => {
+  const f = fixture();
+  const first = await f.send(JSON.stringify(envelope));
+  const second = await f.send(JSON.stringify(envelope));
+  expect(await first.json()).toEqual({ stored: true });
+  expect(await second.json()).toEqual({ stored: true });
+});

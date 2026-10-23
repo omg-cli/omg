@@ -179,6 +179,43 @@ def fetch_pages(path, key):
     raise ValueError('API pagination exceeds bound')
 
 
+# GitHub job metadata can lag a producer that already completed, so the
+# consumer re-reads only this attempt's listing while its sole Ubuntu owner
+# is nonterminal. The wait is bounded inside the existing 60s admission step.
+# Terminal failure, foreign identity, ambiguity or exhaustion never admits.
+OWNER_REFRESH_SECONDS = 30
+OWNER_REFRESH_MAX_DELAY = 8
+NONTERMINAL_JOB_STATUSES = ('queued', 'in_progress', 'waiting', 'pending', 'requested')
+
+
+def await_owner(path, expected):
+    deadline = time.monotonic() + OWNER_REFRESH_SECONDS
+    delay = 2
+    waited = False
+    while True:
+        jobs = fetch_pages(path + '/attempts/' + str(expected['attempt']) + '/jobs', 'jobs')
+        owners = [job for job in jobs if job.get('name') == 'Linux (ubuntu)']
+        require(len(owners) <= 1, 'ambiguous Ubuntu producer')
+        if owners:
+            owner = owners[0]
+            require(owner.get('run_id') == expected['run']
+                    and owner.get('run_attempt') == expected['attempt']
+                    and owner.get('head_sha') == expected['api_head'],
+                    'foreign Ubuntu producer identity')
+            if owner.get('status') != 'completed':
+                require(owner.get('status') in NONTERMINAL_JOB_STATUSES,
+                        'unsupported Ubuntu producer status')
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, 'Ubuntu producer still nonterminal at the admission deadline')
+                time.sleep(min(delay, remaining))
+                delay = min(OWNER_REFRESH_MAX_DELAY, delay * 2)
+                waited = True
+                continue
+        if waited:
+            validate_run(native.api_json(path), expected)
+        return jobs
+
+
 def admit(state, context):
     expected = checked_state(state, context)
     inputs_path = state / 'evidence/admission-inputs.json'
@@ -213,7 +250,7 @@ def admit(state, context):
     inputs['checkoutTree'] = checkout_tree
     write_json(inputs_path, inputs)
     validate_commit(commit, expected, checkout_tree)
-    jobs = fetch_pages(path + '/attempts/' + str(expected['attempt']) + '/jobs', 'jobs')
+    jobs = await_owner(path, expected)
     artifacts = fetch_pages(path + '/artifacts', 'artifacts')
     artifact = select_artifact(artifacts, jobs, expected)
     recipe = dict(repository=expected['repository'], source_sha=expected['source'],

@@ -2,7 +2,75 @@ import assert from "node:assert/strict";
 import { test } from "bun:test";
 import { admitCoderResult } from "../../scripts/ai-coder-client.mjs";
 import { proposalDigest } from "../../scripts/ai-review-publication.mjs";
-import { operationIdentity } from "../../services/ci-coder/src/request.ts";
+import { operationIdentity, parseCodingRequest } from "../../services/ci-coder/src/request.ts";
+import { testAuditProofFixture } from "./fixtures/test-audit-proof.mjs";
+
+function auditFixture() {
+    const proof = testAuditProofFixture();
+    const base = fixture();
+    const { proposal } = proof;
+    const request = parseCodingRequest({
+        ...base.request,
+        source: {
+            ...base.request.source,
+            changedPaths: [],
+            auditPaths: [proposal.test.path, proposal.fault.path],
+            diff: "",
+            ciFailures: [],
+            sourceFiles: [
+                { path: proposal.test.path, content: proposal.test.originalContent, blobSha: proposal.test.originalBlobSha },
+                { path: proposal.fault.path, content: proof.production, blobSha: proposal.fault.originalBlobSha },
+            ],
+        },
+        testAuditTask: {
+            path: proposal.test.path,
+            testName: proposal.test.testName,
+            originalBlobSha: proposal.test.originalBlobSha,
+        },
+    });
+    const digest = proof.receipt.testAuditReceipt.proposalSha256;
+    const id = `cl-42-1-${request.sha}-ta-${digest.slice(0, 16)}`;
+    const continuationId = `cv-42-1-${request.sha}-${digest.slice(0, 16)}`;
+    const response = {
+        ...base.response,
+        ...request,
+        id: operationIdentity(request),
+        result: {
+            ...base.response.result,
+            reads: [{ path: proposal.test.path, start: 1, end: 1 }],
+            testAudit: { proposal, proposalSha256: digest },
+            verification: { proposalSha256: digest, id, receipt: {} },
+            verificationJob: { ...base.response.result.verificationJob, id, proposalSha256: digest, continuationId, status: "verified" },
+        },
+        initialOperation: { operationId: operationIdentity(request), status: "done" },
+        continuation: { ...base.response.continuation, operationId: continuationId, parentOperationId: operationIdentity(request), proposalSha256: digest, verificationId: id },
+    };
+    delete response.result.proposal;
+    return { request, policy: base.policy, response, digest };
+}
+
+test("existing-test audit admission binds the exact audit proposal and only the exact failed continuation reason", () => {
+    const { request, policy, response, digest } = auditFixture();
+    assert.equal(admitCoderResult(response, request, policy).proposalSha256, digest);
+    const failed = structuredClone(response);
+    delete failed.result.verification;
+    failed.result.verificationJob.status = "failed";
+    failed.result.verificationJob.reason = "audit verifier rejected the fault marker";
+    assert.throws(() => admitCoderResult(failed, request, policy), /audit verifier rejected the fault marker/);
+    for (const mutate of [
+        (value) => { value.result.verificationJob.id = "other"; },
+        (value) => { value.result.verificationJob.proposalSha256 = "0".repeat(64); },
+        (value) => { value.result.verificationJob.sessionId = "other"; },
+        (value) => { value.result.verificationJob.continuationId = "other"; },
+    ]) {
+        const changed = structuredClone(failed);
+        mutate(changed);
+        assert.throws(
+            () => admitCoderResult(changed, request, policy),
+            (error) => !String(error.message).includes("audit verifier rejected the fault marker"),
+        );
+    }
+});
 
 function fixture() {
     const request = {
@@ -185,4 +253,48 @@ test("coding proposals require the actual completed continuation of the verified
     delete noFinding.result.verificationJob;
     delete noFinding.continuation;
     assert.equal(admitCoderResult(noFinding, request, policy), null);
+});
+
+test("coding admission surfaces the exact failed verification reason for the active proposal", () => {
+    const { request, policy, response } = fixture();
+    const failed = structuredClone(response);
+    delete failed.result.verification;
+    failed.result.verificationJob.status = "failed";
+    failed.result.verificationJob.reason =
+        "Automatic repairs cannot change existing Rust tests";
+    assert.throws(
+        () => admitCoderResult(failed, request, policy),
+        /Automatic repairs cannot change existing Rust tests/,
+    );
+});
+
+test("coding admission does not attribute a forged or stale failed job to the active proposal", () => {
+    const { request, policy, response } = fixture();
+    for (const mutate of [
+        (value) => {
+            value.result.verificationJob.id = "other";
+        },
+        (value) => {
+            value.result.verificationJob.proposalSha256 = "0".repeat(64);
+        },
+        (value) => {
+            value.result.verificationJob.sessionId = "other";
+        },
+        (value) => {
+            value.result.verificationJob.continuationId = "other";
+        },
+        (value) => {
+            value.continuation.operationId = "other";
+        },
+    ]) {
+        const changed = structuredClone(response);
+        delete changed.result.verification;
+        changed.result.verificationJob.status = "failed";
+        changed.result.verificationJob.reason = "stale failed reason";
+        mutate(changed);
+        assert.throws(
+            () => admitCoderResult(changed, request, policy),
+            (error) => !String(error.message).includes("stale failed reason"),
+        );
+    }
 });

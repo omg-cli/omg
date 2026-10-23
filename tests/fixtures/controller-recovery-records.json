@@ -1,0 +1,109 @@
+{
+  "parent": {
+    "repository": "omg-cli/omg",
+    "sha": "1ab1494c81890facb179586b62acbe0128016a99",
+    "branch": "main",
+    "baseSha": "1ab1494c81890facb179586b62acbe0128016a99",
+    "batches": [],
+    "campaignParent": "39866608722-1",
+    "campaignRun": {
+      "attempt": "1",
+      "runId": "39866923977"
+    },
+    "candidateOutcomes": [],
+    "controllerRevision": "1ab1494c81890facb179586b62acbe0128016a99",
+    "coverageMeaning": "Historical backlog names were reconciled to exact current file candidates. Only independently admitted exact test/fault execution earns bounded sensitivity credit. Held rows remain unresolved.",
+    "formatting": {
+      "attempt": "3",
+      "conclusion": "failure",
+      "ref": "refs/heads/main",
+      "runId": "39808913262",
+      "sha": "1ab1494c81890facb179586b62acbe0128016a99",
+      "sourceFormat": {
+        "audit": null,
+        "exitCode": 0,
+        "name": "source-format",
+        "reports": [],
+        "stderrKey": "logs/cl-39808913262-3-1ab1494c81890facb179586b62acbe0128016a99/source-format.stderr",
+        "stderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdoutKey": "logs/cl-39808913262-3-1ab1494c81890facb179586b62acbe0128016a99/source-format.stdout",
+        "stdoutSha256": "2732d4411bb14cec5d0e90464ebeddde71d9ad1629dbad95b8e6ddcb9ce03220",
+        "verification": null
+      },
+      "status": "passed"
+    },
+    "publications": [],
+    "publishRequested": true,
+    "readPaths": [],
+    "sourceRange": {
+      "cursor": 61,
+      "inventoryDigest": "7772884734180b4fff99af3a93310fcb43067e7bd01212ae519fc010c73c038e",
+      "kind": "test-audit",
+      "manifestDigest": "3871d9de952fc615ac914f45265ac94497d4a6b1f4b48ed325fd20618a53ba54",
+      "nextCursor": 62,
+      "pagePaths": 1,
+      "pageSize": 1,
+      "sha": "1ab1494c81890facb179586b62acbe0128016a99",
+      "totalPaths": 1233
+    },
+    "status": "reviewed",
+    "suppliedPaths": [
+      "tests/debian_tests.rs"
+    ],
+    "testAuditOutcomes": [
+      {
+        "id": "test:debian_tests#apt_integration::test_update_check_no_updates_when_current",
+        "status": "no-supported-strengthening"
+      }
+    ],
+    "testAudits": [],
+    "triggerSha": "1ab1494c81890facb179586b62acbe0128016a99",
+    "unreviewedPaths": []
+  },
+  "priorChild": {
+    "repository": "omg-cli/omg",
+    "sha": "1ab1494c81890facb179586b62acbe0128016a99",
+    "branch": "main",
+    "baseSha": "1ab1494c81890facb179586b62acbe0128016a99",
+    "batches": [],
+    "campaignParent": "39866923977-1",
+    "campaignRun": {
+      "attempt": "1",
+      "runId": "39871147004"
+    },
+    "candidateOutcomes": [],
+    "controllerRevision": "1ab1494c81890facb179586b62acbe0128016a99",
+    "coverageMeaning": "Source inventory was collected, but model review was blocked because formatting evidence was not admitted.",
+    "formatting": {
+      "attempt": "3",
+      "reason": "source-format-evidence-unavailable-or-rejected",
+      "ref": "refs/heads/main",
+      "runId": "39808913262",
+      "sha": "1ab1494c81890facb179586b62acbe0128016a99",
+      "status": "blocked"
+    },
+    "publications": [],
+    "publishRequested": true,
+    "readPaths": [],
+    "sourceRange": {
+      "cursor": 62,
+      "inventoryDigest": "7772884734180b4fff99af3a93310fcb43067e7bd01212ae519fc010c73c038e",
+      "kind": "test-audit",
+      "manifestDigest": "3871d9de952fc615ac914f45265ac94497d4a6b1f4b48ed325fd20618a53ba54",
+      "nextCursor": 63,
+      "pagePaths": 1,
+      "pageSize": 1,
+      "sha": "1ab1494c81890facb179586b62acbe0128016a99",
+      "totalPaths": 1233
+    },
+    "status": "format-blocked",
+    "suppliedPaths": [],
+    "triggerSha": "1ab1494c81890facb179586b62acbe0128016a99",
+    "unreviewedPaths": [
+      {
+        "path": "tests/debian_tests.rs",
+        "reason": "source-format-blocked"
+      }
+    ]
+  }
+}

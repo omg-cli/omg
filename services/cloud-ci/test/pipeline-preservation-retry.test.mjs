@@ -87,7 +87,7 @@ export default {async fetch(request,env){
             build.onResolve({ filter: /^@cloudflare\/sandbox$/ }, () => ({ path: "sandbox", namespace: "fixture-base" }));
             build.onResolve({ filter: /^cloudflare:workers$/ }, () => ({ path: "base", namespace: "fixture-base" }));
             build.onLoad({ filter: /.*/, namespace: "fixture-base" }, ({ path }) => ({
-                contents: path === "sandbox" ? "export const getSandbox=()=>{throw new Error('Unexpected container call in preservation fixture')};"
+                contents: path === "sandbox" ? "export const getSandbox=()=>{throw new Error('Unexpected container call in preservation fixture')};export class OperationInterruptedError extends Error{constructor(context){super('fixture operation interrupted');this.name='OperationInterruptedError';this.context=context;}}"
                     : "export class WorkflowEntrypoint{constructor(ctx,env){this.env=env;}} export class DurableObject{} export class WorkerEntrypoint{} export class RpcTarget{}; export const tracing=undefined;",
                 loader: "js",
             }));

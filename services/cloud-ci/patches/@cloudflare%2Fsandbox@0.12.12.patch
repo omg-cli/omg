@@ -1,20 +1,33 @@
 diff --git a/dist/sandbox-BYPanejK.js b/dist/sandbox-BYPanejK.js
-index 6734b2d..0c158fc 100644
 --- a/dist/sandbox-BYPanejK.js
 +++ b/dist/sandbox-BYPanejK.js
-@@ -4288,3 +4288,3 @@ var ContainerControlClient = class {
+@@ -4286,7 +4286,7 @@
+-	* `cause` should be a typed `SandboxError` describing why the connection is
+-	* being torn down (sandbox stopping, lifetime change, transport switch).
 -	*/
 -	disconnect(cause) {
 -		const conn = this.conn;
+-		if (conn?.isConnecting()) {
+-			this.stopBusyPoll();
++	* `cause` should be a typed `SandboxError` describing why the connection is
++	* being torn down (sandbox stopping, lifetime change, transport switch).
 +	*/
 +	async disconnect(cause) {
 +		const conn = this.conn;
-@@ -4299,5 +4299,7 @@ var ContainerControlClient = class {
++		if (conn?.isConnecting()) {
++			this.stopBusyPoll();
+@@ -4297,9 +4297,11 @@
+-				this.fireSessionIdle();
+-			}
 -			this.stampWeakConnectionCause(cause);
 -			conn.whenSettled().then(() => {
 -				if (this.conn === conn) this.destroyConnection(cause);
 -			});
 -			return;
+-		}
+-		this.destroyConnection(cause);
++				this.fireSessionIdle();
++			}
 +			this.stampWeakConnectionCause(cause);
 +			try {
 +				await conn.whenSettled();
@@ -22,21 +35,41 @@ index 6734b2d..0c158fc 100644
 +				if (this.conn === conn) this.destroyConnection(cause);
 +			}
 +			return;
-@@ -8038,3 +8040,3 @@ var Sandbox = class Sandbox extends Container {
++		}
++		this.destroyConnection(cause);
+@@ -8036,7 +8038,7 @@
+-				this.tunnelsHandler = null;
+-				this.tunnelExitHandler = null;
 -				this.destroyAllTunnels = null;
 -				previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
 -			}
+-			if (storedTransport) this.hasStoredTransport = true;
+-			const storedLabels = await this.ctx.storage.get("labels");
++				this.tunnelsHandler = null;
++				this.tunnelExitHandler = null;
 +				this.destroyAllTunnels = null;
 +				await previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
 +			}
-@@ -8123,3 +8125,3 @@ var Sandbox = class Sandbox extends Container {
++			if (storedTransport) this.hasStoredTransport = true;
++			const storedLabels = await this.ctx.storage.get("labels");
+@@ -8121,7 +8123,7 @@
+-		this.tunnelsHandler = null;
+-		this.tunnelExitHandler = null;
 -		this.destroyAllTunnels = null;
 -		previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
 -		this.renewActivityTimeout();
+-		this.logger.debug("Transport updated", { transport });
+-	}
++		this.tunnelsHandler = null;
++		this.tunnelExitHandler = null;
 +		this.destroyAllTunnels = null;
 +		await previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
 +		this.renewActivityTimeout();
-@@ -8831,10 +8833,13 @@ var Sandbox = class Sandbox extends Container {
++		this.logger.debug("Transport updated", { transport });
++	}
+@@ -8829,14 +8831,17 @@
+-			}
+-			await this.ctx.storage.delete("tunnels");
 -			await this.ctx.storage.delete("tunnels:meta");
 -			this.client.disconnect(this.buildDisconnectCause("sandbox_lifetime_changed", "The sandbox was destroyed while the operation was pending."));
 -			outcome = "success";
@@ -47,6 +80,10 @@ index 6734b2d..0c158fc 100644
 -				this.logger.debug("super.destroy() reported no container instance; treating as no-op");
 -			}
 -		} catch (error) {
+-			caughtError = error instanceof Error ? error : new Error(String(error));
+-			throw error;
++			}
++			await this.ctx.storage.delete("tunnels");
 +			await this.ctx.storage.delete("tunnels:meta");
 +			try {
 +				await this.client.disconnect(this.buildDisconnectCause("sandbox_lifetime_changed", "The sandbox was destroyed while the operation was pending."));
@@ -60,33 +97,90 @@ index 6734b2d..0c158fc 100644
 +			}
 +			outcome = "success";
 +		} catch (error) {
-@@ -8938,3 +8943,4 @@ var Sandbox = class Sandbox extends Container {
++			caughtError = error instanceof Error ? error : new Error(String(error));
++			throw error;
+@@ -8936,7 +8941,8 @@
+-		this.containerGeneration++;
+-		this.defaultSession = null;
 -		this.defaultSessionInit = null;
 -		const disconnectClient = this.transport !== "rpc" || this.client.isWebSocketConnected();
 -		await this.currentRuntime.clear();
+-		await this.clearActivePreviewPorts();
+-		try {
++		this.containerGeneration++;
++		this.defaultSession = null;
 +		this.defaultSessionInit = null;
 +		const clientSnapshot = this.client;
 +		const disconnectClient = this.transport !== "rpc" || clientSnapshot.isWebSocketConnected();
 +		await this.currentRuntime.clear();
-@@ -8946,3 +8952,3 @@ var Sandbox = class Sandbox extends Container {
++		await this.clearActivePreviewPorts();
++		try {
+@@ -8944,7 +8950,7 @@
+-		} catch (error) {
+-			this.logger.error("Failed to reconcile tunnel storage after container stop", error instanceof Error ? error : new Error(String(error)));
 -		}
 -		if (disconnectClient) this.client.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox container stopped while the operation was pending.", params));
 -		await this.releaseRestoredMountRoutes();
+-		let hadR2EgressMount = false;
+-		let hadCredentialProxyMount = false;
++		} catch (error) {
++			this.logger.error("Failed to reconcile tunnel storage after container stop", error instanceof Error ? error : new Error(String(error)));
 +		}
 +		if (disconnectClient) await clientSnapshot.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox container stopped while the operation was pending.", params));
 +		await this.releaseRestoredMountRoutes();
++		let hadR2EgressMount = false;
++		let hadCredentialProxyMount = false;
+@@ -9581,6 +9587,7 @@
+-		let execError;
+-		try {
+-			if (options?.signal?.aborted) throw new Error("Operation was aborted");
+-			let result;
+-			if (options?.stream && options?.onOutput) result = await this.executeWithStreaming(command, sessionId, options, startTime, timestamp);
+-			else {
++		let execError;
++		try {
++			if (options?.signal?.aborted) throw new Error("Operation was aborted");
++			this.assertExecutionAllowed?.();
++			let result;
++			if (options?.stream && options?.onOutput) result = await this.executeWithStreaming(command, sessionId, options, startTime, timestamp);
++			else {
+@@ -9929,6 +9936,7 @@
+-				...options?.encoding !== void 0 && { encoding: options.encoding },
+-				...options?.autoCleanup !== void 0 && { autoCleanup: options.autoCleanup }
+-			};
+-			const response = await this.client.processes.startProcess(command, session, requestOptions);
+-			const processObj = this.createProcessFromDTO({
+-				id: response.processId,
++				...options?.encoding !== void 0 && { encoding: options.encoding },
++				...options?.autoCleanup !== void 0 && { autoCleanup: options.autoCleanup }
++			};
++			this.assertExecutionAllowed?.();
++			const response = await this.client.processes.startProcess(command, session, requestOptions);
++			const processObj = this.createProcessFromDTO({
++				id: response.processId,
 diff --git a/dist/sandbox-mYLglwK1.d.ts b/dist/sandbox-mYLglwK1.d.ts
-index a61fcaa..4c35e76 100644
 --- a/dist/sandbox-mYLglwK1.d.ts
 +++ b/dist/sandbox-mYLglwK1.d.ts
-@@ -1 +1,2 @@
+@@ -1,3 +1,4 @@
 -import { Container, ContainerProxy, StopParams } from "@cloudflare/containers";
+-import "capnweb";
+-
 +import type { Request, Response, ReadableStream } from "@cloudflare/workers-types/index.ts";
 +import { Container, ContainerProxy, StopParams } from "@cloudflare/containers";
-@@ -2802,3 +2803,3 @@ declare class ContainerControlClient {
++import "capnweb";
++
+@@ -2800,7 +2801,7 @@
+-   * `cause` should be a typed `SandboxError` describing why the connection is
+-   * being torn down (sandbox stopping, lifetime change, transport switch).
 -   */
 -  disconnect(cause?: unknown): void;
 -}
+-//#endregion
+-//#region src/tunnels/tunnels-handler.d.ts
++   * `cause` should be a typed `SandboxError` describing why the connection is
++   * being torn down (sandbox stopping, lifetime change, transport switch).
 +   */
 +  disconnect(cause?: unknown): Promise<void>;
 +}
++//#endregion
++//#region src/tunnels/tunnels-handler.d.ts

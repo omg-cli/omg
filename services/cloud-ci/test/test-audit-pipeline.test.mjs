@@ -50,7 +50,7 @@ export default {async fetch(request,env){
         build.onLoad({ filter: /.*/, namespace: "fixture" }, () => ({ contents: source, loader: "ts" }));
         build.onResolve({ filter: /^@cloudflare\/sandbox$/ }, () => ({ path: "sandbox", namespace: "fixture-base" }));
         build.onResolve({ filter: /^cloudflare:workers$/ }, () => ({ path: "base", namespace: "fixture-base" }));
-        build.onLoad({ filter: /.*/, namespace: "fixture-base" }, ({ path }) => ({ contents: path === "sandbox" ? "export const getSandbox=()=>{throw new Error('No native fixture execution')};"
+        build.onLoad({ filter: /.*/, namespace: "fixture-base" }, ({ path }) => ({ contents: path === "sandbox" ? "export const getSandbox=()=>{throw new Error('No native fixture execution')};export class OperationInterruptedError extends Error{constructor(context){super('fixture operation interrupted');this.name='OperationInterruptedError';this.context=context;}}"
             : "export class WorkflowEntrypoint{constructor(ctx,env){this.env=env;}} export class DurableObject{} export class WorkerEntrypoint{} export class RpcTarget{}; export const tracing=undefined;", loader: "js" }));
     } }] });
     expect(built.success, built.logs.join("\n")).toBe(true);
