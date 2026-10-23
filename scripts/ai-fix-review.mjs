@@ -15,6 +15,31 @@ const requiredChecks = [
     "QEMU behavioral verification / QEMU matrix result",
 ];
 const sha40 = /^[a-f0-9]{40}$/;
+const dependencyBranch = /^ai\/dependencies-([a-f0-9]{12})-([a-f0-9]{12})$/;
+const dependencyEvidence = [
+    /^Cloud operation: [A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/m,
+    /^Advisory database: [a-f0-9]{40}$/m,
+    /^Evidence: https:\/\/github\.com\/omg-cli\/omg\/actions\/runs\/[1-9][0-9]{0,19}$/m,
+    /^Executed: real baseline audit failure, patched audit with zero findings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks\. Only Cargo\.lock changes\./m,
+];
+
+export function dependencyRepairPublication(pull, publisher, expectedHead) {
+    const body = pull?.body ?? "";
+    const branch = dependencyBranch.exec(pull?.head?.ref ?? "");
+    const plan = /^Plan SHA256: ([a-f0-9]{64})$/m.exec(body)?.[1];
+    const base = pull?.base?.sha;
+    return publisher?.id === 345568822 && !!publisher?.login &&
+        pull?.user?.id === publisher.id && pull.user.login === publisher.login &&
+        pull?.state === "open" && pull?.draft === false &&
+        pull?.base?.repo?.full_name === repository && pull?.head?.repo?.full_name === repository &&
+        pull?.base?.ref === "main" && typeof base === "string" && sha40.test(base) &&
+        pull?.head?.sha === expectedHead &&
+        pull?.title === "fix(deps): cloud-generated dependency audit repairs" &&
+        !!branch && !!plan && branch[1] === base.slice(0, 12) && branch[2] === plan.slice(0, 12) &&
+        dependencyEvidence.every((pattern) => pattern.test(body)) &&
+        !/^<!-- ai-review-patch:/m.test(body) &&
+        !/^Proof purpose: existing-test-strengthening$/m.test(body);
+}
 
 export function gitBlobSha(content) {
     const bytes = Buffer.from(content);
@@ -98,6 +123,9 @@ export async function reviewAiFix({ github, services, number, expectedHead, publ
     const getChecks = () => list(github, `${prefix}/commits/${expectedHead}/check-runs?filter=latest`, "check_runs");
     const currentMain = async () => (await github.request("GET", `${prefix}/git/ref/heads/main`)).object.sha;
     const pull = await getPull();
+    if (dependencyRepairPublication(pull, publisher, expectedHead))
+        return { action: "unsupported", publication: "dependency-lock-repair", number, headSha: expectedHead,
+            reason: "Dependency lock repair uses its separate verified audit evidence contract; this lane records no approval. Human review and merge remain required." };
     if (/^Proof purpose: existing-test-strengthening$/m.test(pull.body ?? ""))
         return reviewTestAuditFix({ github, services, number, expectedHead, publisher, policy, approve, pull });
     const checkCandidate = (pull, checks) => {

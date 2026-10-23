@@ -110,6 +110,8 @@ if(mode==='ok'||mode==='inline'||mode==='telemetry-throw'||mode==='exit-stream-d
 return Response.json({mode,destroyed,objects:objects.size,events,telemetry});
 `;
 
+let workerPromise;
+
 for (const modes of [
   ["ok"],
   ["inline"],
@@ -145,7 +147,7 @@ for (const modes of [
 
     const source = `import assert from 'node:assert/strict';\nimport { OperationInterruptedError } from "@cloudflare/sandbox";\nimport {CIWorkflow} from ${JSON.stringify(sdk)};\nexport default {async fetch(request,env){const requestMode=new URL(request.url).pathname.slice(1);const originalLog=console.log;const telemetry=[];console.log=requestMode==='telemetry-throw'?()=>{throw new Error('fixture telemetry failure');}:(...args)=>{telemetry.push(args);};try {\n${fixture.replace("MODE", "requestMode")}\n}catch(error){return new Response(error.stack,{status:500});}finally{console.log=originalLog;}}};`;
 
-    const built = await Bun.build({
+    workerPromise ??= Bun.build({
       entrypoints: ["fixture:entry"],
       target: "browser",
       external: ["node:*"],
@@ -179,10 +181,11 @@ for (const modes of [
           },
         },
       ],
+    }).then(async (built) => {
+      expect(built.success, built.logs.map((entry) => entry.message).join("\n")).toBe(true);
+      return built.outputs[0].text();
     });
-
-    expect(built.success, built.logs.map((entry) => entry.message).join("\n")).toBe(true);
-    const worker = await built.outputs[0].text();
+    const worker = await workerPromise;
 
     const program = `import {createRequire} from 'node:module';
 const require=createRequire(${JSON.stringify(new URL("../node_modules/wrangler/package.json", import.meta.url).href)});
