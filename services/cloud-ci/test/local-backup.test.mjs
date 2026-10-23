@@ -51,10 +51,15 @@ await Promise.resolve(
       async listFiles(directory) {
         await this.ctx.initialization;
         this.calls.push("list");
-        if(directory === "/tmp") return {success:true,files:["out","err"].map(extension=>({absolutePath:"/tmp/ci-step."+extension,type:"file",size:5}))};
+        if(directory === "/tmp") return {success:true,count:3,files:[
+          {absolutePath:"/tmp/omg-ci-unit-evidence",type:"directory",size:0},
+          {absolutePath:"/tmp/ci-step.out",type:"file",size:5},
+          {absolutePath:"/tmp/ci-step.err",type:"file",size:5},
+        ]};
 
         return {
           success: true,
+          count: 1,
           files: [
             { absolutePath: "/tmp/omg-ci-unit-evidence/report.xml", type: "file", size: 5 },
           ],
@@ -118,7 +123,7 @@ test("real adapter retains only the unit stage's bounded private report before d
     );
     await sandbox.destroy();
     expect(sandbox.calls).toEqual(
-      failure === "read" ? ["list", "read", "destroy"] : ["list", "read", "put", "destroy"],
+      failure === "read" ? ["list", "list", "read", "destroy"] : ["list", "list", "read", "put", "destroy"],
     );
   }
 
@@ -149,7 +154,7 @@ test("trusted unit stage metadata retains evidence independently of SDK command 
       },
     });
     await sandbox.destroy();
-    expect(sandbox.calls).toEqual(["list", "read", "destroy"]);
+    expect(sandbox.calls).toEqual(["list", "list", "read", "destroy"]);
   }
 });
 

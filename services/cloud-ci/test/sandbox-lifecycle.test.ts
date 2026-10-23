@@ -4,8 +4,8 @@ import type * as Workers from '@cloudflare/workers-types/index.ts';
 declare const ReadableStream: typeof Workers.ReadableStream;
 declare const Response: typeof Workers.Response;
 
-type File = { absolutePath: string; type: 'file' | 'symlink'; size: number };
-type Listing = { success: true; files: File[] };
+type File = { absolutePath: string; type: 'file' | 'symlink' | 'directory'; size: number };
+type Listing = { success: true; count: number; files: File[] };
 type Ctx = {
   id: { toString(): string };
   storage: {
@@ -28,8 +28,8 @@ const id = `cl-123-1-${'a'.repeat(40)}`;
 const metadataKey = 'omg:runner-metadata';
 const teardownKey = 'omg:runner-teardown';
 
-function file(absolutePath: string, size = 0, type: 'file' | 'symlink' = 'file'): File { return { absolutePath, size, type }; }
-function listing(...files: File[]): Listing { return { success: true, files }; }
+function file(absolutePath: string, size = 0, type: 'file' | 'symlink' | 'directory' = 'file'): File { return { absolutePath, size, type }; }
+function listing(...files: File[]): Listing { return { success: true, count: files.length, files }; }
 function stream(bytes: Uint8Array): Workers.ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({ start(c) { c.enqueue(bytes); c.close(); } });
 }
@@ -168,7 +168,7 @@ test('active owner delegates without fencing', async () => {
 test('Rust report fallback retains before destroy', async () => {
   const ctx = new Context(); const env = new EnvFixture(); const s = make(ctx, env); await ctx.settle();
   const run = `${id}-ta-${'b'.repeat(16)}`;
-  env.listFiles = async (path) => path === '/tmp' ? listing(file('/tmp/ci-step.out'), file('/tmp/ci-step.err')) : path === '/tmp/omg-ci-unit-evidence' ? listing(file('/tmp/omg-ci-unit-evidence/report.xml', report.length)) : listing();
+  env.listFiles = async (path) => path === '/tmp' ? listing(file('/tmp/omg-ci-unit-evidence', 0, 'directory'), file('/tmp/ci-step.out'), file('/tmp/ci-step.err')) : path === '/tmp/omg-ci-unit-evidence' ? listing(file('/tmp/omg-ci-unit-evidence/report.xml', report.length)) : listing();
   env.readFile = async (path) => stream(path.endsWith('report.xml') ? report : new Uint8Array());
   await s.startProcess('true', { env: { OMG_CI_LEAF_STEP: 'rust-portable-tests', OMG_DIAGNOSTIC_RUN_ID: run } });
   expect(ctx.storage.values.get(metadataKey)).toEqual({ reportRunId: run, leafStep: 'rust-portable-tests', diagnosticRunId: run });

@@ -16,7 +16,14 @@ test("retained unit bytes round trip through the actual Workers R2 binding", asy
       const mode=new URL(request.url).pathname.slice(1);
       const bytes=new Uint8Array([60,255,0,38,62]);
       const sandbox={
-        async listFiles(){return {success:true,files:[{absolutePath:mode==='unit'?'/tmp/omg-ci-unit-evidence/report.xml':'/tmp/ci-step.'+(mode==='stdout'?'out':'err'),type:'file',size:bytes.length}]};},
+        async listFiles(path){
+          if(path==='/tmp')return {success:true,count:3,files:[
+            {absolutePath:'/tmp/omg-ci-unit-evidence',type:'directory',size:0},
+            {absolutePath:'/tmp/ci-step.out',type:'file',size:bytes.length},
+            {absolutePath:'/tmp/ci-step.err',type:'file',size:bytes.length},
+          ]};
+          return {success:true,count:1,files:[{absolutePath:'/tmp/omg-ci-unit-evidence/report.xml',type:'file',size:bytes.length}]};
+        },
         async readReport(){return new ReadableStream({start(c){c.enqueue(bytes);c.close();}});}
       };
       const id='cl-123-1-'+ 'a'.repeat(40);
