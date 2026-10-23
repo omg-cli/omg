@@ -51,7 +51,7 @@ type DiagnosticMessage = {
 export function redactDiagnosticText(text: string, secrets: readonly string[]) {
   let redacted = text;
   for (const secret of secrets) if (secret) redacted = redacted.replaceAll(secret, "[REDACTED]");
-  return redacted.replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]");
+  return redacted.replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [REDACTED]");
 }
 
 export function diagnosticHistory(

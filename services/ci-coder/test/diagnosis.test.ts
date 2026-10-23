@@ -106,7 +106,7 @@ test("diagnostic continuation rejects non-report done text", () => {
   for (const text of invalid) assert.equal(needs(text), true, text);
 });
 
-import { diagnosticHistory, DIAGNOSIS_HISTORY_MAX_BYTES } from "../src/runtime";
+import { diagnosticHistory, redactDiagnosticText, DIAGNOSIS_HISTORY_MAX_BYTES } from "../src/runtime";
 
 test("diagnostic history keeps ordered assistant text and excludes everything else", () => {
     const production = `diff --git a/src/lib.rs b/src/lib.rs
@@ -140,4 +140,11 @@ test("diagnostic history rejects overflow instead of truncating patch text", () 
         () => diagnosticHistory([{ type: "assistant", id: "a1", content: [{ type: "text", text }] }], []),
         /exceeds/,
     );
+});
+
+test("diagnostic export preserves actual authorization template code while redacting bearer credentials", () => {
+    const code = 'headers: { authorization: `Bearer ${token}` },';
+    assert.equal(redactDiagnosticText(code, []), code);
+    assert.equal(redactDiagnosticText('"Bearer abc.DEF_123+/~=="', []), '"Bearer [REDACTED]"');
+    assert.equal(redactDiagnosticText("Bearer fixture-secret", ["fixture-secret"]), "Bearer [REDACTED]");
 });
