@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitBlobSha } from "../../../scripts/ai-review-candidate.mjs";
@@ -24,10 +25,10 @@ function wranglerCli() {
 }
 
 async function buildCallerBundle(contents, deadline) {
-  const directory = mkdtempSync(join(root, ".caller-bundle-"));
+  const directory = mkdtempSync(join(tmpdir(), "omg-caller-bundle-"));
   const owned = resolve(directory);
-  if (dirname(owned) !== resolve(root) || !basename(owned).startsWith(".caller-bundle-"))
-    throw new Error("Temporary bundle directory escaped the service root");
+  if (dirname(owned) !== resolve(tmpdir()) || !basename(owned).startsWith("omg-caller-bundle-"))
+    throw new Error("Temporary bundle directory escaped the system temporary directory");
   try {
     writeFileSync(join(directory, "caller.ts"), contents);
     writeFileSync(
