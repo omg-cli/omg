@@ -40,6 +40,38 @@ export function assertRuntimeIdentity(
 
 export const parseRuntimeIdentity = (text: string) => identitySchema.parse(JSON.parse(text));
 
+export const DIAGNOSIS_HISTORY_MAX_BYTES = 512 * 1024;
+
+type DiagnosticMessage = {
+  readonly type: string;
+  readonly id: string;
+  readonly content: readonly { readonly type: string; readonly text?: string }[];
+};
+
+export function redactDiagnosticText(text: string, secrets: readonly string[]) {
+  let redacted = text;
+  for (const secret of secrets) if (secret) redacted = redacted.replaceAll(secret, "[REDACTED]");
+  return redacted.replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]");
+}
+
+export function diagnosticHistory(
+  messages: readonly DiagnosticMessage[],
+  secrets: readonly string[],
+) {
+  const history = messages.flatMap((message) => {
+    if (message.type !== "assistant") return [];
+    return [{
+      id: message.id,
+      text: message.content.flatMap((part) =>
+        part.type === "text" ? [redactDiagnosticText(part.text ?? "", secrets)] : [],
+      ),
+    }];
+  });
+  if (new TextEncoder().encode(JSON.stringify(history)).length > DIAGNOSIS_HISTORY_MAX_BYTES)
+    throw new RangeError(`Diagnosis history exceeds ${DIAGNOSIS_HISTORY_MAX_BYTES} UTF-8 bytes`);
+  return history;
+}
+
 export function diagnosticFailureMetadata(
   message: { finish?: string; error?: { type: string; message: string; status?: number } },
   secrets: readonly string[],

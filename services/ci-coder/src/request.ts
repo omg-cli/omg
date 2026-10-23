@@ -141,7 +141,7 @@ export type ApiBindings = {
   CODER: {
     getByName(name: string): {
       start(request: CodingRequest): Promise<{ id: string; accepted: boolean; conflict?: boolean }>;
-      status(): Promise<{ id: string; status: string }>;
+      status(options?: { diagnosisHistory?: boolean }): Promise<{ id: string; status: string }>;
     };
   };
 };
@@ -240,7 +240,15 @@ export async function handleCoderRequest(
       );
 
     if (!match || request.method !== "GET") return respond({ error: "Not found" }, 404);
-    const result = await env.CODER.getByName(match[1]).status();
+    const diagnosisHistory = new URL(request.url).searchParams.get("diagnosis_history") === "1";
+    let result: { id: string; status: string };
+    try {
+      result = await env.CODER.getByName(match[1]).status({ diagnosisHistory });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("Diagnosis history exceeds"))
+        return respond({ error: error.message }, 413);
+      throw error;
+    }
 
     if (result.id !== match[1]) return respond({ error: "Not found" }, 404);
 

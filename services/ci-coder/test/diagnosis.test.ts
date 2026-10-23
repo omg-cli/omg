@@ -105,3 +105,39 @@ test("diagnostic continuation rejects non-report done text", () => {
   const invalid = ["", sp + nl + tab, nl, "I hit the step limit before I could produce the final answer; draft Python script was not emitted.", "not json", "null", "[]", String.fromCharCode(34) + "text" + String.fromCharCode(34), "42", "{}", '{"findings":[],"edits":[]}', '{"findings":{},"edits":[],"tests":[]}'];
   for (const text of invalid) assert.equal(needs(text), true, text);
 });
+
+import { diagnosticHistory, DIAGNOSIS_HISTORY_MAX_BYTES } from "../src/runtime";
+
+test("diagnostic history keeps ordered assistant text and excludes everything else", () => {
+    const production = `diff --git a/src/lib.rs b/src/lib.rs
++pub fn fixed() {}
+`;
+    const testPatch = `diff --git a/tests/fixed.rs b/tests/fixed.rs
++#[test] fn fixed() {}
+`;
+    const secret = "fixture-secret";
+    const history = diagnosticHistory([
+        { type: "user", id: "u1", content: [{ type: "text", text: "ignore user" }] },
+        { type: "system", id: "s1", content: [{ type: "text", text: "ignore system" }] },
+        { type: "assistant", id: "a1", content: [
+            { type: "text", text: production + `Bearer ${secret}` },
+            { type: "reasoning", text: "ignore reasoning" },
+            { type: "tool" },
+        ] },
+        { type: "assistant", id: "a2", content: [{ type: "text", text: testPatch + ` ${secret}` }] },
+    ], [secret]);
+    assert.deepEqual(history, [
+        { id: "a1", text: [production + "Bearer [REDACTED]"] },
+        { id: "a2", text: [testPatch + " [REDACTED]"] },
+    ]);
+    assert.equal(/ignore (user|system|reasoning)/.test(JSON.stringify(history)), false);
+    assert.equal(JSON.stringify(history).includes(secret), false);
+});
+
+test("diagnostic history rejects overflow instead of truncating patch text", () => {
+    const text = "x".repeat(DIAGNOSIS_HISTORY_MAX_BYTES + 1);
+    assert.throws(
+        () => diagnosticHistory([{ type: "assistant", id: "a1", content: [{ type: "text", text }] }], []),
+        /exceeds/,
+    );
+});

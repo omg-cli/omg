@@ -21,6 +21,7 @@ import {
   parseRuntimeIdentity,
   retryDecision,
   diagnosticFailureMetadata,
+  diagnosticHistory,
   diagnosticNeedsReport,
 } from "./runtime.js";
 
@@ -141,7 +142,7 @@ export class Coder extends DurableObject<Env> {
     return { id, accepted: receipt.accepted };
   }
 
-  async status() {
+  async status({ diagnosisHistory = false }: { diagnosisHistory?: boolean } = {}) {
     const stored = await this.ctx.storage.get("request");
 
     if (!stored) return { id: "", status: "missing" };
@@ -164,6 +165,25 @@ export class Coder extends DurableObject<Env> {
 
     if (pending) return { ...identity, status: pending.status };
     const initialOutcome = await this.harness.wait(id);
+    if (diagnosisHistory && request.diagnosisTask) {
+      const runtime = parseRuntimeIdentity(
+        (await this.ctx.storage.get<string>("runtime-identity")) ?? "null",
+      );
+      assertRuntimeIdentity(JSON.stringify(runtime), codingRuntimeIdentity(this.env, requiredSkillsManifest.bundleSha256));
+      return {
+        ...identity,
+        status: initialOutcome.status,
+        runtime,
+        diagnosisHistory: diagnosticHistory(
+          (await this.harness.session(initialOutcome.session).history()).flatMap((message) =>
+            message.type === "assistant"
+              ? [{ type: message.type, id: message.id, content: message.content }]
+              : [],
+          ),
+          [this.env.CI_API_TOKEN, this.env.CODER_API_TOKEN],
+        ),
+      };
+    }
     const failureMetadata = request.diagnosisTask && initialOutcome.status === "unanswered"
       ? (await this.harness.messages({session: initialOutcome.session}))
           .filter(message => message.type === "assistant" || message.type === "idle")
