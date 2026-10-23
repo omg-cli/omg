@@ -23,6 +23,30 @@ export async function retainUnitReport(
   bucket: Pick<R2Bucket, "put">,
 ): Promise<RetentionStatus> {
   if (!runIdPattern.test(runId)) return "invalid-identity";
+
+  let parent: Awaited<ReturnType<EvidenceSource["listFiles"]>>;
+
+  try {
+    parent = await sandbox.listFiles("/tmp");
+  } catch {
+    return "unavailable";
+  }
+
+  if (
+    !parent.success ||
+    !Array.isArray(parent.files) ||
+    parent.count !== parent.files.length
+  )
+    return "unavailable";
+
+  const directory = parent.files.find(
+    (entry) => entry.absolutePath === "/tmp/omg-ci-unit-evidence",
+  );
+
+  if (!directory) return "missing";
+
+  if (directory.type !== "directory") return "unsafe";
+
   return retainFile({
     directory: "/tmp/omg-ci-unit-evidence",
     file: "/tmp/omg-ci-unit-evidence/report.xml",
