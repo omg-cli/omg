@@ -32,6 +32,7 @@ export const codingRequestSchema = z
     source: z.union([sourceReviewInputSchema,auditSourceSchema]),
     testAuditTask: testAuditTaskSchema.optional(),
     dependencyTask: dependencyTaskSchema.optional(),
+    diagnosisTask: z.union([z.literal(true), z.strictObject({question: z.string().min(1).max(2000)})]).optional(),
     hypothesis: sourceReviewProposalSchema.optional(),
     candidateIndex: z.number().int().min(0).max(2).optional(),
   })
@@ -43,7 +44,9 @@ export const codingRequestSchema = z
     "Source identity mismatch",
   )
   .superRefine((request, context) => {
-    if (!request.testAuditTask && !request.dependencyTask && !sourceReviewInputSchema.safeParse(request.source).success)
+    if (request.diagnosisTask && (request.testAuditTask || request.dependencyTask || request.hypothesis || request.candidateIndex !== undefined || !request.source.auditPaths))
+      context.addIssue({code: "custom", message: "Read-only diagnosis requires an immutable audit snapshot and no coding task"});
+    if (!request.testAuditTask && !request.dependencyTask && !request.diagnosisTask && !sourceReviewInputSchema.safeParse(request.source).success)
       context.addIssue({code:"custom",path:["source"],message:"Ordinary repair source exceeds its existing limits"});
     if(request.dependencyTask) {
       const lock=request.source.sourceFiles.find(file=>file.path==="Cargo.lock");
@@ -114,6 +117,7 @@ export const operationIdentity = (request: CodingRequest) => {
         candidateIndex: request.candidateIndex ?? null,
         ...(request.testAuditTask ? {testAuditTask: request.testAuditTask} : {}),
         ...(request.dependencyTask ? {dependencyTask: request.dependencyTask} : {}),
+        ...(request.diagnosisTask ? {diagnosisTask: request.diagnosisTask} : {}),
       }),
     )
     .digest("hex");
@@ -137,7 +141,7 @@ export type ApiBindings = {
   CODER: {
     getByName(name: string): {
       start(request: CodingRequest): Promise<{ id: string; accepted: boolean; conflict?: boolean }>;
-      status(): Promise<{ id: string; status: string }>;
+      status(options?: { diagnosisHistory?: boolean }): Promise<{ id: string; status: string }>;
     };
   };
 };
@@ -236,7 +240,15 @@ export async function handleCoderRequest(
       );
 
     if (!match || request.method !== "GET") return respond({ error: "Not found" }, 404);
-    const result = await env.CODER.getByName(match[1]).status();
+    const diagnosisHistory = new URL(request.url).searchParams.get("diagnosis_history") === "1";
+    let result: { id: string; status: string };
+    try {
+      result = await env.CODER.getByName(match[1]).status({ diagnosisHistory });
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("Diagnosis history exceeds"))
+        return respond({ error: error.message }, 413);
+      throw error;
+    }
 
     if (result.id !== match[1]) return respond({ error: "Not found" }, 404);
 

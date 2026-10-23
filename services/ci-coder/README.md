@@ -25,6 +25,8 @@ The Wrangler configuration binds Workers AI, the `Coder` Durable Object, and the
 
 The trusted courier reads `~/ci/omg-ci-coder.json`. It contains `endpoint`, an absolute protected `tokenFile`, and the expected `bundleSha256`. Keep equivalent protected configuration on each authorized courier. No customer key belongs in this file.
 
+The task context includes the selected existing test and bounded definition windows, so a recovered session can locate its target again. Source listings include line counts. `find_source` returns at most twenty literal-match locations from one supplied immutable file; it grants no source-read evidence. The agent must use the existing `read_source` tool before citing or proposing a change. Tool-call, source-size, skill and verification limits are unchanged. This uses the existing [OpenCode plugin tool interface](https://developers.cloudflare.com/agents/harnesses/opencode/); it adds no shell or repository-wide file access.
+
 ```sh
 bun services/ci-coder/test/harness-runtime.mjs <exact-commit> <main> <isolated-probe-id> <attempt>
 ```
@@ -32,6 +34,8 @@ bun services/ci-coder/test/harness-runtime.mjs <exact-commit> <main> <isolated-p
 The probe reads actual Git objects and checks durable runtime identity, skill delivery and source reads. It does not publish a GitHub issue or PR. A successful no-findings probe proves runtime execution, not a successful repair or complete repository review.
 
 Publication separately re-fetches the coding result, Cloudflare verifier receipt, original Git objects and hashed evidence. Only an exact verified repair can produce a regular PR. Merging, approval, deployment and releases remain human-controlled. The existing OMG native/QEMU gates remain required.
+
+An authenticated operation with `diagnosisTask: true` reads an immutable audit snapshot and actual failure logs, then returns the OpenCode final answer as `diagnosis`. It cannot propose, verify or export a repair, and cannot be combined with a coding task. This makes runner failures observable without treating a model's suggested edits as verified code. It uses the existing [OpenCode operation result](https://developers.cloudflare.com/agents/harnesses/opencode/) and unchanged skill, model and source-read gates.
 
 See the [adaptation research](../../docs/operations/cloudflare-ci-adaptation-research.md) and [activation questions](../../docs/operations/cloudflare-ci-research-open-questions.md) for the handoff basis and limits.
 

@@ -93,41 +93,109 @@ export function planTestAuditContinuation(
             : "Exact immutable inventory continuation.",
     };
 }
-export function admitTestAuditParent(
-    target,
-    parent,
-    revision,
-    manifestDigest,
-    publicationResult,
-) {
+function shape(value, required, optional = []) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const keys = Object.keys(value);
+    return required.every((key) => Object.hasOwn(value, key)) &&
+        keys.every((key) => required.includes(key) || optional.includes(key)) &&
+        keys.length <= required.length + optional.length;
+}
+const absentOrEmpty = (value) =>
+    value === undefined || (Array.isArray(value) && value.length === 0);
+const sameFormat = (formatting, expected) =>
+    formatting?.runId === expected.runId &&
+    formatting?.attempt === expected.attempt &&
+    formatting?.sha === expected.sha &&
+    formatting?.ref === expected.ref;
+function transitionIntake(target, parent, revision, manifestDigest, campaign) {
+    const t = campaign?.transition,
+        child = campaign?.priorChild,
+        parentRef = `${parent.campaignRun?.runId}-${parent.campaignRun?.attempt}`,
+        childRef = `${child?.campaignRun?.runId}-${child?.campaignRun?.attempt}`;
+    if (!shape(t, ["kind","repository","enabled","source","branch","publish","parent","parentController","priorChild","run","cursor","pageSize","pagePaths","totalPaths","manifestDigest","inventoryDigest","priorFormatting","priorImageDigest","imageDigest","verifierRevision","controllerRevision","recordSha256"]))
+        throw new Error("Campaign transition record missing or inferred");
+    if (t.kind !== "test-audit-controller-transition" || t.repository !== "omg-cli/omg" || t.enabled !== true)
+        throw new Error("Campaign transition record is not enabled");
+    if (!sha.test(revision ?? "") || t.branch !== "main" || t.publish !== true ||
+        !sha.test(t.source ?? "") || t.controllerRevision !== revision ||
+        !digest.test(t.recordSha256 ?? "") || !sha.test(t.verifierRevision ?? "") ||
+        !digest.test(t.manifestDigest ?? "") || !digest.test(t.inventoryDigest ?? "") ||
+        t.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
+        target.branch !== "main" || target.publish !== true)
+        throw new Error("Campaign transition controller or manifest mismatch");
+    if (!run.test(parentRef) || !run.test(childRef) || parentRef !== t.parent ||
+        parent.controllerRevision !== t.parentController || parent.status !== "reviewed" ||
+        parent.sha !== t.source || target.sha !== t.source || target.auditParent !== t.parent ||
+        childRef !== t.priorChild)
+        throw new Error("Campaign transition parent or prior child lineage mismatch");
+    if (!shape(child, ["repository","sha","branch","baseSha","batches","campaignParent","campaignRun","candidateOutcomes","controllerRevision","coverageMeaning","formatting","publications","publishRequested","readPaths","sourceRange","status","suppliedPaths","triggerSha","unreviewedPaths"], ["testAudits","testAuditOutcomes"]) ||
+        child.repository !== "omg-cli/omg" || child.branch !== "main" ||
+        child.status !== "format-blocked" || child.sha !== t.source ||
+        child.baseSha !== t.source || child.triggerSha !== t.source ||
+        child.controllerRevision !== t.parentController || child.campaignParent !== parentRef ||
+        child.publishRequested !== true || !absentOrEmpty(child.testAudits) ||
+        !absentOrEmpty(child.testAuditOutcomes) ||
+        ![child.batches, child.candidateOutcomes, child.publications, child.readPaths, child.suppliedPaths].every((value) => Array.isArray(value) && value.length === 0))
+        throw new Error("Campaign prior child record shape or proof mismatch");
+    if (campaign?.runId !== child.campaignRun?.runId || campaign?.attempt === child.campaignRun?.attempt ||
+        campaign?.attempt === t.priorFormatting?.attempt || t.run !== `${campaign?.runId}-${campaign?.attempt}` ||
+        campaign?.imageDigest !== t.imageDigest || campaign?.verifierRevision !== t.verifierRevision)
+        throw new Error("Campaign transition current run identity mismatch");
+    if (!Number.isSafeInteger(t.cursor) || t.cursor < 1 || t.cursor >= t.totalPaths - 1 ||
+        t.pageSize !== 1 || t.pagePaths !== 1 || !Number.isSafeInteger(t.totalPaths) ||
+        t.totalPaths < 3 || t.totalPaths > 10000 ||
+        parent.sourceRange?.kind !== "test-audit" || parent.sourceRange?.sha !== t.source ||
+        parent.sourceRange?.manifestDigest !== t.manifestDigest ||
+        parent.sourceRange?.inventoryDigest !== t.inventoryDigest ||
+        parent.sourceRange?.cursor + 1 !== t.cursor || parent.sourceRange?.nextCursor !== t.cursor ||
+        parent.sourceRange?.pageSize !== 1 || parent.sourceRange?.pagePaths !== 1 ||
+        parent.sourceRange?.totalPaths !== t.totalPaths ||
+        child.sourceRange?.kind !== "test-audit" || child.sourceRange?.sha !== t.source ||
+        child.sourceRange?.manifestDigest !== t.manifestDigest ||
+        child.sourceRange?.inventoryDigest !== t.inventoryDigest ||
+        child.sourceRange?.cursor !== t.cursor || child.sourceRange?.nextCursor !== t.cursor + 1 ||
+        child.sourceRange?.pageSize !== 1 || child.sourceRange?.pagePaths !== 1 ||
+        child.sourceRange?.totalPaths !== t.totalPaths ||
+        target.range?.cursor !== t.cursor || target.range?.inventoryDigest !== t.inventoryDigest ||
+        target.range?.resnapshot === true)
+        throw new Error("Campaign transition page or inventory mismatch");
+    if (!shape(t.priorFormatting, ["runId","attempt","sha","ref"]) ||
+        !/^[1-9][0-9]{0,19}$/.test(t.priorFormatting.runId ?? "") ||
+        !/^[1-9][0-9]{0,5}$/.test(t.priorFormatting.attempt ?? "") ||
+        t.priorFormatting.sha !== t.source || t.priorFormatting.ref !== "refs/heads/main" ||
+        parent.formatting?.status !== "passed" || !sameFormat(parent.formatting, t.priorFormatting) ||
+        child.formatting?.status !== "blocked" ||
+        child.formatting?.reason !== "source-format-evidence-unavailable-or-rejected" ||
+        !sameFormat(child.formatting, t.priorFormatting))
+        throw new Error("Campaign transition formatting lineage mismatch");
+    if (!/^sha256:[a-f0-9]{64}$/.test(t.imageDigest ?? "") ||
+        !/^sha256:[a-f0-9]{64}$/.test(t.priorImageDigest ?? "") ||
+        t.imageDigest === t.priorImageDigest)
+        throw new Error("Campaign transition runtime identity mismatch");
+    if (!Array.isArray(child.unreviewedPaths) || child.unreviewedPaths.length !== 1 ||
+        !shape(child.unreviewedPaths[0], ["path","reason"]) ||
+        child.unreviewedPaths[0].path !== "tests/debian_tests.rs" ||
+        child.unreviewedPaths[0].reason !== "source-format-blocked")
+        throw new Error("Campaign prior child blocked path mismatch");
+    return { from: parent.controllerRevision, to: revision, recordSha256: t.recordSha256, parent: parentRef, priorChild: childRef, run: t.run };
+}
+export function admitTestAuditParent(target, parent, revision, manifestDigest, publicationResult, campaign) {
     const r = checkRange(parent);
-    if (
-        `${parent.campaignRun?.runId}-${parent.campaignRun?.attempt}` !==
-            target.auditParent ||
-        !run.test(target.auditParent ?? "") ||
-        parent.controllerRevision !== revision ||
-        r.manifestDigest !== manifestDigest ||
-        target.range?.manifestDigest !== manifestDigest ||
-        target.branch !== "main" ||
-        target.publish !== parent.publishRequested
-    )
+    const transition = campaign?.transition === undefined ? null : transitionIntake(target, parent, revision, manifestDigest, campaign);
+    if (transition === null) {
+        if (`${parent.campaignRun?.runId}-${parent.campaignRun?.attempt}` !== target.auditParent ||
+            !run.test(target.auditParent ?? "") || parent.controllerRevision !== revision ||
+            r.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
+            target.branch !== "main" || target.publish !== parent.publishRequested)
+            throw new Error("Campaign parent/controller/manifest mismatch");
+    } else if (r.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
+        target.branch !== "main" || target.publish !== parent.publishRequested)
         throw new Error("Campaign parent/controller/manifest mismatch");
     const [runId, attempt] = target.auditParent.split("-");
-    const plan = planTestAuditContinuation(
-        parent,
-        target.sha,
-        runId,
-        attempt,
-        publicationResult,
-    );
-    if (
-        plan.status !== "continue" ||
-        Number(plan.inputs.audit_cursor) !== target.range.cursor ||
-        Boolean(plan.resnapshot) !== Boolean(target.range.resnapshot)
-    )
-        throw new Error(
-            "Campaign parent did not authorize this cursor or source",
-        );
+    const plan = planTestAuditContinuation(parent, target.sha, runId, attempt, publicationResult);
+    if (plan.status !== "continue" || Number(plan.inputs.audit_cursor) !== target.range.cursor ||
+        Boolean(plan.resnapshot) !== Boolean(target.range.resnapshot))
+        throw new Error("Campaign parent did not authorize this cursor or source");
     if (plan.resnapshot)
         return {
             ...target,
@@ -135,36 +203,19 @@ export function admitTestAuditParent(
             range: {
                 ...target.range,
                 inventoryDigest: undefined,
-                resnapshotOf: {
-                    runId,
-                    attempt,
-                    sha: parent.sha,
-                    cursor: r.cursor,
-                    priorUnpublished: plan.priorUnpublished,
-                },
+                resnapshotOf: { runId, attempt, sha: parent.sha, cursor: r.cursor, priorUnpublished: plan.priorUnpublished },
                 qualification: plan.qualification,
             },
         };
-    if (
-        parent.sha !== target.sha ||
-        r.inventoryDigest !== target.range.inventoryDigest
-    )
+    if (parent.sha !== target.sha || r.inventoryDigest !== target.range.inventoryDigest)
         throw new Error("Campaign immutable inventory mismatch");
     if (parent.formatting?.status !== "passed") return target;
-    if (
-        parent.formatting.sha !== target.sha ||
-        parent.formatting.ref !== "refs/heads/main" ||
+    if (parent.formatting.sha !== target.sha || parent.formatting.ref !== "refs/heads/main" ||
         !/^[1-9][0-9]{0,19}$/.test(parent.formatting.runId ?? "") ||
-        !/^[1-9][0-9]{0,5}$/.test(parent.formatting.attempt ?? "")
-    )
+        !/^[1-9][0-9]{0,5}$/.test(parent.formatting.attempt ?? ""))
         throw new Error("Campaign formatting source mismatch");
-    return {
-        ...target,
-        upstream: {
-            runId: parent.formatting.runId,
-            attempt: parent.formatting.attempt,
-        },
-    };
+    const admitted = { ...target, upstream: { runId: parent.formatting.runId, attempt: parent.formatting.attempt } };
+    return transition === null ? admitted : { ...admitted, controllerTransition: transition };
 }
 export async function listTestAuditChildren(
     github,

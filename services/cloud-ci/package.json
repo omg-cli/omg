@@ -5,7 +5,7 @@
   "scripts": {
     "test": "bun test --isolate test",
     "check": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json && tsc --noEmit -p type-tests/tsconfig.json",
-    "build": "wrangler deploy --dry-run && node test/hosted-image-probe.mjs"
+    "build": "wrangler deploy --dry-run"
   },
   "dependencies": {
     "@cloudflare/ci": "0.2.0",

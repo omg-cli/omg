@@ -267,3 +267,68 @@ test("named durable status retains the submitted operation across identity algor
     storedOperationIdentity(previousName.replace("cl-123-", "cl-124-"), request),
   ).toThrow();
 });
+
+test("diagnostic history is opt-in, exact and authenticated", async () => {
+  const id = operationIdentity(parseCodingRequest(input));
+  const calls: ({ diagnosisHistory?: boolean } | undefined)[] = [];
+  const env = {
+    CODER_API_TOKEN: "fixture-token",
+    CODER: {
+      getByName: (name: string) => ({
+        start: async () => ({ id: name, accepted: true }),
+        status: async (options?: { diagnosisHistory?: boolean }) => {
+          calls.push(options);
+          return { id: name, status: "queued" };
+        },
+      }),
+    },
+  };
+  const get = (query: string, token = "fixture-token") =>
+    handleCoderRequest(
+      new Request(`https://coder.test/operations/${id}${query}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      env,
+      () => {},
+    );
+
+  expect((await get("?diagnosis_history=1", "wrong")).status).toBe(401);
+  expect(calls.length).toBe(0);
+
+  const plain = await get("");
+  expect(plain.status).toBe(200);
+  expect(await plain.json()).toEqual({ id, status: "queued" });
+  expect(calls[0]).toEqual({ diagnosisHistory: false });
+
+  for (const query of ["?diagnosis_history=01", "?diagnosis_history=true", "?diagnosis_history="]) {
+    expect((await get(query)).status).toBe(200);
+    expect(calls[calls.length - 1]).toEqual({ diagnosisHistory: false });
+  }
+
+  expect((await get("?diagnosis_history=1")).status).toBe(200);
+  expect(calls[calls.length - 1]).toEqual({ diagnosisHistory: true });
+});
+
+test("diagnostic history overflow is rejected explicitly", async () => {
+  const id = operationIdentity(parseCodingRequest(input));
+  const env = {
+    CODER_API_TOKEN: "fixture-token",
+    CODER: {
+      getByName: (name: string) => ({
+        start: async () => ({ id: name, accepted: true }),
+        status: async () => {
+          throw new RangeError("Diagnosis history exceeds 524288 UTF-8 bytes");
+        },
+      }),
+    },
+  };
+  const response = await handleCoderRequest(
+    new Request(`https://coder.test/operations/${id}?diagnosis_history=1`, {
+      headers: { Authorization: "Bearer fixture-token" },
+    }),
+    env,
+    () => {},
+  );
+  expect(response.status).toBe(413);
+  expect(await response.json()).toEqual({ error: "Diagnosis history exceeds 524288 UTF-8 bytes" });
+});

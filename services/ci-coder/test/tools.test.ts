@@ -487,3 +487,65 @@ test("a successful verification run never requests the failure log", async () =>
   assert.equal((await f.poll())?.status, "verified");
   assert.equal(f.failureLogRequests.length, 0);
 });
+
+test("a third distinct audit proposal preserves the failed job and existing budget", async () => {
+  const oldTest = "#[test]\nfn checks_value() {\n    let value = 1;\n    assert!(value > 0);\n}\n";
+  const source = "pub const VALUE: u32 = 1;\n";
+  const sha = "a".repeat(40);
+  const request: CodingRequest = {
+    repository: "omg-cli/omg",
+    branch: "main",
+    sha,
+    runId: "42",
+    attempt: "1",
+    source: {
+      repository: "omg-cli/omg",
+      branch: "main",
+      sha,
+      changedPaths: [],
+      auditPaths: ["tests/value.rs", "src/value.rs"],
+      diff: "",
+      ciFailures: [],
+      sourceFiles: [
+        { path: "tests/value.rs", blobSha: gitBlobSha(oldTest), content: oldTest },
+        { path: "src/value.rs", blobSha: gitBlobSha(source), content: source },
+      ],
+    },
+    testAuditTask: {
+      path: "tests/value.rs",
+      testName: "checks_value",
+      originalBlobSha: gitBlobSha(oldTest),
+    },
+  };
+  const skills = await createRequiredSkillsPlugin();
+  const sessionID = Session.ID.create();
+  skills.contextHook({ sessionID, system: [] });
+  const failed = { id: "cl-failed", proposalSha256: "d".repeat(64), sessionId: sessionID,
+    continuationId: "cv-failed", deadline: 1, status: "failed" as const, reason: "cargo fmt" };
+  let state: CodingState = { calls: 0, reads: [
+    { path: "tests/value.rs", start: 1, end: 5 },
+    { path: "src/value.rs", start: 1, end: 1 },
+  ], verifiedDigests: ["e".repeat(64), "f".repeat(64)], verificationJob: failed };
+  const actions = createCodingActions({
+    skills,
+    getRequest: async () => request,
+    update: async (change) => { state = change(state); return state; },
+    env: {
+      CI_API_TOKEN: "fixture-token".repeat(4),
+      CI_IMAGE_DIGEST: "sha256:" + "b".repeat(64),
+      CI_VERIFIER_REVISION: "c".repeat(40),
+      CI_SERVICE: { async fetch() { throw new Error("no service call expected"); } },
+    },
+  });
+  await assert.rejects(
+    () => actions.propose_test_strengthening.execute({
+      purpose: "existing-test-strengthening",
+      assertion: { line: 4, source: "    assert_eq!(value, 1);" },
+      fault: { path: "src/value.rs", oldQuote: "VALUE: u32 = 1", replacement: "VALUE: u32 = 2" },
+    }, { sessionID, signal: new AbortController().signal }),
+    /Coding verification budget exhausted/,
+  );
+  assert.equal(state.verificationJob, failed);
+  assert.deepEqual(state.verifiedDigests, ["e".repeat(64), "f".repeat(64)]);
+  assert.equal(state.testAudit, undefined);
+});

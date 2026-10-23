@@ -97,6 +97,91 @@ export function admitSourceFormatting(receipt, expected, imageDigest) {
     return format;
 }
 
+export async function admitFormattingRun({
+    sha,
+    branch,
+    upstream,
+    runId,
+    attempt,
+    imageDigest,
+    priorImageDigest,
+    fetchReceipt,
+    startRun,
+    verifyLogs,
+}) {
+    exactSha(sha);
+    branchName(branch);
+
+    if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest ?? ""))
+        throw new Error("Formatting evidence image mismatch.");
+
+    if (priorImageDigest !== undefined && !/^sha256:[a-f0-9]{64}$/.test(priorImageDigest))
+        throw new Error("Formatting prior image identity is invalid.");
+
+    const currentRequest = parseCloudCiRequest({
+        repository: SOURCE_REPOSITORY,
+        sha,
+        ref: `refs/heads/${branch}`,
+        runId,
+        attempt,
+    });
+    const currentId = `cl-${currentRequest.runId}-${currentRequest.attempt}-${sha}`;
+
+    const admit = async (receipt, expected, image) => {
+        if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt))
+            throw new Error("Formatting evidence is unavailable.");
+        const format = admitSourceFormatting(receipt, expected, image);
+        await verifyLogs(`cl-${expected.runId}-${expected.attempt}-${expected.sha}`, format);
+        return format;
+    };
+
+    const passed = (receipt, format) => ({
+        status: "passed",
+        runId: receipt.runId,
+        attempt: receipt.attempt,
+        sha,
+        ref: receipt.ref,
+        conclusion: receipt.conclusion,
+        sourceFormat: format,
+        ...(receipt.sourceBaseSha ? { sourceBaseSha: exactSha(receipt.sourceBaseSha) } : {}),
+    });
+
+    if (upstream !== undefined && upstream !== null) {
+        const upstreamRequest = parseCloudCiRequest({
+            repository: SOURCE_REPOSITORY,
+            sha,
+            ref: `refs/heads/${branch}`,
+            runId: upstream.runId,
+            attempt: upstream.attempt,
+        });
+        const prior = await fetchReceipt(
+            `cl-${upstreamRequest.runId}-${upstreamRequest.attempt}-${sha}`,
+        );
+
+        if (prior === null || typeof prior !== "object" || Array.isArray(prior))
+            throw new Error("Formatting evidence is unavailable.");
+
+        if (prior.imageDigest === imageDigest) {
+            const format = await admit(prior, upstreamRequest, imageDigest);
+            return passed(prior, format);
+        }
+
+        if (priorImageDigest === undefined || prior.imageDigest !== priorImageDigest)
+            throw new Error("Formatting prior evidence is not admitted.");
+
+        if (upstreamRequest.runId === currentRequest.runId && upstreamRequest.attempt === currentRequest.attempt)
+            throw new Error("Formatting refresh cannot reuse its prior run identity.");
+
+        await admit(prior, upstreamRequest, priorImageDigest);
+    }
+
+    await startRun(currentRequest);
+    const receipt = await fetchReceipt(currentId);
+    const format = await admit(receipt, currentRequest, imageDigest);
+
+    return passed(receipt, format);
+}
+
 export function reviewRecord(report, runId, attempt) {
     if (!/^[1-9][0-9]{0,19}$/.test(runId ?? "") || !/^[1-9][0-9]{0,5}$/.test(attempt ?? ""))
         throw new Error("Invalid review run identity.");
@@ -761,7 +846,7 @@ export function sourceAuditContinuation(report, currentSha, runId, attempt, publ
 }
 
 export function admitAuditResume(target, parent, revision, campaign) {
-    if(target.range?.kind === "test-audit" && parent.sourceRange?.manifestDigest) return admitTestAuditParent(target,parent,revision,campaign?.manifestDigest,campaign?.publicationResult);
+    if(target.range?.kind === "test-audit" && parent.sourceRange?.manifestDigest) return admitTestAuditParent(target,parent,revision,campaign?.manifestDigest,campaign?.publicationResult,campaign);
     if (!/^[1-9][0-9]{0,19}-[1-9][0-9]{0,5}$/.test(target.auditParent ?? "") ||
         parent.controllerRevision !== revision || parent.sha !== target.sha ||
         parent.sourceRange?.kind !== target.range.kind || parent.sourceRange?.inventoryDigest !== target.range.inventoryDigest ||
@@ -827,6 +912,60 @@ export function admitRuntimeReplay({ original, replayRef, runtimeEvents, sha, co
         (publications !== undefined && canonicalJson(original.publications) !== canonicalJson(publications)))
         throw new Error("Canonical runtime publication source, controller or event identity differs; unresolved evidence must not be replaced.");
     return { ...original, status: "publication-replay", replayOf: replayRef };
+}
+
+const transitionKeys = "branch cursor enabled imageDigest inventoryDigest kind manifestDigest pagePaths pageSize parent parentController priorChild priorFormatting priorImageDigest publish repository run source totalPaths verifierRevision".split(" ");
+const formattingKeys = "attempt ref runId sha".split(" ");
+const exactKeys = (value, keys) => value !== null && typeof value === "object" && !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify(keys);
+const sha40 = (value) => typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
+const imageSha = (value) => typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
+const hex64 = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+const runIdentity = (value) => typeof value === "string" && /^[1-9][0-9]{0,19}-[1-9][0-9]{0,5}$/.test(value);
+
+export async function loadTestAuditTransition(context, readRecord = document) {
+    let rawRecord;
+    try {
+        rawRecord = await readRecord(path.join(root, "config/ci/test-audit-transition.json"));
+    } catch (error) {
+        if (error?.code === "ENOENT") return undefined;
+        throw error;
+    }
+    if (!exactKeys(rawRecord, transitionKeys) ||
+        rawRecord.kind !== "test-audit-controller-transition" ||
+        rawRecord.repository !== SOURCE_REPOSITORY || rawRecord.branch !== "main" ||
+        typeof rawRecord.enabled !== "boolean" || typeof rawRecord.publish !== "boolean" ||
+        !sha40(rawRecord.source) || !sha40(rawRecord.parentController) || !sha40(rawRecord.verifierRevision) ||
+        !runIdentity(rawRecord.parent) || !runIdentity(rawRecord.priorChild) || !runIdentity(rawRecord.run) ||
+        !Number.isSafeInteger(rawRecord.cursor) || rawRecord.cursor < 0 ||
+        rawRecord.pageSize !== 1 || rawRecord.pagePaths !== 1 ||
+        !Number.isSafeInteger(rawRecord.totalPaths) || rawRecord.totalPaths < 1 ||
+        rawRecord.cursor + rawRecord.pagePaths > rawRecord.totalPaths ||
+        !hex64(rawRecord.manifestDigest) || !hex64(rawRecord.inventoryDigest) ||
+        !imageSha(rawRecord.priorImageDigest) || !imageSha(rawRecord.imageDigest) ||
+        !exactKeys(rawRecord.priorFormatting, formattingKeys) ||
+        typeof rawRecord.priorFormatting.runId !== "string" ||
+        !/^[1-9][0-9]{0,19}$/.test(rawRecord.priorFormatting.runId) ||
+        typeof rawRecord.priorFormatting.attempt !== "string" ||
+        !/^[1-9][0-9]{0,5}$/.test(rawRecord.priorFormatting.attempt) ||
+        !sha40(rawRecord.priorFormatting.sha) || rawRecord.priorFormatting.ref !== "refs/heads/main")
+        throw new Error("Test audit transition record is malformed.");
+    if (!rawRecord.enabled) return undefined;
+    if (!runIdentity(`${context.runId}-${context.attempt}`) || !sha40(context.controllerRevision) ||
+        !imageSha(context.imageDigest) || !sha40(context.verifierRevision))
+        throw new Error("Test audit transition context is malformed.");
+    if (rawRecord.run !== `${context.runId}-${context.attempt}`) return undefined;
+    if (rawRecord.imageDigest !== context.imageDigest || rawRecord.verifierRevision !== context.verifierRevision ||
+        rawRecord.parentController === context.controllerRevision || rawRecord.verifierRevision === context.controllerRevision)
+        throw new Error("Test audit transition runtime or controller context drifted.");
+    return { ...rawRecord, controllerRevision: context.controllerRevision, recordSha256: sha256(JSON.stringify(rawRecord)) };
+}
+
+export function transitionMatchesFormatting(record, { sha, branch, upstream }) {
+    return record?.enabled === true && record?.source === sha && record?.branch === branch && branch === "main" &&
+        record?.priorFormatting?.sha === sha && record?.priorFormatting?.ref === "refs/heads/main" &&
+        record?.priorFormatting?.runId === upstream?.runId &&
+        record?.priorFormatting?.attempt === upstream?.attempt;
 }
 
 async function document(file, maximum = 512 * 1024) {
@@ -900,7 +1039,7 @@ async function fetchJson(url, token, body, maximum = 256 * 1024) {
     return JSON.parse(text);
 }
 
-async function createController(github, controllerRevision) {
+async function createController(github, controllerRevision, transition) {
     const head = async (branch) =>
         exactSha((await github.request("GET", `${prefix}/git/ref/heads/${branch}`)).object.sha);
 
@@ -981,75 +1120,71 @@ async function createController(github, controllerRevision) {
                 attempt: upstream?.attempt ?? attempt,
             });
 
-            const id = `cl-${request.runId}-${request.attempt}-${sha}`;
-
             try {
-                if (!upstream) {
-                    await execute("bun", ["scripts/cloud-ci-mirror.mjs", sha]);
+                return await admitFormattingRun({
+                    sha,
+                    branch,
+                    upstream,
+                    runId,
+                    attempt,
+                    imageDigest: policy.imageDigest,
+                    priorImageDigest: transitionMatchesFormatting(transition, {
+                        sha,
+                        branch,
+                        upstream,
+                    })
+                        ? transition.priorImageDigest
+                        : undefined,
+                    fetchReceipt: (id) =>
+                        fetchJson(new URL(`/runs/${id}/evidence`, config.endpoint), token),
+                    startRun: async (startRequest) => {
+                        await execute("bun", ["scripts/cloud-ci-mirror.mjs", sha]);
 
-                    const started = await fetchJson(
-                        new URL("/runs", config.endpoint),
-                        token,
-                        JSON.stringify(request),
-                    );
-
-                    if (started.id !== id || started.sha !== sha)
-                        throw new Error("Formatting run identity mismatch.");
-                    const deadline = Date.now() + 60 * 60 * 1000;
-
-                    for (;;) {
-                        if (Date.now() >= deadline)
-                            throw new Error("Formatting run deadline exceeded.");
-                        const state = await fetchJson(
-                            new URL(`/runs/${id}`, config.endpoint),
+                        const id = `cl-${startRequest.runId}-${startRequest.attempt}-${sha}`;
+                        const started = await fetchJson(
+                            new URL("/runs", config.endpoint),
                             token,
+                            JSON.stringify(startRequest),
                         );
 
-                        if (state.id !== id || state.sha !== sha)
+                        if (started.id !== id || started.sha !== sha)
                             throw new Error("Formatting run identity mismatch.");
+                        const deadline = Date.now() + 60 * 60 * 1000;
 
-                        if (["complete", "errored", "terminated"].includes(state.status)) break;
+                        for (;;) {
+                            if (Date.now() >= deadline)
+                                throw new Error("Formatting run deadline exceeded.");
+                            const state = await fetchJson(
+                                new URL(`/runs/${id}`, config.endpoint),
+                                token,
+                            );
 
-                        if (state.status === "unknown")
-                            throw new Error("Formatting run state is unknown.");
-                        await setTimeout(5000);
-                    }
-                }
+                            if (state.id !== id || state.sha !== sha)
+                                throw new Error("Formatting run identity mismatch.");
 
-                const receipt = await fetchJson(
-                    new URL(`/runs/${id}/evidence`, config.endpoint),
-                    token,
-                );
-                const format = admitSourceFormatting(receipt, request, policy.imageDigest);
+                            if (["complete", "errored", "terminated"].includes(state.status)) break;
 
-                await verifyCloudCiObjects({ checks: [format] }, (key) =>
-                    fetch(
-                        new URL(
-                            `/runs/${id}/logs/${key.slice(`logs/${id}/`.length)}`,
-                            config.endpoint,
-                        ),
-                        {
-                            headers: { authorization: `Bearer ${token}` },
-                            redirect: "error",
-                            signal: AbortSignal.timeout(30000),
-                        },
-                    ),
-                );
-
-                const formatting = {
-                    status: "passed",
-                    runId: request.runId,
-                    attempt: request.attempt,
-                    sha,
-                    ref: request.ref,
-                    conclusion: receipt.conclusion,
-                    sourceFormat: format,
-                };
-
-                if (receipt.sourceBaseSha)
-                    formatting.sourceBaseSha = exactSha(receipt.sourceBaseSha);
-
-                return formatting;
+                            if (state.status === "unknown")
+                                throw new Error("Formatting run state is unknown.");
+                            await setTimeout(5000);
+                        }
+                    },
+                    verifyLogs: async (id, format) => {
+                        await verifyCloudCiObjects({ checks: [format] }, (key) =>
+                            fetch(
+                                new URL(
+                                    `/runs/${id}/logs/${key.slice(`logs/${id}/`.length)}`,
+                                    config.endpoint,
+                                ),
+                                {
+                                    headers: { authorization: `Bearer ${token}` },
+                                    redirect: "error",
+                                    signal: AbortSignal.timeout(30000),
+                                },
+                            ),
+                        );
+                    },
+                });
             } catch {
                 return {
                     status: "blocked",
@@ -1212,12 +1347,23 @@ export async function main(args = process.argv.slice(2)) {
             if(target.range.cursor>=campaignManifest.rows.length)throw new Error("Campaign cursor outside manifest");
             target={...target,range:{...target.range,sha:target.sha,manifestDigest:digest,totalPaths:campaignManifest.rows.length,pageSize:1,pagePaths:1,nextCursor:target.range.cursor+1<campaignManifest.rows.length?target.range.cursor+1:null}};
         }
+        let transition;
         if (target.auditParent) {
             const config = await protectedConfig("omg-cloud-ci.json");
-            ciPolicy(config);
-            const parent = await fetchJson(new URL(`/review-records/${target.auditParent}`, config.endpoint), await secret(config.tokenFile), undefined, 2 * 1024 * 1024);
-            target = admitAuditResume(target, parent, revision, campaignManifest?{
-                manifestDigest:testAuditManifestDigest(campaignManifest),publicationResult:await parentPublicationResult(github,target.auditParent,parent)}:undefined);
+            const policy = ciPolicy(config);
+            const token = await secret(config.tokenFile);
+            transition = await loadTestAuditTransition({ runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+                controllerRevision: revision, imageDigest: policy.imageDigest, verifierRevision: policy.verifierRevision });
+            const parent = await fetchJson(new URL(`/review-records/${target.auditParent}`, config.endpoint), token, undefined, 2 * 1024 * 1024);
+            const priorChild = transition && target.range?.kind === "test-audit" &&
+                transition.source === target.sha && transition.parent === target.auditParent
+                ? await fetchJson(new URL(`/review-records/${transition.priorChild}`, config.endpoint), token, undefined, 2 * 1024 * 1024)
+                : undefined;
+            target = admitAuditResume(target, parent, revision, campaignManifest ? { transition, priorChild,
+                runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+                imageDigest: policy.imageDigest, verifierRevision: policy.verifierRevision,
+                manifestDigest: testAuditManifestDigest(campaignManifest),
+                publicationResult: await parentPublicationResult(github, target.auditParent, parent) } : undefined);
         }
         let report;
         if(campaignManifest){
@@ -1228,8 +1374,9 @@ export async function main(args = process.argv.slice(2)) {
                 formatting:{status:"not-started",reason:"equivalent-campaign-row-already-recorded"},suppliedPaths:[],readPaths:[],unreviewedPaths:[],batches:[],publications:[],candidateOutcomes:[],testAudits:[],publishRequested:target.publish,
                 duplicateOf:prior,coverageMeaning:"Duplicate campaign intake performed no inference, verification, continuation or coverage credit."};
         }
-        report ??= await runReviewFlow({ target, io: await createController(github, revision) });
+        report ??= await runReviewFlow({ target, io: await createController(github, revision, transition) });
         if(campaignManifest){report.campaignParent=target.auditParent??null;report.triggerSha=exactSha(process.env.GITHUB_SHA);report.campaignRun={runId:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT};}
+        if (target.controllerTransition) report.controllerTransition = target.controllerTransition;
         report.controllerRevision = revision;
         await mkdir(directory, { recursive: true });
         await writeFile(path.join(directory, "review.json"), `${JSON.stringify(report)}\n`, {

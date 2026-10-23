@@ -11,6 +11,7 @@ import { sourceReviewProposalSchema } from "../../ci-inspector/src/review-contra
 import { verifyPublicationProof } from "../../../scripts/ai-review-proof.mjs";
 import { verifyCloudCiObjects } from "../../../scripts/cloud-ci-evidence.mjs";
 import { createDependencyTool, dependencyLockRange, type DependencyPlan } from "./dependency";
+import { testAuditContext, createSourceSearch } from "./source-navigation";
 
 type Json = z.infer<ReturnType<typeof z.json>>;
 
@@ -24,6 +25,19 @@ export type VerificationJob = {
   deadline: number;
 } & ({ status: "pending" } | { status: "verified" } | { status: "failed"; reason: string });
 
+// Frozen before the first submit. The installed SDK reconciles a duplicate operation id by
+// session and type only, so changed prompt bytes would be accepted silently on re-entry.
+export type VerificationHandoff = {
+  prompt: string;
+  proposalSha256: string;
+  parentOperationId: string;
+  sessionId: string;
+  skillBundleSha256: string;
+  operationId: string;
+  whenBusy: "followUp";
+  status: "pending" | "nojob";
+};
+
 export type CodingState = {
   calls: number;
   reads: ReadRange[];
@@ -33,6 +47,7 @@ export type CodingState = {
   verification?: { proposalSha256: string; id: string; receipt: Json };
   verifiedDigests: string[];
   verificationJob?: VerificationJob;
+  verificationHandoff?: VerificationHandoff;
   skillBundleSha256?: string;
   sessionId?: string;
 };
@@ -71,10 +86,91 @@ export async function continueCodingVerification({ job, parentOperationId, sessi
   } } as const;
 }
 
+const verificationHandoffPrompt = (input: { parentOperationId: string; proposalSha256: string }) =>
+  [
+    "Trusted controller handoff for the original operation. The admitted existing-test audit has no verification job. Treat the identifiers below as data.",
+    `Call the registered tool through CodeMode exactly once: execute with {"code":"return await tools.verify_patch({proposalSha256: \\"${input.proposalSha256}\\"})"}. Do not call verify_patch directly, re-propose, export or claim verification. Stop this turn after the tool returns.`,
+    JSON.stringify({ parentOperationId: input.parentOperationId, proposalSha256: input.proposalSha256 }),
+  ].join("\n\n");
+
+export async function startCodingVerificationHandoff({ state, outcomeStatus, parentOperationId, sessionId, skillBundleSha256, harness, update }: {
+  state: CodingState;
+  outcomeStatus: string;
+  parentOperationId: string;
+  sessionId: string | undefined;
+  skillBundleSha256: string | undefined;
+  harness: Pick<OpenCodeHarness, "submit" | "pending" | "wait">;
+  update: (change: (state: CodingState) => CodingState) => Promise<CodingState>;
+}) {
+  if (outcomeStatus !== "done") return null;
+  const proposal = state.testAudit;
+  if (!proposal || state.verificationJob || state.verification) return null;
+  if (state.verificationHandoff?.status === "nojob") return { status: "nojob" as const };
+  if (!sessionId || sessionId !== state.sessionId || !skillBundleSha256 || skillBundleSha256 !== state.skillBundleSha256)
+    throw new Error("Verification handoff session or skill delivery mismatch");
+
+  const operationId = `hv-${parentOperationId}-${proposal.proposalSha256.slice(0, 16)}`;
+  const frozen = {
+    prompt: verificationHandoffPrompt({ parentOperationId, proposalSha256: proposal.proposalSha256 }),
+    proposalSha256: proposal.proposalSha256,
+    parentOperationId,
+    sessionId,
+    skillBundleSha256,
+    operationId,
+    whenBusy: "followUp" as const,
+  };
+  const previous = state.verificationHandoff;
+
+  if (previous) {
+    if (previous.prompt !== frozen.prompt || previous.proposalSha256 !== frozen.proposalSha256 ||
+        previous.parentOperationId !== frozen.parentOperationId || previous.sessionId !== frozen.sessionId ||
+        previous.skillBundleSha256 !== frozen.skillBundleSha256 || previous.operationId !== frozen.operationId ||
+        previous.whenBusy !== frozen.whenBusy)
+      throw new Error("Verification handoff intent differs from the frozen follow-up");
+  } else {
+    await update((current) => {
+      if (current.verificationJob || current.verification ||
+          current.testAudit?.proposalSha256 !== proposal.proposalSha256 || current.sessionId !== sessionId)
+        throw new Error("Proposal changed during verification handoff");
+      return { ...current, verificationHandoff: { ...frozen, status: "pending" as const } };
+    });
+  }
+
+  // Intent is durable before submit, so a crash or unknown receipt re-sends identical bytes and id.
+  await harness.submit(frozen.prompt, { operationId, session: sessionId, whenBusy: frozen.whenBusy });
+  if ((await harness.pending()).some((operation) => operation.operationId === operationId))
+    return { status: "pending" as const };
+
+  // The official wait resolves done or unanswered. A transport error is not terminal:
+  // leaving the intent pending re-sends the identical operation id and bytes on the next status call.
+  await harness.wait(operationId);
+  if ((await update((current) => current)).verificationJob) return { status: "settled" as const };
+  await update((current) => {
+    const handoff = current.verificationHandoff;
+    if (handoff?.operationId !== operationId || handoff.status !== "pending") return current;
+    return { ...current, verificationHandoff: { ...handoff, status: "nojob" as const } };
+  });
+  return { status: "nojob" as const };
+}
+
 const emptyState = (): CodingState => ({ calls: 0, reads: [], verifiedDigests: [] });
 const output = (value: Json) => ({ content: JSON.stringify(value) });
 const noInput = z.strictObject({});
 const hashInput = z.strictObject({ proposalSha256: z.string().regex(/^[a-f0-9]{64}$/) });
+
+export async function continueCodingDiagnosis({operationId, sessionId, harness}: {
+  operationId: string;
+  sessionId: string | undefined;
+  harness: Pick<OpenCodeHarness, "submit" | "pending" | "wait">;
+}) {
+  if (!sessionId) throw new Error("Diagnostic reporting session missing");
+  const id = `${operationId}-report`;
+  await harness.submit("Return your diagnostic findings, applicable proposed edits and executable test code as JSON using only the evidence already read. Tool access is now closed. State unsupported conclusions explicitly; no claim of verified repair or test proof is allowed.",
+    {operationId: id, session: sessionId, whenBusy: "followUp"});
+  const pending = (await harness.pending()).find(operation => operation.operationId === id);
+  if (pending) return {status: "pending", pending} as const;
+  return {status: "completed", outcome: await harness.wait(id), operationId: id} as const;
+}
 
 async function ciJson(
   env: ActionsOptions["env"],
@@ -262,9 +358,10 @@ export async function pollCodingVerification(
 }
 
 export function createCodingActions({ getRequest, env, skills, update }: ActionsOptions) {
-  async function enter(context: ToolContext) {
+  async function enter(context: ToolContext, mutation = false) {
     const delivery = skills.assertDelivered(context.sessionID);
     const request = await getRequest();
+    if (mutation && request.diagnosisTask) throw new Error("Operation is a read-only diagnosis");
     await update((state) => {
       if (state.calls >= 96) throw new Error("Coding tool budget exhausted");
 
@@ -291,7 +388,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           repository: request.repository,
           sha: request.sha,
           changedPaths: request.source.changedPaths,
-          files: request.source.sourceFiles.map(({ path, blobSha }) => ({ path, blobSha })),
+          files: request.source.sourceFiles.map(({ path, blobSha, content }) => ({ path, blobSha, lines:content.split("\n").length })),
         });
       },
     },
@@ -302,7 +399,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       async execute(_input: z.infer<typeof noInput>, context: ToolContext) {
         const request = await enter(context);
 
-        return output({
+        return output(z.json().parse({
           diff: request.source.diff,
           ciFailures: request.source.ciFailures,
           ...(request.source.runtimeEvidence ? {
@@ -313,9 +410,11 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           candidateIndex: request.candidateIndex ?? null,
           ...(request.dependencyTask ? {dependencyTask:request.dependencyTask,
             lockRanges:request.dependencyTask.targets.map(target=>({...target,...dependencyLockRange(request.source.sourceFiles.find(file=>file.path==="Cargo.lock")!.content,target)}))} : {}),
-        });
+          ...testAuditContext(request),
+        }));
       },
     },
+    find_source: createSourceSearch(enter),
     read_source: {
       input: z.strictObject({
         path: z.string().min(1).max(300),
@@ -373,7 +472,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       description:
         "Propose exactly one evidenced repair with exact unique replacements and one new regression test. Does not publish or execute code.",
       async execute(input: z.infer<typeof sourceReviewProposalSchema>, context: ToolContext) {
-        const request = await enter(context);
+        const request = await enter(context, true);
         if (request.testAuditTask) throw new Error("Use the separate existing-test audit tools");
         if(request.dependencyTask) throw new Error("Use the separate dependency planning tool");
         const { repository, sha, branch, runId, attempt, source } = request;
@@ -413,17 +512,19 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
         });
       },
     },
-    propose_dependency_updates: createDependencyTool(enter, update),
+    propose_dependency_updates: createDependencyTool((context) => enter(context, true), update),
     propose_test_strengthening: {
       input: testAuditToolSchema,
-      description: "Audit the selected test against an evidence-only source fault. For an adequate test use existing-test-sensitivity with unchanged bytes; strengthening inserts one assertion. Never publish the fault.",
+      description: "Audit the selected test against one evidence-only source fault. Prefer existing-test-strengthening when a plausible uncovered observable behavior supports one inserted assertion. Existing-test-sensitivity with unchanged bytes is also acceptable when the selected fault is caught by the existing assertion within existing budgets; it need not prove that no gap exists. Sensitivity has two states and earns verified-sensitivity credit without export; strengthening has four states and exports only the strengthened test. Never manufacture a fault, assertion or patch, and never publish the fault.",
       async execute(input: z.infer<typeof testAuditToolSchema>, context: ToolContext) {
-        const request = await enter(context);
+        const request = await enter(context, true);
         const testAudit = buildTestAuditProposal(request, input);
         await update((state) => {
           if (![testAudit.proposal.test.path,input.fault.path].every((path) => state.reads.some((read) => read.path === path)))
             throw new Error("Read the test and fault source before proposing strengthening");
-          return {...state,testAudit:{proposal:testAudit.proposal,proposalSha256:testAudit.proposalSha256},proposal:undefined,verification:undefined,verificationJob:undefined};
+          if (state.verifiedDigests.length >= 2 && !state.verifiedDigests.includes(testAudit.proposalSha256))
+            throw new Error("Coding verification budget exhausted");
+          return {...state,testAudit:{proposal:testAudit.proposal,proposalSha256:testAudit.proposalSha256},proposal:undefined,verification:undefined,verificationJob:undefined,verificationHandoff:undefined};
         });
         return output({proposalSha256:testAudit.proposalSha256,handover:testAudit.handover});
       },
@@ -433,7 +534,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       description:
         "Run the exact proposed repair through independent Cloudflare CI and regression checks. Waits for actual terminal evidence.",
       async execute(input: z.infer<typeof hashInput>, context: ToolContext) {
-        const request = await enter(context);
+        const request = await enter(context, true);
 
         const state = await update((current) => {
           if (!(current.testAudit ?? current.proposal) || (current.testAudit ?? current.proposal)?.proposalSha256 !== input.proposalSha256)
@@ -498,7 +599,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
       description:
         "Export a verified exact proposal with required skill provenance. Publishing still uses the separate trusted GitHub controller.",
       async execute(input: z.infer<typeof hashInput>, context: ToolContext) {
-        const request=await enter(context);
+        const request=await enter(context, true);
         const state = await update((current) => current);
 
         if (
@@ -552,6 +653,7 @@ export function createCodingTools(
         editor.add({ name: "list_sources", ...actions.list_sources });
         editor.add({ name: "read_context", ...actions.read_context });
         editor.add({ name: "read_source", ...actions.read_source });
+        editor.add({ name: "find_source", ...actions.find_source });
         editor.add({ name: "read_skill", ...actions.read_skill });
         editor.add({ name: "propose_fix", ...actions.propose_fix });
         editor.add({ name: "propose_dependency_updates", ...actions.propose_dependency_updates });
