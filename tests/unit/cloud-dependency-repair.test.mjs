@@ -77,6 +77,7 @@ import {
     auditHeld,
     auditIgnores,
     groupFindings,
+    restoreUnplannedLockEdges,
     selectCandidates,
 } from "../../scripts/cloud-dependency-repair.mjs";
 
@@ -113,6 +114,91 @@ test("lockfile verifier admits exact published updates and preserves unrelated p
         admitLockChange(before, after, plan, {
             example: [{ ...index.example[0], yanked: true }],
         }),
+    );
+});
+
+const realisticBefore = `version = 4
+
+[[package]]
+name = "ctutils"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "${"c".repeat(64)}"
+
+[[package]]
+name = "errno"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "libc"
+version = "0.2.177"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "${"d".repeat(64)}"
+
+[[package]]
+name = "windows-sys"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "${"e".repeat(64)}"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "${"f".repeat(64)}"
+`;
+const realisticProduced = realisticBefore
+    .replace('version = "0.4.2"', 'version = "0.4.4"')
+    .replace("c".repeat(64), "a".repeat(64))
+    .replace('"windows-sys 0.52.0"', '"windows-sys 0.61.2"');
+const realisticPlan = { updates: [{ name: "ctutils", from: "0.4.2", to: "0.4.4" }] };
+const realisticIndex = { ctutils: [{ name: "ctutils", vers: "0.4.4", cksum: "a".repeat(64), yanked: false }] };
+
+test("producer restores only unplanned dependency edges and the strict gate stays closed", () => {
+    assert.throws(
+        () => admitLockChange(realisticBefore, realisticProduced, realisticPlan, realisticIndex),
+        /Unrelated package changed/,
+    );
+    const restored = restoreUnplannedLockEdges(realisticBefore, realisticProduced, realisticPlan);
+    assert.equal(
+        restored,
+        realisticBefore.replace('version = "0.4.2"', 'version = "0.4.4"').replace("c".repeat(64), "a".repeat(64)),
+    );
+    assert.equal(admitLockChange(realisticBefore, restored, realisticPlan, realisticIndex), true);
+});
+
+test("producer restoration refuses checksum, source, version and inventory changes", () => {
+    const checksum = realisticProduced.replace(
+        "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb",
+        "9".repeat(64),
+    );
+    assert.throws(
+        () => restoreUnplannedLockEdges(realisticBefore, checksum, realisticPlan),
+        /Unplanned package checksum changed/,
+    );
+    const source = realisticProduced.replace(
+        'name = "errno"\nversion = "0.3.14"\nsource = "registry+https://github.com/rust-lang/crates.io-index"',
+        'name = "errno"\nversion = "0.3.14"\nsource = "git+https://evil.example/index"',
+    );
+    assert.throws(
+        () => restoreUnplannedLockEdges(realisticBefore, source, realisticPlan),
+        /Unplanned package identity or inventory changed/,
+    );
+    const version = realisticProduced.replace('version = "0.3.14"', 'version = "0.3.15"');
+    assert.throws(
+        () => restoreUnplannedLockEdges(realisticBefore, version, realisticPlan),
+        /Unplanned package identity or inventory changed/,
+    );
+    const extra = realisticProduced + '\n[[package]]\nname = "extra"\nversion = "1.0.0"\n';
+    assert.throws(
+        () => restoreUnplannedLockEdges(realisticBefore, extra, realisticPlan),
+        /Dependency graph expansion requires separate review/,
     );
 });
 
@@ -242,4 +328,12 @@ test("the same immutable ignore policy gates verify and readmit", () => {
     const patched = { exitCode: 0, database: baseline.database, report: { vulnerabilities: { found: false, count: 0, list: [] }, warnings: { unsound: [{ advisory: { id: "RUSTSEC-2023-0071", informational: "unsound", withdrawn: null }, package: { name: "ignored", version: "1.0.0" }, versions: { patched: [], unaffected: [] } }] } } };
     assert.equal(admitAuditPair(baseline, patched, manifest, ignored), true);
     assert.throws(() => admitAuditPair(baseline, patched, manifest, new Set()));
+});
+
+test("restoration rejects duplicate identities and preserves planned checksums for strict admission", () => {
+    const duplicate = realisticProduced.replace('name = "libc"\nversion = "0.2.177"', 'name = "errno"\nversion = "0.3.14"');
+    assert.throws(() => restoreUnplannedLockEdges(realisticBefore, duplicate, realisticPlan), /Duplicate updated package identity/);
+    const tampered = realisticProduced.replace("a".repeat(64), "9".repeat(64));
+    const restored = restoreUnplannedLockEdges(realisticBefore, tampered, realisticPlan);
+    assert.throws(() => admitLockChange(realisticBefore, restored, realisticPlan, realisticIndex), /checksum differs/);
 });

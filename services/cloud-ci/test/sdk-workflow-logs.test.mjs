@@ -6,25 +6,28 @@ const mode = MODE;
 const bytes = new Uint8Array(310_001).map((_, index) => index % 256);
 const events=[];
 let destroyed=false;
-let starts=0;let polls=0;let streamCalls=0;let startDisposals=0;let pollDisposals=0;let resolvedPolls=0;
-function owned(value,kind){if(mode==='plain-process')return value;let disposed=false;return Object.assign(value,{[Symbol.dispose](){assert.equal(disposed,false,'process result must be disposed exactly once');disposed=true;if(kind==='start')startDisposals++;else pollDisposals++;events.push(kind+'-dispose');}}); }
+let executions=0;let backgroundCalls=0;let backups=0;
 const startedAt=Date.now();
-function interrupted(retryable){return new OperationInterruptedError({reason:retryable?'runtime_replaced':'sandbox_lifetime_changed',operation:'sandbox.getProcess',phase:'poll',admitted:false,retryable});}
+const invalidExits={
+ 'command-signal':null,'command-missing-exit':undefined,'command-negative':-1,
+ 'command-fractional':0.5,'command-nan':NaN,'command-infinite':Infinity,
+ 'command-string':'0','command-unsafe':Number.MAX_SAFE_INTEGER+1,
+};
 const sandbox={
- async exec(command){return {exitCode:0,stdout:'preview',stderr:''};},
- async startProcess(){starts++;return owned({id:'fixture-process',waitForExit:async()=>{streamCalls++;if(mode==='exit-stream-disposed')throw new Error('WritableStream RPC stub was disposed without calling close()');return {exitCode:0};}},'start');},
- async getProcess(id){assert.equal(id,'fixture-process');polls++;
- if(mode==='process-read-failure')throw new Error('fixture status RPC failed');
- if(mode==='process-read-hang')return new Promise(()=>{});
- if(mode==='process-retry-nonretryable')throw interrupted(false);
- if(mode==='process-retry-exhausted')throw interrupted(true);
- if((mode==='process-retry-completed'||mode==='process-retry-missing'||mode==='process-retry-identity')&&polls===1)throw interrupted(true);
- if(mode==='process-retry-missing')return null;
- if(mode==='process-missing'||(mode==='process-transient-missing'&&polls===1))return null;
- const result=mode==='process-timeout'?{id,status:'running'}:mode==='process-nonzero'?{id,status:'failed',exitCode:7}:mode==='process-signal'?{id,status:'killed',exitCode:null}:mode==='process-invalid-zero'?{id,status:'failed',exitCode:0}:mode==='process-unknown'?{id,status:'unknown'}:mode==='process-identity'?{id:'other-process',status:'completed',exitCode:0}:mode==='process-retry-identity'?{id:'other-process',status:'completed',exitCode:0}:mode==='exit-stream-disposed'&&polls===1?{id,status:'running'}:{id,status:'completed',exitCode:0};
- if(mode==='process-read-late')await new Promise(resolve=>setTimeout(resolve,30));
- resolvedPolls++;return owned(result,'poll');},
- async createBackup(){return {id:'actual-snapshot',dir:'/workspace'};},
+ async exec(command,options){
+   if(!command.startsWith('(trusted fixture)'))return {success:true,exitCode:0,stdout:'preview',stderr:''};
+   executions++;assert.equal(options.cwd,'/workspace');assert.equal(options.env.CI,'true');
+   assert.equal(options.timeout,shortDeadline?5:10000);
+   if(mode==='command-read-hang'||mode==='command-timeout')return new Promise(()=>{});
+   if(mode==='command-read-late')await new Promise(resolve=>setTimeout(resolve,30));
+   if(mode==='command-read-failure')throw new Error('fixture command RPC failed');
+   if(mode==='command-interrupted'||mode==='command-interrupted-retryable')throw new OperationInterruptedError({reason:'runtime_replaced',operation:'sandbox.exec',phase:'execute',admitted:false,retryable:mode.endsWith('-retryable')});
+   const exitCode=Object.hasOwn(invalidExits,mode)?invalidExits[mode]:mode==='command-nonzero'?7:0;
+   return {success:mode==='command-invalid-zero'?false:mode==='command-invalid-nonzero'?true:exitCode===0,exitCode:mode==='command-invalid-nonzero'?7:exitCode,stdout:'',stderr:''};
+ },
+ async startProcess(){backgroundCalls++;throw new Error('finite command must not use background process');},
+ async getProcess(){backgroundCalls++;throw new Error('finite command must not poll process status');},
+ async createBackup(){backups++;return {id:'actual-snapshot',dir:'/workspace'};},
  async listFiles(){const size=mode==='inline'?5:bytes.length+(mode==='length-mismatch'?1:0);return {files:[{absolutePath:'/tmp/ci-step.out',size},{absolutePath:'/tmp/ci-step.err',size}]};},
  async readFile(path,options){
    if(mode==='inline'){assert.equal(options.encoding,'utf-8');return {content:'small'};}
@@ -54,10 +57,11 @@ const provider={
  create(){return {getSourceCheckout:async()=>({kind:'archive',url:'https://fixture.invalid/source'}),startStepNotification:async()=>null};},
 };
 let checkpoint;
+const shortDeadline=['finite-quiet-completed','command-read-hang','command-read-late','command-timeout'].includes(mode);
 class Fixture extends CIWorkflow{
  static getProvider(){return provider;}
  async pipeline(event,step,ci){
-   const output=await ci.runner({name:'large-unit-output',command:'trusted fixture',config:{commandTimeoutMs:mode==='process-timeout'||mode==='process-read-hang'||mode==='process-read-late'||mode==='process-missing'||mode==='process-retry-missing'?5:10000}});
+   const output=await ci.runner({name:'large-unit-output',command:'trusted fixture',config:{commandTimeoutMs:shortDeadline?5:10000}});
    assert.equal(output.snapshot.id,'actual-snapshot');
    for(const log of [output.logs.stdout,output.logs.stderr]){
      if(mode==='inline')assert.equal(log,'small');
@@ -77,35 +81,30 @@ const step={async do(name,config,callback){
 const workflow=new Fixture({}, {BACKUP_BUCKET:bucket});
 let failure;
 try{await workflow.run({instanceId:'fixture-run',payload:{provider:'fixture',providerData:{},owner:'fixed',repo:'repo',sha:'a'.repeat(40),ref:'refs/heads/main',event:{type:'push'}}},step);}catch(error){failure=error;}
-if(mode==='process-read-late')await new Promise(resolve=>setTimeout(resolve,50));
-assert.equal(starts,1,'a status wait must never restart the command');
-assert.equal(startDisposals,mode==='plain-process'?0:1,'start result capabilities must be released');
-assert.equal(pollDisposals,mode==='plain-process'?0:resolvedPolls,'every resolved poll result must release its capabilities, including after timeout');
-if(mode==='ok'||mode==='inline'||mode==='telemetry-throw'||mode==='exit-stream-disposed'||mode==='plain-process'||mode==='process-transient-missing'||mode==='process-retry-completed'){
+if(mode==='command-read-late')await new Promise(resolve=>setTimeout(resolve,50));
+assert.equal(executions,1,'a completion wait must never restart the command');
+assert.equal(backgroundCalls,0,'finite command completion must not depend on background status');
+if(['finite-quiet-completed','ok','inline','telemetry-throw','empty-command-output'].includes(mode)){
  assert.equal(failure,undefined,failure?.stack);
- if(mode==='exit-stream-disposed'||mode==='process-transient-missing'||mode==='process-retry-completed'){assert.equal(streamCalls,0);assert.equal(polls,2);}
- assert.equal(objects.size,mode==='inline'?0:2);assert.equal(destroyed,true);
+ assert.equal(backups,1);assert.equal(objects.size,mode==='inline'?0:2);assert.equal(destroyed,true);
  assert.ok(events.indexOf('destroy')<events.indexOf('checkpoint'));
  for(const value of objects.values())assert.deepEqual(value,bytes);
  if(mode==='inline')assert.equal(checkpoint.logs.stdout,'small');
  else assert.equal(typeof checkpoint.logs.stdout.r2Key,'string');
 }else{
- assert.ok(failure,'storage failure must fail closed');assert.equal(destroyed,true,'failure must still destroy sandbox');
+ assert.ok(failure,'unconfirmed completion or storage failure must fail closed');assert.equal(destroyed,true,'failure must still destroy sandbox');
  if(mode==='missing')assert.match(failure.message,/missing/i);
  if(mode==='write-failure'||mode==='partial-write-failure')assert.match(failure.message,/write failed/i);
  if(mode==='partial-write-failure')assert.equal(objects.size,1);
  if(mode==='read-failure')assert.match(failure.message,/read failed/i);
- if(mode==='process-identity')assert.equal(failure.message,'large-unit-output failed: CI process identity unavailable (expected string, received string)');
- if(mode==='process-retry-identity')assert.equal(failure.message,'large-unit-output failed: CI process identity unavailable (expected string, received string)');
- if(mode==='process-retry-nonretryable'){assert.match(failure.message,/fixture operation interrupted/i);assert.equal(polls,1);}
- if(mode==='process-retry-exhausted'){assert.match(failure.message,/fixture operation interrupted/i);assert.equal(polls,3);}
- if(mode==='process-retry-missing'){assert.match(failure.message,/timed out/i);assert.match(failure.message,/polls=[2-9][0-9]*, missing=[1-9][0-9]*, lastStatus=missing/);assert.ok(Date.now()-startedAt<250,'retry must keep the original deadline');}
- if(mode==='process-read-failure')assert.match(failure.message,/status RPC failed/i);
- if(mode==='process-timeout'||mode==='process-read-hang'||mode==='process-read-late'||mode==='process-missing')assert.match(failure.message,/timed out/i);
- if(mode==='process-timeout')assert.match(failure.message,/polls=[1-9][0-9]*, missing=0, lastStatus=running/);
- if(mode==='process-missing')assert.match(failure.message,/polls=[1-9][0-9]*, missing=[1-9][0-9]*, lastStatus=missing/);
- if(mode==='process-read-hang')assert.match(failure.message,/polls=1, missing=0, lastStatus=unobserved/);
- if(mode.startsWith('process-'))assert.equal(objects.size,0,'unconfirmed completion must not publish logs or a snapshot');
+ if(mode==='command-read-failure')assert.match(failure.message,/command RPC failed/i);
+ if(mode.startsWith('command-interrupted'))assert.match(failure.message,/fixture operation interrupted/i);
+ if(['command-timeout','command-read-hang','command-read-late'].includes(mode)){
+   assert.match(failure.message,/timed out/i);assert.ok(Date.now()-startedAt<250,'completion keeps its original deadline');
+ }
+ if(Object.hasOwn(invalidExits,mode))assert.match(failure.message,/terminal exit code unavailable/i);
+ if(mode==='command-invalid-zero'||mode==='command-invalid-nonzero')assert.match(failure.message,/inconsistent command completion/i);
+ if(mode.startsWith('command-')){assert.equal(backups,0,'unconfirmed or failed completion must not snapshot');assert.equal(objects.size,0,'unconfirmed completion must not publish logs');}
 }
 return Response.json({mode,destroyed,objects:objects.size,events,telemetry});
 `;
@@ -113,6 +112,7 @@ return Response.json({mode,destroyed,objects:objects.size,events,telemetry});
 let workerPromise;
 
 for (const modes of [
+  ["finite-quiet-completed"],
   ["ok"],
   ["inline"],
   ["telemetry-throw"],
@@ -121,24 +121,24 @@ for (const modes of [
   ["partial-write-failure"],
   ["read-failure"],
   ["length-mismatch"],
-  ["exit-stream-disposed"],
-  ["process-nonzero"],
-  ["process-signal"],
-  ["process-invalid-zero"],
-  ["process-transient-missing"],
-  ["process-retry-completed"],
-  ["process-retry-nonretryable"],
-  ["process-retry-exhausted"],
-  ["process-retry-missing"],
-  ["process-retry-identity"],
-  ["process-missing"],
-  ["process-read-failure"],
-  ["process-read-hang"],
-  ["process-read-late"],
-  ["plain-process"],
-  ["process-timeout"],
-  ["process-unknown"],
-  ["process-identity"],
+  ["empty-command-output"],
+  ["command-nonzero"],
+  ["command-signal"],
+  ["command-invalid-zero"],
+  ["command-invalid-nonzero"],
+  ["command-missing-exit"],
+  ["command-negative"],
+  ["command-fractional"],
+  ["command-nan"],
+  ["command-infinite"],
+  ["command-string"],
+  ["command-unsafe"],
+  ["command-interrupted"],
+  ["command-interrupted-retryable"],
+  ["command-read-failure"],
+  ["command-read-hang"],
+  ["command-read-late"],
+  ["command-timeout"],
 ]) {
   test(`actual SDK execution and R2 cleanup: ${modes.join(", ")}`, async () => {
     const sdk = fileURLToPath(
@@ -213,7 +213,7 @@ try{const results=[];for(const mode of ${JSON.stringify(modes)}){const r=await m
       expect(result.status, `${result.mode}: ${result.body}`).toBe(200);
       const body = JSON.parse(result.body);
       expect(body.destroyed, result.mode).toBe(true);
-      if (["ok", "inline", "exit-stream-disposed", "plain-process", "process-transient-missing", "process-retry-completed"].includes(result.mode)) {
+      if (["finite-quiet-completed", "ok", "inline", "empty-command-output"].includes(result.mode)) {
         expect(body.telemetry.length, result.mode).toBe(1);
         const [line] = body.telemetry[0];
         expect(typeof line, result.mode).toBe("string");
