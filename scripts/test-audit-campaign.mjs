@@ -93,78 +93,172 @@ export function planTestAuditContinuation(
             : "Exact immutable inventory continuation.",
     };
 }
-export function admitTestAuditParent(
-    target,
-    parent,
-    revision,
-    manifestDigest,
-    publicationResult,
-) {
+function shape(value, required, optional = []) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const keys = Object.keys(value);
+    return required.every((key) => Object.hasOwn(value, key)) &&
+        keys.every((key) => required.includes(key) || optional.includes(key)) &&
+        keys.length <= required.length + optional.length;
+}
+const absentOrEmpty = (value) =>
+    value === undefined || (Array.isArray(value) && value.length === 0);
+const sameFormat = (formatting, expected) =>
+    formatting?.runId === expected.runId &&
+    formatting?.attempt === expected.attempt &&
+    formatting?.sha === expected.sha &&
+    formatting?.ref === expected.ref;
+const renewalRecordKeys = "branch controllerRevision enabled imageDigest inventoryDigest kind manifestDigest parent parentController priorImageDigest publication publish recordSha256 repository source targetController verifierRevision".split(" ");
+function renewalIntake(target, parent, revision, manifestDigest, publicationResult, campaign) {
+    const t = campaign?.renewal,
+        parentRef = `${parent?.campaignRun?.runId}-${parent?.campaignRun?.attempt}`;
+    if (!shape(t, renewalRecordKeys))
+        throw new Error("Campaign renewal record missing or inferred");
+    if (t.kind !== "test-audit-controller-renewal" || t.repository !== "omg-cli/omg" || t.enabled !== true)
+        throw new Error("Campaign renewal record is not enabled");
+    if (!sha.test(revision ?? "") || t.branch !== "main" || t.publish !== true ||
+        !sha.test(t.source ?? "") || !sha.test(t.parentController ?? "") ||
+        t.controllerRevision !== revision || t.targetController !== revision || !digest.test(t.recordSha256 ?? "") ||
+        !sha.test(t.verifierRevision ?? "") || !digest.test(t.manifestDigest ?? "") ||
+        !digest.test(t.inventoryDigest ?? "") ||
+        !/^sha256:[a-f0-9]{64}$/.test(t.imageDigest ?? "") ||
+        !/^sha256:[a-f0-9]{64}$/.test(t.priorImageDigest ?? "") ||
+        t.imageDigest === t.priorImageDigest ||
+        t.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
+        target.branch !== "main" || target.publish !== true)
+        throw new Error("Campaign renewal controller, runtime or manifest mismatch");
+    if (campaign.imageDigest !== t.imageDigest || campaign.verifierRevision !== t.verifierRevision)
+        throw new Error("Campaign renewal runtime drifted");
+    if (!run.test(parentRef) || parentRef !== t.parent || target.auditParent !== t.parent ||
+        parent.controllerRevision !== t.parentController || parent.status !== "reviewed" ||
+        parent.publishRequested !== true || parent.sha !== t.source ||
+        parent.sourceRange?.kind !== "test-audit" || parent.sourceRange?.sha !== t.source ||
+        parent.sourceRange?.manifestDigest !== t.manifestDigest ||
+        parent.sourceRange?.inventoryDigest !== t.inventoryDigest ||
+        !sha.test(target.sha ?? "") || target.sha === t.source ||
+        target.range?.resnapshot !== true || target.range?.sha !== target.sha ||
+        campaign.mainSha !== target.sha || campaign.mainSha === t.source)
+        throw new Error("Campaign renewal parent, source or inventory lineage mismatch");
+    if (!["success","skipped","failure","cancelled","timed_out"].includes(publicationResult) ||
+        publicationResult !== t.publication)
+        throw new Error("Campaign renewal publication is not terminal or does not match");
+    return { from: parent.controllerRevision, to: revision, recordSha256: t.recordSha256, parent: parentRef, priorChild: null };
+}
+function transitionIntake(target, parent, revision, manifestDigest, campaign) {
+    const t = campaign?.transition,
+        child = campaign?.priorChild,
+        parentRef = `${parent.campaignRun?.runId}-${parent.campaignRun?.attempt}`,
+        childRef = `${child?.campaignRun?.runId}-${child?.campaignRun?.attempt}`;
+    if (!shape(t, ["kind","repository","enabled","source","branch","publish","parent","parentController","priorChild","run","cursor","pageSize","pagePaths","totalPaths","manifestDigest","inventoryDigest","priorFormatting","priorImageDigest","imageDigest","verifierRevision","controllerRevision","recordSha256"]))
+        throw new Error("Campaign transition record missing or inferred");
+    if (t.kind !== "test-audit-controller-transition" || t.repository !== "omg-cli/omg" || t.enabled !== true)
+        throw new Error("Campaign transition record is not enabled");
+    if (!sha.test(revision ?? "") || t.branch !== "main" || t.publish !== true ||
+        !sha.test(t.source ?? "") || t.controllerRevision !== revision ||
+        !digest.test(t.recordSha256 ?? "") || !sha.test(t.verifierRevision ?? "") ||
+        !digest.test(t.manifestDigest ?? "") || !digest.test(t.inventoryDigest ?? "") ||
+        t.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
+        target.branch !== "main" || target.publish !== true)
+        throw new Error("Campaign transition controller or manifest mismatch");
+    if (!run.test(parentRef) || !run.test(childRef) || parentRef !== t.parent ||
+        parent.controllerRevision !== t.parentController || parent.status !== "reviewed" ||
+        parent.sha !== t.source || target.sha !== t.source || target.auditParent !== t.parent ||
+        childRef !== t.priorChild)
+        throw new Error("Campaign transition parent or prior child lineage mismatch");
+    if (!shape(child, ["repository","sha","branch","baseSha","batches","campaignParent","campaignRun","candidateOutcomes","controllerRevision","coverageMeaning","formatting","publications","publishRequested","readPaths","sourceRange","status","suppliedPaths","triggerSha","unreviewedPaths"], ["testAudits","testAuditOutcomes"]) ||
+        child.repository !== "omg-cli/omg" || child.branch !== "main" ||
+        child.status !== "format-blocked" || child.sha !== t.source ||
+        child.baseSha !== t.source || child.triggerSha !== t.source ||
+        child.controllerRevision !== t.parentController || child.campaignParent !== parentRef ||
+        child.publishRequested !== true || !absentOrEmpty(child.testAudits) ||
+        !absentOrEmpty(child.testAuditOutcomes) ||
+        ![child.batches, child.candidateOutcomes, child.publications, child.readPaths, child.suppliedPaths].every((value) => Array.isArray(value) && value.length === 0))
+        throw new Error("Campaign prior child record shape or proof mismatch");
+    if (campaign?.runId !== child.campaignRun?.runId || campaign?.attempt === child.campaignRun?.attempt ||
+        campaign?.attempt === t.priorFormatting?.attempt || t.run !== `${campaign?.runId}-${campaign?.attempt}` ||
+        campaign?.imageDigest !== t.imageDigest || campaign?.verifierRevision !== t.verifierRevision)
+        throw new Error("Campaign transition current run identity mismatch");
+    if (!Number.isSafeInteger(t.cursor) || t.cursor < 1 || t.cursor >= t.totalPaths - 1 ||
+        t.pageSize !== 1 || t.pagePaths !== 1 || !Number.isSafeInteger(t.totalPaths) ||
+        t.totalPaths < 3 || t.totalPaths > 10000 ||
+        parent.sourceRange?.kind !== "test-audit" || parent.sourceRange?.sha !== t.source ||
+        parent.sourceRange?.manifestDigest !== t.manifestDigest ||
+        parent.sourceRange?.inventoryDigest !== t.inventoryDigest ||
+        parent.sourceRange?.cursor + 1 !== t.cursor || parent.sourceRange?.nextCursor !== t.cursor ||
+        parent.sourceRange?.pageSize !== 1 || parent.sourceRange?.pagePaths !== 1 ||
+        parent.sourceRange?.totalPaths !== t.totalPaths ||
+        child.sourceRange?.kind !== "test-audit" || child.sourceRange?.sha !== t.source ||
+        child.sourceRange?.manifestDigest !== t.manifestDigest ||
+        child.sourceRange?.inventoryDigest !== t.inventoryDigest ||
+        child.sourceRange?.cursor !== t.cursor || child.sourceRange?.nextCursor !== t.cursor + 1 ||
+        child.sourceRange?.pageSize !== 1 || child.sourceRange?.pagePaths !== 1 ||
+        child.sourceRange?.totalPaths !== t.totalPaths ||
+        target.range?.cursor !== t.cursor || target.range?.inventoryDigest !== t.inventoryDigest ||
+        target.range?.resnapshot === true)
+        throw new Error("Campaign transition page or inventory mismatch");
+    if (!shape(t.priorFormatting, ["runId","attempt","sha","ref"]) ||
+        !/^[1-9][0-9]{0,19}$/.test(t.priorFormatting.runId ?? "") ||
+        !/^[1-9][0-9]{0,5}$/.test(t.priorFormatting.attempt ?? "") ||
+        t.priorFormatting.sha !== t.source || t.priorFormatting.ref !== "refs/heads/main" ||
+        parent.formatting?.status !== "passed" || !sameFormat(parent.formatting, t.priorFormatting) ||
+        child.formatting?.status !== "blocked" ||
+        child.formatting?.reason !== "source-format-evidence-unavailable-or-rejected" ||
+        !sameFormat(child.formatting, t.priorFormatting))
+        throw new Error("Campaign transition formatting lineage mismatch");
+    if (!/^sha256:[a-f0-9]{64}$/.test(t.imageDigest ?? "") ||
+        !/^sha256:[a-f0-9]{64}$/.test(t.priorImageDigest ?? "") ||
+        t.imageDigest === t.priorImageDigest)
+        throw new Error("Campaign transition runtime identity mismatch");
+    if (!Array.isArray(child.unreviewedPaths) || child.unreviewedPaths.length !== 1 ||
+        !shape(child.unreviewedPaths[0], ["path","reason"]) ||
+        child.unreviewedPaths[0].path !== "tests/debian_tests.rs" ||
+        child.unreviewedPaths[0].reason !== "source-format-blocked")
+        throw new Error("Campaign prior child blocked path mismatch");
+    return { from: parent.controllerRevision, to: revision, recordSha256: t.recordSha256, parent: parentRef, priorChild: childRef, run: t.run };
+}
+export function admitTestAuditParent(target, parent, revision, manifestDigest, publicationResult, campaign) {
     const r = checkRange(parent);
-    if (
-        `${parent.campaignRun?.runId}-${parent.campaignRun?.attempt}` !==
-            target.auditParent ||
-        !run.test(target.auditParent ?? "") ||
-        parent.controllerRevision !== revision ||
-        r.manifestDigest !== manifestDigest ||
-        target.range?.manifestDigest !== manifestDigest ||
-        target.branch !== "main" ||
-        target.publish !== parent.publishRequested
-    )
+    const renewal = campaign?.renewal;
+    const renewalApplies = renewal !== undefined && parent.controllerRevision !== revision &&
+        parent.controllerRevision === renewal.parentController &&
+        target.auditParent === renewal.parent && target.range?.resnapshot === true;
+    const transition = renewalApplies
+        ? renewalIntake(target, parent, revision, manifestDigest, publicationResult, campaign)
+        : campaign?.transition === undefined ? null : transitionIntake(target, parent, revision, manifestDigest, campaign);
+    if (transition === null) {
+        if (`${parent.campaignRun?.runId}-${parent.campaignRun?.attempt}` !== target.auditParent ||
+            !run.test(target.auditParent ?? "") || parent.controllerRevision !== revision ||
+            r.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
+            target.branch !== "main" || target.publish !== parent.publishRequested)
+            throw new Error("Campaign parent/controller/manifest mismatch");
+    } else if (r.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
+        target.branch !== "main" || target.publish !== parent.publishRequested)
         throw new Error("Campaign parent/controller/manifest mismatch");
     const [runId, attempt] = target.auditParent.split("-");
-    const plan = planTestAuditContinuation(
-        parent,
-        target.sha,
-        runId,
-        attempt,
-        publicationResult,
-    );
-    if (
-        plan.status !== "continue" ||
-        Number(plan.inputs.audit_cursor) !== target.range.cursor ||
-        Boolean(plan.resnapshot) !== Boolean(target.range.resnapshot)
-    )
-        throw new Error(
-            "Campaign parent did not authorize this cursor or source",
-        );
+    const plan = planTestAuditContinuation(parent, target.sha, runId, attempt, publicationResult);
+    if (plan.status !== "continue" || Number(plan.inputs.audit_cursor) !== target.range.cursor ||
+        Boolean(plan.resnapshot) !== Boolean(target.range.resnapshot))
+        throw new Error("Campaign parent did not authorize this cursor or source");
     if (plan.resnapshot)
         return {
             ...target,
             upstream: undefined,
+            ...(transition === null ? {} : { controllerTransition: transition }),
             range: {
                 ...target.range,
                 inventoryDigest: undefined,
-                resnapshotOf: {
-                    runId,
-                    attempt,
-                    sha: parent.sha,
-                    cursor: r.cursor,
-                    priorUnpublished: plan.priorUnpublished,
-                },
+                resnapshotOf: { runId, attempt, sha: parent.sha, cursor: r.cursor, priorUnpublished: plan.priorUnpublished },
                 qualification: plan.qualification,
             },
         };
-    if (
-        parent.sha !== target.sha ||
-        r.inventoryDigest !== target.range.inventoryDigest
-    )
+    if (parent.sha !== target.sha || r.inventoryDigest !== target.range.inventoryDigest)
         throw new Error("Campaign immutable inventory mismatch");
     if (parent.formatting?.status !== "passed") return target;
-    if (
-        parent.formatting.sha !== target.sha ||
-        parent.formatting.ref !== "refs/heads/main" ||
+    if (parent.formatting.sha !== target.sha || parent.formatting.ref !== "refs/heads/main" ||
         !/^[1-9][0-9]{0,19}$/.test(parent.formatting.runId ?? "") ||
-        !/^[1-9][0-9]{0,5}$/.test(parent.formatting.attempt ?? "")
-    )
+        !/^[1-9][0-9]{0,5}$/.test(parent.formatting.attempt ?? ""))
         throw new Error("Campaign formatting source mismatch");
-    return {
-        ...target,
-        upstream: {
-            runId: parent.formatting.runId,
-            attempt: parent.formatting.attempt,
-        },
-    };
+    const admitted = { ...target, upstream: { runId: parent.formatting.runId, attempt: parent.formatting.attempt } };
+    return transition === null ? admitted : { ...admitted, controllerTransition: transition };
 }
 export async function listTestAuditChildren(
     github,
@@ -370,15 +464,374 @@ export async function dispatchTestAuditPlan({
     await dispatch(inputs);
     return { ...plan, status: "dispatched" };
 }
+export const MAX_RECOVERY_ATTEMPTS = 3;
+export function missingRecordIntent({
+    title,
+    child,
+    revision,
+    manifestDigest,
+    ownerRunId,
+    ownerAttempt,
+}) {
+    const match =
+        /^Test audit ([1-9][0-9]{0,19}-[1-9][0-9]{0,5}) ([a-f0-9]{40}) ([0-9]+)$/.exec(
+            title ?? "",
+        );
+    if (!match) return { held: "recovery-requires-title-named-parent" };
+    const [, parent, source, cursorText] = match;
+    const cursor = Number(cursorText);
+    const childRef = `${child.id}-${child.run_attempt}`;
+    if (
+        !run.test(parent) ||
+        parent === childRef ||
+        parent.split("-")[0] === String(child.id) ||
+        source !== child.head_sha
+    )
+        return { held: "recovery-lineage-mismatch" };
+    if (!Number.isSafeInteger(cursor) || cursor < 1)
+        return { held: "recovery-cursor-mismatch" };
+    if (
+        !run.test(`${ownerRunId}-${ownerAttempt}`) ||
+        !sha.test(source) ||
+        !sha.test(revision) ||
+        !digest.test(manifestDigest)
+    )
+        throw new Error("Invalid recovery intent identity");
+    return {
+        intent: {
+            repository: "omg-cli/omg",
+            kind: "admission-retry-intent",
+            runId: String(child.id),
+            attempt: String(child.run_attempt),
+            ownerRunId,
+            ownerAttempt,
+            parent,
+            sha: source,
+            cursor,
+            controllerRevision: revision,
+            manifestDigest,
+        },
+    };
+}
+export async function recoverMissingTestAuditRecord({
+    github,
+    child,
+    title,
+    revision,
+    manifestDigest,
+    ownerRunId,
+    ownerAttempt,
+    loadRecord,
+    loadIntent,
+    storeIntent,
+    rerun,
+}) {
+    if (
+        ![loadRecord, loadIntent, storeIntent, rerun].every(
+            (fn) => typeof fn === "function",
+        )
+    )
+        throw new Error(
+            "Missing-record recovery requires parent, intent storage and rerun callers",
+        );
+    const parentRef = `${child.id}-${child.run_attempt}`;
+    if (child.status !== "completed")
+        return { status: "campaign-already-active", runId: String(child.id) };
+    if (!["failure", "cancelled", "timed_out"].includes(child.conclusion))
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "missing-record-attempt-is-not-a-failed-attempt",
+        };
+    if (Number(child.run_attempt) >= MAX_RECOVERY_ATTEMPTS)
+        return {
+            status: "campaign-recovery-attempts-exhausted",
+            parent: parentRef,
+        };
+    const planned = missingRecordIntent({
+        title,
+        child,
+        revision,
+        manifestDigest,
+        ownerRunId,
+        ownerAttempt,
+    });
+    if (planned.held)
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: planned.held,
+        };
+    const intent = planned.intent;
+    const owner = `${ownerRunId}-${ownerAttempt}`;
+    const reread = async () => {
+        const [metadata, workflow] = await Promise.all([
+            github.request("GET", `/repos/omg-cli/omg/actions/runs/${child.id}`),
+            github.request(
+                "GET",
+                "/repos/omg-cli/omg/actions/workflows/ai-review.yml",
+            ),
+        ]);
+        if (
+            String(metadata.id) !== String(child.id) ||
+            metadata.head_sha !== intent.sha ||
+            metadata.head_branch !== "main" ||
+            metadata.path !== ".github/workflows/ai-review.yml" ||
+            metadata.repository?.full_name !== "omg-cli/omg" ||
+            metadata.display_title !== title ||
+            metadata.event !== "workflow_dispatch" ||
+            !Number.isSafeInteger(metadata.run_attempt) ||
+            metadata.run_attempt < 1 ||
+            metadata.run_attempt > 999999 ||
+            ![
+                "queued",
+                "in_progress",
+                "completed",
+                "requested",
+                "waiting",
+                "pending",
+            ].includes(metadata.status) ||
+            (metadata.status === "completed"
+                ? ![
+                      "success",
+                      "failure",
+                      "cancelled",
+                      "timed_out",
+                      "action_required",
+                      "neutral",
+                      "skipped",
+                      "stale",
+                  ].includes(metadata.conclusion)
+                : metadata.conclusion != null) ||
+            !Number.isSafeInteger(workflow.id) ||
+            workflow.id < 1 ||
+            metadata.workflow_id !== workflow.id ||
+            workflow.path !== ".github/workflows/ai-review.yml" ||
+            workflow.name !== "AI source review"
+        )
+            throw new Error("Campaign run workflow identity mismatch");
+        return metadata;
+    };
+    const reconcile = async (existing) => {
+        if (
+            existing.kind !== "admission-retry-intent" ||
+            existing.repository !== "omg-cli/omg" ||
+            existing.runId !== String(child.id) ||
+            existing.attempt !== String(child.run_attempt) ||
+            existing.parent !== intent.parent ||
+            existing.sha !== intent.sha ||
+            existing.cursor !== intent.cursor ||
+            existing.controllerRevision !== revision ||
+            existing.manifestDigest !== manifestDigest
+        )
+            throw new Error("Recovery intent identity mismatch");
+        const observed = await reread();
+        const priorOwner = `${existing.ownerRunId}-${existing.ownerAttempt}`;
+        if (
+            Number(observed.run_attempt) > Number(child.run_attempt) ||
+            observed.status !== "completed"
+        )
+            return {
+                status: "campaign-recovery-reconciled",
+                parent: parentRef,
+                current: `${observed.id}-${observed.run_attempt}`,
+                owner: priorOwner,
+            };
+        if (priorOwner !== owner)
+            return {
+                status: "campaign-recovery-intent-conflict",
+                parent: parentRef,
+                owner: priorOwner,
+                qualification:
+                    "Another recovery attempt owns the durable rerun intent. This run does not issue a second rerun.",
+            };
+        return {
+            status: "campaign-recovery-unknown",
+            parent: parentRef,
+            owner: priorOwner,
+            qualification:
+                "This run already won the durable intent but the child attempt did not advance. The earlier POST outcome is unknown and is not repeated.",
+        };
+    };
+    let existing = null;
+    try {
+        existing = await loadIntent(parentRef);
+    } catch (error) {
+        if (error.status !== 404) throw error;
+    }
+    if (existing) return reconcile(existing);
+    let parentRecord;
+    try {
+        parentRecord = await loadRecord(intent.parent);
+    } catch (error) {
+        if (error.status === 404)
+            return {
+                status: "campaign-recovery-held",
+                parent: parentRef,
+                reason: "title-named-parent-record-missing",
+            };
+        throw error;
+    }
+    if (
+        parentRecord.repository !== "omg-cli/omg" ||
+        parentRecord.branch !== "main" ||
+        parentRecord.controllerRevision !== revision ||
+        parentRecord.sourceRange?.manifestDigest !== manifestDigest
+    )
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "title-named-parent-lineage-mismatch",
+        };
+    let publicationResult;
+    try {
+        publicationResult = await parentPublicationResult(
+            github,
+            intent.parent,
+            parentRecord,
+        );
+    } catch (error) {
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "title-named-parent-not-terminal-successful",
+            qualification:
+                error instanceof Error
+                    ? error.message
+                    : "Parent review or publication is not terminal.",
+        };
+    }
+    const plan = planTestAuditContinuation(
+        parentRecord,
+        intent.sha,
+        ...intent.parent.split("-"),
+        publicationResult,
+    );
+    if (
+        plan.status !== "continue" ||
+        Number(plan.inputs.audit_cursor) !== intent.cursor ||
+        plan.inputs.audit_parent !== intent.parent
+    )
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "title-named-parent-did-not-authorize-this-cursor",
+        };
+    const current = await reread();
+    if (
+        current.status !== "completed" ||
+        Number(current.run_attempt) !== Number(child.run_attempt) ||
+        !["failure", "cancelled", "timed_out"].includes(current.conclusion)
+    )
+        return {
+            status: "campaign-recovery-held",
+            parent: parentRef,
+            reason: "child-state-changed-before-mutation",
+        };
+    let won;
+    try {
+        won = await storeIntent(parentRef, intent);
+    } catch (error) {
+        if (error.status === 409)
+            return {
+                status: "campaign-recovery-intent-conflict",
+                parent: parentRef,
+                owner,
+            };
+        throw error;
+    }
+    if (won?.stored !== true)
+        throw new Error("Recovery intent was not acknowledged");
+    if (won.created !== true) {
+        let claimed = null;
+        try {
+            claimed = await loadIntent(parentRef);
+        } catch (error) {
+            if (error.status !== 404) throw error;
+        }
+        if (claimed) return reconcile(claimed);
+        return {
+            status: "campaign-recovery-intent-held",
+            parent: parentRef,
+            owner,
+            qualification:
+                "The durable intent already existed but could not be read back, so this run does not issue a second rerun.",
+        };
+    }
+    try {
+        await rerun(String(child.id));
+    } catch {
+        return {
+            status: "campaign-recovery-unknown",
+            parent: parentRef,
+            owner,
+            qualification:
+                "The rerun request outcome is unknown. The durable intent prevents a blind repeat; the next recovery reconciles the child attempt.",
+        };
+    }
+    return {
+        status: "campaign-recovery-rerun-requested",
+        parent: parentRef,
+        owner,
+        qualification:
+            "GitHub's rerun endpoint has no compare-and-swap. A concurrent rerun between the recheck and this request can advance the attempt first; the next recovery reconciles by attempt identity.",
+    };
+}
 export async function recoverTestAuditCampaign({
     github,
     currentSha,
     revision,
+    renewal,
+    imageDigest,
+    verifierRevision,
     manifestDigest,
     loadRecord,
     dispatch,
     currentRunId,
+    currentRunAttempt,
+    loadIntent,
+    storeIntent,
+    rerun,
 }) {
+    const currentCampaignRun = async (item) => {
+        const id = String(item.id ?? "");
+        if (!/^[1-9][0-9]{0,19}$/.test(id))
+            throw new Error("Campaign run identity is malformed");
+        const [metadata, workflow] = await Promise.all([
+            github.request("GET", `/repos/omg-cli/omg/actions/runs/${id}`),
+            github.request(
+                "GET",
+                "/repos/omg-cli/omg/actions/workflows/ai-review.yml",
+            ),
+        ]);
+        if (
+            String(metadata.id) !== id ||
+            metadata.display_title !== item.display_title ||
+            metadata.head_sha !== item.head_sha ||
+            metadata.head_branch !== "main" ||
+            metadata.path !== ".github/workflows/ai-review.yml" ||
+            metadata.repository?.full_name !== "omg-cli/omg" ||
+            metadata.event !== "workflow_dispatch" ||
+            ![
+                "queued",
+                "in_progress",
+                "completed",
+                "requested",
+                "waiting",
+                "pending",
+            ].includes(metadata.status) ||
+            !Number.isSafeInteger(metadata.run_attempt) ||
+            metadata.run_attempt < 1 ||
+            metadata.run_attempt > 999999 ||
+            !Number.isSafeInteger(workflow.id) ||
+            workflow.id < 1 ||
+            metadata.workflow_id !== workflow.id ||
+            workflow.path !== ".github/workflows/ai-review.yml" ||
+            workflow.name !== "AI source review"
+        )
+            throw new Error("Campaign run workflow identity mismatch");
+        return metadata;
+    };
     for (let page = 1; page <= 5; page++) {
         const response = await github.request(
             "GET",
@@ -399,32 +852,51 @@ export async function recoverTestAuditCampaign({
                 item.repository?.full_name !== "omg-cli/omg"
             )
                 continue;
-            if (item.status !== "completed")
+            const metadata = await currentCampaignRun(item);
+            const parentRef = `${item.id}-${metadata.run_attempt}`;
+            if (metadata.status !== "completed")
                 return {
                     status: "campaign-already-active",
-                    runId: String(item.id),
+                    runId: String(metadata.id),
                 };
-            const parentRef = `${item.id}-${item.run_attempt}`;
             let report;
             try {
                 report = await loadRecord(parentRef);
             } catch (error) {
                 if (error.status === 404)
-                    return {
-                        status: "campaign-record-missing",
-                        parent: parentRef,
-                    };
+                    return recoverMissingTestAuditRecord({
+                        github,
+                        child: metadata,
+                        title: item.display_title,
+                        revision,
+                        manifestDigest,
+                        ownerRunId: String(currentRunId),
+                        ownerAttempt: currentRunAttempt,
+                        loadRecord,
+                        loadIntent,
+                        storeIntent,
+                        rerun,
+                    });
                 throw error;
             }
             if (report.status === "duplicate-noop") continue;
+            const renewalApplies = renewal !== undefined &&
+                report.controllerRevision === renewal.parentController &&
+                parentRef === renewal.parent && report.sha === renewal.source &&
+                report.sourceRange?.kind === "test-audit" &&
+                report.sourceRange?.manifestDigest === renewal.manifestDigest &&
+                report.sourceRange?.inventoryDigest === renewal.inventoryDigest &&
+                report.status === "reviewed" && currentSha !== report.sha;
             if (
                 report.controllerRevision !== revision ||
                 report.sourceRange?.manifestDigest !== manifestDigest
-            )
-                return {
-                    status: "campaign-controller-or-manifest-held",
-                    parent: parentRef,
-                };
+            ) {
+                if (!renewalApplies || manifestDigest !== renewal.manifestDigest)
+                    return {
+                        status: "campaign-controller-or-manifest-held",
+                        parent: parentRef,
+                    };
+            }
             const publicationResult = await parentPublicationResult(
                 github,
                 parentRef,
@@ -434,9 +906,41 @@ export async function recoverTestAuditCampaign({
                 report,
                 currentSha,
                 String(item.id),
-                String(item.run_attempt),
+                String(metadata.run_attempt),
                 publicationResult,
             );
+            if (renewalApplies) {
+                if (plan.status !== "continue" || !plan.resnapshot)
+                    return {
+                        status: "campaign-controller-or-manifest-held",
+                        parent: parentRef,
+                    };
+                try {
+                    const admittedTarget = testAuditTarget({
+                        branch: "main",
+                        scope: "test-audit",
+                        publish: String(report.publishRequested === true),
+                        audit_sha: currentSha,
+                        audit_cursor: plan.inputs.audit_cursor,
+                        audit_parent: parentRef,
+                        audit_manifest: plan.inputs.audit_manifest,
+                        audit_resnapshot: "true",
+                    });
+                    admitTestAuditParent(
+                        { ...admittedTarget, range: { ...admittedTarget.range, sha: currentSha } },
+                        report,
+                        revision,
+                        manifestDigest,
+                        publicationResult,
+                        { renewal, mainSha: currentSha, imageDigest, verifierRevision },
+                    );
+                } catch {
+                    return {
+                        status: "campaign-controller-or-manifest-held",
+                        parent: parentRef,
+                    };
+                }
+            }
             return dispatchTestAuditPlan({
                 github,
                 plan,

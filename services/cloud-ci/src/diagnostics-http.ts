@@ -16,7 +16,97 @@ type DiagnosticBucket = {
   }): Promise<{ objects: { key: string }[]; truncated: boolean; cursor?: string }>;
 };
 
-const recordSchema = z.strictObject({
+export const stableInterruptionReasons = [
+  "runtime_replaced",
+  "transport_disposed",
+  "sandbox_lifetime_changed",
+  "recovery_exhausted",
+] as const;
+
+export const stableInterruptionOperations = [
+  "sandbox.exec",
+  "sandbox.execWithSessionToken",
+  "sandbox.startProcess",
+  "sandbox.restoreBackup",
+  "sandbox.createBackup",
+  "sandbox.streamProcessLogs",
+  "sandbox.readFileStream",
+  "sandbox.listFiles",
+  "sandbox.destroy",
+  "sandbox.stop",
+  "sandbox.configure",
+  "commands.execute",
+  "commands.executeStream",
+  "processes.startProcess",
+  "processes.streamProcessLogs",
+  "files.readFileStream",
+  "files.listFiles",
+  "files.mkdir",
+  "files.writeFile",
+  "files.writeFileStream",
+  "backup.restore",
+  "backup.restoreArchive",
+  "backup.createArchive",
+  "backup.uploadParts",
+  "rpc.connect",
+] as const;
+
+export const stableInterruptionCauses = [
+  "code-update-reset",
+  "network-connection-lost",
+  "do-storage-startup-reset",
+] as const;
+
+export const diagnosticByteLimit = 32000;
+export const stableInterruptionPhases = [
+  "durable_object_call", "rpc_call", "connection", "validating",
+  "runtime_ready", "archive_ready", "interrupted",
+] as const;
+
+export const diagnosticErrorSchema = z.strictObject({
+  name: z.enum([
+    "Error",
+    "OperationInterruptedError",
+    "RPCTransportError",
+    "BackupRestoreError",
+    "BackupCreateError",
+    "ProcessReadyTimeoutError",
+    "WorkflowInternalError",
+    "TimeoutError",
+  ]),
+  code: z
+    .enum([
+      "RPC_TRANSPORT_ERROR",
+      "BACKUP_RESTORE_FAILED",
+      "BACKUP_CREATE_FAILED",
+      "BACKUP_NOT_FOUND",
+      "BACKUP_EXPIRED",
+      "PROCESS_READY_TIMEOUT",
+      "OPERATION_INTERRUPTED",
+    ])
+    .optional(),
+  kind: z
+    .enum([
+      "session_disposed",
+      "connection_failed",
+      "upgrade_failed",
+      "peer_closed",
+      "invalid_frame",
+      "protocol_error",
+      "unknown",
+    ])
+    .optional(),
+  reason: z.enum(stableInterruptionReasons).optional(),
+  operation: z.enum(stableInterruptionOperations).optional(),
+  phase: z.enum(stableInterruptionPhases).optional(),
+  admitted: z.union([z.boolean(), z.literal("unknown")]).optional(),
+  retryable: z.boolean().optional(),
+  containerExitCode: z.number().int().min(-255).max(255).optional(),
+  stopReason: z.enum(["exit", "runtime_signal"]).optional(),
+  cause: z.enum(stableInterruptionCauses).optional(),
+});
+
+export const recordSchema = z.strictObject({
   version: z.literal(1),
   sandboxId: z.string().regex(/^[a-f0-9]{64}$/),
   fuseExitCode: z.number().int().min(0).max(255).optional(),
@@ -50,45 +140,14 @@ const recordSchema = z.strictObject({
             exitCode: z.number().int().min(-255).max(255),
           })
           .optional(),
-        error: z
-          .strictObject({
-            name: z.enum([
-              "Error",
-              "RPCTransportError",
-              "BackupRestoreError",
-              "BackupCreateError",
-              "ProcessReadyTimeoutError",
-              "WorkflowInternalError",
-              "TimeoutError",
-            ]),
-            code: z
-              .enum([
-                "RPC_TRANSPORT_ERROR",
-                "BACKUP_RESTORE_FAILED",
-                "BACKUP_CREATE_FAILED",
-                "BACKUP_NOT_FOUND",
-                "BACKUP_EXPIRED",
-                "PROCESS_READY_TIMEOUT",
-              ])
-              .optional(),
-            kind: z
-              .enum([
-                "session_disposed",
-                "connection_failed",
-                "upgrade_failed",
-                "peer_closed",
-                "invalid_frame",
-                "protocol_error",
-                "unknown",
-              ])
-              .optional(),
-          })
-          .optional(),
+        error: diagnosticErrorSchema.optional(),
       }),
     )
     .max(64),
   truncated: z.boolean(),
-});
+}).refine((record) => record.events.every((event, index, events) =>
+  event.sequence < Number.MAX_SAFE_INTEGER - 2 &&
+  (event.sequence > (events[index - 1]?.sequence ?? 0))), "Invalid diagnostic sequence");
 
 const json = <T>(value: T, status = 200) =>
   Response.json(value, { status, headers: { "Cache-Control": "no-store" } });
@@ -116,12 +175,14 @@ export async function diagnosticsHttp(
       if (listed.objects.length > 50 || (listed.truncated && !listed.cursor))
         throw new Error("Invalid diagnostic listing");
 
-      const ids = listed.objects.map((object) => {
+      const ids = listed.objects.flatMap((object) => {
+        if (/^diagnostics\/sandboxes\/[a-f0-9]{64}-retention\.json$/.test(object.key)) return [];
+
         const match = /^diagnostics\/sandboxes\/([a-f0-9]{64})\.json$/.exec(object.key);
 
         if (!match) throw new Error("Invalid diagnostic key");
 
-        return match[1];
+        return [match[1]];
       });
 
       return json({
@@ -138,10 +199,10 @@ export async function diagnosticsHttp(
 
     if (!stored) return json({ error: "Not found" }, 404);
 
-    if ((stored.size ?? 0) > 32000) throw new Error("Diagnostic record exceeds byte budget");
+    if ((stored.size ?? 0) > diagnosticByteLimit) throw new Error("Diagnostic record exceeds byte budget");
     const text = await stored.text();
 
-    if (new TextEncoder().encode(text).length > 32000)
+    if (new TextEncoder().encode(text).length > diagnosticByteLimit)
       throw new Error("Diagnostic record exceeds byte budget");
     const record = recordSchema.parse(JSON.parse(text));
 

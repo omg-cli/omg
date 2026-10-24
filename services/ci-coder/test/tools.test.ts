@@ -12,7 +12,9 @@ import { expectedCloudReports } from "../../cloud-ci/runner/plan.mjs";
 
 type RawReportCase = "valid" | "missing-baseline" | "missing-patched" | "forged-baseline" | "forged-patched";
 
-async function fixture(deliver = true, terminal = "errored", rawReports?: RawReportCase) {
+type FailureLogCase = "text" | "missing" | "redirect" | "oversized";
+
+async function fixture(deliver = true, terminal = "errored", rawReports?: RawReportCase, failureLog?: FailureLogCase) {
   const content = "pub const VALUE: u32 = 1;\n";
   const sha = "a".repeat(40);
 
@@ -70,6 +72,8 @@ async function fixture(deliver = true, terminal = "errored", rawReports?: RawRep
   let state: CodingState = { calls: 0, reads: [], verifiedDigests: [] };
   let serviceCalls = 0;
   const fetchedReports: string[] = [];
+  const failureLogRequests: { path: string; init: { headers?: unknown; redirect?: string } | undefined }[] = [];
+  let failureLogCanceled = false;
   const objects = new Map<string, string>();
   let currentTerminal = terminal;
 
@@ -145,6 +149,25 @@ async function fixture(deliver = true, terminal = "errored", rawReports?: RawRep
 
           if (input.endsWith("/receipt"))
             return Response.json(rawReports ? completeReceipt(id) : { conclusion: "success" });
+          if (input.endsWith("/logs/failure.txt")) {
+            failureLogRequests.push({ path: new URL(input).pathname, init });
+            if (failureLog === "redirect")
+              return new Response(null, { status: 302, headers: { location: "https://must-not-follow.invalid/" } });
+            if (!failureLog || failureLog === "missing") return new Response("not found", { status: 404 });
+            if (failureLog === "text")
+              return new Response("error: Automatic repairs cannot change existing Rust tests before cargo.\n");
+            const encoder = new TextEncoder();
+            let pulls = 0;
+            return new Response(new ReadableStream<Uint8Array>({
+              pull(controller) {
+                if (pulls++ === 0) controller.enqueue(encoder.encode("x".repeat(4096)));
+                else if (pulls === 2) controller.enqueue(encoder.encode("y".repeat(4096)));
+                else if (pulls === 3) controller.enqueue(encoder.encode("z".repeat(4096)));
+                else controller.close();
+              },
+              cancel() { failureLogCanceled = true; },
+            }));
+          }
           const objectPath = new URL(input).pathname.split("/").slice(-2).join("/");
           const key = `${objectPath.split("/")[0]}/${id}/${objectPath.split("/")[1]}`;
           if (objects.has(key)) {
@@ -171,6 +194,8 @@ async function fixture(deliver = true, terminal = "errored", rawReports?: RawRep
     state: () => state,
     serviceCalls: () => serviceCalls,
     fetchedReports,
+    failureLogRequests,
+    failureLogCanceled: () => failureLogCanceled,
     poll: () => pollCodingVerification(options, context.signal),
     recover: () => { state = structuredClone(state); },
     setTerminal: (status: string) => { currentTerminal = status; },
@@ -387,7 +412,7 @@ test("failed CI or a fabricated success object cannot export a repair", async ()
       /verified proposal/,
     );
     assert.equal(f.state().verification, undefined);
-    assert.equal(f.serviceCalls(), terminal === "complete" ? 3 : 2);
+    assert.equal(f.serviceCalls(), 3);
   }
 });
 
@@ -398,4 +423,129 @@ test("tool budget persists rather than allowing an unbounded agent loop", async 
   await assert.rejects(() => f.actions.list_sources.execute({}, f.context), /budget exhausted/);
   assert.equal(f.state().calls, 96);
   assert.equal(f.serviceCalls(), 0);
+});
+
+async function terminalFailure(failureLog: FailureLogCase) {
+  const f = await fixture(true, "errored", undefined, failureLog);
+  await f.actions.read_source.execute({ path: "src/value.rs", start: 1, lines: 1 }, f.context);
+  await f.actions.propose_fix.execute(f.candidate, f.context);
+  const digest = f.state().proposal?.proposalSha256;
+  if (!digest) throw new Error("Fixture proposal was not admitted");
+  await f.actions.verify_patch.execute({ proposalSha256: digest }, f.context);
+  const job = await f.poll();
+  if (job?.status !== "failed") throw new Error("Expected a terminal failure");
+  return { f, digest, job };
+}
+
+test("a terminal verifier failure delivers its bounded authenticated failure log as untrusted data", async () => {
+  const { f, digest, job } = await terminalFailure("text");
+  assert.match(job.reason, /^Coding verification ended errored; verifier failure log \(untrusted data, \d+ bytes read\):/);
+  assert.match(job.reason, /Automatic repairs cannot change existing Rust tests before cargo\./);
+  assert.equal(f.failureLogRequests.length, 1);
+  assert.equal(f.failureLogRequests[0].path, `/runs/${job.id}/logs/failure.txt`);
+  assert.deepEqual(f.failureLogRequests[0].init?.headers, { Authorization: `Bearer ${"fixture-token".repeat(4)}` });
+  assert.equal(f.failureLogRequests[0].init?.redirect, "manual");
+  assert.equal(f.failureLogCanceled(), false);
+  assert.equal(f.state().verification, undefined);
+  await assert.rejects(() => f.actions.export_proposal.execute({ proposalSha256: digest }, f.context), /verified proposal/);
+});
+
+test("oversized verifier failure text is bounded to 8192 bytes and the rest of the stream is canceled", async () => {
+  const { f, digest, job } = await terminalFailure("oversized");
+  assert.match(job.reason, /^Coding verification ended errored; verifier failure log \(untrusted data, 8192 bytes read\):/);
+  const body = job.reason.split(":\n")[1] ?? "";
+  assert.equal(body.length, 8192);
+  assert.equal(body, "x".repeat(4096) + "y".repeat(4096));
+  assert.equal(f.failureLogCanceled(), true);
+  assert.equal(f.state().verification, undefined);
+  await assert.rejects(() => f.actions.export_proposal.execute({ proposalSha256: digest }, f.context), /verified proposal/);
+});
+
+test("an unavailable or redirected failure log still fails the job with an explicit status and no export", async () => {
+  for (const [failureLog, detail] of [
+    ["missing", /verifier failure log unavailable \(HTTP 404\)/],
+    ["redirect", /verifier failure log unavailable \(HTTP 302\)/],
+  ] as const) {
+    const { f, digest, job } = await terminalFailure(failureLog);
+    assert.match(job.reason, /^Coding verification ended errored; /);
+    assert.match(job.reason, detail);
+    assert.equal(f.failureLogRequests.length, 1);
+    assert.equal(f.failureLogRequests[0].init?.redirect, "manual");
+    assert.equal(f.state().verification, undefined);
+    await assert.rejects(() => f.actions.export_proposal.execute({ proposalSha256: digest }, f.context), /verified proposal/);
+    assert.equal(f.serviceCalls(), 3);
+  }
+});
+
+test("a successful verification run never requests the failure log", async () => {
+  const f = await fixture(true, "complete", "valid");
+  await f.actions.read_source.execute({ path: "src/value.rs", start: 1, lines: 1 }, f.context);
+  await f.actions.propose_fix.execute(f.candidate, f.context);
+  const digest = f.state().proposal?.proposalSha256;
+  if (!digest) throw new Error("Fixture proposal was not admitted");
+  await f.actions.verify_patch.execute({ proposalSha256: digest }, f.context);
+  assert.equal((await f.poll())?.status, "verified");
+  assert.equal(f.failureLogRequests.length, 0);
+});
+
+test("a third distinct audit proposal preserves the failed job and existing budget", async () => {
+  const oldTest = "#[test]\nfn checks_value() {\n    let value = 1;\n    assert!(value > 0);\n}\n";
+  const source = "pub const VALUE: u32 = 1;\n";
+  const sha = "a".repeat(40);
+  const request: CodingRequest = {
+    repository: "omg-cli/omg",
+    branch: "main",
+    sha,
+    runId: "42",
+    attempt: "1",
+    source: {
+      repository: "omg-cli/omg",
+      branch: "main",
+      sha,
+      changedPaths: [],
+      auditPaths: ["tests/value.rs", "src/value.rs"],
+      diff: "",
+      ciFailures: [],
+      sourceFiles: [
+        { path: "tests/value.rs", blobSha: gitBlobSha(oldTest), content: oldTest },
+        { path: "src/value.rs", blobSha: gitBlobSha(source), content: source },
+      ],
+    },
+    testAuditTask: {
+      path: "tests/value.rs",
+      testName: "checks_value",
+      originalBlobSha: gitBlobSha(oldTest),
+    },
+  };
+  const skills = await createRequiredSkillsPlugin();
+  const sessionID = Session.ID.create();
+  skills.contextHook({ sessionID, system: [] });
+  const failed = { id: "cl-failed", proposalSha256: "d".repeat(64), sessionId: sessionID,
+    continuationId: "cv-failed", deadline: 1, status: "failed" as const, reason: "cargo fmt" };
+  let state: CodingState = { calls: 0, reads: [
+    { path: "tests/value.rs", start: 1, end: 5 },
+    { path: "src/value.rs", start: 1, end: 1 },
+  ], verifiedDigests: ["e".repeat(64), "f".repeat(64)], verificationJob: failed };
+  const actions = createCodingActions({
+    skills,
+    getRequest: async () => request,
+    update: async (change) => { state = change(state); return state; },
+    env: {
+      CI_API_TOKEN: "fixture-token".repeat(4),
+      CI_IMAGE_DIGEST: "sha256:" + "b".repeat(64),
+      CI_VERIFIER_REVISION: "c".repeat(40),
+      CI_SERVICE: { async fetch() { throw new Error("no service call expected"); } },
+    },
+  });
+  await assert.rejects(
+    () => actions.propose_test_strengthening.execute({
+      purpose: "existing-test-strengthening",
+      assertion: { line: 4, source: "    assert_eq!(value, 1);" },
+      fault: { path: "src/value.rs", oldQuote: "VALUE: u32 = 1", replacement: "VALUE: u32 = 2" },
+    }, { sessionID, signal: new AbortController().signal }),
+    /Coding verification budget exhausted/,
+  );
+  assert.equal(state.verificationJob, failed);
+  assert.deepEqual(state.verifiedDigests, ["e".repeat(64), "f".repeat(64)]);
+  assert.equal(state.testAudit, undefined);
 });

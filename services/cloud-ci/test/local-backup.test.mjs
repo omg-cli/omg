@@ -19,9 +19,17 @@ await Promise.resolve(
         waitUntil(value) {
           pending.push(value);
         },
+        blockConcurrencyWhile(callback) {
+          this.initialization = callback();
+          return this.initialization;
+        },
       };
       env = {
         BACKUP_BUCKET: {
+          async get(key) {
+            const text = evidence.get(key);
+            return typeof text === "string" ? { text: async () => text } : null;
+          },
           async put(key, value) {
             evidence.set(key, value);
 
@@ -30,29 +38,39 @@ await Promise.resolve(
         },
       };
       async createBackup(options) {
+        await this.ctx.initialization;
         return options;
       }
       async restoreBackup(backup) {
+        await this.ctx.initialization;
         return backup;
       }
       async execWithSessionToken(command) {
+        await this.ctx.initialization;
         return { exitCode: this.probeExitCode, command };
       }
-      async onStop() {}
-      async onActivityExpired() {}
-      async startProcess() {}
+      async onStop() { await this.ctx.initialization; }
+      async onActivityExpired() { await this.ctx.initialization; }
+      async startProcess() { await this.ctx.initialization; }
       async listFiles(directory) {
+        await this.ctx.initialization;
         this.calls.push("list");
-        if(directory === "/tmp") return {success:true,files:["out","err"].map(extension=>({absolutePath:"/tmp/ci-step."+extension,type:"file",size:5}))};
+        if(directory === "/tmp") return {success:true,count:3,files:[
+          {absolutePath:"/tmp/omg-ci-unit-evidence",type:"directory",size:0},
+          {absolutePath:"/tmp/ci-step.out",type:"file",size:5},
+          {absolutePath:"/tmp/ci-step.err",type:"file",size:5},
+        ]};
 
         return {
           success: true,
+          count: 1,
           files: [
             { absolutePath: "/tmp/omg-ci-unit-evidence/report.xml", type: "file", size: 5 },
           ],
         };
       }
       async readFile(path, options) {
+        await this.ctx.initialization;
         this.calls.push("read");
         if(path === "/tmp/ci-step.out" || path === "/tmp/ci-step.err") {
           if(this.failRead) throw new Error("private provider detail");
@@ -73,6 +91,7 @@ await Promise.resolve(
         };
       }
       async destroy() {
+        await this.ctx.initialization;
         this.calls.push("destroy");
       }
     },
@@ -108,7 +127,7 @@ test("real adapter retains only the unit stage's bounded private report before d
     );
     await sandbox.destroy();
     expect(sandbox.calls).toEqual(
-      failure === "read" ? ["list", "read", "destroy"] : ["list", "read", "put", "destroy"],
+      failure === "read" ? ["list", "list", "read", "destroy"] : ["list", "list", "read", "put", "destroy"],
     );
   }
 
@@ -139,7 +158,7 @@ test("trusted unit stage metadata retains evidence independently of SDK command 
       },
     });
     await sandbox.destroy();
-    expect(sandbox.calls).toEqual(["list", "read", "destroy"]);
+    expect(sandbox.calls).toEqual(["list", "list", "read", "destroy"]);
   }
 });
 

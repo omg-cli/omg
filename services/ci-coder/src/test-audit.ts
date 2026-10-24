@@ -5,6 +5,7 @@ import {
     testAuditDigest,
 } from "../../cloud-ci/src/test-audit-contract";
 import { gitBlobSha } from "../../../scripts/ai-review-candidate.mjs";
+import { assertRustSourceChange } from "../../../scripts/rust-source-policy.mjs";
 import type { CodingRequest } from "./request";
 
 export function createTestAuditProposal(
@@ -48,6 +49,20 @@ export function createTestAuditProposal(
         throw new Error(
             "Existing-test audit original source differs from supplied snapshot",
         );
+    assertRustSourceChange(
+        proposal.fault.path,
+        originalFault.content,
+        proposal.fault.newContent,
+    );
+    if (
+        proposal.test.path === proposal.fault.path &&
+        (proposal.test.target !== "lib" ||
+            originalFault.content.split("\n").length !==
+                proposal.fault.newContent.split("\n").length)
+    )
+        throw new Error(
+            "Same-file fault must preserve test line positions and use the library target",
+        );
     return {
         proposal,
         proposalSha256: testAuditDigest(proposal),
@@ -83,7 +98,14 @@ export const testAuditToolSchema = z.strictObject({
     ]),
     assertion: z.strictObject({
         line: z.number().int().positive().safe(),
-        source: z.string().min(1).max(2000).optional(),
+        source: z
+            .string()
+            .min(1)
+            .max(2000)
+            .describe(
+                "One physical assertion line, already rustfmt-stable; omit messages that would wrap; a rustfmt diff is setup failure, not proof",
+            )
+            .optional(),
     }),
     fault: z.strictObject({
         path: z.string().max(240),

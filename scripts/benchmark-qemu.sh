@@ -14,6 +14,7 @@ arch=
 print_pins=false
 benchmark=false
 transaction_samples=0
+transaction_producer_started=false
 inventory_tiers=
 inventory_mutations=false
 inventory_isolation=false
@@ -1009,6 +1010,40 @@ if [[ "$distro" == debian-trixie ]]; then
 fi
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
+fedora_makecache_class() {
+  local log=$1
+  [[ -r "$log" ]] || return 1
+  if grep -Eqi 'GPG check FAILED|signature verification failed|Public key for .* is not installed|Import of key\(s\) didn.t help|No space left on device|Read-only file system|Disk quota exceeded|Permission denied|Operation not permitted|Status code: 40[134]' "$log"; then
+    printf 'permanent\n'
+    return 0
+  fi
+  if grep -Eqi 'Status code: 5(00|02|03|04)|Curl error \((6|7|28|35|52|56)\)|Connection reset by peer|Connection timed out|Temporary failure in name resolution|Could not resolve host|Network is unreachable|Timeout was reached' "$log"; then
+    printf 'transient\n'
+    return 0
+  fi
+  printf 'permanent\n'
+  return 0
+}
+fedora_makecache() {
+  local attempt rc=0 log
+  for attempt in 1 2 3; do
+    log="evidence/index-update-$attempt.txt"
+    : > "$log" || return 1
+    sudo -n dnf -y makecache > "$log" 2>&1
+    rc=$?
+    if (( rc == 0 )); then
+      cp -- "$log" evidence/index-update.txt || return 1
+      return 0
+    fi
+    if (( attempt == 1 )); then
+      cp -- "$log" evidence/index-update.txt || return 1
+    fi
+    [[ "$(fedora_makecache_class "$log")" == transient ]] || return 1
+    (( attempt < 3 )) || break
+    sleep 5
+  done
+  return 1
+}
 case "$distro" in
   arch) sudo -n pacman -Syu --noconfirm >evidence/arch-system-upgrade.txt 2>&1 || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
   debian|debian-trixie|ubuntu)
@@ -1020,7 +1055,10 @@ case "$distro" in
     sudo -n apt-get update > evidence/index-update.txt 2>&1 || exit 120
     native=(apt-cache --no-all-versions show tree)
     version_cmd=(dpkg-query -W '-f=${Version}\n' tree) ;;
-  fedora) sudo -n dnf -y makecache > evidence/index-update.txt 2>&1 || exit 120; native=(rpm -qi tree); version_cmd=(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' tree) ;;
+  fedora)
+    fedora_makecache || exit 120
+    native=(rpm -qi tree)
+    version_cmd=(rpm -q --qf '%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n' tree) ;;
 esac
 installed() {
   case "$distro" in arch) pacman -Q tree ;; debian|debian-trixie|ubuntu) [[ $(dpkg-query -W '-f=${Status}' tree 2>/dev/null) == 'install ok installed' ]] ;; fedora) rpm -q tree ;; esac
@@ -1335,6 +1373,7 @@ if [[ "$benchmark" == true && "$rc" == 0 ]]; then
 fi
 if [[ "$transaction_samples" != 0 && "$rc" == 0 ]]; then
   transaction_rc=0
+  transaction_producer_started=true
   timeout --kill-after=10s 21600 docker exec -w /work "$controller" bash /work/qemu-transactions.sh \
     "$distro" "$tag" "$arch" "$transaction_samples" "$firmware" "$ssh_service" \
     "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" \
@@ -1586,15 +1625,30 @@ fi
 # boot-scoped kernel/crash identity only, never raw cores or process environments.
 health_rc=0
 health_serial="$work/guest/serial.log"
-if [[ "$transaction_samples" != 0 ]]; then
-  health_serial="$work/transactions/resume-serial.log"
+active_guest_boot=
+if [[ "$transaction_samples" != 0 && "$transaction_producer_started" == true ]]; then
+  health_serial=
+  receipt="$work/transactions/active-guest.json"
+  if [[ -f "$receipt" && ! -L "$receipt" && $(wc -c < "$receipt") -le 4096 ]] &&
+     jq -e '. as $r | ($r|keys)==["boot_id","schema_version","serial","state"] and
+            $r.schema_version==1 and $r.state=="restored" and
+            $r.serial=="transactions/resume-serial.log" and
+            ($r.boot_id|type)=="string" and
+            ($r.boot_id|test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"))' \
+       "$receipt" >/dev/null 2>> "$work/health-validation.log"; then
+    health_serial="$work/transactions/resume-serial.log"
+    active_guest_boot=$(jq -r '.boot_id' "$receipt")
+  else
+    printf 'Transaction run did not prove a restored active guest\n' >> "$work/health-validation.log"
+    health_rc=120
+  fi
 fi
 timeout --kill-after=5s 30s docker exec -i -w /work/guest "$controller" \
   ssh -i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 \
     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
     -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts \
     bench@127.0.0.1 cat /proc/sys/kernel/random/boot_id \
-  > "$work/guest-boot-id.txt" 2> "$work/health-validation.log" || health_rc=$?
+  > "$work/guest-boot-id.txt" 2>> "$work/health-validation.log" || health_rc=$?
 health_boot_id=$(tr -d '\r\n' < "$work/guest-boot-id.txt")
 timeout --kill-after=5s 60s docker exec -i -w /work/guest "$controller" \
   ssh -i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 \
@@ -1603,6 +1657,10 @@ timeout --kill-after=5s 60s docker exec -i -w /work/guest "$controller" \
     bench@127.0.0.1 sudo -n python3 - collect \
   < "$here/check-qemu-health.py" > "$work/guest-health.json" 2>> "$work/health-validation.log" || health_rc=$?
 timeout 15 docker inspect --format '{{json .State}}' "$controller" > "$work/controller-health.json" 2>> "$work/health-validation.log" || health_rc=120
+if [[ "$health_rc" == 0 && -n "$active_guest_boot" && "$active_guest_boot" != "$health_boot_id" ]]; then
+  printf 'Active guest boot identity changed before health admission\n' >> "$work/health-validation.log"
+  health_rc=120
+fi
 if [[ "$health_rc" == 0 ]]; then
   python3 "$here/check-qemu-health.py" verify --guest "$work/guest-health.json" \
     --serial "$health_serial" --controller "$work/controller-health.json" --boot-id "$health_boot_id" \

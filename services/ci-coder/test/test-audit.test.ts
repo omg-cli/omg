@@ -187,3 +187,122 @@ test("sensitivity compact audit exports no patch and larger source remains audit
         parseCodingRequest({ ...widened, testAuditTask: undefined }),
     ).toThrow();
 });
+
+test("compact audit admits a before-boundary production fault and rejects an in-boundary fault", () => {
+    const { request: raw } = auditFixture();
+    const source = "pub const VALUE: u32 = 1;\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn checks_value() {\n        assert_eq!(super::VALUE, 1);\n    }\n}\n";
+    const request = parseCodingRequest({
+        ...raw,
+        source: {
+            ...raw.source,
+            sourceFiles: raw.source.sourceFiles.map((file) =>
+                file.path === "src/value.rs"
+                    ? { ...file, content: source, blobSha: gitBlobSha(source) }
+                    : file,
+            ),
+        },
+    });
+    expect(
+        buildTestAuditProposal(request, {
+            purpose: "existing-test-sensitivity",
+            assertion: { line: 4 },
+            fault: {
+                path: "src/value.rs",
+                oldQuote: "VALUE: u32 = 1",
+                replacement: "VALUE: u32 = 2",
+            },
+        }).proposal.fault.newContent,
+    ).toContain("VALUE: u32 = 2");
+    expect(() =>
+        buildTestAuditProposal(request, {
+            purpose: "existing-test-sensitivity",
+            assertion: { line: 4 },
+            fault: {
+                path: "src/value.rs",
+                oldQuote: "assert_eq!(super::VALUE, 1);",
+                replacement: "assert_eq!(super::VALUE, 2);",
+            },
+        }),
+    ).toThrow("Automatic repairs cannot change existing Rust tests");
+});
+
+function sameFileAuditRequest(content: string) {
+    const { request } = auditFixture();
+    return parseCodingRequest({
+        ...request,
+        source: {
+            ...request.source,
+            sourceFiles: [
+                request.source.sourceFiles[0],
+                {
+                    path: "src/value.rs",
+                    blobSha: gitBlobSha(content),
+                    content,
+                },
+            ],
+        },
+        testAuditTask: {
+            path: "src/value.rs",
+            target: "lib",
+            testName: "checks_value",
+            originalBlobSha: gitBlobSha(content),
+        },
+    });
+}
+
+test("same-file audit faults preserve line positions outside cfg(test), including CRLF", () => {
+    const content =
+        "pub const VALUE: u32 = 1;\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn checks_value() {\n        assert_eq!(super::VALUE, 1);\n    }\n}\n";
+    const request = sameFileAuditRequest(content);
+    const sensitivity = {
+        purpose: "existing-test-sensitivity" as const,
+        assertion: { line: 7 },
+    };
+    expect(() =>
+        buildTestAuditProposal(request, {
+            ...sensitivity,
+            fault: {
+                path: "src/value.rs",
+                oldQuote: "pub const VALUE: u32 = 1;",
+                replacement:
+                    "pub const VALUE: u32 = 1;\npub const EXTRA: u32 = 2;",
+            },
+        }),
+    ).toThrow(
+        "Same-file fault must preserve test line positions and use the library target",
+    );
+    expect(
+        buildTestAuditProposal(request, {
+            ...sensitivity,
+            fault: {
+                path: "src/value.rs",
+                oldQuote: "pub const VALUE: u32 = 1;",
+                replacement: "pub const VALUE: u32 = 2;",
+            },
+        }).proposal.fault.newContent,
+    ).toContain("VALUE: u32 = 2");
+    const crlf = sameFileAuditRequest(content.replace(/\n/g, "\r\n"));
+    expect(() =>
+        buildTestAuditProposal(crlf, {
+            ...sensitivity,
+            fault: {
+                path: "src/value.rs",
+                oldQuote: "pub const VALUE: u32 = 1;",
+                replacement:
+                    "pub const VALUE: u32 = 1;\r\npub const EXTRA: u32 = 2;",
+            },
+        }),
+    ).toThrow(
+        "Same-file fault must preserve test line positions and use the library target",
+    );
+    expect(
+        buildTestAuditProposal(crlf, {
+            ...sensitivity,
+            fault: {
+                path: "src/value.rs",
+                oldQuote: "pub const VALUE: u32 = 1;",
+                replacement: "pub const VALUE: u32 = 2;",
+            },
+        }).proposal.fault.newContent,
+    ).toContain("VALUE: u32 = 2");
+});

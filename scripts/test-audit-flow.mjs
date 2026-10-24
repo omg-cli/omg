@@ -36,8 +36,9 @@ export async function runTestAuditPage({
             });
             continue;
         }
-        report.suppliedPaths.push(row.task.path);
         try {
+            await io.portableTest(row, formatting);
+            report.suppliedPaths.push(row.task.path);
             const audit = await io.audit(row);
             if (audit) {
                 report.readPaths.push(...(audit.readPaths ?? []));
@@ -57,13 +58,15 @@ export async function runTestAuditPage({
                     status: "no-supported-strengthening",
                 });
         } catch (error) {
+            const reason =
+                error instanceof Error
+                    ? error.message
+                    : "audit-operation-failed";
+            report.unreviewedPaths.push({ path: row.task.path, reason });
             report.testAuditOutcomes.push({
                 id: row.id,
                 status: "held",
-                reason:
-                    error instanceof Error
-                        ? error.message
-                        : "audit-operation-failed",
+                reason,
             });
         }
     }

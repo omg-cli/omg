@@ -1,7 +1,13 @@
 import { CiSandbox as NativeCiSandbox } from "@cloudflare/ci/worker";
 import { PhaseDiagnostics, type StopDetails } from "./phase-diagnostics";
 import { backupTransferMode, leafSnapshotOptions } from "./backup-policy";
-import { retainRunnerLog, retainUnitReport } from "./unit-report-retention";
+import {
+  releaseTerminalOwner,
+  retainRunnerLog,
+  retainSandboxEvidence,
+  retainUnitReport,
+  runIdPattern,
+} from "./unit-report-retention";
 
 type RunnerMetadata = {
   reportRunId?: string;
@@ -9,13 +15,53 @@ type RunnerMetadata = {
   leafStep?: string;
 };
 const metadataKey = "omg:runner-metadata";
+const teardownKey = "omg:runner-teardown";
 
 export class CiSandbox extends NativeCiSandbox {
   private phases?: PhaseDiagnostics;
   private fuseExitCode?: number;
+  private cleanupOwner?: string;
+  private teardown = false;
+
+  constructor(...args: ConstructorParameters<typeof NativeCiSandbox>) {
+    super(...args);
+    void this.ctx.blockConcurrencyWhile(async () => {
+      this.teardown = (await this.ctx.storage.get<boolean>(teardownKey)) === true;
+    });
+  }
+
+  private assertStartAllowed() {
+    if (this.teardown) throw new Error("Runner teardown refuses container start");
+
+    if (this.cleanupOwner)
+      throw new Error(`Sandbox is releasing terminal owner ${this.cleanupOwner}`);
+  }
+
+  protected override beforeStart() {
+    this.assertStartAllowed();
+  }
+
+  protected assertExecutionAllowed() {
+    this.assertStartAllowed();
+  }
+
+  private async fenceTeardown() {
+    this.teardown = true;
+    await this.ctx.storage.put(teardownKey, true);
+  }
+
   private get diagnostics() {
-    return (this.phases ??= new PhaseDiagnostics(this.ctx.id.toString(), (key, value) =>
-      this.env.BACKUP_BUCKET.put(key, value, { httpMetadata: { contentType: "application/json" } }),
+    return (this.phases ??= new PhaseDiagnostics(
+      this.ctx.id.toString(),
+      (key, value) =>
+        this.env.BACKUP_BUCKET.put(key, value, {
+          httpMetadata: { contentType: "application/json" },
+        }),
+      async (key) => {
+        const stored = await this.env.BACKUP_BUCKET.get(key);
+
+        return stored ? stored.text() : null;
+      },
     ));
   }
   private trace<T>(
@@ -38,15 +84,40 @@ export class CiSandbox extends NativeCiSandbox {
 
     return this.trace("configure", () => super.configure(configuration));
   }
+  private async persistRunnerMetadata(env: {
+    OMG_DIAGNOSTIC_RUN_ID?: string;
+    OMG_REPORT_RUN_ID?: string;
+    OMG_CI_LEAF_STEP?: string;
+  } | undefined) {
+    const diagnosticRunId = env?.OMG_DIAGNOSTIC_RUN_ID;
+    const reportRunId =
+      env?.OMG_CI_LEAF_STEP === "rust-portable-tests"
+        ? env?.OMG_REPORT_RUN_ID ??
+          (diagnosticRunId && runIdPattern.test(diagnosticRunId) ? diagnosticRunId : undefined)
+        : undefined;
+    await this.ctx.storage.put<RunnerMetadata>(metadataKey, {
+      reportRunId,
+      leafStep: env?.OMG_CI_LEAF_STEP,
+      diagnosticRunId,
+    });
+  }
   override exec(...args: Parameters<NativeCiSandbox["exec"]>) {
     const phase =
       args[0] === "test -c /dev/fuse"
         ? "preflight"
         : args[0].startsWith("tail -c ")
           ? "log-read"
-          : "checkout";
+          : args[1]?.env?.OMG_CI_LEAF_STEP
+            ? "process-start"
+            : "checkout";
 
     return this.trace(phase, async () => {
+      if (phase === "process-start") {
+        this.assertStartAllowed();
+        await this.persistRunnerMetadata(args[1]?.env);
+        this.assertStartAllowed();
+      }
+
       const result = await super.exec(...args);
 
       if (phase === "preflight") {
@@ -63,9 +134,17 @@ export class CiSandbox extends NativeCiSandbox {
         ? "preflight"
         : args[0].startsWith("tail -c ")
           ? "log-read"
-          : "checkout";
+          : args[2]?.env?.OMG_CI_LEAF_STEP
+            ? "process-start"
+            : "checkout";
 
     return this.trace(phase, async () => {
+      if (phase === "process-start") {
+        this.assertStartAllowed();
+        await this.persistRunnerMetadata(args[2]?.env);
+        this.assertStartAllowed();
+      }
+
       const result = await super.execWithSessionToken(...args);
 
       if (phase === "preflight") {
@@ -91,13 +170,11 @@ export class CiSandbox extends NativeCiSandbox {
     });
   }
   override startProcess(...args: Parameters<NativeCiSandbox["startProcess"]>) {
-    const env = args[1]?.env;
+    this.assertStartAllowed();
     return this.trace("process-start", async () => {
-      await this.ctx.storage.put<RunnerMetadata>(metadataKey, {
-        reportRunId: env?.OMG_CI_LEAF_STEP === "rust-portable-tests" ? env?.OMG_REPORT_RUN_ID : undefined,
-        leafStep: env?.OMG_CI_LEAF_STEP,
-        diagnosticRunId: env?.OMG_DIAGNOSTIC_RUN_ID,
-      });
+      this.assertStartAllowed();
+      await this.persistRunnerMetadata(args[1]?.env);
+      this.assertStartAllowed();
       return super.startProcess(...args);
     });
   }
@@ -116,9 +193,61 @@ export class CiSandbox extends NativeCiSandbox {
   override onActivityExpired() {
     return this.trace("activity-expired", () => super.onActivityExpired());
   }
+  override async alarm(...args: Parameters<NativeCiSandbox["alarm"]>) {
+    try {
+      await releaseTerminalOwner({
+        readOwner: async () => (await this.ctx.storage.get<RunnerMetadata>(metadataKey))?.diagnosticRunId,
+        lookup: async (owner) => {
+          const instance = await this.env.CI_WORKFLOW.get(owner);
+          const status = await instance.status();
+
+          return { id: instance.id, status: status.status };
+        },
+        acquire: (owner) => {
+          this.cleanupOwner = owner;
+        },
+        release: () => {
+          this.cleanupOwner = undefined;
+        },
+        retain: async (owner) => {
+          const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
+
+          if (metadata?.diagnosticRunId !== owner)
+            return {
+              retained: false,
+              failures: [{ evidence: "runner-metadata:owner", status: "invalid-identity" as const }],
+            };
+
+          await this.fenceTeardown();
+
+          return retainSandboxEvidence(
+            metadata,
+            { listFiles: (path) => super.listFiles(path) },
+            async (path) => (await super.readFile(path, { encoding: "none" })).content,
+            this.env.BACKUP_BUCKET,
+            owner,
+          );
+        },
+        destroy: () => this.trace("destroy", () => super.destroy()),
+        delegate: () => super.alarm(...args),
+        warn: (event) => console.warn(JSON.stringify({ ...event, sandboxId: this.ctx.id.toString() })),
+      });
+    } catch (error) {
+      console.warn(
+        JSON.stringify({
+          event: "sandbox_cleanup_rescheduled",
+          sandboxId: this.ctx.id.toString(),
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      await this.ctx.storage.setAlarm(Date.now() + 60_000);
+    }
+  }
   override destroy() {
+    this.teardown = true;
     return this.trace("destroy", async () => {
       try {
+        await this.ctx.storage.put(teardownKey, true);
         const metadata = await this.ctx.storage.get<RunnerMetadata>(metadataKey);
         const streams: { stream: string; status: string }[] = [];
         if (metadata?.diagnosticRunId && metadata.leafStep) {

@@ -89,6 +89,7 @@ test("coordinator audit handoff persists and freshly readmits actual server proo
                 entries: [{ path: task.path }], rows: [{ id: "selected-existing-test", status: "selected", task }],
                 unreviewedPaths: [] }),
             format: async () => ({ status: "passed" }),
+            portableTest: async (row) => { expect(row.task).toEqual(task); },
             audit: async (row) => {
                 audits++;
                 expect(row.task).toEqual(task);

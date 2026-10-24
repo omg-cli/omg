@@ -1,6 +1,6 @@
 # OMG Cloudflare portable CI
 
-This Worker ports CodeLoud's `@cloudflare/ci` 0.2.0 pipeline with its reviewed Bun patches, Sandbox 0.12.12 runtime and an OMG Rust image. Trusted image commands run against an exact commit mirrored into the `omg-ci/omg` Artifacts repository. GitHub credentials stay in the trusted courier/publisher, outside candidate execution and model tools.
+This Worker ports CodeLoud's `@cloudflare/ci` 0.2.0 pipeline with its reviewed Bun patches, Sandbox 0.12.14 runtime and an OMG Rust image. Trusted image commands run against an exact commit mirrored into the `omg-ci/omg` Artifacts repository. GitHub credentials stay in the trusted courier/publisher, outside candidate execution and model tools.
 
 See the existing [adaptation research](../../docs/operations/cloudflare-ci-adaptation-research.md), [activation and open questions](../../docs/operations/cloudflare-ci-research-open-questions.md), and [implementation plan](../../docs/plans/2026-10-20-opencode-pipeline.md). The pinned CodeLoud handoff informed this port; it is not copied into this repository.
 
@@ -10,7 +10,21 @@ As of 2026-10-20, the owner has deployed `omg-cloud-ci`, `omg-ci-coder` and `omg
 
 The actual image digest and verifier revision are pinned in `wrangler.jsonc` and must agree with the coder and trusted courier policy. A copied CodeLoud digest or earlier successful receipt is not evidence for a new OMG image or source revision.
 
+### Renew an existing audit across a controller change
+
+Ordinary campaign admission still requires the parent's controller. A reviewed renewal is a separate, owner-controlled policy delivered through repository variable `OMG_CI_AUDIT_RENEWAL`. The review and recovery configuration writers alone materialize its bounded JSON at `$HOME/ci/test-audit-renewal.json` with mode `0600` and exclusive creation; their existing cleanup removes it. Candidate files, model output and workflow inputs cannot supply this policy. The disabled historical source transition remains unchanged.
+
+While holding both rollout admission groups, fetch the actual latest terminal parent and its publication conclusion. Bind `kind: test-audit-controller-renewal`, repository, branch, enabled/publish flags, exact parent run/attempt, `parentController`, prior `source`, `manifestDigest`, `inventoryDigest`, `priorImageDigest`, publication conclusion, new `targetController`, `imageDigest` and `verifierRevision`. Use the verified runtime and parent receipts for these values. The target controller is the accepted immutable controller SHA supplied after verification, so no source commit must contain its own hash. Set and read back the owner variable and retain its exact JSON and admitted record hash with activation evidence.
+
+The unchanged planner chooses the cursor and resnapshot. Recovery and intake independently validate the policy, actual terminal publication, current main and runtime; the new source inherits no formatting, inventory execution or test-proof credit. Ordinary descendants keep their normal admission path. Once the renewed child has durable provenance and normal continuation ownership, retire the temporary owner variable explicitly. Malformed, oversized or stale policy holds renewal; it does not bypass the original controller gate.
+
 ### Admit a completed image rollout
+
+Dispatch the existing `Cloudflare verification` workflow on `main` with task `rollout-lock`. Its workflow group holds `omg-ai-review-global` and its job group holds `omg-cloud-dependencies`, both with `queue: max` and `cancel-in-progress: false`. New AI reviews stay enabled and queue while existing couriers finish. [GitHub supports concurrency at both workflow and job level](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency); each queue holds at most 100 pending entries, so inspect capacity before dispatch.
+
+Admission is locked only after the hold **step** is running, not merely when the workflow is in progress. Verify the dedicated run owns both groups through the [concurrency-group API](https://docs.github.com/en/rest/actions/concurrency-groups), then wait for all remote backends and coder operations to finish. The lock has no credentials, checkout or deployment authority. It expires after 30 minutes; check its live step and remaining lease before every activation mutation. If it fails, is cancelled or expires, stop activation and reacquire a fresh lock before continuing. Do not deploy unless the remaining lease covers deployment, rollout verification and rollback. Inspector-only independent reviews use a separate group and are not paused; this lock does not authorize changing their runtime or policy during the window.
+
+While holding both groups, deploy the matching CI Worker and coder configuration and update their courier/controller policy pins coherently. Release only the dedicated lock run after readiness, authenticated plan preflight and pin readback succeed. Never cancel real reviews to acquire it. Verify the first resumed courier's actual pins rather than assuming queued configuration refreshed.
 
 Pause new courier admissions and wait for active backends to finish before deploying an image. Keep admissions paused until the readiness check succeeds. [Cloudflare deployment success starts a rollout](https://developers.cloudflare.com/containers/configuration/rollouts/); old instances can still serve requests until replacement finishes. Durable Object storage survives that replacement, so saved metadata alone cannot prove a command still has its original filesystem.
 
@@ -25,6 +39,14 @@ python3 scripts/check-cloud-ci-rollout.py \
 The check uses the existing `CLOUDFLARE_API_TOKEN`. A local operator can instead pass `--wrangler-auth-file <existing Wrangler config/default.toml>` to reuse OAuth. It creates no credentials and performs only authenticated reads. Exit code zero requires a completed rollout, the intended image and application version, completed steps, a fully updated fleet, and a second matching readback. No running container slots are required. Missing evidence, an active or superseding rollout, or a changed target holds admission. A deployment with no container change must still match its existing completed target.
 
 After this gate succeeds, run the existing authenticated plan preflight, then resume courier admissions. This is an operator deployment check; the CI Worker and candidate runners receive no new administrative credentials. It does not certify passing tests or replace the final receipt verifier.
+
+## Rebuild the stable runtime base
+
+`Dockerfile.base` reconstructs the custom toolchain from digest-pinned Sandbox 0.12.14, Node 24.22.1 and Rust 1.95.0 stages. It preserves Python 3.12.15, the candidate account, system prerequisites and the Sandbox entrypoint. Bun 1.4.4 is checked against both its official archive digest and extracted binary digest. Candidate Python uses the updated system certificate bundle.
+
+Build and publish that base in the existing hosted builder first. Replace the final `Dockerfile` FROM digest with the verified private base digest, then run the existing hosted image probe on the committed source. Preserve all frozen-file, manifest, local/remote linkage and Linux smoke checks. The final image installs its frozen runner dependencies and verifies prepared fixture ownership as the unprivileged candidate.
+
+Update the Worker, coder and trusted courier image/verifier pins only after that image passes. A new SDK lockfile or a dry Worker build does not establish that the matching image was built or deployed. Existing image and receipt pins remain authoritative until the coordinated update is accepted. Do not reuse old-image snapshots or receipts as evidence for the replacement runtime.
 
 ## Authenticated API and source identity
 

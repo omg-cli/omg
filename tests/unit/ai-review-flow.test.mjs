@@ -623,14 +623,14 @@ test("workflow isolates write permission and excludes generated branches from th
         assert.ok(
             job.steps.some((step) =>
                 step.run?.includes(
-                    "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip",
+                    "https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip",
                 ),
             ),
         );
         assert.ok(
             job.steps.some((step) =>
                 step.run?.includes(
-                    "a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c",
+                    "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235",
                 ),
             ),
         );

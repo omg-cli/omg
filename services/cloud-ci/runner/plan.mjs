@@ -25,11 +25,11 @@ export function expectedCloudReports(name) {
     return [];
 }
 export const toolchain = {
-    bun: "1.4.2+744846f84",
-    node: "v24.21.0",
+    bun: "1.4.4+38afee6c8",
+    node: "v24.22.1",
     rust: "1.95.0",
     nativeCi: "0.2.0",
-    sandbox: "0.12.12",
+    sandbox: "0.12.14",
 };
 export const rustProfiles = [
     { features: "pgp,license", platform: "portable" },

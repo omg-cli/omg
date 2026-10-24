@@ -107,3 +107,74 @@ test("diagnostic retrieval rejects arbitrary keys and raw or oversized records",
       .status,
   ).toBe(503);
 });
+
+test("diagnostic listing skips only retention sidecars and keeps bounded continuation", async () => {
+  const calls: ListOptions[] = [];
+  const reads: string[] = [];
+  const sidecarId = "b".repeat(64);
+
+  const bucket = {
+    get: async (key: string) => {
+      reads.push(key);
+      return null;
+    },
+    list: async (options: ListOptions) => {
+      calls.push(options);
+
+      return {
+        objects: [
+          { key: `diagnostics/sandboxes/${id}.json` },
+          { key: `diagnostics/sandboxes/${sidecarId}-retention.json` },
+        ],
+        truncated: true,
+        cursor: "next-page",
+      };
+    },
+  };
+
+  const response = await diagnosticsHttp(
+    new Request("https://fixture/diagnostics/sandboxes?cursor=first-page"),
+    bucket,
+  );
+
+  expect(response.status).toBe(200);
+  expect(calls).toEqual([{ prefix: "diagnostics/sandboxes/", limit: 50, cursor: "first-page" }]);
+  expect(await response.json()).toEqual({ ids: [id], truncated: true, cursor: "next-page" });
+  expect(reads).toEqual([]);
+});
+
+test("diagnostic listing rejects unknown malformed keys next to retention sidecars", async () => {
+  const bucket = {
+    get: async () => null,
+    list: async () => ({
+      objects: [
+        { key: `diagnostics/sandboxes/${id}.json` },
+        { key: `diagnostics/sandboxes/${id}-retention.json` },
+        { key: `diagnostics/sandboxes/${id}-retention.txt` },
+      ],
+      truncated: false,
+    }),
+  };
+
+  const response = await diagnosticsHttp(
+    new Request("https://fixture/diagnostics/sandboxes"),
+    bucket,
+  );
+
+  expect(response.status).toBe(503);
+  expect(await response.json()).toEqual({ error: "Diagnostics unavailable" });
+});
+
+test("diagnostic listing rejects a retention suffix that is not bound to a sandbox id", async () => {
+  const bucket = {
+    get: async () => null,
+    list: async () => ({
+      objects: [{ key: "diagnostics/sandboxes/not-a-sandbox-retention.json" }],
+      truncated: false,
+    }),
+  };
+
+  expect(
+    (await diagnosticsHttp(new Request("https://fixture/diagnostics/sandboxes"), bucket)).status,
+  ).toBe(503);
+});

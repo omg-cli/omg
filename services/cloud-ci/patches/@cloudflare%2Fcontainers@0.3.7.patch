@@ -7,3 +7,31 @@ index 83e084ff646b52054db0f389652531880491518d..a35abce95fff73e015fc4b7aaf368133
  import type { ContainerOptions, ContainerStartOptions, ContainerStartConfigOptions, Schedule, StopParams, State, WaitOptions, CancellationOptions, StartAndWaitForPortsOptions } from '../types';
  import { DurableObject, WorkerEntrypoint } from 'cloudflare:workers';
  export type OutboundHandlerContext<Params = unknown> = {
+@@ -207,6 +208,7 @@ export declare class Container<Env = Cloudflare.Env> extends DurableObject<Env>
+      * Destroys the container with a SIGKILL. Triggers onStop.
+      */
+     destroy(): Promise<void>;
++    protected beforeStart(): void;
+     /**
+      * Lifecycle method called when container starts successfully
+      * Override this method in subclasses to handle container start events
+diff --git a/dist/lib/container.js b/dist/lib/container.js
+index b7567e230cf5d6168a3b6d5e1fbb1fc009eaf235..6e959e521548832f0822249e6e4f93f6eb9e664c 100644
+--- a/dist/lib/container.js
++++ b/dist/lib/container.js
+@@ -721,6 +721,7 @@ export class Container extends DurableObject {
+     async destroy() {
+         await this.container.destroy();
+     }
++    beforeStart() {}
+     /**
+      * Lifecycle method called when container starts successfully
+      * Override this method in subclasses to handle container start events
+@@ -1375,6 +1376,7 @@ export class Container extends DurableObject {
+             await this.scheduleNextAlarm();
+             if (!this.container.running) {
+                 await this.refreshOutboundInterception();
++                this.beforeStart();
+                 this.container.start(startConfig);
+                 this.monitor = this.container.monitor();
+                 await this.state.setRunning();

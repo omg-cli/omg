@@ -18,7 +18,7 @@ for (const partialSkips of [false, true]) {
         import { createRequire } from "node:module";
         import { parseStringPromise } from "xml2js";
         import { assertUnitExecution } from ${JSON.stringify(moduleUrl)};
-        assert.equal(Bun.version, "1.4.2");
+        assert.equal(Bun.version, "1.4.4");
         const require = createRequire(import.meta.url);
         const declaredPin = JSON.parse(readFileSync(new URL(${JSON.stringify(runnerPackageUrl)}), "utf8")).dependencies.xml2js;
         assert.equal(declaredPin, "0.5.0");

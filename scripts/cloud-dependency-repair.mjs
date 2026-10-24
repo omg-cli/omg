@@ -19,6 +19,186 @@ const blob = (value) =>
         .update(value)
         .digest("hex");
 const packages = (content) => Bun.TOML.parse(content).package;
+const dependencySections = ["dependencies", "dev-dependencies", "build-dependencies"];
+export const dependencyExecutedEvidence =
+    "Executed: observed actionable findings cleared after patch, patched audit with zero vulnerabilities and zero actionable warnings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks. Only Cargo.lock changes.";
+const stableVersion = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/;
+const comparator = /^(?:>=|<=|>|<|=)?\s*(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/;
+
+function parseVersion(text) {
+    assert.equal(typeof text, "string", "Malformed advisory range version");
+    assert.match(text, stableVersion, "Malformed advisory range version");
+    for (const part of text.split("."))
+        assert.ok(Number.isSafeInteger(Number(part)), "Advisory range version exceeds safe integer");
+    return text;
+}
+
+function parseRange(text) {
+    assert.equal(typeof text, "string", "Malformed advisory range");
+    assert.notEqual(text.trim(), "", "Empty advisory range");
+    const parts = text.split(",").map((part) => part.trim());
+    for (const part of parts) {
+        assert.notEqual(part, "", "Empty advisory range comparator");
+        assert.match(part, comparator, "Unsupported advisory range comparator");
+        parseVersion(part.replace(/^(?:>=|<=|>|<|=)?\s*/, ""));
+    }
+    return parts.map((part) => part.replace(/^(>=|<=|>|<|=)\s*/, "$1")).join(" ");
+}
+
+function advisoryVersions(versions) {
+    assert.ok(versions && typeof versions === "object", "Malformed advisory versions");
+    assert.ok(versions.patched == null || Array.isArray(versions.patched), "Malformed advisory versions");
+    assert.ok(versions.unaffected == null || Array.isArray(versions.unaffected), "Malformed advisory versions");
+    assert.ok(Array.isArray(versions.patched) || Array.isArray(versions.unaffected), "Malformed advisory versions");
+    const patched = versions.patched ?? [];
+    const unaffected = versions.unaffected ?? [];
+    for (const range of [...patched, ...unaffected]) parseRange(range);
+    return { patched, unaffected };
+}
+
+export function advisorySafe(version, advisories) {
+    assert.ok(Array.isArray(advisories) && advisories.length > 0, "Advisory findings required");
+    const candidate = parseVersion(version);
+    const checks = advisories.map((entry) => {
+        assert.ok(entry && typeof entry === "object", "Malformed advisory entry");
+        const { patched, unaffected } = advisoryVersions(entry.versions);
+        return {
+            patched: patched.map((range) => parseRange(range)),
+            unaffected: unaffected.map((range) => parseRange(range)),
+        };
+    });
+    return checks.every(
+        ({ patched, unaffected }) =>
+            patched.some((range) => Bun.semver.satisfies(candidate, range)) ||
+            unaffected.some((range) => Bun.semver.satisfies(candidate, range)),
+    );
+}
+
+export function selectCandidates(version, versions, advisories) {
+    const candidate = parseVersion(version);
+    const [major, minor] = candidate.split(".");
+    assert.ok(Array.isArray(versions), "Malformed registry versions");
+    return versions
+        .filter((item) => {
+            if (!item || typeof item !== "object" || !item.vers || !stableVersion.test(item.vers)) return false;
+            if (item.yanked) return false;
+            parseVersion(item.vers);
+            const [itemMajor, itemMinor] = item.vers.split(".");
+            return itemMajor === major && (major !== "0" || itemMinor === minor) && Bun.semver.order(item.vers, candidate) > 0 && advisorySafe(item.vers, advisories);
+        })
+        .sort((left, right) => Bun.semver.order(left.vers, right.vers))
+        .slice(0, 5);
+}
+
+export function auditIgnores(config) {
+    assert.ok(config && typeof config === "object", "Malformed audit configuration");
+    const ignore = config.advisories?.ignore;
+    assert.ok(Array.isArray(ignore), "Malformed audit ignore policy");
+    for (const id of ignore)
+        assert.match(id, /^RUSTSEC-[0-9]{4}-[0-9]{4}$/, "Malformed audit ignore policy");
+    return new Set(ignore);
+}
+
+export function groupFindings(findings) {
+    assert.ok(Array.isArray(findings), "Malformed audit findings");
+    const groups = new Map();
+    for (const finding of findings) {
+        const { name, version } = finding.package;
+        assert.match(name, /^[a-z][a-z0-9_-]{0,63}$/);
+        parseVersion(version);
+        const advisory = { id: finding.advisory.id, versions: finding.versions };
+        const group = groups.get(name);
+        if (group) {
+            assert.equal(group.version, version);
+            group.advisories.push(advisory);
+            continue;
+        }
+        groups.set(name, { name, version, advisories: [advisory] });
+    }
+    return [...groups.values()];
+}
+
+function directDependencyNames(manifest) {
+    assert.equal(typeof manifest, "string", "Cargo.toml source missing");
+    const parsed = Bun.TOML.parse(manifest), names = new Set();
+    assert.equal(parsed.workspace, undefined, "Workspace dependency resolution is unsupported");
+    const collect = (table) => {
+        if (!table || typeof table !== "object") return;
+        for (const [key, value] of Object.entries(table)) names.add(value && typeof value === "object" && typeof value.package === "string" ? value.package : key);
+    };
+    for (const section of dependencySections) collect(parsed[section]);
+    for (const target of Object.values(parsed.target ?? {})) for (const section of dependencySections) collect(target?.[section]);
+    return names;
+}
+
+export function auditFindings(report, manifest, ignored = new Set()) {
+    assert.ok(Array.isArray(report?.vulnerabilities?.list ?? []) && Array.isArray(report?.warnings?.unsound ?? []), "Malformed audit report");
+    const direct = directDependencyNames(manifest), seen = new Set(), findings = [];
+    const add = (advisory, pkg, versions, directOnly) => {
+        assert.ok(advisory && typeof advisory.id === "string" && pkg && typeof pkg.name === "string" && typeof pkg.version === "string", "Malformed audit finding");
+        const normalized = advisoryVersions(versions);
+        if (advisory.withdrawn != null || ignored.has(advisory.id)) return;
+        if (directOnly && !direct.has(pkg.name)) return;
+        const key = `${advisory.id}\0${pkg.name}\0${pkg.version}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        findings.push({ advisory, versions: normalized, package: pkg });
+    };
+    for (const finding of report?.vulnerabilities?.list ?? []) add(finding?.advisory, finding?.package, finding?.versions, false);
+    for (const warning of report?.warnings?.unsound ?? []) if (warning?.advisory?.informational === "unsound") add(warning.advisory, warning.package, warning.versions, true);
+    assert.ok(findings.length <= 6, "Bounded structured audit findings required");
+    return findings;
+}
+
+export function auditHeld(report, manifest, ignored = new Set()) {
+    const warnings = report?.warnings;
+    if (warnings == null) return [];
+    assert.ok(typeof warnings === "object", "Malformed audit warnings");
+    const direct = directDependencyNames(manifest), held = [];
+    for (const kind of ["unmaintained", "yanked"]) {
+        const list = warnings[kind];
+        if (list == null) continue;
+        assert.ok(Array.isArray(list), "Malformed audit warnings");
+        const active = list.filter((entry) => entry?.advisory?.withdrawn == null && !ignored.has(entry?.advisory?.id) && (kind !== "unmaintained" || direct.has(entry?.package?.name)));
+        if (active.length > 0) held.push({ kind, count: active.length });
+    }
+    return held;
+}
+
+function lockBlocks(text) {
+    const starts = [...text.matchAll(/^\[\[package\]\]$/gm)].map((match) => match.index);
+    return starts.map((start, index) => {
+        const end = starts[index + 1] ?? text.length;
+        const content = text.slice(start, end);
+        const entries = packages(content);
+        assert.equal(entries.length, 1, "Malformed Cargo.lock package block");
+        return { start, end, content, item: entries[0] };
+    });
+}
+
+export function restoreUnplannedLockEdges(original, updated, plan) {
+    const before = lockBlocks(original), after = lockBlocks(updated);
+    assert.equal(after.length, before.length, "Dependency graph expansion requires separate review");
+    const identity = (item) => json([item.name, item.version, item.source]);
+    const originals = new Map(before.map((block) => [identity(block.item), block]));
+    assert.equal(originals.size, before.length, "Duplicate original package identity");
+    assert.equal(new Set(after.map((block) => identity(block.item))).size, after.length, "Duplicate updated package identity");
+    const planned = new Set(plan.updates.map((update) => json([update.name, update.to, "registry+https://github.com/rust-lang/crates.io-index"])));
+    let restored = updated;
+    for (const block of after.toReversed()) {
+        if (planned.has(identity(block.item))) continue;
+        const old = originals.get(identity(block.item));
+        assert.ok(old, "Unplanned package identity or inventory changed");
+        assert.equal(block.item.checksum, old.item.checksum, "Unplanned package checksum changed");
+        const { dependencies: currentEdges, ...currentFields } = block.item;
+        const { dependencies: originalEdges, ...originalFields } = old.item;
+        assert.deepEqual(currentFields, originalFields, "Unplanned package fields changed");
+        if (json(currentEdges ?? []) === json(originalEdges ?? [])) continue;
+        // Restore unrelated edges before the unchanged gate and cargo metadata --locked validate the graph.
+        restored = restored.slice(0, block.start) + old.content + restored.slice(block.end);
+    }
+    return restored;
+}
 
 export function admitLockChange(original, updated, plan, index) {
     assert.notEqual(
@@ -91,27 +271,26 @@ export function admitLockChange(original, updated, plan, index) {
     return true;
 }
 
-export function admitAuditPair(baseline, patched) {
+export function admitAuditPair(baseline, patched, manifest, ignored = new Set()) {
     assert.match(baseline.database, /^[a-f0-9]{40}$/);
-    assert.equal(
-        baseline.database,
-        patched.database,
-        "Audit database changed between checks",
-    );
-    assert.equal(
-        baseline.exitCode,
-        1,
-        "Baseline must fail on actual audit findings",
-    );
-    const old = baseline.report?.vulnerabilities,
-        current = patched.report?.vulnerabilities;
-    assert.equal(old?.found, true);
-    assert.ok(Array.isArray(old?.list) && old.list.length > 0);
-    assert.equal(old.count, old.list.length);
+    assert.equal(baseline.database, patched.database, "Audit database changed between checks");
+    const old = baseline.report?.vulnerabilities, current = patched.report?.vulnerabilities;
+    assert.ok(auditFindings(baseline.report, manifest, ignored).length > 0, "Baseline must report actionable advisories");
+    if (old?.found === true) {
+        assert.ok(Array.isArray(old.list) && old.list.length > 0);
+        assert.equal(old.count, old.list.length);
+        assert.equal(baseline.exitCode, 1);
+    } else {
+        assert.equal(old?.found, false);
+        assert.deepEqual(old?.list, []);
+        assert.equal(old?.count, 0);
+        assert.equal(baseline.exitCode, 0);
+    }
     assert.equal(patched.exitCode, 0);
     assert.equal(current?.found, false);
     assert.deepEqual(current?.list, []);
     assert.equal(current?.count, 0);
+    assert.deepEqual(auditFindings(patched.report, manifest, ignored), [], "Patched audit must clear every actionable advisory");
     return true;
 }
 
@@ -231,89 +410,37 @@ async function verify(root) {
         );
         const baseline = await audit(source, root, "baseline", database, false);
         await save(root, "baseline.json", baseline);
-        const findings = baseline.report?.vulnerabilities?.list;
-        if (
-            baseline.exitCode === 0 &&
-            baseline.report?.vulnerabilities?.found === false
-        ) {
+        const manifest = await readFile(path.join(source, "Cargo.toml"), "utf8");
+        const auditConfig = Bun.TOML.parse(await readFile(path.join(source, ".cargo/audit.toml"), "utf8"));
+        const ignored = auditIgnores(auditConfig);
+        const findings = auditFindings(baseline.report, manifest, ignored);
+        if (findings.length === 0) {
+            const held = auditHeld(baseline.report, manifest, ignored);
+            if (held.length > 0) {
+                await save(root, "outcome.json", { status: "held", reason: "unsupported-advisory-class", base, held });
+                throw new Error(`Held unsupported advisory class: ${json(held)}`);
+            }
+            assert.equal(baseline.exitCode, 0, "Unclassified audit failure");
+            assert.equal(baseline.report?.vulnerabilities?.found, false);
+            assert.deepEqual(baseline.report?.vulnerabilities?.list, []);
             await save(root, "outcome.json", { status: "no-findings", base });
             return;
         }
-        assert.equal(baseline.exitCode, 1);
-        assert.ok(
-            Array.isArray(findings) &&
-                findings.length > 0 &&
-                findings.length <= 6,
-            "Bounded structured audit findings required",
-        );
-        const targets = [],
-            index = {};
-        for (const finding of findings) {
-            const { name, version } = finding.package;
-            assert.match(name, /^[a-z][a-z0-9_-]{0,63}$/);
-            assert.match(version, /^\d+\.\d+\.\d+$/);
-            const existing = targets.find((target) => target.name === name);
-            if (existing) {
-                assert.equal(existing.version, version);
-                existing.advisories.push(finding.advisory.id);
-                continue;
+        assert.ok(baseline.exitCode === 0 || baseline.exitCode === 1, "Baseline must report bounded actionable advisories");
+        assert.ok(findings.length > 0 && findings.length <= 6, "Bounded structured audit findings required");
+        const groups = groupFindings(findings);
+        const targets = [], index = {};
+        for (const { name, version, advisories } of groups) {
+            const prefix = name.length === 1 ? `1/${name}` : name.length === 2 ? `2/${name}` : name.length === 3 ? `3/${name[0]}/${name}` : `${name.slice(0, 2)}/${name.slice(2, 4)}/${name}`;
+            const response = await fetch(`https://index.crates.io/${prefix}`, { headers: { "User-Agent": "omg-cli cloud dependency CI" }, redirect: "error", signal: AbortSignal.timeout(30000) });
+            assert.equal(response.status, 200, "Official registry index unavailable");
+            const versions = (await response.text()).trim().split("\n").map(JSON.parse);
+            index[name] = selectCandidates(version, versions, advisories);
+            if (index[name].length === 0) {
+                await save(root, "outcome.json", { status: "held", reason: "no-patched-candidate", base, package: name, version, advisories: advisories.map((advisory) => ({ id: advisory.id, versions: advisory.versions })) });
+                throw new Error(`Held no patched candidate for ${name}@${version}`);
             }
-            const prefix =
-                name.length === 1
-                    ? `1/${name}`
-                    : name.length === 2
-                      ? `2/${name}`
-                      : name.length === 3
-                        ? `3/${name[0]}/${name}`
-                        : `${name.slice(0, 2)}/${name.slice(2, 4)}/${name}`;
-            const response = await fetch(`https://index.crates.io/${prefix}`, {
-                headers: { "User-Agent": "omg-cli cloud dependency CI" },
-                redirect: "error",
-                signal: AbortSignal.timeout(30000),
-            });
-            assert.equal(
-                response.status,
-                200,
-                "Official registry index unavailable",
-            );
-            const versions = (await response.text())
-                .trim()
-                .split("\n")
-                .map(JSON.parse);
-            const parts = version.split(".").map(Number);
-            index[name] = versions
-                .filter(
-                    (item) =>
-                        !item.yanked &&
-                        /^\d+\.\d+\.\d+$/.test(item.vers) &&
-                        item.vers.split(".")[0] === String(parts[0]) &&
-                        (parts[0] !== 0 ||
-                            item.vers.split(".")[1] === String(parts[1])) &&
-                        item.vers
-                            .split(".")
-                            .some(
-                                (part, i, array) =>
-                                    Number(part) > parts[i] &&
-                                    array
-                                        .slice(0, i)
-                                        .every(
-                                            (value, j) =>
-                                                Number(value) === parts[j],
-                                        ),
-                            ),
-                )
-                .sort((a, b) => {
-                    const x = a.vers.split(".").map(Number),
-                        y = b.vers.split(".").map(Number);
-                    return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
-                })
-                .slice(0, 5);
-            targets.push({
-                name,
-                version,
-                availableVersions: index[name].map((item) => item.vers),
-                advisories: [finding.advisory.id],
-            });
+            targets.push({ name, version, availableVersions: index[name].map((item) => item.vers), advisories: advisories.map((advisory) => advisory.id) });
         }
         const sourceFiles = await Promise.all(
             ["Cargo.toml", "Cargo.lock"].map(async (file) => {
@@ -385,10 +512,12 @@ async function verify(root) {
             command(["git", "diff", "--name-only"], source).stdout.trim(),
             "Cargo.lock",
         );
-        const updated = await readFile(path.join(source, "Cargo.lock"), "utf8"),
+        const produced = await readFile(path.join(source, "Cargo.lock"), "utf8"),
             original = sourceFiles.find(
                 (file) => file.path === "Cargo.lock",
             ).content;
+        const updated = restoreUnplannedLockEdges(original, produced, plan);
+        if (updated !== produced) await writeFile(path.join(source, "Cargo.lock"), updated, "utf8");
         admitLockChange(original, updated, plan, index);
         await save(root, "Cargo.lock", updated);
         await save(root, "Cargo.lock.before", original);
@@ -397,16 +526,18 @@ async function verify(root) {
                 "cargo",
                 "metadata",
                 "--locked",
-                "--no-deps",
                 "--format-version",
                 "1",
             ],
             source,
         );
+        const resolved = JSON.parse(metadata.stdout);
+        assert.ok(Array.isArray(resolved.resolve?.nodes) && resolved.resolve.nodes.length > 0, "Locked dependency graph must resolve");
+        assert.equal(await readFile(path.join(source, "Cargo.lock"), "utf8"), updated, "Graph verification must preserve the admitted lockfile");
         await save(root, "metadata.json", metadata.stdout);
         const patched = await audit(source, root, "patched", database, true);
         await save(root, "patched.json", patched);
-        admitAuditPair(baseline, patched);
+        admitAuditPair(baseline, patched, manifest, ignored);
         const deny = command(
             [
                 "cargo",
@@ -500,9 +631,17 @@ async function readmit(root) {
         plan,
         await document(root, "registry.json"),
     );
+    const manifest = request.source.sourceFiles.find((file) => file.path === "Cargo.toml")?.content;
+    assert.equal(typeof manifest, "string", "Cargo.toml source missing");
+    const auditConfig = await github("GET", `/contents/.cargo/audit.toml?ref=${receipt.base}`);
+    assert.equal(typeof auditConfig?.content, "string", "Audit ignore policy source missing");
+    assert.equal(auditConfig.encoding, "base64", "Audit ignore policy encoding unsupported");
+    const auditSource = Buffer.from(auditConfig.content, "base64").toString("utf8");
+    assert.equal(auditConfig.sha, blob(auditSource), "Audit ignore policy differs from pinned base");
+    const ignored = auditIgnores(Bun.TOML.parse(auditSource));
     const baseline = await document(root, "baseline.json"),
         patched = await document(root, "patched.json");
-    admitAuditPair(baseline, patched);
+    admitAuditPair(baseline, patched, manifest, ignored);
     for (const name of ["baseline", "patched"]) {
         const raw = await readFile(path.join(root, `${name}.stdout`), "utf8");
         assert.equal(hash(raw), receipt[`${name}Sha256`]);
@@ -581,7 +720,7 @@ async function publish(root) {
         `Cloud operation: ${receipt.id}`,
         `Advisory database: ${receipt.database}`,
         `Plan SHA256: ${receipt.planSha256}`,
-        "\nExecuted: real baseline audit failure, patched audit with zero findings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks. Only Cargo.lock changes. Native, QEMU, coverage and all normal PR checks still must pass. This dependency proof is not Rust test sensitivity credit. Human review and merge remain required.",
+        `\n${dependencyExecutedEvidence} Native, QEMU, coverage and all normal PR checks still must pass. This dependency proof is not Rust test sensitivity credit. Human review and merge remain required.`,
     ].join("\n");
     const pull = await github("POST", "/pulls", {
         title: "fix(deps): cloud-generated dependency audit repairs",

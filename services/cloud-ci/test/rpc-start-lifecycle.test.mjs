@@ -335,3 +335,95 @@ test("stop disconnects the client captured before asynchronous cleanup", async (
   expect(state.disconnected()).toBe(true);
   expect(replacementDisconnected).toBe(false);
 });
+
+function executionFixture({ pause = false } = {}) {
+  const sentinel = "Runner teardown refuses container start";
+  const submissions = [];
+  const gate = deferred();
+  const entered = deferred();
+  let fenced = false;
+  let guardCalls = 0;
+
+  const host = Object.assign(Object.create(Sandbox.prototype), {
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    client: {
+      commands: {
+        async execute(command) {
+          submissions.push(`execute:${command}`);
+          return { exitCode: 0, success: true, stdout: "", stderr: "" };
+        },
+      },
+      processes: {
+        async startProcess(command) {
+          submissions.push(`startProcess:${command}`);
+          return { processId: "fixture-process", pid: 1, command };
+        },
+      },
+    },
+    serializeExecutionContext: (context) => context.sessionId,
+    validateExplicitSessionId() {},
+    buildExecutionRequestOptions: () => ({}),
+    getProcessSessionBinding: (session) => session,
+    getPublicExecutionSessionId: (sessionId) => sessionId,
+    mapExecuteResponseToExecResult: (response) => response,
+    createProcessFromDTO: (data) => data,
+    async executeWithStreaming(command) {
+      submissions.push(`executeWithStreaming:${command}`);
+      return { exitCode: 0, success: true, stdout: "", stderr: "" };
+    },
+    async resolveExecution() {
+      if (pause) {
+        entered.resolve();
+        await gate.promise;
+      }
+
+      return { sessionId: "default" };
+    },
+    assertExecutionAllowed() {
+      guardCalls += 1;
+      if (fenced) throw new Error(sentinel);
+    },
+  });
+
+  return {
+    host,
+    submissions,
+    sentinel,
+    gate,
+    entered,
+    fence() {
+      fenced = true;
+    },
+    guardCalls: () => guardCalls,
+  };
+}
+
+test("actual SDK exec paths reject at the installed guard before command submission", async () => {
+  const invocations = [
+    (host) => Sandbox.prototype.exec.call(host, "echo normal"),
+    (host) => Sandbox.prototype.execWithSessionToken.call(host, "echo explicit", "session-1"),
+    (host) => Sandbox.prototype.exec.call(host, "echo stream", { stream: true, onOutput() {} }),
+  ];
+
+  for (const invoke of invocations) {
+    const state = executionFixture();
+    state.fence();
+
+    await expect(invoke(state.host)).rejects.toThrow(state.sentinel);
+    expect(state.submissions).toEqual([]);
+    expect(state.guardCalls()).toBe(1);
+  }
+});
+
+test("actual SDK startProcess released after fencing rejects before process submission", async () => {
+  const state = executionFixture({ pause: true });
+  const pending = Sandbox.prototype.startProcess.call(state.host, "sleep 2", { env: {} });
+
+  await state.entered.promise;
+  state.fence();
+  state.gate.resolve();
+
+  await expect(pending).rejects.toThrow(state.sentinel);
+  expect(state.submissions).toEqual([]);
+  expect(state.guardCalls()).toBe(1);
+});
