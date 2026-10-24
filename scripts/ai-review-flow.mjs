@@ -992,6 +992,36 @@ const imageSha = (value) => typeof value === "string" && /^sha256:[a-f0-9]{64}$/
 const hex64 = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const runIdentity = (value) => typeof value === "string" && /^[1-9][0-9]{0,19}-[1-9][0-9]{0,5}$/.test(value);
 
+const renewalKeys = "branch enabled imageDigest inventoryDigest kind manifestDigest parent parentController priorImageDigest publication publish repository source targetController verifierRevision".split(" ");
+export async function loadTestAuditRenewal(context, readRecord = document) {
+    let rawRecord;
+    try {
+        rawRecord = await readRecord(path.join(homedir(), "ci", "test-audit-renewal.json"), 8192);
+    } catch (error) {
+        if (error?.code === "ENOENT") return undefined;
+        throw error;
+    }
+    if (!exactKeys(rawRecord, renewalKeys) ||
+        rawRecord.kind !== "test-audit-controller-renewal" ||
+        rawRecord.repository !== SOURCE_REPOSITORY || rawRecord.branch !== "main" ||
+        typeof rawRecord.enabled !== "boolean" || typeof rawRecord.publish !== "boolean" ||
+        !sha40(rawRecord.source) || !sha40(rawRecord.parentController) || !sha40(rawRecord.targetController) ||
+        !sha40(rawRecord.verifierRevision) || !runIdentity(rawRecord.parent) ||
+        !hex64(rawRecord.manifestDigest) || !hex64(rawRecord.inventoryDigest) ||
+        !imageSha(rawRecord.priorImageDigest) || !imageSha(rawRecord.imageDigest) ||
+        !["success","skipped","failure","cancelled","timed_out"].includes(rawRecord.publication))
+        throw new Error("Test audit renewal record is malformed.");
+    if (!rawRecord.enabled) return undefined;
+    if (!runIdentity(`${context.runId}-${context.attempt}`) || !sha40(context.controllerRevision) ||
+        !imageSha(context.imageDigest) || !sha40(context.verifierRevision))
+        throw new Error("Test audit renewal context is malformed.");
+    if (rawRecord.targetController !== context.controllerRevision || rawRecord.imageDigest !== context.imageDigest ||
+        rawRecord.verifierRevision !== context.verifierRevision ||
+        rawRecord.parentController === context.controllerRevision ||
+        rawRecord.priorImageDigest === rawRecord.imageDigest)
+        throw new Error("Test audit renewal runtime or controller context drifted.");
+    return { ...rawRecord, controllerRevision: context.controllerRevision, recordSha256: sha256(JSON.stringify(rawRecord)) };
+}
 export async function loadTestAuditTransition(context, readRecord = document) {
     let rawRecord;
     try {
@@ -1430,11 +1460,22 @@ export async function main(args = process.argv.slice(2)) {
             transition = await loadTestAuditTransition({ runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
                 controllerRevision: revision, imageDigest: policy.imageDigest, verifierRevision: policy.verifierRevision });
             const parent = await fetchJson(new URL(`/review-records/${target.auditParent}`, config.endpoint), token, undefined, 2 * 1024 * 1024);
+            const renewal = target.range?.kind === "test-audit" && target.range?.resnapshot === true &&
+                parent.controllerRevision !== revision
+                ? await loadTestAuditRenewal({ runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+                    controllerRevision: revision, imageDigest: policy.imageDigest, verifierRevision: policy.verifierRevision })
+                : undefined;
+            const renewalApplies = renewal !== undefined &&
+                parent.controllerRevision === renewal.parentController &&
+                target.auditParent === renewal.parent;
+            const mainSha = renewalApplies
+                ? exactSha((await github.request("GET", `${prefix}/git/ref/heads/main`)).object.sha)
+                : undefined;
             const priorChild = transition && target.range?.kind === "test-audit" &&
                 transition.source === target.sha && transition.parent === target.auditParent
                 ? await fetchJson(new URL(`/review-records/${transition.priorChild}`, config.endpoint), token, undefined, 2 * 1024 * 1024)
                 : undefined;
-            target = admitAuditResume(target, parent, revision, campaignManifest ? { transition, priorChild,
+            target = admitAuditResume(target, parent, revision, campaignManifest ? { transition, renewal: renewalApplies ? renewal : undefined, mainSha, priorChild,
                 runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
                 imageDigest: policy.imageDigest, verifierRevision: policy.verifierRevision,
                 manifestDigest: testAuditManifestDigest(campaignManifest),
@@ -1514,7 +1555,12 @@ export async function main(args = process.argv.slice(2)) {
     if(mode === "recover"){
         const manifest=JSON.parse(await readFile(path.join(root,"config/test-audit-backlog.json"),"utf8"));
         const currentSha=exactSha((await github.request("GET",`${prefix}/git/ref/heads/main`)).object.sha);
-        const recovered=await recoverTestAuditCampaign({github,currentSha,revision,manifestDigest:testAuditManifestDigest(manifest),currentRunId:runId,currentRunAttempt:attempt,dispatch:dispatchAudit,
+        const policy=ciPolicy(config);
+        const renewal=await loadTestAuditRenewal({runId,attempt,controllerRevision:revision,
+            imageDigest:policy.imageDigest,verifierRevision:policy.verifierRevision});
+        const recovered=await recoverTestAuditCampaign({github,currentSha,revision,renewal,
+            imageDigest:policy.imageDigest,verifierRevision:policy.verifierRevision,
+            manifestDigest:testAuditManifestDigest(manifest),currentRunId:runId,currentRunAttempt:attempt,dispatch:dispatchAudit,
             loadRecord:(ref)=>fetchJson(new URL(`/review-records/${ref}`,config.endpoint),token,undefined,2*1024*1024),
             loadIntent:(ref)=>fetchJson(new URL(`/review-records/${ref}/recovery-intent`,config.endpoint),token,undefined,64*1024),
             storeIntent:(ref,body)=>fetchJson(new URL(`/review-records/${ref}/recovery-intent`,config.endpoint),token,JSON.stringify(body),64*1024),

@@ -107,6 +107,42 @@ const sameFormat = (formatting, expected) =>
     formatting?.attempt === expected.attempt &&
     formatting?.sha === expected.sha &&
     formatting?.ref === expected.ref;
+const renewalRecordKeys = "branch controllerRevision enabled imageDigest inventoryDigest kind manifestDigest parent parentController priorImageDigest publication publish recordSha256 repository source targetController verifierRevision".split(" ");
+function renewalIntake(target, parent, revision, manifestDigest, publicationResult, campaign) {
+    const t = campaign?.renewal,
+        parentRef = `${parent?.campaignRun?.runId}-${parent?.campaignRun?.attempt}`;
+    if (!shape(t, renewalRecordKeys))
+        throw new Error("Campaign renewal record missing or inferred");
+    if (t.kind !== "test-audit-controller-renewal" || t.repository !== "omg-cli/omg" || t.enabled !== true)
+        throw new Error("Campaign renewal record is not enabled");
+    if (!sha.test(revision ?? "") || t.branch !== "main" || t.publish !== true ||
+        !sha.test(t.source ?? "") || !sha.test(t.parentController ?? "") ||
+        t.controllerRevision !== revision || t.targetController !== revision || !digest.test(t.recordSha256 ?? "") ||
+        !sha.test(t.verifierRevision ?? "") || !digest.test(t.manifestDigest ?? "") ||
+        !digest.test(t.inventoryDigest ?? "") ||
+        !/^sha256:[a-f0-9]{64}$/.test(t.imageDigest ?? "") ||
+        !/^sha256:[a-f0-9]{64}$/.test(t.priorImageDigest ?? "") ||
+        t.imageDigest === t.priorImageDigest ||
+        t.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
+        target.branch !== "main" || target.publish !== true)
+        throw new Error("Campaign renewal controller, runtime or manifest mismatch");
+    if (campaign.imageDigest !== t.imageDigest || campaign.verifierRevision !== t.verifierRevision)
+        throw new Error("Campaign renewal runtime drifted");
+    if (!run.test(parentRef) || parentRef !== t.parent || target.auditParent !== t.parent ||
+        parent.controllerRevision !== t.parentController || parent.status !== "reviewed" ||
+        parent.publishRequested !== true || parent.sha !== t.source ||
+        parent.sourceRange?.kind !== "test-audit" || parent.sourceRange?.sha !== t.source ||
+        parent.sourceRange?.manifestDigest !== t.manifestDigest ||
+        parent.sourceRange?.inventoryDigest !== t.inventoryDigest ||
+        !sha.test(target.sha ?? "") || target.sha === t.source ||
+        target.range?.resnapshot !== true || target.range?.sha !== target.sha ||
+        campaign.mainSha !== target.sha || campaign.mainSha === t.source)
+        throw new Error("Campaign renewal parent, source or inventory lineage mismatch");
+    if (!["success","skipped","failure","cancelled","timed_out"].includes(publicationResult) ||
+        publicationResult !== t.publication)
+        throw new Error("Campaign renewal publication is not terminal or does not match");
+    return { from: parent.controllerRevision, to: revision, recordSha256: t.recordSha256, parent: parentRef, priorChild: null };
+}
 function transitionIntake(target, parent, revision, manifestDigest, campaign) {
     const t = campaign?.transition,
         child = campaign?.priorChild,
@@ -181,7 +217,13 @@ function transitionIntake(target, parent, revision, manifestDigest, campaign) {
 }
 export function admitTestAuditParent(target, parent, revision, manifestDigest, publicationResult, campaign) {
     const r = checkRange(parent);
-    const transition = campaign?.transition === undefined ? null : transitionIntake(target, parent, revision, manifestDigest, campaign);
+    const renewal = campaign?.renewal;
+    const renewalApplies = renewal !== undefined && parent.controllerRevision !== revision &&
+        parent.controllerRevision === renewal.parentController &&
+        target.auditParent === renewal.parent && target.range?.resnapshot === true;
+    const transition = renewalApplies
+        ? renewalIntake(target, parent, revision, manifestDigest, publicationResult, campaign)
+        : campaign?.transition === undefined ? null : transitionIntake(target, parent, revision, manifestDigest, campaign);
     if (transition === null) {
         if (`${parent.campaignRun?.runId}-${parent.campaignRun?.attempt}` !== target.auditParent ||
             !run.test(target.auditParent ?? "") || parent.controllerRevision !== revision ||
@@ -200,6 +242,7 @@ export function admitTestAuditParent(target, parent, revision, manifestDigest, p
         return {
             ...target,
             upstream: undefined,
+            ...(transition === null ? {} : { controllerTransition: transition }),
             range: {
                 ...target.range,
                 inventoryDigest: undefined,
@@ -738,6 +781,9 @@ export async function recoverTestAuditCampaign({
     github,
     currentSha,
     revision,
+    renewal,
+    imageDigest,
+    verifierRevision,
     manifestDigest,
     loadRecord,
     dispatch,
@@ -834,14 +880,23 @@ export async function recoverTestAuditCampaign({
                 throw error;
             }
             if (report.status === "duplicate-noop") continue;
+            const renewalApplies = renewal !== undefined &&
+                report.controllerRevision === renewal.parentController &&
+                parentRef === renewal.parent && report.sha === renewal.source &&
+                report.sourceRange?.kind === "test-audit" &&
+                report.sourceRange?.manifestDigest === renewal.manifestDigest &&
+                report.sourceRange?.inventoryDigest === renewal.inventoryDigest &&
+                report.status === "reviewed" && currentSha !== report.sha;
             if (
                 report.controllerRevision !== revision ||
                 report.sourceRange?.manifestDigest !== manifestDigest
-            )
-                return {
-                    status: "campaign-controller-or-manifest-held",
-                    parent: parentRef,
-                };
+            ) {
+                if (!renewalApplies || manifestDigest !== renewal.manifestDigest)
+                    return {
+                        status: "campaign-controller-or-manifest-held",
+                        parent: parentRef,
+                    };
+            }
             const publicationResult = await parentPublicationResult(
                 github,
                 parentRef,
@@ -854,6 +909,38 @@ export async function recoverTestAuditCampaign({
                 String(metadata.run_attempt),
                 publicationResult,
             );
+            if (renewalApplies) {
+                if (plan.status !== "continue" || !plan.resnapshot)
+                    return {
+                        status: "campaign-controller-or-manifest-held",
+                        parent: parentRef,
+                    };
+                try {
+                    const admittedTarget = testAuditTarget({
+                        branch: "main",
+                        scope: "test-audit",
+                        publish: String(report.publishRequested === true),
+                        audit_sha: currentSha,
+                        audit_cursor: plan.inputs.audit_cursor,
+                        audit_parent: parentRef,
+                        audit_manifest: plan.inputs.audit_manifest,
+                        audit_resnapshot: "true",
+                    });
+                    admitTestAuditParent(
+                        { ...admittedTarget, range: { ...admittedTarget.range, sha: currentSha } },
+                        report,
+                        revision,
+                        manifestDigest,
+                        publicationResult,
+                        { renewal, mainSha: currentSha, imageDigest, verifierRevision },
+                    );
+                } catch {
+                    return {
+                        status: "campaign-controller-or-manifest-held",
+                        parent: parentRef,
+                    };
+                }
+            }
             return dispatchTestAuditPlan({
                 github,
                 plan,

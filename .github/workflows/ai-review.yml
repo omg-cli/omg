@@ -107,6 +107,7 @@ jobs:
           OMG_CI_CODER_TOKEN: ${{ secrets.OMG_CI_CODER_TOKEN }}
           OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
           OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+          OMG_CI_AUDIT_RENEWAL: ${{ vars.OMG_CI_AUDIT_RENEWAL }}
           OMG_CI_CODER_SKILL_BUNDLE_SHA256: ${{ vars.OMG_CI_CODER_SKILL_BUNDLE_SHA256 }}
         run: |
           bun run - <<'JS'
@@ -127,6 +128,11 @@ jobs:
           for (const [, variable] of services)
             if (!/^[^\s]{32,512}$/.test(process.env[variable] ?? "")) throw new Error(`Missing dedicated OMG credential: ${variable}`);
           mkdirSync(root, { mode: 0o700 });
+          const renewal = process.env.OMG_CI_AUDIT_RENEWAL;
+          if (renewal) {
+            if (Buffer.byteLength(renewal, "utf8") > 8192) throw new Error("Audit renewal exceeds its policy budget");
+            writeFileSync(path.join(root, "test-audit-renewal.json"), renewal, { mode: 0o600, flag: "wx" });
+          }
           for (const [name, variable, endpoint] of services) {
             const tokenFile = path.join(root, `${name}.token`);
             writeFileSync(tokenFile, process.env[variable], { mode: 0o600, flag: "wx" });
@@ -153,7 +159,7 @@ jobs:
       - name: Remove private OMG service configuration
         if: always()
         shell: bash
-        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json"
+        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/omg-ci-inspector.token" "$HOME/ci/omg-ci-inspector.json" "$HOME/ci/omg-ci-coder.token" "$HOME/ci/omg-ci-coder.json" "$HOME/ci/test-audit-renewal.json"
 
   publish:
     needs: review
@@ -311,6 +317,7 @@ jobs:
           OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
           OMG_CI_IMAGE_DIGEST: ${{ vars.OMG_CI_IMAGE_DIGEST }}
           OMG_CI_VERIFIER_REVISION: ${{ vars.OMG_CI_VERIFIER_REVISION }}
+          OMG_CI_AUDIT_RENEWAL: ${{ vars.OMG_CI_AUDIT_RENEWAL }}
         run: |
           bun run - <<'JS'
           import { mkdirSync, writeFileSync } from "node:fs";
@@ -320,6 +327,11 @@ jobs:
           const { OMG_CI_API_TOKEN: token, OMG_CI_IMAGE_DIGEST: imageDigest, OMG_CI_VERIFIER_REVISION: verifierRevision } = process.env;
           if (!/^[^\s]{32,512}$/.test(token ?? "")) throw new Error("Missing dedicated OMG credential");
           mkdirSync(root, { mode: 0o700 });
+          const renewal = process.env.OMG_CI_AUDIT_RENEWAL;
+          if (renewal) {
+            if (Buffer.byteLength(renewal, "utf8") > 8192) throw new Error("Audit renewal exceeds its policy budget");
+            writeFileSync(path.join(root, "test-audit-renewal.json"), renewal, { mode: 0o600, flag: "wx" });
+          }
           const tokenFile = path.join(root, "omg-cloud-ci.token");
           writeFileSync(tokenFile, token, { mode: 0o600, flag: "wx" });
           writeFileSync(path.join(root, "omg-cloud-ci.json"), JSON.stringify({
@@ -348,4 +360,4 @@ jobs:
       - name: Remove private review record configuration
         if: always()
         shell: bash
-        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json"
+        run: rm -f -- "$HOME/ci/omg-cloud-ci.token" "$HOME/ci/omg-cloud-ci.json" "$HOME/ci/test-audit-renewal.json"

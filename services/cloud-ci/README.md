@@ -10,6 +10,14 @@ As of 2026-10-20, the owner has deployed `omg-cloud-ci`, `omg-ci-coder` and `omg
 
 The actual image digest and verifier revision are pinned in `wrangler.jsonc` and must agree with the coder and trusted courier policy. A copied CodeLoud digest or earlier successful receipt is not evidence for a new OMG image or source revision.
 
+### Renew an existing audit across a controller change
+
+Ordinary campaign admission still requires the parent's controller. A reviewed renewal is a separate, owner-controlled policy delivered through repository variable `OMG_CI_AUDIT_RENEWAL`. The review and recovery configuration writers alone materialize its bounded JSON at `$HOME/ci/test-audit-renewal.json` with mode `0600` and exclusive creation; their existing cleanup removes it. Candidate files, model output and workflow inputs cannot supply this policy. The disabled historical source transition remains unchanged.
+
+While holding both rollout admission groups, fetch the actual latest terminal parent and its publication conclusion. Bind `kind: test-audit-controller-renewal`, repository, branch, enabled/publish flags, exact parent run/attempt, `parentController`, prior `source`, `manifestDigest`, `inventoryDigest`, `priorImageDigest`, publication conclusion, new `targetController`, `imageDigest` and `verifierRevision`. Use the verified runtime and parent receipts for these values. The target controller is the accepted immutable controller SHA supplied after verification, so no source commit must contain its own hash. Set and read back the owner variable and retain its exact JSON and admitted record hash with activation evidence.
+
+The unchanged planner chooses the cursor and resnapshot. Recovery and intake independently validate the policy, actual terminal publication, current main and runtime; the new source inherits no formatting, inventory execution or test-proof credit. Ordinary descendants keep their normal admission path. Once the renewed child has durable provenance and normal continuation ownership, retire the temporary owner variable explicitly. Malformed, oversized or stale policy holds renewal; it does not bypass the original controller gate.
+
 ### Admit a completed image rollout
 
 Dispatch the existing `Cloudflare verification` workflow on `main` with task `rollout-lock`. Its workflow group holds `omg-ai-review-global` and its job group holds `omg-cloud-dependencies`, both with `queue: max` and `cancel-in-progress: false`. New AI reviews stay enabled and queue while existing couriers finish. [GitHub supports concurrency at both workflow and job level](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency); each queue holds at most 100 pending entries, so inspect capacity before dispatch.
