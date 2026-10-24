@@ -12,8 +12,8 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Coder"] }],
   "services": [{ "binding": "CI_SERVICE", "service": "omg-cloud-ci" }],
   "vars": {
-    "CI_IMAGE_DIGEST": "sha256:81e15bae31832afb2b378bf90c95c6b2818aa3088aada654732c666e05ad49e2",
-    "CI_VERIFIER_REVISION": "0e3f615b9501df0ed266c075f4bc97265153b9eb"
+    "CI_IMAGE_DIGEST": "sha256:450cf77edc8afc9157ea40829e435981341385f3d7bf202baa72fdd163a0d11a",
+    "CI_VERIFIER_REVISION": "b14524dbe238876c938349432c87ac731b53fdbc"
   },
   "observability": { "enabled": false },
 }
