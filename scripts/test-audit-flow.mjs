@@ -1,3 +1,5 @@
+import { CloudCiEngineFailure } from "./cloud-ci-evidence.mjs";
+
 export async function runTestAuditPage({
     collected,
     sha,
@@ -58,6 +60,7 @@ export async function runTestAuditPage({
                     status: "no-supported-strengthening",
                 });
         } catch (error) {
+            if (error instanceof CloudCiEngineFailure) throw error;
             const reason =
                 error instanceof Error
                     ? error.message
