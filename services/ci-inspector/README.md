@@ -14,7 +14,7 @@ The model is `@cf/deepseek-ai/deepseek-v4.1-flash-1017`, with explicit `reasonin
 
 Responses contain the supplied identity plus `summary`, `model`, `usage`, `codeExecutions` and `snapshotToolCalls`. A summary requires at least one completed Code Mode call and one successful snapshot tool call. Summaries are capped at 16,000 characters. The service has no payload logging or enabled Worker observability. Responses use `Cache-Control: no-store`. This is an advisory explanation. Its output is not a required CI check or proof that a test passed.
 
-From this directory, use Bun 1.4.2 and run `bun install --frozen-lockfile`, `bun test`, `bun run check` and `bun run build`. Build performs a Wrangler dry run. There is deliberately no deploy script. Unit fixtures verify request admission and tool behavior. A deployed acceptance must separately establish the exact model call, actual sandbox tool composition, blocked egress and runtime limits using an isolated snapshot.
+From this directory, use Bun 1.4.4 and run `bun install --frozen-lockfile`, `bun test`, `bun run check` and `bun run build`. Build performs a Wrangler dry run. There is deliberately no deploy script. Unit fixtures verify request admission and tool behavior. A deployed acceptance must separately establish the exact model call, actual sandbox tool composition, blocked egress and runtime limits using an isolated snapshot.
 
 The source type check imports Cloudflare's official exported runtime types and uses `runtime.d.ts` to connect dependency ambient names to those exact declarations, avoiding conflicting Worker, Node and browser global declarations. Source and Bun tests have separate TypeScript contexts, with full dependency declaration checking and no `skipLibCheck` or diagnostic suppressions.
 

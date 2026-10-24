@@ -25,7 +25,8 @@ import {
     cloudCiPlanSha256,
     admitCloudCiRuntime,
 } from "./cloud-ci-evidence.mjs";
-import { expectedCloudChecks } from "../services/cloud-ci/runner/plan.mjs";
+import { expectedCloudChecks, expectedCloudReports } from "../services/cloud-ci/runner/plan.mjs";
+import { assertPortableTestMember } from "../services/cloud-ci/portable-report.mjs";
 import {
     SOURCE_REPOSITORY,
     sourceChanges,
@@ -95,6 +96,74 @@ export function admitSourceFormatting(receipt, expected, imageDigest) {
         throw new Error("Source format object identity mismatch.");
 
     return format;
+}
+
+export function admitPortableTestReceipt(receipt, expected, imageDigest) {
+    admitSourceFormatting(receipt, expected, imageDigest);
+    const request = parseCloudCiRequest(expected);
+    const id = `cl-${request.runId}-${request.attempt}-${request.sha}`;
+
+    if (
+        receipt.id !== id ||
+        !["success", "failure"].includes(receipt.conclusion) ||
+        Object.entries(request).some(([key, value]) => receipt[key] !== value)
+    )
+        throw new Error("Portable test evidence identity mismatch.");
+
+    if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest ?? "") || receipt.imageDigest !== imageDigest)
+        throw new Error("Portable test evidence image mismatch.");
+
+    if (receipt.planSha256 !== cloudCiPlanSha256)
+        throw new Error("Portable test evidence plan mismatch.");
+
+    const portable = (Array.isArray(receipt.checks) ? receipt.checks : []).filter(
+        (check) => check?.name === "rust-portable-tests",
+    );
+
+    if (portable.length !== 1) throw new Error("Portable test check is missing or duplicated.");
+
+    const names = expectedCloudReports("rust-portable-tests");
+    const reports = Array.isArray(portable[0].reports) ? portable[0].reports : [];
+
+    if (
+        portable[0].exitCode !== 0 ||
+        reports.length !== names.length ||
+        new Set(reports.map((report) => report.name)).size !== names.length ||
+        names.some((name) => !reports.some((report) => report.name === name)) ||
+        reports.some((report) => report.key !== `reports/${id}/${report.name}`)
+    )
+        throw new Error("Portable test reports are missing or unexpected.");
+
+    return reports.find((report) => report.name === "rust-pgp-license-junit.xml");
+}
+
+export async function verifiedPortableReport(report, load) {
+    const response = await load(report.key);
+    if (!response.ok || !response.body)
+        throw new Error(`Portable test report is unavailable: ${report.key}.`);
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of response.body) {
+        size += chunk.byteLength;
+        if (size > 20_000_000) throw new Error("Portable test report exceeds its byte budget.");
+        chunks.push(chunk);
+    }
+    const bytes = Buffer.concat(chunks);
+    await verifyCloudCiObjects({ checks: [], verificationReports: [report] }, async () => new Response(bytes));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+export async function admitPortableAuditRow(row, formatting, io, imageDigest) {
+    if (formatting?.status !== "passed" || formatting.sha !== row.request.sha || formatting.ref !== "refs/heads/main")
+        throw new Error("Portable test baseline identity mismatch.");
+    const request = parseCloudCiRequest({repository: SOURCE_REPOSITORY, sha: row.request.sha,
+        ref: formatting.ref, runId: formatting.runId, attempt: formatting.attempt});
+    const id = `cl-${request.runId}-${request.attempt}-${request.sha}`;
+    const receipt = await io.receipt(id);
+    const report = admitPortableTestReceipt(receipt, request, imageDigest);
+    const xml = await verifiedPortableReport(report, key => io.report(id, key));
+    const suite = row.task.target === "lib" ? "omg" : `omg::${path.basename(row.task.path, ".rs")}`;
+    return assertPortableTestMember(xml, suite, row.task.testName);
 }
 
 export async function admitFormattingRun({
@@ -923,6 +992,36 @@ const imageSha = (value) => typeof value === "string" && /^sha256:[a-f0-9]{64}$/
 const hex64 = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const runIdentity = (value) => typeof value === "string" && /^[1-9][0-9]{0,19}-[1-9][0-9]{0,5}$/.test(value);
 
+const renewalKeys = "branch enabled imageDigest inventoryDigest kind manifestDigest parent parentController priorImageDigest publication publish repository source targetController verifierRevision".split(" ");
+export async function loadTestAuditRenewal(context, readRecord = document) {
+    let rawRecord;
+    try {
+        rawRecord = await readRecord(path.join(homedir(), "ci", "test-audit-renewal.json"), 8192);
+    } catch (error) {
+        if (error?.code === "ENOENT") return undefined;
+        throw error;
+    }
+    if (!exactKeys(rawRecord, renewalKeys) ||
+        rawRecord.kind !== "test-audit-controller-renewal" ||
+        rawRecord.repository !== SOURCE_REPOSITORY || rawRecord.branch !== "main" ||
+        typeof rawRecord.enabled !== "boolean" || typeof rawRecord.publish !== "boolean" ||
+        !sha40(rawRecord.source) || !sha40(rawRecord.parentController) || !sha40(rawRecord.targetController) ||
+        !sha40(rawRecord.verifierRevision) || !runIdentity(rawRecord.parent) ||
+        !hex64(rawRecord.manifestDigest) || !hex64(rawRecord.inventoryDigest) ||
+        !imageSha(rawRecord.priorImageDigest) || !imageSha(rawRecord.imageDigest) ||
+        !["success","skipped","failure","cancelled","timed_out"].includes(rawRecord.publication))
+        throw new Error("Test audit renewal record is malformed.");
+    if (!rawRecord.enabled) return undefined;
+    if (!runIdentity(`${context.runId}-${context.attempt}`) || !sha40(context.controllerRevision) ||
+        !imageSha(context.imageDigest) || !sha40(context.verifierRevision))
+        throw new Error("Test audit renewal context is malformed.");
+    if (rawRecord.targetController !== context.controllerRevision || rawRecord.imageDigest !== context.imageDigest ||
+        rawRecord.verifierRevision !== context.verifierRevision ||
+        rawRecord.parentController === context.controllerRevision ||
+        rawRecord.priorImageDigest === rawRecord.imageDigest)
+        throw new Error("Test audit renewal runtime or controller context drifted.");
+    return { ...rawRecord, controllerRevision: context.controllerRevision, recordSha256: sha256(JSON.stringify(rawRecord)) };
+}
 export async function loadTestAuditTransition(context, readRecord = document) {
     let rawRecord;
     try {
@@ -1222,6 +1321,12 @@ async function createController(github, controllerRevision, transition) {
         },
         review: (input) => fetchJson(endpoint, inspectorToken, JSON.stringify(input), 128 * 1024),
         adapt: (input,review,candidateIndex) => code(input,review,candidateIndex),
+        portableTest: (row, formatting) => admitPortableAuditRow(row, formatting, {
+            receipt: id => fetchJson(new URL(`/runs/${id}/evidence`, config.endpoint), token, undefined, 2 * 1024 * 1024),
+            report: (id, key) => fetch(new URL(`/runs/${id}/reports/${key.split("/")[2]}`, config.endpoint), {
+                headers: { authorization: `Bearer ${token}` }, redirect: "error", signal: AbortSignal.timeout(30000),
+            }),
+        }, policy.imageDigest),
         audit: async (row) => {
             const adapted=await code(row.request.source,undefined,undefined,row.task);
             if(!adapted)return null;
@@ -1355,11 +1460,22 @@ export async function main(args = process.argv.slice(2)) {
             transition = await loadTestAuditTransition({ runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
                 controllerRevision: revision, imageDigest: policy.imageDigest, verifierRevision: policy.verifierRevision });
             const parent = await fetchJson(new URL(`/review-records/${target.auditParent}`, config.endpoint), token, undefined, 2 * 1024 * 1024);
+            const renewal = target.range?.kind === "test-audit" && target.range?.resnapshot === true &&
+                parent.controllerRevision !== revision
+                ? await loadTestAuditRenewal({ runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+                    controllerRevision: revision, imageDigest: policy.imageDigest, verifierRevision: policy.verifierRevision })
+                : undefined;
+            const renewalApplies = renewal !== undefined &&
+                parent.controllerRevision === renewal.parentController &&
+                target.auditParent === renewal.parent;
+            const mainSha = renewalApplies
+                ? exactSha((await github.request("GET", `${prefix}/git/ref/heads/main`)).object.sha)
+                : undefined;
             const priorChild = transition && target.range?.kind === "test-audit" &&
                 transition.source === target.sha && transition.parent === target.auditParent
                 ? await fetchJson(new URL(`/review-records/${transition.priorChild}`, config.endpoint), token, undefined, 2 * 1024 * 1024)
                 : undefined;
-            target = admitAuditResume(target, parent, revision, campaignManifest ? { transition, priorChild,
+            target = admitAuditResume(target, parent, revision, campaignManifest ? { transition, renewal: renewalApplies ? renewal : undefined, mainSha, priorChild,
                 runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
                 imageDigest: policy.imageDigest, verifierRevision: policy.verifierRevision,
                 manifestDigest: testAuditManifestDigest(campaignManifest),
@@ -1439,7 +1555,12 @@ export async function main(args = process.argv.slice(2)) {
     if(mode === "recover"){
         const manifest=JSON.parse(await readFile(path.join(root,"config/test-audit-backlog.json"),"utf8"));
         const currentSha=exactSha((await github.request("GET",`${prefix}/git/ref/heads/main`)).object.sha);
-        const recovered=await recoverTestAuditCampaign({github,currentSha,revision,manifestDigest:testAuditManifestDigest(manifest),currentRunId:runId,currentRunAttempt:attempt,dispatch:dispatchAudit,
+        const policy=ciPolicy(config);
+        const renewal=await loadTestAuditRenewal({runId,attempt,controllerRevision:revision,
+            imageDigest:policy.imageDigest,verifierRevision:policy.verifierRevision});
+        const recovered=await recoverTestAuditCampaign({github,currentSha,revision,renewal,
+            imageDigest:policy.imageDigest,verifierRevision:policy.verifierRevision,
+            manifestDigest:testAuditManifestDigest(manifest),currentRunId:runId,currentRunAttempt:attempt,dispatch:dispatchAudit,
             loadRecord:(ref)=>fetchJson(new URL(`/review-records/${ref}`,config.endpoint),token,undefined,2*1024*1024),
             loadIntent:(ref)=>fetchJson(new URL(`/review-records/${ref}/recovery-intent`,config.endpoint),token,undefined,64*1024),
             storeIntent:(ref,body)=>fetchJson(new URL(`/review-records/${ref}/recovery-intent`,config.endpoint),token,JSON.stringify(body),64*1024),

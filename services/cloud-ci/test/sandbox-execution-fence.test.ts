@@ -17,7 +17,7 @@ type Ctx = {
   blockConcurrencyWhile<T>(fn: () => Promise<T>): Promise<T>;
 };
 type Env = {
-  BACKUP_BUCKET: { put(key: string, body: string | Uint8Array, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown> };
+  BACKUP_BUCKET: { get(key: string): Promise<{ text(): Promise<string> } | null>; put(key: string, body: string | Uint8Array, options?: { httpMetadata?: { contentType?: string } }): Promise<unknown> };
   CI_WORKFLOW: { get(owner: string): Promise<{ id: string; status(): Promise<{ status: string }> }> };
   listFiles(path: string): Promise<Listing>;
   readFile(path: string): Promise<Workers.ReadableStream<Uint8Array>>;
@@ -58,6 +58,10 @@ class Context implements Ctx {
 }
 
 class Bucket {
+  async get(key: string) {
+    const stored = this.writes.findLast((write) => write.key === key);
+    return stored ? { text: async () => new TextDecoder().decode(stored.content) } : null;
+  }
   readonly writes: { key: string; content: Uint8Array; contentType?: string }[] = [];
   async put(key: string, body: string | Uint8Array, options?: { httpMetadata?: { contentType?: string } }) {
     this.writes.push({ key, content: new Uint8Array(await new Response(body).arrayBuffer()), contentType: options?.httpMetadata?.contentType });

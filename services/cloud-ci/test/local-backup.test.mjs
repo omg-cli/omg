@@ -26,6 +26,10 @@ await Promise.resolve(
       };
       env = {
         BACKUP_BUCKET: {
+          async get(key) {
+            const text = evidence.get(key);
+            return typeof text === "string" ? { text: async () => text } : null;
+          },
           async put(key, value) {
             evidence.set(key, value);
 

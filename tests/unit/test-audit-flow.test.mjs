@@ -36,6 +36,7 @@ test("bounded test-audit page hands exact selected task to coder and preserves h
         formatting: { status: "passed" },
         publishRequested: true,
         io: {
+            portableTest: async () => {},
             audit: async (row) => {
                 calls.push(row);
                 return null;
@@ -102,6 +103,7 @@ test("existing review coordinator accepts bounded audit scope and bypasses defec
                 unreviewedPaths: [],
             }),
             format: async () => ({ status: "passed" }),
+            portableTest: async () => {},
             audit: async () => {
                 calls++;
                 return null;

@@ -1,12 +1,14 @@
-FROM registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci@sha256:101e87873863044d27cc09f171ab8f970336349859b502b9f65d0ca57942df88
+FROM registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci-base@sha256:21eb35d60826d1183e60e9220e6db58dffd1472762c32e8c57c998ea6f24609c
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/* && command -v ip && setpriv --reuid=10001 --regid=10001 --clear-groups ip -statistics -statistics link > /tmp/ip-statistics && grep -q 'RX:' /tmp/ip-statistics && rm /tmp/ip-statistics
+RUN command -v ip && setpriv --reuid=10001 --regid=10001 --clear-groups ip -statistics -statistics link > /tmp/ip-statistics && grep -q 'RX:' /tmp/ip-statistics && rm /tmp/ip-statistics
+COPY services/cloud-ci/runner/package.json services/cloud-ci/runner/bun.lock /opt/omg-ci/
+RUN cd /opt/omg-ci && bun install --frozen-lockfile --ignore-scripts
 COPY services/cloud-ci/runner/ /opt/omg-ci/
 COPY services/cloud-ci/runner/ /opt/omg-ci/runner/
 COPY services/cloud-ci/verifier.mjs /opt/omg-ci/verifier.mjs
 COPY scripts/rust-source-policy.mjs /scripts/rust-source-policy.mjs
 COPY scripts/prepare-node-test-fixture.py /scripts/prepare-node-test-fixture.py
-RUN setpriv --reuid=10001 --regid=10001 --clear-groups python3 /scripts/prepare-node-test-fixture.py --destination /opt/omg-node-test-fixture
+RUN python3 /scripts/prepare-node-test-fixture.py --destination /opt/omg-node-test-fixture && chown -R 10001:10001 /opt/omg-node-test-fixture && setpriv --reuid=10001 --regid=10001 --clear-groups python3 /scripts/prepare-node-test-fixture.py --destination /opt/omg-node-test-fixture
 RUN chmod -R a+rX,go-w /opt/omg-ci /scripts
 RUN node /opt/omg-ci/verification-envelope-smoke.mjs
 RUN node /opt/omg-ci/frozen-rust-inputs-smoke.mjs

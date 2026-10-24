@@ -16,6 +16,7 @@ test("portable execution drops identity and does not inherit controller credenti
             GIT_CONFIG_KEY_0: "safe.directory",
             GIT_CONFIG_VALUE_0: "*",
             PYTHONPATH: "/untrusted/modules",
+            SSL_CERT_FILE: "/untrusted/certificates",
         });
 
         expect(options.uid).toBe(10001);
@@ -27,6 +28,7 @@ test("portable execution drops identity and does not inherit controller credenti
         expect(Object.hasOwn(options.env, "NODE_OPTIONS")).toBe(false);
         expect(options.env.OMG_NODE_TEST_FIXTURE).toBe("/opt/omg-node-test-fixture/node");
         expect(options.env.PYTHONPATH).toBe("/workspace");
+        expect(options.env.SSL_CERT_FILE).toBe("/etc/ssl/certs/ca-certificates.crt");
         expect(options.env).toMatchObject({
             GIT_CONFIG_NOSYSTEM: "1",
             GIT_CONFIG_GLOBAL: "/dev/null",
