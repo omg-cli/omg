@@ -1,4 +1,4 @@
-FROM registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci-base@sha256:21eb35d60826d1183e60e9220e6db58dffd1472762c32e8c57c998ea6f24609c
+FROM registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci-base@sha256:449a09c7fcb6daac581d5c98dd9d245372a16998be1d7de001f6b87eed4d0df6
 USER root
 RUN command -v ip && setpriv --reuid=10001 --regid=10001 --clear-groups ip -statistics -statistics link > /tmp/ip-statistics && grep -q 'RX:' /tmp/ip-statistics && rm /tmp/ip-statistics
 COPY scripts/test_qemu_boot_diagnostics.py scripts/qemu-boot-diagnostics.sh scripts/benchmark-qemu.sh scripts/test_qemu_cloud_init_ready.py scripts/check-qemu-cloud-init.sh /opt/omg-ci-image-prerequisites/scripts/
