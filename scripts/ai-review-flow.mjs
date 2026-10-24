@@ -25,7 +25,8 @@ import {
     cloudCiPlanSha256,
     admitCloudCiRuntime,
 } from "./cloud-ci-evidence.mjs";
-import { expectedCloudChecks } from "../services/cloud-ci/runner/plan.mjs";
+import { expectedCloudChecks, expectedCloudReports } from "../services/cloud-ci/runner/plan.mjs";
+import { assertPortableTestMember } from "../services/cloud-ci/portable-report.mjs";
 import {
     SOURCE_REPOSITORY,
     sourceChanges,
@@ -95,6 +96,74 @@ export function admitSourceFormatting(receipt, expected, imageDigest) {
         throw new Error("Source format object identity mismatch.");
 
     return format;
+}
+
+export function admitPortableTestReceipt(receipt, expected, imageDigest) {
+    admitSourceFormatting(receipt, expected, imageDigest);
+    const request = parseCloudCiRequest(expected);
+    const id = `cl-${request.runId}-${request.attempt}-${request.sha}`;
+
+    if (
+        receipt.id !== id ||
+        !["success", "failure"].includes(receipt.conclusion) ||
+        Object.entries(request).some(([key, value]) => receipt[key] !== value)
+    )
+        throw new Error("Portable test evidence identity mismatch.");
+
+    if (!/^sha256:[a-f0-9]{64}$/.test(imageDigest ?? "") || receipt.imageDigest !== imageDigest)
+        throw new Error("Portable test evidence image mismatch.");
+
+    if (receipt.planSha256 !== cloudCiPlanSha256)
+        throw new Error("Portable test evidence plan mismatch.");
+
+    const portable = (Array.isArray(receipt.checks) ? receipt.checks : []).filter(
+        (check) => check?.name === "rust-portable-tests",
+    );
+
+    if (portable.length !== 1) throw new Error("Portable test check is missing or duplicated.");
+
+    const names = expectedCloudReports("rust-portable-tests");
+    const reports = Array.isArray(portable[0].reports) ? portable[0].reports : [];
+
+    if (
+        portable[0].exitCode !== 0 ||
+        reports.length !== names.length ||
+        new Set(reports.map((report) => report.name)).size !== names.length ||
+        names.some((name) => !reports.some((report) => report.name === name)) ||
+        reports.some((report) => report.key !== `reports/${id}/${report.name}`)
+    )
+        throw new Error("Portable test reports are missing or unexpected.");
+
+    return reports.find((report) => report.name === "rust-pgp-license-junit.xml");
+}
+
+export async function verifiedPortableReport(report, load) {
+    const response = await load(report.key);
+    if (!response.ok || !response.body)
+        throw new Error(`Portable test report is unavailable: ${report.key}.`);
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of response.body) {
+        size += chunk.byteLength;
+        if (size > 20_000_000) throw new Error("Portable test report exceeds its byte budget.");
+        chunks.push(chunk);
+    }
+    const bytes = Buffer.concat(chunks);
+    await verifyCloudCiObjects({ checks: [], verificationReports: [report] }, async () => new Response(bytes));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+export async function admitPortableAuditRow(row, formatting, io, imageDigest) {
+    if (formatting?.status !== "passed" || formatting.sha !== row.request.sha || formatting.ref !== "refs/heads/main")
+        throw new Error("Portable test baseline identity mismatch.");
+    const request = parseCloudCiRequest({repository: SOURCE_REPOSITORY, sha: row.request.sha,
+        ref: formatting.ref, runId: formatting.runId, attempt: formatting.attempt});
+    const id = `cl-${request.runId}-${request.attempt}-${request.sha}`;
+    const receipt = await io.receipt(id);
+    const report = admitPortableTestReceipt(receipt, request, imageDigest);
+    const xml = await verifiedPortableReport(report, key => io.report(id, key));
+    const suite = row.task.target === "lib" ? "omg" : `omg::${path.basename(row.task.path, ".rs")}`;
+    return assertPortableTestMember(xml, suite, row.task.testName);
 }
 
 export async function admitFormattingRun({
@@ -1222,6 +1291,12 @@ async function createController(github, controllerRevision, transition) {
         },
         review: (input) => fetchJson(endpoint, inspectorToken, JSON.stringify(input), 128 * 1024),
         adapt: (input,review,candidateIndex) => code(input,review,candidateIndex),
+        portableTest: (row, formatting) => admitPortableAuditRow(row, formatting, {
+            receipt: id => fetchJson(new URL(`/runs/${id}/evidence`, config.endpoint), token, undefined, 2 * 1024 * 1024),
+            report: (id, key) => fetch(new URL(`/runs/${id}/reports/${key.split("/")[2]}`, config.endpoint), {
+                headers: { authorization: `Bearer ${token}` }, redirect: "error", signal: AbortSignal.timeout(30000),
+            }),
+        }, policy.imageDigest),
         audit: async (row) => {
             const adapted=await code(row.request.source,undefined,undefined,row.task);
             if(!adapted)return null;
