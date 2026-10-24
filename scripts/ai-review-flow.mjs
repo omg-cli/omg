@@ -20,6 +20,7 @@ import { proposalDigest, publishAiReview, sha256, canonicalJson } from "./ai-rev
 import { ciPolicy, verifyPublicationProof } from "./ai-review-proof.mjs";
 import { createGhClient } from "./publish-ai-review.mjs";
 import {
+    CloudCiEngineFailure,
     verifyCloudCiObjects,
     parseCloudCiRequest,
     cloudCiPlanSha256,
@@ -71,6 +72,13 @@ export function admitSourceFormatting(receipt, expected, imageDigest) {
     )
         throw new Error("Source format evidence inventory is invalid.");
     const format = receipt.checks.find((check) => check.name === "source-format");
+
+    if (
+        !format &&
+        receipt.conclusion === "failure" &&
+        receipt.failureCategory === "workflow-internal-error"
+    )
+        throw new CloudCiEngineFailure("workflow-internal-error");
     const hash = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
 
     if (
@@ -120,7 +128,15 @@ export function admitPortableTestReceipt(receipt, expected, imageDigest) {
         (check) => check?.name === "rust-portable-tests",
     );
 
-    if (portable.length !== 1) throw new Error("Portable test check is missing or duplicated.");
+    if (portable.length !== 1) {
+        if (
+            portable.length === 0 &&
+            receipt.conclusion === "failure" &&
+            receipt.failureCategory === "workflow-internal-error"
+        )
+            throw new CloudCiEngineFailure("workflow-internal-error");
+        throw new Error("Portable test check is missing or duplicated.");
+    }
 
     const names = expectedCloudReports("rust-portable-tests");
     const reports = Array.isArray(portable[0].reports) ? portable[0].reports : [];
@@ -174,6 +190,7 @@ export async function admitFormattingRun({
     attempt,
     imageDigest,
     priorImageDigest,
+    requirePortableEvidence = false,
     fetchReceipt,
     startRun,
     verifyLogs,
@@ -232,16 +249,28 @@ export async function admitFormattingRun({
 
         if (prior.imageDigest === imageDigest) {
             const format = await admit(prior, upstreamRequest, imageDigest);
-            return passed(prior, format);
+
+            if (!requirePortableEvidence) return passed(prior, format);
+
+            try {
+                admitPortableTestReceipt(prior, upstreamRequest, imageDigest);
+
+                return passed(prior, format);
+            } catch (error) {
+                if (!(error instanceof CloudCiEngineFailure)) throw error;
+
+                if (upstreamRequest.runId === currentRequest.runId && upstreamRequest.attempt === currentRequest.attempt)
+                    throw new Error("Formatting refresh cannot reuse its prior run identity.");
+            }
+        } else {
+            if (priorImageDigest === undefined || prior.imageDigest !== priorImageDigest)
+                throw new Error("Formatting prior evidence is not admitted.");
+
+            if (upstreamRequest.runId === currentRequest.runId && upstreamRequest.attempt === currentRequest.attempt)
+                throw new Error("Formatting refresh cannot reuse its prior run identity.");
+
+            await admit(prior, upstreamRequest, priorImageDigest);
         }
-
-        if (priorImageDigest === undefined || prior.imageDigest !== priorImageDigest)
-            throw new Error("Formatting prior evidence is not admitted.");
-
-        if (upstreamRequest.runId === currentRequest.runId && upstreamRequest.attempt === currentRequest.attempt)
-            throw new Error("Formatting refresh cannot reuse its prior run identity.");
-
-        await admit(prior, upstreamRequest, priorImageDigest);
     }
 
     await startRun(currentRequest);
@@ -526,7 +555,7 @@ export async function runReviewFlow({ target, io }) {
             coverageMeaning: "No model inference or native verification was started because no source was admitted.",
         };
     }
-    const formatting = await io.format(sha, branch, target.upstream);
+    const formatting = await io.format(sha, branch, target.upstream, target.range?.kind === "test-audit");
 
     if (formatting.status !== "passed")
         return {
@@ -1210,7 +1239,7 @@ async function createController(github, controllerRevision, transition) {
     return {
         head,
         controllerRevision,
-        format: async (sha, branch, upstream) => {
+        format: async (sha, branch, upstream, requirePortableEvidence = false) => {
             const request = parseCloudCiRequest({
                 repository: SOURCE_REPOSITORY,
                 sha,
@@ -1234,6 +1263,7 @@ async function createController(github, controllerRevision, transition) {
                     })
                         ? transition.priorImageDigest
                         : undefined,
+                    requirePortableEvidence,
                     fetchReceipt: (id) =>
                         fetchJson(new URL(`/runs/${id}/evidence`, config.endpoint), token),
                     startRun: async (startRequest) => {
@@ -1284,7 +1314,8 @@ async function createController(github, controllerRevision, transition) {
                         );
                     },
                 });
-            } catch {
+            } catch (error) {
+                if (error instanceof CloudCiEngineFailure) throw error;
                 return {
                     status: "blocked",
                     reason: "source-format-evidence-unavailable-or-rejected",
