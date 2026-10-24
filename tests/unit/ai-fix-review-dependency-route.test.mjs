@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { reviewAiFix, dependencyRepairPublication } from "../../scripts/ai-fix-review.mjs";
+import { dependencyExecutedEvidence } from "../../scripts/cloud-dependency-repair.mjs";
 
-function dependencyFixture() {
+const legacyExecuted = "Executed: real baseline audit failure, patched audit with zero findings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks. Only Cargo.lock changes.";
+
+function dependencyFixture(executed = legacyExecuted) {
     const base = "38f9a30d7d246cd1dcfc8d6dd266259acad24082";
     const head = "9555dc49ca7a0fbdf32dc912ca75a626a8a8dad7";
     const plan = "f4b8ccbd88316f861bb0c287a2f342629c6197e0cb529c4b17ab045613ac1952";
@@ -19,7 +22,7 @@ function dependencyFixture() {
             "Advisory database: f7b2f6bc663452200bbe639ebb75e0c762b3422b",
             `Plan SHA256: ${plan}`,
             "",
-            "Executed: real baseline audit failure, patched audit with zero findings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks. Only Cargo.lock changes. Native, QEMU, coverage and all normal PR checks still must pass. This dependency proof is not Rust test sensitivity credit. Human review and merge remain required.",
+            `${executed} Native, QEMU, coverage and all normal PR checks still must pass. This dependency proof is not Rust test sensitivity credit. Human review and merge remain required.`,
         ].join("\n"),
         base: { ref: "main", sha: base, repo: { full_name: "omg-cli/omg" } },
         head: { ref: `ai/dependencies-${base.slice(0, 12)}-${plan.slice(0, 12)}`, sha: head, repo: { full_name: "omg-cli/omg" } },
@@ -80,6 +83,47 @@ for (const [name, mutate] of [
 ]) test(`dependency lookalike ${name} still rejects without approval or write`, async () => {
     const input = dependencyFixture();
     mutate(input.pull);
+    await assert.rejects(reviewAiFix(input));
+    assert.equal(input.state.posts.length, 0);
+    assert.equal(input.state.saved.length, 0);
+});
+
+test("actual producer wording from the dependency verifier routes to explicit unsupported without approval", async () => {
+    const input = dependencyFixture(dependencyExecutedEvidence);
+    assert.equal(dependencyRepairPublication(input.pull, input.publisher, input.expectedHead), true);
+    const result = await reviewAiFix(input);
+    assert.deepEqual(result, {
+        action: "unsupported",
+        publication: "dependency-lock-repair",
+        number: 983,
+        headSha: input.expectedHead,
+        reason: "Dependency lock repair uses its separate verified audit evidence contract; this lane records no approval. Human review and merge remain required.",
+    });
+    assert.deepEqual(input.state.routes, ["/repos/omg-cli/omg/pulls/983"]);
+    assert.equal(input.state.posts.length, 0);
+    assert.equal(input.state.saved.length, 0);
+});
+
+test("legacy and current producer wording are the only accepted dependency contracts", () => {
+    const legacy = dependencyFixture();
+    assert.equal(dependencyRepairPublication(legacy.pull, legacy.publisher, legacy.expectedHead), true);
+    const current = dependencyFixture(dependencyExecutedEvidence);
+    assert.equal(dependencyRepairPublication(current.pull, current.publisher, current.expectedHead), true);
+    for (const executed of [
+        dependencyExecutedEvidence.replace("patched audit with zero vulnerabilities", "patched audit with no vulnerabilities"),
+        dependencyExecutedEvidence.replace("Only Cargo.lock changes.", "Only Cargo.lock change."),
+    ]) {
+        const forged = dependencyFixture(executed);
+        assert.equal(dependencyRepairPublication(forged.pull, forged.publisher, forged.expectedHead), false);
+    }
+    const forgedDatabase = dependencyFixture(dependencyExecutedEvidence);
+    forgedDatabase.pull.body = forgedDatabase.pull.body.replace(/^Advisory database: .*$/m, "Advisory database: not-a-database");
+    assert.equal(dependencyRepairPublication(forgedDatabase.pull, forgedDatabase.publisher, forgedDatabase.expectedHead), false);
+});
+
+test("forged current-wording dependency lookalike is rejected by the generic lane without approval or write", async () => {
+    const input = dependencyFixture(dependencyExecutedEvidence);
+    input.pull.user = { login: "attacker", id: 1 };
     await assert.rejects(reviewAiFix(input));
     assert.equal(input.state.posts.length, 0);
     assert.equal(input.state.saved.length, 0);

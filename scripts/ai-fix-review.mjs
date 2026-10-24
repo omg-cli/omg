@@ -20,7 +20,7 @@ const dependencyEvidence = [
     /^Cloud operation: [A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/m,
     /^Advisory database: [a-f0-9]{40}$/m,
     /^Evidence: https:\/\/github\.com\/omg-cli\/omg\/actions\/runs\/[1-9][0-9]{0,19}$/m,
-    /^Executed: real baseline audit failure, patched audit with zero findings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks\. Only Cargo\.lock changes\./m,
+    /^(?:Executed: real baseline audit failure, patched audit with zero findings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks\. Only Cargo\.lock changes\.|Executed: observed actionable findings cleared after patch, patched audit with zero vulnerabilities and zero actionable warnings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks\. Only Cargo\.lock changes\.)/m,
 ];
 
 export function dependencyRepairPublication(pull, publisher, expectedHead) {

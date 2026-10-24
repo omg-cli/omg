@@ -75,15 +75,40 @@ export class CiSandbox extends NativeCiSandbox {
 
     return this.trace("configure", () => super.configure(configuration));
   }
+  private async persistRunnerMetadata(env: {
+    OMG_DIAGNOSTIC_RUN_ID?: string;
+    OMG_REPORT_RUN_ID?: string;
+    OMG_CI_LEAF_STEP?: string;
+  } | undefined) {
+    const diagnosticRunId = env?.OMG_DIAGNOSTIC_RUN_ID;
+    const reportRunId =
+      env?.OMG_CI_LEAF_STEP === "rust-portable-tests"
+        ? env?.OMG_REPORT_RUN_ID ??
+          (diagnosticRunId && runIdPattern.test(diagnosticRunId) ? diagnosticRunId : undefined)
+        : undefined;
+    await this.ctx.storage.put<RunnerMetadata>(metadataKey, {
+      reportRunId,
+      leafStep: env?.OMG_CI_LEAF_STEP,
+      diagnosticRunId,
+    });
+  }
   override exec(...args: Parameters<NativeCiSandbox["exec"]>) {
     const phase =
       args[0] === "test -c /dev/fuse"
         ? "preflight"
         : args[0].startsWith("tail -c ")
           ? "log-read"
-          : "checkout";
+          : args[1]?.env?.OMG_CI_LEAF_STEP
+            ? "process-start"
+            : "checkout";
 
     return this.trace(phase, async () => {
+      if (phase === "process-start") {
+        this.assertStartAllowed();
+        await this.persistRunnerMetadata(args[1]?.env);
+        this.assertStartAllowed();
+      }
+
       const result = await super.exec(...args);
 
       if (phase === "preflight") {
@@ -100,9 +125,17 @@ export class CiSandbox extends NativeCiSandbox {
         ? "preflight"
         : args[0].startsWith("tail -c ")
           ? "log-read"
-          : "checkout";
+          : args[2]?.env?.OMG_CI_LEAF_STEP
+            ? "process-start"
+            : "checkout";
 
     return this.trace(phase, async () => {
+      if (phase === "process-start") {
+        this.assertStartAllowed();
+        await this.persistRunnerMetadata(args[2]?.env);
+        this.assertStartAllowed();
+      }
+
       const result = await super.execWithSessionToken(...args);
 
       if (phase === "preflight") {
@@ -128,21 +161,10 @@ export class CiSandbox extends NativeCiSandbox {
     });
   }
   override startProcess(...args: Parameters<NativeCiSandbox["startProcess"]>) {
-    const env = args[1]?.env;
     this.assertStartAllowed();
     return this.trace("process-start", async () => {
       this.assertStartAllowed();
-      const diagnosticRunId = env?.OMG_DIAGNOSTIC_RUN_ID;
-      const reportRunId =
-        env?.OMG_CI_LEAF_STEP === "rust-portable-tests"
-          ? env?.OMG_REPORT_RUN_ID ??
-            (diagnosticRunId && runIdPattern.test(diagnosticRunId) ? diagnosticRunId : undefined)
-          : undefined;
-      await this.ctx.storage.put<RunnerMetadata>(metadataKey, {
-        reportRunId,
-        leafStep: env?.OMG_CI_LEAF_STEP,
-        diagnosticRunId,
-      });
+      await this.persistRunnerMetadata(args[1]?.env);
       this.assertStartAllowed();
       return super.startProcess(...args);
     });

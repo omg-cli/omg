@@ -1,185 +1,212 @@
 diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
-index 9603fd2ff9548c4640fa202aa951ca4fc8256cb0..805a7197614a9206619845e994e567850cbe41dd 100644
 --- a/src/ci/capabilities.ts
 +++ b/src/ci/capabilities.ts
-@@ -191,6 +191,7 @@ async function executeStep(
-   return {
-     exitCode: result.exitCode,
-     logs: result.logs,
+@@ -191,6 +191,7 @@
+-  return {
+-    exitCode: result.exitCode,
+-    logs: result.logs,
+-    preview: result.preview,
+-    snapshot: result.snapshot,
+-    cacheHit: false,
++  return {
++    exitCode: result.exitCode,
++    logs: result.logs,
 +    logSizes: result.logSizes,
-     preview: result.preview,
-     snapshot: result.snapshot,
-     cacheHit: false,
++    preview: result.preview,
++    snapshot: result.snapshot,
++    cacheHit: false,
 diff --git a/src/ci/runners/runner.ts b/src/ci/runners/runner.ts
-index aa6068d5ab399caf3f018e5c7c4a691da57931a7..117060dd04b5f72ec259d7aeecd4b374ecbef775 100644
 --- a/src/ci/runners/runner.ts
 +++ b/src/ci/runners/runner.ts
 @@ -1,3 +1,4 @@
+-// Copyright (c) 2026 Cloudflare, Inc.
+-// SPDX-License-Identifier: Apache-2.0
+-
 +import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
- // Copyright (c) 2026 Cloudflare, Inc.
- // SPDX-License-Identifier: Apache-2.0
-
-@@ -21,6 +22,7 @@ export type RunOutput = {
-     stderr: string | ReadableStream<Uint8Array>;
-   };
-   preview: { stdout: string; stderr: string };
++// Copyright (c) 2026 Cloudflare, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
+@@ -21,6 +22,7 @@
+-    stderr: string | ReadableStream<Uint8Array>;
+-  };
+-  preview: { stdout: string; stderr: string };
+-};
+-
+-export type RunStepResult<S> = RunOutput & {
++    stderr: string | ReadableStream<Uint8Array>;
++  };
++  preview: { stdout: string; stderr: string };
 +  logSizes?: { stdout: number; stderr: number };
- };
-
- export type RunStepResult<S> = RunOutput & {
++};
++
++export type RunStepResult<S> = RunOutput & {
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
-index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d81e765fc 100644
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
-@@ -1,3 +1,7 @@
+@@ -1,3 +1,6 @@
+-// Copyright (c) 2026 Cloudflare, Inc.
+-// SPDX-License-Identifier: Apache-2.0
+-
 +import type * as Workers from "@cloudflare/workers-types/index.ts";
-+import { OperationInterruptedError } from "@cloudflare/sandbox";
 +type ReadableStream<R> = Workers.ReadableStream<R>;
 +declare const ReadableStream: typeof Workers.ReadableStream;
- // Copyright (c) 2026 Cloudflare, Inc.
- // SPDX-License-Identifier: Apache-2.0
-
-@@ -86,8 +90,17 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
-           autoCleanup: false,
-         }
-       );
++// Copyright (c) 2026 Cloudflare, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
+@@ -75,20 +78,39 @@
+-        });
+-      }
+-
+-      const proc = await sandbox.startProcess(
+-        `(${input.command}) > ${STDOUT_FILE} 2> ${STDERR_FILE}`,
+-        {
+-          cwd: resolveCwd(input.cwd),
+-          env: {
+-            CI: 'true',
+-            ...input.extraEnv,
+-          },
+-          autoCleanup: false,
+-        }
+-      );
 -      const { exitCode } = await proc.waitForExit(
 -        input.timeoutMs ?? COMMAND_TIMEOUT_MS
-+      let processId: string;
-+      try {
-+        processId = proc.id;
-+      } finally {
-+        if (Symbol.dispose in proc) {
-+          const dispose = proc[Symbol.dispose];
-+          if (typeof dispose === 'function') dispose.call(proc);
-+        }
+-      );
+-      const preview = await readPreviews(sandbox);
+-
+-      if (exitCode !== 0) {
++        });
 +      }
-+      const exitCode = await waitForProcessExit(
-+        sandbox, processId, input.timeoutMs ?? COMMAND_TIMEOUT_MS
-       );
-       const preview = await readPreviews(sandbox);
-
-@@ -102,13 +115,13 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
-         ttl: input.ttlSeconds,
-         localBucket,
-       });
--      const rawLogs = await readLogs(sandbox);
-+      const { logs: rawLogs, sizes: logSizes } = await readLogs(sandbox);
-       const streams = [rawLogs.stdout, rawLogs.stderr].filter(
-         (value): value is ReadableStream<Uint8Array> =>
-           typeof value !== 'string'
-       );
-       if (streams.length === 0) {
--        return { exitCode, logs: rawLogs, preview, snapshot };
-+        return { exitCode, logs: rawLogs, logSizes, preview, snapshot };
-       }
-
-       let remainingStreams = streams.length;
-@@ -133,6 +146,7 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
-         },
-         preview,
-         snapshot,
-+        logSizes,
-       };
-     } finally {
-       if (!cleanupTransferredToStreams) {
-@@ -142,14 +156,81 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
-   }
- }
-
-+async function waitForProcessExit(
-+  sandbox: ReturnType<typeof getSandbox>,
-+  id: string,
-+  timeoutMs: number,
-+): Promise<number> {
-+  const deadline = Date.now() + timeoutMs;
-+  let polls = 0;
-+  let missing = 0;
-+  let lastStatus = 'unobserved';
-+  const timedOut = () => new Error(`CI process completion timed out (polls=${polls}, missing=${missing}, lastStatus=${lastStatus})`);
-+  const retryLimit = 2;
-+  for (;;) {
-+    let process: { id: string; status: string; exitCode: number | null | undefined } | null = null;
-+    for (let attempt = 0; ; attempt++) {
-+      const remaining = deadline - Date.now();
-+      if (remaining <= 0) throw timedOut();
++
++      const timeoutMs = input.timeoutMs ?? COMMAND_TIMEOUT_MS;
++      const deadline = Date.now() + timeoutMs;
++      const timedOut = () => new Error('CI command completion timed out');
 +      let timer: ReturnType<typeof setTimeout> | undefined;
-+      polls++;
++      let result: Awaited<ReturnType<typeof sandbox.exec>>;
 +      try {
-+        process = await Promise.race([
-+          sandbox.getProcess(id).then(process => {
-+            try {
-+              return process ? { id: process.id, status: process.status, exitCode: process.exitCode } : null;
-+            } finally {
-+              if (process && Symbol.dispose in process) {
-+                const dispose = process[Symbol.dispose];
-+                if (typeof dispose === 'function') dispose.call(process);
-+              }
++        result = await Promise.race([
++          sandbox.exec(
++            `(${input.command}) > ${STDOUT_FILE} 2> ${STDERR_FILE}`,
++            {
++              cwd: resolveCwd(input.cwd),
++              timeout: timeoutMs,
++              env: {
++                CI: 'true',
++                ...input.extraEnv,
++              },
 +            }
-+          }),
++          ),
 +          new Promise<never>((_, reject) => {
-+            timer = setTimeout(() => reject(timedOut()), remaining);
++            timer = setTimeout(() => reject(timedOut()), timeoutMs);
 +          }),
-+        ]).finally(() => clearTimeout(timer));
-+        break;
-+      } catch (error) {
-+        if (!(error instanceof OperationInterruptedError) || error.context.retryable !== true || attempt >= retryLimit) {
-+          throw error;
-+        }
++        ]);
++        if (Date.now() > deadline) throw timedOut();
++      } finally {
++        clearTimeout(timer);
 +      }
-+    }
-+    if (Date.now() > deadline) throw timedOut();
-+    if (process) {
-+      if (process.id !== id) throw new Error(`CI process identity unavailable (expected ${typeof id}, received ${typeof process.id})`);
-+      const { status, exitCode } = process;
-+      lastStatus = ['starting', 'running', 'completed', 'failed', 'killed', 'error'].includes(status) ? status : 'invalid';
-+      if (status !== 'starting' && status !== 'running') {
-+        if (!['completed', 'failed', 'killed', 'error'].includes(status)) {
-+          throw new Error('CI process returned an unknown state');
-+        }
-+        if (typeof exitCode !== 'number' || !Number.isSafeInteger(exitCode) || exitCode < 0 ||
-+            (exitCode === 0 && status !== 'completed')) {
-+          throw new Error('CI process terminal exit code unavailable');
-+        }
-+        return exitCode;
++      const exitCode = result.exitCode;
++      if (typeof exitCode !== 'number' || !Number.isSafeInteger(exitCode) || exitCode < 0) {
++        throw new Error('CI command terminal exit code unavailable');
 +      }
-+    } else {
-+      missing++;
-+      lastStatus = 'missing';
++      if (result.success !== (exitCode === 0)) {
++        throw new Error('Inconsistent command completion');
++      }
++      const preview = await readPreviews(sandbox);
++
++      if (exitCode !== 0) {
+@@ -102,13 +124,13 @@
+-        ttl: input.ttlSeconds,
+-        localBucket,
+-      });
+-      const rawLogs = await readLogs(sandbox);
+-      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
+-        (value): value is ReadableStream<Uint8Array> =>
+-          typeof value !== 'string'
+-      );
+-      if (streams.length === 0) {
+-        return { exitCode, logs: rawLogs, preview, snapshot };
+-      }
+-
+-      let remainingStreams = streams.length;
++        ttl: input.ttlSeconds,
++        localBucket,
++      });
++      const { logs: rawLogs, sizes: logSizes } = await readLogs(sandbox);
++      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
++        (value): value is ReadableStream<Uint8Array> =>
++          typeof value !== 'string'
++      );
++      if (streams.length === 0) {
++        return { exitCode, logs: rawLogs, logSizes, preview, snapshot };
++      }
++
++      let remainingStreams = streams.length;
+@@ -133,6 +155,7 @@
+-        },
+-        preview,
+-        snapshot,
+-      };
+-    } finally {
+-      if (!cleanupTransferredToStreams) {
++        },
++        preview,
++        snapshot,
++        logSizes,
++      };
++    } finally {
++      if (!cleanupTransferredToStreams) {
+@@ -141,6 +164,7 @@
+-    }
+-  }
+-}
+-
+-async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
+-  const listing = await sandbox.listFiles('/tmp');
 +    }
-+    await new Promise(resolve => setTimeout(resolve, Math.min(1000, Math.max(0, deadline - Date.now()))));
 +  }
 +}
 +
- async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
-   const listing = await sandbox.listFiles('/tmp');
-   const sizes = new Map(
-     listing.files.map((file) => [file.absolutePath, file.size])
-   );
-   return {
++
++async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
++  const listing = await sandbox.listFiles('/tmp');
+@@ -148,8 +172,11 @@
+-    listing.files.map((file) => [file.absolutePath, file.size])
+-  );
+-  return {
 -    stdout: await readLog(sandbox, STDOUT_FILE, sizes.get(STDOUT_FILE) ?? 0),
 -    stderr: await readLog(sandbox, STDERR_FILE, sizes.get(STDERR_FILE) ?? 0),
+-  };
+-}
+-
++    listing.files.map((file) => [file.absolutePath, file.size])
++  );
++  return {
 +    logs: {
 +      stdout: await readLog(sandbox, STDOUT_FILE, sizes.get(STDOUT_FILE) ?? 0),
 +      stderr: await readLog(sandbox, STDERR_FILE, sizes.get(STDERR_FILE) ?? 0),
 +    },
 +    sizes: { stdout: sizes.get(STDOUT_FILE) ?? 0, stderr: sizes.get(STDERR_FILE) ?? 0 },
-   };
- }
-
-@@ -159,7 +240,7 @@ async function readLog(
-   size: number
- ): Promise<string | ReadableStream<Uint8Array>> {
-   if (size > INLINE_LOG_BYTES) {
++  };
++}
++
+@@ -159,7 +186,7 @@
+-  size: number
+-): Promise<string | ReadableStream<Uint8Array>> {
+-  if (size > INLINE_LOG_BYTES) {
 -    return sandbox.readFileStream(file);
+-  }
+-  return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
+-}
++  size: number
++): Promise<string | ReadableStream<Uint8Array>> {
++  if (size > INLINE_LOG_BYTES) {
 +    return (await sandbox.readFile(file, { encoding: 'none' })).content;
-   }
-   return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
- }
-@@ -203,26 +284,21 @@ function withCleanup(
-   release: () => Promise<void>
- ) {
-   const reader = stream.getReader();
++  }
++  return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
++}
+@@ -203,26 +230,21 @@
+-  release: () => Promise<void>
+-) {
+-  const reader = stream.getReader();
 -  let released = false;
 -  const releaseOnce = async () => {
 -    if (!released) {
@@ -187,77 +214,127 @@ index 4fb4a42354cdc9fbc18c930b0f3396c7a979d036..303f55f49a8a710e16733fced4972d9d
 -      await release();
 -    }
 -  };
+-  return new ReadableStream<Uint8Array>({
+-    async pull(controller) {
+-      try {
+-        const result = await reader.read();
+-        if (result.done) {
+-          controller.close();
+-          await releaseOnce();
+-        } else {
+-          controller.enqueue(result.value);
+-        }
+-      } catch (error) {
+-        controller.error(error);
+-        await releaseOnce();
+-      }
+-    },
+-    async cancel(reason) {
++  release: () => Promise<void>
++) {
++  const reader = stream.getReader();
 +  let releasePromise: Promise<void> | undefined;
 +  const releaseOnce = () => (releasePromise ??= release());
-   return new ReadableStream<Uint8Array>({
-     async pull(controller) {
-       try {
-         const result = await reader.read();
-         if (result.done) {
--          controller.close();
-           await releaseOnce();
++  return new ReadableStream<Uint8Array>({
++    async pull(controller) {
++      try {
++        const result = await reader.read();
++        if (result.done) {
++          await releaseOnce();
 +          controller.close();
-         } else {
-           controller.enqueue(result.value);
-         }
-       } catch (error) {
--        controller.error(error);
-         await releaseOnce();
++        } else {
++          controller.enqueue(result.value);
++        }
++      } catch (error) {
++        await releaseOnce();
 +        controller.error(error);
-       }
-     },
-     async cancel(reason) {
++      }
++    },
++    async cancel(reason) {
 diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
-index 2d70c69e664aa3083fec8346bd51ca2d41101cdc..56dfa0e52e8ace474e1838fff56987018730d9f1 100644
 --- a/src/ci/step-notification.ts
 +++ b/src/ci/step-notification.ts
-@@ -13,6 +13,7 @@ export type StepExecution = {
-   exitCode: number;
-   logs: CiRunnerLogs;
-   preview: { stdout: string; stderr: string };
+@@ -13,6 +13,7 @@
+-  exitCode: number;
+-  logs: CiRunnerLogs;
+-  preview: { stdout: string; stderr: string };
+-  // The restorable workspace backup (always produced on success), kept separate
+-  // from the cache pointer below: `snapshot` is the thing you restore,
+-  // `cachePointer` is only bookkeeping for the deterministic cache indirection.
++  exitCode: number;
++  logs: CiRunnerLogs;
++  preview: { stdout: string; stderr: string };
 +  logSizes?: { stdout: number; stderr: number };
-   // The restorable workspace backup (always produced on success), kept separate
-   // from the cache pointer below: `snapshot` is the thing you restore,
-   // `cachePointer` is only bookkeeping for the deterministic cache indirection.
-@@ -75,6 +76,7 @@ export async function withStepNotification(
-     return {
-       exitCode: completed.exitCode,
-       logs: completed.logs,
++  // The restorable workspace backup (always produced on success), kept separate
++  // from the cache pointer below: `snapshot` is the thing you restore,
++  // `cachePointer` is only bookkeeping for the deterministic cache indirection.
+@@ -75,6 +76,7 @@
+-    return {
+-      exitCode: completed.exitCode,
+-      logs: completed.logs,
+-      snapshot: completed.snapshot,
+-      cachePointer: completed.cachePointer,
+-    };
++    return {
++      exitCode: completed.exitCode,
++      logs: completed.logs,
 +      logSizes: completed.logSizes,
-       snapshot: completed.snapshot,
-       cachePointer: completed.cachePointer,
-     };
++      snapshot: completed.snapshot,
++      cachePointer: completed.cachePointer,
++    };
 diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
-index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a548874c2402f 100644
 --- a/src/pipeline/ci-workflow.ts
 +++ b/src/pipeline/ci-workflow.ts
-@@ -25,6 +25,7 @@ import {
- import type { Bindings } from '../env';
- import { runCiStep } from '../ci/capabilities';
- import { RunnerGroup } from './runner-group';
+@@ -25,6 +25,7 @@
+-import type { Bindings } from '../env';
+-import { runCiStep } from '../ci/capabilities';
+-import { RunnerGroup } from './runner-group';
+-
+-const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
+-const DEFAULT_STEP_CONFIG = {
++import type { Bindings } from '../env';
++import { runCiStep } from '../ci/capabilities';
++import { RunnerGroup } from './runner-group';
 +import { persistLogs, restoreLogs } from './persisted-logs';
-
- const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
- const DEFAULT_STEP_CONFIG = {
-@@ -145,8 +146,8 @@ export abstract class CIWorkflow<
-       runners.run(options, inherited, () => {
-         const config = resolveRunnerConfig(options);
-         return step
++
++const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
++const DEFAULT_STEP_CONFIG = {
+@@ -145,8 +146,8 @@
+-      runners.run(options, inherited, () => {
+-        const config = resolveRunnerConfig(options);
+-        return step
 -          .do(options.name, config.workflow, (ctx) =>
 -            runCiStep(this.env, provider, {
+-              ...runContext,
+-              label: options.name,
+-              attempt: ctx.attempt,
++      runners.run(options, inherited, () => {
++        const config = resolveRunnerConfig(options);
++        return step
 +          .do(options.name, config.workflow, async (ctx) => {
 +            const output = await runCiStep(this.env, provider, {
-               ...runContext,
-               label: options.name,
-               attempt: ctx.attempt,
-@@ -160,15 +161,33 @@ export abstract class CIWorkflow<
-               cachePaths: options.cache?.inputs,
-               env: options.env,
-               secrets: options.secrets,
++              ...runContext,
++              label: options.name,
++              attempt: ctx.attempt,
+@@ -160,15 +161,33 @@
+-              cachePaths: options.cache?.inputs,
+-              env: options.env,
+-              secrets: options.secrets,
 -            })
 -          )
 -          .then((output) =>
 -            Object.freeze({
+-              ...output,
+-              runner: (nextOptions: RunnerOptions) =>
+-                invoke(nextOptions, output.snapshot),
+-            })
+-          );
+-      });
+-
+-    // CI ctx object
++              cachePaths: options.cache?.inputs,
++              env: options.env,
++              secrets: options.secrets,
 +            });
 +            const stored = await persistLogs(
 +              this.env.BACKUP_BUCKET,
@@ -280,19 +357,16 @@ index a0ac164d44c2caace0a209652d181b013a2138e9..5fe452466de7166bbd21eef8c97a5488
 +          .then(async (stored) => {
 +            const output = await restoreLogs(this.env.BACKUP_BUCKET, stored);
 +            return Object.freeze({
-               ...output,
-               runner: (nextOptions: RunnerOptions) =>
-                 invoke(nextOptions, output.snapshot),
--            })
--          );
++              ...output,
++              runner: (nextOptions: RunnerOptions) =>
++                invoke(nextOptions, output.snapshot),
 +            });
 +          });
-       });
-
-     // CI ctx object
-diff --git a/node_modules/@cloudflare/ci/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
++      });
++
++    // CI ctx object
+diff --git a/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..b1d457fb27d03f19c024702588041d05160f60c7
 --- /dev/null
 +++ b/src/pipeline/persisted-logs.ts
 @@ -0,0 +1,87 @@
@@ -384,19 +458,27 @@ index 0000000000000000000000000000000000000000..b1d457fb27d03f19c024702588041d05
 +  return object.body;
 +}
 diff --git a/src/pipeline/types.ts b/src/pipeline/types.ts
-index a1f5ff3aa8c30350300f3bd8d1f25cbc850aff65..1dff7079eca079ff2d96b9309e1ffd93826b6b16 100644
 --- a/src/pipeline/types.ts
 +++ b/src/pipeline/types.ts
 @@ -1,3 +1,4 @@
+-// Copyright (c) 2026 Cloudflare, Inc.
+-// SPDX-License-Identifier: Apache-2.0
+-
 +import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
- // Copyright (c) 2026 Cloudflare, Inc.
- // SPDX-License-Identifier: Apache-2.0
-
-@@ -136,6 +137,7 @@ export type CiRunStepInput = {
- };
-
- export type CiRunStepOutput = {
++// Copyright (c) 2026 Cloudflare, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
+@@ -136,6 +137,7 @@
+-};
+-
+-export type CiRunStepOutput = {
+-  exitCode: number;
+-  logs: CiRunnerLogs;
+-  // The workspace backup the sandbox writes after every successful runner. The
++};
++
++export type CiRunStepOutput = {
 +  logSizes?: { stdout: number; stderr: number };
-   exitCode: number;
-   logs: CiRunnerLogs;
-   // The workspace backup the sandbox writes after every successful runner. The
++  exitCode: number;
++  logs: CiRunnerLogs;
++  // The workspace backup the sandbox writes after every successful runner. The

@@ -234,3 +234,17 @@ test('retention reads evidence after the durable fence and then destroys', async
   expect(keys).toContain(`diagnostics/runner-logs/${owner}/test-audit-four-state.stdout`);
   expect(keys).toContain(`diagnostics/runner-logs/${owner}/test-audit-four-state.stderr`);
 });
+
+for (const explicitSession of [false, true]) {
+  test(`finite leaf metadata is retained before execution, explicit session ${explicitSession}`, async () => {
+    const ctx = new Context();
+    const env = new EnvFixture();
+    const sandbox = make(ctx, env);
+    await ctx.settle();
+    const options = { env: { OMG_CI_LEAF_STEP: 'rust-portable-tests', OMG_REPORT_RUN_ID: id, OMG_DIAGNOSTIC_RUN_ID: id } };
+    if (explicitSession) await sandbox.execWithSessionToken('trusted command', 'session-1', options);
+    else await sandbox.exec('trusted command', options);
+    expect(ctx.storage.values.get(metadataKey)).toEqual({ reportRunId: id, diagnosticRunId: id, leafStep: 'rust-portable-tests' });
+    expect(sandbox.commands).toEqual(['trusted command']);
+  });
+}

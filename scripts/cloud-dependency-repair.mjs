@@ -20,6 +20,8 @@ const blob = (value) =>
         .digest("hex");
 const packages = (content) => Bun.TOML.parse(content).package;
 const dependencySections = ["dependencies", "dev-dependencies", "build-dependencies"];
+export const dependencyExecutedEvidence =
+    "Executed: observed actionable findings cleared after patch, patched audit with zero vulnerabilities and zero actionable warnings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks. Only Cargo.lock changes.";
 const stableVersion = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/;
 const comparator = /^(?:>=|<=|>|<|=)?\s*(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/;
 
@@ -161,6 +163,41 @@ export function auditHeld(report, manifest, ignored = new Set()) {
         if (active.length > 0) held.push({ kind, count: active.length });
     }
     return held;
+}
+
+function lockBlocks(text) {
+    const starts = [...text.matchAll(/^\[\[package\]\]$/gm)].map((match) => match.index);
+    return starts.map((start, index) => {
+        const end = starts[index + 1] ?? text.length;
+        const content = text.slice(start, end);
+        const entries = packages(content);
+        assert.equal(entries.length, 1, "Malformed Cargo.lock package block");
+        return { start, end, content, item: entries[0] };
+    });
+}
+
+export function restoreUnplannedLockEdges(original, updated, plan) {
+    const before = lockBlocks(original), after = lockBlocks(updated);
+    assert.equal(after.length, before.length, "Dependency graph expansion requires separate review");
+    const identity = (item) => json([item.name, item.version, item.source]);
+    const originals = new Map(before.map((block) => [identity(block.item), block]));
+    assert.equal(originals.size, before.length, "Duplicate original package identity");
+    assert.equal(new Set(after.map((block) => identity(block.item))).size, after.length, "Duplicate updated package identity");
+    const planned = new Set(plan.updates.map((update) => json([update.name, update.to, "registry+https://github.com/rust-lang/crates.io-index"])));
+    let restored = updated;
+    for (const block of after.toReversed()) {
+        if (planned.has(identity(block.item))) continue;
+        const old = originals.get(identity(block.item));
+        assert.ok(old, "Unplanned package identity or inventory changed");
+        assert.equal(block.item.checksum, old.item.checksum, "Unplanned package checksum changed");
+        const { dependencies: currentEdges, ...currentFields } = block.item;
+        const { dependencies: originalEdges, ...originalFields } = old.item;
+        assert.deepEqual(currentFields, originalFields, "Unplanned package fields changed");
+        if (json(currentEdges ?? []) === json(originalEdges ?? [])) continue;
+        // Restore unrelated edges before the unchanged gate and cargo metadata --locked validate the graph.
+        restored = restored.slice(0, block.start) + old.content + restored.slice(block.end);
+    }
+    return restored;
 }
 
 export function admitLockChange(original, updated, plan, index) {
@@ -475,10 +512,12 @@ async function verify(root) {
             command(["git", "diff", "--name-only"], source).stdout.trim(),
             "Cargo.lock",
         );
-        const updated = await readFile(path.join(source, "Cargo.lock"), "utf8"),
+        const produced = await readFile(path.join(source, "Cargo.lock"), "utf8"),
             original = sourceFiles.find(
                 (file) => file.path === "Cargo.lock",
             ).content;
+        const updated = restoreUnplannedLockEdges(original, produced, plan);
+        if (updated !== produced) await writeFile(path.join(source, "Cargo.lock"), updated, "utf8");
         admitLockChange(original, updated, plan, index);
         await save(root, "Cargo.lock", updated);
         await save(root, "Cargo.lock.before", original);
@@ -487,12 +526,14 @@ async function verify(root) {
                 "cargo",
                 "metadata",
                 "--locked",
-                "--no-deps",
                 "--format-version",
                 "1",
             ],
             source,
         );
+        const resolved = JSON.parse(metadata.stdout);
+        assert.ok(Array.isArray(resolved.resolve?.nodes) && resolved.resolve.nodes.length > 0, "Locked dependency graph must resolve");
+        assert.equal(await readFile(path.join(source, "Cargo.lock"), "utf8"), updated, "Graph verification must preserve the admitted lockfile");
         await save(root, "metadata.json", metadata.stdout);
         const patched = await audit(source, root, "patched", database, true);
         await save(root, "patched.json", patched);
@@ -679,7 +720,7 @@ async function publish(root) {
         `Cloud operation: ${receipt.id}`,
         `Advisory database: ${receipt.database}`,
         `Plan SHA256: ${receipt.planSha256}`,
-        "\nExecuted: observed actionable findings cleared after patch, patched audit with zero vulnerabilities and zero actionable warnings against the same database, cargo metadata --locked, and all existing cargo-deny policy checks. Only Cargo.lock changes. Native, QEMU, coverage and all normal PR checks still must pass. This dependency proof is not Rust test sensitivity credit. Human review and merge remain required.",
+        `\n${dependencyExecutedEvidence} Native, QEMU, coverage and all normal PR checks still must pass. This dependency proof is not Rust test sensitivity credit. Human review and merge remain required.`,
     ].join("\n");
     const pull = await github("POST", "/pulls", {
         title: "fix(deps): cloud-generated dependency audit repairs",
