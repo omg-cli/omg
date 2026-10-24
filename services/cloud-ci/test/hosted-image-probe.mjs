@@ -112,7 +112,10 @@ async function main() {
         const sha = revision.stdout.trim();
         const archive = spawnSync("git", ["archive", sha,
             "services/cloud-ci/runner", "services/cloud-ci/verifier.mjs", "services/cloud-ci/Dockerfile",
-            "scripts/rust-source-policy.mjs", "scripts/prepare-node-test-fixture.py"],
+            "scripts/rust-source-policy.mjs", "scripts/prepare-node-test-fixture.py",
+            "scripts/test_qemu_boot_diagnostics.py", "scripts/qemu-boot-diagnostics.sh",
+            "scripts/benchmark-qemu.sh", "scripts/test_qemu_cloud_init_ready.py",
+            "scripts/check-qemu-cloud-init.sh"],
             { cwd: repo, maxBuffer: 8 * 1024 * 1024 });
         if (archive.status !== 0) throw new Error("Image probe source archive failed");
         const extracted = spawnSync("tar", ["-x", "-C", context], { input: archive.stdout });
