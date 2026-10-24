@@ -571,6 +571,7 @@ mod tests {
         assert!(apt_cleanup_requests_unsupported_work(true, false, false));
         assert!(apt_cleanup_requests_unsupported_work(false, true, false));
         assert!(!apt_cleanup_requests_unsupported_work(false, false, false));
+        assert!(apt_cleanup_requests_unsupported_work(true, true, false));
     }
 
     #[test]
