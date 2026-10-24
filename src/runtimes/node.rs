@@ -670,13 +670,11 @@ async fn probe_node_with_signals(
             #[cfg(target_os = "macos")]
             {
                 match &observer_cleanup {
-                    Ok(()) => observe_node_probe_group_cleanup(
-                        group,
-                        &owned_leader,
-                        observation_end,
-                    )
-                    .await
-                    .context("Node.js probe descendant absence was not proven"),
+                    Ok(()) => {
+                        observe_node_probe_group_cleanup(group, &owned_leader, observation_end)
+                            .await
+                            .context("Node.js probe descendant absence was not proven")
+                    }
                     Err(error) => Err(anyhow::anyhow!(
                         "Node.js probe leader exit was not observed: {error:#}"
                     )),
