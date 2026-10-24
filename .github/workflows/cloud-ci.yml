@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: Run portable verification or a cloud-selected dependency repair
+        description: Run portable verification, dependency repair, or a bounded operator rollout lock
         type: choice
-        options: [portable, dependencies]
+        options: [portable, dependencies, rollout-lock]
         default: portable
   workflow_run:
     workflows: [Security Audit]
@@ -25,11 +25,33 @@ env:
   CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
 
 jobs:
+  rollout-lock:
+    name: Hold cloud admission groups for operator rollout
+    permissions: {}
+    if: >-
+      github.repository == 'omg-cli/omg' && github.ref_name == 'main' &&
+      github.event_name == 'workflow_dispatch' && inputs.task == 'rollout-lock'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 31
+    concurrency:
+      group: omg-cloud-dependencies
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Hold both admission groups for at most 30 minutes
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Rollout admission hold acquired at %s; expires in 30 minutes.\n' "$(date -u +%FT%TZ)"
+          sleep 1800
+          echo 'Rollout hold expired; activation must stop.' >&2
+          exit 1
+
   portable:
     name: Cloudflare portable checks
     if: >-
       github.repository == 'omg-cli/omg' && github.ref_name == 'main' &&
-      github.event_name == 'workflow_dispatch' && inputs.task != 'dependencies'
+      github.event_name == 'workflow_dispatch' && inputs.task == 'portable'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:

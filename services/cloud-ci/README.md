@@ -12,6 +12,12 @@ The actual image digest and verifier revision are pinned in `wrangler.jsonc` and
 
 ### Admit a completed image rollout
 
+Dispatch the existing `Cloudflare verification` workflow on `main` with task `rollout-lock`. Its workflow group holds `omg-ai-review-global` and its job group holds `omg-cloud-dependencies`, both with `queue: max` and `cancel-in-progress: false`. New AI reviews stay enabled and queue while existing couriers finish. [GitHub supports concurrency at both workflow and job level](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency); each queue holds at most 100 pending entries, so inspect capacity before dispatch.
+
+Admission is locked only after the hold **step** is running, not merely when the workflow is in progress. Verify the dedicated run owns both groups through the [concurrency-group API](https://docs.github.com/en/rest/actions/concurrency-groups), then wait for all remote backends and coder operations to finish. The lock has no credentials, checkout or deployment authority. It expires after 30 minutes; check its live step and remaining lease before every activation mutation. If it fails, is cancelled or expires, stop activation and reacquire a fresh lock before continuing. Do not deploy unless the remaining lease covers deployment, rollout verification and rollback. Inspector-only independent reviews use a separate group and are not paused; this lock does not authorize changing their runtime or policy during the window.
+
+While holding both groups, deploy the matching CI Worker and coder configuration and update their courier/controller policy pins coherently. Release only the dedicated lock run after readiness, authenticated plan preflight and pin readback succeed. Never cancel real reviews to acquire it. Verify the first resumed courier's actual pins rather than assuming queued configuration refreshed.
+
 Pause new courier admissions and wait for active backends to finish before deploying an image. Keep admissions paused until the readiness check succeeds. [Cloudflare deployment success starts a rollout](https://developers.cloudflare.com/containers/configuration/rollouts/); old instances can still serve requests until replacement finishes. Durable Object storage survives that replacement, so saved metadata alone cannot prove a command still has its original filesystem.
 
 After deployment, run this check from the repository root with the expected digest from `wrangler.jsonc`:
