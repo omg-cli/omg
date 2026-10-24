@@ -31,6 +31,7 @@ export function portableOptions(workspace, home, env = {}) {
             CARGO_PROFILE_DEV_DEBUG: "0",
             CARGO_PROFILE_TEST_DEBUG: "0",
             RUST_BACKTRACE: "0",
+            SSL_CERT_FILE: "/etc/ssl/certs/ca-certificates.crt",
             PYTHONDONTWRITEBYTECODE: "1",
             PYTHONPATH: workspace,
             OMG_NODE_TEST_FIXTURE: "/opt/omg-node-test-fixture/node",

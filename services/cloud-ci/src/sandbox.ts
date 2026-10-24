@@ -51,8 +51,17 @@ export class CiSandbox extends NativeCiSandbox {
   }
 
   private get diagnostics() {
-    return (this.phases ??= new PhaseDiagnostics(this.ctx.id.toString(), (key, value) =>
-      this.env.BACKUP_BUCKET.put(key, value, { httpMetadata: { contentType: "application/json" } }),
+    return (this.phases ??= new PhaseDiagnostics(
+      this.ctx.id.toString(),
+      (key, value) =>
+        this.env.BACKUP_BUCKET.put(key, value, {
+          httpMetadata: { contentType: "application/json" },
+        }),
+      async (key) => {
+        const stored = await this.env.BACKUP_BUCKET.get(key);
+
+        return stored ? stored.text() : null;
+      },
     ));
   }
   private trace<T>(

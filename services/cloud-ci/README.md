@@ -1,6 +1,6 @@
 # OMG Cloudflare portable CI
 
-This Worker ports CodeLoud's `@cloudflare/ci` 0.2.0 pipeline with its reviewed Bun patches, Sandbox 0.12.12 runtime and an OMG Rust image. Trusted image commands run against an exact commit mirrored into the `omg-ci/omg` Artifacts repository. GitHub credentials stay in the trusted courier/publisher, outside candidate execution and model tools.
+This Worker ports CodeLoud's `@cloudflare/ci` 0.2.0 pipeline with its reviewed Bun patches, Sandbox 0.12.14 runtime and an OMG Rust image. Trusted image commands run against an exact commit mirrored into the `omg-ci/omg` Artifacts repository. GitHub credentials stay in the trusted courier/publisher, outside candidate execution and model tools.
 
 See the existing [adaptation research](../../docs/operations/cloudflare-ci-adaptation-research.md), [activation and open questions](../../docs/operations/cloudflare-ci-research-open-questions.md), and [implementation plan](../../docs/plans/2026-10-20-opencode-pipeline.md). The pinned CodeLoud handoff informed this port; it is not copied into this repository.
 
@@ -25,6 +25,14 @@ python3 scripts/check-cloud-ci-rollout.py \
 The check uses the existing `CLOUDFLARE_API_TOKEN`. A local operator can instead pass `--wrangler-auth-file <existing Wrangler config/default.toml>` to reuse OAuth. It creates no credentials and performs only authenticated reads. Exit code zero requires a completed rollout, the intended image and application version, completed steps, a fully updated fleet, and a second matching readback. No running container slots are required. Missing evidence, an active or superseding rollout, or a changed target holds admission. A deployment with no container change must still match its existing completed target.
 
 After this gate succeeds, run the existing authenticated plan preflight, then resume courier admissions. This is an operator deployment check; the CI Worker and candidate runners receive no new administrative credentials. It does not certify passing tests or replace the final receipt verifier.
+
+## Rebuild the stable runtime base
+
+`Dockerfile.base` reconstructs the custom toolchain from digest-pinned Sandbox 0.12.14, Node 24.22.1 and Rust 1.95.0 stages. It preserves Python 3.12.15, the candidate account, system prerequisites and the Sandbox entrypoint. Bun 1.4.4 is checked against both its official archive digest and extracted binary digest. Candidate Python uses the updated system certificate bundle.
+
+Build and publish that base in the existing hosted builder first. Replace the final `Dockerfile` FROM digest with the verified private base digest, then run the existing hosted image probe on the committed source. Preserve all frozen-file, manifest, local/remote linkage and Linux smoke checks. The final image installs its frozen runner dependencies and verifies prepared fixture ownership as the unprivileged candidate.
+
+Update the Worker, coder and trusted courier image/verifier pins only after that image passes. A new SDK lockfile or a dry Worker build does not establish that the matching image was built or deployed. Existing image and receipt pins remain authoritative until the coordinated update is accepted. Do not reuse old-image snapshots or receipts as evidence for the replacement runtime.
 
 ## Authenticated API and source identity
 

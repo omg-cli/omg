@@ -57,14 +57,14 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CONTROLLER_SHA"
-          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          tools="$RUNNER_TEMP/omg-bun-1.4.4"
           mkdir -m 700 -p "$tools"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
-            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$tools/bun.zip"
           unzip -q "$tools/bun.zip" -d "$tools"
           directory="$tools/bun-linux-x64"
-          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
-          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s  %s\n' '10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.4+38afee6c8'
           printf '%s\n' "$directory" >> "$GITHUB_PATH"
       - name: Fetch candidate Git objects without checking out candidate files
         env:
@@ -180,14 +180,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          tools="$RUNNER_TEMP/omg-bun-1.4.4"
           mkdir -m 700 -p "$tools"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
-            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$tools/bun.zip"
           unzip -q "$tools/bun.zip" -d "$tools"
           directory="$tools/bun-linux-x64"
-          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
-          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s  %s\n' '10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.4+38afee6c8'
           printf '%s\n' "$directory" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
@@ -243,14 +243,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tools="$RUNNER_TEMP/omg-bun-1.4.2"
+          tools="$RUNNER_TEMP/omg-bun-1.4.4"
           mkdir -m 700 -p "$tools"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
-            https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/bun-linux-x64.zip -o "$tools/bun.zip"
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$tools/bun.zip"
           unzip -q "$tools/bun.zip" -d "$tools"
           directory="$tools/bun-linux-x64"
-          printf '%s  %s\n' 'a83d263767d839e4d2649ca8e35d07159c7afc99afdc96d731ced29e056dda0c' "$directory/bun" | sha256sum -c -
-          test "$("$directory/bun" --revision)" = '1.4.2+744846f84'
+          printf '%s  %s\n' '10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.4+38afee6c8'
           printf '%s\n' "$directory" >> "$GITHUB_PATH"
       - name: Install frozen controller dependencies
         run: |

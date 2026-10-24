@@ -19,13 +19,13 @@
     },
   },
   "patchedDependencies": {
+    "@cloudflare/sandbox@0.12.14": "patches/@cloudflare%2Fsandbox@0.12.14.patch",
     "capnweb@0.8.0": "patches/capnweb@0.8.0.patch",
-    "@cloudflare/sandbox@0.12.12": "patches/@cloudflare%2Fsandbox@0.12.12.patch",
     "@cloudflare/ci@0.2.0": "patches/@cloudflare%2Fci@0.2.0.patch",
     "@cloudflare/containers@0.3.7": "patches/@cloudflare%2Fcontainers@0.3.7.patch",
   },
   "overrides": {
-    "@cloudflare/sandbox": "0.12.12",
+    "@cloudflare/sandbox": "0.12.14",
   },
   "packages": {
     "@cloudflare/ci": ["@cloudflare/ci@0.2.0", "", { "dependencies": { "@cloudflare/sandbox": "0.12.1", "zod": "^4.4.3" } }, "sha512-uAr54YhZy4sYHaJM2fYMPg2BtmS2btemBMtED59XDdYQhw08lGr29IS+njNKSWnrBGpbJuQGRWc/jWWiMgg3vg=="],
@@ -34,7 +34,7 @@
 
     "@cloudflare/kv-asset-handler": ["@cloudflare/kv-asset-handler@0.5.0", "", {}, "sha512-jxQYkj8dSIzc0cD6cMMNdOc1UVjqSqu8BZdor5s8cGjW2I8BjODt/kWPVdY+u9zj3ms75Q5qaZgnxUad83+eAg=="],
 
-    "@cloudflare/sandbox": ["@cloudflare/sandbox@0.12.12", "", { "dependencies": { "@cloudflare/containers": "^0.3.5", "aws4fetch": "^1.0.20", "capnweb": "^0.8.0", "hono": "^4.13.7" }, "peerDependencies": { "@openai/agents": "^0.3.3", "@opencode-ai/sdk": "^1.1.40", "@xterm/xterm": ">=5.0.0" }, "optionalPeers": ["@openai/agents", "@opencode-ai/sdk", "@xterm/xterm"] }, "sha512-6hACtMzVmX09+HvWKrTI68CHshvOeoleZItPAHI8b8lukbJ2o4wtSYASHkjZsQ0o1kgbuWPgahqi4mmoMunhbw=="],
+    "@cloudflare/sandbox": ["@cloudflare/sandbox@0.12.14", "", { "dependencies": { "@cloudflare/containers": "^0.3.5", "aws4fetch": "^1.0.20", "capnweb": "^0.8.0", "hono": "^4.13.7" }, "peerDependencies": { "@openai/agents": "^0.3.3", "@opencode-ai/sdk": "^1.1.40", "@xterm/xterm": ">=5.0.0" }, "optionalPeers": ["@openai/agents", "@opencode-ai/sdk", "@xterm/xterm"] }, "sha512-Y+QaTgYtK3tfu2mz7q3Egn9Yzo1gFlmM5/+0tqHaXuXZBuPfEETQ1Dj4UeL/KWd+2KFefUlBdrLL6/uAMRUj9g=="],
 
     "@cloudflare/unenv-preset": ["@cloudflare/unenv-preset@2.16.2", "", { "peerDependencies": { "unenv": "2.0.0-rc.24", "workerd": ">1.20260305.0 <2.0.0-0" }, "optionalPeers": ["workerd"] }, "sha512-JBP1+Z7ZSNG/d4mRP+y8VC5dka3tZVMLEZRvS+rzQ4DGV1EoxRFQckcJTTkXbHSQiTj0DtNI01Zwb/V2fX0mvQ=="],
 
