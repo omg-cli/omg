@@ -27,7 +27,7 @@ export function portableOptions(workspace, home, env = {}) {
             RUSTUP_HOME: "/usr/local/rustup",
             CARGO_INCREMENTAL: "0",
             CARGO_TERM_COLOR: "never",
-            CARGO_BUILD_JOBS: "2",
+            CARGO_BUILD_JOBS: "4",
             CARGO_PROFILE_DEV_DEBUG: "0",
             CARGO_PROFILE_TEST_DEBUG: "0",
             RUST_BACKTRACE: "0",
