@@ -1,5 +1,6 @@
 import {
     CIWorkflow,
+    CiOperationInterruptedError,
     cloudflareArtifacts,
     isCiRunnerFailure,
     type CiContext,
@@ -31,8 +32,11 @@ type CheckResult = Pick<CiRunnerResult, "exitCode" | "logs">;
 function isEngineFailure(error: unknown) {
     return (
         isCiRunnerFailure(error) &&
-        error.cause instanceof Error &&
-        error.cause.name === "WorkflowInternalError"
+        ((error.cause instanceof Error &&
+            error.cause.name === "WorkflowInternalError") ||
+            (error.cause instanceof CiOperationInterruptedError &&
+                (error.cause.reason === "runtime_replaced" ||
+                    error.cause.reason === "transport_disposed")))
     );
 }
 
