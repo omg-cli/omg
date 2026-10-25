@@ -96,6 +96,7 @@ export const diagnosticErrorSchema = z.strictObject({
       "unknown",
     ])
     .optional(),
+  closeCode: z.number().int().min(1000).max(4999).optional(),
   reason: z.enum(stableInterruptionReasons).optional(),
   operation: z.enum(stableInterruptionOperations).optional(),
   phase: z.enum(stableInterruptionPhases).optional(),

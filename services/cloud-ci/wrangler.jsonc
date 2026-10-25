@@ -15,6 +15,7 @@
       "max_instances": 4,
       "instance_type": "standard-4",
       "rollout_step_percentage": 100,
+      "observability": { "enabled": true },
     },
   ],
   "durable_objects": { "bindings": [{ "name": "SANDBOX", "class_name": "CiSandbox" }] },

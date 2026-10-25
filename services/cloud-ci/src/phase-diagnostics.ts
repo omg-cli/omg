@@ -63,6 +63,7 @@ const failureSchema = z.object({
                     "unknown",
                 ])
                 .catch("unknown"),
+            closeCode: z.number().int().min(1000).max(4999).optional().catch(undefined),
             reason: z.enum(stableInterruptionReasons).optional().catch(undefined),
             operation: z.enum(stableInterruptionOperations).optional().catch(undefined),
             phase: z.enum(stableInterruptionPhases).optional().catch(undefined),
@@ -263,6 +264,7 @@ export class PhaseDiagnostics {
             name: parsed.success ? parsed.data.name : "Error",
             code: parsed.success ? parsed.data.code : undefined,
             kind: context?.kind,
+            closeCode: context?.closeCode,
             reason: context?.reason,
             operation: context?.operation,
             phase: context?.phase,
