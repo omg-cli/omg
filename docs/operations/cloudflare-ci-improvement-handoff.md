@@ -6,6 +6,20 @@ The OMG implementation is in [PR 974](https://github.com/omg-cli/omg/pull/974). 
 
 ## Improvements to transfer
 
+### Preserve caller evidence and avoid changes to live tracing during execution
+
+The October 25 caller repair targets CI 0.2.0 with Sandbox 0.12.14. The SDK retains the original platform exception in `OperationInterruptedError.cause`, but CI's `withStepNotification` previously copied only the outer message. The repaired runner captures evidence before cleanup. The existing failure report carries the redacted cause, generated runner and Durable Object IDs, validated run, attempt, source and leaf identity, and the SDK interruption fields. Capture failure preserves the original error. Ordinary errors keep their existing message.
+
+The diagnostic fields do not authorize recovery. The existing `operationInterruptedFrom` admission logic is unchanged, including refusal to replay an operation with unknown completion and `retryable: false`. Oversized context fields are rejected whole, and cause redaction precedes output truncation.
+
+Live tracing can change the system under observation. Cloudflare documents that enabling Wrangler tail or dashboard logs requires a software update, and that software updates can replace a Durable Object. In an isolated comparison, both the native SDK class and OMG's class were interrupted after live tail was enabled. Both completed the same 420-second finite command on a fresh private Worker where tail was never enabled. Each clean branch returned exit zero, exact expected output and successful destruction. This supports an observation-induced reset in that experiment; it does not establish every earlier production failure. [Durable Object known issues](https://developers.cloudflare.com/durable-objects/platform/known-issues/).
+
+Establish logging and record deployed identities before a finite execution starts. During execution, inspect existing Workflow status and persisted receipts. Do not enable or disable live tail, activate dashboard logs, change observability settings or deploy. Retire remote tail resources after terminal execution; stopping a local client alone does not prove remote retirement. After an exception, use a fresh stub for subsequent requests, and do not retry an unknown command merely because a diagnostic record exists. [Durable Object error handling](https://developers.cloudflare.com/durable-objects/best-practices/error-handling/).
+
+The new real-boundary regression uses actual `getSandbox`, a Miniflare Durable Object, `SandboxRunner` and the actual failure notification. It fails before the repair at the missing cause in the report, then passes with the repair. Sixteen new tests cover reporting, correlation, redaction, malformed capture data and unchanged ordinary errors. The complete service run passed 266 tests with one existing Linux-only skip; all three type checks and the Worker dry build passed. Canonical patch application reproduces the verified installed source. These are service checks and controlled diagnostic evidence, not a fresh cloud-generated Rust repair proof.
+
+Two test callbacks use block bodies because Bun can treat a returned `Error` as a thrown error in `toThrow`. The assertions remain intact. [Bun upstream report and fix](https://github.com/oven-sh/bun/pull/34392).
+
 ### Retry-safe preservation of streamed logs
 
 Commit `e41619c2deffc007e5b1a009a59f565911d6089b` changes `services/cloud-ci/src/pipeline.ts` and adds `test/pipeline-preservation-retry.test.mjs`.
