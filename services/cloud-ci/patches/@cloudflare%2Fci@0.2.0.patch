@@ -254,88 +254,87 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
 --- a/src/ci/step-notification.ts
 +++ b/src/ci/step-notification.ts
-@@ -13,6 +13,7 @@
--  exitCode: number;
--  logs: CiRunnerLogs;
--  preview: { stdout: string; stderr: string };
--  // The restorable workspace backup (always produced on success), kept separate
--  // from the cache pointer below: `snapshot` is the thing you restore,
--  // `cachePointer` is only bookkeeping for the deterministic cache indirection.
-+  exitCode: number;
-+  logs: CiRunnerLogs;
-+  preview: { stdout: string; stderr: string };
+@@ -8,11 +8,13 @@
+   DirectoryBackup,
+ } from '../pipeline';
+ import type { StepNotificationHandle } from '../source-control';
++import { operationInterruptedFrom } from '../pipeline/operation-interrupted';
+-
++
+ export type StepExecution = {
+   exitCode: number;
+   logs: CiRunnerLogs;
+   preview: { stdout: string; stderr: string };
 +  logSizes?: { stdout: number; stderr: number };
-+  // The restorable workspace backup (always produced on success), kept separate
-+  // from the cache pointer below: `snapshot` is the thing you restore,
-+  // `cachePointer` is only bookkeeping for the deterministic cache indirection.
-@@ -75,6 +76,7 @@
--    return {
--      exitCode: completed.exitCode,
--      logs: completed.logs,
--      snapshot: completed.snapshot,
--      cachePointer: completed.cachePointer,
--    };
-+    return {
-+      exitCode: completed.exitCode,
-+      logs: completed.logs,
+   // The restorable workspace backup (always produced on success), kept separate
+   // from the cache pointer below: `snapshot` is the thing you restore,
+   // `cachePointer` is only bookkeeping for the deterministic cache indirection.
+@@ -75,11 +77,14 @@
+     return {
+       exitCode: completed.exitCode,
+       logs: completed.logs,
 +      logSizes: completed.logSizes,
-+      snapshot: completed.snapshot,
-+      cachePointer: completed.cachePointer,
-+    };
+       snapshot: completed.snapshot,
+       cachePointer: completed.cachePointer,
+     };
+   } catch (error) {
+-    const safeError = sanitizeError(error, input.sensitiveValues);
++    const safeError =
++      operationInterruptedFrom(error) ??
++      sanitizeError(error, input.sensitiveValues);
+     try {
+       await cancelLogs(execution?.logs);
+     } catch (cleanupError) {
+diff --git a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+-
++
+ export { CIWorkflow, cloudflareArtifacts, isCiRunnerFailure } from './pipeline';
++export { CiOperationInterruptedError } from './pipeline/operation-interrupted';
+ export type {
+   CiContext,
+   CiParams,
 diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 --- a/src/pipeline/ci-workflow.ts
 +++ b/src/pipeline/ci-workflow.ts
-@@ -25,6 +25,7 @@
--import type { Bindings } from '../env';
--import { runCiStep } from '../ci/capabilities';
--import { RunnerGroup } from './runner-group';
--
--const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
--const DEFAULT_STEP_CONFIG = {
-+import type { Bindings } from '../env';
-+import { runCiStep } from '../ci/capabilities';
-+import { RunnerGroup } from './runner-group';
+@@ -25,6 +25,12 @@
+ import type { Bindings } from '../env';
+ import { runCiStep } from '../ci/capabilities';
+ import { RunnerGroup } from './runner-group';
 +import { persistLogs, restoreLogs } from './persisted-logs';
++import {
++  decodeOperationInterrupted,
++  encodeOperationInterrupted,
++  isOperationInterruptedSignal,
++} from './operation-interrupted';
+-
 +
-+const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
-+const DEFAULT_STEP_CONFIG = {
-@@ -145,8 +146,8 @@
--      runners.run(options, inherited, () => {
--        const config = resolveRunnerConfig(options);
--        return step
+ const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
+ const DEFAULT_STEP_CONFIG = {
+@@ -145,8 +151,8 @@
+       runners.run(options, inherited, () => {
+         const config = resolveRunnerConfig(options);
+         return step
 -          .do(options.name, config.workflow, (ctx) =>
 -            runCiStep(this.env, provider, {
--              ...runContext,
--              label: options.name,
--              attempt: ctx.attempt,
-+      runners.run(options, inherited, () => {
-+        const config = resolveRunnerConfig(options);
-+        return step
 +          .do(options.name, config.workflow, async (ctx) => {
 +            const output = await runCiStep(this.env, provider, {
-+              ...runContext,
-+              label: options.name,
-+              attempt: ctx.attempt,
-@@ -160,15 +161,33 @@
--              cachePaths: options.cache?.inputs,
--              env: options.env,
--              secrets: options.secrets,
+               ...runContext,
+               label: options.name,
+               attempt: ctx.attempt,
+@@ -160,15 +166,36 @@
+               cachePaths: options.cache?.inputs,
+               env: options.env,
+               secrets: options.secrets,
 -            })
 -          )
 -          .then((output) =>
 -            Object.freeze({
--              ...output,
--              runner: (nextOptions: RunnerOptions) =>
--                invoke(nextOptions, output.snapshot),
--            })
--          );
--      });
--
--    // CI ctx object
-+              cachePaths: options.cache?.inputs,
-+              env: options.env,
-+              secrets: options.secrets,
-+            });
++            }).catch(encodeOperationInterrupted);
++            if (isOperationInterruptedSignal(output)) return output;
 +            const stored = await persistLogs(
 +              this.env.BACKUP_BUCKET,
 +              `logs/${event.instanceId}/native/${crypto.randomUUID()}`,
@@ -355,16 +354,108 @@ diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 +            return stored;
 +          })
 +          .then(async (stored) => {
++            if (isOperationInterruptedSignal(stored))
++              throw decodeOperationInterrupted(stored);
 +            const output = await restoreLogs(this.env.BACKUP_BUCKET, stored);
 +            return Object.freeze({
-+              ...output,
-+              runner: (nextOptions: RunnerOptions) =>
-+                invoke(nextOptions, output.snapshot),
+               ...output,
+               runner: (nextOptions: RunnerOptions) =>
+                 invoke(nextOptions, output.snapshot),
+-            })
+-          );
 +            });
 +          });
-+      });
+       });
+-
 +
-+    // CI ctx object
+     // CI ctx object
+diff --git a/src/pipeline/operation-interrupted.ts b/src/pipeline/operation-interrupted.ts
+new file mode 100644
+--- /dev/null
++++ b/src/pipeline/operation-interrupted.ts
+@@ -0,0 +1,82 @@
++export type OperationInterruptedTag = 'runtime_replaced' | 'transport_disposed';
++
++export type OperationInterruptedSignal = {
++  readonly kind: 'operation-interrupted';
++  readonly reason: OperationInterruptedTag;
++};
++
++export class CiOperationInterruptedError extends Error {
++  readonly reason: OperationInterruptedTag;
++
++  constructor(reason: OperationInterruptedTag) {
++    super(`CI operation interrupted: ${operationInterruptedTag(reason)}`);
++    this.name = 'CiOperationInterruptedError';
++    this.reason = reason;
++  }
++}
++
++export function operationInterruptedTag(value: unknown): OperationInterruptedTag {
++  if (value === 'runtime_replaced' || value === 'transport_disposed') {
++    return value;
++  }
++  throw new Error('Unknown CI operation interruption reason');
++}
++
++export function encodeOperationInterrupted(
++  error: unknown
++): OperationInterruptedSignal {
++  if (!(error instanceof CiOperationInterruptedError)) throw error;
++  return Object.freeze({
++    kind: 'operation-interrupted',
++    reason: operationInterruptedTag(error.reason),
++  });
++}
++
++export function isOperationInterruptedSignal(
++  value: unknown
++): value is OperationInterruptedSignal {
++  return (
++    typeof value === 'object' &&
++    value !== null &&
++    !Array.isArray(value) &&
++    Object.hasOwn(value, 'kind') &&
++    (value as { kind?: unknown }).kind === 'operation-interrupted'
++  );
++}
++
++export function decodeOperationInterrupted(
++  signal: OperationInterruptedSignal
++): CiOperationInterruptedError {
++  return new CiOperationInterruptedError(operationInterruptedTag(signal.reason));
++}
++
++export function operationInterruptedFrom(
++  error: unknown
++): CiOperationInterruptedError | undefined {
++  if (!(error instanceof Error)) return undefined;
++  const response = own(error, 'errorResponse');
++  if (!isRecord(response)) return undefined;
++  if (own(response, 'code') !== 'OPERATION_INTERRUPTED') return undefined;
++  const context = own(response, 'context');
++  if (!isRecord(context)) return undefined;
++  if (own(context, 'retryable') !== true) return undefined;
++  const reason = own(context, 'reason');
++  if (reason !== 'runtime_replaced' && reason !== 'transport_disposed') return undefined;
++  const operation = own(context, 'operation');
++  const phase = own(context, 'phase');
++  if (typeof operation !== 'string' || operation.length === 0) return undefined;
++  if (typeof phase !== 'string' || phase.length === 0) return undefined;
++  const admitted = own(context, 'admitted');
++  if (admitted !== true && admitted !== false && admitted !== 'unknown') return undefined;
++  return new CiOperationInterruptedError(reason);
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++function own(value: object, key: string): unknown {
++  return Object.hasOwn(value, key)
++    ? (value as Record<string, unknown>)[key]
++    : undefined;
++}
 diff --git a/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
 new file mode 100644
 --- /dev/null
