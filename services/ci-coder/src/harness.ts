@@ -194,7 +194,7 @@ export class Coder extends DurableObject<Env> {
         (initialOutcome.status === "unanswered" && (initialOutcome.reason?.includes("inference request per min rate reached") ||
           failureMetadata?.some(message => message.error?.type === "output-limit"))))) {
       await this.ctx.storage.put("diagnosis-reporting", true);
-      const report = await continueCodingDiagnosis({operationId: id, sessionId: initialOutcome.session, harness: this.harness});
+      const report = await continueCodingDiagnosis({operationId: id, sessionId: initialOutcome.session, request, harness: this.harness});
       if (report.status === "pending") return {...identity, status: "running"};
       outcome = report.outcome;
     }
