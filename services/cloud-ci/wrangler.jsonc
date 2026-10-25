@@ -12,7 +12,7 @@
     {
       "class_name": "CiSandbox",
       "image": "registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci@sha256:450cf77edc8afc9157ea40829e435981341385f3d7bf202baa72fdd163a0d11a",
-      "max_instances": 2,
+      "max_instances": 4,
       "instance_type": "standard-4",
       "rollout_step_percentage": 100,
     },
