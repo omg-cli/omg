@@ -1,53 +1,55 @@
 diff --git a/dist/sandbox-DlkunMi0.js b/dist/sandbox-DlkunMi0.js
+index 275f544a09b1f1b21aefc90f28ef415f6537a02d..9dca3b65d6fe91555a487c2b94c744cc43323f35 100644
 --- a/dist/sandbox-DlkunMi0.js
 +++ b/dist/sandbox-DlkunMi0.js
-@@ -4286,7 +4286,7 @@
- 	* `cause` should be a typed `SandboxError` describing why the connection is
- 	* being torn down (sandbox stopping, lifetime change, transport switch).
- 	*/
+@@ -3315,0 +3316,1 @@
++	lastTransportMetadata = null;
+@@ -3471,1 +3472,5 @@
+-	onWebSocketClose = () => {
++	onWebSocketClose = (event) => {
++		this.lastTransportMetadata = {
++			kind: "peer_closed",
++			...Number.isInteger(event?.code) && event.code >= 1e3 && event.code <= 4999 && { closeCode: event.code }
++		};
+@@ -3482,0 +3488,1 @@
++		this.lastTransportMetadata = { kind: "connection_failed" };
+@@ -3909,0 +3916,3 @@
++	const metadata = context.connectionError;
++	const metadataKind = metadata?.kind === "peer_closed" || metadata?.kind === "connection_failed" ? metadata.kind : void 0;
++	const closeCode = Number.isInteger(metadata?.closeCode) && metadata.closeCode >= 1e3 && metadata.closeCode <= 4999 ? metadata.closeCode : void 0;
+@@ -3915,1 +3924,3 @@
+-		retryable: false
++		retryable: false,
++		...metadataKind !== void 0 && { kind: metadataKind },
++		...closeCode !== void 0 && { closeCode }
+@@ -4039,0 +4051,2 @@
++				const metadata = this.conn?.lastTransportMetadata;
++				if (metadata && !this.connectionErrorIsAuthoritative) this.lastConnectionError = metadata;
+@@ -4289,1 +4302,1 @@
 -	disconnect(cause) {
 +	async disconnect(cause) {
- 		const conn = this.conn;
- 		if (conn?.isConnecting()) {
- 			this.stopBusyPoll();
-@@ -4297,9 +4297,11 @@
- 				this.fireSessionIdle();
- 			}
- 			this.stampWeakConnectionCause(cause);
+@@ -4300,1 +4313,3 @@
 -			conn.whenSettled().then(() => {
 +			try {
 +				await conn.whenSettled();
 +			} finally {
- 				if (this.conn === conn) this.destroyConnection(cause);
+@@ -4302,1 +4317,1 @@
 -			});
 +			}
- 			return;
- 		}
- 		this.destroyConnection(cause);
-@@ -8036,7 +8038,7 @@
- 				this.tunnelsHandler = null;
- 				this.tunnelExitHandler = null;
- 				this.destroyAllTunnels = null;
+@@ -8039,1 +8054,1 @@
 -				previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
 +				await previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
- 			}
- 			if (storedTransport) this.hasStoredTransport = true;
- 			const storedLabels = await this.ctx.storage.get("labels");
-@@ -8121,7 +8123,7 @@
- 		this.tunnelsHandler = null;
- 		this.tunnelExitHandler = null;
- 		this.destroyAllTunnels = null;
+@@ -8124,1 +8139,1 @@
 -		previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
 +		await previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
- 		this.renewActivityTimeout();
- 		this.logger.debug("Transport updated", { transport });
- 	}
-@@ -8829,14 +8831,17 @@
- 			}
- 			await this.ctx.storage.delete("tunnels");
- 			await this.ctx.storage.delete("tunnels:meta");
+@@ -8832,2 +8846,0 @@
 -			this.client.disconnect(this.buildDisconnectCause("sandbox_lifetime_changed", "The sandbox was destroyed while the operation was pending."));
-+			try {
+-			outcome = "success";
+@@ -8835,4 +8848,8 @@
+-				await super.destroy();
+-			} catch (error) {
+-				if (!this.isNoInstanceError(error)) throw error;
+-				this.logger.debug("super.destroy() reported no container instance; treating as no-op");
 +				await this.client.disconnect(this.buildDisconnectCause("sandbox_lifetime_changed", "The sandbox was destroyed while the operation was pending."));
 +			} finally {
 +				try {
@@ -56,66 +58,25 @@ diff --git a/dist/sandbox-DlkunMi0.js b/dist/sandbox-DlkunMi0.js
 +					if (!this.isNoInstanceError(error)) throw error;
 +					this.logger.debug("super.destroy() reported no container instance; treating as no-op");
 +				}
-+			}
- 			outcome = "success";
--			try {
--				await super.destroy();
--			} catch (error) {
--				if (!this.isNoInstanceError(error)) throw error;
--				this.logger.debug("super.destroy() reported no container instance; treating as no-op");
--			}
- 		} catch (error) {
- 			caughtError = error instanceof Error ? error : new Error(String(error));
- 			throw error;
-@@ -8936,7 +8941,8 @@
- 		this.containerGeneration++;
- 		this.defaultSession = null;
- 		this.defaultSessionInit = null;
+@@ -8839,0 +8857,1 @@
++			outcome = "success";
+@@ -8939,1 +8957,2 @@
 -		const disconnectClient = this.transport !== "rpc" || this.client.isWebSocketConnected();
 +		const clientSnapshot = this.client;
 +		const disconnectClient = this.transport !== "rpc" || clientSnapshot.isWebSocketConnected();
- 		await this.currentRuntime.clear();
- 		await this.clearActivePreviewPorts();
- 		try {
-@@ -8944,7 +8950,7 @@
- 		} catch (error) {
- 			this.logger.error("Failed to reconcile tunnel storage after container stop", error instanceof Error ? error : new Error(String(error)));
- 		}
+@@ -8947,1 +8966,1 @@
 -		if (disconnectClient) this.client.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox container stopped while the operation was pending.", params));
 +		if (disconnectClient) await clientSnapshot.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox container stopped while the operation was pending.", params));
- 		await this.releaseRestoredMountRoutes();
- 		let hadR2EgressMount = false;
- 		let hadCredentialProxyMount = false;
-@@ -9581,6 +9587,7 @@
- 		let execError;
- 		try {
- 			if (options?.signal?.aborted) throw new Error("Operation was aborted");
+@@ -9583,0 +9603,1 @@
 +			this.assertExecutionAllowed?.();
- 			let result;
- 			if (options?.stream && options?.onOutput) result = await this.executeWithStreaming(command, sessionId, options, startTime, timestamp);
- 			else {
-@@ -9929,6 +9936,7 @@
- 				...options?.encoding !== void 0 && { encoding: options.encoding },
- 				...options?.autoCleanup !== void 0 && { autoCleanup: options.autoCleanup }
- 			};
+@@ -9931,0 +9952,1 @@
 +			this.assertExecutionAllowed?.();
- 			const response = await this.client.processes.startProcess(command, session, requestOptions);
- 			const processObj = this.createProcessFromDTO({
- 				id: response.processId,
 diff --git a/dist/sandbox-mYLglwK1.d.ts b/dist/sandbox-mYLglwK1.d.ts
+index a61fcaabbfc1fad4799ad0a4a5135ef649aab37a..4c35e769979006c726bbb9d8983a2450022a0abf 100644
 --- a/dist/sandbox-mYLglwK1.d.ts
 +++ b/dist/sandbox-mYLglwK1.d.ts
-@@ -1,3 +1,4 @@
+@@ -0,0 +1,1 @@
 +import type { Request, Response, ReadableStream } from "@cloudflare/workers-types/index.ts";
- import { Container, ContainerProxy, StopParams } from "@cloudflare/containers";
- import "capnweb";
- 
-@@ -2800,7 +2801,7 @@
-    * `cause` should be a typed `SandboxError` describing why the connection is
-    * being torn down (sandbox stopping, lifetime change, transport switch).
-    */
+@@ -2803,1 +2804,1 @@
 -  disconnect(cause?: unknown): void;
 +  disconnect(cause?: unknown): Promise<void>;
- }
- //#endregion
- //#region src/tunnels/tunnels-handler.d.ts
