@@ -727,6 +727,14 @@ def artifact_guest_identity(name):
     return match.group(2), "aarch64" if match.group(1) else "x86_64"
 
 
+def admission_failure(stage, error):
+    kinds = ((zipfile.BadZipFile, "invalid-archive"), (ValueError, "invalid-data"),
+             (OSError, "io-error"), (KeyError, "missing-field"),
+             (TypeError, "invalid-type"), (subprocess.SubprocessError, "process-error"))
+    kind = next(label for category, label in kinds if isinstance(error, category))
+    return f"Evidence admission failed: stage={stage} kind={kind}"
+
+
 def main():
     repository = os.environ["GITHUB_REPOSITORY"]
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -744,14 +752,18 @@ def main():
     # Keep the workflow failure reportable, but do not admit guest identities
     # using an incomplete allowlist or whatever happened to remain readable.
     evidence_error = False
+    evidence_diagnostic = ""
     required_distros = None
+    stage = "source-profile"
     try:
         required_distros = run_guest_profile(repository, run['head_sha'])
+        stage = "policy-catalog"
         _, snapshots = all_snapshots(Path("tests/qemu-inventory-policy.json"))
         allowed_cases = canonical_case_ids({"inventories": snapshots})
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError) as error:
         allowed_cases = None
         evidence_error = True
+        evidence_diagnostic = admission_failure(stage, error)
     jobs_valid = False
     job_rows = []
     try:
@@ -768,9 +780,10 @@ def main():
                for job in job_rows):
             raise ValueError("invalid workflow job identity")
         jobs_valid = True
-    except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError):
+    except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as error:
         job_rows = []
         evidence_error = True
+        evidence_diagnostic = evidence_diagnostic or admission_failure("job-listing", error)
     published_candidate = (run["conclusion"] == "success"
                            and run["path"] == ".github/workflows/qemu-matrix.yml"
                            and run["event"] in ("schedule", "workflow_dispatch")
@@ -780,6 +793,7 @@ def main():
     published_revision = None
     rows = []
     diagnostics = {}
+    stage = "artifact-listing"
     try:
         if allowed_cases is None or not jobs_valid or required_distros is None:
             raise ValueError("unvalidated policy catalog or job listing")
@@ -789,6 +803,7 @@ def main():
         guest_artifacts = set()
         published_artifacts = {}
         for artifact in artifacts:
+            stage = "artifact-metadata"
             if artifact_guest_identity(artifact["name"]) is None and artifact["name"] != "qemu-workflow-report":
                 continue
             # Re-run failed jobs retains successful jobs and their artifacts.
@@ -804,7 +819,9 @@ def main():
             guest = artifact_guest_identity(artifact["name"])
             if guest is not None and artifact["name"] in guest_artifacts:
                 raise ValueError("duplicate guest artifact identity")
+            stage = "artifact-download"
             content = api(f"repos/{repository}/actions/artifacts/{artifact['id']}/zip", MAX_DOWNLOAD)
+            stage = "artifact-archive"
             artifact_rows = archive_rows(content, allowed_cases, diagnostics,
                                          guest=guest, revision=run["head_sha"])
             if guest is not None and any(row["case_id"] == "qemu-matrix-workflow"
@@ -820,10 +837,12 @@ def main():
                     raise ValueError("duplicate published guest artifact")
                 published_artifacts[artifact["name"]] = content
         if run["path"] == ".github/workflows/ci.yml" and run["conclusion"] == "success":
+            stage = "guest-completeness"
             if (not {f"qemu-evidence-{distro}" for distro in required_distros} <= guest_artifacts
                     or not set(required_distros) <= {row["distro"] for row in rows}):
                 raise ValueError("successful CI is missing required Linux guest evidence")
         if published_candidate:
+            stage = "published-provenance"
             required = {f"qemu-evidence-{distro}" for distro in required_distros}
             if set(published_artifacts) == required:
                 sources = {published_provenance(published_artifacts[f"qemu-evidence-{distro}"],
@@ -834,20 +853,24 @@ def main():
                     if len(sources) != 1:
                         raise ValueError("published guest artifacts disagree on release tag")
                     source_tag, source_revision = next(iter(sources))
+                    stage = "release-identity"
                     release_commit = json.loads(api(f"repos/{repository}/commits/{source_tag}"))
                     if release_commit.get("sha") != source_revision:
                         raise ValueError("published inventory revision does not match release tag")
                     latest = json.loads(api(f"repos/{repository}/releases/latest"))
+                    stage = "published-admission"
                     admissions = [published_inventory_admission(
                         published_artifacts[f"qemu-evidence-{distro}"], distro,
                         Path("tests/qemu-inventory-policy.json")) for distro in required_distros]
                     verified_published = latest.get("tag_name") == source_tag and all(admissions)
                     published_tag = source_tag if verified_published else None
                     published_revision = source_revision if verified_published else None
+        stage = "result-projection"
         selected = projection(rows, verified_published)
-    except (ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile, subprocess.SubprocessError):
+    except (ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
         selected = []
         evidence_error = True
+        evidence_diagnostic = evidence_diagnostic or admission_failure(stage, error)
     ci_failed = ci_non_qemu_failure(run, job_rows)
     qemu_failed = qemu_job_failed(run, job_rows)
     receipt = workflow_receipt(job_rows, run["conclusion"]) if jobs_valid else dict(
@@ -857,6 +880,9 @@ def main():
         selected = []
         verified_published = False
         evidence_error = True
+        evidence_diagnostic = evidence_diagnostic or "Evidence admission failed: stage=workflow-receipt kind=invalid-data"
+    if evidence_diagnostic:
+        print(evidence_diagnostic, file=sys.stderr)
     selected = [receipt if row["case_id"] == "qemu-matrix-workflow" else row for row in selected]
     if evidence_error:
         if qemu_failed or not ci_failed:
@@ -929,7 +955,8 @@ def main():
                     + "Case diagnostic (untrusted log excerpt, redacted by issue helper):\n"
                     + diagnostics.get((row["case_id"], row["distro"], arch),
                                       "No case log available; inspect linked artifacts.")
-                    + "\n" + catalog_note)
+                    + "\n" + (evidence_diagnostic + "\n" if evidence_diagnostic else "")
+                    + catalog_note)
         run_url = f"https://github.com/{repository}/actions/runs/{run_id}/attempts/{run['run_attempt']}"
         for source in ("qemu-matrix", "ci"):
             source_rows = [row for row in selected
