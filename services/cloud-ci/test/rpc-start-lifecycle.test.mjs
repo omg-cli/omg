@@ -427,3 +427,220 @@ test("actual SDK startProcess released after fencing rejects before process subm
   expect(state.submissions).toEqual([]);
   expect(state.guardCalls()).toBe(1);
 });
+
+const { RpcSession } =
+    await import("../node_modules/capnweb/dist/index-bun.js");
+function pair() {
+    const mk = () => {
+        const l = new Map(),
+            s = {
+                peer: null,
+                accept() {},
+                addEventListener(t, f) {
+                    l.set(t, [...(l.get(t) || []), f]);
+                },
+                removeEventListener(t, f) {
+                    l.set(
+                        t,
+                        (l.get(t) || []).filter((x) => x !== f),
+                    );
+                },
+                deliver(t, e) {
+                    for (const f of l.get(t) || []) f(e);
+                },
+                send(d) {
+                    queueMicrotask(() =>
+                        s.peer.deliver("message", { data: d }),
+                    );
+                },
+                close(c = 1000, r = "") {
+                    queueMicrotask(() => {
+                        s.peer.deliver("close", { code: c, reason: r });
+                        s.deliver("close", { code: c, reason: r });
+                    });
+                },
+            };
+        return s;
+    };
+    const a = mk(),
+        b = mk();
+    a.peer = b;
+    b.peer = a;
+    return [a, b];
+}
+function tx(s) {
+    const q = [];
+    let w, e;
+    s.addEventListener("message", (x) => {
+        if (typeof x.data !== "string") return;
+        if (w) {
+            const r = w;
+            w = null;
+            r(x.data);
+        } else q.push(x.data);
+    });
+    s.addEventListener("close", (x) => {
+        e ??= new Error(`Peer closed WebSocket: ${x.code} ${x.reason}`);
+    });
+    s.addEventListener("error", () => {
+        e ??= new Error("WebSocket connection failed.");
+    });
+    return {
+        send(m) {
+            s.send(m);
+        },
+        receive() {
+            if (q.length) return Promise.resolve(q.shift());
+            if (e) return Promise.reject(e);
+            return new Promise((r) => {
+                w = r;
+            });
+        },
+    };
+}
+async function open() {
+    const h = {
+        logger: { debug() {}, info() {}, warn() {}, error() {} },
+        ctx: {
+            storage: { async delete() {}, async put() {} },
+            id: { toString: () => "fixture" },
+        },
+        currentLifetime: { async rotate() {} },
+        currentRuntime: { async clear() {} },
+        activeMounts: new Map(),
+        async clearActivePreviewPorts() {},
+        ensureTunnelsBuilt() {},
+        computeRetryTimeoutMs: () => 1,
+        renewActivityTimeout() {},
+        isNoInstanceError: () => false,
+        buildDisconnectCause: Sandbox.prototype.buildDisconnectCause,
+        createSandboxClient: () => ({ disconnect() {} }),
+        async startContainerForRPC() {},
+    };
+    const c = Sandbox.prototype.createClientForTransport.call(h, "rpc");
+    h.client = c;
+    const [a, b] = pair(),
+        started = [];
+    c.connOptions.stub = {
+        async fetch() {
+            return { status: 101, webSocket: a };
+        },
+    };
+    const session = new RpcSession(tx(b), {
+        commands: {
+            async execute(cmd) {
+                started.push(cmd);
+                await new Promise(() => {});
+            },
+        },
+    });
+    c.stopBusyPoll();
+    await c.connect();
+    return { c, b, started, session };
+}
+async function wait(s, n = 1) {
+    for (let i = 0; i < 200 && s.length < n; i++)
+        await new Promise((r) => setTimeout(r, 5));
+    expect(s.length).toBeGreaterThanOrEqual(n);
+}
+async function settle(p) {
+    let t;
+    try {
+        return await Promise.race([
+            p,
+            new Promise((_, j) => {
+                t = setTimeout(() => j(new Error("deadline")), 2000);
+            }),
+        ]);
+    } finally {
+        clearTimeout(t);
+    }
+}
+async function close(c, b, s) {
+    c.stopBusyPoll();
+    c.conn?.disconnect();
+    s[Symbol.dispose]?.();
+    b.close(1000, "cleanup");
+}
+test("cause-less close preserves peer metadata on both in-flight calls", async () => {
+    const { c, b, started, session } = await open();
+    try {
+        const x = c.commands.execute("tail -c 64 /tmp/ci-step.out"),
+            y = c.commands.execute("tail -c 64 /tmp/ci-step.out");
+        await wait(started, 2);
+        b.close(4001, "probe-close");
+        const [p, q] = await Promise.all([
+            settle(
+                x.then(
+                    () => null,
+                    (v) => v,
+                ),
+            ),
+            settle(
+                y.then(
+                    () => null,
+                    (v) => v,
+                ),
+            ),
+        ]);
+        expect(p.name).toBe("OperationInterruptedError");
+        expect(p.code).toBe("OPERATION_INTERRUPTED");
+        expect(p.context).toEqual({
+            reason: "transport_disposed",
+            operation: "commands.execute",
+            phase: "rpc_call",
+            admitted: true,
+            retryable: false,
+            kind: "peer_closed",
+            closeCode: 4001,
+        });
+        expect(q.context).toEqual(p.context);
+        expect(c.conn).toBeNull();
+    } finally {
+        await close(c, b, session);
+    }
+});
+test("invalid close code is dropped while peer kind survives", async () => {
+    const { c, b, started, session } = await open();
+    try {
+        const p = c.commands.execute("tail -c 64 /tmp/ci-step.out");
+        await wait(started);
+        b.close(6000, "probe-close");
+        const e = await settle(
+            p.then(
+                () => null,
+                (v) => v,
+            ),
+        );
+        expect(e.context.kind).toBe("peer_closed");
+        expect(e.context.reason).toBe("transport_disposed");
+        expect(e.context.retryable).toBe(false);
+        expect(Object.hasOwn(e.context, "closeCode")).toBe(false);
+    } finally {
+        await close(c, b, session);
+    }
+});
+
+test("socket errors preserve structured identity on both pending calls", async () => {
+  const { c, b, started, session } = await open();
+  try {
+    const first = c.commands.execute("tail -c 64 /tmp/ci-step.out");
+    const second = c.commands.execute("tail -c 64 /tmp/ci-step.err");
+    await wait(started, 2);
+    b.peer.deliver("error", {});
+    const failures = await Promise.all([
+      settle(first.then(() => null, (error) => error)),
+      settle(second.then(() => null, (error) => error)),
+    ]);
+    for (const failure of failures) {
+      expect(failure.code).toBe("OPERATION_INTERRUPTED");
+      expect(failure.context).toEqual({
+        reason: "transport_disposed", operation: "commands.execute", phase: "rpc_call",
+        admitted: true, retryable: false, kind: "connection_failed",
+      });
+    }
+    expect(c.conn).toBeNull();
+  } finally {
+    await close(c, b, session);
+  }
+});

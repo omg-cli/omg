@@ -400,6 +400,22 @@ mod terminal_group {
     }
 
     #[cfg(target_os = "macos")]
+    pub(super) fn verify_no_descendants(
+        owned: Result<&OwnedLeader, &anyhow::Error>,
+        first: &[Member],
+        second: &[Member],
+    ) -> Result<()> {
+        verify(owned, first, second)?;
+        ensure!(
+            first.len() == 1 && second.len() == 1,
+            "Node.js probe descendant absence was not proven: first_count={} second_count={}",
+            first.len(),
+            second.len()
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
     pub(super) mod macos {
         use super::*;
         use nix::libc;
@@ -488,6 +504,18 @@ mod terminal_group {
             let second = snapshot(pgid)?;
             verify(Ok(leader), &first, &second)
         }
+
+        pub(in crate::runtimes::node) fn prove_no_descendants(
+            owned: &Result<OwnedLeader>,
+            pgid: i32,
+        ) -> Result<()> {
+            let leader = owned.as_ref().map_err(|error| {
+                anyhow::anyhow!("Node.js probe ownership unavailable: {error:#}")
+            })?;
+            let first = snapshot(pgid)?;
+            let second = snapshot(pgid)?;
+            verify_no_descendants(Ok(leader), &first, &second)
+        }
     }
 }
 
@@ -507,6 +535,21 @@ async fn observe_node_probe_exit(group: nix::unistd::Pid) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn observe_node_probe_group_cleanup(
+    group: nix::unistd::Pid,
+    owned_leader: &Result<terminal_group::OwnedLeader>,
+    observation_end: tokio::time::Instant,
+) -> Result<()> {
+    loop {
+        match terminal_group::macos::prove_no_descendants(owned_leader, group.as_raw()) {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() >= observation_end => return Err(error),
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(2)).await,
+        }
+    }
 }
 
 async fn probe_node(directory: &Path, expected: &str, deadline: std::time::Duration) -> Result<()> {
@@ -623,7 +666,25 @@ async fn probe_node_with_signals(
         .context("Node.js probe exit observation timed out during cleanup")
         .and_then(std::convert::identity);
     let group_cleanup = match group_signal {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {
+            #[cfg(target_os = "macos")]
+            {
+                match &observer_cleanup {
+                    Ok(()) => {
+                        observe_node_probe_group_cleanup(group, &owned_leader, observation_end)
+                            .await
+                            .context("Node.js probe descendant absence was not proven")
+                    }
+                    Err(error) => Err(anyhow::anyhow!(
+                        "Node.js probe leader exit was not observed: {error:#}"
+                    )),
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Ok(())
+            }
+        }
         #[cfg(target_os = "macos")]
         Err(error @ nix::errno::Errno::EPERM) => {
             let proof = match &observer_cleanup {

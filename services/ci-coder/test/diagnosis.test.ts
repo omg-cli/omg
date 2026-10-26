@@ -45,6 +45,7 @@ test("large diagnostic source remains read-only and cannot enter ordinary repair
 
 test("a diagnostic without a final answer resumes once in the original session for reporting", async () => {
     assert.equal(typeof codingTools.continueCodingDiagnosis, "function", "A settled diagnostic must produce a report instead of silently losing its result");
+    const request = parseCodingRequest(input);
     const submitted: {id?: string; session?: string}[] = [];
     let pending = true;
     const harness: Pick<OpenCodeHarness, "submit" | "pending" | "wait"> = {
@@ -55,14 +56,39 @@ test("a diagnostic without a final answer resumes once in the original session f
         pending: async () => pending ? [{operationId: "cl-example-report", session: "ses_root", status: "running"}] : [],
         wait: async () => ({operationId: "cl-example-report", session: "ses_root", status: "done", text: '{"findings": []}'}),
     };
-    const first = await codingTools.continueCodingDiagnosis({operationId: "cl-example", sessionId: "ses_root", harness});
+    const first = await codingTools.continueCodingDiagnosis({operationId: "cl-example", sessionId: "ses_root", request, harness});
     assert.equal(first.status, "pending");
     pending = false;
-    const second = await codingTools.continueCodingDiagnosis({operationId: "cl-example", sessionId: "ses_root", harness});
+    const second = await codingTools.continueCodingDiagnosis({operationId: "cl-example", sessionId: "ses_root", request, harness});
     assert.equal(second.status, "completed");
     if (second.status !== "completed") throw new Error("Final report missing");
     assert.equal(second.outcome.text, '{"findings": []}');
     assert.deepEqual(submitted, [{id: "cl-example-report", session: "ses_root"}, {id: "cl-example-report", session: "ses_root"}]);
+});
+
+test("diagnostic report prompt re-sends the validated immutable request deterministically", async () => {
+    const request = parseCodingRequest({...input, diagnosisTask: {question: "Recover exact source and report edits."}});
+    const prompts: string[] = [];
+    let pending = true;
+    const harness: Pick<OpenCodeHarness, "submit" | "pending" | "wait"> = {
+        submit: async (prompt: string, options: {operationId?: string; session?: string}) => {
+            prompts.push(prompt);
+            return {operationId: options.operationId ?? "", session: options.session ?? "", accepted: prompts.length === 1};
+        },
+        pending: async () => pending ? [{operationId: "cl-example-report", session: "ses_root", status: "running"}] : [],
+        wait: async () => ({operationId: "cl-example-report", session: "ses_root", status: "done", text: '{"findings": []}'}),
+    };
+    await codingTools.continueCodingDiagnosis({operationId: "cl-example", sessionId: "ses_root", request, harness});
+    pending = false;
+    await codingTools.continueCodingDiagnosis({operationId: "cl-example", sessionId: "ses_root", request, harness});
+    assert.equal(prompts[0], prompts[1], "Report prompt must be byte-identical on re-entry");
+    assert.ok(prompts[0].includes("\n\n"), "Report prompt must carry a source data section");
+    const data = JSON.parse(prompts[0].split("\n\n").slice(-1)[0]);
+    assert.equal(data.question, "Recover exact source and report edits.");
+    assert.equal(data.source.sha, request.source.sha);
+    assert.equal(data.source.sourceFiles[0].blobSha, request.source.sourceFiles[0].blobSha);
+    assert.equal(data.source.sourceFiles[0].content, request.source.sourceFiles[0].content);
+    assert.deepEqual(data.source.ciFailures, request.source.ciFailures);
 });
 
 test("cloud diagnosis reads evidence but cannot propose, verify or export a repair", async () => {

@@ -15,6 +15,216 @@ diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
 +    preview: result.preview,
 +    snapshot: result.snapshot,
 +    cacheHit: false,
+diff --git a/src/ci/runner-failure-evidence.ts b/src/ci/runner-failure-evidence.ts
+new file mode 100644
+--- /dev/null
++++ b/src/ci/runner-failure-evidence.ts
+@@ -0,0 +1,205 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// SPDX-License-Identifier: Apache-2.0
++
++export const MAX_RUNNER_CAUSE = 1024;
++export const RUNNER_CAUSE_OMITTED = '[cause omitted: exceeds safe bound]';
++const MAX_RAW_CAUSE = 65_536;
++const MAX_LABEL = 128;
++const MAX_FIELD = 64;
++const MAX_DEPTH = 4;
++const OWNER = /^cl-([1-9][0-9]{0,19})-([1-9][0-9]{0,5})-([a-f0-9]{40})(?:-(v|ta)-([a-f0-9]{16}))?$/;
++const TOKEN = /^[A-Za-z0-9._-]{1,64}$/;
++
++export type RunnerFailureIdentityInput = {
++  readonly runnerId: string;
++  readonly actor: string;
++  readonly label: string;
++  readonly diagnosticRunId?: string;
++  readonly leaf?: string;
++};
++export type RunnerFailureOwner = {
++  readonly run: string;
++  readonly attempt: string;
++  readonly source: string;
++  readonly variant?: string;
++};
++export type RunnerFailureIdentity = {
++  readonly label: string;
++  readonly runnerId: string;
++  readonly actor: string;
++  readonly owner?: RunnerFailureOwner;
++  readonly leaf?: string;
++  readonly phase?: string;
++};
++export type RunnerFailureEvidence = {
++  readonly identity: RunnerFailureIdentity;
++  readonly cause: string;
++  readonly interruption: boolean;
++  readonly reason?: 'runtime_replaced' | 'transport_disposed';
++  readonly operation?: string;
++  readonly admitted?: true | false | 'unknown';
++  readonly retryable?: boolean;
++};
++type Interruption = {
++  readonly reason: 'runtime_replaced' | 'transport_disposed';
++  readonly operation: string;
++  readonly phase: string;
++  readonly admitted: true | false | 'unknown';
++  readonly retryable: boolean;
++};
++
++const EVIDENCE = new WeakMap<object, RunnerFailureEvidence>();
++
++export function captureRunnerFailure(error: unknown, identity: RunnerFailureIdentityInput): unknown {
++  if (typeof error !== 'object' || error === null) return error;
++  if (EVIDENCE.has(error)) return error;
++  let evidence: RunnerFailureEvidence;
++  try {
++    evidence = buildEvidence(error, identity);
++  } catch {
++    evidence = fallbackEvidence(error, identity);
++  }
++  EVIDENCE.set(error, evidence);
++  return error;
++}
++
++export function runnerFailureOf(error: unknown): RunnerFailureEvidence | undefined {
++  return typeof error === 'object' && error !== null ? EVIDENCE.get(error) : undefined;
++}
++
++export function boundedCause(cause: string, redact: (value: string) => string): string {
++  return redact(cause).slice(0, MAX_RUNNER_CAUSE);
++}
++
++function buildEvidence(error: object, input: RunnerFailureIdentityInput): RunnerFailureEvidence {
++  const interruption = interruptionOf(error);
++  const owner = ownerOf(input.diagnosticRunId);
++  const leaf = tokenOf(input.leaf);
++  return Object.freeze({
++    identity: Object.freeze({
++      label: boundedText(input.label, MAX_LABEL),
++      runnerId: boundedText(input.runnerId, MAX_LABEL),
++      actor: boundedText(input.actor, MAX_LABEL),
++      ...(owner ? { owner } : {}),
++      ...(leaf ? { leaf } : {}),
++      ...(interruption ? { phase: interruption.phase } : {}),
++    }),
++    cause: causeChain(error),
++    interruption: interruption !== undefined,
++    ...(interruption
++      ? {
++          reason: interruption.reason,
++          operation: interruption.operation,
++          admitted: interruption.admitted,
++          retryable: interruption.retryable,
++        }
++      : {}),
++  });
++}
++
++function fallbackEvidence(error: object, input: RunnerFailureIdentityInput): RunnerFailureEvidence {
++  const owner = ownerOf(input.diagnosticRunId);
++  const leaf = tokenOf(input.leaf);
++  const message = readOwn(error, 'message');
++  return Object.freeze({
++    identity: Object.freeze({
++      label: boundedText(input.label, MAX_LABEL),
++      runnerId: boundedText(input.runnerId, MAX_LABEL),
++      actor: boundedText(input.actor, MAX_LABEL),
++      ...(owner ? { owner } : {}),
++      ...(leaf ? { leaf } : {}),
++    }),
++    cause: typeof message === 'string' ? message : '',
++    interruption: false,
++  });
++}
++
++function causeChain(error: object): string {
++  const parts: string[] = [];
++  const seen = new Set<object>();
++  let total = 0;
++  let current = readOwn(error, 'cause');
++  for (let depth = 0; depth < MAX_DEPTH; depth += 1) {
++    if (typeof current !== 'object' || current === null || seen.has(current)) break;
++    seen.add(current);
++    const message = readOwn(current, 'message');
++    if (typeof message === 'string' && message.length > 0 && !parts.includes(message)) {
++      parts.push(message);
++      total += message.length;
++    }
++    if (total > MAX_RAW_CAUSE) return RUNNER_CAUSE_OMITTED;
++    current = readOwn(current, 'cause');
++  }
++  return parts.join(' <- ');
++}
++
++function interruptionOf(error: object): Interruption | undefined {
++  const response = readOwn(error, 'errorResponse');
++  if (!isRecord(response)) return undefined;
++  if (readOwn(response, 'code') !== 'OPERATION_INTERRUPTED') return undefined;
++  return interruptionContext(readOwn(response, 'context'));
++}
++
++function interruptionContext(value: unknown): Interruption | undefined {
++  if (!isRecord(value)) return undefined;
++  const reason = readOwn(value, 'reason');
++  const operation = readOwn(value, 'operation');
++  const phase = readOwn(value, 'phase');
++  const admitted = readOwn(value, 'admitted');
++  const retryable = readOwn(value, 'retryable');
++  if (reason !== 'runtime_replaced' && reason !== 'transport_disposed') return undefined;
++  if (typeof operation !== 'string' || operation.length === 0 || operation.length > MAX_FIELD) {
++    return undefined;
++  }
++  if (typeof phase !== 'string' || phase.length === 0 || phase.length > MAX_FIELD) {
++    return undefined;
++  }
++  if (admitted !== true && admitted !== false && admitted !== 'unknown') return undefined;
++  if (retryable !== true && retryable !== false) return undefined;
++  return Object.freeze({
++    reason,
++    operation,
++    phase,
++    admitted,
++    retryable,
++  });
++}
++
++function ownerOf(value: unknown): RunnerFailureOwner | undefined {
++  if (typeof value !== 'string') return undefined;
++  const match = OWNER.exec(value);
++  if (!match) return undefined;
++  const run = match[1];
++  const attempt = match[2];
++  const source = match[3];
++  if (!run || !attempt || !source) return undefined;
++  const kind = match[4];
++  const id = match[5];
++  return Object.freeze({
++    run,
++    attempt,
++    source,
++    ...(kind && id ? { variant: `${kind}-${id}` } : {}),
++  });
++}
++
++function tokenOf(value: unknown): string | undefined {
++  return typeof value === 'string' && TOKEN.test(value) ? value : undefined;
++}
++
++function boundedText(value: unknown, max: number): string {
++  return typeof value === 'string' ? value.slice(0, max) : '';
++}
++
++function readOwn(value: object, key: string): unknown {
++  try {
++    const descriptor = Object.getOwnPropertyDescriptor(value, key);
++    return descriptor && 'value' in descriptor ? descriptor.value : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
 diff --git a/src/ci/runners/runner.ts b/src/ci/runners/runner.ts
 --- a/src/ci/runners/runner.ts
 +++ b/src/ci/runners/runner.ts
@@ -53,7 +263,49 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
-@@ -75,20 +78,39 @@
+@@ -9,6 +12,10 @@
+-  checkoutSourceScript,
+-} from '../../shared/source-checkout';
+-import { slugify } from '../../shared/slugify';
+-import type { RunStepInput, RunStepResult, Runner } from './runner';
+-
+-// Sandbox implementation limits. Pipeline-facing command and Snapshot
++  checkoutSourceScript,
++} from '../../shared/source-checkout';
++import { slugify } from '../../shared/slugify';
++import {
++  captureRunnerFailure,
++  type RunnerFailureIdentityInput,
++} from '../runner-failure-evidence';
++import type { RunStepInput, RunStepResult, Runner } from './runner';
++
++// Sandbox implementation limits. Pipeline-facing command and Snapshot
+@@ -39,11 +46,13 @@
+-    input: RunStepInput & { restore?: DirectoryBackup }
+-  ): Promise<RunStepResult<DirectoryBackup>> {
+-    // create the sandbox handle
+-    const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
+-      transport: 'rpc',
+-      enableDefaultSession: false,
+-      containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
+-    });
+-
+-    let cleanupTransferredToStreams = false;
+-    try {
++    input: RunStepInput & { restore?: DirectoryBackup }
++  ): Promise<RunStepResult<DirectoryBackup>> {
++    // create the sandbox handle
++    const runnerId = createRunnerId(input.label);
++    const sandbox = getSandbox(this.env.SANDBOX, runnerId, {
++      transport: 'rpc',
++      enableDefaultSession: false,
++      containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
++    });
++    const actor = runnerActorId(this.env.SANDBOX, runnerId);
++
++    let cleanupTransferredToStreams = false;
++    try {
+@@ -75,20 +84,39 @@
 -        });
 -      }
 -
@@ -113,7 +365,7 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +      const preview = await readPreviews(sandbox);
 +
 +      if (exitCode !== 0) {
-@@ -102,13 +124,13 @@
+@@ -102,13 +130,13 @@
 -        ttl: input.ttlSeconds,
 -        localBucket,
 -      });
@@ -140,21 +392,33 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +      }
 +
 +      let remainingStreams = streams.length;
-@@ -133,6 +155,7 @@
+@@ -133,7 +161,18 @@
 -        },
 -        preview,
 -        snapshot,
 -      };
 -    } finally {
 -      if (!cleanupTransferredToStreams) {
+-        await destroySandbox(sandbox);
 +        },
 +        preview,
 +        snapshot,
 +        logSizes,
 +      };
++    } catch (error) {
++      const diagnosticRunId = input.extraEnv?.OMG_DIAGNOSTIC_RUN_ID;
++      const leaf = input.extraEnv?.OMG_CI_LEAF_STEP;
++      throw captureRunnerFailure(error, {
++        runnerId,
++        actor,
++        label: input.label,
++        ...(diagnosticRunId ? { diagnosticRunId } : {}),
++        ...(leaf ? { leaf } : {}),
++      });
 +    } finally {
 +      if (!cleanupTransferredToStreams) {
-@@ -141,6 +164,7 @@
++        await destroySandbox(sandbox);
+@@ -141,6 +180,7 @@
 -    }
 -  }
 -}
@@ -168,7 +432,7 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +
 +async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
 +  const listing = await sandbox.listFiles('/tmp');
-@@ -148,8 +172,11 @@
+@@ -148,8 +188,11 @@
 -    listing.files.map((file) => [file.absolutePath, file.size])
 -  );
 -  return {
@@ -188,7 +452,7 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +  };
 +}
 +
-@@ -159,7 +186,7 @@
+@@ -159,7 +202,7 @@
 -  size: number
 -): Promise<string | ReadableStream<Uint8Array>> {
 -  if (size > INLINE_LOG_BYTES) {
@@ -203,7 +467,7 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +  }
 +  return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
 +}
-@@ -203,26 +230,21 @@
+@@ -203,26 +246,21 @@
 -  release: () => Promise<void>
 -) {
 -  const reader = stream.getReader();
@@ -251,16 +515,56 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +      }
 +    },
 +    async cancel(reason) {
+@@ -239,6 +277,17 @@
+-  return `${slugify(label).slice(0, 16)}-${crypto.randomUUID()}`;
+-}
+-
+-async function destroySandbox(sandbox: ReturnType<typeof getSandbox>) {
+-  try {
+-    await sandbox.destroy();
++  return `${slugify(label).slice(0, 16)}-${crypto.randomUUID()}`;
++}
++
++function runnerActorId(
++  namespace: Bindings['SANDBOX'] | undefined,
++  runnerId: string
++) {
++  try {
++    return namespace ? namespace.idFromName(runnerId).toString() : 'unavailable';
++  } catch {
++    return 'unavailable';
++  }
++}
++
++async function destroySandbox(sandbox: ReturnType<typeof getSandbox>) {
++  try {
++    await sandbox.destroy();
 diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
 --- a/src/ci/step-notification.ts
 +++ b/src/ci/step-notification.ts
-@@ -13,6 +13,7 @@
+@@ -8,11 +8,18 @@
+-  DirectoryBackup,
+-} from '../pipeline';
+-import type { StepNotificationHandle } from '../source-control';
+-
+-export type StepExecution = {
 -  exitCode: number;
 -  logs: CiRunnerLogs;
 -  preview: { stdout: string; stderr: string };
 -  // The restorable workspace backup (always produced on success), kept separate
 -  // from the cache pointer below: `snapshot` is the thing you restore,
 -  // `cachePointer` is only bookkeeping for the deterministic cache indirection.
++  DirectoryBackup,
++} from '../pipeline';
++import type { StepNotificationHandle } from '../source-control';
++import { operationInterruptedFrom } from '../pipeline/operation-interrupted';
++import {
++  boundedCause,
++  runnerFailureOf,
++  type RunnerFailureEvidence,
++} from './runner-failure-evidence';
++
++export type StepExecution = {
 +  exitCode: number;
 +  logs: CiRunnerLogs;
 +  preview: { stdout: string; stderr: string };
@@ -268,13 +572,18 @@ diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
 +  // The restorable workspace backup (always produced on success), kept separate
 +  // from the cache pointer below: `snapshot` is the thing you restore,
 +  // `cachePointer` is only bookkeeping for the deterministic cache indirection.
-@@ -75,6 +76,7 @@
+@@ -75,11 +82,14 @@
 -    return {
 -      exitCode: completed.exitCode,
 -      logs: completed.logs,
 -      snapshot: completed.snapshot,
 -      cachePointer: completed.cachePointer,
 -    };
+-  } catch (error) {
+-    const safeError = sanitizeError(error, input.sensitiveValues);
+-    try {
+-      await cancelLogs(execution?.logs);
+-    } catch (cleanupError) {
 +    return {
 +      exitCode: completed.exitCode,
 +      logs: completed.logs,
@@ -282,10 +591,109 @@ diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
 +      snapshot: completed.snapshot,
 +      cachePointer: completed.cachePointer,
 +    };
++  } catch (error) {
++    const safeError =
++      operationInterruptedFrom(error) ??
++      sanitizeError(error, input.sensitiveValues);
++    try {
++      await cancelLogs(execution?.logs);
++    } catch (cleanupError) {
+@@ -120,9 +130,65 @@
+-    error instanceof Error ? error.message : String(error),
+-    sensitiveValues
+-  );
+-  const safe = new Error(message);
+-  safe.name = error instanceof Error ? error.name : 'Error';
+-  return safe;
+-}
+-
+-function redact(value: string, sensitiveValues: string[]) {
++    error instanceof Error ? error.message : String(error),
++    sensitiveValues
++  );
++  const evidence = runnerFailureOf(error);
++  const detail = evidence?.interruption
++    ? failureDetail(evidence, sensitiveValues)
++    : '';
++  const safe = new Error(detail ? `${message}\n${detail}` : message);
++  safe.name = error instanceof Error ? error.name : 'Error';
++  return safe;
++}
++
++function failureDetail(
++  evidence: RunnerFailureEvidence,
++  sensitiveValues: string[]
++) {
++  const cause = boundedCause(evidence.cause, (value) =>
++    redact(value, sensitiveValues)
++  );
++  const identity = redact(formatIdentity(evidence), sensitiveValues);
++  return [
++    ...(cause ? [`=== cause ===\n${cause}`] : []),
++    `=== identity ===\n${identity}`,
++  ].join('\n');
++}
++
++function formatIdentity(evidence: RunnerFailureEvidence) {
++  const identity = evidence.identity;
++  const fields = [
++    `runnerId=${identity.runnerId}`,
++    `actor=${identity.actor}`,
++    `label=${identity.label}`,
++  ];
++  if (identity.owner) {
++    fields.push(
++      `run=${identity.owner.run}`,
++      `attempt=${identity.owner.attempt}`,
++      `source=${identity.owner.source}`
++    );
++    if (identity.owner.variant) {
++      fields.push(`variant=${identity.owner.variant}`);
++    }
++  }
++  if (identity.leaf) {
++    fields.push(`leaf=${identity.leaf}`);
++  }
++  if (identity.phase) {
++    fields.push(`phase=${identity.phase}`);
++  }
++  if (evidence.reason) {
++    fields.push(`reason=${evidence.reason}`);
++  }
++  if (evidence.operation) {
++    fields.push(`operation=${evidence.operation}`);
++  }
++  if (evidence.admitted !== undefined) {
++    fields.push(`admitted=${evidence.admitted}`);
++  }
++  if (evidence.retryable !== undefined) {
++    fields.push(`retryable=${evidence.retryable}`);
++  }
++  return fields.join('\n');
++}
++
++function redact(value: string, sensitiveValues: string[]) {
+diff --git a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -2,6 +2,7 @@
+-// SPDX-License-Identifier: Apache-2.0
+-
+-export { CIWorkflow, cloudflareArtifacts, isCiRunnerFailure } from './pipeline';
+-export type {
+-  CiContext,
+-  CiParams,
++// SPDX-License-Identifier: Apache-2.0
++
++export { CIWorkflow, cloudflareArtifacts, isCiRunnerFailure } from './pipeline';
++export { CiOperationInterruptedError } from './pipeline/operation-interrupted';
++export type {
++  CiContext,
++  CiParams,
 diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 --- a/src/pipeline/ci-workflow.ts
 +++ b/src/pipeline/ci-workflow.ts
-@@ -25,6 +25,7 @@
+@@ -25,6 +25,12 @@
 -import type { Bindings } from '../env';
 -import { runCiStep } from '../ci/capabilities';
 -import { RunnerGroup } from './runner-group';
@@ -296,10 +704,15 @@ diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 +import { runCiStep } from '../ci/capabilities';
 +import { RunnerGroup } from './runner-group';
 +import { persistLogs, restoreLogs } from './persisted-logs';
++import {
++  decodeOperationInterrupted,
++  encodeOperationInterrupted,
++  isOperationInterruptedSignal,
++} from './operation-interrupted';
 +
 +const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
 +const DEFAULT_STEP_CONFIG = {
-@@ -145,8 +146,8 @@
+@@ -145,8 +151,8 @@
 -      runners.run(options, inherited, () => {
 -        const config = resolveRunnerConfig(options);
 -        return step
@@ -316,7 +729,7 @@ diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 +              ...runContext,
 +              label: options.name,
 +              attempt: ctx.attempt,
-@@ -160,15 +161,33 @@
+@@ -160,15 +166,36 @@
 -              cachePaths: options.cache?.inputs,
 -              env: options.env,
 -              secrets: options.secrets,
@@ -335,7 +748,8 @@ diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 +              cachePaths: options.cache?.inputs,
 +              env: options.env,
 +              secrets: options.secrets,
-+            });
++            }).catch(encodeOperationInterrupted);
++            if (isOperationInterruptedSignal(output)) return output;
 +            const stored = await persistLogs(
 +              this.env.BACKUP_BUCKET,
 +              `logs/${event.instanceId}/native/${crypto.randomUUID()}`,
@@ -355,6 +769,8 @@ diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 +            return stored;
 +          })
 +          .then(async (stored) => {
++            if (isOperationInterruptedSignal(stored))
++              throw decodeOperationInterrupted(stored);
 +            const output = await restoreLogs(this.env.BACKUP_BUCKET, stored);
 +            return Object.freeze({
 +              ...output,
@@ -365,6 +781,93 @@ diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 +      });
 +
 +    // CI ctx object
+diff --git a/src/pipeline/operation-interrupted.ts b/src/pipeline/operation-interrupted.ts
+new file mode 100644
+--- /dev/null
++++ b/src/pipeline/operation-interrupted.ts
+@@ -0,0 +1,82 @@
++export type OperationInterruptedTag = 'runtime_replaced' | 'transport_disposed';
++
++export type OperationInterruptedSignal = {
++  readonly kind: 'operation-interrupted';
++  readonly reason: OperationInterruptedTag;
++};
++
++export class CiOperationInterruptedError extends Error {
++  readonly reason: OperationInterruptedTag;
++
++  constructor(reason: OperationInterruptedTag) {
++    super(`CI operation interrupted: ${operationInterruptedTag(reason)}`);
++    this.name = 'CiOperationInterruptedError';
++    this.reason = reason;
++  }
++}
++
++export function operationInterruptedTag(value: unknown): OperationInterruptedTag {
++  if (value === 'runtime_replaced' || value === 'transport_disposed') {
++    return value;
++  }
++  throw new Error('Unknown CI operation interruption reason');
++}
++
++export function encodeOperationInterrupted(
++  error: unknown
++): OperationInterruptedSignal {
++  if (!(error instanceof CiOperationInterruptedError)) throw error;
++  return Object.freeze({
++    kind: 'operation-interrupted',
++    reason: operationInterruptedTag(error.reason),
++  });
++}
++
++export function isOperationInterruptedSignal(
++  value: unknown
++): value is OperationInterruptedSignal {
++  return (
++    typeof value === 'object' &&
++    value !== null &&
++    !Array.isArray(value) &&
++    Object.hasOwn(value, 'kind') &&
++    (value as { kind?: unknown }).kind === 'operation-interrupted'
++  );
++}
++
++export function decodeOperationInterrupted(
++  signal: OperationInterruptedSignal
++): CiOperationInterruptedError {
++  return new CiOperationInterruptedError(operationInterruptedTag(signal.reason));
++}
++
++export function operationInterruptedFrom(
++  error: unknown
++): CiOperationInterruptedError | undefined {
++  if (!(error instanceof Error)) return undefined;
++  const response = own(error, 'errorResponse');
++  if (!isRecord(response)) return undefined;
++  if (own(response, 'code') !== 'OPERATION_INTERRUPTED') return undefined;
++  const context = own(response, 'context');
++  if (!isRecord(context)) return undefined;
++  if (own(context, 'retryable') !== true) return undefined;
++  const reason = own(context, 'reason');
++  if (reason !== 'runtime_replaced' && reason !== 'transport_disposed') return undefined;
++  const operation = own(context, 'operation');
++  const phase = own(context, 'phase');
++  if (typeof operation !== 'string' || operation.length === 0) return undefined;
++  if (typeof phase !== 'string' || phase.length === 0) return undefined;
++  const admitted = own(context, 'admitted');
++  if (admitted !== true && admitted !== false && admitted !== 'unknown') return undefined;
++  return new CiOperationInterruptedError(reason);
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++function own(value: object, key: string): unknown {
++  return Object.hasOwn(value, key)
++    ? (value as Record<string, unknown>)[key]
++    : undefined;
++}
 diff --git a/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
 new file mode 100644
 --- /dev/null

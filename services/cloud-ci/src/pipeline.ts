@@ -1,5 +1,6 @@
 import {
     CIWorkflow,
+    CiOperationInterruptedError,
     cloudflareArtifacts,
     isCiRunnerFailure,
     type CiContext,
@@ -27,6 +28,17 @@ import { encodeVerificationEnvironment } from "../runner/verification-envelope.m
 declare const Response: typeof import("@cloudflare/workers-types/index.ts").Response;
 
 type CheckResult = Pick<CiRunnerResult, "exitCode" | "logs">;
+
+function isEngineFailure(error: unknown) {
+    return (
+        isCiRunnerFailure(error) &&
+        ((error.cause instanceof Error &&
+            error.cause.name === "WorkflowInternalError") ||
+            (error.cause instanceof CiOperationInterruptedError &&
+                (error.cause.reason === "runtime_replaced" ||
+                    error.cause.reason === "transport_disposed")))
+    );
+}
 
 const config = {
     retries: { limit: 0, delay: 1000 },
@@ -391,6 +403,9 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                 : error instanceof Error
                   ? error.message
                   : "Unknown CI failure";
+            const failureCategory = isEngineFailure(error)
+                ? "workflow-internal-error"
+                : undefined;
 
             await step.do(
                 "preserve-failure",
@@ -407,6 +422,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                             id: event.instanceId,
                             ...request,
                             conclusion: "failure",
+                            ...(failureCategory ? { failureCategory } : {}),
                             requiredChecks,
                             inapplicableChecks: inapplicableCloudChecks(request.ref),
                             checks: records,
