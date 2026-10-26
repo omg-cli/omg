@@ -71,6 +71,9 @@ runbook_for() {
         printf 'Rerun this leg: `./scripts/benchmark-qemu.sh --distro %s --arch aarch64 --release <same-tag-as-run> --staged-dir <arm64-binaries>`.\nFull per-case evidence (transcripts, guest logs, metadata) is in this run'"'"'s uploaded `qemu-arm-evidence-*` artifacts; paths below are relative to the evidence root.\n' "$1"
       else
         printf 'Rerun this leg: `./scripts/benchmark-qemu.sh --distro %s --release <same-tag-as-run> --staged-dir <staged-binaries>`.\nFull per-case evidence (transcripts, guest logs, metadata) is in this run'"'"'s uploaded `qemu-evidence-*` artifacts; paths below are relative to the evidence root.\n' "$1"
+      fi
+      if [[ "$1" == fedora ]]; then
+        printf 'Fedora also requires `--fedora-sqlite-bundle <verified-same-revision-bundle>` from its successful native supply build. See `docs/qemu-local.md`.\n'
       fi ;;
     release-smoke)
       printf 'Rerun this leg: `./scripts/release-smoke.sh --distro %s --release <same-tag-as-run>%s`.\nFull per-case evidence (transcripts, metadata, result.json) is in this run'"'"'s uploaded `release-smoke-*` artifacts; paths below are relative to the evidence root.\n' "$1" "$2" ;;

@@ -267,12 +267,13 @@ shadow mode and uploads per-case evidence even on failure.
 
 ## benchmark-qemu.sh
 
-Run all four supported x86_64 guest baselines sequentially. The profiles use Arch
-20260901, Debian 12 Bookworm, Ubuntu 24.04, and Fedora 44. Each image has a pinned
-checksum. Image signatures are not independently verified by this script.
+Run all five supported x86_64 guest baselines sequentially. The profiles use Arch
+20260901, Debian 12 Bookworm, Debian 13 Trixie, Ubuntu 24.04, and Fedora 44. Each
+image has a pinned checksum. Pass the image policy to require publisher verification.
+Fedora also requires the checked SQLite supply described in `docs/qemu-local.md`.
 
 ```bash
-./scripts/benchmark-qemu.sh --distro all --staged-dir /path/to/artifacts --benchmark
+./scripts/benchmark-qemu.sh --distro all --fedora-sqlite-bundle /path/to/verified-sqlite --staged-dir /path/to/artifacts --benchmark
 ./scripts/benchmark-qemu.sh --distro ubuntu --release v0.1.223
 ```
 
@@ -280,7 +281,7 @@ The staged directory must contain the selected distro archives and checksum
 sidecars using the canonical names below. Missing staged inputs fail rather than
 falling back to published files. Omit `--staged-dir` to download published archives.
 The selected release or staged artifacts must still be reviewed against the
-artifact-specific evidence before treating a four-guest result as a release
+artifact-specific evidence before treating a five-guest result as a release
 qualification.
 
 Requirements are local Docker access, `/dev/kvm` available to the controller,
@@ -317,7 +318,7 @@ The experimental transaction profile adds independently reset install/remove
 samples to those read checks:
 
 ```bash
-./scripts/benchmark-qemu.sh --distro all --staged-dir /path/to/artifacts \
+./scripts/benchmark-qemu.sh --distro all --fedora-sqlite-bundle /path/to/verified-sqlite --staged-dir /path/to/artifacts \
   --benchmark-transactions 20
 ```
 

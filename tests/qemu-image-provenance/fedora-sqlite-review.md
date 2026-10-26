@@ -65,8 +65,8 @@ digest checks intact. Admission then checks the actual resolved library bytes,
 root ownership, exact package identity and `rpm -V`. The existing OMG lifecycle,
 benchmarks, inventory rows, frozen-clone transactions and health checks continue
 against that installed baseline. After the lifecycle, the library is checked
-again. Both native receipts and the supplied manifest are retained in the
-allowlisted QEMU evidence. The raw package bundle remains in its separate
+again and once more after all selected guest work. All three native receipts
+and the supplied manifest are retained in the allowlisted QEMU evidence. The raw package bundle remains in its separate
 immutable workflow artifact.
 
 ## Executed evidence and limits

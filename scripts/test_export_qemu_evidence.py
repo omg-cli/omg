@@ -50,7 +50,7 @@ class AllowlistTests(unittest.TestCase):
         self.assertFalse(exporter.allowed_file((*prefix, "native-excluded-secrets.stdout")))
 
     def test_sqlite_admission_exports_receipts_but_not_raw_package_inputs(self):
-        for name in ['fedora-sqlite-before.json', 'fedora-sqlite-after.json']:
+        for name in ['fedora-sqlite-before.json', 'fedora-sqlite-after.json', 'fedora-sqlite-final.json']:
             self.assertTrue(exporter.allowed_file(('run-test', 'guest', 'evidence', name)))
             self.assertFalse(exporter.allowed_file(('run-test', 'guest', 'evidence', name+'.bak')))
         for name in ['fedora-sqlite-manifest.json', 'fedora-sqlite-admission.log', 'fedora-sqlite-install.log']:

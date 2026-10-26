@@ -107,7 +107,7 @@ def validate_installed(record, manifest):
 
 
 def verify_guest_evidence(directory, bundle, manifest):
-    for name in ('before', 'after'):
+    for name in ('before', 'after', 'final'):
         record = document(directory/('fedora-sqlite-'+name+'.json'))
         expected = {'schema_version': 1, 'source_sha': manifest['source_sha'],
                     'manifest_sha256': digest(bundle/'manifest.json'), 'native_package_verification': True}

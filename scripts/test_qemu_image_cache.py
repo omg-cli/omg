@@ -337,7 +337,7 @@ docker() {
                        driver.index('  jq -n --arg source "$source_kind" --arg suffix "$case_suffix"')]
         script = block + 'printf "%s\\n" "${args[@]}"'
         environment = dict(os.environ, tag='v1.2.3', arch='x86_64', image_cache='/cache',
-                           image_cache_budget_bytes='17', staged_dir='', release_dir='',
+                           image_cache_budget_bytes='17', fedora_sqlite_bundle='/checked-sqlite', staged_dir='', release_dir='',
                            inventory_file='', inventory_policy='', image_policy='', benchmark='false',
                            transaction_samples='0', inventory_tiers='', inventory_mutations='false',
                            inventory_isolation='false', storage_faults='false', restrict_egress='false',
@@ -346,6 +346,7 @@ docker() {
                                 env=environment, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ['--release', 'v1.2.3', '--arch', 'x86_64',
+                                                     '--fedora-sqlite-bundle', '/checked-sqlite',
                                                      '--image-cache', '/cache',
                                                      '--image-cache-budget-bytes', '17'])
 

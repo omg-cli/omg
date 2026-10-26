@@ -1298,11 +1298,6 @@ if [[ ! "$guest_rc" =~ ^[0-9]+$ || "$guest_rc" != "$rc" ]]; then
   printf 'Guest exit %s differs from transport exit %s\n' "$guest_rc" "$rc" >&2
   exit 3
 fi
-if [[ "$rc" == 0 && "$distro" == fedora ]]; then
-  python3 "$here/fedora-sqlite.py" verify "$work/fedora-sqlite-bundle" --arch "$arch" \
-    --revision "$fedora_sqlite_revision" --evidence-dir "$work/guest/evidence" \
-    >> "$work/fedora-sqlite-admission.log" 2>&1 || exit 3
-fi
 if [[ "$rc" == 0 ]]; then
   # A zero guest exit alone is insufficient: require the daemon probe receipt.
   daemon_receipt="$work/guest/evidence/daemon-lifecycle.json"
@@ -1654,6 +1649,26 @@ if [[ "$storage_faults" == true && "$rc" == 0 ]]; then
      jq -e '.schema_version==1 and .scope=="privacy-export-atomic-write" and .complete==false and .failure_kind=="product"' "$work/storage-faults.json" >/dev/null; then
     rc=1
   elif [[ "$fault_rc" != 0 ]] || ! python3 "$here/qemu-storage-faults.py" --receipt "$work/storage-faults.json" >> "$work/storage-faults.log" 2>&1; then
+    rc=120
+  fi
+fi
+if [[ "$distro" == fedora && "$rc" == 0 ]]; then
+  sqlite_final_rc=0
+  timeout --kill-after=5s 30s docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 \
+    "sudo -n python3 fedora-sqlite.py installed fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' --output evidence/fedora-sqlite-final.json" \
+    >> "$work/fedora-sqlite-install.log" 2>&1 || sqlite_final_rc=$?
+  if [[ "$sqlite_final_rc" == 0 ]]; then
+    timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
+      bench@127.0.0.1:evidence/fedora-sqlite-final.json /work/guest/evidence/ \
+      >> "$work/evidence-copy.log" 2>&1 || sqlite_final_rc=$?
+  fi
+  if [[ "$sqlite_final_rc" == 0 ]]; then
+    python3 "$here/fedora-sqlite.py" verify "$work/fedora-sqlite-bundle" --arch "$arch" \
+      --revision "$fedora_sqlite_revision" --evidence-dir "$work/guest/evidence" \
+      >> "$work/fedora-sqlite-admission.log" 2>&1 || sqlite_final_rc=$?
+  fi
+  if [[ "$sqlite_final_rc" != 0 ]]; then
+    printf 'Final Fedora SQLite library failed admission\n' >&2
     rc=120
   fi
 fi

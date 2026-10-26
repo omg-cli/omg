@@ -145,7 +145,7 @@ class FedoraSQLiteTests(unittest.TestCase):
                 'architecture': 'x86_64', 'library_sha256': 'd'*64},
             'before': {'version': '3.51.2', 'release': '1.fc44'}, 'before_admitted': False,
             'package_sha256': {n: self.manifest['files'][n] for n in sqlite.package_names(self.policy, 'x86_64')}}
-        for phase in ['before', 'after']:
+        for phase in ['before', 'after', 'final']:
             (self.bundle/f'fedora-sqlite-{phase}.json').write_text(json.dumps(record))
         sqlite.verify_guest_evidence(self.bundle, self.bundle, self.manifest)
         for field, value in [('source_sha', 'b'*40), ('manifest_sha256', 'e'*64), ('native_package_verification', False),
@@ -156,6 +156,9 @@ class FedoraSQLiteTests(unittest.TestCase):
                 with self.assertRaises(ValueError): sqlite.verify_guest_evidence(self.bundle, self.bundle, self.manifest)
         (self.bundle/'fedora-sqlite-before.json').write_text(json.dumps(record))
         (self.bundle/'fedora-sqlite-after.json').unlink()
+        with self.assertRaises(ValueError): sqlite.verify_guest_evidence(self.bundle, self.bundle, self.manifest)
+        (self.bundle/'fedora-sqlite-after.json').write_text(json.dumps(record))
+        (self.bundle/'fedora-sqlite-final.json').unlink()
         with self.assertRaises(ValueError): sqlite.verify_guest_evidence(self.bundle, self.bundle, self.manifest)
 
     def test_unreviewed_extra_files_are_not_copied_into_the_guest(self):
