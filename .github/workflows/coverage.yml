@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          packages=(base-devel git curl pkgconf openssl libarchive clang cmake python zsh fish)
+          packages=(base-devel git curl pkgconf openssl libarchive clang cmake python zsh fish docker-cli jq)
           # One full upgrade/install transaction keeps the rolling container
           # consistent and avoids resolving the package graph twice.
           if pacman -Syu --noconfirm --needed "${packages[@]}" 2>&1 | tee /tmp/omg-pacman-setup.log; then
@@ -133,6 +133,47 @@ jobs:
             --retries 0 \
             --no-fail-fast \
             --no-report
+
+      - name: Cover sandbox descendant cancellation
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          source <(cargo llvm-cov show-env --sh)
+          cargo test --lib --no-run --features arch,pgp,license --locked --message-format=json > /tmp/coverage-binaries.jsonl
+          binary=$(jq -sr '[.[] | select(.reason == "compiler-artifact" and .profile.test == true and .target.kind == ["lib"]) | .executable] | unique | if length == 1 then .[0] else error("expected one instrumented libtest binary") end' /tmp/coverage-binaries.jsonl)
+          test -x "$binary"
+          profile_dir=$(dirname "$LLVM_PROFILE_FILE")
+          test -d "$profile_dir"
+
+          docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
+          FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
+          RUN pacman -Syu --noconfirm --needed bubblewrap fakeroot && pacman -Scc --noconfirm
+          DOCKERFILE
+          curl -fsS https://raw.githubusercontent.com/moby/profiles/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json -o /tmp/coverage-seccomp.json
+          echo '536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74  /tmp/coverage-seccomp.json' | sha256sum --check
+          jq '(.syscalls[] | select(.includes.caps == ["CAP_SYS_ADMIN"]) | .names) += ["pivot_root"]' \
+            /tmp/coverage-seccomp.json > /tmp/coverage-sandbox-seccomp.json
+
+          # Namespace permissions apply only to this credential-free fixture.
+          container=$(docker create --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json \
+            --network none --pids-limit 128 --memory 1g --cpus 2 \
+            --env LLVM_PROFILE_FILE='/profiles/omg-sandbox-%p-%m.profraw' \
+            omg-coverage-sandbox /bin/bash -euo pipefail -c '
+              mkdir /profiles
+              command -v fakeroot
+              bwrap --ro-bind / / --unshare-pid --proc /proc -- /bin/true
+              bwrap --unshare-user --uid "$(id -u nobody)" --gid "$(id -g nobody)" \
+                --cap-drop ALL --ro-bind / / --proc /proc -- /usr/bin/id
+              /fixture --exact package_managers::aur::client::tests::cancelling_logged_sandbox_build_terminates_descendants --ignored --nocapture
+            ')
+          trap 'docker rm --force "$container"' EXIT
+          docker cp "$binary" "$container:/fixture"
+          timeout --kill-after=5s 90s docker start --attach "$container" | tee /tmp/coverage-sandbox.log
+          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' /tmp/coverage-sandbox.log
+          docker cp "$container:/profiles/." "$profile_dir/"
+          test -n "$(find "$profile_dir" -maxdepth 1 -name 'omg-sandbox-*.profraw' -print -quit)"
 
       - name: Generate LCOV report
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
