@@ -23,6 +23,26 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_sandbox_coverage_requires_one_existing_instrumented_binary(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        selection = script.split('docker build', 1)[0]
+        for count, expected in ((0, 1), (1, 0), (2, 1)):
+            with self.subTest(binaries=count), tempfile.TemporaryDirectory() as directory:
+                deps = Path(directory) / 'target/llvm-cov-target/debug/deps'
+                deps.mkdir(parents=True)
+                for number in range(count):
+                    binary = deps / f'omg_lib-fixture{number}'
+                    binary.write_text('#!/bin/sh\nexit 0\n')
+                    binary.chmod(0o755)
+                result = subprocess.run(
+                    [BASH, '-c', 'cargo() { return 97; };\n' + selection
+                     + 'printf "%s" "$binary"'],
+                    env={**os.environ, 'GITHUB_WORKSPACE': Path(directory).as_posix()},
+                    text=True, capture_output=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if count == 1:
+                    self.assertEqual(Path(result.stdout), deps / 'omg_lib-fixture0')
+
     def test_function_report_is_isolated_and_requires_nonempty_output(self):
         script = step_script('coverage.yml', 'Generate function coverage evidence')
         exporter = """

@@ -139,12 +139,12 @@ jobs:
         timeout-minutes: 5
         run: |
           set -euo pipefail
-          source <(cargo llvm-cov show-env --sh)
-          cargo test --lib --no-run --features arch,pgp,license --locked --message-format=json > /tmp/coverage-binaries.jsonl
-          binary=$(jq -sr '[.[] | select(.reason == "compiler-artifact" and .profile.test == true and .target.kind == ["lib"]) | .executable] | unique | if length == 1 then .[0] else error("expected one instrumented libtest binary") end' /tmp/coverage-binaries.jsonl)
-          test -x "$binary"
-          profile_dir=$(dirname "$LLVM_PROFILE_FILE")
+          profile_dir="$GITHUB_WORKSPACE/target/llvm-cov-target"
           test -d "$profile_dir"
+          # Workspace executables are excluded from the restored dependency cache.
+          mapfile -d '' binaries < <(find "$profile_dir/debug/deps" -maxdepth 1 -type f -name 'omg_lib-*' -executable -print0)
+          test "${#binaries[@]}" -eq 1
+          binary=${binaries[0]}
 
           docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
