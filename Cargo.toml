@@ -95,12 +95,7 @@ harness = false
 # - The archlinux/alpm git family is pinned by exact version (`=`) AND full
 #   commit rev for supply-chain integrity. Updates require a deliberate rev
 #   bump applied to ALL five alpm-* entries together (same repo commit).
-# - sequoia-openpgp tracks the stable 2.x line (currently 2.4.1). The PQC
-#   pre-release experiment ended: post-quantum algorithms ship only in
-#   `-pqc` pre-releases until the standards ratify, so stable is the
-#   correct target for signature verification use. The experimental-crypto
-#   build flags stay because sequoia's RustCrypto backend requires the
-#   opt-in to compile at all, not because PQC algorithms are enabled.
+# - sequoia-openpgp tracks the stable 2.x line; Cargo.lock pins the exact release.
 # ----------------------------------------------------------------------------
 [dependencies]
 

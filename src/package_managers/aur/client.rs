@@ -5897,13 +5897,13 @@ mod tests {
             .unwrap();
         let pid =
             Pid::from_raw(pid.trim().parse().expect("child host PID")).expect("nonzero child PID");
-        let pidfd = pidfd_open(pid, PidfdFlags::NONBLOCK).unwrap();
         // SAFETY: AsyncFd owns the pidfd, which is never replaced or closed independently.
         #[expect(
             unsafe_code,
             reason = "Tokio requires an explicit ownership proof for AsyncFd registration"
         )]
-        let exit = unsafe { AsyncFd::register(pidfd) }.unwrap();
+        let exit =
+            unsafe { AsyncFd::register(pidfd_open(pid, PidfdFlags::NONBLOCK).unwrap()).unwrap() };
         let _cleanup_child = scopeguard::guard(&exit, |exit| {
             // The failed regression must not leak its fixture. A pidfd
             // cannot accidentally signal an unrelated process after PID reuse.
