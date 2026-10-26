@@ -114,7 +114,7 @@ anyhow = "1.0.103"
 thiserror = "2.0.17"
 
 # Async runtime
-tokio = { version = "1.49", features = [
+tokio = { version = "1.51.6", features = [
   "rt",
   "rt-multi-thread",
   "macros",
@@ -309,7 +309,7 @@ stats_alloc = "=0.1.10" # Allocation regression instrumentation; no runtime depe
 syn = { version = "2.0", features = ["full", "visit"] } # Parse source-audit item boundaries.
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 lzma-rs = "0.3" # Test-only XZ encoder for synthetic archives.
-tokio = { version = "1.49", features = ["test-util"] }
+tokio = { version = "1.51.6", features = ["test-util"] }
 rcgen = "=0.13.2"
 tokio-rustls = { version = "=0.26.4", default-features = false } # Real TLS fixtures; already locked transitively.
 criterion = { version = "0.8", features = ["html_reports"] }
