@@ -297,7 +297,7 @@ class NativeBuildAdmission(unittest.TestCase):
         lane = (root / '.github/workflows/qemu-lane.yml').read_text(encoding='utf-8')
         matrix = (root / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
         self.assertNotIn('native-build-artifact.py ready', job_block(matrix, 'prepare'))
-        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu]', job_block(ci, 'qemu'))
+        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]', job_block(ci, 'qemu'))
         for owner in ('linux-matrix', 'ubuntu'):
             block = job_block(ci, owner)
             self.assertIn('native-build-artifact.py build', block)

@@ -52,7 +52,7 @@ class QemuProducerDependency(unittest.TestCase):
     def test_native_failure_still_schedules_guests_after_a_successful_quick_gate(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         qemu = job_block(ci, 'qemu')
-        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu]', qemu)
+        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]', qemu)
         condition = re.search(r'^    if: >-\n((?:      .*\n)+)', qemu, re.MULTILINE)
         self.assertIsNotNone(condition)
         expression = condition.group(1)

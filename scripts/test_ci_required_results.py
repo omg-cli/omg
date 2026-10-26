@@ -29,7 +29,7 @@ class RequiredResultsTests(unittest.TestCase):
             env = dict(os.environ, QUICK_GATE="success", WORKFLOW_CHECKS="success", BUILD_REQUIRED=required,
                        STANDALONE_SUITES="success", PORTABLE="success", LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", MACOS_NEXTEST_SOURCE="success", UBUNTU="success",
-                       DOCS_AUDIT="success", RUNTIME_USAGE="success",
+                       DOCS_AUDIT="success", RUNTIME_USAGE="success", FEDORA_SQLITE="success",
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
             for key, value in (overrides or {}).items():
                 if value is None:
@@ -39,20 +39,27 @@ class RequiredResultsTests(unittest.TestCase):
             bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
             return subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True, timeout=15)
 
+    def test_fedora_sqlite_supply_failure_cannot_hide_behind_successful_guests(self):
+        for result in ('failure', 'cancelled', 'skipped', '', None):
+            with self.subTest(result=result):
+                observed = self.evaluate('true', {'FEDORA_SQLITE': result})
+                self.assertNotEqual(observed.returncode, 0)
+                self.assertIn('Fedora SQLite supply did not succeed', observed.stdout)
+
     def test_required_job_skips_fail(self):
-        for job in ("STANDALONE_SUITES", "PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE"):
+        for job in ("STANDALONE_SUITES", "PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE", "FEDORA_SQLITE"):
             with self.subTest(job=job):
                 self.assertNotEqual(self.evaluate("true", {job: "skipped"}).returncode, 0)
 
     def test_docs_only_skips_pass(self):
-        jobs = ("STANDALONE_SUITES", "PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE")
+        jobs = ("STANDALONE_SUITES", "PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE", "FEDORA_SQLITE")
         self.assertEqual(self.evaluate("false", {job: "skipped" for job in jobs}).returncode, 0)
 
     def test_all_success_passes_and_failure_never_does(self):
         self.assertEqual(self.evaluate("true").returncode, 0)
         for required in ("true", "false"):
             for state in ("failure", "cancelled", ""):
-                for job in ("STANDALONE_SUITES", "PORTABLE", "RUNTIME_USAGE"):
+                for job in ("STANDALONE_SUITES", "PORTABLE", "RUNTIME_USAGE", "FEDORA_SQLITE"):
                     with self.subTest(required=required, state=state, job=job):
                         self.assertNotEqual(self.evaluate(required, {job: state}).returncode, 0)
 

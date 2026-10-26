@@ -437,15 +437,25 @@ jobs:
   # PRs (or dispatch + staged=true) once the arm64 builds above succeed.
   # No arch row: upstream publishes no aarch64 cloud image.
   #########################################################################
+  fedora-sqlite-arm:
+    needs: [prepare, arm-runner-health]
+    if: needs.prepare.outputs.arm64 == 'true' && contains(fromJSON(needs.prepare.outputs.arm-distros), 'fedora')
+    uses: ./.github/workflows/fedora-sqlite.yml
+    permissions:
+      contents: read
+    with:
+      arch: aarch64
+
   guest-arm:
     name: "QEMU guest arm64 (${{ matrix.distro }})"
     concurrency:
       group: qemu-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'interactive' }}-guest-arm-${{ matrix.distro }}
       cancel-in-progress: ${{ github.event_name != 'schedule' }}
-    needs: [prepare, arm-runner-health, build-staged-arm, build-staged-ubuntu-arm]
+    needs: [prepare, arm-runner-health, build-staged-arm, build-staged-ubuntu-arm, fedora-sqlite-arm]
     if: >-
       !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.arm64 == 'true' &&
       needs.arm-runner-health.result == 'success' &&
+      (needs.fedora-sqlite-arm.result == 'success' || needs.fedora-sqlite-arm.result == 'skipped') &&
       (needs.build-staged-arm.result == 'success' || needs.build-staged-arm.result == 'skipped') &&
       (needs.build-staged-ubuntu-arm.result == 'success' || needs.build-staged-ubuntu-arm.result == 'skipped')
     runs-on: ${{ vars.OMG_QEMU_ARM_RUNNER || 'ubuntu-24.04-arm' }}
@@ -504,11 +514,29 @@ jobs:
           name: staged-arm-${{ matrix.distro }}
           path: staged/
 
+      - name: Download current-run native ARM Fedora SQLite supply
+        if: matrix.distro == 'fedora'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: fedora-sqlite-aarch64-*
+          path: ${{ runner.temp }}/fedora-sqlite-inputs
+
+      - name: Admit latest same-revision ARM Fedora SQLite supply
+        if: matrix.distro == 'fedora'
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          bundle=$(python3 scripts/fedora-sqlite.py select "$RUNNER_TEMP/fedora-sqlite-inputs" \
+            --arch aarch64 --attempt "$GITHUB_RUN_ATTEMPT" --revision "$SOURCE_REVISION")
+          printf 'FEDORA_SQLITE_BUNDLE=%s\n' "$bundle" >> "$GITHUB_ENV"
+
       - name: Run disposable ARM guest lifecycle + read benchmarks + inventory rows
         # Match x64 staged coverage, including the selected CLI inventory.
         run: |
           python3 scripts/check-qemu-runner-isolation.py
-          ./scripts/benchmark-qemu.sh --arch aarch64 --distro "${{ matrix.distro }}" --benchmark --evidence-dir "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" \
+          sqlite_args=()
+          if [[ "${{ matrix.distro }}" == fedora ]]; then sqlite_args+=(--fedora-sqlite-bundle "$FEDORA_SQLITE_BUNDLE"); fi
+          ./scripts/benchmark-qemu.sh "${sqlite_args[@]}" --arch aarch64 --distro "${{ matrix.distro }}" --benchmark --evidence-dir "$RUNNER_TEMP/$QEMU_EVIDENCE_NAME" \
             --release "${{ needs.prepare.outputs.tag }}" \
             --inventory-policy tests/qemu-inventory-policy.json \
             --image-policy tests/qemu-image-provenance/manifest.json \
@@ -564,7 +592,7 @@ jobs:
   # code. Guest execution never receives issue-write permission.
   summary:
     name: "QEMU matrix result"
-    needs: [prepare, arm-runner-health, build-staged-arm, build-staged-ubuntu-arm, guest, guest-arm]
+    needs: [prepare, arm-runner-health, build-staged-arm, build-staged-ubuntu-arm, fedora-sqlite-arm, guest, guest-arm]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

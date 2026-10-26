@@ -284,6 +284,16 @@ jobs:
   # STAGE 2: Platform Matrix (Linux containers)
   # Parallel builds across Arch, Debian, Ubuntu 26.04, Fedora
   #############################################################################
+  fedora-sqlite:
+    name: Fedora SQLite supply
+    needs: quick-gate
+    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    uses: ./.github/workflows/fedora-sqlite.yml
+    permissions:
+      contents: read
+    with:
+      arch: x86_64
+
   linux-matrix:
     name: "Linux (${{ matrix.platform }})"
     needs: quick-gate
@@ -1659,7 +1669,7 @@ jobs:
   # in the push-to-main-only release-tag job below.
   qemu:
     name: QEMU behavioral verification
-    needs: [quick-gate, linux-matrix, ubuntu]
+    needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]
     if: >-
       !cancelled() &&
       (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
@@ -1730,7 +1740,7 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, workflow-checks, standalone-suites, portable, linux-matrix, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
+    needs: [quick-gate, workflow-checks, standalone-suites, portable, linux-matrix, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1745,6 +1755,7 @@ jobs:
           STANDALONE_SUITES: ${{ needs.standalone-suites.result }}
           PORTABLE: ${{ needs.portable.result }}
           LINUX_MATRIX: ${{ needs.linux-matrix.result }}
+          FEDORA_SQLITE: ${{ needs.fedora-sqlite.result }}
           SANDBOX_CANCELLATION: ${{ needs.sandbox-cancellation.result }}
           FEATURE_INTERSECTIONS: ${{ needs.feature-intersections.result }}
           MACOS: ${{ needs.macos.result }}
@@ -1764,6 +1775,7 @@ jobs:
           echo "| Standalone suites | $STANDALONE_SUITES |" >> $GITHUB_STEP_SUMMARY
           echo "| Portable Rust | $PORTABLE |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Matrix | $LINUX_MATRIX |" >> $GITHUB_STEP_SUMMARY
+          echo "| Fedora SQLite supply | $FEDORA_SQLITE |" >> $GITHUB_STEP_SUMMARY
           echo "| AUR Sandbox Cancellation | $SANDBOX_CANCELLATION |" >> $GITHUB_STEP_SUMMARY
           echo "| Feature Intersections | $FEATURE_INTERSECTIONS |" >> $GITHUB_STEP_SUMMARY
           echo "| macOS | $MACOS |" >> $GITHUB_STEP_SUMMARY
@@ -1797,6 +1809,7 @@ jobs:
             ["Standalone suites"]="$STANDALONE_SUITES"
             ["Portable Rust"]="$PORTABLE"
             ["Linux Matrix"]="$LINUX_MATRIX"
+            ["Fedora SQLite supply"]="$FEDORA_SQLITE"
             ["AUR Sandbox Cancellation"]="$SANDBOX_CANCELLATION"
             ["Feature Intersections"]="$FEATURE_INTERSECTIONS"
             ["macOS"]="$MACOS"
