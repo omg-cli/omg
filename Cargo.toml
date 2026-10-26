@@ -313,7 +313,7 @@ proptest = "1.4"                                             # Property-based te
 serial_test = "4.0.1"                                          # Serialize tests that modify global state
 scopeguard = "1.2"
 temp-env = "0.3"
-zstd = "0.13"                                                # For decompression benchmarks
+zstd = "0.14.3"                                                # For decompression benchmarks
 
 # Maximum optimization for production releases
 [profile.release]
