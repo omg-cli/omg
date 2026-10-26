@@ -95,12 +95,7 @@ harness = false
 # - The archlinux/alpm git family is pinned by exact version (`=`) AND full
 #   commit rev for supply-chain integrity. Updates require a deliberate rev
 #   bump applied to ALL five alpm-* entries together (same repo commit).
-# - sequoia-openpgp tracks the stable 2.x line (currently 2.4.1). The PQC
-#   pre-release experiment ended: post-quantum algorithms ship only in
-#   `-pqc` pre-releases until the standards ratify, so stable is the
-#   correct target for signature verification use. The experimental-crypto
-#   build flags stay because sequoia's RustCrypto backend requires the
-#   opt-in to compile at all, not because PQC algorithms are enabled.
+# - sequoia-openpgp tracks the stable 2.x line; Cargo.lock pins the exact release.
 # ----------------------------------------------------------------------------
 [dependencies]
 
@@ -114,7 +109,7 @@ anyhow = "1.0.103"
 thiserror = "2.0.17"
 
 # Async runtime
-tokio = { version = "1.49", features = [
+tokio = { version = "1.51.6", features = [
   "rt",
   "rt-multi-thread",
   "macros",
@@ -309,7 +304,7 @@ stats_alloc = "=0.1.10" # Allocation regression instrumentation; no runtime depe
 syn = { version = "2.0", features = ["full", "visit"] } # Parse source-audit item boundaries.
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 lzma-rs = "0.3" # Test-only XZ encoder for synthetic archives.
-tokio = { version = "1.49", features = ["test-util"] }
+tokio = { version = "1.51.6", features = ["test-util"] }
 rcgen = "=0.13.2"
 tokio-rustls = { version = "=0.26.4", default-features = false } # Real TLS fixtures; already locked transitively.
 criterion = { version = "0.8", features = ["html_reports"] }
@@ -318,7 +313,7 @@ proptest = "1.4"                                             # Property-based te
 serial_test = "4.0.1"                                          # Serialize tests that modify global state
 scopeguard = "1.2"
 temp-env = "0.3"
-zstd = "0.13"                                                # For decompression benchmarks
+zstd = "0.14.3"                                                # For decompression benchmarks
 
 # Maximum optimization for production releases
 [profile.release]

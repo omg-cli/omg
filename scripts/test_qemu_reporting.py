@@ -1373,6 +1373,40 @@ class ReportingBoundaryTests(unittest.TestCase):
                 self.assertEqual(calls[0][1][0]["result"], "HARNESS_ERROR")
                 self.assertEqual(calls[0][1][0]["case_id"], "qemu-matrix-x86-workflow")
 
+    def test_invalid_archive_reports_closed_stage_without_changing_failure(self):
+        calls, catalog = self.run_report_fixture([self.row()], corrupt=True)
+        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        self.assertEqual(catalog["failures"][0]["result"], "HARNESS_ERROR")
+        self.assertEqual(catalog["failures"][0]["exit_code"], 1)
+        transcript = calls[0][2]["matrix-qemu-matrix-x86-workflow"]
+        self.assertIn("Evidence admission failed: stage=artifact-archive kind=invalid-data", transcript)
+
+    def test_missing_artifact_metadata_reports_distinct_closed_stage(self):
+        calls, catalog = self.run_report_fixture([self.row()], artifacts_payload=dict(
+            total_count=1, artifacts=[dict(name="qemu-evidence-arch")]))
+        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        self.assertEqual(catalog["failures"][0]["result"], "HARNESS_ERROR")
+        self.assertEqual(catalog["failures"][0]["exit_code"], 1)
+        transcript = calls[0][2]["matrix-qemu-matrix-x86-workflow"]
+        self.assertIn("Evidence admission failed: stage=artifact-metadata kind=missing-field", transcript)
+
+    def test_job_failure_keeps_first_closed_diagnostic_without_exception_payload(self):
+        error = REPORT.subprocess.CalledProcessError(
+            1, ["private-command", "https://private.invalid/secret-marker"],
+            output="secret-marker", stderr="secret-marker")
+        with patch.object(REPORT.sys, "stderr", io.StringIO()) as diagnostic:
+            calls, catalog = self.run_report_fixture([self.row()], jobs_api_error=error)
+        self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        self.assertEqual(catalog["failures"][0]["result"], "HARNESS_ERROR")
+        transcript = calls[0][2]["matrix-qemu-matrix-workflow"]
+        self.assertIn("Evidence admission failed: stage=job-listing kind=process-error", transcript)
+        self.assertEqual(diagnostic.getvalue(),
+                         "Evidence admission failed: stage=job-listing kind=process-error\n")
+        for private in ("secret-marker", "private-command", "private.invalid"):
+            self.assertNotIn(private, transcript)
+            self.assertNotIn(private, json.dumps(catalog))
+            self.assertNotIn(private, diagnostic.getvalue())
+
     def test_unreadable_unrelated_historical_policy_files_report_only_workflow_failure(self):
         for damage in ("missing", "tampered"):
             for conclusion, guest_result in (("failure", "FAIL"), ("success", "PASS")):
