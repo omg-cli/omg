@@ -14,7 +14,8 @@ Build dependencies come only from signature-checked Fedora 44 release/updates
 repositories. The complete installed dependency inventory is retained.
 
 The retained WAL backport is combined with the exact upstream `walrestart.test`
-from [SQLite commit fe57e14](https://github.com/sqlite/sqlite/commit/fe57e14b49f9189b56da8233ab3415ce5ff6b1ff).
+from [SQLite commit fe57e14](https://github.com/sqlite/sqlite/commit/fe57e14b49f9189b56da8233ab3415ce5ff6b1ff),
+plus its upstream callback cleanup described below.
 The added test is discovered by the original complete test suite. The package
 release is `2.omgci.walreset2.fc44` to distinguish it from the earlier privately
 verified fixture. Its source, patch, key and pinned builder image are recorded
@@ -84,3 +85,17 @@ lands. ARM receives no runtime credit without its existing real native ARM/KVM
 runner gate and guest evidence. This review does not establish the historical
 cause of #626 or #623. The separate compatible dependency blocker #996 still
 holds the product release.
+
+
+## Fault callback cleanup
+
+The original WAL regression from `fe57e14b` leaves a process-global fault
+callback pointing at its destroyed Tcl interpreter. Hosted RPM checking reproduced
+the next-file failure at `walro.test` with `[faultsim 500]`. The native two-file
+control reproduced that failure and then passed 48 assertions with zero errors
+when applying only SQLite's upstream cleanup. No assertion or expected value changes.
+
+The patch includes `sqlite3_test_control_fault_install` before `finish_test`, as
+in [SQLite's callback cleanup commit](https://github.com/sqlite/sqlite/commit/ea595494e202c9aa9d733bfe379e228f5cb828b6).
+All original regression assertions stay intact. Full RPM and fresh candidate CI
+must still pass; the two-file control alone does not qualify the package.
