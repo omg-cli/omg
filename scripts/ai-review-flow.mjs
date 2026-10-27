@@ -37,6 +37,7 @@ import {
     sourceReviewEndpoint,
 } from "./review-source-evidence.mjs";
 import { validateReviewProposal } from "../services/ci-inspector/src/review-contract.ts";
+import { collectIssueSources, assertIssueUnchanged } from "./github-issue-source.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const command = promisify(execFile);
@@ -364,14 +365,26 @@ export function reviewTarget(eventName, event) {
     if (eventName === "workflow_dispatch") {
         const input = event.inputs ?? {};
 
-        if (Object.keys(input).some((key) => !["branch", "publish", "scope", "audit_sha", "audit_digest", "audit_cursor", "audit_parent", "audit_manifest", "audit_resnapshot"].includes(key)))
+        if (Object.keys(input).some((key) => !["branch", "publish", "scope", "issue", "audit_sha", "audit_digest", "audit_cursor", "audit_parent", "audit_manifest", "audit_resnapshot"].includes(key)))
             throw new Error("Unknown manual review input.");
 
         if (![undefined, false, true, "false", "true"].includes(input.publish))
             throw new Error("Invalid publication input.");
 
-        if (![undefined, "changes", "source-audit", "runtime-events", "test-audit"].includes(input.scope)) throw new Error("Unknown review scope.");
-        if(input.scope === "test-audit")return testAuditTarget(input);
+        if (![undefined, "changes", "source-audit", "runtime-events", "test-audit", "issue"].includes(input.scope)) throw new Error("Unknown review scope.");
+        if (input.scope === "issue") {
+            if (typeof input.issue !== "string" || !/^[1-9][0-9]*$/.test(input.issue) || !Number.isSafeInteger(Number(input.issue)) ||
+                [input.audit_sha, input.audit_digest, input.audit_cursor, input.audit_parent, input.audit_manifest].some(Boolean) ||
+                ![undefined, false, "false", ""].includes(input.audit_resnapshot))
+                throw new Error("Issue repair requires one issue number and no audit inputs");
+            return { branch: branchName(input.branch), sha: null, publish: input.publish === true || input.publish === "true",
+                range: { kind: "issue", issue: Number(input.issue) } };
+        }
+        if (input.issue) throw new Error("Issue number requires issue scope");
+        if(input.scope === "test-audit") {
+            const { issue: _issue, ...auditInput } = input;
+            return testAuditTarget(auditInput);
+        }
         if(input.audit_manifest||![undefined,false,"false", ""].includes(input.audit_resnapshot))throw new Error("Campaign inputs require test-audit scope");
         const auditInputs = [input.audit_sha, input.audit_digest, input.audit_cursor, input.audit_parent];
         if (input.scope === "source-audit") {
@@ -521,7 +534,7 @@ export async function runReviewFlow({ target, io }) {
         };
     }
     const sha = head;
-    const precollected = ["audit", "runtime", "test-audit"].includes(target.range?.kind)
+    const precollected = ["audit", "runtime", "test-audit", "issue"].includes(target.range?.kind)
         ? await io.collect(sha, branch, target.range, { reserve: target.publish === true }) : undefined;
     if (precollected?.replayRef) {
         try {
@@ -646,6 +659,7 @@ export async function runReviewFlow({ target, io }) {
             sha, branch,
             sourceFiles: entries.map(({ path, blobSha, content }) => ({ path, blobSha, content })),
             runtimeEvidence: collected.runtimeEvidence,
+            ciFailures: collected.issueEvidence,
         }) : createSourceReviewEvidence({
             sha,
             baseSha: collected.baseSha,
@@ -1327,6 +1341,8 @@ async function createController(github, controllerRevision, transition) {
             }
         },
         collect: async (sha, _branch, range, options) => {
+            if (range?.kind === "issue")
+                return collectIssueSources({ github, sha, number: range.issue, directory: root });
             if(range?.kind === "test-audit") {
                 const manifest=JSON.parse(await readFile(path.join(root,"config/test-audit-backlog.json"),"utf8"));
                 const page=await collectTestAuditPage({sha,manifest,cursor:range.cursor,pageSize:1,inventoryDigest:range.inventoryDigest,manifestDigest:range.resnapshotOf?range.manifestDigest:undefined,directory:root});
@@ -1525,6 +1541,7 @@ export async function main(args = process.argv.slice(2)) {
         if(campaignManifest){report.campaignParent=target.auditParent??null;report.triggerSha=exactSha(process.env.GITHUB_SHA);report.campaignRun={runId:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT};}
         if (target.controllerTransition) report.controllerTransition = target.controllerTransition;
         report.controllerRevision = revision;
+        await assertIssueUnchanged(github, report.sourceRange);
         await mkdir(directory, { recursive: true });
         await writeFile(path.join(directory, "review.json"), `${JSON.stringify(report)}\n`, {
             flag: "wx",
@@ -1651,6 +1668,7 @@ export async function main(args = process.argv.slice(2)) {
 
     if (flag === "--publish" && report.publishRequested !== true)
         throw new Error("This review did not authorize publication.");
+    await assertIssueUnchanged(github, report.sourceRange);
     const results = [];
     const coder = await protectedConfig("omg-ci-coder.json");
     const codingEndpoint = coderEndpoint(coder);

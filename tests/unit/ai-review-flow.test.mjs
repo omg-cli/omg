@@ -201,7 +201,7 @@ test("weekly workflow chains bounded pages only through a separate trusted dispa
     assert.deepEqual(workflow.on.schedule, [{ cron: "23 6 * * 1" }, { cron: "*/15 * * * *" }, {cron:"11 */6 * * *"}]);
     assert.equal(workflow.concurrency.group, "omg-ai-review-global");
     assert.equal(workflow.concurrency.queue, "max");
-    assert.deepEqual(workflow.on.workflow_dispatch.inputs.scope.options, ["changes", "source-audit", "runtime-events", "test-audit"]);
+    assert.deepEqual(workflow.on.workflow_dispatch.inputs.scope.options, ["changes", "source-audit", "runtime-events", "test-audit", "issue"]);
     assert.match(workflow.jobs.review.if, /github.event_name == 'schedule'/);
     const continuation = workflow.jobs.continue;
     assert.deepEqual(continuation.needs, ["review", "publish"]);

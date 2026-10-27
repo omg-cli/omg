@@ -18,8 +18,12 @@ on:
       scope:
         description: Review current changes, one immutable source audit page, or pending runtime evidence
         type: choice
-        options: [changes, source-audit, runtime-events, test-audit]
+        options: [changes, source-audit, runtime-events, test-audit, issue]
         default: changes
+      issue:
+        description: One open OMG issue whose referenced Rust source fits existing review limits
+        type: string
+        default: ""
       audit_sha:
         description: Exact commit for a resumed source audit
         type: string
