@@ -1,4 +1,5 @@
 import { assertRustSourceChange } from "./rust-source-policy.mjs";
+import { REVIEW_SOURCE_BYTES } from "../services/ci-inspector/src/review-contract.ts";
 import { createHash } from "node:crypto";
 import { Schema } from "effect";
 import { runtimeEvidenceSchema } from "../services/ci-inspector/src/runtime-evidence.ts";
@@ -15,7 +16,7 @@ const positive = Schema.Number.check(
 const sourceFile = Schema.Struct({
     path: text(300),
     blobSha: sha40,
-    content: Schema.String.check(Schema.isMaxLength(24000)),
+    content: Schema.String.check(Schema.isMaxLength(REVIEW_SOURCE_BYTES), Schema.makeFilter(value => Buffer.byteLength(value) <= REVIEW_SOURCE_BYTES)),
 });
 
 const inputSchema = Schema.Struct({
@@ -75,7 +76,7 @@ const reviewSchema = Schema.Struct({
 const sourceSchema = Schema.Struct({
     sha: sha40,
     mode: Schema.Literal("100644"),
-    content: Schema.String.check(Schema.isMaxLength(24000)),
+    content: Schema.String.check(Schema.isMaxLength(REVIEW_SOURCE_BYTES), Schema.makeFilter(value => Buffer.byteLength(value) <= REVIEW_SOURCE_BYTES)),
 });
 
 const parse = (schema, value) =>
@@ -266,7 +267,7 @@ export async function collectCandidateSources({ github, sha, paths, onHeld }) {
             onHeld(path, "nonregular-source");
             continue;
         }
-        if (onHeld && Number.isSafeInteger(entry.size) && entry.size > 24000) {
+        if (onHeld && Number.isSafeInteger(entry.size) && entry.size > REVIEW_SOURCE_BYTES) {
             onHeld(path, "source-byte-budget-exceeded");
             continue;
         }
@@ -276,13 +277,14 @@ export async function collectCandidateSources({ github, sha, paths, onHeld }) {
         const blob = await github.request("GET", `${prefix}/git/blobs/${entry.sha}`);
 
         const content = parse(
-            Schema.Struct({ encoding: Schema.Literal("base64"), content: text(40000) }),
+            Schema.Struct({ encoding: Schema.Literal("base64"), content: text(REVIEW_SOURCE_BYTES * 2) }),
             { encoding: blob.encoding, content: blob.content },
         );
 
         const bytes = Buffer.from(content.content, "base64");
-        if (onHeld && (bytes.length > 24000 || bytes.includes(0))) {
-            onHeld(path, bytes.length > 24000 ? "source-byte-budget-exceeded" : "binary-source");
+        if (bytes.length > REVIEW_SOURCE_BYTES || bytes.includes(0)) {
+            if (!onHeld) throw new Error("Review source exceeds the byte budget or contains NUL");
+            onHeld(path, bytes.length > REVIEW_SOURCE_BYTES ? "source-byte-budget-exceeded" : "binary-source");
             continue;
         }
         let decoded;

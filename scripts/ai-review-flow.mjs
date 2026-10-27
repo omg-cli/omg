@@ -36,7 +36,7 @@ import {
     createSourceAuditEvidence,
     sourceReviewEndpoint,
 } from "./review-source-evidence.mjs";
-import { validateReviewProposal } from "../services/ci-inspector/src/review-contract.ts";
+import { validateReviewProposal, REVIEW_SOURCE_BYTES } from "../services/ci-inspector/src/review-contract.ts";
 import { collectIssueSources, assertIssueUnchanged } from "./github-issue-source.mjs";
 import { ciImageInputsSha256 } from "./ci-image-inputs.mjs";
 
@@ -431,6 +431,7 @@ export function partitionReviewSources(entries) {
     const unreviewedPaths = [];
     let batch = [];
     let bytes = 0;
+    let sourceBytes = 0;
 
     for (const entry of entries) {
         if (seen.has(entry.path)) throw new Error("Duplicate source path.");
@@ -438,7 +439,7 @@ export function partitionReviewSources(entries) {
         let reason;
 
         if (!isReviewSourcePath(entry.path)) reason = "unsupported-source-type";
-        else if (Buffer.byteLength(entry.content) > 24000) reason = "source-byte-budget-exceeded";
+        else if (Buffer.byteLength(entry.content) > REVIEW_SOURCE_BYTES) reason = "source-byte-budget-exceeded";
         else if (Buffer.byteLength(entry.diff ?? "") > 64000) reason = "diff-byte-budget-exceeded";
 
         if (reason) {
@@ -446,10 +447,12 @@ export function partitionReviewSources(entries) {
             continue;
         }
 
-        if (batch.length === 12 || bytes + Buffer.byteLength(entry.diff ?? "") > 64000) {
+        if (batch.length === 12 || bytes + Buffer.byteLength(entry.diff ?? "") > 64000 ||
+            sourceBytes + Buffer.byteLength(entry.content) > REVIEW_SOURCE_BYTES) {
             batches.push(batch);
             batch = [];
             bytes = 0;
+            sourceBytes = 0;
         }
 
         if (batches.length >= 4) {
@@ -459,6 +462,7 @@ export function partitionReviewSources(entries) {
 
         batch.push(entry);
         bytes += Buffer.byteLength(entry.diff ?? "");
+        sourceBytes += Buffer.byteLength(entry.content);
     }
 
     if (batch.length) batches.push(batch);
@@ -840,7 +844,7 @@ export async function collectSources(github, sha, range, directory = root) {
 
         if (!Number.isSafeInteger(size) || size < 0) throw new Error("Invalid Git blob size.");
 
-        if (size > 24000) {
+        if (size > REVIEW_SOURCE_BYTES) {
             unreviewedPaths.push({ path: change.path, reason: "source-byte-budget-exceeded" });
             continue;
         }
@@ -917,7 +921,7 @@ export async function collectAuditSources(sha, range, directory = root) {
         else if (file.includes("\\") || /[\x00-\x1f\x7f]/.test(file) || file.startsWith("/") ||
             file.split("/").some((segment) => !segment || segment === "." || segment === "..")) reason = "invalid-source-path";
         else if (!isReviewSourcePath(file)) reason = "unsupported-source-type";
-        else if (Number(sizeText) > 24000) reason = "source-byte-budget-exceeded";
+        else if (Number(sizeText) > REVIEW_SOURCE_BYTES) reason = "source-byte-budget-exceeded";
         if (reason) { unreviewedPaths.push({ path: file, reason }); continue; }
         const bytes = await sourceGit(["cat-file", "blob", blobSha], null);
         if (bytes.includes(0)) { unreviewedPaths.push({ path: file, reason: "binary-source" }); continue; }

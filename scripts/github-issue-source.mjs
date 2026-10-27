@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { SOURCE_REPOSITORY, createSourceAuditEvidence } from "./review-source-evidence.mjs";
+import { REVIEW_SOURCE_BYTES } from "../services/ci-inspector/src/review-contract.ts";
 
 const execute = promisify(execFile);
 const digest = value => createHash("sha256").update(value).digest("hex");
@@ -35,7 +36,7 @@ export async function collectIssueSources({ github, sha, number, directory }) {
     if (!paths.length || paths.length > 12 || paths.some(file => file.split("/").some(p => p === "." || p === "..")))
         throw new Error("Issue must reference one to twelve complete Rust source files");
     const git = async args => (await execute("git", ["--no-pager", "--literal-pathspecs", ...args], {
-        cwd: directory, encoding: "buffer", timeout: 30000, maxBuffer: 26000, windowsHide: true,
+        cwd: directory, encoding: "buffer", timeout: 30000, maxBuffer: REVIEW_SOURCE_BYTES + 8192, windowsHide: true,
     })).stdout;
     const entries = [];
     for (const file of paths) {
@@ -43,7 +44,7 @@ export async function collectIssueSources({ github, sha, number, directory }) {
         const match = /^(100644|100755) blob ([a-f0-9]{40}) +([0-9]+)\t([^\0]+)\0$/.exec(listing);
         if (!match || match[4] !== file) throw new Error(`Issue source is missing or non-regular: ${file}`);
         const size = Number(match[3]);
-        if (size > 24000) throw new Error(`Complete issue source exceeds existing budget: ${file}`);
+        if (size > REVIEW_SOURCE_BYTES) throw new Error(`Complete issue source exceeds existing budget: ${file}`);
         const bytes = await git(["show", `${sha}:${file}`]);
         if (bytes.length !== size) throw new Error("Issue source size mismatch");
         entries.push({ path: file, blobSha: match[2], size,

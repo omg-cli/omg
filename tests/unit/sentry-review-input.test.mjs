@@ -100,10 +100,18 @@ test("unknown release attribution remains explicit and can produce a reproducibl
 test("oversized owned source is held before strict collection and cannot poison the pending queue", async () => {
     let outcome;
     try {
-        const result = await collectRuntimeSources(fixture([event], "x".repeat(24001)));
+        const result = await collectRuntimeSources(fixture([event], "x".repeat(256 * 1024 + 1)));
         outcome = { entries: result.entries, held: result.unreviewedPaths };
     } catch (error) { outcome = { error: error.name }; }
     expect(outcome).toEqual({ entries: [], held: [{ path: "src/value.rs", reason: "source-byte-budget-exceeded" }] });
+});
+
+test("runtime evidence retains a complete larger Rust blob under the shared source limit", async () => {
+    const larger = "// complete Rust source\n".repeat(1500);
+    const result = await collectRuntimeSources(fixture([event], larger));
+    expect(result.unreviewedPaths).toEqual([]);
+    expect(result.entries[0].content).toBe(larger);
+    expect(result.entries[0].blobSha).toBe(createHash("sha1").update(`blob ${Buffer.byteLength(larger)}\0${larger}`).digest("hex"));
 });
 
 test("unreadable runtime source has a held reason while provider failures still fail the run", async () => {

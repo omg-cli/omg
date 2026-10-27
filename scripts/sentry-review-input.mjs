@@ -1,4 +1,5 @@
 import { collectCandidateSources } from "./ai-review-candidate.mjs";
+import { REVIEW_SOURCE_BYTES } from "../services/ci-inspector/src/review-contract.ts";
 import { runtimeEvidencePageSchema, runtimeReviewRefSchema } from "../services/ci-inspector/src/runtime-evidence.ts";
 import { canRecoverRuntimeBeforeInference } from "../services/ci-inspector/src/runtime-recovery.ts";
 
@@ -63,7 +64,7 @@ export async function collectRuntimeSources({ github, sha, endpoint, token, requ
     const unreviewedPaths = [];
     for (const file of paths) {
         const source = sources.get(file);
-        const reason = held.get(file) ?? (!source ? "runtime-source-unavailable" : Buffer.byteLength(source.content) > 24000 ? "source-byte-budget-exceeded" : null);
+        const reason = held.get(file) ?? (!source ? "runtime-source-unavailable" : Buffer.byteLength(source.content) > REVIEW_SOURCE_BYTES ? "source-byte-budget-exceeded" : null);
         if (reason) unreviewedPaths.push({ path: file, reason });
         else entries.push({ path: file, blobSha: source.sha, content: source.content });
     }

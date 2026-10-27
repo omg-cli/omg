@@ -138,7 +138,7 @@ test("source evidence refuses binary files, symlinks and submodules", () => {
 });
 
 test("source evidence refuses content and diff budget overflow without truncation", () => {
-    assert.throws(() => createSourceReviewEvidence(fixture("x".repeat(24001))), /budget|large/);
+    assert.throws(() => createSourceReviewEvidence(fixture("x".repeat(256 * 1024 + 1))), /budget|large/);
     assert.throws(
         () => createSourceReviewEvidence({ ...fixture(), diff: "x".repeat(64001) }),
         /budget|large/,
