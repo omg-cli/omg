@@ -243,6 +243,9 @@ export class CiSandbox extends NativeCiSandbox {
       await this.ctx.storage.setAlarm(Date.now() + 60_000);
     }
   }
+  cancel() {
+    return this.destroy();
+  }
   override destroy() {
     this.teardown = true;
     return this.trace("destroy", async () => {
