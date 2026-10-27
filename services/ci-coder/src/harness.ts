@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { Lifecycle } from "agents/lifecycle";
 import { OpenCodeHarness } from "agents/harness/opencode";
 import { createAI } from "agents/models/opencode";
+import { pacedAI } from "../../ci-inspector/src/model-admission";
 import { OpenCodeWorkerd } from "@opencode/sdk/workerd";
 import { Plugin, Agent } from "@opencode/plugin";
 import { Schema } from "effect";
@@ -26,7 +27,7 @@ import {
 } from "./runtime.js";
 
 export class Coder extends DurableObject<Env> {
-  private readonly ai = createAI({ binding: this.env.AI });
+  private readonly ai = createAI({ binding: pacedAI(this.env.AI, this.env.MODEL_PACER) });
   private readonly harness = new OpenCodeHarness({
     opencode: async ({ storage }) => {
       const skills = await createRequiredSkillsPlugin();
@@ -82,7 +83,7 @@ export class Coder extends DurableObject<Env> {
         ],
       });
     },
-    defaults: { model: this.ai(CODING_MODEL, { reasoningEffort: "high" }), agent: "build" },
+    defaults: { model: this.ai(CODING_MODEL, { reasoningEffort: "low" }), agent: "build" },
   });
   private readonly lifecycle = Lifecycle.install(this).use(this.harness);
 

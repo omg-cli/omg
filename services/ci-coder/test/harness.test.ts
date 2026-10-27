@@ -1,5 +1,21 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { z } from "zod";
 import { codingRuntimeIdentity, assertRuntimeIdentity } from "../src/runtime";
+
+test("the coding consumer uses the CI worker's exact image and verifier", () => {
+  const config = z.object({ vars: z.object({
+    CI_IMAGE_DIGEST: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    CI_VERIFIER_REVISION: z.string().regex(/^[a-f0-9]{40}$/),
+  }) });
+  const [worker, coder] = ["../../cloud-ci/wrangler.jsonc", "../wrangler.jsonc"].map(path =>
+    config.parse(Bun.JSONC.parse(readFileSync(new URL(path, import.meta.url), "utf8"))).vars,
+  );
+  const runtime = codingRuntimeIdentity({ ...coder, CI_API_TOKEN: "x".repeat(32) }, "a".repeat(64));
+  expect({ image: runtime.imageDigest, verifier: runtime.verifierRevision }).toEqual({
+    image: worker.CI_IMAGE_DIGEST, verifier: worker.CI_VERIFIER_REVISION,
+  });
+});
 
 test("a durable coding operation cannot silently change verifier or mandatory skills on recovery", () => {
   const configuration = {
@@ -16,6 +32,7 @@ test("a durable coding operation cannot silently change verifier or mandatory sk
     JSON.stringify({ ...identity, bundleSha256: "d".repeat(64) }),
     JSON.stringify({ ...identity, imageDigest: `sha256:${"d".repeat(64)}` }),
     JSON.stringify({ ...identity, verifierRevision: "d".repeat(40) }),
+    JSON.stringify({ ...identity, reasoningEffort: "high" }),
   ])
     expect(() => assertRuntimeIdentity(previous, identity)).toThrow();
   expect(() =>

@@ -76,7 +76,7 @@ test("publisher independently admits cloud plan identity, runtime, skills and ac
         runtime: {
             ...policy,
             model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
-            reasoningEffort: "high",
+            reasoningEffort: "low",
         },
         skillsDelivery: {
             bundleSha256: policy.bundleSha256,

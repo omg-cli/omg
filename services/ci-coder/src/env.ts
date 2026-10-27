@@ -1,10 +1,12 @@
 import type { Ai } from "@cloudflare/workers-types/index.ts";
 import type { ApiBindings } from "./request.js";
+import type { ModelPacerNamespace } from "../../ci-inspector/src/model-admission";
 
 export type { CodingRequest } from "./request.js";
 
 export type Env = {
   AI: Ai;
+  MODEL_PACER: ModelPacerNamespace;
   CODER: ApiBindings["CODER"];
   CI_SERVICE: { fetch(input: string, init?: RequestInit): Promise<Response> };
   CI_API_TOKEN: string;

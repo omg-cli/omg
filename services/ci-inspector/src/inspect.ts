@@ -5,13 +5,14 @@ import { createWorkersAI } from "workers-ai-provider";
 import type { Snapshot } from "./snapshot";
 import { snapshotTools } from "./tools";
 import type { Ai, WorkerLoader } from "@cloudflare/workers-types/index.ts";
+import { pacedAI, type ModelPacerNamespace } from "./model-admission";
 
 export const MODEL = "@cf/deepseek-ai/deepseek-v4.1-flash-1017";
 
-export type InspectorEnv = { AI: Ai; LOADER: WorkerLoader; CI_INSPECTOR_TOKEN: string };
+export type InspectorEnv = { AI: Ai; MODEL_PACER: ModelPacerNamespace; LOADER: WorkerLoader; CI_INSPECTOR_TOKEN: string };
 
 export async function inspectSnapshot(snapshot: Snapshot, env: InspectorEnv) {
-  const workersai = createWorkersAI({ binding: env.AI });
+  const workersai = createWorkersAI({ binding: pacedAI(env.AI, env.MODEL_PACER) });
   let snapshotToolCalls = 0;
 
   const codemode = createCodeTool({

@@ -4,7 +4,9 @@ This document describes the repair paths added after the original Cloudflare CI 
 
 ## Cloud model and required skills
 
-Cloud inference uses Workers AI model `@cf/deepseek-ai/deepseek-v4.1-flash-1017`. The coding harness selects high reasoning. Local Codex model settings do not configure Cloudflare. The model is documented in the [Workers AI catalog](https://developers.cloudflare.com/workers-ai/models/deepseek-v4.1-flash-1017/).
+Cloud inference uses Workers AI model `@cf/deepseek-ai/deepseek-v4.1-flash-1017`. The coding harness selects low reasoning. Local Codex model settings do not configure Cloudflare. The model is documented in the [Workers AI catalog](https://developers.cloudflare.com/workers-ai/models/deepseek-v4.1-flash-1017/). Coding keeps its existing 6,000 output-token limit and 16 agent steps; diagnosis keeps its 24,000 output-token limit. The controller verifies the same reasoning configuration reported by the coder.
+
+Coder and inspector share the OMG `ModelPacer` Durable Object. It admits at most one inference every 12 seconds. CodeLoud's separate pacer permits 15 requests per minute on the same account and model, leaving five of the documented [20 requests per minute for paid Workers AI models](https://developers.cloudflare.com/workers-ai/platform/limits/) for OMG. Other callers can still consume that shared account quota. The admission adapter never retries inference; the harness retains its existing bounded retry policy. Admission waits obey the caller's cancellation signal.
 
 The pinned coding bundle includes Potato Mode, Ponytail, Rust best practices, Rust async patterns, and TDD. Bundle validation checks every source file hash. Mandatory guidance is delivered again when OpenCode generates or compacts context. A changed bundle requires a coder deployment and matching trusted bundle pin before a new operation starts.
 
@@ -66,6 +68,10 @@ Publication retries at most three times within the same job, preserving its run 
 The native SDK currently initializes only in the opt-in `omgd` daemon. Release builds default to Sentry environment `production`; debug builds default to `development` unless `SENTRY_ENVIRONMENT` is set. The intake allows the configured production environment. General CLI error capture and exact commit tagging need separate native implementation and verification. Do not claim those paths from a webhook fixture. See the [Rust SDK environment defaults](https://github.com/getsentry/sentry-rust/blob/0.49.0/sentry/src/defaults.rs).
 
 ## Activation evidence
+
+The October 27 recovery batch builds the Rust executor from `5543893617801998468b71b0e74bf2a18ff93bd3`. Its immutable registry manifest is `sha256:768b4ff3432702dbb212ade528445cf8093332593e65657e816c6b0ad85b72a6`, with config digest `sha256:c94f3e571f90755ab6abd7adb5f4c906fd455d5b2a5807cbea27747ea6822f60`. All 35 build-context files came from that commit. The build passed environment-envelope, frozen-input, portable-fixture, timeout-cleanup and unprivileged Rust 1.95.0 checks. Remote manifest, platform and config identity were checked after publication. These are image-build results; deployment and a cloud-generated Rust PR require their own acceptance evidence.
+
+The controller-renewal gate requires different old and new image identities. Activation must keep the image, verifier and controller identities consistent with the exact retained parent and the existing renewal planner. Keep new AI reviews enabled while using the existing admission hold for the transition. The inspector must also type-check before coder dependencies are installed; this prevents a shared helper from silently adding an undeclared package dependency.
 
 Before enabling unattended operation, retain all of the following evidence:
 

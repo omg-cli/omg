@@ -8,6 +8,7 @@ let mutations=0;
 const source=`
 import {DurableObject} from 'cloudflare:workers';
 import {OperationInterruptedError} from ${JSON.stringify(c+'/services/cloud-ci/node_modules/@cloudflare/sandbox/dist/index.js')};
+import {CiSandbox} from ${JSON.stringify(c+'/services/cloud-ci/node_modules/@cloudflare/ci/src/ci/sandbox.ts')};
 import {CI} from ${JSON.stringify(c+'/services/cloud-ci/src/pipeline.ts')};
 const mode=${JSON.stringify(mode)},sha='a'.repeat(40),id='cl-123-1-'+sha;
 const receiptKey='receipts/123-1/'+sha+'.json';
@@ -26,25 +27,28 @@ export class Interrupter extends DurableObject{
  }
 }
 function sandboxFor(env,name){
- const text=name.startsWith('source-format-')?'source format clean\\n':'';
+ const text='source format clean\\n';let command='';const startTime=new Date();
  return {
-  async exec(command,options){
-   if(name.startsWith('rust-portable-tests'.slice(0,16)+'-')&&options?.cwd==='/workspace')return env.INTERRUPTER.getByName('interrupt').fail();
-   return {success:true,exitCode:0,stdout:'',stderr:''};
-  },
-  async createBackup(){return {id:'synthetic-snapshot-'+name,dir:'/workspace'};},
+  env:{BACKUP_BUCKET:env.BUCKET},
+  async waitForConfiguration(){},
+  async exec(){return {success:true,exitCode:0,stdout:'',stderr:''};},
+  async startProcess(value,options){command=value;if(options.env.OMG_CI_LEAF_STEP==='rust-portable-tests')return env.INTERRUPTER.getByName('interrupt').fail();return {id:'fixture-process',command,startTime};},
+  async getProcess(id){return {id,command,startTime,status:'completed',exitCode:0};},
+  async createBackup(){const id='aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';await env.BUCKET.put('backups/'+id+'/meta.json','{}');await env.BUCKET.put('backups/'+id+'/data.sqsh','snapshot');return {id,dir:'/workspace'};},
   async restoreBackup(){},
   async listFiles(){return {files:[{absolutePath:'/tmp/ci-step.out',size:new TextEncoder().encode(text).length},{absolutePath:'/tmp/ci-step.err',size:0}]};},
-  async readFile(path){return {content:path.endsWith('.out')?text:''};},
-  async destroy(){},
+  async readFile(path){const bytes=new TextEncoder().encode(path.endsWith('.out')?text:'');return {content:new ReadableStream({start(c){c.enqueue(bytes);c.close();}})};},
+  async persistCiLogs(prefix){return CiSandbox.prototype.persistCiLogs.call(this,prefix);},
+  async destroy(){},async cancel(){},
  };
 }
 const provider={assertSource(){},create(){return {getSourceCheckout:async()=>({kind:'archive',url:'https://synthetic.invalid/source'}),startStepNotification:async()=>null,listTreeBlobs:async()=>null};}};
 export class Probe extends CI{
  constructor(ctx,env){
   const counter=env.COUNTER.getByName('counts');
-  const bucket={get:(...args)=>env.BUCKET.get(...args),put:async(key,...args)=>{if(key===receiptKey)await counter.increment('consumer');return env.BUCKET.put(key,...args);}};
-  super(ctx,{...env,BACKUP_BUCKET:bucket,SANDBOX:{make:name=>sandboxFor(env,name)},CI_IMAGE_DIGEST:'sha256:'+'b'.repeat(64)});
+  const bucket={head:(...args)=>env.BUCKET.head(...args),delete:(...args)=>env.BUCKET.delete(...args),get:(...args)=>env.BUCKET.get(...args),put:async(key,...args)=>{if(key===receiptKey)await counter.increment('consumer');return env.BUCKET.put(key,...args);}};
+  const actors=new Map();const make=name=>{if(!actors.has(name))actors.set(name,sandboxFor(env,name));return actors.get(name);};
+  super(ctx,{...env,BACKUP_BUCKET:bucket,SANDBOX:{make,idFromName:name=>name,get:make},CI_IMAGE_DIGEST:'sha256:'+'b'.repeat(64)});
  }
  static getProvider(){return provider;}
  async run(event,step){
@@ -69,11 +73,11 @@ export default{async fetch(request,env){
  return Response.json({label:'SYNTHETIC LOCAL WORKERD: actual SDK/RPC/CIWorkflow/pipeline; no containers/native/cloud acceptance',mode,before,after,objects});
 }};`;
 const built=await Bun.build({entrypoints:['actual-ci:entry'],target:'browser',external:['cloudflare:workers','node:*'],plugins:[{name:'actual production CI path with sandbox transport fixture',setup(build){
- build.onLoad({filter:/ci-workflow\.ts$/},({path})=>{if(!mutate)return;const code=readFileSync(path,'utf8');const anchor='throw decodeOperationInterrupted(stored);';assert.equal(code.split(anchor).length-1,1,'mutation must reach actual production decoder');mutations++;return {contents:code.replace(anchor,"throw new Error('mutation: dropped interruption');"),loader:'ts'};});
+ build.onLoad({filter:/ci-workflow\.ts$/},({path})=>{if(!mutate)return;const code=readFileSync(path,'utf8');const anchor='throw decodeOperationInterrupted(parsed);';assert.equal(code.split(anchor).length-1,1,'mutation must reach actual production decoder');mutations++;return {contents:code.replace(anchor,"throw new Error('mutation: dropped interruption');"),loader:'ts'};});
  build.onResolve({filter:/^actual-ci:entry$/},()=>({path:'entry',namespace:'actual-ci'}));
  build.onLoad({filter:/.*/,namespace:'actual-ci'},()=>({contents:source,loader:'ts'}));
  build.onResolve({filter:/^@cloudflare\/sandbox$/},()=>({path:'transport',namespace:'actual-ci-sandbox'}));
- build.onLoad({filter:/.*/,namespace:'actual-ci-sandbox'},()=>({contents:'export const getSandbox=(namespace,name)=>namespace.make(name);',loader:'js'}));
+ build.onLoad({filter:/.*/,namespace:'actual-ci-sandbox'},()=>({contents:'export {OperationInterruptedError} from '+JSON.stringify(c+'/services/cloud-ci/node_modules/@cloudflare/sandbox/dist/index.js')+';export class Sandbox{};export const getSandbox=(namespace,name)=>namespace.make(name);',loader:'js'}));
 }}]});
 assert.equal(built.success,true,JSON.stringify(built.logs));
 const worker=await built.outputs[0].text();

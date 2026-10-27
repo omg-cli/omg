@@ -7,13 +7,13 @@
   "compatibility_flags": ["nodejs_compat"],
   "ai": { "binding": "AI", "remote": true },
   "durable_objects": {
-    "bindings": [{ "name": "CODER", "class_name": "Coder" }],
+    "bindings": [{ "name": "CODER", "class_name": "Coder" }, { "name": "MODEL_PACER", "class_name": "ModelPacer" }],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Coder"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Coder"] }, { "tag": "v2", "new_sqlite_classes": ["ModelPacer"] }],
   "services": [{ "binding": "CI_SERVICE", "service": "omg-cloud-ci" }],
   "vars": {
-    "CI_IMAGE_DIGEST": "sha256:450cf77edc8afc9157ea40829e435981341385f3d7bf202baa72fdd163a0d11a",
-    "CI_VERIFIER_REVISION": "b14524dbe238876c938349432c87ac731b53fdbc"
+    "CI_IMAGE_DIGEST": "sha256:768b4ff3432702dbb212ade528445cf8093332593e65657e816c6b0ad85b72a6",
+    "CI_VERIFIER_REVISION": "5543893617801998468b71b0e74bf2a18ff93bd3"
   },
   "observability": { "enabled": false },
 }

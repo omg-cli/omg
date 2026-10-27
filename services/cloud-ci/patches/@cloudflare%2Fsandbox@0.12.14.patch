@@ -1,55 +1,136 @@
+diff --git a/dist/contexts-CxAJGHFf.d.ts b/dist/contexts-CxAJGHFf.d.ts
+--- a/dist/contexts-CxAJGHFf.d.ts
++++ b/dist/contexts-CxAJGHFf.d.ts
+@@ -215,0 +216 @@
++/** The Containers platform rate-limited admission of a new container. */ | 'container_start_rate_limited'
 diff --git a/dist/sandbox-DlkunMi0.js b/dist/sandbox-DlkunMi0.js
-index 275f544a09b1f1b21aefc90f28ef415f6537a02d..9dca3b65d6fe91555a487c2b94c744cc43323f35 100644
 --- a/dist/sandbox-DlkunMi0.js
 +++ b/dist/sandbox-DlkunMi0.js
-@@ -3315,0 +3316,1 @@
+@@ -753,2 +753,2 @@
+-		case ErrorCode.INTERNAL_ERROR: return new SandboxError(errorResponse);
+-		default: return new SandboxError(errorResponse);
++		case ErrorCode.INTERNAL_ERROR: return new SandboxError(errorResponse, options);
++		default: return new SandboxError(errorResponse, options);
+@@ -2556,0 +2557,4 @@
++		substring: "you are requesting too many containers per second",
++		reason: "container_start_rate_limited"
++	},
++	{
+@@ -2576,0 +2581,10 @@
++		if (candidate instanceof ContainerUnavailableError && candidate.code === ErrorCode.CONTAINER_UNAVAILABLE && candidate.context?.retryable === true && [
++			"container_starting",
++			"container_unhealthy",
++			"container_replaced",
++			"rpc_upgrade_failed",
++			"no_container_instance_available",
++			"max_container_instances_exceeded",
++			"container_unreachable",
++			"container_start_rate_limited"
++		].includes(candidate.context.reason)) return candidate.context.reason;
+@@ -3315,0 +3330 @@
 +	lastTransportMetadata = null;
-@@ -3471,1 +3472,5 @@
+@@ -3471 +3486,5 @@
 -	onWebSocketClose = () => {
 +	onWebSocketClose = (event) => {
 +		this.lastTransportMetadata = {
 +			kind: "peer_closed",
 +			...Number.isInteger(event?.code) && event.code >= 1e3 && event.code <= 4999 && { closeCode: event.code }
 +		};
-@@ -3482,0 +3488,1 @@
+@@ -3482,0 +3502 @@
 +		this.lastTransportMetadata = { kind: "connection_failed" };
-@@ -3909,0 +3916,3 @@
+@@ -3909,0 +3930,3 @@
 +	const metadata = context.connectionError;
 +	const metadataKind = metadata?.kind === "peer_closed" || metadata?.kind === "connection_failed" ? metadata.kind : void 0;
 +	const closeCode = Number.isInteger(metadata?.closeCode) && metadata.closeCode >= 1e3 && metadata.closeCode <= 4999 ? metadata.closeCode : void 0;
-@@ -3915,1 +3924,3 @@
+@@ -3915 +3938,3 @@
 -		retryable: false
 +		retryable: false,
 +		...metadataKind !== void 0 && { kind: metadataKind },
 +		...closeCode !== void 0 && { closeCode }
-@@ -4039,0 +4051,2 @@
+@@ -4039,0 +4065,2 @@
 +				const metadata = this.conn?.lastTransportMetadata;
 +				if (metadata && !this.connectionErrorIsAuthoritative) this.lastConnectionError = metadata;
-@@ -4289,1 +4302,1 @@
+@@ -4289 +4316 @@
 -	disconnect(cause) {
 +	async disconnect(cause) {
-@@ -4300,1 +4313,3 @@
+@@ -4300 +4327,3 @@
 -			conn.whenSettled().then(() => {
 +			try {
 +				await conn.whenSettled();
 +			} finally {
-@@ -4302,1 +4317,1 @@
+@@ -4302 +4331 @@
 -			});
 +			}
-@@ -8039,1 +8054,1 @@
+@@ -5261 +5290 @@
+-		body.pipeTo(sized.writable, { signal: pipeAbort.signal }).catch(() => {});
++		body.pipeTo(sized.writable, { signal: pipeAbort.signal }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -5908 +5937 @@
+-			}).catch(() => {});
++			}).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -7466 +7494,0 @@
+-const sandboxConfigurationCache = /* @__PURE__ */ new WeakMap();
+@@ -7502 +7529,0 @@
+-const BACKUP_DOWNLOAD_PARALLEL_PARTS = 8;
+@@ -7504 +7530,0 @@
+-const BACKUP_DOWNLOAD_MAX_PARTS = 64;
+@@ -7552,7 +7577,0 @@
+-}
+-function getNamespaceConfigurationCache(namespace) {
+-	const existing = sandboxConfigurationCache.get(namespace);
+-	if (existing) return existing;
+-	const created = /* @__PURE__ */ new Map();
+-	sandboxConfigurationCache.set(namespace, created);
+-	return created;
+@@ -7590,14 +7608,0 @@
+-}
+-function mergeSandboxConfiguration(cached, configuration) {
+-	return {
+-		...cached,
+-		...configuration.sandboxName && {
+-			sandboxName: configuration.sandboxName.name,
+-			normalizeId: configuration.sandboxName.normalizeId
+-		},
+-		...configuration.sleepAfter !== void 0 && { sleepAfter: configuration.sleepAfter },
+-		...configuration.keepAlive !== void 0 && { keepAlive: configuration.keepAlive },
+-		...configuration.containerTimeouts !== void 0 && { containerTimeouts: configuration.containerTimeouts },
+-		...configuration.transport !== void 0 && { transport: configuration.transport },
+-		...configuration.labels !== void 0 && { labels: cloneLabels(configuration.labels) }
+-	};
+@@ -7654,3 +7659,2 @@
+-	const namespaceCache = getNamespaceConfigurationCache(ns);
+-	const cachedConfiguration = namespaceCache.get(effectiveId);
+-	const configuration = buildSandboxConfiguration(effectiveId, options, cachedConfiguration);
++	const configuration = buildSandboxConfiguration(effectiveId, options);
++	let configurationReady = Promise.resolve();
+@@ -7658,9 +7662,2 @@
+-		const nextConfiguration = mergeSandboxConfiguration(cachedConfiguration, configuration);
+-		namespaceCache.set(effectiveId, nextConfiguration);
+-		applySandboxConfiguration(stub, configuration).catch(() => {
+-			if (cachedConfiguration) {
+-				namespaceCache.set(effectiveId, cachedConfiguration);
+-				return;
+-			}
+-			namespaceCache.delete(effectiveId);
+-		});
++		configurationReady = configurationReady.then(withSandboxOperationContext("sandbox.configure", () => applySandboxConfiguration(stub, configuration)));
++		configurationReady.catch(() => { console.warn('Sandbox configuration readiness failed'); });
+@@ -7670,0 +7668 @@
++		waitForConfiguration: () => configurationReady,
+@@ -7730 +7728 @@
+-			return withSandboxOperationContext(`sandbox.tunnels.${method}`, (...args) => stub.callTunnels(method, args));
++			return (...args) => configurationReady.then(withSandboxOperationContext(`sandbox.tunnels.${method}`, () => stub.callTunnels(method, args)));
+@@ -7736 +7734 @@
+-			if (typeof method === "function") return withSandboxOperationContext(`sandbox.${prop}`, method);
++			if (typeof method === "function") return (...args) => configurationReady.then(withSandboxOperationContext(`sandbox.${prop}`, () => method(...args)));
+@@ -8039 +8037 @@
 -				previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
 +				await previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
-@@ -8124,1 +8139,1 @@
+@@ -8124 +8122 @@
 -		previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
 +		await previousClient.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox transport was switched while the operation was pending."));
-@@ -8832,2 +8846,0 @@
+@@ -8832 +8830,10 @@
 -			this.client.disconnect(this.buildDisconnectCause("sandbox_lifetime_changed", "The sandbox was destroyed while the operation was pending."));
--			outcome = "success";
-@@ -8835,4 +8848,8 @@
--				await super.destroy();
--			} catch (error) {
--				if (!this.isNoInstanceError(error)) throw error;
--				this.logger.debug("super.destroy() reported no container instance; treating as no-op");
++			try {
 +				await this.client.disconnect(this.buildDisconnectCause("sandbox_lifetime_changed", "The sandbox was destroyed while the operation was pending."));
 +			} finally {
 +				try {
@@ -58,25 +139,189 @@ index 275f544a09b1f1b21aefc90f28ef415f6537a02d..9dca3b65d6fe91555a487c2b94c744cc
 +					if (!this.isNoInstanceError(error)) throw error;
 +					this.logger.debug("super.destroy() reported no container instance; treating as no-op");
 +				}
-@@ -8839,0 +8857,1 @@
-+			outcome = "success";
-@@ -8939,1 +8957,2 @@
++			}
+@@ -8834,6 +8840,0 @@
+-			try {
+-				await super.destroy();
+-			} catch (error) {
+-				if (!this.isNoInstanceError(error)) throw error;
+-				this.logger.debug("super.destroy() reported no container instance; treating as no-op");
+-			}
+@@ -8939 +8940,2 @@
 -		const disconnectClient = this.transport !== "rpc" || this.client.isWebSocketConnected();
 +		const clientSnapshot = this.client;
 +		const disconnectClient = this.transport !== "rpc" || clientSnapshot.isWebSocketConnected();
-@@ -8947,1 +8966,1 @@
+@@ -8947 +8949 @@
 -		if (disconnectClient) this.client.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox container stopped while the operation was pending.", params));
 +		if (disconnectClient) await clientSnapshot.disconnect(this.buildDisconnectCause("runtime_replaced", "The sandbox container stopped while the operation was pending.", params));
-@@ -9583,0 +9603,1 @@
+@@ -8958,2 +8960,2 @@
+-		if (hadR2EgressMount) await this.configureR2EgressOutbound({ buckets: {} }).catch(() => {});
+-		if (hadCredentialProxyMount) await this.configureS3CredentialProxyOutbound({ mounts: {} }).catch(() => {});
++		if (hadR2EgressMount) await this.configureR2EgressOutbound({ buckets: {} }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
++		if (hadCredentialProxyMount) await this.configureS3CredentialProxyOutbound({ mounts: {} }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -9583,0 +9586 @@
 +			this.assertExecutionAllowed?.();
-@@ -9931,0 +9952,1 @@
+@@ -9931,0 +9935 @@
 +			this.assertExecutionAllowed?.();
+@@ -10978 +10982 @@
+-			await client.fetch(`${objectURL}?uploadId=${encodeURIComponent(uploadId)}`, { method: "DELETE" }).catch(() => {});
++			await client.fetch(`${objectURL}?uploadId=${encodeURIComponent(uploadId)}`, { method: "DELETE" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11056,4 +11060,2 @@
+-	* For archives >= BACKUP_DOWNLOAD_PARALLEL_MIN_SIZE, uses BACKUP_DOWNLOAD_PARALLEL_PARTS
+-	* concurrent curl processes (each downloading a byte-range) to maximise both
+-	* network and disk-write throughput. Parts are written into a pre-sized file
+-	* with dd using byte offsets, then atomically moved to the final path.
++	* Stream one object GET into a temporary file, verify its size, then atomically
++	* move it to the final path. Preserve the existing small-archive retry policy.
+@@ -11065,13 +11067,23 @@
+-		if (expectedSize < BACKUP_DOWNLOAD_PARALLEL_MIN_SIZE) {
+-			const curlCmd = [
+-				"curl -sSf",
+-				"--connect-timeout 10",
+-				"--max-time 1800",
+-				"--retry 2",
+-				"--retry-max-time 60",
+-				`-o ${shellEscape(tmpPath)}`,
+-				shellEscape(presignedURL)
+-			].join(" ");
+-			const result = await this.execWithSession(curlCmd, backupSession, {
+-				timeout: 181e4,
+-				origin: "internal"
++		const curlCmd = [
++			"curl -sSf",
++			"--connect-timeout 10",
++			"--max-time 1800",
++			...(expectedSize < BACKUP_DOWNLOAD_PARALLEL_MIN_SIZE ? ["--retry 2", "--retry-max-time 60"] : []),
++			`-o ${shellEscape(tmpPath)}`,
++			shellEscape(presignedURL)
++		].join(" ");
++		const result = await this.execWithSession(curlCmd, backupSession, {
++			timeout: 181e4,
++			origin: "internal"
++		});
++		if (result.exitCode !== 0) {
++			await this.execWithSession(`rm -f ${shellEscape(tmpPath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
++			throw new BackupRestoreError({
++				message: `Presigned URL download failed (exit code ${result.exitCode}): ${result.stderr}`,
++				code: ErrorCode.BACKUP_RESTORE_FAILED,
++				httpStatus: 500,
++				context: {
++					dir,
++					backupId
++				},
++				timestamp: (/* @__PURE__ */ new Date()).toISOString()
+@@ -11079,63 +11090,0 @@
+-			if (result.exitCode !== 0) {
+-				await this.execWithSession(`rm -f ${shellEscape(tmpPath)}`, backupSession, { origin: "internal" }).catch(() => {});
+-				throw new BackupRestoreError({
+-					message: `Presigned URL download failed (exit code ${result.exitCode}): ${result.stderr}`,
+-					code: ErrorCode.BACKUP_RESTORE_FAILED,
+-					httpStatus: 500,
+-					context: {
+-						dir,
+-						backupId
+-					},
+-					timestamp: (/* @__PURE__ */ new Date()).toISOString()
+-				});
+-			}
+-		} else {
+-			const numParts = calculatePartCount(expectedSize, BACKUP_DOWNLOAD_PARALLEL_PARTS, BACKUP_DOWNLOAD_MAX_PARTS);
+-			const partSize = Math.floor(expectedSize / numParts);
+-			const startLines = Array.from({ length: numParts }, (_, i) => {
+-				const start = i * partSize;
+-				return {
+-					start,
+-					range: `${start}-${i < numParts - 1 ? start + partSize - 1 : expectedSize - 1}`
+-				};
+-			}).map(({ start, range }) => [
+-				"curl -sSf",
+-				"--connect-timeout 10",
+-				"--max-time 1800",
+-				`-H ${shellEscape(`Range: bytes=${range}`)}`,
+-				shellEscape(presignedURL),
+-				"|",
+-				"dd",
+-				`of=${shellEscape(tmpPath)}`,
+-				"oflag=seek_bytes",
+-				`seek=${start}`,
+-				"conv=notrunc",
+-				"2>/dev/null"
+-			].join(" ")).map((cmd, i) => `(set -o pipefail; ${cmd}) & J${i}=$!`);
+-			const waitLines = Array.from({ length: numParts }, (_, i) => `wait $J${i}; E${i}=$?`);
+-			const exitVars = Array.from({ length: numParts }, (_, i) => `$E${i}`);
+-			const script = [
+-				`rm -f ${shellEscape(tmpPath)}`,
+-				`truncate -s ${expectedSize} ${shellEscape(tmpPath)}`,
+-				...startLines,
+-				...waitLines,
+-				`FAILED=$(( ${exitVars.join(" + ")} ))`,
+-				`if [ "$FAILED" -ne 0 ]; then echo "download part exit codes: ${exitVars.join(" ")}" >&2; rm -f ${shellEscape(tmpPath)}; exit 1; fi`
+-			].join("; ");
+-			const result = await this.execWithSession(`( ${script} )`, backupSession, {
+-				timeout: 181e4,
+-				origin: "internal"
+-			});
+-			if (result.exitCode !== 0) {
+-				await this.execWithSession(`rm -f ${shellEscape(tmpPath)}`, backupSession, { origin: "internal" }).catch(() => {});
+-				throw new BackupRestoreError({
+-					message: `Parallel download failed (exit code ${result.exitCode}): ${result.stderr}`,
+-					code: ErrorCode.BACKUP_RESTORE_FAILED,
+-					httpStatus: 500,
+-					context: {
+-						dir,
+-						backupId
+-					},
+-					timestamp: (/* @__PURE__ */ new Date()).toISOString()
+-				});
+-			}
+@@ -11146 +11095 @@
+-			await this.execWithSession(`rm -f ${shellEscape(tmpPath)}`, backupSession, { origin: "internal" }).catch(() => {});
++			await this.execWithSession(`rm -f ${shellEscape(tmpPath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11160 +11109 @@
+-			await this.execWithSession(`rm -f ${shellEscape(tmpPath)}`, backupSession, { origin: "internal" }).catch(() => {});
++			await this.execWithSession(`rm -f ${shellEscape(tmpPath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11297 +11246 @@
+-			await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => {});
++			await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11308 +11257 @@
+-				await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => {});
++				await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11443 +11392 @@
+-			await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => {});
++			await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11455 +11404 @@
+-				await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => {});
++				await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11595,2 +11544,2 @@
+-			await this.execWithSession(`/usr/bin/fusermount3 -uz ${shellEscape(dir)} 2>/dev/null || true`, backupSession, { origin: "internal" }).catch(() => {});
+-			await this.execWithSession(`for d in ${shellEscape(mountGlob)}_*/lower ${shellEscape(mountGlob)}/lower; do [ -d "$d" ] && /usr/bin/fusermount3 -uz "$d" 2>/dev/null; done; true`, backupSession, { origin: "internal" }).catch(() => {});
++			await this.execWithSession(`/usr/bin/fusermount3 -uz ${shellEscape(dir)} 2>/dev/null || true`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
++			await this.execWithSession(`for d in ${shellEscape(mountGlob)}_*/lower ${shellEscape(mountGlob)}/lower; do [ -d "$d" ] && /usr/bin/fusermount3 -uz "$d" 2>/dev/null; done; true`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11600,2 +11549,3 @@
+-			if (!(await this.client.backup.restoreArchive(dir, archivePath, backupSession)).success) throw new BackupRestoreError({
+-				message: "Container failed to restore backup archive",
++			const extractResult = await this.execWithSession(`/usr/bin/unsquashfs -f -d ${shellEscape(dir)} ${shellEscape(archivePath)}`, backupSession, { origin: "internal" });
++			if (extractResult.exitCode !== 0) throw new BackupRestoreError({
++				message: `unsquashfs extraction failed (exit code ${extractResult.exitCode}): ${extractResult.stderr}`,
+@@ -11615,0 +11566 @@
++			await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11622 +11573 @@
+-				await this.execWithSession(`rm -f ${shellEscape(cleanupPath)}`, backupSession, { origin: "internal" }).catch(() => {});
++				await this.execWithSession(`rm -f ${shellEscape(cleanupPath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11765 +11716 @@
+-			await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => {});
++			await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
+@@ -11772 +11723 @@
+-				await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => {});
++				await this.execWithSession(`rm -f ${shellEscape(archivePath)}`, backupSession, { origin: "internal" }).catch(() => { console.warn('Sandbox backup temporary cleanup failed'); });
 diff --git a/dist/sandbox-mYLglwK1.d.ts b/dist/sandbox-mYLglwK1.d.ts
-index a61fcaabbfc1fad4799ad0a4a5135ef649aab37a..4c35e769979006c726bbb9d8983a2450022a0abf 100644
 --- a/dist/sandbox-mYLglwK1.d.ts
 +++ b/dist/sandbox-mYLglwK1.d.ts
-@@ -0,0 +1,1 @@
+@@ -0,0 +1 @@
 +import type { Request, Response, ReadableStream } from "@cloudflare/workers-types/index.ts";
-@@ -2803,1 +2804,1 @@
+@@ -2803 +2804 @@
 -  disconnect(cause?: unknown): void;
 +  disconnect(cause?: unknown): Promise<void>;
+@@ -2837 +2838 @@
+-declare function getSandbox<T extends Sandbox<any>>(ns: DurableObjectNamespace<T>, id: string, options?: SandboxOptions): T;
++declare function getSandbox<T extends Sandbox<any>>(ns: DurableObjectNamespace<T>, id: string, options?: SandboxOptions): T & { waitForConfiguration(): Promise<void> };

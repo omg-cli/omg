@@ -5,6 +5,10 @@ let structuredMessages;
 let sourceRequest;
 let sourceWindowContent;
 let patchSystem;
+const reviewEnv = {
+    AI: {}, LOADER: {}, CI_INSPECTOR_TOKEN: "unused",
+    MODEL_PACER: { getByName() { return { async admit() { return { granted: true }; } }; } },
+};
 mock.module("@cloudflare/codemode", () => ({ DynamicWorkerExecutor: class {} }));
 mock.module("@cloudflare/codemode/ai", () => ({ createCodeTool: ({ tools }) => tools }));
 mock.module("workers-ai-provider", () => ({ createWorkersAI: () => () => ({}) }));
@@ -41,7 +45,7 @@ test("structured independent review receives the whole actual patch when CodeMod
         patch: [{ path: "src/value.rs", before: "pub const VALUE: u8 = 1;", after: "pub const VALUE: u8 = 2;" },
             { path: "tests/ai-review-value.rs", before: null, after: "#[test] fn value_returns_two() { assert_eq!(omg::VALUE, 2); }" }],
     };
-    const result = await reviewPatch(input, { AI: {}, LOADER: {}, CI_INSPECTOR_TOKEN: "unused" });
+    const result = await reviewPatch(input, reviewEnv);
     expect(result.readCompletePatch).toBe(true);
     expect(JSON.parse(structuredMessages.at(-1).content).retrievedPatch).toEqual(input);
 });
@@ -69,7 +73,7 @@ test("strengthening semantic review sees the controlled fault and all four state
     const input = { purpose: "test-strengthening-approval", repository: proposal.repository, branch: proposal.branch, baseSha: proposal.baseSha,
         headSha: "b".repeat(40), headTreeSha: "c".repeat(40), proposalSha256: testAuditDigest(proposal),
         patch: [{ path: proposal.test.path, before: originalContent, after: newContent }], audit: { test: testIdentity, fault: proposal.fault, receipt } };
-    await reviewPatch(input, { AI: {}, LOADER: {}, CI_INSPECTOR_TOKEN: "unused" });
+    await reviewPatch(input, reviewEnv);
     expect(JSON.parse(structuredMessages.at(-1).content).retrievedPatch).toEqual(input);
     expect(patchSystem).toContain("old/fault GREEN");
     expect(patchSystem).toContain("evidence-only");
@@ -85,7 +89,7 @@ test("actual source-model request includes historical runtime error types and fr
         diff: "", ciFailures: [], runtimeEvidence,
         sourceFiles: [{ path: "src/value.rs", blobSha: "e".repeat(40),
             content: Array.from({ length: 160 }, (_, index) => `pub const LINE_${index + 1}: usize = ${index + 1};`).join("\n") }] };
-    await reviewSource(input, { AI: {}, LOADER: {}, CI_INSPECTOR_TOKEN: "unused" });
+    await reviewSource(input, reviewEnv);
     const prompt = JSON.parse(sourceRequest.prompt);
     expect(prompt.runtimeEvidence).toEqual(runtimeEvidence);
     expect(prompt.sourceWindows[0].lineStart).toBeLessThanOrEqual(120);
@@ -95,7 +99,7 @@ test("actual source-model request includes historical runtime error types and fr
     expect(sourceRequest.system).toMatch(/historical.*uncorroborated/i);
 
     input.runtimeEvidence[0].frames[0].line = 99999;
-    await reviewSource(input, { AI: {}, LOADER: {}, CI_INSPECTOR_TOKEN: "unused" });
+    await reviewSource(input, reviewEnv);
     const historical = JSON.parse(sourceRequest.prompt);
     expect(historical.sourceWindows[0].lineEnd).toBe(160);
     expect(historical.runtimeFrameContext[0].outsideCurrentSource).toBe(true);

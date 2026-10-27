@@ -1,20 +1,137 @@
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -42,0 +43,4 @@
++    },
++    "./runner-id": {
++      "types": "./src/ci/runners/runner-id.ts",
++      "import": "./src/ci/runners/runner-id.ts"
+diff --git a/src/artifacts/source-control.ts b/src/artifacts/source-control.ts
+--- a/src/artifacts/source-control.ts
++++ b/src/artifacts/source-control.ts
+@@ -3,0 +4 @@
++import { rpcData } from '../shared/rpc-data';
+@@ -34 +35 @@
+-type ArtifactsRepoReader = {
++type ArtifactsRepoReader = Disposable & {
+@@ -89,4 +90 @@
+-    const repo = (await this.getRepo(
+-      namespace,
+-      source.repo
+-    )) as unknown as ArtifactsRepoReader;
++    using repo = (await this.getRepo(namespace, source.repo)) as unknown as ArtifactsRepoReader;
+@@ -94 +92 @@
+-      const commit = await repo.readCommit(source.sha);
++      const commit = rpcData(await repo.readCommit(source.sha));
+@@ -112 +110 @@
+-    const entries = await repo.readTree(treeHash);
++    const entries = rpcData(await repo.readTree(treeHash));
+@@ -147,5 +145,9 @@
+-    const token = await repo.createToken(scope, SOURCE_TOKEN_TTL_SECONDS);
+-    return {
+-      remote: this.repoRemote(namespace, source.repo),
+-      token: token.plaintext,
+-    };
++    try {
++      const token = rpcData(await repo.createToken(scope, SOURCE_TOKEN_TTL_SECONDS));
++      return { remote: this.repoRemote(namespace, source.repo), token: token.plaintext };
++    } finally {
++      if (Symbol.dispose in repo) {
++        const dispose = repo[Symbol.dispose];
++        if (typeof dispose === 'function') dispose.call(repo);
++      }
++    }
+diff --git a/src/ci/cache.ts b/src/ci/cache.ts
+--- a/src/ci/cache.ts
++++ b/src/ci/cache.ts
+@@ -227,0 +228 @@
++  console.log('[cache] metadata get acknowledged', { backupId, present: meta !== null });
+@@ -234,0 +236 @@
++    console.log('[cache] metadata body acknowledged', { backupId });
+@@ -266,0 +269 @@
++  console.log('[cache] archive head acknowledged', { backupId, present: archive !== null });
 diff --git a/src/ci/capabilities.ts b/src/ci/capabilities.ts
 --- a/src/ci/capabilities.ts
 +++ b/src/ci/capabilities.ts
-@@ -191,6 +191,7 @@
--  return {
--    exitCode: result.exitCode,
--    logs: result.logs,
--    preview: result.preview,
--    snapshot: result.snapshot,
--    cacheHit: false,
-+  return {
-+    exitCode: result.exitCode,
-+    logs: result.logs,
+@@ -4,0 +5 @@
++import type { StoredOutput } from '../pipeline/persisted-logs';
+@@ -7 +7,0 @@
+-  CiRunStepOutput,
+@@ -16,0 +17 @@
++import { persistCompletion, beginExecution, recordStartedProcess, claimProcessRecovery, discardProcessAdmission, type RunningProcess } from '../pipeline/completion';
+@@ -59,2 +60,3 @@
+-  input: CiRunStepInput
+-): Promise<CiRunStepOutput> {
++  input: CiRunStepInput,
++  process?: RunningProcess
++): Promise<StoredOutput> {
+@@ -67 +69,23 @@
+-  const prepared = await prepareStep(env, sourceControlProvider, input);
++  assertPreparationBudget(input);
++  if (!process) {
++    const completed = await beginExecution(env.BACKUP_BUCKET, input);
++    if (completed) return completed;
++  }
++  let prepared: PreparedStep;
++  try {
++    prepared = await prepareStep(env, sourceControlProvider, input);
++  } catch (error) {
++    if (
++      !(error instanceof Error) || error.name !== 'ArtifactsError' ||
++      !('code' in error) || error.code !== 'INTERNAL_ERROR' ||
++      !('numericCode' in error) || error.numericCode !== 10400 ||
++      input.deadlineMs === undefined || Date.now() + 1000 >= input.deadlineMs
++    ) throw error;
++    console.warn('CI source preparation recovery', {
++      stage: 'artifacts', code: 'INTERNAL_ERROR', numericCode: 10400, preparationAttempt: 1,
++    });
++    await new Promise((resolve) => setTimeout(resolve, 1000));
++    assertPreparationBudget(input);
++    prepared = await prepareStep(env, sourceControlProvider, input);
++  }
++  assertPreparationBudget(input);
+@@ -75 +99 @@
+-  return withStepNotification(
++  const output = await withStepNotification(
+@@ -82 +106 @@
+-    () => executeStep(env, input, prepared),
++    () => executeStep(env, input, prepared, process),
+@@ -84,0 +109,10 @@
++  if (!output.cachePointer) await persistCompletion(env.BACKUP_BUCKET, input, output);
++  await discardProcessAdmission(env.BACKUP_BUCKET, input);
++  return output;
++}
++
++function assertPreparationBudget(input: CiRunStepInput) {
++  if (input.deadlineMs !== undefined && !Number.isFinite(input.deadlineMs))
++    throw new Error('CI source preparation deadline must be finite');
++  if (input.deadlineMs !== undefined && Date.now() >= input.deadlineMs)
++    throw new Error('CI source preparation budget exhausted before process launch');
+@@ -153 +187,2 @@
+-  prepared: PreparedStep
++  prepared: PreparedStep,
++  process?: RunningProcess
+@@ -155 +190,4 @@
+-  const runner = new SandboxRunner(env);
++  const runner = new SandboxRunner(env, {
++    started: (process) => recordStartedProcess(env.BACKUP_BUCKET, input, process),
++    claimRecovery: () => claimProcessRecovery(env.BACKUP_BUCKET, input),
++  });
+@@ -156,0 +195,2 @@
++    instanceId: input.instanceId,
++    attempt: input.attempt,
+@@ -160,0 +201 @@
++    deadlineMs: input.deadlineMs,
+@@ -166 +207 @@
+-  const cache = prepared.cacheKey
++  const cache = prepared.cacheKey && !process
+@@ -190 +231 @@
+-  const result = await runner.run({ ...runInput, restore: input.snapshot });
++  const result = await runner.run({ ...runInput, restore: input.snapshot }, process);
+@@ -193,0 +235 @@
 +    logSizes: result.logSizes,
-+    preview: result.preview,
-+    snapshot: result.snapshot,
-+    cacheHit: false,
+@@ -218,0 +261 @@
++  console.log('[cache] publish started', { label: input.label, cacheKey: prepared.cacheKey, backupId: execution.snapshot.id });
 diff --git a/src/ci/runner-failure-evidence.ts b/src/ci/runner-failure-evidence.ts
 new file mode 100644
 --- /dev/null
@@ -225,87 +342,190 @@ new file mode 100644
 +function isRecord(value: unknown): value is Record<string, unknown> {
 +  return typeof value === 'object' && value !== null && !Array.isArray(value);
 +}
+diff --git a/src/ci/runners/runner-id.ts b/src/ci/runners/runner-id.ts
+new file mode 100644
+--- /dev/null
++++ b/src/ci/runners/runner-id.ts
+@@ -0,0 +1,24 @@
++import { z } from 'zod';
++
++const identitySchema = z.object({
++  instanceId: z.string().min(1).max(256),
++  label: z.string().min(1).max(256),
++  attempt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
++  incarnation: z.union([z.literal(0), z.literal(1)]).default(0),
++});
++
++export type RunnerIdentity = {
++  instanceId: string;
++  label: string;
++  attempt?: number;
++  incarnation?: 0 | 1;
++};
++
++export async function createRunnerId(input: RunnerIdentity): Promise<string> {
++  const { instanceId, label, attempt, incarnation } = identitySchema.parse(input);
++  const kind = instanceId.startsWith('fmt-') ? 'format' : 'ci';
++  const tuple = JSON.stringify(['omg-ci-runner', 1, kind, instanceId, label, attempt, ...(incarnation === 1 ? ['incarnation', 1] : [])]);
++  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(tuple));
++  const hex = Array.from(new Uint8Array(digest), value => value.toString(16).padStart(2, '0')).join('');
++  return `ci1-${kind === 'format' ? 'f' : 'c'}-${hex.slice(0, 56)}`;
++}
 diff --git a/src/ci/runners/runner.ts b/src/ci/runners/runner.ts
 --- a/src/ci/runners/runner.ts
 +++ b/src/ci/runners/runner.ts
-@@ -1,3 +1,4 @@
--// Copyright (c) 2026 Cloudflare, Inc.
--// SPDX-License-Identifier: Apache-2.0
--
+@@ -0,0 +1 @@
 +import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
-+// Copyright (c) 2026 Cloudflare, Inc.
-+// SPDX-License-Identifier: Apache-2.0
+@@ -6,0 +8,2 @@
++  instanceId: string;
++  attempt?: number;
+@@ -10,0 +14 @@
++  deadlineMs?: number;
+@@ -16,0 +21,2 @@
++import type { StoredOutput } from "../../pipeline/persisted-logs";
 +
-@@ -21,6 +22,7 @@
+@@ -19,4 +25 @@
+-  logs: {
+-    stdout: string | ReadableStream<Uint8Array>;
 -    stderr: string | ReadableStream<Uint8Array>;
 -  };
--  preview: { stdout: string; stderr: string };
--};
--
--export type RunStepResult<S> = RunOutput & {
-+    stderr: string | ReadableStream<Uint8Array>;
-+  };
-+  preview: { stdout: string; stderr: string };
++  logs: StoredOutput["logs"];
+@@ -23,0 +27 @@
 +  logSizes?: { stdout: number; stderr: number };
-+};
-+
-+export type RunStepResult<S> = RunOutput & {
 diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 --- a/src/ci/runners/sandbox.ts
 +++ b/src/ci/runners/sandbox.ts
-@@ -1,3 +1,6 @@
--// Copyright (c) 2026 Cloudflare, Inc.
--// SPDX-License-Identifier: Apache-2.0
--
-+import type * as Workers from "@cloudflare/workers-types/index.ts";
-+type ReadableStream<R> = Workers.ReadableStream<R>;
-+declare const ReadableStream: typeof Workers.ReadableStream;
-+// Copyright (c) 2026 Cloudflare, Inc.
-+// SPDX-License-Identifier: Apache-2.0
-+
-@@ -9,6 +12,10 @@
--  checkoutSourceScript,
--} from '../../shared/source-checkout';
+@@ -4 +4,4 @@
+-import { getSandbox, type DirectoryBackup } from '@cloudflare/sandbox';
++import { captureRunnerFailure } from '../runner-failure-evidence';
++import { rpcData } from '../../shared/rpc-data';
++import { executionHash, type ProcessJournal, type RunningProcess } from '../../pipeline/completion';
++import { getSandbox, OperationInterruptedError, type DirectoryBackup } from '@cloudflare/sandbox';
+@@ -11 +14 @@
 -import { slugify } from '../../shared/slugify';
--import type { RunStepInput, RunStepResult, Runner } from './runner';
--
--// Sandbox implementation limits. Pipeline-facing command and Snapshot
-+  checkoutSourceScript,
-+} from '../../shared/source-checkout';
-+import { slugify } from '../../shared/slugify';
-+import {
-+  captureRunnerFailure,
-+  type RunnerFailureIdentityInput,
-+} from '../runner-failure-evidence';
-+import type { RunStepInput, RunStepResult, Runner } from './runner';
-+
-+// Sandbox implementation limits. Pipeline-facing command and Snapshot
-@@ -39,11 +46,13 @@
++import { createRunnerId } from './runner-id';
+@@ -25,2 +28 @@
+-// Two inline logs plus result metadata must remain below Workflows' 1 MiB limit.
+-const INLINE_LOG_BYTES = 300_000;
++class ProcessTimeoutError extends Error {}
+@@ -31 +33 @@
+-  constructor(private readonly env: Bindings) {}
++  constructor(private readonly env: Bindings, private readonly journal?: ProcessJournal) {}
+@@ -36 +38 @@
+-   * Large log streams keep the Sandbox alive until they are read or cancelled.
++   * Logs are committed to R2 before the Sandbox is destroyed.
+@@ -39 +41,2 @@
 -    input: RunStepInput & { restore?: DirectoryBackup }
--  ): Promise<RunStepResult<DirectoryBackup>> {
--    // create the sandbox handle
++    input: RunStepInput & { restore?: DirectoryBackup },
++    resume?: RunningProcess
+@@ -42 +45,3 @@
 -    const sandbox = getSandbox(this.env.SANDBOX, createRunnerId(input.label), {
--      transport: 'rpc',
--      enableDefaultSession: false,
--      containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
--    });
++    const runnerId = await createRunnerId(input);
++    let physicalRunnerId = resume?.physicalRunnerId ?? runnerId;
++    const connect = () => getSandbox(this.env.SANDBOX, physicalRunnerId, {
+@@ -47,2 +52,5 @@
 -
 -    let cleanupTransferredToStreams = false;
--    try {
-+    input: RunStepInput & { restore?: DirectoryBackup }
-+  ): Promise<RunStepResult<DirectoryBackup>> {
-+    // create the sandbox handle
-+    const runnerId = createRunnerId(input.label);
-+    const sandbox = getSandbox(this.env.SANDBOX, runnerId, {
-+      transport: 'rpc',
-+      enableDefaultSession: false,
-+      containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
-+    });
-+    const actor = runnerActorId(this.env.SANDBOX, runnerId);
++    let sandbox = connect();
++    const recovery = { used: Boolean(resume), claim: this.journal?.claimRecovery };
++    let cleanupDeadline = input.deadlineMs ?? Date.now() + SOURCE_TIMEOUT_MS;
++    let outcome: { kind: 'incomplete' | 'success' } | { kind: 'failed-result'; exitCode: number } | { kind: 'failed-error'; error: unknown } = { kind: 'incomplete' };
 +
-+    let cleanupTransferredToStreams = false;
-+    try {
-@@ -75,20 +84,39 @@
+@@ -50,14 +58,64 @@
+-      // Containers without FUSE must restore through the local R2 binding and
+-      // unsquashfs. RPC streams those archives instead of base64-encoding them
+-      // into a single request, which can exceed the local dev request limit.
+-      const localBucket =
+-        (await sandbox.exec('test -c /dev/fuse')).exitCode !== 0;
+-      if (input.restore) {
+-        await sandbox.restoreBackup(input.restore);
+-        // Overlay (no rm) so cached node_modules survive while tracked source
+-        // files are refreshed to this commit. The restored archive may carry a
+-        // different commit's source (e.g. a reused install cache), so this is
+-        // what keeps it correct. Files deleted since then linger; the next
+-        // install/build regenerates derived output.
+-        await sandbox.exec(
+-          checkoutSourceScript(input.source, WORKSPACE_DIR, true),
++      if (input.deadlineMs !== undefined && (!Number.isFinite(input.deadlineMs) || Date.now() >= input.deadlineMs)) {
++        throw new Error('CI command deadline must be finite');
++      }
++      let localBucket: boolean;
++      let processId: string;
++      let deadline: number;
++      if (resume) {
++        localBucket = resume.localBucket;
++        processId = resume.id;
++        deadline = resume.deadlineMs;
++      } else {
++        // Containers without FUSE must restore through the local R2 binding and
++        // unsquashfs. RPC streams those archives instead of base64-encoding them
++        // into a single request, which can exceed the local dev request limit.
++        const initializationDeadline = Math.min(Date.now() + SOURCE_TIMEOUT_MS, input.deadlineMs ?? Infinity);
++        for (;;) {
++          let configuring = true;
++          let restoring = false;
++          try {
++            await beforeDeadline(() => sandbox.waitForConfiguration(), initializationDeadline);
++            configuring = false;
++            localBucket = (await beforeDeadline(async () => rpcData(await sandbox.exec('test -c /dev/fuse')), initializationDeadline)).exitCode !== 0;
++            if (input.restore) {
++              restoring = true;
++              const backup = input.restore;
++              await beforeDeadline(async () => rpcData(await sandbox.restoreBackup(backup)), initializationDeadline);
++            }
++            break;
++          } catch (error) {
++            if (restoring) {
++              if (!await recoverRuntime(error, [], initializationDeadline, recovery, true, true)) throw error;
++              await beforeDeadline(() => this.env.SANDBOX.get(this.env.SANDBOX.idFromName(physicalRunnerId)).cancel(), initializationDeadline);
++              physicalRunnerId = await beforeDeadline(() => createRunnerId({ ...input, incarnation: 1 }), initializationDeadline);
++              if (Date.now() >= initializationDeadline) throw new Error('CI sandbox deadline expired');
++            } else if (!await recoverRuntime(error, ['sandbox.configure', 'sandbox.exec'], initializationDeadline, recovery, configuring)) throw error;
++            sandbox = connect();
++          }
++        }
++        const checkoutDeadline = Math.min(Date.now() + SOURCE_TIMEOUT_MS, input.deadlineMs ?? Infinity);
++        if (input.deadlineMs === undefined) cleanupDeadline = checkoutDeadline;
++        if (!Number.isFinite(checkoutDeadline) || checkoutDeadline <= Date.now())
++          throw new Error('CI source checkout deadline expired');
++        const checkout = rpcData(await sandbox.exec(
++          checkoutSourceScript(input.source, WORKSPACE_DIR, Boolean(input.restore), checkoutDeadline),
++          { cwd: '/', timeout: checkoutDeadline - Date.now(), env: checkoutSourceEnv(input.source) }
++        ));
++
++        if (checkout.stderr.startsWith('CI source preparation recovery: git-fetch HTTP503 exit128 attempt1')) {
++          const diagnostics = input.source.kind === 'git' && input.source.token
++            ? checkout.stderr.split(input.source.token).join('[REDACTED]') : checkout.stderr;
++          console.warn('CI source checkout recovery', diagnostics.slice(0, 4000));
++        }
++
++        const startedAt = Date.now();
++        deadline = Math.min(
++          startedAt + (input.timeoutMs ?? COMMAND_TIMEOUT_MS),
++          input.deadlineMs ?? Infinity
++        );
++        if (input.deadlineMs === undefined) cleanupDeadline = deadline;
++        if (!Number.isFinite(deadline) || deadline <= startedAt) {
++          throw new Error('CI command budget exhausted before process launch');
++        }
++        const proc = await sandbox.startProcess(
++          `(${input.command}) > ${STDOUT_FILE} 2> ${STDERR_FILE}`,
+@@ -65,3 +123,6 @@
+-            cwd: '/',
+-            timeout: SOURCE_TIMEOUT_MS,
+-            env: checkoutSourceEnv(input.source),
++            cwd: resolveCwd(input.cwd),
++            env: {
++              CI: 'true',
++              ...input.extraEnv,
++            },
++            autoCleanup: false,
+@@ -70,23 +131,60 @@
+-      } else {
+-        await sandbox.exec(checkoutSourceScript(input.source, WORKSPACE_DIR), {
+-          cwd: '/',
+-          timeout: SOURCE_TIMEOUT_MS,
+-          env: checkoutSourceEnv(input.source),
 -        });
 -      }
 -
@@ -324,51 +544,87 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 -        input.timeoutMs ?? COMMAND_TIMEOUT_MS
 -      );
 -      const preview = await readPreviews(sandbox);
--
--      if (exitCode !== 0) {
-+        });
-+      }
-+
-+      const timeoutMs = input.timeoutMs ?? COMMAND_TIMEOUT_MS;
-+      const deadline = Date.now() + timeoutMs;
-+      const timedOut = () => new Error('CI command completion timed out');
-+      let timer: ReturnType<typeof setTimeout> | undefined;
-+      let result: Awaited<ReturnType<typeof sandbox.exec>>;
-+      try {
-+        result = await Promise.race([
-+          sandbox.exec(
-+            `(${input.command}) > ${STDOUT_FILE} 2> ${STDERR_FILE}`,
-+            {
-+              cwd: resolveCwd(input.cwd),
-+              timeout: timeoutMs,
-+              env: {
-+                CI: 'true',
-+                ...input.extraEnv,
-+              },
++        let command: string;
++        try {
++          processId = proc.id;
++          command = proc.command;
++        } finally {
++          if (Symbol.dispose in proc) {
++            const dispose = proc[Symbol.dispose];
++            if (typeof dispose === 'function') dispose.call(proc);
++          }
++        }
++        if (this.journal) {
++          // startProcess stamps client time; getProcess supplies the server's immutable start time.
++          const startedAt = await beforeDeadline(async () => {
++            const observed = await sandbox.getProcess(processId);
++            try {
++              if (!observed || observed.id !== processId || observed.command !== command)
++                throw new Error('CI process admission identity mismatch');
++              return observed.startTime.toISOString();
++            } finally {
++              if (observed && Symbol.dispose in observed) {
++                const dispose = observed[Symbol.dispose];
++                if (typeof dispose === 'function') dispose.call(observed);
++              }
 +            }
-+          ),
-+          new Promise<never>((_, reject) => {
-+            timer = setTimeout(() => reject(timedOut()), timeoutMs);
-+          }),
-+        ]);
-+        if (Date.now() > deadline) throw timedOut();
-+      } finally {
-+        clearTimeout(timer);
++          }, deadline);
++          await this.journal.started({
++            physicalRunnerId, id: processId, startedAt,
++            commandSha256: await executionHash(command), deadlineMs: deadline, localBucket,
++          });
++        }
 +      }
-+      const exitCode = result.exitCode;
-+      if (typeof exitCode !== 'number' || !Number.isSafeInteger(exitCode) || exitCode < 0) {
-+        throw new Error('CI command terminal exit code unavailable');
++      let exitCode: number;
++      try {
++        exitCode = await waitForProcessExit(sandbox, processId, deadline, recovery, () => {
++          sandbox = connect();
++          return sandbox;
++        }, resume);
++      } catch (error) {
++        if (!(error instanceof ProcessTimeoutError)) throw error;
++        const preview = await readPreviews(sandbox, true);
++        preview.stderr += '\nCI process completion timed out';
++        outcome = { kind: 'failed-result', exitCode: 124 };
++        return { exitCode: 124, logs: preview, preview };
 +      }
-+      if (result.success !== (exitCode === 0)) {
-+        throw new Error('Inconsistent command completion');
-+      }
-+      const preview = await readPreviews(sandbox);
-+
-+      if (exitCode !== 0) {
-@@ -102,13 +130,13 @@
--        ttl: input.ttlSeconds,
--        localBucket,
--      });
++      const finalize = async <T>(operation: () => Promise<T>, operations: string[]): Promise<T> => {
++        for (;;) {
++          try {
++            return await beforeDeadline(operation, deadline);
++          } catch (error) {
++            if (!await recoverRuntime(error, operations, deadline, recovery, true)) throw error;
++            sandbox = connect();
++            await beforeDeadline(() => sandbox.waitForConfiguration(), deadline);
++            const observed = await beforeDeadline(() => readProcess(sandbox, processId, resume), deadline);
++            const observedExit = processExitCode(observed, processId);
++            if (observedExit === undefined || observedExit !== exitCode)
++              throw new Error('CI process completion changed during finalization');
++          }
++        }
++      };
++      const preview = await finalize(() => readPreviews(sandbox), ['sandbox.exec']);
+@@ -94,0 +193 @@
++        outcome = { kind: 'failed-result', exitCode };
+@@ -98 +197 @@
+-      const snapshot = await sandbox.createBackup({
++      const snapshot = await finalize(async () => rpcData(await sandbox.createBackup({
+@@ -103,0 +203,14 @@
++      })), ['sandbox.createBackup']);
++      const logs = await finalize(async () => rpcData(await sandbox.persistCiLogs(
++        `logs/${input.instanceId}/native/${runnerId}`
++      )), ['sandbox.persistCiLogs']);
++      outcome = { kind: 'success' };
++      return { exitCode, snapshot, preview, ...logs };
++    } catch (error) {
++      outcome = { kind: 'failed-error', error };
++      throw captureRunnerFailure(error, {
++        runnerId: physicalRunnerId,
++        actor: runnerActorId(this.env.SANDBOX, physicalRunnerId),
++        label: input.label,
++        diagnosticRunId: input.extraEnv?.OMG_DIAGNOSTIC_RUN_ID,
++        leaf: input.extraEnv?.OMG_CI_LEAF_STEP,
+@@ -105,32 +217,0 @@
 -      const rawLogs = await readLogs(sandbox);
 -      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
 -        (value): value is ReadableStream<Uint8Array> =>
@@ -379,60 +635,53 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 -      }
 -
 -      let remainingStreams = streams.length;
-+        ttl: input.ttlSeconds,
-+        localBucket,
-+      });
-+      const { logs: rawLogs, sizes: logSizes } = await readLogs(sandbox);
-+      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
-+        (value): value is ReadableStream<Uint8Array> =>
-+          typeof value !== 'string'
-+      );
-+      if (streams.length === 0) {
-+        return { exitCode, logs: rawLogs, logSizes, preview, snapshot };
-+      }
-+
-+      let remainingStreams = streams.length;
-@@ -133,7 +161,18 @@
+-      const releaseStream = async () => {
+-        remainingStreams -= 1;
+-        if (remainingStreams === 0) {
+-          await destroySandbox(sandbox);
+-        }
+-      };
+-      cleanupTransferredToStreams = true;
+-      return {
+-        exitCode,
+-        logs: {
+-          stdout:
+-            typeof rawLogs.stdout === 'string'
+-              ? rawLogs.stdout
+-              : withCleanup(rawLogs.stdout, releaseStream),
+-          stderr:
+-            typeof rawLogs.stderr === 'string'
+-              ? rawLogs.stderr
+-              : withCleanup(rawLogs.stderr, releaseStream),
 -        },
 -        preview,
 -        snapshot,
 -      };
--    } finally {
+@@ -138,2 +219,18 @@
 -      if (!cleanupTransferredToStreams) {
 -        await destroySandbox(sandbox);
-+        },
-+        preview,
-+        snapshot,
-+        logSizes,
-+      };
-+    } catch (error) {
-+      const diagnosticRunId = input.extraEnv?.OMG_DIAGNOSTIC_RUN_ID;
-+      const leaf = input.extraEnv?.OMG_CI_LEAF_STEP;
-+      throw captureRunnerFailure(error, {
-+        runnerId,
-+        actor,
-+        label: input.label,
-+        ...(diagnosticRunId ? { diagnosticRunId } : {}),
-+        ...(leaf ? { leaf } : {}),
-+      });
-+    } finally {
-+      if (!cleanupTransferredToStreams) {
-+        await destroySandbox(sandbox);
-@@ -141,6 +180,7 @@
--    }
--  }
--}
--
++      try {
++        await beforeDeadline(() => this.env.SANDBOX.get(this.env.SANDBOX.idFromName(physicalRunnerId)).cancel(), cleanupDeadline);
++        console.log('CI runner cleanup acknowledged', { instanceId: input.instanceId, label: input.label, attempt: input.attempt, runnerId: physicalRunnerId });
++      } catch (cleanupError) {
++        if (outcome.kind !== 'failed-error' && outcome.kind !== 'failed-result') throw cleanupError;
++        if (outcome.kind === 'failed-error' && outcome.error instanceof Error) {
++          const descriptor = Object.getOwnPropertyDescriptor(outcome.error, 'cause');
++          if (descriptor?.writable || (!descriptor && Object.isExtensible(outcome.error))) {
++            const previous: unknown = descriptor?.value;
++            Object.defineProperty(outcome.error, 'cause', {
++              ...descriptor,
++              value: previous === undefined ? cleanupError : new AggregateError([previous, cleanupError], 'CI command and cleanup failed'),
++              writable: true,
++              configurable: descriptor?.configurable ?? true,
++            });
++          }
++        }
++        console.error('CI sandbox cleanup acknowledgement failed');
+@@ -145,12 +242,40 @@
 -async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
 -  const listing = await sandbox.listFiles('/tmp');
-+    }
-+  }
-+}
-+
-+
-+async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
-+  const listing = await sandbox.listFiles('/tmp');
-@@ -148,8 +188,11 @@
+-  const sizes = new Map(
 -    listing.files.map((file) => [file.absolutePath, file.size])
 -  );
 -  return {
@@ -441,18 +690,49 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 -  };
 -}
 -
-+    listing.files.map((file) => [file.absolutePath, file.size])
-+  );
-+  return {
-+    logs: {
-+      stdout: await readLog(sandbox, STDOUT_FILE, sizes.get(STDOUT_FILE) ?? 0),
-+      stderr: await readLog(sandbox, STDERR_FILE, sizes.get(STDERR_FILE) ?? 0),
-+    },
-+    sizes: { stdout: sizes.get(STDOUT_FILE) ?? 0, stderr: sizes.get(STDERR_FILE) ?? 0 },
-+  };
+-async function readLog(
++
++async function beforeDeadline<T>(operation: () => Promise<T>, deadline: number): Promise<T> {
++  const expired = () => new Error('CI sandbox deadline expired');
++  const remaining = deadline - Date.now();
++  if (!Number.isFinite(remaining) || remaining <= 0) throw expired();
++  let timer: ReturnType<typeof setTimeout> | undefined;
++  try {
++    const result = await Promise.race([
++      operation(),
++      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(expired()), remaining); }),
++    ]);
++    if (Date.now() >= deadline) throw expired();
++    return result;
++  } finally {
++    clearTimeout(timer);
++  }
 +}
 +
-@@ -159,7 +202,7 @@
++async function recoverRuntime(error: unknown, operations: string[], deadline: number, recovery: { used: boolean; claim?: () => Promise<boolean> }, allowInactiveBoundary = false, allowRetryableRestore = false): Promise<boolean> {
++  let cause: unknown = error;
++  for (let depth = 0; depth < 8 && typeof cause === 'object' && cause !== null; depth += 1) {
++    if ('overloaded' in cause && cause.overloaded === true) return false;
++    cause = 'cause' in cause ? cause.cause : undefined;
++  }
++  const inactiveBoundary = allowInactiveBoundary && error instanceof Error && !(error instanceof OperationInterruptedError) &&
++    error.message === 'Connection closed: this Durable Object instance is no longer active. Reconnect or retry the request.';
++  const retryableRestore = allowRetryableRestore && error instanceof Error && !(error instanceof OperationInterruptedError) &&
++    'retryable' in error && error.retryable === true;
++  if (recovery.used || (!inactiveBoundary && !retryableRestore && (!(error instanceof OperationInterruptedError) ||
++    error.code !== 'OPERATION_INTERRUPTED' || error.context.reason !== 'runtime_replaced' ||
++    !operations.includes(error.context.operation) || error.context.phase !== 'durable_object_call' ||
++    error.context.admitted !== 'unknown'))) return false;
++  if (Date.now() >= deadline) return false;
++  if (recovery.claim && !await recovery.claim()) return false;
++  recovery.used = true;
++  await new Promise(resolve => setTimeout(resolve, Math.min(1000, Math.max(0, deadline - Date.now()))));
++  return Date.now() < deadline;
++}
++
++async function waitForProcessExit(
+@@ -158,10 +283,86 @@
+-  file: string,
 -  size: number
 -): Promise<string | ReadableStream<Uint8Array>> {
 -  if (size > INLINE_LOG_BYTES) {
@@ -460,16 +740,133 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 -  }
 -  return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
 -}
-+  size: number
-+): Promise<string | ReadableStream<Uint8Array>> {
-+  if (size > INLINE_LOG_BYTES) {
-+    return (await sandbox.readFile(file, { encoding: 'none' })).content;
+-
+-async function readPreviews(sandbox: ReturnType<typeof getSandbox>) {
++  id: string,
++  deadline: number,
++  recovery: { used: boolean; claim?: () => Promise<boolean> },
++  reconnect: () => ReturnType<typeof getSandbox>,
++  expected?: RunningProcess,
++): Promise<number> {
++  const startedAt = Date.now();
++  let polls = 0;
++  const timedOut = () => new ProcessTimeoutError('CI process completion timed out');
++  for (;;) {
++    const remaining = deadline - Date.now();
++    if (remaining <= 0) throw timedOut();
++    polls += 1;
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    let process: { id: string; status: string; exitCode?: number | null } | null;
++    try {
++      process = await Promise.race([
++        readProcess(sandbox, id, expected),
++        new Promise<never>((_, reject) => {
++          timer = setTimeout(() => reject(timedOut()), remaining);
++        }),
++      ]);
++    } catch (error) {
++      if (await recoverRuntime(error, ['sandbox.getProcess'], deadline, recovery, true)) {
++        sandbox = reconnect();
++        await beforeDeadline(() => sandbox.waitForConfiguration(), deadline);
++        continue;
++      }
++      if (Date.now() >= deadline) throw timedOut();
++      throw error;
++    } finally {
++      clearTimeout(timer);
++    }
++    if (Date.now() > deadline) throw timedOut();
++    if (!process || process.id !== id) {
++      const details = JSON.stringify({
++        polls,
++        elapsedMs: Date.now() - startedAt,
++        expectedId: typeof id === 'string' ? id.slice(0, 128) : typeof id,
++        observedIdType: process ? typeof process.id : 'absent',
++      });
++      throw new Error(`CI process ${process ? 'identity mismatch' : 'missing'}: ${details}`);
++    }
++    const { status, exitCode } = process;
++    if (status !== 'starting' && status !== 'running') {
++      if (!['completed', 'failed', 'killed', 'error'].includes(status)) {
++        throw new Error('CI process returned an unknown state');
++      }
++      if (typeof exitCode !== 'number' || !Number.isSafeInteger(exitCode) || exitCode < 0 ||
++          ((exitCode === 0) !== (status === 'completed'))) {
++        throw new Error(typeof process.exitCode === 'number' && Number.isSafeInteger(process.exitCode) && process.exitCode >= 0 ? 'Inconsistent command completion' : 'CI process terminal exit code unavailable');
++      }
++      return exitCode;
++    }
++    await new Promise(resolve => setTimeout(resolve, Math.min(1000, Math.max(0, deadline - Date.now()))));
 +  }
-+  return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
 +}
-@@ -203,26 +246,21 @@
++
++async function readProcess(sandbox: ReturnType<typeof getSandbox>, id: string, expected?: RunningProcess) {
++  const process = await sandbox.getProcess(id);
++  try {
++    if (expected && process && (
++      process.id !== expected.id || process.startTime.toISOString() !== expected.startedAt ||
++      await executionHash(process.command) !== expected.commandSha256
++    )) throw new Error('Running process identity changed');
++    return process ? { id: process.id, status: process.status, exitCode: process.exitCode } : null;
++  } finally {
++    if (process && Symbol.dispose in process) {
++      const dispose = process[Symbol.dispose];
++      if (typeof dispose === 'function') dispose.call(process);
++    }
++  }
++}
++
++function processExitCode(process: { id: string; status: string; exitCode?: number | null } | null, id: string): number | undefined {
++  if (!process || process.id !== id) throw new Error(`CI process ${process ? 'identity mismatch' : 'missing'}`);
++  if (process.status === 'starting' || process.status === 'running') return undefined;
++  if (!['completed', 'failed', 'killed', 'error'].includes(process.status)) throw new Error('CI process returned an unknown state');
++  const code = process.exitCode;
++  if (typeof code !== 'number' || !Number.isSafeInteger(code) || code < 0 || ((code === 0) !== (process.status === 'completed')))
++    throw new Error(typeof process.exitCode === 'number' && Number.isSafeInteger(process.exitCode) && process.exitCode >= 0 ? 'Inconsistent command completion' : 'CI process terminal exit code unavailable');
++  return code;
++}
++
++async function readPreviews(sandbox: ReturnType<typeof getSandbox>, timedOut = false) {
++  const read = timedOut ? readTimeoutTail : readTail;
+@@ -169,2 +370,2 @@
+-    readTail(sandbox, STDOUT_FILE),
+-    readTail(sandbox, STDERR_FILE),
++    read(sandbox, STDOUT_FILE),
++    read(sandbox, STDERR_FILE),
+@@ -175 +376,15 @@
+-async function readTail(sandbox: ReturnType<typeof getSandbox>, file: string) {
++async function readTimeoutTail(sandbox: ReturnType<typeof getSandbox>, file: string) {
++  let timer: ReturnType<typeof setTimeout> | undefined;
++  try {
++    return await Promise.race([
++      readTail(sandbox, file, 1000).catch(() => '[timeout preview RPC failed]'),
++      new Promise<string>(resolve => {
++        timer = setTimeout(() => resolve('[timeout preview deadline exceeded]'), 1000);
++      }),
++    ]);
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++async function readTail(sandbox: ReturnType<typeof getSandbox>, file: string, timeout = 30_000) {
+@@ -177 +392 @@
+-    await sandbox.exec(`tail -c ${TAIL_BYTES} ${file} 2>/dev/null`, {
++    rpcData(await sandbox.exec(`tail -c ${TAIL_BYTES} ${file} 2>/dev/null`, {
+@@ -179,2 +394,2 @@
+-      timeout: 30_000,
+-    })
++      timeout,
++    }))
+@@ -201,3 +416,4 @@
+-function withCleanup(
+-  stream: ReadableStream<Uint8Array>,
 -  release: () => Promise<void>
--) {
++
++function runnerActorId(
++  namespace: Bindings['SANDBOX'] | undefined,
++  runnerId: string
+@@ -205,38 +420,0 @@
 -  const reader = stream.getReader();
 -  let released = false;
 -  const releaseOnce = async () => {
@@ -494,130 +891,101 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 -      }
 -    },
 -    async cancel(reason) {
-+  release: () => Promise<void>
-+) {
-+  const reader = stream.getReader();
-+  let releasePromise: Promise<void> | undefined;
-+  const releaseOnce = () => (releasePromise ??= release());
-+  return new ReadableStream<Uint8Array>({
-+    async pull(controller) {
-+      try {
-+        const result = await reader.read();
-+        if (result.done) {
-+          await releaseOnce();
-+          controller.close();
-+        } else {
-+          controller.enqueue(result.value);
-+        }
-+      } catch (error) {
-+        await releaseOnce();
-+        controller.error(error);
-+      }
-+    },
-+    async cancel(reason) {
-@@ -239,6 +277,17 @@
+-      try {
+-        await reader.cancel(reason);
+-      } finally {
+-        await releaseOnce();
+-      }
+-    },
+-  });
+-}
+-
+-function createRunnerId(label: string) {
 -  return `${slugify(label).slice(0, 16)}-${crypto.randomUUID()}`;
 -}
 -
 -async function destroySandbox(sandbox: ReturnType<typeof getSandbox>) {
--  try {
+@@ -244,5 +422,6 @@
 -    await sandbox.destroy();
-+  return `${slugify(label).slice(0, 16)}-${crypto.randomUUID()}`;
-+}
-+
-+function runnerActorId(
-+  namespace: Bindings['SANDBOX'] | undefined,
-+  runnerId: string
-+) {
-+  try {
+-  } catch (error) {
+-    console.error('Failed to destroy CI sandbox', { error });
+-  }
+-}
 +    return namespace ? namespace.idFromName(runnerId).toString() : 'unavailable';
 +  } catch {
 +    return 'unavailable';
 +  }
 +}
 +
-+async function destroySandbox(sandbox: ReturnType<typeof getSandbox>) {
-+  try {
-+    await sandbox.destroy();
+diff --git a/src/ci/sandbox.ts b/src/ci/sandbox.ts
+--- a/src/ci/sandbox.ts
++++ b/src/ci/sandbox.ts
+@@ -5,0 +6 @@
++import { persistLogs } from '../pipeline/persisted-logs';
+@@ -7 +8,20 @@
+-export class CiSandbox extends Sandbox<Bindings> {}
++export class CiSandbox extends Sandbox<Bindings> {
++  async persistCiLogs(prefix: string) {
++    if (!/^logs\/[A-Za-z0-9_-]{1,256}\/native\/ci1-[fc]-[a-f0-9]{56}$/.test(prefix))
++      throw new Error('Invalid CI log identity');
++    const listing = await this.listFiles('/tmp');
++    const sizes = new Map(listing.files.map(file => [file.absolutePath, file.size]));
++    const stdoutSize = sizes.get('/tmp/ci-step.out');
++    const stderrSize = sizes.get('/tmp/ci-step.err');
++    if (stdoutSize === undefined || stderrSize === undefined)
++      throw new Error('CI log file is missing');
++    const [stdout, stderr] = await Promise.all([
++      this.readFile('/tmp/ci-step.out', { encoding: 'none' }),
++      this.readFile('/tmp/ci-step.err', { encoding: 'none' }),
++    ]);
++    return persistLogs(this.env.BACKUP_BUCKET, prefix, {
++      logs: { stdout: stdout.content, stderr: stderr.content },
++      logSizes: { stdout: stdoutSize, stderr: stderrSize },
++    });
++  }
++}
 diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
 --- a/src/ci/step-notification.ts
 +++ b/src/ci/step-notification.ts
-@@ -8,11 +8,18 @@
--  DirectoryBackup,
--} from '../pipeline';
--import type { StepNotificationHandle } from '../source-control';
--
--export type StepExecution = {
--  exitCode: number;
--  logs: CiRunnerLogs;
--  preview: { stdout: string; stderr: string };
--  // The restorable workspace backup (always produced on success), kept separate
--  // from the cache pointer below: `snapshot` is the thing you restore,
--  // `cachePointer` is only bookkeeping for the deterministic cache indirection.
-+  DirectoryBackup,
-+} from '../pipeline';
-+import type { StepNotificationHandle } from '../source-control';
+@@ -6,2 +5,0 @@
+-  CiRunStepOutput,
+-  CiRunnerLogs,
+@@ -10,0 +9,7 @@
 +import { operationInterruptedFrom } from '../pipeline/operation-interrupted';
 +import {
 +  boundedCause,
 +  runnerFailureOf,
 +  type RunnerFailureEvidence,
 +} from './runner-failure-evidence';
-+
-+export type StepExecution = {
-+  exitCode: number;
-+  logs: CiRunnerLogs;
-+  preview: { stdout: string; stderr: string };
++import type { StoredOutput } from '../pipeline/persisted-logs';
+@@ -14 +19 @@
+-  logs: CiRunnerLogs;
++  logs: StoredOutput["logs"];
+@@ -15,0 +21 @@
 +  logSizes?: { stdout: number; stderr: number };
-+  // The restorable workspace backup (always produced on success), kept separate
-+  // from the cache pointer below: `snapshot` is the thing you restore,
-+  // `cachePointer` is only bookkeeping for the deterministic cache indirection.
-@@ -75,11 +82,14 @@
--    return {
--      exitCode: completed.exitCode,
--      logs: completed.logs,
--      snapshot: completed.snapshot,
--      cachePointer: completed.cachePointer,
--    };
--  } catch (error) {
+@@ -44 +50 @@
+-): Promise<CiRunStepOutput> {
++): Promise<StoredOutput> {
+@@ -77,0 +84 @@
++      logSizes: completed.logSizes,
+@@ -82,6 +89,3 @@
 -    const safeError = sanitizeError(error, input.sensitiveValues);
 -    try {
 -      await cancelLogs(execution?.logs);
 -    } catch (cleanupError) {
-+    return {
-+      exitCode: completed.exitCode,
-+      logs: completed.logs,
-+      logSizes: completed.logSizes,
-+      snapshot: completed.snapshot,
-+      cachePointer: completed.cachePointer,
-+    };
-+  } catch (error) {
+-      console.error('Failed to cancel CI log streams', { cleanupError });
+-    }
 +    const safeError =
 +      operationInterruptedFrom(error) ??
 +      sanitizeError(error, input.sensitiveValues);
-+    try {
-+      await cancelLogs(execution?.logs);
-+    } catch (cleanupError) {
-@@ -120,9 +130,65 @@
--    error instanceof Error ? error.message : String(error),
--    sensitiveValues
--  );
+@@ -123 +127,5 @@
 -  const safe = new Error(message);
--  safe.name = error instanceof Error ? error.name : 'Error';
--  return safe;
--}
--
--function redact(value: string, sensitiveValues: string[]) {
-+    error instanceof Error ? error.message : String(error),
-+    sensitiveValues
-+  );
 +  const evidence = runnerFailureOf(error);
 +  const detail = evidence?.interruption
 +    ? failureDetail(evidence, sensitiveValues)
 +    : '';
 +  const safe = new Error(detail ? `${message}\n${detail}` : message);
-+  safe.name = error instanceof Error ? error.name : 'Error';
-+  return safe;
+@@ -125,0 +134,52 @@
 +}
 +
 +function failureDetail(
@@ -670,66 +1038,67 @@ diff --git a/src/ci/step-notification.ts b/src/ci/step-notification.ts
 +    fields.push(`retryable=${evidence.retryable}`);
 +  }
 +  return fields.join('\n');
-+}
-+
-+function redact(value: string, sensitiveValues: string[]) {
+@@ -139,10 +198,0 @@
+-async function cancelLogs(logs: CiRunnerLogs | undefined) {
+-  if (!logs) {
+-    return;
+-  }
+-  await Promise.all(
+-    [logs.stdout, logs.stderr].map((log) =>
+-      typeof log === 'string' ? Promise.resolve() : log.cancel()
+-    )
+-  );
+-}
+diff --git a/src/env.ts b/src/env.ts
+--- a/src/env.ts
++++ b/src/env.ts
+@@ -25 +25 @@
+-  SANDBOX: DurableObjectNamespace<import('./ci/sandbox').CiSandbox>;
++  SANDBOX: DurableObjectNamespace<import('./ci/sandbox').CiSandbox & { cancel(): Promise<void> }>;
 diff --git a/src/index.ts b/src/index.ts
 --- a/src/index.ts
 +++ b/src/index.ts
-@@ -2,6 +2,7 @@
--// SPDX-License-Identifier: Apache-2.0
--
--export { CIWorkflow, cloudflareArtifacts, isCiRunnerFailure } from './pipeline';
--export type {
--  CiContext,
--  CiParams,
-+// SPDX-License-Identifier: Apache-2.0
-+
-+export { CIWorkflow, cloudflareArtifacts, isCiRunnerFailure } from './pipeline';
+@@ -4,0 +5 @@
 +export { CiOperationInterruptedError } from './pipeline/operation-interrupted';
-+export type {
-+  CiContext,
-+  CiParams,
 diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 --- a/src/pipeline/ci-workflow.ts
 +++ b/src/pipeline/ci-workflow.ts
-@@ -25,6 +25,12 @@
--import type { Bindings } from '../env';
--import { runCiStep } from '../ci/capabilities';
--import { RunnerGroup } from './runner-group';
--
--const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
--const DEFAULT_STEP_CONFIG = {
-+import type { Bindings } from '../env';
-+import { runCiStep } from '../ci/capabilities';
-+import { RunnerGroup } from './runner-group';
-+import { persistLogs, restoreLogs } from './persisted-logs';
-+import {
-+  decodeOperationInterrupted,
-+  encodeOperationInterrupted,
-+  isOperationInterruptedSignal,
-+} from './operation-interrupted';
-+
-+const DEFAULT_STEP_TIMEOUT_MS = 12 * 60 * 1000;
-+const DEFAULT_STEP_CONFIG = {
-@@ -145,8 +151,8 @@
--      runners.run(options, inherited, () => {
--        const config = resolveRunnerConfig(options);
--        return step
+@@ -27,0 +28,3 @@
++import { decodeOperationInterrupted, encodeOperationInterrupted, isOperationInterruptedSignal } from './operation-interrupted';
++import { recoverCompletion, CompletionUnavailableError, readProcessAdmission, claimProcessRecovery } from './completion';
++import { decodeStoredOutput, restoreLogs } from './persisted-logs';
+@@ -146,0 +150,15 @@
++        const input = {
++          ...runContext,
++          label: options.name,
++          command: options.command,
++          cwd: options.cwd,
++          commandTimeoutMs: config.commandTimeoutMs,
++          snapshot: inherited,
++          snapshotTtlSeconds: config.snapshotTtlSeconds,
++          cloudflareCredentials: options.cloudflareCredentials,
++          sourceControlCredentials: options.sourceControlCredentials,
++          cachePaths: options.cache?.inputs,
++          env: options.env,
++          secrets: options.secrets,
++        };
++        let invocation: CiRunStepInput | undefined;
+@@ -148,4 +166,3 @@
 -          .do(options.name, config.workflow, (ctx) =>
 -            runCiStep(this.env, provider, {
 -              ...runContext,
 -              label: options.name,
--              attempt: ctx.attempt,
-+      runners.run(options, inherited, () => {
-+        const config = resolveRunnerConfig(options);
-+        return step
 +          .do(options.name, config.workflow, async (ctx) => {
-+            const output = await runCiStep(this.env, provider, {
-+              ...runContext,
-+              label: options.name,
-+              attempt: ctx.attempt,
-@@ -160,15 +166,36 @@
++            invocation = {
++              ...input,
+@@ -153,14 +170,54 @@
+-              command: options.command,
+-              cwd: options.cwd,
+-              commandTimeoutMs: config.commandTimeoutMs,
+-              snapshot: inherited,
+-              snapshotTtlSeconds: config.snapshotTtlSeconds,
+-              cloudflareCredentials: options.cloudflareCredentials,
+-              sourceControlCredentials: options.sourceControlCredentials,
 -              cachePaths: options.cache?.inputs,
 -              env: options.env,
 -              secrets: options.secrets,
@@ -737,50 +1106,317 @@ diff --git a/src/pipeline/ci-workflow.ts b/src/pipeline/ci-workflow.ts
 -          )
 -          .then((output) =>
 -            Object.freeze({
--              ...output,
--              runner: (nextOptions: RunnerOptions) =>
--                invoke(nextOptions, output.snapshot),
--            })
--          );
--      });
--
--    // CI ctx object
-+              cachePaths: options.cache?.inputs,
-+              env: options.env,
-+              secrets: options.secrets,
-+            }).catch(encodeOperationInterrupted);
-+            if (isOperationInterruptedSignal(output)) return output;
-+            const stored = await persistLogs(
-+              this.env.BACKUP_BUCKET,
-+              `logs/${event.instanceId}/native/${crypto.randomUUID()}`,
-+              output
-+            );
-+            try {
-+              console.log(JSON.stringify({
-+                event: 'ci-checkpoint-reached',
-+                step: options.name.slice(0, 64),
-+                stdout: typeof stored.logs.stdout === 'string' ? 'inline' : 'r2',
-+                stderr: typeof stored.logs.stderr === 'string' ? 'inline' : 'r2',
-+                snapshot: stored.snapshot != null,
-+              }));
-+            } catch {
-+              console.error('ci-checkpoint-telemetry-failed');
++              deadlineMs: Date.now() + config.workflow.timeout - COMMAND_TIMEOUT_MARGIN_MS,
++            };
++            // Primitive step results avoid the RPC lifetime issue: https://github.com/cloudflare/workerd/issues/6925.
++            const output = await runCiStep(this.env, provider, invocation).catch(encodeOperationInterrupted);
++            if (!isOperationInterruptedSignal(output)) {
++              try {
++                console.log(JSON.stringify({ event: 'ci-checkpoint-reached', step: options.name.slice(0, 64), stdout: typeof output.logs.stdout === 'string' ? 'inline' : 'r2', stderr: typeof output.logs.stderr === 'string' ? 'inline' : 'r2', snapshot: output.snapshot != null }));
++              } catch {
++                console.error('ci-checkpoint-telemetry-failed');
++              }
 +            }
-+            return stored;
++            return JSON.stringify(output);
++          })
++          .then(decodeCheckpoint)
++          .catch(async (error: unknown) => {
++            const captured = invocation ?? (
++              config.workflow.retries.limit === 0 ? { ...input, attempt: 1 } : undefined
++            );
++            console.warn('CI step rejection', { instanceId: event.instanceId, label: options.name, errorName: error instanceof Error ? error.name.slice(0, 64) : typeof error, capturedInvocation: Boolean(invocation), capturedAttempt: captured?.attempt, deadlineMs: captured?.deadlineMs });
++            const interrupted = error instanceof Error && (
++              error.name === 'WorkflowInternalError' ||
++              (error.name === 'Error' && error.message === 'Attempt failed due to internal workflows error')
++            );
++            if (!interrupted || !captured)
++              throw error;
++            try {
++              try {
++                return await recoverCompletion(this.env.BACKUP_BUCKET, captured, !invocation);
++              } catch (completionError) {
++                if (!(completionError instanceof CompletionUnavailableError)) throw completionError;
++                const admission = await readProcessAdmission(this.env.BACKUP_BUCKET, captured, !invocation);
++                if (admission.record.state !== 'started' || admission.record.recoveryClaimed)
++                  throw new Error('Running process is not available for recovery');
++                const process = admission.record.process;
++                const remaining = Math.min(admission.record.deadlineMs, process.deadlineMs) - Date.now();
++                if (remaining <= 0) throw new Error('Running process deadline expired');
++                // Observed command failures must escape instead of reverting to the original platform error.
++                return step.do(`${options.name}-resume`, {
++                  retries: { limit: 0, delay: 0 }, timeout: remaining,
++                }, async () => {
++                  if (!await claimProcessRecovery(this.env.BACKUP_BUCKET, admission.input))
++                    throw new Error('Running process recovery already claimed');
++                  console.warn('CI process observation resumed', { instanceId: event.instanceId, label: options.name, attempt: admission.input.attempt, remainingMs: remaining });
++                  return JSON.stringify(await runCiStep(this.env, provider, admission.input, process));
++                }).then(decodeCheckpoint);
++              }
++            } catch (recoveryError) {
++              console.warn('CI completion recovery rejected', { instanceId: event.instanceId, label: options.name, errorName: recoveryError instanceof Error ? recoveryError.name.slice(0, 64) : typeof recoveryError, reason: recoveryError instanceof Error && recoveryError.message.startsWith('Completed runner ') ? recoveryError.message : 'validation failed' });
++              throw error;
++            }
 +          })
 +          .then(async (stored) => {
-+            if (isOperationInterruptedSignal(stored))
-+              throw decodeOperationInterrupted(stored);
 +            const output = await restoreLogs(this.env.BACKUP_BUCKET, stored);
 +            return Object.freeze({
-+              ...output,
-+              runner: (nextOptions: RunnerOptions) =>
-+                invoke(nextOptions, output.snapshot),
+@@ -170,2 +227,2 @@
+-            })
+-          );
 +            });
 +          });
-+      });
+@@ -220,0 +278,8 @@
 +
-+    // CI ctx object
++function decodeCheckpoint(value: unknown) {
++  if (typeof value === 'string') {
++    const parsed: unknown = JSON.parse(value);
++    if (isOperationInterruptedSignal(parsed)) throw decodeOperationInterrupted(parsed);
++  }
++  return decodeStoredOutput(value);
++}
+diff --git a/src/pipeline/completion.ts b/src/pipeline/completion.ts
+new file mode 100644
+--- /dev/null
++++ b/src/pipeline/completion.ts
+@@ -0,0 +1,238 @@
++import { z } from "zod";
++import type * as Workers from "@cloudflare/workers-types/index.ts";
++import type { CiRunStepInput } from "./types";
++import type { StoredOutput } from "./persisted-logs";
++import { createRunnerId } from "../ci/runners/runner-id";
++
++declare const crypto: Crypto & { DigestStream: typeof Workers.DigestStream };
++const objectSchema = z.strictObject({
++  key: z.string(),
++  size: z.number().int().nonnegative(),
++  etag: z.string(),
++  sha256: z
++    .string()
++    .regex(/^[a-f0-9]{64}$/)
++    .optional(),
++});
++const outputSchema = z.strictObject({
++  exitCode: z.literal(0),
++  logs: z.strictObject({
++    stdout: z.strictObject({ r2Key: z.string() }),
++    stderr: z.strictObject({ r2Key: z.string() }),
++  }),
++  logSizes: z.strictObject({
++    stdout: z.number().int().nonnegative(),
++    stderr: z.number().int().nonnegative(),
++  }),
++  snapshot: z.strictObject({
++    id: z.string().uuid(),
++    dir: z.literal("/workspace"),
++    localBucket: z.boolean().optional(),
++  }),
++});
++const receiptSchema = z.strictObject({
++  version: z.literal(2),
++  deadlineMs: z.number().finite().positive(),
++  identity: z.string(),
++  output: outputSchema,
++  objects: z.array(objectSchema).length(4),
++});
++const runningProcessSchema = z.strictObject({
++  physicalRunnerId: z.string().regex(/^ci1-[fc]-[a-f0-9]{56}$/),
++  id: z.string().min(1).max(256),
++  startedAt: z.string().datetime(),
++  commandSha256: z.string().regex(/^[a-f0-9]{64}$/),
++  deadlineMs: z.number().finite().positive(),
++  localBucket: z.boolean(),
++});
++const executionIdentity = {
++  version: z.literal(1),
++  identity: z.string().regex(/^[a-f0-9]{64}$/),
++  deadlineMs: z.number().finite().positive(),
++  recoveryClaimed: z.boolean(),
++};
++const executionSchema = z.discriminatedUnion('state', [
++  z.strictObject({ ...executionIdentity, state: z.literal('preparing') }),
++  z.strictObject({ ...executionIdentity, state: z.literal('started'), process: runningProcessSchema }),
++]);
++export type RunningProcess = z.infer<typeof runningProcessSchema>;
++export type ProcessJournal = {
++  started(process: RunningProcess): Promise<void>;
++  claimRecovery(): Promise<boolean>;
++};
++export class CompletionUnavailableError extends Error {}
++const hex = (bytes: ArrayBuffer) =>
++  Array.from(new Uint8Array(bytes), (value) => value.toString(16).padStart(2, "0")).join("");
++export async function executionHash(value: string) {
++  return hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)));
++}
++async function identity(input: CiRunStepInput) {
++  return executionHash(JSON.stringify(input));
++}
++const processKey = async (input: CiRunStepInput) => `native-processes/${await createRunnerId(input)}.json`;
++
++export async function beginExecution(bucket: R2Bucket, input: CiRunStepInput) {
++  if (await bucket.head(`native-completions/${await createRunnerId(input)}.json`))
++    return recoverCompletion(bucket, input);
++  const record = executionSchema.parse({
++    version: 1, state: 'preparing', identity: await identity(input),
++    deadlineMs: input.deadlineMs, recoveryClaimed: false,
++  });
++  if (Date.now() >= record.deadlineMs) throw new Error('Running process deadline expired');
++  const saved = await bucket.put(await processKey(input), JSON.stringify(record), {
++    onlyIf: { etagDoesNotMatch: '*' }, httpMetadata: { contentType: 'application/json' },
++  });
++  if (!saved) throw new Error('Running process execution already admitted');
++  return null;
++}
++
++export async function readProcessAdmission(bucket: R2Bucket, input: CiRunStepInput, restoreDeadline = false) {
++  if (restoreDeadline && (input.deadlineMs !== undefined || input.attempt !== 1))
++    throw new Error('Running process replay identity invalid');
++  const object = await bucket.get(await processKey(input));
++  if (!object || object.size > 8192) throw new Error('Running process admission unavailable');
++  const record = executionSchema.parse(await object.json());
++  const captured = restoreDeadline ? { ...input, deadlineMs: record.deadlineMs } : input;
++  if (captured.deadlineMs !== record.deadlineMs || Date.now() >= record.deadlineMs)
++    throw new Error('Running process deadline expired');
++  if (record.identity !== await identity(captured)) throw new Error('Running process identity mismatch');
++  if (record.state === 'started') {
++    const allowed = await Promise.all([createRunnerId(captured), createRunnerId({ ...captured, incarnation: 1 })]);
++    if (!allowed.includes(record.process.physicalRunnerId)) throw new Error('Running process actor identity mismatch');
++    if (record.process.deadlineMs > record.deadlineMs || Date.now() >= record.process.deadlineMs)
++      throw new Error('Running process deadline expired');
++  }
++  return { input: captured, record, etag: object.etag };
++}
++
++export async function recordStartedProcess(bucket: R2Bucket, input: CiRunStepInput, process: RunningProcess) {
++  const prior = await readProcessAdmission(bucket, input);
++  if (prior.record.state !== 'preparing') throw new Error('Running process admission already started');
++  const record = executionSchema.parse({ ...prior.record, state: 'started', process });
++  if (record.state !== 'started') throw new Error('Running process admission is not started');
++  const allowed = await Promise.all([createRunnerId(input), createRunnerId({ ...input, incarnation: 1 })]);
++  if (!allowed.includes(record.process.physicalRunnerId) || record.process.deadlineMs > record.deadlineMs)
++    throw new Error('Running process admission identity invalid');
++  if (!await bucket.put(await processKey(input), JSON.stringify(record), {
++    onlyIf: { etagMatches: prior.etag }, httpMetadata: { contentType: 'application/json' },
++  })) throw new Error('Running process admission changed');
++}
++
++export async function claimProcessRecovery(bucket: R2Bucket, input: CiRunStepInput) {
++  const prior = await readProcessAdmission(bucket, input);
++  if (prior.record.recoveryClaimed) return false;
++  return Boolean(await bucket.put(await processKey(input), JSON.stringify({ ...prior.record, recoveryClaimed: true }), {
++    onlyIf: { etagMatches: prior.etag }, httpMetadata: { contentType: 'application/json' },
++  }));
++}
++
++export async function discardProcessAdmission(bucket: R2Bucket, input: CiRunStepInput) {
++  await bucket.delete(await processKey(input));
++}
++async function fingerprint(bucket: R2Bucket, key: string) {
++  if (key.endsWith("/data.sqsh")) {
++    const object = await bucket.head(key);
++    if (!object) throw new Error("Completed runner snapshot is missing");
++    return { key, size: object.size, etag: object.etag };
++  }
++  const object = await bucket.get(key);
++  if (!object) throw new Error("Completed runner object is missing");
++  const hash = new crypto.DigestStream("SHA-256");
++  await object.body.pipeTo(hash);
++  return { key, size: object.size, etag: object.etag, sha256: hex(await hash.digest) };
++}
++async function keys(output: z.infer<typeof outputSchema>, input: CiRunStepInput) {
++  const prefix = `logs/${input.instanceId}/native/${await createRunnerId(input)}`;
++  for (const channel of ["stdout", "stderr"] as const) {
++    if (output.logs[channel].r2Key !== `${prefix}/${channel}`)
++      throw new Error("Completed runner log identity mismatch");
++  }
++  return [
++    output.logs.stdout.r2Key,
++    output.logs.stderr.r2Key,
++    `backups/${output.snapshot.id}/meta.json`,
++    `backups/${output.snapshot.id}/data.sqsh`,
++  ];
++}
++async function validate(bucket: R2Bucket, input: CiRunStepInput, value: unknown) {
++  const receipt = receiptSchema.parse(value);
++  if (receipt.identity !== (await identity(input)))
++    throw new Error("Completed runner identity mismatch");
++  const expected = await keys(receipt.output, input);
++  for (const [index, key] of expected.entries()) {
++    const object = receipt.objects[index];
++    if (object.key !== key) throw new Error("Completed runner object identity mismatch");
++    const actual = await fingerprint(bucket, key);
++    if (
++      actual.size !== object.size ||
++      actual.etag !== object.etag ||
++      actual.sha256 !== object.sha256
++    )
++      throw new Error("Completed runner object integrity mismatch");
++    if (index < 2 && actual.size !== receipt.output.logSizes[index === 0 ? "stdout" : "stderr"])
++      throw new Error("Completed runner log size mismatch");
++  }
++  return receipt.output;
++}
++export async function persistCompletion(
++  bucket: R2Bucket,
++  input: CiRunStepInput,
++  value: StoredOutput,
++) {
++  const output = outputSchema.parse({
++    exitCode: value.exitCode,
++    logs: value.logs,
++    logSizes: value.logSizes,
++    snapshot: value.snapshot,
++  });
++  const objects = await Promise.all(
++    (await keys(output, input)).map((key) => fingerprint(bucket, key)),
++  );
++  const receipt = receiptSchema.parse({
++    version: 2,
++    deadlineMs: input.deadlineMs,
++    identity: await identity(input),
++    output,
++    objects,
++  });
++  const key = `native-completions/${await createRunnerId(input)}.json`;
++  const saved = await bucket.put(key, JSON.stringify(receipt), {
++    onlyIf: { etagDoesNotMatch: "*" },
++    httpMetadata: { contentType: "application/json" },
++  });
++  if (!saved) {
++    const previous = await bucket.get(key);
++    if (
++      !previous ||
++      previous.size > 16384 ||
++      JSON.stringify(receiptSchema.parse(await previous.json())) !== JSON.stringify(receipt)
++    )
++      throw new Error("Completed runner receipt collision");
++  }
++}
++export async function recoverCompletion(
++  bucket: R2Bucket,
++  input: CiRunStepInput,
++  restoreDeadline = false,
++) {
++  if (restoreDeadline && (input.deadlineMs !== undefined || input.attempt !== 1))
++    throw new Error("Completed runner replay identity invalid");
++  if (
++    !restoreDeadline && (
++      input.deadlineMs === undefined ||
++      !Number.isFinite(input.deadlineMs) ||
++      Date.now() >= input.deadlineMs
++    )
++  )
++    throw new Error("Completed runner deadline expired");
++  const object = await bucket.get(`native-completions/${await createRunnerId(input)}.json`);
++  if (!object) throw new CompletionUnavailableError("Completed runner receipt unavailable");
++  if (object.size > 16384) throw new Error("Completed runner receipt exceeds byte budget");
++  const receipt = receiptSchema.parse(await object.json());
++  const captured = restoreDeadline ? { ...input, deadlineMs: receipt.deadlineMs } : input;
++  if (captured.deadlineMs !== receipt.deadlineMs || Date.now() >= receipt.deadlineMs)
++    throw new Error("Completed runner deadline expired");
++  const output = await validate(bucket, captured, receipt);
++  if (Date.now() >= receipt.deadlineMs) throw new Error("Completed runner deadline expired");
++  return output;
++}
 diff --git a/src/pipeline/operation-interrupted.ts b/src/pipeline/operation-interrupted.ts
 new file mode 100644
 --- /dev/null
@@ -872,22 +1508,50 @@ diff --git a/src/pipeline/persisted-logs.ts b/src/pipeline/persisted-logs.ts
 new file mode 100644
 --- /dev/null
 +++ b/src/pipeline/persisted-logs.ts
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,161 @@
 +import type * as Workers from '@cloudflare/workers-types/index.ts';
++import { createHash } from 'node:crypto';
++import { z } from 'zod';
 +import type { CiRunStepOutput } from './types';
 +
 +declare const FixedLengthStream: typeof Workers.FixedLengthStream;
 +
 +type StoredLog = string | { r2Key: string };
-+type StoredOutput = Omit<CiRunStepOutput, 'logs'> & {
++export type StoredOutput = Omit<CiRunStepOutput, 'logs'> & {
 +  logs: { stdout: StoredLog; stderr: StoredLog };
 +};
 +
-+export async function persistLogs(
++const storedLogSchema = z.union([z.string(), z.strictObject({ r2Key: z.string() })]);
++const storedOutputSchema = z.strictObject({
++  exitCode: z.number().finite(),
++  logs: z.strictObject({ stdout: storedLogSchema, stderr: storedLogSchema }),
++  logSizes: z.strictObject({
++    stdout: z.number().int().nonnegative(),
++    stderr: z.number().int().nonnegative(),
++  }).optional(),
++  preview: z.strictObject({ stdout: z.string(), stderr: z.string() }).optional(),
++  snapshot: z.strictObject({
++    id: z.string(),
++    dir: z.string(),
++    localBucket: z.boolean().optional(),
++  }),
++  cachePointer: z.strictObject({
++    key: z.string(),
++    createdAt: z.string(),
++    sizeBytes: z.number().int().nonnegative(),
++  }).optional(),
++  cacheHit: z.boolean().optional(),
++});
++
++export function decodeStoredOutput(value: unknown): StoredOutput {
++  return storedOutputSchema.parse(JSON.parse(z.string().parse(value)));
++}
++
++export async function persistLogs<T extends Pick<CiRunStepOutput, "logs" | "logSizes">>(
 +  bucket: R2Bucket,
 +  prefix: string,
-+  output: CiRunStepOutput
-+): Promise<StoredOutput> {
++  output: T
++): Promise<Omit<T, "logs"> & { logs: StoredOutput["logs"] }> {
 +  const results = await Promise.allSettled([
 +    storeLog(bucket, `${prefix}/stdout`, output.logs.stdout, output.logSizes?.stdout),
 +    storeLog(bucket, `${prefix}/stderr`, output.logs.stderr, output.logSizes?.stderr),
@@ -906,8 +1570,35 @@ new file mode 100644
 +): Promise<StoredLog> {
 +  if (typeof log === 'string') return log;
 +  if (size === undefined || !Number.isSafeInteger(size) || size < 0) {
-+    await log.cancel().catch(() => {});
++    await log.cancel().catch(() => { console.warn('CI stream cleanup failed'); });
 +    throw new Error('Streamed CI log has no valid byte length');
++  }
++  let existing: Workers.R2ObjectBody | null;
++  try {
++    existing = await bucket.get(r2Key);
++  } catch (error) {
++    await log.cancel().catch(() => { console.warn('CI stream cleanup failed'); });
++    throw error;
++  }
++  if (existing) {
++    if (existing.size !== size) {
++      await Promise.allSettled([log.cancel(), existing.body.cancel()]);
++      throw new Error('Existing CI log size differs');
++    }
++    const incomingReader = log.getReader();
++    const existingReader = existing.body.getReader();
++    try {
++      const [incomingHash, existingHash] = await Promise.all([
++        hashLog(incomingReader, size),
++        hashLog(existingReader, size),
++      ]);
++      if (incomingHash !== existingHash) throw new Error('Existing CI log bytes differ');
++      return { r2Key };
++    } finally {
++      await Promise.allSettled([incomingReader.cancel(), existingReader.cancel()]);
++      incomingReader.releaseLock();
++      existingReader.releaseLock();
++    }
 +  }
 +  const body = new FixedLengthStream(size);
 +  const reader = log.getReader();
@@ -921,23 +1612,42 @@ new file mode 100644
 +      }
 +      await writer.close();
 +    } catch (error) {
-+      await writer.abort(error).catch(() => {});
++      await writer.abort(error).catch(() => { console.warn('CI stream cleanup failed'); });
 +      throw error;
 +    } finally {
-+      await reader.cancel().catch(() => {});
++      await reader.cancel().catch(() => { console.warn('CI stream cleanup failed'); });
 +      writer.releaseLock();
 +    }
 +  })();
-+  const upload = Promise.resolve().then(() => bucket.put(r2Key, body.readable, {
-+    httpMetadata: { contentType: 'application/octet-stream' },
-+  })).catch(async (error) => {
-+    await body.readable.cancel(error).catch(() => {});
++  const upload = Promise.resolve().then(async () => {
++    const saved = await bucket.put(r2Key, body.readable, {
++      httpMetadata: { contentType: 'application/octet-stream' },
++      onlyIf: { etagDoesNotMatch: '*' },
++    });
++    if (!saved) throw new Error('CI log object already exists');
++    return saved;
++  }).catch(async (error) => {
++    await body.readable.cancel(error).catch(() => { console.warn('CI stream cleanup failed'); });
 +    throw error;
 +  });
 +  const [transferred, uploaded] = await Promise.allSettled([transfer, upload]);
 +  if (uploaded.status === 'rejected') throw uploaded.reason;
 +  if (transferred.status === 'rejected') throw transferred.reason;
 +  return { r2Key };
++}
++
++async function hashLog(reader: Pick<Workers.ReadableStreamDefaultReader<Uint8Array>, 'read'>, size: number): Promise<string> {
++  const hash = createHash('sha256');
++  let bytes = 0;
++  for (;;) {
++    const chunk = await reader.read();
++    if (chunk.done) break;
++    bytes += chunk.value.byteLength;
++    if (bytes > size) throw new Error('CI log stream exceeds its byte length');
++    hash.update(chunk.value);
++  }
++  if (bytes !== size) throw new Error('CI log stream ended before its byte length');
++  return hash.digest('hex');
 +}
 +
 +export async function restoreLogs(
@@ -949,7 +1659,7 @@ new file mode 100644
 +    const stderr = await loadLog(bucket, output.logs.stderr);
 +    return { ...output, logs: { stdout, stderr } };
 +  } catch (error) {
-+    if (typeof stdout !== 'string') await stdout.cancel().catch(() => {});
++    if (typeof stdout !== 'string') await stdout.cancel().catch(() => { console.warn('CI stream cleanup failed'); });
 +    throw error;
 +  }
 +}
@@ -963,25 +1673,71 @@ new file mode 100644
 diff --git a/src/pipeline/types.ts b/src/pipeline/types.ts
 --- a/src/pipeline/types.ts
 +++ b/src/pipeline/types.ts
-@@ -1,3 +1,4 @@
--// Copyright (c) 2026 Cloudflare, Inc.
--// SPDX-License-Identifier: Apache-2.0
--
+@@ -0,0 +1 @@
 +import type { ReadableStream } from "@cloudflare/workers-types/index.ts";
+@@ -110,0 +112 @@
++  deadlineMs?: number;
+@@ -138,0 +141 @@
++  logSizes?: { stdout: number; stderr: number };
+diff --git a/src/shared/rpc-data.ts b/src/shared/rpc-data.ts
+new file mode 100644
+--- /dev/null
++++ b/src/shared/rpc-data.ts
+@@ -0,0 +1,13 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// SPDX-License-Identifier: Apache-2.0
 +
-@@ -136,6 +137,7 @@
--};
--
--export type CiRunStepOutput = {
--  exitCode: number;
--  logs: CiRunnerLogs;
--  // The workspace backup the sandbox writes after every successful runner. The
-+};
-+
-+export type CiRunStepOutput = {
-+  logSizes?: { stdout: number; stderr: number };
-+  exitCode: number;
-+  logs: CiRunnerLogs;
-+  // The workspace backup the sandbox writes after every successful runner. The
++export function rpcData<T>(value: T): T {
++  try {
++    return structuredClone(value);
++  } finally {
++    if (typeof value === 'object' && value !== null && Symbol.dispose in value) {
++      const dispose = value[Symbol.dispose];
++      if (typeof dispose === 'function') dispose.call(value);
++    }
++  }
++}
+diff --git a/src/shared/source-checkout.ts b/src/shared/source-checkout.ts
+--- a/src/shared/source-checkout.ts
++++ b/src/shared/source-checkout.ts
+@@ -18 +18,2 @@
+-  overlay = false
++  overlay = false,
++  deadlineMs?: number
+@@ -19,0 +21,4 @@
++  if (deadlineMs !== undefined && !Number.isFinite(deadlineMs))
++    throw new Error('CI source checkout deadline must be finite');
++  const budget = deadlineMs === undefined ? ':' :
++    `if [ "$(date +%s%3N)" -lt ${deadlineMs} ]; then :; else printf '%s\n' 'CI source checkout deadline expired' >&2; exit 124; fi`;
+@@ -24 +29 @@
+-    return `${prepare} && curl --connect-timeout 10 --max-time 300 --fail --silent --show-error --location ${shellQuote(source.url)} | tar -xz --strip-components=1 -C ${shellQuote(workspace)}`;
++    return `${budget} && ${prepare} && curl --connect-timeout 10 --max-time 300 --fail --silent --show-error --location ${shellQuote(source.url)} | tar -xz --strip-components=1 -C ${shellQuote(workspace)}`;
+@@ -25,0 +31 @@
++  const fetch = `LC_ALL=C git -c http.extraHeader="Authorization: Bearer $SOURCE_CONTROL_TOKEN" -C ${shellQuote(CLONE_DIR)} fetch --depth=1 origin ${shellQuote(source.sha)}`;
+@@ -26,0 +33 @@
++    budget,
+@@ -31 +38,23 @@
+-    `git -c http.extraHeader="Authorization: Bearer $SOURCE_CONTROL_TOKEN" -C ${shellQuote(CLONE_DIR)} fetch --depth=1 origin ${shellQuote(source.sha)}`,
++    budget,
++    `(
++      umask 077
++      fetch_error="$(mktemp)" || exit 1
++      trap 'rm -f -- "$fetch_error"' EXIT
++      if ${fetch} 2>"$fetch_error"; then
++        cat "$fetch_error" >&2
++      else
++        fetch_status=$?
++        if [ "$fetch_status" -eq 128 ] && grep -Fxq -- ${shellQuote(`fatal: unable to access '${source.remote.replace(/\/?$/, '/')}': The requested URL returned error: 503`)} "$fetch_error"; then
++          printf '%s\n' 'CI source preparation recovery: git-fetch HTTP503 exit128 attempt1' >&2
++          awk '{ rest=$0; result=""; token=ENVIRON["SOURCE_CONTROL_TOKEN"]; while (token!="" && (at=index(rest,token))>0) { result=result substr(rest,1,at-1) "[REDACTED]"; rest=substr(rest,at+length(token)); } print result rest; }' "$fetch_error" | tail -c 2000 >&2
++          printf '\n' >&2
++          sleep 1
++          ${budget}
++          ${fetch}
++        else
++          cat "$fetch_error" >&2
++          exit "$fetch_status"
++        fi
++      fi
++    )`,
++    `test "$(git -C ${shellQuote(CLONE_DIR)} rev-parse --verify FETCH_HEAD)" = ${shellQuote(source.sha)}`,
