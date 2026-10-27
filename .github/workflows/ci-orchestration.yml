@@ -47,8 +47,9 @@ jobs:
       - name: Install frozen orchestration dependencies
         run: |
           bun install --frozen-lockfile --ignore-scripts
-          bun install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts
           bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+          bun run --cwd services/ci-inspector check
+          bun install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts
           bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
       - name: Test courier, verifier, inspector and coder contracts
         run: |

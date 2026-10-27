@@ -69,6 +69,10 @@ The native SDK currently initializes only in the opt-in `omgd` daemon. Release b
 
 ## Activation evidence
 
+The October 27 recovery batch builds the Rust executor from `5543893617801998468b71b0e74bf2a18ff93bd3`. Its immutable registry manifest is `sha256:768b4ff3432702dbb212ade528445cf8093332593e65657e816c6b0ad85b72a6`, with config digest `sha256:c94f3e571f90755ab6abd7adb5f4c906fd455d5b2a5807cbea27747ea6822f60`. All 35 build-context files came from that commit. The build passed environment-envelope, frozen-input, portable-fixture, timeout-cleanup and unprivileged Rust 1.95.0 checks. Remote manifest, platform and config identity were checked after publication. These are image-build results; deployment and a cloud-generated Rust PR require their own acceptance evidence.
+
+The controller-renewal gate requires different old and new image identities. Activation must keep the image, verifier and controller identities consistent with the exact retained parent and the existing renewal planner. Keep new AI reviews enabled while using the existing admission hold for the transition. The inspector must also type-check before coder dependencies are installed; this prevents a shared helper from silently adding an undeclared package dependency.
+
 Before enabling unattended operation, retain all of the following evidence:
 
 1. The actual merged main commit containing the registered workflows and all three services. GitHub requires a dispatch workflow on the default branch. See [workflow event requirements](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
