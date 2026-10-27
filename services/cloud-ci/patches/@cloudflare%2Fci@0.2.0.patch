@@ -657,7 +657,7 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 -        preview,
 -        snapshot,
 -      };
-@@ -138,2 +219,11 @@
+@@ -138,2 +219,18 @@
 -      if (!cleanupTransferredToStreams) {
 -        await destroySandbox(sandbox);
 +      try {
@@ -666,12 +666,19 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +      } catch (cleanupError) {
 +        if (outcome.kind !== 'failed-error' && outcome.kind !== 'failed-result') throw cleanupError;
 +        if (outcome.kind === 'failed-error' && outcome.error instanceof Error) {
-+          outcome.error.cause = outcome.error.cause === undefined
-+            ? cleanupError
-+            : new AggregateError([outcome.error.cause, cleanupError], 'CI command and cleanup failed');
++          const descriptor = Object.getOwnPropertyDescriptor(outcome.error, 'cause');
++          if (descriptor?.writable || (!descriptor && Object.isExtensible(outcome.error))) {
++            const previous: unknown = descriptor?.value;
++            Object.defineProperty(outcome.error, 'cause', {
++              ...descriptor,
++              value: previous === undefined ? cleanupError : new AggregateError([previous, cleanupError], 'CI command and cleanup failed'),
++              writable: true,
++              configurable: descriptor?.configurable ?? true,
++            });
++          }
 +        }
 +        console.error('CI sandbox cleanup acknowledgement failed');
-@@ -145,12 +235,40 @@
+@@ -145,12 +242,40 @@
 -async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
 -  const listing = await sandbox.listFiles('/tmp');
 -  const sizes = new Map(
@@ -724,7 +731,7 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +}
 +
 +async function waitForProcessExit(
-@@ -158,10 +276,86 @@
+@@ -158,10 +283,86 @@
 -  file: string,
 -  size: number
 -): Promise<string | ReadableStream<Uint8Array>> {
@@ -821,12 +828,12 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +
 +async function readPreviews(sandbox: ReturnType<typeof getSandbox>, timedOut = false) {
 +  const read = timedOut ? readTimeoutTail : readTail;
-@@ -169,2 +363,2 @@
+@@ -169,2 +370,2 @@
 -    readTail(sandbox, STDOUT_FILE),
 -    readTail(sandbox, STDERR_FILE),
 +    read(sandbox, STDOUT_FILE),
 +    read(sandbox, STDERR_FILE),
-@@ -175 +369,15 @@
+@@ -175 +376,15 @@
 -async function readTail(sandbox: ReturnType<typeof getSandbox>, file: string) {
 +async function readTimeoutTail(sandbox: ReturnType<typeof getSandbox>, file: string) {
 +  let timer: ReturnType<typeof setTimeout> | undefined;
@@ -843,15 +850,15 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +}
 +
 +async function readTail(sandbox: ReturnType<typeof getSandbox>, file: string, timeout = 30_000) {
-@@ -177 +385 @@
+@@ -177 +392 @@
 -    await sandbox.exec(`tail -c ${TAIL_BYTES} ${file} 2>/dev/null`, {
 +    rpcData(await sandbox.exec(`tail -c ${TAIL_BYTES} ${file} 2>/dev/null`, {
-@@ -179,2 +387,2 @@
+@@ -179,2 +394,2 @@
 -      timeout: 30_000,
 -    })
 +      timeout,
 +    }))
-@@ -201,3 +409,4 @@
+@@ -201,3 +416,4 @@
 -function withCleanup(
 -  stream: ReadableStream<Uint8Array>,
 -  release: () => Promise<void>
@@ -859,7 +866,7 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 +function runnerActorId(
 +  namespace: Bindings['SANDBOX'] | undefined,
 +  runnerId: string
-@@ -205,38 +413,0 @@
+@@ -205,38 +420,0 @@
 -  const reader = stream.getReader();
 -  let released = false;
 -  const releaseOnce = async () => {
@@ -898,7 +905,7 @@ diff --git a/src/ci/runners/sandbox.ts b/src/ci/runners/sandbox.ts
 -}
 -
 -async function destroySandbox(sandbox: ReturnType<typeof getSandbox>) {
-@@ -244,5 +415,6 @@
+@@ -244,5 +422,6 @@
 -    await sandbox.destroy();
 -  } catch (error) {
 -    console.error('Failed to destroy CI sandbox', { error });
