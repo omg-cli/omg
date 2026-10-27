@@ -18,8 +18,12 @@ on:
       scope:
         description: Review current changes, one immutable source audit page, or pending runtime evidence
         type: choice
-        options: [changes, source-audit, runtime-events, test-audit]
+        options: [changes, source-audit, runtime-events, test-audit, issue]
         default: changes
+      issue:
+        description: One open OMG issue whose referenced Rust source fits existing review limits
+        type: string
+        default: ""
       audit_sha:
         description: Exact commit for a resumed source audit
         type: string
@@ -298,6 +302,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: ${{ needs.review.outputs.controller-sha || vars.OMG_CI_CONTROLLER_SHA }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify trusted controller Bun
         shell: bash

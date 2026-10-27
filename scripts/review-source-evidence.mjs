@@ -100,10 +100,11 @@ export function isReviewSourcePath(file) {
     );
 }
 
-export function createSourceAuditEvidence({ sha, branch, sourceFiles, runtimeEvidence }) {
+export function createSourceAuditEvidence({ sha, branch, sourceFiles, runtimeEvidence, ciFailures = [] }) {
     const sourceInput = sourceReviewInputSchema.parse({
         repository: SOURCE_REPOSITORY, sha, branch, changedPaths: [], diff: "",
         auditPaths: sourceFiles.map((file) => file.path), sourceFiles,
+        ciFailures,
         ...(runtimeEvidence ? { runtimeEvidence } : {}),
     });
     for (const file of sourceInput.sourceFiles) {
