@@ -338,6 +338,11 @@ class CiDeduplicationTests(unittest.TestCase):
     def test_workflow_recipe_executes_checks_and_propagates_failure(self) -> None:
         commands = [
             ["cargo", "fmt", "--all", "--", "--check"],
+            ["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_qemu_*.py", "-v"],
+            ["./scripts/test-release-smoke.sh"],
+            ["./scripts/test-qa-file-issue.sh"],
+            ["./scripts/test-qa-audit.sh"],
+            ["./scripts/test-qa-open-pr.sh"],
             ["python3", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py", "-v"],
             ["python3", "tests/test_benchmark_records.py"],
             ["python3", "tests/test_terminal_update_notice.py"],
@@ -376,6 +381,10 @@ class CiDeduplicationTests(unittest.TestCase):
                     else:
                         content = f'#!/bin/sh\nexec "{sys.executable}" "{runner}" {command} "$@"\n'
                     stub.write_text(content, encoding="utf-8")
+                    stub.chmod(0o755)
+                for command in ("test-release-smoke.sh", "test-qa-file-issue.sh", "test-qa-audit.sh", "test-qa-open-pr.sh"):
+                    stub = root / "scripts" / command
+                    stub.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{runner}" ./scripts/{command} "$@"\n', encoding="utf-8")
                     stub.chmod(0o755)
                 log = root / "checks.jsonl"
                 make = ["make", "--no-print-directory", "ci-workflow-quick"]

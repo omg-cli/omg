@@ -321,5 +321,16 @@ else
 fi
 unset FAKE_FAIL_OPERATION
 
+printf '%s' '[{"case_id":"qemu-fedora-search","distro":"fedora","result":"PRODUCT_FAIL","exit_code":1,"elapsed_seconds":2}]' > "$results"
+export FAKE_ISSUES_JSON='[]'
+export FAKE_COMMENTS_JSON=''
+: > "$CALL_LOG"
+if bash "$runner" "$results" --run-url https://run/fedora-sqlite --source qemu-matrix >"$scratch/fedora-output" 2>"$scratch/error"; then
+  grep -q -- '--fedora-sqlite-bundle <verified-same-revision-bundle>' "$CALL_LOG" || fail "Fedora runbook omitted required package supply"
+  grep -q 'docs/qemu-local.md' "$CALL_LOG" || fail "Fedora runbook omitted supply instructions"
+else
+  fail "Fedora failure reporting failed"
+fi
+
 if [[ "$failures" -ne 0 ]]; then printf '%s failure(s)\n' "$failures" >&2; exit 1; fi
 printf 'qa-file-issue harness: all green\n'

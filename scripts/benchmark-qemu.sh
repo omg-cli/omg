@@ -9,6 +9,7 @@ inventory_file=
 inventory_policy=
 image_policy=
 image_cache=
+fedora_sqlite_bundle=
 image_cache_budget_bytes=4294967296
 arch=
 print_pins=false
@@ -27,13 +28,14 @@ root="$HOME/.cache/build-targets/omg-qemu-benchmark"
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 while (($#)); do
   case "$1" in
-    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--image-cache-budget-bytes|--evidence-dir|--inventory-tiers|--arch)
+    --distro|--release|--staged-dir|--release-dir|--inventory-file|--inventory-policy|--image-policy|--image-cache|--image-cache-budget-bytes|--evidence-dir|--inventory-tiers|--arch|--fedora-sqlite-bundle)
       [[ $# -ge 2 && -n "$2" ]] || exit 2
       case "$1" in
         --distro) distro=$2 ;; --release) tag=$2 ;; --staged-dir) staged_dir=$2 ;; --evidence-dir) root=$2 ;;
         --release-dir) release_dir=$2 ;; --inventory-file) inventory_file=$2 ;;
         --inventory-policy) inventory_policy=$2 ;;
         --image-policy) image_policy=$2 ;;
+        --fedora-sqlite-bundle) fedora_sqlite_bundle=$2 ;;
         --image-cache) image_cache=$2 ;;
         --image-cache-budget-bytes) [[ "$2" =~ ^[0-9]+$ ]] || exit 2; image_cache_budget_bytes=$2 ;;
         --inventory-tiers) inventory_tiers=$2 ;; --arch) arch=$2 ;;
@@ -57,6 +59,7 @@ Usage: scripts/benchmark-qemu.sh [--distro all|arch|debian|debian-trixie|ubuntu|
   [--evidence-dir DIR] [--benchmark] [--benchmark-transactions COUNT]
   [--print-pins] [--inventory-tiers CSV] [--inventory-allow-mutations]
   [--inventory-policy JSON]
+  [--fedora-sqlite-bundle DIR] (required for Fedora, including all)
   [--image-policy JSON] [--image-cache DIR] [--image-cache-budget-bytes BYTES]
   [--inventory-isolate-hermetic]
   [--allow-tcg]
@@ -228,6 +231,7 @@ if [[ "$distro" == all ]]; then
   [[ -z "$inventory_file" ]] || args+=(--inventory-file "$inventory_file")
   [[ -z "$inventory_policy" ]] || args+=(--inventory-policy "$inventory_policy")
   [[ -z "$image_policy" ]] || args+=(--image-policy "$image_policy")
+  [[ -z "$fedora_sqlite_bundle" ]] || args+=(--fedora-sqlite-bundle "$fedora_sqlite_bundle")
   [[ -z "$image_cache" ]] || args+=(--image-cache "$image_cache" --image-cache-budget-bytes "$image_cache_budget_bytes")
   [[ "$benchmark" == false ]] || args+=(--benchmark)
   [[ "$transaction_samples" == 0 ]] || args+=(--benchmark-transactions "$transaction_samples")
@@ -312,6 +316,10 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 mkdir -p "$work/release" "$work/guest"
 : > "$work/guest/serial.log"
+if [[ "$distro" == fedora && -z "$fedora_sqlite_bundle" ]]; then
+  printf 'Fedora requires a verified SQLite bundle (--fedora-sqlite-bundle)\n' >&2
+  exit 3
+fi
 # Preflight probes. Each fails closed to HARNESS_ERROR (exit 3 lands in
 # the EXIT trap, which records the result). TCG is only selected by the
 # explicit --allow-tcg local-audit option; CI and default runs stay on KVM.
@@ -375,6 +383,17 @@ fi
 for tool in docker timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
 [[ "$benchmark" == false ]] || { command -v python3 >/dev/null || exit 3; }
 [[ -n "$staged_dir" || -n "$release_dir" ]] || { command -v gh >/dev/null || exit 3; }
+fedora_sqlite_revision=
+if [[ "$distro" == fedora ]]; then
+  fedora_sqlite_revision=$(git -C "$repo_root" rev-parse HEAD)
+  python3 "$here/fedora-sqlite.py" verify "$fedora_sqlite_bundle" --arch "$arch" \
+    --revision "$fedora_sqlite_revision" > "$work/fedora-sqlite-admission.log" 2>&1 || exit 3
+  cp -a "$fedora_sqlite_bundle" "$work/fedora-sqlite-bundle"
+  cp "$here/fedora-sqlite.py" "$work/fedora-sqlite.py"
+  cp "$here/../tests/qemu-image-provenance/fedora-sqlite.json" "$work/fedora-sqlite-policy.json"
+  cp "$work/fedora-sqlite-bundle/manifest.json" "$work/fedora-sqlite-manifest.json"
+fi
+
 timeout --kill-after=2s 15s docker version --format '{{.Server.Version}}' > "$work/engine-preflight.log" 2>&1 || exit 3
 { date -u; uname -a; cat /proc/loadavg; grep -E 'MemTotal|MemAvailable|SwapFree' /proc/meminfo; } > "$work/host-metadata.txt"
 archive="omg-${tag}-${arch}-linux-${distro}.tar.gz"
@@ -1213,6 +1232,13 @@ fi
 echo 'PASS: package lifecycle and native version parity'
 GUEST
 opts=(-i client-key -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
+if [[ "$distro" == fedora ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp -r "${opts[@]}" -P 2222 \
+    /work/fedora-sqlite-bundle /work/fedora-sqlite.py /work/fedora-sqlite-policy.json bench@127.0.0.1:
+  timeout --kill-after=5s 90s docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 \
+    "mkdir -p evidence && sudo -n python3 fedora-sqlite.py install fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' --output evidence/fedora-sqlite-before.json" \
+    > "$work/fedora-sqlite-install.log" 2>&1 || exit 3
+fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
@@ -1257,6 +1283,11 @@ if [[ "$benchmark" == true ]]; then
 fi
 rc=0
 timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel'" > "$work/guest-check.log" 2>&1 || rc=$?
+if [[ "$distro" == fedora && "$rc" == 0 ]]; then
+  timeout --kill-after=5s 30s docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 \
+    "sudo -n python3 fedora-sqlite.py installed fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' --output evidence/fedora-sqlite-after.json" \
+    >> "$work/fedora-sqlite-install.log" 2>&1 || rc=3
+fi
 timeout 60 docker exec -w /work/guest "$controller" scp -r "${opts[@]}" -P 2222 bench@127.0.0.1:evidence /work/guest/ > "$work/evidence-copy.log" 2>&1
 if [[ ! -f "$work/guest/evidence/exit-code" ]]; then
   printf 'Guest evidence receipt is missing (transport exit %s); see %s/evidence-copy.log and %s/guest-check.log\n' "$rc" "$work" "$work" >&2
@@ -1618,6 +1649,26 @@ if [[ "$storage_faults" == true && "$rc" == 0 ]]; then
      jq -e '.schema_version==1 and .scope=="privacy-export-atomic-write" and .complete==false and .failure_kind=="product"' "$work/storage-faults.json" >/dev/null; then
     rc=1
   elif [[ "$fault_rc" != 0 ]] || ! python3 "$here/qemu-storage-faults.py" --receipt "$work/storage-faults.json" >> "$work/storage-faults.log" 2>&1; then
+    rc=120
+  fi
+fi
+if [[ "$distro" == fedora && "$rc" == 0 ]]; then
+  sqlite_final_rc=0
+  timeout --kill-after=5s 30s docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 \
+    "sudo -n python3 fedora-sqlite.py installed fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' --output evidence/fedora-sqlite-final.json" \
+    >> "$work/fedora-sqlite-install.log" 2>&1 || sqlite_final_rc=$?
+  if [[ "$sqlite_final_rc" == 0 ]]; then
+    timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
+      bench@127.0.0.1:evidence/fedora-sqlite-final.json /work/guest/evidence/ \
+      >> "$work/evidence-copy.log" 2>&1 || sqlite_final_rc=$?
+  fi
+  if [[ "$sqlite_final_rc" == 0 ]]; then
+    python3 "$here/fedora-sqlite.py" verify "$work/fedora-sqlite-bundle" --arch "$arch" \
+      --revision "$fedora_sqlite_revision" --evidence-dir "$work/guest/evidence" \
+      >> "$work/fedora-sqlite-admission.log" 2>&1 || sqlite_final_rc=$?
+  fi
+  if [[ "$sqlite_final_rc" != 0 ]]; then
+    printf 'Final Fedora SQLite library failed admission\n' >&2
     rc=120
   fi
 fi

@@ -19,6 +19,7 @@ MAX_TOTAL_BYTES = 256 * 1024 * 1024
 NAME = r"[a-zA-Z0-9][a-zA-Z0-9_.-]*"
 RUN = r"run-[a-zA-Z0-9-]+"
 HOST_FILES = {
+    "fedora-sqlite-manifest.json", "fedora-sqlite-admission.log", "fedora-sqlite-install.log",
     "results.json", "sentry-results.json", "backend-mismatch-results.json",
     "backend-mismatch.json", "backend-mismatch.log", "metadata.txt", "host-metadata.txt",
     "cleanup.log", "reporting.log", "reporting-status.json", "kvm-probe.log", "engine-preflight.log",
@@ -34,6 +35,7 @@ HOST_FILES = {
     "benchmark-driver-sha256.txt", "cases.tsv", "controller-id.txt", "release-checksum.txt",
 }
 GUEST_FILES = {
+    "fedora-sqlite-before.json", "fedora-sqlite-after.json", "fedora-sqlite-final.json",
     "aur-search-flags.json", "aur-fixture-events.jsonl", "aur-detailed.json",
     "aur-no-aur.json", "aur-basic.json", "aur-cert.log", "aur-fixture-preflight.log",
     "aur-fixture.stdout", "aur-fixture.stderr",

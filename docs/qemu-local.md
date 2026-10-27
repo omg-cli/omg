@@ -206,17 +206,32 @@ execute a release binary on the host. Follow the commands in
 
 Full QEMU guests (needs KVM + Docker):
 
+Fedora requires the `fedora-sqlite-x86_64-*` artifact from a successful native
+SQLite supply job on the exact checkout revision. Extract it into `<sqlite-bundle>`
+and verify it before booting. Failed-build diagnostic artifacts are not admissible.
+Use the `aarch64` artifact and architecture on a native ARM host.
+
 ```bash
-./scripts/benchmark-qemu.sh --distro all --release vX.Y.Z --staged-dir <dir> --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,container --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress --benchmark --benchmark-transactions 1 --storage-faults
+python3 scripts/fedora-sqlite.py verify <sqlite-bundle> --arch x86_64 --revision "$(git rev-parse HEAD)"
+```
+
+The driver installs the reviewed RPMs and verifies the library before and after
+lifecycle checks and after all selected guest work. The existing image, inventory
+and guest health gates remain required.
+
+```bash
+./scripts/benchmark-qemu.sh --distro all --fedora-sqlite-bundle <sqlite-bundle> --release vX.Y.Z --staged-dir <dir> --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,container --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress --benchmark --benchmark-transactions 1 --storage-faults
 ./scripts/benchmark-qemu.sh --arch aarch64 --distro debian --release vX.Y.Z --staged-dir <arm-dir> --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,container --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress --benchmark --benchmark-transactions 1 --storage-faults  # ARM host only
 ```
 
 Nightly-equivalent (published release + all safe tiers, x86_64 KVM host):
 
 ```bash
-for distro in arch debian ubuntu fedora; do
+for distro in arch debian debian-trixie ubuntu fedora; do
+  sqlite_args=()
+  [[ "$distro" != fedora ]] || sqlite_args=(--fedora-sqlite-bundle /path/to/verified-sqlite)
   python3 scripts/prepare-qemu-release.py --tag vX.Y.Z --distro "$distro" --destination "published-$distro"
-  ./scripts/benchmark-qemu.sh --distro "$distro" --release vX.Y.Z --release-dir "published-$distro" --inventory-file "published-$distro/cases.tsv" --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,qemu,container,network,pty --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress
+  ./scripts/benchmark-qemu.sh --distro "$distro" "${sqlite_args[@]}" --release vX.Y.Z --release-dir "published-$distro" --inventory-file "published-$distro/cases.tsv" --inventory-policy tests/qemu-inventory-policy.json --image-policy tests/qemu-image-provenance/manifest.json --inventory-tiers hermetic,qemu,container,network,pty --inventory-allow-mutations --inventory-isolate-hermetic --restrict-egress
 done
 ```
 

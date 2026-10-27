@@ -498,7 +498,7 @@ class WorkflowTests(unittest.TestCase):
                                             ('false', 'skipped', True), ('false', 'failure', False)]:
             with self.subTest(required=required, status=status), tempfile.TemporaryDirectory() as directory:
                 environment = dict(os.environ, **dict.fromkeys(keys, 'success'),
-                                   BUILD_REQUIRED=required, RUNTIME_USAGE=status, QEMU_REQUIRED='false',
+                                   BUILD_REQUIRED=required, FEDORA_SQLITE="success", RUNTIME_USAGE=status, QEMU_REQUIRED='false',
                                    GITHUB_STEP_SUMMARY=str(Path(directory) / 'summary'))
                 result = subprocess.run(['bash', '--noprofile', '--norc', '-euo', 'pipefail', '-c', script],
                                         env=environment, capture_output=True, text=True, timeout=5)

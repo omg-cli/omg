@@ -1,0 +1,59 @@
+name: Reviewed Fedora SQLite supply
+on:
+  workflow_call:
+    inputs:
+      arch:
+        required: true
+        type: string
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    name: "SQLite full RPM check (${{ inputs.arch }})"
+    runs-on: ${{ inputs.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    container:
+      image: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+      options: --cpus 2 --memory 4g --memory-swap 4g --pids-limit 512
+    steps:
+      - name: Prepare authenticated Fedora 44 checkout tools
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          [[ "$ID" == fedora && "$VERSION_ID" == 44 ]]
+          timeout --kill-after=10s 600s dnf --releasever=44 --disablerepo='*' \
+            --enablerepo=fedora --enablerepo=updates --setopt=gpgcheck=1 \
+            -y install git python3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Trust the checked-out worktree
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Build complete checked source and binary RPMs
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+          NATIVE_ARCH: ${{ inputs.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == "$NATIVE_ARCH" ]]
+          python3 scripts/fedora-sqlite.py build "$RUNNER_TEMP/fedora-sqlite/fedora-sqlite-$NATIVE_ARCH-$GITHUB_RUN_ATTEMPT" --revision "$SOURCE_REVISION"
+      - name: Preserve complete admitted package supply
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora-sqlite-${{ inputs.arch }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fedora-sqlite/
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+      - name: Preserve failed build diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora-sqlite-failure-${{ inputs.arch }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fedora-sqlite/
+          retention-days: 30
+          if-no-files-found: warn
