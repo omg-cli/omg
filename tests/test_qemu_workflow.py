@@ -712,9 +712,9 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotIn('native-build-artifact.py ready', PARENT)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  ci-success:', 1)[0]
-        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu]', automatic)
+        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]', automatic)
         self.assertIn('inputs.staged && inputs.reuse-ci', LANE)
-        self.assertIn('needs: [build-staged, build-staged-ubuntu]', LANE)
+        self.assertIn('needs: [build-staged, build-staged-ubuntu, fedora-sqlite]', LANE)
         self.assertIn("inputs.distro != 'ubuntu' && needs.build-staged.result == 'success'", LANE)
         self.assertIn("inputs.distro == 'ubuntu' && needs.build-staged-ubuntu.result == 'success'", LANE)
         self.assertNotIn('concurrency:', LANE)
