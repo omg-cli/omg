@@ -35,7 +35,7 @@ export function admitCoderResult(response, request, policy) {
         runtime.imageDigest !== policy.imageDigest ||
         runtime.verifierRevision !== policy.verifierRevision ||
         runtime.model !== "@cf/deepseek-ai/deepseek-v4.1-flash-1017" ||
-        runtime.reasoningEffort !== "high" ||
+        runtime.reasoningEffort !== "low" ||
         delivery.bundleSha256 !== policy.bundleSha256 ||
         state.skillBundleSha256 !== policy.bundleSha256 ||
         !Schema.is(Schema.String)(delivery.sessionId) ||

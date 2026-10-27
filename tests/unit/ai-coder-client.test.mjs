@@ -118,7 +118,7 @@ function fixture() {
         runtime: {
             ...policy,
             model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
-            reasoningEffort: "high",
+            reasoningEffort: "low",
         },
         skillsDelivery: { bundleSha256: policy.bundleSha256, sessionId: "session-1" },
         result: {
@@ -181,6 +181,9 @@ test("coding admission binds exact server skill delivery, runtime, source and ve
         },
         (value) => {
             value.runtime.model = "unapproved";
+        },
+        (value) => {
+            value.runtime.reasoningEffort = "high";
         },
         (value) => {
             value.result.verification.proposalSha256 = "f".repeat(64);

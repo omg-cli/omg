@@ -130,7 +130,7 @@ const ai = { aiGatewayLogId: null, async run(model, input) {
   return sse("proposal admitted");
 } };
 export class Coder extends BaseCoder {
-  constructor(ctx, env) { super(ctx, { ...env, AI: ai }); }
+  constructor(ctx, env) { super(ctx, { ...env, AI: ai, MODEL_PACER: { getByName() { return { async admit() { return { granted: true }; } }; } } }); }
   async debugState() { return (await this.ctx.storage.get("coding-result")) ?? null; }
   async debugPending() { return await this.harness.pending(); }
 }

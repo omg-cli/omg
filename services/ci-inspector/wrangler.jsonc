@@ -8,6 +8,7 @@
   "compatibility_date": "2026-10-20",
   "compatibility_flags": ["nodejs_compat"],
   "ai": { "binding": "AI" },
+  "durable_objects": { "bindings": [{ "name": "MODEL_PACER", "class_name": "ModelPacer", "script_name": "omg-ci-coder" }] },
   "worker_loaders": [{ "binding": "LOADER" }],
   "limits": { "cpu_ms": 1000 },
   "observability": { "enabled": false },

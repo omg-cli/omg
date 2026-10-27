@@ -8,7 +8,7 @@ const identitySchema = z.strictObject({
   imageDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   verifierRevision: z.string().regex(/^[a-f0-9]{40}$/),
   model: z.literal(CODING_MODEL),
-  reasoningEffort: z.literal("high"),
+  reasoningEffort: z.literal("low"),
 });
 
 export function codingRuntimeIdentity(
@@ -23,7 +23,7 @@ export function codingRuntimeIdentity(
     imageDigest: configuration.CI_IMAGE_DIGEST,
     verifierRevision: configuration.CI_VERIFIER_REVISION,
     model: CODING_MODEL,
-    reasoningEffort: "high",
+    reasoningEffort: "low",
   });
 }
 

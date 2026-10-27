@@ -114,7 +114,7 @@ for (;;) {
 
   if (state.status === "done") {
     assert.equal(state.runtime.model, CODING_MODEL);
-    assert.equal(state.runtime.reasoningEffort, "high");
+    assert.equal(state.runtime.reasoningEffort, "low");
     assert.equal(state.skillsDelivery.bundleSha256, state.runtime.bundleSha256);
     assert.match(state.skillsDelivery.sessionId, /^ses_/);
     assert.ok(

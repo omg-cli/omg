@@ -32,5 +32,10 @@
     "SENTRY_PROJECT_ID": "4512291389636608",
     "SENTRY_ENVIRONMENT": "production",
   },
-  "observability": { "enabled": false },
+  "observability": {
+    "enabled": true,
+    "redact_query_string": true,
+    "logs": { "enabled": true, "invocation_logs": false, "persist": true },
+    "traces": { "enabled": false }
+  },
 }

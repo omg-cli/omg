@@ -16,6 +16,7 @@ test("a durable coding operation cannot silently change verifier or mandatory sk
     JSON.stringify({ ...identity, bundleSha256: "d".repeat(64) }),
     JSON.stringify({ ...identity, imageDigest: `sha256:${"d".repeat(64)}` }),
     JSON.stringify({ ...identity, verifierRevision: "d".repeat(40) }),
+    JSON.stringify({ ...identity, reasoningEffort: "high" }),
   ])
     expect(() => assertRuntimeIdentity(previous, identity)).toThrow();
   expect(() =>

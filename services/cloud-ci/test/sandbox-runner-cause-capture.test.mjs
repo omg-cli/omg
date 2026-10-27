@@ -15,7 +15,8 @@ const owner=${JSON.stringify(owner)};
 export class ErrorFixture extends DurableObject {
   mode=''; commands=0; destroyed=0;
   async configure(value){this.mode=value.sandboxName.name;}
-  async execWithSessionToken(command){
+  async execWithSessionToken(command){return {success:true,exitCode:0,stdout:'',stderr:''};}
+  async startProcess(command){
     if(!command.startsWith('(fixture-main-'))return {success:true,exitCode:0,stdout:'',stderr:''};
     this.commands++;
     if(command.startsWith('(fixture-main-ordinary)'))throw new Error('ordinary literal failure');
@@ -24,6 +25,7 @@ export class ErrorFixture extends DurableObject {
     throw error;
   }
   async destroy(){this.destroyed++;}
+  async cancel(){await this.destroy();}
   async stats(){return {commands:this.commands,destroyed:this.destroyed};}
 }
 export default {async fetch(request,env){
@@ -35,7 +37,7 @@ export default {async fetch(request,env){
   let rawCause=null;let rawAdmission=null;let failure;const reports=[];
   try{
     await withStepNotification({handle:{async fail(value){reports.push(value);},async succeed(){throw new Error('failure fixture cannot succeed');}},label:'script-contracts-'+mode,command:'fixture-main',sensitiveValues:[${JSON.stringify(secret)}]},
-      async()=>{try{return {...await runner.run({label:'script-contracts-'+mode,command:'fixture-main-'+mode,source:{kind:'archive',url:'https://fixture.invalid/source'},ttlSeconds:3600,timeoutMs:10000,extraEnv:{OMG_DIAGNOSTIC_RUN_ID:owner,OMG_CI_LEAF_STEP:${JSON.stringify(leaf)}}}),cacheHit:false};}
+      async()=>{try{return {...await runner.run({instanceId:owner,attempt:1,label:'script-contracts-'+mode,command:'fixture-main-'+mode,source:{kind:'archive',url:'https://fixture.invalid/source'},ttlSeconds:3600,timeoutMs:10000,extraEnv:{OMG_DIAGNOSTIC_RUN_ID:owner,OMG_CI_LEAF_STEP:${JSON.stringify(leaf)}}}),cacheHit:false};}
         catch(error){rawCause=error.cause?.message??null;rawAdmission=error.context??null;throw error;}},
       async execution=>execution);
   }catch(error){failure=error;}
@@ -51,7 +53,7 @@ test("actual SDK boundary keeps the redacted Durable Object cause and correlatio
   const program = `import {createRequire} from 'node:module';
 const require=createRequire(${JSON.stringify(new URL("../node_modules/wrangler/package.json", import.meta.url).href)});
 const {Miniflare,convertV4MiniflareOptions}=require('miniflare');
-const mf=new Miniflare(convertV4MiniflareOptions({modules:true,script:${JSON.stringify(script)},compatibilityDate:'2026-10-20',compatibilityFlags:['nodejs_compat'],durableObjects:{FIXTURE:{className:'ErrorFixture',useSQLite:true}}}));
+const mf=new Miniflare(convertV4MiniflareOptions({handleStructuredLogs:({message})=>console.error(message),modules:true,script:${JSON.stringify(script)},compatibilityDate:'2026-10-20',compatibilityFlags:['nodejs_compat'],durableObjects:{FIXTURE:{className:'ErrorFixture',useSQLite:true}}}));
 try{const rows=[];for(const mode of ['reset','ordinary']){const response=await mf.dispatchFetch('https://fixture.invalid/'+mode);if(response.status!==200)throw new Error(await response.text());rows.push(await response.json());}console.log(JSON.stringify(rows));}finally{await mf.dispose();}`;
   const child = Bun.spawn(["node", "--input-type=module", "-"], {stdin:new TextEncoder().encode(program),stdout:"pipe",stderr:"pipe"});
   const deadline = setTimeout(() => child.kill(), 30_000);

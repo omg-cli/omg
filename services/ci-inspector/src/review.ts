@@ -13,9 +13,10 @@ import { sourceReviewTools } from "./review-tools";
 import { z } from "zod";
 import { patchReviewInputSchema, patchReviewResultSchema, type PatchReviewInput } from "./patch-review-contract";
 import type { PatchReviewInference } from "./patch-review-http";
+import { pacedAI } from "../../ci-coder/src/model-admission";
 
 export async function reviewSource(input: SourceReviewInput, env: InspectorEnv) {
-    const workersai = createWorkersAI({ binding: env.AI });
+    const workersai = createWorkersAI({ binding: pacedAI(env.AI, env.MODEL_PACER) });
     const signal = AbortSignal.timeout(60000);
     const providerOptions = { "workers-ai": { reasoning_effort: "none" } };
     let sourceToolCalls = 0;
@@ -137,7 +138,7 @@ export async function reviewSource(input: SourceReviewInput, env: InspectorEnv) 
 
 export async function reviewPatch(rawInput: PatchReviewInput, env: InspectorEnv): Promise<PatchReviewInference> {
     const input = patchReviewInputSchema.parse(rawInput);
-    const workersai = createWorkersAI({ binding: env.AI });
+    const workersai = createWorkersAI({ binding: pacedAI(env.AI, env.MODEL_PACER) });
     const signal = AbortSignal.timeout(60000);
     const providerOptions = { "workers-ai": { reasoning_effort: "none" } };
     let readCompletePatch = false;

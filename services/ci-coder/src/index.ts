@@ -3,6 +3,7 @@ import { handleCoderRequest } from "./request.js";
 import { createRequiredSkillsPlugin } from "./skills.js";
 
 export { Coder } from "./harness.js";
+export { ModelPacer } from "./model-pacer";
 
 export default {
   fetch(request: Request, env: Env) {
