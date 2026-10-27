@@ -520,6 +520,7 @@ jobs:
         with:
           pattern: fedora-sqlite-aarch64-*
           path: ${{ runner.temp }}/fedora-sqlite-inputs
+          merge-multiple: true
 
       - name: Admit latest same-revision ARM Fedora SQLite supply
         if: matrix.distro == 'fedora'

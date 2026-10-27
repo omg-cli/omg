@@ -356,6 +356,7 @@ jobs:
         with:
           pattern: fedora-sqlite-x86_64-*
           path: ${{ runner.temp }}/fedora-sqlite-inputs
+          merge-multiple: true
 
       - name: Admit latest same-revision Fedora SQLite supply
         if: inputs.distro == 'fedora'

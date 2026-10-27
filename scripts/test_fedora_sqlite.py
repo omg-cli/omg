@@ -59,6 +59,59 @@ class FedoraSQLiteTests(unittest.TestCase):
             self.assertEqual([(row['case_id'], row['result'], row['exit_code']) for row in report],
                              [('qemu-fedora-lifecycle', 'HARNESS_ERROR', 3)])
 
+    @unittest.skipUnless(__import__('sys').platform.startswith('linux') and sqlite.platform.machine() == 'x86_64', 'native producer shell requires Linux x86_64')
+    def test_producer_archive_keeps_attempt_namespace_for_single_and_multiple_downloads(self):
+        import io
+        import shutil
+        import subprocess
+        import sys
+        import zipfile
+        workflow = (ROOT/'.github/workflows/fedora-sqlite.yml').read_text()
+        block = workflow.split('      - name: Build complete checked source and binary RPMs\n', 1)[1].split('      - name: Preserve complete admitted package supply', 1)[0]
+        script = '\n'.join(line[10:] for line in block.split('        run: |\n', 1)[1].splitlines())
+        self.assertIn('path: ${{ runner.temp }}/fedora-sqlite/', workflow)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root/'bin'
+            tools.mkdir()
+            builder = root/'builder.py'
+            builder.write_text('import os, shutil, sys\nshutil.copytree(os.environ["FIXTURE_SUPPLY"], sys.argv[3])\n')
+            (tools/'python3').write_text(f'#!/bin/sh\nexec "{sys.executable}" "{builder}" "$@"\n')
+            (tools/'python3').chmod(0o755)
+            archives = []
+            for attempt in (1, 2):
+                name = f'fedora-sqlite-x86_64-{attempt}'
+                result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
+                    env=dict(os.environ, PATH=str(tools)+os.pathsep+os.environ['PATH'],
+                             RUNNER_TEMP=str(root), NATIVE_ARCH='x86_64', SOURCE_REVISION=REVISION,
+                             GITHUB_RUN_ATTEMPT=str(attempt), FIXTURE_SUPPLY=str(self.bundle)),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                upload = root/'fedora-sqlite'
+                raw = io.BytesIO()
+                with zipfile.ZipFile(raw, 'w') as archive:
+                    for path in upload.rglob('*'):
+                        if path.is_file(): archive.write(path, path.relative_to(upload).as_posix())
+                with zipfile.ZipFile(io.BytesIO(raw.getvalue())) as archive:
+                    self.assertEqual(set(archive.namelist()), {name+'/'+p.name for p in self.bundle.iterdir()})
+                archives.append(raw.getvalue())
+                shutil.rmtree(upload)
+            for filename in ('qemu-lane.yml', 'qemu-matrix.yml'):
+                consumer = (ROOT/'.github/workflows'/filename).read_text()
+                self.assertIn('path: ${{ runner.temp }}/fedora-sqlite-inputs\n          merge-multiple: true', consumer)
+            for count in (1, 2):
+                downloads = root/f'download-{count}'
+                downloads.mkdir()
+                for raw in archives[:count]:
+                    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                        for name in archive.namelist():
+                            path = downloads/name
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(archive.read(name))
+                selected = sqlite.select_bundle(downloads, 'x86_64', count)
+                self.assertEqual(selected.name, f'fedora-sqlite-x86_64-{count}')
+                sqlite.verify_bundle(selected, self.policy, 'x86_64', REVISION)
+
     def test_complete_same_revision_bundle_is_admitted(self):
         receipt = sqlite.verify_bundle(self.bundle, self.policy, 'x86_64', REVISION)
         self.assertEqual(receipt['source_sha'], REVISION)

@@ -107,3 +107,17 @@ and each other requested outcome. It cannot exit early without suite evidence.
 The existing shell harnesses run in the early workflow target and again during
 QEMU preparation, so reporting and interruption regressions surface before the
 native build barrier.
+
+
+## Download-action archive layout
+
+The pinned download action flattens a single matching artifact, even when
+`merge-multiple` is false. Its exact source includes `artifacts.length === 1`
+in the destination-path condition. See the [pinned source](https://github.com/actions/download-artifact/blob/3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/src/download-artifact.ts)
+and [upstream report #455](https://github.com/actions/download-artifact/issues/455).
+
+The producer puts the attempt directory inside the archive. Both consumers
+merge these archives into one parent; each attempt retains its own directory.
+Single and multiple downloads then have the same layout. The existing latest
+attempt selector, exact source admission and pinned action's fatal digest
+verification stay intact. No custom downloader or fallback to bad older supply.

@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$(uname -m)" == "$NATIVE_ARCH" ]]
-          python3 scripts/fedora-sqlite.py build "$RUNNER_TEMP/fedora-sqlite" --revision "$SOURCE_REVISION"
+          python3 scripts/fedora-sqlite.py build "$RUNNER_TEMP/fedora-sqlite/fedora-sqlite-$NATIVE_ARCH-$GITHUB_RUN_ATTEMPT" --revision "$SOURCE_REVISION"
       - name: Preserve complete admitted package supply
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
