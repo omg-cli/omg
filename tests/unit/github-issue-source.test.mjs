@@ -112,7 +112,7 @@ test("issue intake delivers complete untrusted evidence through the existing sou
                 assert.equal(input.diff, "");
                 return { repository: "omg-cli/omg", sha, branch: "main", model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
                     publication: "requires-verifier", suppliedPaths: ["src/cli/config.rs"], readPaths: ["src/cli/config.rs"],
-                    readDiff: false, codeExecutions: 1, sourceToolCalls: 1, kind: "no-findings", summary: "Fixture makes no repair claim." };
+                    readDiff: false, readCiFailures: [0], codeExecutions: 1, sourceToolCalls: 1, kind: "no-findings", summary: "Fixture makes no repair claim." };
             },
         },
     });

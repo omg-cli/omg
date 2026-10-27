@@ -90,3 +90,13 @@ test("source tools receipt reports only successful actual file and diff reads", 
   await tools.readDiff.execute({ offset: 0, limit: 6 });
   expect(readDiff).toBe(true);
 });
+
+test("failure report receipt records only successful supplied evidence reads", async () => {
+  const reads: number[] = [];
+  const tools = sourceReviewTools(input, () => {}, () => {}, index => reads.push(index));
+  await tools.listChangedFiles.execute({});
+  await expect(tools.readCiFailure.execute({index: 1})).rejects.toThrow("Unknown CI failure");
+  expect(reads).toEqual([]);
+  expect(await tools.readCiFailure.execute({index: 0})).toEqual(input.ciFailures[0]);
+  expect(reads).toEqual([0]);
+});

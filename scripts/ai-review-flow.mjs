@@ -470,6 +470,12 @@ export function validateReviewReceipt(input, response) {
     for (const key of ["repository", "sha", "branch"])
         if (response[key] !== input[key]) throw new Error("Model receipt identity mismatch.");
     const supplied = input.sourceFiles.map((file) => file.path);
+    const failureReads = response.readCiFailures ?? [];
+    const failureCount = input.ciFailures?.length ?? 0;
+    if (!Array.isArray(failureReads) || failureReads.length !== failureCount ||
+        new Set(failureReads).size !== failureReads.length ||
+        failureReads.some(index => !Number.isSafeInteger(index) || index < 0 || index >= failureCount))
+        throw new Error("Invalid failure evidence read receipt.");
 
     if (
         response.model !== "@cf/deepseek-ai/deepseek-v4.1-flash-1017" ||

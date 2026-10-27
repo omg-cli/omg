@@ -16,6 +16,7 @@ export type ReviewInference = {
   sourceToolCalls: number;
   readPaths: string[];
   readDiff: boolean;
+  readCiFailures?: number[];
 };
 
 type SourceReviewCandidate = Extract<
@@ -68,6 +69,11 @@ export async function handleSourceReview(
       throw new Error("Source tools were not executed");
 
     const suppliedPaths = input.sourceFiles.map((file) => file.path);
+    const failureReads = result.readCiFailures ?? [];
+    if (!Array.isArray(failureReads) || failureReads.length !== input.ciFailures.length ||
+      new Set(failureReads).size !== failureReads.length ||
+      failureReads.some(index => !Number.isSafeInteger(index) || index < 0 || index >= input.ciFailures.length))
+      throw new Error("Invalid failure evidence read receipt");
 
     if (
       result.readPaths.length < 1 ||
@@ -113,6 +119,7 @@ export async function handleSourceReview(
       suppliedPaths,
       readPaths: result.readPaths,
       readDiff: result.readDiff,
+      readCiFailures: failureReads,
     } satisfies SourceReviewResponse;
 
     if (JSON.stringify(response).length > 100000) throw new Error("Review output too large");

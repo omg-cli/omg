@@ -25,6 +25,19 @@ const proposal = sourceReviewProposalSchema.parse({
   summary: "No supported finding.",
 });
 
+test("reported issue cannot become no-findings without its exact evidence read receipt", async () => {
+  const body = {...payload, ciFailures: [{job: "GitHub issue #1011", step: "untrusted issue report", log: "Inspect src/value.mjs:1"}]};
+  const inference = {proposal, model: "fixture", usage: {}, codeExecutions: 1,
+    sourceToolCalls: 1, readPaths: ["src/value.mjs"], readDiff: true};
+  for (const readCiFailures of [undefined, [], [1], [0, 0]]) {
+    const response = await handleSourceReview(request(body), env, async () => ({...inference, readCiFailures}));
+    expect(response.status).toBe(502);
+  }
+  const response = await handleSourceReview(request(body), env, async () => ({...inference, readCiFailures: [0]}));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({kind: "no-findings", readCiFailures: [0]});
+});
+
 function request(
   body: Parameters<typeof JSON.stringify>[0] = payload,
   token = env.CI_INSPECTOR_TOKEN,
@@ -118,6 +131,7 @@ test("review returns structured uncorroborated output with exact request identit
     sourceToolCalls: 1,
     readPaths: ["src/value.mjs"],
     readDiff: true,
+    readCiFailures: [],
   });
 });
 

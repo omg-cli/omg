@@ -1201,6 +1201,10 @@ test("model read receipts reject fabricated reads and preserve explicit partial 
     };
 
     assert.deepEqual(validateReviewReceipt(input, response).readPaths, ["src/value-0.rs"]);
+    const reported = { ...input, ciFailures: [{ job: "GitHub issue #1011", step: "untrusted report", log: "Inspect the failing behavior" }] };
+    for (const readCiFailures of [undefined, [], [1], [0, 0], ["0"]])
+        assert.throws(() => validateReviewReceipt(reported, { ...response, readCiFailures }), /receipt/);
+    assert.deepEqual(validateReviewReceipt(reported, { ...response, readCiFailures: [0] }).readCiFailures, [0]);
     assert.throws(
         () => validateReviewReceipt(input, { ...response, readPaths: ["shared/invented.mjs"] }),
         /receipt/,
