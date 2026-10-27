@@ -204,6 +204,8 @@ test("weekly workflow chains bounded pages only through a separate trusted dispa
     assert.deepEqual(workflow.on.workflow_dispatch.inputs.scope.options, ["changes", "source-audit", "runtime-events", "test-audit", "issue"]);
     assert.match(workflow.jobs.review.if, /github.event_name == 'schedule'/);
     const continuation = workflow.jobs.continue;
+    assert.equal(continuation.steps.find(step => step.uses?.startsWith("actions/checkout@")).with["fetch-depth"],
+        workflow.jobs.review.steps.find(step => step.uses?.startsWith("actions/checkout@")).with["fetch-depth"]);
     assert.deepEqual(continuation.needs, ["review", "publish"]);
     assert.deepEqual(continuation.permissions, { contents: "read", actions: "write" });
     assert.match(continuation.if, /needs.publish.result == 'success'/);
