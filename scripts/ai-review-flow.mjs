@@ -38,6 +38,7 @@ import {
 } from "./review-source-evidence.mjs";
 import { validateReviewProposal } from "../services/ci-inspector/src/review-contract.ts";
 import { collectIssueSources, assertIssueUnchanged } from "./github-issue-source.mjs";
+import { ciImageInputsSha256 } from "./ci-image-inputs.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const command = promisify(execFile);
@@ -1036,7 +1037,7 @@ const hex64 = (value) => typeof value === "string" && /^[a-f0-9]{64}$/.test(valu
 const runIdentity = (value) => typeof value === "string" && /^[1-9][0-9]{0,19}-[1-9][0-9]{0,5}$/.test(value);
 
 const renewalKeys = "branch enabled imageDigest inventoryDigest kind manifestDigest parent parentController priorImageDigest publication publish repository source targetController verifierRevision".split(" ");
-export async function loadTestAuditRenewal(context, readRecord = document) {
+export async function loadTestAuditRenewal(context, readRecord = document, imageInputs = revision => ciImageInputsSha256(revision, git)) {
     let rawRecord;
     try {
         rawRecord = await readRecord(path.join(homedir(), "ci", "test-audit-renewal.json"), 8192);
@@ -1044,8 +1045,9 @@ export async function loadTestAuditRenewal(context, readRecord = document) {
         if (error?.code === "ENOENT") return undefined;
         throw error;
     }
-    if (!exactKeys(rawRecord, renewalKeys) ||
-        rawRecord.kind !== "test-audit-controller-renewal" ||
+    const controllerOnly = rawRecord?.kind === "test-audit-controller-only-renewal";
+    if (!exactKeys(rawRecord, controllerOnly ? [...renewalKeys, "imageInputsSha256"].sort() : renewalKeys) ||
+        !["test-audit-controller-renewal", "test-audit-controller-only-renewal"].includes(rawRecord.kind) ||
         rawRecord.repository !== SOURCE_REPOSITORY || rawRecord.branch !== "main" ||
         typeof rawRecord.enabled !== "boolean" || typeof rawRecord.publish !== "boolean" ||
         !sha40(rawRecord.source) || !sha40(rawRecord.parentController) || !sha40(rawRecord.targetController) ||
@@ -1061,8 +1063,13 @@ export async function loadTestAuditRenewal(context, readRecord = document) {
     if (rawRecord.targetController !== context.controllerRevision || rawRecord.imageDigest !== context.imageDigest ||
         rawRecord.verifierRevision !== context.verifierRevision ||
         rawRecord.parentController === context.controllerRevision ||
-        rawRecord.priorImageDigest === rawRecord.imageDigest)
+        (controllerOnly ? rawRecord.priorImageDigest !== rawRecord.imageDigest : rawRecord.priorImageDigest === rawRecord.imageDigest))
         throw new Error("Test audit renewal runtime or controller context drifted.");
+    if (controllerOnly) {
+        const identities = await Promise.all([rawRecord.source, context.controllerRevision, rawRecord.verifierRevision].map(imageInputs));
+        if (!hex64(rawRecord.imageInputsSha256) || identities.some(value => value !== rawRecord.imageInputsSha256))
+            throw new Error("Controller-only renewal image inputs differ");
+    }
     return { ...rawRecord, controllerRevision: context.controllerRevision, recordSha256: sha256(JSON.stringify(rawRecord)) };
 }
 export async function loadTestAuditTransition(context, readRecord = document) {

@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { ciImageInputsSha256 } from "../../scripts/ci-image-inputs.mjs";
 
 const issue = { number: 1011, state: "open", title: "config validate reports success on invalid configuration",
     body: "`src/cli/config.rs:1` returns success after finding issues. Preserve assertions.",
@@ -119,4 +120,38 @@ test("issue intake delivers complete untrusted evidence through the existing sou
     assert.equal(result.status, "reviewed");
     assert.equal(result.sourceRange.issue.number, 1011);
     assert.deepEqual(result.publications, []);
+}));
+
+test("image identity follows committed content and modes, excludes unrelated code and refuses unknown COPY inputs", async () => fixture(async ({ directory, git }) => {
+    const files = ["services/cloud-ci/Dockerfile", "services/cloud-ci/verifier.mjs", "services/cloud-ci/runner/run.mjs",
+        "scripts/rust-source-policy.mjs", "scripts/prepare-node-test-fixture.py", "scripts/test_qemu_boot_diagnostics.py",
+        "scripts/qemu-boot-diagnostics.sh", "scripts/benchmark-qemu.sh", "scripts/test_qemu_cloud_init_ready.py", "scripts/check-qemu-cloud-init.sh"];
+    for (const file of files) {
+        await mkdir(path.dirname(path.join(directory, file)), { recursive: true });
+        await writeFile(path.join(directory, file), file.endsWith("Dockerfile")
+            ? "FROM pinned-base\nCOPY services/cloud-ci/runner/ /runtime/\n" : "image input\n");
+    }
+    const commit = message => {
+        git("add", ".");
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", message);
+        return git("rev-parse", "HEAD");
+    };
+    const fingerprint = revision => ciImageInputsSha256(revision, async args => git(...args));
+    const first = await fingerprint(commit("image"));
+    git("update-index", "--chmod=+x", "services/cloud-ci/runner/run.mjs");
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "executable runner");
+    assert.notEqual(await fingerprint(git("rev-parse", "HEAD")), first);
+    git("update-index", "--chmod=-x", "services/cloud-ci/runner/run.mjs");
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "restore runner mode");
+    await writeFile(path.join(directory, "src/cli/config.rs"), "unrelated product code\n");
+    assert.equal(await fingerprint(commit("product only")), first);
+    await writeFile(path.join(directory, "services/cloud-ci/runner/run.mjs"), "changed runner\n");
+    assert.notEqual(await fingerprint(commit("runner changed")), first);
+    await writeFile(path.join(directory, "services/cloud-ci/Dockerfile"), "FROM pinned-base\nCOPY new-untracked-input /runtime/\n");
+    await assert.rejects(fingerprint(commit("unsupported image input")), /COPY input/);
+    await writeFile(path.join(directory, "services/cloud-ci/Dockerfile"), "FROM pinned-base\nCOPY services/cloud-ci/runner/../other /runtime/\n");
+    await assert.rejects(fingerprint(commit("escaped image input")), /COPY input/);
+    await writeFile(path.join(directory, "services/cloud-ci/Dockerfile"), "FROM pinned-base\nCOPY services/cloud-ci/runner/ /runtime/\n");
+    await rm(path.join(directory, "scripts/check-qemu-cloud-init.sh"));
+    await assert.rejects(fingerprint(commit("missing image input")), /missing/);
 }));

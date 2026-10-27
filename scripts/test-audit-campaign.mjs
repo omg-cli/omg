@@ -111,9 +111,10 @@ const renewalRecordKeys = "branch controllerRevision enabled imageDigest invento
 function renewalIntake(target, parent, revision, manifestDigest, publicationResult, campaign) {
     const t = campaign?.renewal,
         parentRef = `${parent?.campaignRun?.runId}-${parent?.campaignRun?.attempt}`;
-    if (!shape(t, renewalRecordKeys))
+    const controllerOnly = t?.kind === "test-audit-controller-only-renewal";
+    if (!shape(t, controllerOnly ? [...renewalRecordKeys, "imageInputsSha256"] : renewalRecordKeys))
         throw new Error("Campaign renewal record missing or inferred");
-    if (t.kind !== "test-audit-controller-renewal" || t.repository !== "omg-cli/omg" || t.enabled !== true)
+    if (!["test-audit-controller-renewal", "test-audit-controller-only-renewal"].includes(t.kind) || t.repository !== "omg-cli/omg" || t.enabled !== true)
         throw new Error("Campaign renewal record is not enabled");
     if (!sha.test(revision ?? "") || t.branch !== "main" || t.publish !== true ||
         !sha.test(t.source ?? "") || !sha.test(t.parentController ?? "") ||
@@ -122,7 +123,7 @@ function renewalIntake(target, parent, revision, manifestDigest, publicationResu
         !digest.test(t.inventoryDigest ?? "") ||
         !/^sha256:[a-f0-9]{64}$/.test(t.imageDigest ?? "") ||
         !/^sha256:[a-f0-9]{64}$/.test(t.priorImageDigest ?? "") ||
-        t.imageDigest === t.priorImageDigest ||
+        (controllerOnly ? t.imageDigest !== t.priorImageDigest || !digest.test(t.imageInputsSha256 ?? "") : t.imageDigest === t.priorImageDigest) ||
         t.manifestDigest !== manifestDigest || target.range?.manifestDigest !== manifestDigest ||
         target.branch !== "main" || target.publish !== true)
         throw new Error("Campaign renewal controller, runtime or manifest mismatch");

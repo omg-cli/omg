@@ -116,6 +116,23 @@ const runRecovery = async ({ report, item, renewalRecord, publication = "skipped
 };
 
 const oldItem = { id: 100, run_attempt: 1, display_title: `Test audit initial ${OLD} 109`, head_sha: OLD, head_branch: "main", path: ".github/workflows/ai-review.yml", repository: { full_name: "omg-cli/omg" } };
+
+test("controller-only renewal requires identical verified image inputs and retains fresh-source admission", async () => {
+    const imageInputsSha256 = "d".repeat(64);
+    const raw = renewal({ kind: "test-audit-controller-only-renewal", priorImageDigest: IMAGE, imageInputsSha256 });
+    const context = { runId: "200", attempt: "1", controllerRevision: CONTROLLER, imageDigest: IMAGE, verifierRevision: VERIFIER };
+    const loaded = await loadTestAuditRenewal(context, async () => raw, async () => imageInputsSha256);
+    const admitted = admit({}, "skipped", { renewal: loaded });
+    assert.equal(admitted.range.resnapshot, true);
+    assert.equal(admitted.upstream, undefined);
+    assert.equal(loaded.imageInputsSha256, imageInputsSha256);
+    for (const changed of [OLD, CONTROLLER, VERIFIER])
+        await assert.rejects(loadTestAuditRenewal(context, async () => raw,
+            async revision => revision === changed ? "e".repeat(64) : imageInputsSha256), /image inputs/);
+    await assert.rejects(loadTestAuditRenewal(context, async () => ({ ...raw, priorImageDigest: PRIOR_IMAGE }),
+        async () => imageInputsSha256), /runtime or controller/);
+    await assert.rejects(loadTestAuditRenewal(context, async () => renewal({ priorImageDigest: IMAGE })), /runtime or controller/);
+});
 const ordinaryItem = { id: 200, run_attempt: 1, display_title: `Test audit initial ${CURRENT} 109`, head_sha: CURRENT, head_branch: "main", path: ".github/workflows/ai-review.yml", repository: { full_name: "omg-cli/omg" } };
 const ordinaryReport = () => parent({ campaignRun: { runId: "200", attempt: "1" }, sha: CURRENT, sourceRange: { ...parent().sourceRange, sha: CURRENT }, controllerRevision: CONTROLLER, formatting: { status: "passed", sha: CURRENT, ref: "refs/heads/main", runId: "200", attempt: "1" } });
 
