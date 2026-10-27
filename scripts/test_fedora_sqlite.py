@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -48,9 +49,15 @@ class FedoraSQLiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(['bash', str(ROOT/'scripts/benchmark-qemu.sh'), '--distro', 'fedora',
                 '--staged-dir', directory, '--evidence-dir', directory+'/evidence'],
-                capture_output=True, text=True, timeout=25)
-        self.assertEqual(result.returncode, 3)
-        self.assertIn('Fedora requires a verified SQLite bundle', result.stderr)
+                capture_output=True, text=True, timeout=25,
+                env=dict(os.environ, OMG_SMOKE_SENTRY_CONFIG=directory+'/no-sentry.json', OMG_SMOKE_SENTRY_DSN=''))
+            self.assertEqual(result.returncode, 3)
+            self.assertIn('Fedora requires a verified SQLite bundle', result.stderr)
+            reports = list(Path(directory).glob('evidence/run-*/results.json'))
+            self.assertEqual(len(reports), 1)
+            report = json.loads(reports[0].read_text())
+            self.assertEqual([(row['case_id'], row['result'], row['exit_code']) for row in report],
+                             [('qemu-fedora-lifecycle', 'HARNESS_ERROR', 3)])
 
     def test_complete_same_revision_bundle_is_admitted(self):
         receipt = sqlite.verify_bundle(self.bundle, self.policy, 'x86_64', REVISION)

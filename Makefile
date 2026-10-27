@@ -288,6 +288,10 @@ debt-refresh:
 ci-workflow-quick: check-shell-syntax
 	cargo fmt --all -- --check
 	python3 -m unittest discover -s tests -p 'test_qemu_*.py' -v
+	./scripts/test-release-smoke.sh
+	./scripts/test-qa-file-issue.sh
+	./scripts/test-qa-audit.sh
+	./scripts/test-qa-open-pr.sh
 	python3 -m unittest discover -s scripts -p 'test_*.py' -v
 	python3 tests/test_benchmark_records.py
 	python3 tests/test_terminal_update_notice.py

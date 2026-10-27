@@ -99,3 +99,11 @@ The patch includes `sqlite3_test_control_fault_install` before `finish_test`, as
 in [SQLite's callback cleanup commit](https://github.com/sqlite/sqlite/commit/ea595494e202c9aa9d733bfe379e228f5cb828b6).
 All original regression assertions stay intact. Full RPM and fresh candidate CI
 must still pass; the two-file control alone does not qualify the package.
+
+
+Missing supply is refused inside the individual guest's reporting scope, before
+preflight or boot. An all-distro run therefore retains a failed Fedora receipt
+and each other requested outcome. It cannot exit early without suite evidence.
+The existing shell harnesses run in the early workflow target and again during
+QEMU preparation, so reporting and interruption regressions surface before the
+native build barrier.

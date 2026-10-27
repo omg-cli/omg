@@ -220,10 +220,6 @@ if [[ "$print_pins" == true ]]; then
   done
   exit 0
 fi
-if [[ ( "$distro" == fedora || "$distro" == all ) && -z "$fedora_sqlite_bundle" ]]; then
-  printf 'Fedora requires a verified SQLite bundle (--fedora-sqlite-bundle)\n' >&2
-  exit 3
-fi
 if [[ "$distro" == all ]]; then
   targets=(arch debian debian-trixie ubuntu fedora)
   [[ "$arch" != aarch64 ]] || targets=(debian ubuntu fedora)
@@ -320,6 +316,10 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 mkdir -p "$work/release" "$work/guest"
 : > "$work/guest/serial.log"
+if [[ "$distro" == fedora && -z "$fedora_sqlite_bundle" ]]; then
+  printf 'Fedora requires a verified SQLite bundle (--fedora-sqlite-bundle)\n' >&2
+  exit 3
+fi
 # Preflight probes. Each fails closed to HARNESS_ERROR (exit 3 lands in
 # the EXIT trap, which records the result). TCG is only selected by the
 # explicit --allow-tcg local-audit option; CI and default runs stay on KVM.
