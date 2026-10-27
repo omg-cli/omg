@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { Lifecycle } from "agents/lifecycle";
 import { OpenCodeHarness } from "agents/harness/opencode";
 import { createAI } from "agents/models/opencode";
-import { pacedAI } from "./model-admission";
+import { pacedAI } from "../../ci-inspector/src/model-admission";
 import { OpenCodeWorkerd } from "@opencode/sdk/workerd";
 import { Plugin, Agent } from "@opencode/plugin";
 import { Schema } from "effect";

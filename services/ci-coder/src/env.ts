@@ -1,6 +1,6 @@
 import type { Ai } from "@cloudflare/workers-types/index.ts";
 import type { ApiBindings } from "./request.js";
-import type { ModelPacerNamespace } from "./model-admission";
+import type { ModelPacerNamespace } from "../../ci-inspector/src/model-admission";
 
 export type { CodingRequest } from "./request.js";
 

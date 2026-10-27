@@ -5,7 +5,7 @@ import { createWorkersAI } from "workers-ai-provider";
 import type { Snapshot } from "./snapshot";
 import { snapshotTools } from "./tools";
 import type { Ai, WorkerLoader } from "@cloudflare/workers-types/index.ts";
-import { pacedAI, type ModelPacerNamespace } from "../../ci-coder/src/model-admission";
+import { pacedAI, type ModelPacerNamespace } from "./model-admission";
 
 export const MODEL = "@cf/deepseek-ai/deepseek-v4.1-flash-1017";
 

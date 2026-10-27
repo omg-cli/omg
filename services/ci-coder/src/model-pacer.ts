@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { PACING_INTERVAL_MS, PACING_MODEL, type Admission } from "./model-admission";
+import { PACING_INTERVAL_MS, PACING_MODEL, type Admission } from "../../ci-inspector/src/model-admission";
 
 export class ModelPacer extends DurableObject {
   async admit(model: string): Promise<Admission> {

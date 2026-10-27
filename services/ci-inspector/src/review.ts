@@ -13,7 +13,7 @@ import { sourceReviewTools } from "./review-tools";
 import { z } from "zod";
 import { patchReviewInputSchema, patchReviewResultSchema, type PatchReviewInput } from "./patch-review-contract";
 import type { PatchReviewInference } from "./patch-review-http";
-import { pacedAI } from "../../ci-coder/src/model-admission";
+import { pacedAI } from "./model-admission";
 
 export async function reviewSource(input: SourceReviewInput, env: InspectorEnv) {
     const workersai = createWorkersAI({ binding: pacedAI(env.AI, env.MODEL_PACER) });
