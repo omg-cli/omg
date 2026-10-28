@@ -4,6 +4,7 @@ import {
   sourceReviewProposalSchema,
   validateReviewProposal,
   verifySourceBlobs,
+  groundReviewSelection,
   type SourceReviewProposal,
 } from "../src/review-contract";
 
@@ -39,6 +40,34 @@ const candidate = {
     },
   },
 };
+
+test("evidence selections use exact server source and require an actually read range", () => {
+  const selection = {kind: "candidates" as const, summary: "Uncorroborated candidate", candidates: [{
+    title: candidate.title, impact: candidate.impact,
+    evidence: [{path: "src/value.mjs", lineStart: 1, lineEnd: 1}],
+  }]};
+  expect(groundReviewSelection(input, selection, [{path: "src/value.mjs", lineStart: 1, lineEnd: 2}])).toEqual({
+    ...selection, candidates: [{title: candidate.title, impact: candidate.impact, proposedFix: null,
+      evidence: [{path: "src/value.mjs", lineStart: 1, lineEnd: 1, blobSha: "b".repeat(40), quote: "export const value = 0;"}],
+    }],
+  });
+  expect(() => groundReviewSelection(input, selection, [])).toThrow("not read");
+  expect(() => groundReviewSelection(input, selection, [{path: "src/value.mjs", lineStart: 2, lineEnd: 2}])).toThrow("not read");
+  const invented = {...selection, candidates: [{title: candidate.title, impact: candidate.impact,
+    evidence: [{path: "src/value.mjs", lineStart: 1, lineEnd: 1, quote: "invented"}]}]};
+  expect(() => groundReviewSelection(input, invented, [{path: "src/value.mjs", lineStart: 1, lineEnd: 2}])).toThrow();
+});
+
+test("grounded evidence preserves indentation and CRLF without model copying", () => {
+  const source = {...input, sourceFiles: [{...input.sourceFiles[0], content: "first\r\n    second\r\n\tthird\r\n"}]};
+  const selected = {kind: "candidates", summary: "Candidate only", candidates: [{
+    title: candidate.title, impact: candidate.impact, evidence: [{path: "src/value.mjs", lineStart: 2, lineEnd: 3}],
+  }]};
+  const result = groundReviewSelection(source, selected, [{path: "src/value.mjs", lineStart: 1, lineEnd: 4}]);
+  expect(result.kind).toBe("candidates");
+  if (result.kind !== "candidates") throw new Error("Candidate missing");
+  expect(result.candidates[0]?.evidence[0]?.quote).toBe("    second\r\n\tthird\r");
+});
 
 test("source audits preserve honest input identity and accept only exact audited source evidence", () => {
   const audit = { ...input, changedPaths: [], diff: "", auditPaths: ["src/value.mjs"] };

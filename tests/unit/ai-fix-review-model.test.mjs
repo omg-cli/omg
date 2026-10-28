@@ -29,7 +29,7 @@ mock.module("ai", () => ({
                 responseMessages: [{ role: "assistant", content: "OK" }] };
         }
         structuredMessages = request.messages;
-        if (request.output.name === "source_review_proposal")
+        if (request.output.name === "source_review_selection")
             return { output: { kind: "no-findings", summary: "The historical runtime lead remains uncorroborated." } };
         return { output: { verdict: "approved", reason: "Independent review accepted the patch.", findings: [] } };
     },
@@ -92,15 +92,18 @@ test("actual source-model request includes historical runtime error types and fr
     await reviewSource(input, reviewEnv);
     const prompt = JSON.parse(sourceRequest.prompt);
     expect(prompt.runtimeEvidence).toEqual(runtimeEvidence);
-    expect(prompt.sourceWindows[0].lineStart).toBeLessThanOrEqual(120);
-    expect(prompt.sourceWindows[0].lineEnd).toBeGreaterThanOrEqual(120);
-    expect(sourceWindowContent.content).toContain("pub const LINE_120: usize = 120;");
+    expect(prompt.sourceWindows[0].line).toBe(120);
+    expect(sourceWindowContent.lineStart).toBe(81);
+    expect(sourceWindowContent.lineEnd).toBe(160);
+    expect(sourceWindowContent.numberedLines).toContainEqual({line: 120, text: "pub const LINE_120: usize = 120;"});
     expect(JSON.parse(structuredMessages[0].content).runtimeEvidence).toEqual(runtimeEvidence);
     expect(sourceRequest.system).toMatch(/historical.*uncorroborated/i);
 
     input.runtimeEvidence[0].frames[0].line = 99999;
     await reviewSource(input, reviewEnv);
     const historical = JSON.parse(sourceRequest.prompt);
-    expect(historical.sourceWindows[0].lineEnd).toBe(160);
+    expect(historical.sourceWindows[0].line).toBe(160);
+    expect(sourceWindowContent.lineEnd).toBe(160);
+    expect(sourceWindowContent.numberedLines).toHaveLength(80);
     expect(historical.runtimeFrameContext[0].outsideCurrentSource).toBe(true);
 });
