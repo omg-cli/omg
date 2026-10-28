@@ -36,11 +36,14 @@ test("authenticated diagnostic questions are explicit and bind the durable opera
     assert.throws(() => parseCodingRequest({...input, diagnosisTask: {question: ""}}));
 });
 
-test("large diagnostic source remains read-only and cannot enter ordinary repair admission", () => {
+test("large diagnostic source retains its read-only operation identity", () => {
     const content = "// source evidence\n".repeat(2000);
     const source = {...input.source, sourceFiles: [{path: input.source.auditPaths[0], content, blobSha: gitBlobSha(content)}]};
     assert.doesNotThrow(() => parseCodingRequest({...input, source}), "Diagnostic reads use the existing bounded audit source envelope");
-    assert.throws(() => parseCodingRequest({...input, source, diagnosisTask: undefined}));
+    const diagnostic = parseCodingRequest({...input, source});
+    const ordinary = parseCodingRequest({...input, source, diagnosisTask: undefined});
+    assert.equal(diagnostic.diagnosisTask, true);
+    assert.notEqual(operationIdentity(diagnostic), operationIdentity(ordinary));
 });
 
 test("a diagnostic without a final answer resumes once in the original session for reporting", async () => {

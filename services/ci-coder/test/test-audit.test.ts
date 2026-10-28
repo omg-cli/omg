@@ -146,7 +146,7 @@ test("compact model proposal reconstructs exact test/fault bytes and hashes with
     ).toThrow();
 });
 
-test("sensitivity compact audit exports no patch and larger source remains audit-only", () => {
+test("sensitivity exports no patch and larger audit sources retain separate operation ownership", () => {
     const { request } = auditFixture();
     const result = buildTestAuditProposal(parseCodingRequest(request), {
         purpose: "existing-test-sensitivity",
@@ -183,9 +183,11 @@ test("sensitivity compact audit exports no patch and larger source remains audit
         },
     };
     expect(() => parseCodingRequest(widened)).not.toThrow();
-    expect(() =>
-        parseCodingRequest({ ...widened, testAuditTask: undefined }),
-    ).toThrow();
+    const audit = parseCodingRequest(widened);
+    const ordinary = parseCodingRequest({ ...widened, testAuditTask: undefined });
+    expect(operationIdentity(ordinary)).not.toBe(operationIdentity(audit));
+    expect(ordinary.testAuditTask).toBeUndefined();
+    expect(() => createTestAuditProposal(ordinary, result.proposal)).toThrow("Existing-test audit task required");
 });
 
 test("compact audit admits a before-boundary production fault and rejects an in-boundary fault", () => {

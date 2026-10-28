@@ -311,7 +311,7 @@ test("audit inventory pages cover the exact committed tree and hold unsupported 
         git("init", "--initial-branch=main");
         for (let index = 0; index < 50; index++) await writeFile(path.join(directory, `source-${index}.rs`), `pub const VALUE: usize = ${index};\n`);
         await writeFile(path.join(directory, "notes.txt"), "unsupported\n");
-        await writeFile(path.join(directory, "oversized.rs"), "x".repeat(24001));
+        await writeFile(path.join(directory, "oversized.rs"), "x".repeat(256 * 1024 + 1));
         await writeFile(path.join(directory, "binary.rs"), Buffer.from([0, 1, 2]));
         git("add", "--all");
         git("-c", "user.name=Audit fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture");
@@ -1159,7 +1159,7 @@ test("bounded batches retain every admitted file and explicitly account for over
         { path: "src/value-48.rs", reason: "batch-budget-exceeded" },
         { path: "src/value-49.rs", reason: "batch-budget-exceeded" },
     ]);
-    const oversized = partitionReviewSources([entry(0, { content: "a".repeat(24001) }), entry(1)]);
+    const oversized = partitionReviewSources([entry(0, { content: "a".repeat(256 * 1024 + 1) }), entry(1)]);
     assert.equal(oversized.batches[0][0].path, "src/value-1.rs");
     assert.deepEqual(oversized.unreviewedPaths, [
         { path: "src/value-0.rs", reason: "source-byte-budget-exceeded" },
@@ -1201,6 +1201,10 @@ test("model read receipts reject fabricated reads and preserve explicit partial 
     };
 
     assert.deepEqual(validateReviewReceipt(input, response).readPaths, ["src/value-0.rs"]);
+    const reported = { ...input, ciFailures: [{ job: "GitHub issue #1011", step: "untrusted report", log: "Inspect the failing behavior" }] };
+    for (const readCiFailures of [undefined, [], [1], [0, 0], ["0"]])
+        assert.throws(() => validateReviewReceipt(reported, { ...response, readCiFailures }), /receipt/);
+    assert.deepEqual(validateReviewReceipt(reported, { ...response, readCiFailures: [0] }).readCiFailures, [0]);
     assert.throws(
         () => validateReviewReceipt(input, { ...response, readPaths: ["shared/invented.mjs"] }),
         /receipt/,
@@ -1209,6 +1213,14 @@ test("model read receipts reject fabricated reads and preserve explicit partial 
         () => validateReviewReceipt(input, { ...response, sha: "b".repeat(40) }),
         /identity/,
     );
+});
+
+test("complete larger Rust sources split into byte-bounded review batches", () => {
+    const sources = [0, 1, 2].map(index => entry(index, {content: "a".repeat(100000)}));
+    const result = partitionReviewSources(sources);
+    assert.equal(result.unreviewedPaths.length, 0);
+    assert.deepEqual(result.batches.map(batch => batch.length), [2, 1]);
+    assert.deepEqual(result.batches.flat().map(file => file.content.length), [100000, 100000, 100000]);
 });
 
 test("stale target is rejected before model, mirror or verifier calls", async () => {

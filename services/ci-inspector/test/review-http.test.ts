@@ -25,6 +25,35 @@ const proposal = sourceReviewProposalSchema.parse({
   summary: "No supported finding.",
 });
 
+test("large complete Rust source is admitted while an oversized UTF-8 blob is rejected", async () => {
+  const content = "// bounded complete Rust source\n".repeat(1200);
+  const body = {...payload, sourceFiles: [{...payload.sourceFiles[0], content,
+    blobSha: createHash("sha1").update(`blob ${Buffer.byteLength(content)}\0${content}`).digest("hex")}]};
+  let calls = 0;
+  const inference = async () => { calls++; return {proposal, model: "fixture", usage: {}, codeExecutions: 1,
+    sourceToolCalls: 1, readPaths: ["src/value.mjs"], readDiff: true}; };
+  expect((await handleSourceReview(request(body), env, inference)).status).toBe(200);
+  expect(calls).toBe(1);
+  const oversized = "🦀".repeat(65537);
+  const invalid = {...body, sourceFiles: [{...body.sourceFiles[0], content: oversized,
+    blobSha: createHash("sha1").update(`blob ${Buffer.byteLength(oversized)}\0${oversized}`).digest("hex")}]};
+  expect((await handleSourceReview(request(invalid), env, inference)).status).toBe(400);
+  expect(calls).toBe(1);
+});
+
+test("reported issue cannot become no-findings without its exact evidence read receipt", async () => {
+  const body = {...payload, ciFailures: [{job: "GitHub issue #1011", step: "untrusted issue report", log: "Inspect src/value.mjs:1"}]};
+  const inference = {proposal, model: "fixture", usage: {}, codeExecutions: 1,
+    sourceToolCalls: 1, readPaths: ["src/value.mjs"], readDiff: true};
+  for (const readCiFailures of [undefined, [], [1], [0, 0]]) {
+    const response = await handleSourceReview(request(body), env, async () => ({...inference, readCiFailures}));
+    expect(response.status).toBe(502);
+  }
+  const response = await handleSourceReview(request(body), env, async () => ({...inference, readCiFailures: [0]}));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({kind: "no-findings", readCiFailures: [0]});
+});
+
 function request(
   body: Parameters<typeof JSON.stringify>[0] = payload,
   token = env.CI_INSPECTOR_TOKEN,
@@ -118,6 +147,7 @@ test("review returns structured uncorroborated output with exact request identit
     sourceToolCalls: 1,
     readPaths: ["src/value.mjs"],
     readDiff: true,
+    readCiFailures: [],
   });
 });
 

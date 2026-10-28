@@ -5,6 +5,7 @@ export function sourceReviewTools(
   input: SourceReviewInput,
   onSourceRead: (path: string) => void = () => {},
   onDiffRead: () => void = () => {},
+  onFailureRead: (index: number) => void = () => {},
 ) {
   const empty = z.strictObject({});
 
@@ -100,7 +101,7 @@ export function sourceReviewTools(
         const failure = input.ciFailures[index];
 
         if (!failure) throw new Error("Unknown CI failure");
-
+        onFailureRead(index);
         return failure;
       },
     },

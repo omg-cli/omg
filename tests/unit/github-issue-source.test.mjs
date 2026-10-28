@@ -81,7 +81,7 @@ test("issue preflight refuses foreign, closed, PR, missing and oversized reports
 }));
 
 test("issue preflight refuses oversized and symlink Git objects without partial coverage", async () => fixture(async ({ directory, git }) => {
-    await writeFile(path.join(directory, "src/cli/config.rs"), "x".repeat(24001));
+    await writeFile(path.join(directory, "src/cli/config.rs"), "x".repeat(256 * 1024 + 1));
     git("add", ".");
     git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "oversized");
     await assert.rejects(collectIssueSources({ github: api(), sha: git("rev-parse", "HEAD"), number: 1011, directory }), /budget/);
@@ -112,7 +112,7 @@ test("issue intake delivers complete untrusted evidence through the existing sou
                 assert.equal(input.diff, "");
                 return { repository: "omg-cli/omg", sha, branch: "main", model: "@cf/deepseek-ai/deepseek-v4.1-flash-1017",
                     publication: "requires-verifier", suppliedPaths: ["src/cli/config.rs"], readPaths: ["src/cli/config.rs"],
-                    readDiff: false, codeExecutions: 1, sourceToolCalls: 1, kind: "no-findings", summary: "Fixture makes no repair claim." };
+                    readDiff: false, readCiFailures: [0], codeExecutions: 1, sourceToolCalls: 1, kind: "no-findings", summary: "Fixture makes no repair claim." };
             },
         },
     });
@@ -120,6 +120,18 @@ test("issue intake delivers complete untrusted evidence through the existing sou
     assert.equal(result.status, "reviewed");
     assert.equal(result.sourceRange.issue.number, 1011);
     assert.deepEqual(result.publications, []);
+}));
+
+test("issue intake admits a complete Rust file beyond 24 KB without truncating its Git blob", async () => fixture(async ({directory, git}) => {
+    const content = "// complete Rust context\n".repeat(1500) + "pub fn validate() -> bool { true }\n";
+    await writeFile(path.join(directory, "src/cli/config.rs"), content);
+    git("add", ".");
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "full Rust source");
+    const sha = git("rev-parse", "HEAD");
+    const collected = await collectIssueSources({github: api(), sha, number: 1011, directory});
+    assert.equal(collected.entries[0].content, content);
+    assert.equal(collected.entries[0].size, Buffer.byteLength(content));
+    assert.equal(collected.entries[0].blobSha, git("rev-parse", "HEAD:src/cli/config.rs"));
 }));
 
 test("image identity follows committed content and modes, excludes unrelated code and refuses unknown COPY inputs", async () => fixture(async ({ directory, git }) => {

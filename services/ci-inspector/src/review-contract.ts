@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { runtimeEvidenceSchema } from "./runtime-evidence";
 
+export const REVIEW_SOURCE_BYTES = 256 * 1024;
+
 const sha = z.string().regex(/^[a-f0-9]{40}$/);
 
 const path = z
@@ -30,7 +32,8 @@ export const sourceReviewInputSchema = z
         runtimeEvidence: z.array(runtimeEvidenceSchema).min(1).max(3).optional(),
         diff: z.string().max(64000),
         sourceFiles: z
-            .array(z.strictObject({ path, blobSha: sha, content: z.string().max(24000) }))
+            .array(z.strictObject({ path, blobSha: sha, content: z.string().max(REVIEW_SOURCE_BYTES)
+                .refine(content => new TextEncoder().encode(content).length <= REVIEW_SOURCE_BYTES) }))
             .min(1)
             .max(12),
         ciFailures: z

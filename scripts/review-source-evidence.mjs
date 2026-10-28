@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { Schema } from "effect";
-import { sourceReviewInputSchema } from "../services/ci-inspector/src/review-contract.ts";
+import { sourceReviewInputSchema, REVIEW_SOURCE_BYTES } from "../services/ci-inspector/src/review-contract.ts";
 
 export const SOURCE_REPOSITORY = "omg-cli/omg";
 
@@ -109,7 +109,7 @@ export function createSourceAuditEvidence({ sha, branch, sourceFiles, runtimeEvi
     });
     for (const file of sourceInput.sourceFiles) {
         const bytes = Buffer.from(file.content);
-        if (bytes.length > 24000 || bytes.includes(0) || createHash("sha1")
+        if (bytes.length > REVIEW_SOURCE_BYTES || bytes.includes(0) || createHash("sha1")
             .update(`blob ${bytes.length}\0`).update(bytes).digest("hex") !== file.blobSha)
             throw new Error("Audit source differs from exact bounded Git blob.");
     }
@@ -180,9 +180,9 @@ export function createSourceReviewEvidence(value) {
 
         if (!(bytes instanceof Uint8Array)) throw new Error("Missing exact Git blob bytes.");
 
-        if (bytes.byteLength > 24000)
+        if (bytes.byteLength > REVIEW_SOURCE_BYTES)
             throw new Error(
-                "Source file is too large for the 24000-byte budget; no coverage was truncated.",
+                "Source file exceeds the 256 KiB budget; no coverage was truncated.",
             );
 
         if (bytes.includes(0)) throw new Error("Binary source file is refused.");
