@@ -1525,11 +1525,11 @@ mod version_detection {
 
     #[test]
     fn test_package_json_engines() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = TestProject::new();
         let mut f = File::create(temp_dir.path().join("package.json")).unwrap();
         writeln!(f, r#"{{"name": "test", "engines": {{"node": "20.10.0"}}}}"#).unwrap();
 
-        let result = run_omg_in_dir(&["use", "node"], temp_dir.path());
+        let result = detect_installed_runtime(&temp_dir, temp_dir.path(), "node", "20.10.0");
         result.assert_stdout_contains("20.10.0");
     }
 
