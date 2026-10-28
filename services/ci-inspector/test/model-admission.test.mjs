@@ -1,5 +1,20 @@
 import { expect, test } from "bun:test";
-import { pacedAI } from "../src/model-admission.ts";
+import { pacedAI, PACING_MODEL } from "../src/model-admission.ts";
+
+test("DeepSeek binding inputs carry the exact routed model and preserve the call options", async () => {
+  const calls = [];
+  const binding = {async run(...args) {calls.push(args); return {response: "OK"};}};
+  const ai = pacedAI(binding, {getByName() {return {async admit() {return {granted: true};}};}});
+  const inputs = {messages: [{role: "user", content: "Reply OK"}], max_tokens: 16, reasoning_effort: "none"};
+  const options = {signal: new AbortController().signal};
+  expect(await ai.run(PACING_MODEL, inputs, options)).toEqual({response: "OK"});
+  expect(calls).toEqual([[PACING_MODEL, {...inputs, model: PACING_MODEL}, options]]);
+  expect(Object.hasOwn(inputs, "model")).toBe(false);
+  await ai.run(PACING_MODEL, {...inputs, model: "wrong-model"}, options);
+  expect(calls[1][1].model).toBe(PACING_MODEL);
+  await ai.run("other-model", inputs, options);
+  expect(calls[2]).toEqual(["other-model", inputs, options]);
+});
 
 const model = "@cf/deepseek-ai/deepseek-v4.1-flash-1017";
 
@@ -24,7 +39,7 @@ test("model admission waits before sending the original request and preserves bi
   } };
   const ai = pacedAI(binding, namespace);
   expect(await ai.run(model, { prompt: "fixture" })).toBe("original inference");
-  expect(events).toEqual(["admit", "admit", ["owner", model, { prompt: "fixture" }]]);
+  expect(events).toEqual(["admit", "admit", ["owner", model, { prompt: "fixture", model }]]);
   expect(ai.describe()).toBe("owner");
 });
 
@@ -42,7 +57,7 @@ test("aborted admission cannot launch inference and provider failure is not retr
   expect(requests).toEqual([]);
   const admitted = pacedAI(binding, { getByName() { return { async admit() { return { granted: true }; } }; } });
   await expect(admitted.run(model, { prompt: "once" }, { signal: AbortSignal.timeout(1000) })).rejects.toBe(failure);
-  expect(requests).toEqual([[model, { prompt: "once" }, expect.any(Object)]]);
+  expect(requests).toEqual([[model, { prompt: "once", model }, expect.any(Object)]]);
 });
 
 test("an aborted pending grant cannot turn into a late inference", async () => {
