@@ -5,6 +5,7 @@ import { createCodingActions, type CodingState } from "../src/tools";
 import { createRequiredSkillsPlugin } from "../src/skills";
 import { parseCodingRequest } from "../src/request";
 import { gitBlobSha } from "../../../scripts/ai-review-candidate.mjs";
+import { parseRustCatalog, parseRustExecution } from "../../cloud-ci/runner/rust-evidence.mjs";
 
 async function fixture(deliver = true, repair = false) {
     const content =
@@ -106,6 +107,25 @@ test("repair context directs real reads to candidate evidence and keeps API cont
     }]},f.context),/admitted source|source snapshot/i);
     assert.equal(f.state().proposal,undefined);
     assert.equal(f.state().verificationJob,undefined);
+});
+
+test("Rust repair context supplies an assertion example accepted by the unchanged proof parser",async()=>{
+    const f=await fixture(true,true);
+    const context=JSON.parse((await f.actions.read_context.execute({},f.context)).content);
+    assert.ok(context.regressionContract.baselineFailure,"Missing baseline assertion requirements");
+    const file=context.regressionContract.path,testName="regression";
+    const execute=(source:string,message:string)=>parseRustExecution({
+        stdout:`running 1 test\ntest regression ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n`,
+        stderr:`thread 'regression' panicked at ${file}:2:1:\n${message}\n`,
+        exitCode:101,testName,file,source,catalog:parseRustCatalog("regression: test\n",testName),
+    });
+    const result=execute(context.regressionContract.baselineFailure.example,"assertion failed: outcome.is_ok()");
+    assert.equal(result.failures,1);
+    assert.ok("assertionFile" in result && "assertionLine" in result);
+    assert.equal(result.assertionFile,file);
+    assert.equal(result.assertionLine,2);
+    assert.throws(()=>execute('let outcome = operation_under_test();\noutcome.expect("operation must succeed");',"operation must succeed"),/setup or did not reach/);
+    assert.throws(()=>execute('let outcome = operation_under_test();\nassert!(outcome.is_ok(), "operation must succeed");',"operation must succeed"),/setup or did not reach/);
 });
 
 test("repair navigation covers an entire eighty-line evidence span without exceeding the read bound",async()=>{

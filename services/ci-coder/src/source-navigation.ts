@@ -40,6 +40,10 @@ export function repairContext(request: CodingRequest) {
             path:designatedRegressionPath(request.sha,0,true),
             expectedTestName:verificationSchema.shape.regression.shape.testName.toJSONSchema(),
             instruction:"Submit this exact new integration-test path and one matching named case. Use the supplied Cargo library/public exports. The server assigns the published filename after admission; do not guess it.",
+            baselineFailure:{
+                example:"let outcome = operation_under_test();\nassert!(outcome.is_ok());",
+                instruction:"The unchanged base must reach one failing assert!, assert_eq! or assert_ne! in this exact test file. Start that source line with the assertion macro and its opening parenthesis. Use default assertion diagnostics, without a custom panic message. Replace operation_under_test with the actual public API call; the example shows a Result-returning operation. Capture the operation result before asserting; unwrap, expect, panic, compilation and fixture setup failures are not behavioral RED. The same named case must pass with the fix. Keep it nonignored, without should_panic, preserve existing tests and satisfy rustfmt before requesting verification.",
+            },
         }}:{}),
     };
     if(request.hypothesis?.kind!=="candidates"||request.candidateIndex===undefined)
