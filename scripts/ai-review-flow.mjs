@@ -1149,7 +1149,7 @@ async function secret(file) {
     return value;
 }
 
-async function fetchJson(url, token, body, maximum = 256 * 1024) {
+export async function fetchJson(url, token, body, maximum = 256 * 1024) {
     if (body)
         for (const value of [
             token,
@@ -1193,7 +1193,18 @@ async function fetchJson(url, token, body, maximum = 256 * 1024) {
 
     text += decoder.decode();
 
-    if (!response.ok) throw Object.assign(new Error(`Service request failed: HTTP ${response.status}.`), { status: response.status });
+    if (!response.ok) {
+        let failureCode;
+        try {
+            const failure = JSON.parse(text);
+            if (["TOOL_MODEL_FAILED", "SOURCE_READ_MISSING", "STRUCTURED_MODEL_FAILED", "EVIDENCE_REJECTED", "REVIEW_REJECTED"].includes(failure?.code))
+                failureCode = failure.code;
+        } catch (cause) {
+            if (!(cause instanceof SyntaxError)) throw cause;
+        }
+        throw Object.assign(new Error(`Service request failed: HTTP ${response.status}${failureCode ? ` (${failureCode})` : ""}.`),
+            {status: response.status, ...(failureCode ? {code: failureCode} : {})});
+    }
 
     return JSON.parse(text);
 }

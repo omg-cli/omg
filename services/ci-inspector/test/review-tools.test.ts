@@ -12,6 +12,27 @@ const input = sourceReviewInputSchema.parse({
   ciFailures: [{ job: "Unit", step: "Test", log: "actual assertion" }],
 });
 
+test("source context anchors return at most eighty exact lines around the reported location", async () => {
+  const lines = Array.from({length: 1000}, (_, index) => `line ${index + 1}`);
+  const tools = sourceReviewTools({...input, sourceFiles: [{...input.sourceFiles[0], content: lines.join("\n")}]});
+  expect(await tools.readSource.execute({path: "src/value.mjs", line: 268})).toEqual({
+    path: "src/value.mjs", blobSha: "b".repeat(40), lineStart: 229, lineEnd: 308,
+    numberedLines: lines.slice(228,308).map((text, index) => ({line: 229 + index, text})),
+  });
+  const last = await tools.readSource.execute({path: "src/value.mjs", line: 1000});
+  expect(last.lineStart).toBe(921);
+  expect(last.lineEnd).toBe(1000);
+  expect(last.numberedLines).toHaveLength(80);
+  await expect(tools.readSource.execute({path: "src/value.mjs", line: 1001})).rejects.toThrow();
+});
+
+test("source context refuses an oversized line without a successful-read receipt", async () => {
+  let reads = 0;
+  const tools = sourceReviewTools({...input, sourceFiles: [{...input.sourceFiles[0], content: "x".repeat(12001)}]}, () => {reads++;});
+  await expect(tools.readSource.execute({path: "src/value.mjs", line: 1})).rejects.toThrow("Source excerpt too large");
+  expect(reads).toBe(0);
+});
+
 test("source audit metadata reports audited paths and an empty real diff", async () => {
   const audit = sourceReviewInputSchema.parse({
     ...input, changedPaths: [], diff: "", auditPaths: ["src/value.mjs"],
@@ -37,13 +58,13 @@ test("source review has only bounded supplied-data read tools", async () => {
     "readCiFailure",
   ]);
   expect(
-    await tools.readSource.execute({ path: "src/value.mjs", lineStart: 2, lineEnd: 2 }),
+    await tools.readSource.execute({ path: "src/value.mjs", line: 2 }),
   ).toEqual({
     path: "src/value.mjs",
     blobSha: "b".repeat(40),
-    lineStart: 2,
-    lineEnd: 2,
-    content: "second",
+    lineStart: 1,
+    lineEnd: 3,
+    numberedLines: [{line: 1, text: "first"}, {line: 2, text: "second"}, {line: 3, text: ""}],
   });
   expect(reads).toBe(1);
   expect(await tools.readDiff.execute({ offset: 0, limit: 4 })).toEqual({
@@ -57,7 +78,7 @@ test("source review has only bounded supplied-data read tools", async () => {
 test("source review tool arguments and total calls are bounded at execution", async () => {
   const tools = sourceReviewTools(input);
   expect(
-    tools.readSource.execute({ path: "../secret", lineStart: 1, lineEnd: 2 }),
+    tools.readSource.execute({ path: "../secret", line: 1 }),
   ).rejects.toThrow();
   expect(tools.readDiff.execute({ offset: 0, limit: 12001 })).rejects.toThrow();
 
@@ -71,7 +92,7 @@ test("source tools receipt reports only successful actual file and diff reads", 
 
   const tools = sourceReviewTools(
     input,
-    (path) => {
+    ({path}) => {
       readPaths.push(path);
     },
     () => {
@@ -84,7 +105,7 @@ test("source tools receipt reports only successful actual file and diff reads", 
   expect(readDiff).toBe(false);
   await tools.readDiff.execute({ offset: 6, limit: 1 });
   expect(readDiff).toBe(false);
-  await tools.readSource.execute({ path: "src/value.mjs", lineStart: 1, lineEnd: 1 });
+  await tools.readSource.execute({ path: "src/value.mjs", line: 1 });
   expect(readPaths).toEqual(["src/value.mjs"]);
   expect(readDiff).toBe(false);
   await tools.readDiff.execute({ offset: 0, limit: 6 });

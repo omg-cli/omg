@@ -110,6 +110,32 @@ export const sourceReviewProposalSchema = z.discriminatedUnion("kind", [
     }),
 ]);
 
+const selectionEvidence = evidence.omit({blobSha: true, quote: true});
+const selectionCandidate = candidate.omit({proposedFix: true}).extend({
+    evidence: z.array(selectionEvidence).min(1).max(3),
+});
+export const sourceReviewSelectionSchema = z.discriminatedUnion("kind", [
+    sourceReviewProposalSchema.options[0],
+    sourceReviewProposalSchema.options[1].extend({candidates: z.array(selectionCandidate).min(1).max(3)}),
+]);
+export type SourceReadRange = z.infer<typeof selectionEvidence>;
+
+export function groundReviewSelection(input: SourceReviewInput, value: unknown, reads: readonly SourceReadRange[]): SourceReviewProposal {
+    const selection = sourceReviewSelectionSchema.parse(value);
+    if (selection.kind === "no-findings") return validateReviewProposal(input, selection);
+    return validateReviewProposal(input, {...selection, candidates: selection.candidates.map(candidate => ({
+        ...candidate, proposedFix: null,
+        evidence: candidate.evidence.map(item => {
+            const file = input.sourceFiles.find(file => file.path === item.path);
+            if (!file || item.lineEnd < item.lineStart || !reads.some(read => read.path === item.path &&
+                read.lineStart <= item.lineStart && read.lineEnd >= item.lineEnd))
+                throw new Error("Evidence source range was not read");
+            return {...item, blobSha: file.blobSha,
+                quote: file.content.split("\n").slice(item.lineStart - 1, item.lineEnd).join("\n")};
+        }),
+    }))});
+}
+
 export type SourceReviewInput = z.infer<typeof sourceReviewInputSchema>;
 
 export type SourceReviewProposal = z.infer<typeof sourceReviewProposalSchema>;

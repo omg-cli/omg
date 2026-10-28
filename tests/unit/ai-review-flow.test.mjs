@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -25,6 +26,33 @@ import {
 
 const sha = "a".repeat(40);
 const repository = { full_name: "omg-cli/omg" };
+
+test("service failures retain bounded diagnostic codes without exposing raw response bodies", async () => {
+    let payload = JSON.stringify({error: "private response text", code: "STRUCTURED_MODEL_FAILED"});
+    const server = createServer((_request, response) => {response.writeHead(502); response.end(payload);});
+    await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+        const address = server.address();
+        assert.ok(address && typeof address === "object");
+        const url = new URL(`http://127.0.0.1:${address.port}/review`);
+        await assert.rejects(reviewFlow.fetchJson(url, "t".repeat(40)), error => {
+            assert.equal(error.status, 502);
+            assert.equal(error.code, "STRUCTURED_MODEL_FAILED");
+            assert.match(error.message, /STRUCTURED_MODEL_FAILED/);
+            assert.equal(error.message.includes("private response text"), false);
+            return true;
+        });
+        for (const body of ["<html>private response text</html>", JSON.stringify({code: "PRIVATE_RESPONSE_TEXT"})]) {
+            payload = body;
+            await assert.rejects(reviewFlow.fetchJson(url, "t".repeat(40)), error => {
+                assert.equal(error.status, 502);
+                assert.equal(error.code, undefined);
+                assert.equal(error.message, "Service request failed: HTTP 502.");
+                return true;
+            });
+        }
+    } finally {await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));}
+});
 
 test("weekly source audit targets current main with honest resumable audit identity", () => {
     assert.deepEqual(reviewTarget("schedule", { repository }), {
@@ -837,6 +865,31 @@ test("candidate flow mirrors only exact source and waits for proof without publi
     assert.deepEqual(calls, [`mirror:${sha}`, "adapt", `verify:${sha}:main`]);
     assert.equal(result.publications.length, 1);
     assert.equal(result.publishRequested, true);
+});
+
+test("source-only candidates reach the coder without inventing a repair or publication", async () => {
+    const fixture = candidateFixture();
+    fixture.response.candidates[0].proposedFix = null;
+    const calls = [];
+    const result = await runReviewFlow({
+        target: {branch: "main", sha, publish: true},
+        io: {
+            head: async () => sha,
+            format: async () => ({status: "passed"}),
+            collect: async () => ({baseSha: "b".repeat(40), entries: [fixture.source], unreviewedPaths: []}),
+            review: async () => fixture.response,
+            mirror: async value => calls.push(`mirror:${value}`),
+            adapt: async (_input, review, index) => {
+                assert.equal(review.candidates[index].proposedFix, null);
+                calls.push("coder");
+                return null;
+            },
+            verify: async () => { throw new Error("No repair may reach verification"); },
+        },
+    });
+    assert.deepEqual(calls, [`mirror:${sha}`, "coder"]);
+    assert.deepEqual(result.publications, []);
+    assert.deepEqual(result.candidateOutcomes, [{title: "Wrong value", outcome: "coding-agent-produced-no-repair"}]);
 });
 
 test("failed native verification cannot produce a publication receipt", async () => {
