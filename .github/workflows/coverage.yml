@@ -127,12 +127,53 @@ jobs:
           runuser -u omg-coverage -- env \
             HOME=/home/omg-coverage \
             CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" PATH="$PATH" \
+            cargo llvm-cov clean --workspace
+          runuser -u omg-coverage -- env \
+            HOME=/home/omg-coverage \
+            CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" PATH="$PATH" \
             cargo llvm-cov nextest \
             --features arch,pgp,license \
             --locked \
             --retries 0 \
             --no-fail-fast \
             --no-report
+
+      - name: Cover genuine Node installation and activation
+        id: node_install_tests
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e target/nextest/ci/junit.xml
+          runuser -u omg-coverage -- env \
+            HOME=/home/omg-coverage OMG_RUN_NETWORK_TESTS=1 \
+            CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" PATH="$PATH" \
+            cargo llvm-cov nextest --features arch,pgp,license --locked \
+            --profile ci --retries 0 --no-report \
+            -E 'binary(=e2e_runtime_management) & test(=test_use_node_with_version)'
+          python3 - <<'PY'
+          import json, runpy
+          from pathlib import Path
+          read = runpy.run_path('scripts/check-test-selection.py')['read_junit']
+          report = read(Path('target/nextest/ci/junit.xml').read_bytes())
+          expected = 'omg::e2e_runtime_management::test_use_node_with_version'
+          assert set(report) == {expected}, 'Expected one exact Node installation case'
+          case = report[expected]
+          assert not case['runtime_skip'] and len(case['attempts']) == 1
+          assert case['attempts'][0]['result'] == 'PASS'
+          Path('node-install-coverage.receipt.json').write_text(json.dumps(report, indent=2))
+          PY
+
+      - name: Preserve genuine Node coverage evidence
+        if: ${{ !cancelled() && (steps.node_install_tests.outcome == 'success' || steps.node_install_tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage-node-install
+          path: |
+            target/nextest/ci/junit.xml
+            node-install-coverage.receipt.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Cover sandbox descendant cancellation
         shell: bash

@@ -892,6 +892,19 @@ test("source-only candidates reach the coder without inventing a repair or publi
     assert.deepEqual(result.candidateOutcomes, [{title: "Wrong value", outcome: "coding-agent-produced-no-repair"}]);
 });
 
+test("an unverified no-repair conclusion is recorded without entering verification or publication",async()=>{
+    const f=candidateFixture();f.response.candidates[0].proposedFix=null;
+    const diagnostic={scope:"Unverified agent conclusion, not test or repair proof",agentConclusion:"A claimed repair is model text only."};
+    const result=await runReviewFlow({target:{branch:"main",sha,publish:true},io:{
+        head:async()=>sha,format:async()=>({status:"passed"}),
+        collect:async()=>({baseSha:"b".repeat(40),entries:[f.source],unreviewedPaths:[]}),review:async()=>f.response,
+        mirror:async()=>{},adapt:async()=>({kind:"no-repair",diagnostic}),
+        verify:async()=>{throw new Error("A diagnostic is not a repair proposal");},
+    }});
+    assert.deepEqual(result.publications,[]);
+    assert.deepEqual(result.candidateOutcomes,[{title:"Wrong value",outcome:"coding-agent-produced-no-repair",diagnostic}]);
+});
+
 test("failed native verification cannot produce a publication receipt", async () => {
     const fixture = candidateFixture();
     const calls = [];

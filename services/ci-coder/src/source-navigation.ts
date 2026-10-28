@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { CodingRequest } from "./request";
+import {designatedRegressionPath} from "../../ci-inspector/src/review-contract";
+import {verificationSchema} from "../../cloud-ci/src/verification-schema";
 
 const locations = (content: string, needle: string) =>
     content
@@ -27,6 +29,31 @@ export function testAuditContext(request: CodingRequest) {
                     lines: Math.min(80, count - start + 1),
                 };
             }),
+    };
+}
+
+export function repairContext(request: CodingRequest) {
+    if(request.testAuditTask||request.dependencyTask||request.diagnosisTask)return {};
+    const contract={
+        ...(request.rustContext?{rustContext:request.rustContext}:{}),
+        ...(request.source.sourceFiles.some(file=>file.path.endsWith(".rs"))?{regressionContract:{
+            path:designatedRegressionPath(request.sha,0,true),
+            expectedTestName:verificationSchema.shape.regression.shape.testName.toJSONSchema(),
+            instruction:"Submit this exact new integration-test path and one matching named case. Use the supplied Cargo library/public exports. The server assigns the published filename after admission; do not guess it.",
+        }}:{}),
+    };
+    if(request.hypothesis?.kind!=="candidates"||request.candidateIndex===undefined)
+        return contract;
+    const selected=request.hypothesis.candidates[request.candidateIndex];
+    if(!selected)throw new Error("Selected repair candidate missing");
+    return {
+        ...contract,
+        repairWindows:selected.evidence.map(item=>{
+            const file=request.source.sourceFiles.find(file=>file.path===item.path);
+            if(!file)throw new Error("Repair evidence source missing");
+            const start=Math.max(1,item.lineStart-10,item.lineEnd-79);
+            return {path:item.path,start,lines:Math.min(80,file.content.split("\n").length-start+1)};
+        }),
     };
 }
 

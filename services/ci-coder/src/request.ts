@@ -30,6 +30,10 @@ export const codingRequestSchema = z
     runId: runNumber,
     attempt: z.string().regex(/^[1-9][0-9]{0,5}$/),
     source: z.union([sourceReviewInputSchema,auditSourceSchema]),
+    rustContext: z.array(sourceReviewInputSchema.shape.sourceFiles.element.extend({
+      path:z.string().regex(/^(?:Cargo\.toml|src\/lib\.rs|src\/(?:[A-Za-z0-9_.-]+\/)*mod\.rs)$/)
+        .refine(path=>!path.split("/").some(part=>part==="."||part==="..")),
+    })).min(1).max(12).optional(),
     testAuditTask: testAuditTaskSchema.optional(),
     dependencyTask: dependencyTaskSchema.optional(),
     diagnosisTask: z.union([z.literal(true), z.strictObject({question: z.string().min(1).max(2000)})]).optional(),
@@ -44,6 +48,12 @@ export const codingRequestSchema = z
     "Source identity mismatch",
   )
   .superRefine((request, context) => {
+    if(request.rustContext) {
+      const paths=[...request.source.sourceFiles,...request.rustContext].map(file=>file.path);
+      if(paths.length>12||new Set(paths).size!==paths.length||request.testAuditTask||request.dependencyTask||request.diagnosisTask||
+        !request.source.sourceFiles.some(file=>file.path.endsWith(".rs")))
+        context.addIssue({code:"custom",path:["rustContext"],message:"Rust repair context must be separate, bounded and read-only"});
+    }
     if (request.diagnosisTask && (request.testAuditTask || request.dependencyTask || request.hypothesis || request.candidateIndex !== undefined || !request.source.auditPaths))
       context.addIssue({code: "custom", message: "Read-only diagnosis requires an immutable audit snapshot and no coding task"});
     if (!request.testAuditTask && !request.dependencyTask && !request.diagnosisTask && !sourceReviewInputSchema.safeParse(request.source).success)
@@ -118,6 +128,7 @@ export const operationIdentity = (request: CodingRequest) => {
         ...(request.testAuditTask ? {testAuditTask: request.testAuditTask} : {}),
         ...(request.dependencyTask ? {dependencyTask: request.dependencyTask} : {}),
         ...(request.diagnosisTask ? {diagnosisTask: request.diagnosisTask} : {}),
+        ...(request.rustContext ? {rustContext: request.rustContext} : {}),
       }),
     )
     .digest("hex");
@@ -223,6 +234,8 @@ export async function handleCoderRequest(
 
       if (!(await verifySourceBlobs(input.source)))
         return respond({ error: "Source blob hash mismatch" }, 400);
+      if(input.rustContext&&!(await verifySourceBlobs({...input.source,sourceFiles:input.rustContext})))
+        return respond({error:"Rust API context blob hash mismatch"},400);
       await assertReady();
       const id = operationIdentity(input);
       const result = await env.CODER.getByName(id).start(input);

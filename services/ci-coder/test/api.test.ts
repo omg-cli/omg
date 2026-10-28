@@ -43,6 +43,31 @@ test("coding requests bind source identity and reject arbitrary instructions", (
   expect(() => parseCodingRequest({ ...input, branch: "attacker-branch" })).toThrow();
 });
 
+test("read-only Rust context is identity-bound, bounded and hash-checked before dispatch", async () => {
+  const content='[lib]\nname="omg_lib"\n';
+  const context={path:"Cargo.toml",content,blobSha:createHash("sha1").update(`blob ${Buffer.byteLength(content)}\0${content}`).digest("hex")};
+  const request=parseCodingRequest({...input,rustContext:[context]});
+  expect(operationIdentity(request)).not.toBe(operationIdentity(parseCodingRequest(input)));
+  expect(operationIdentity(parseCodingRequest({...input,rustContext:[{...context,content:content+"\n"}]}))).not.toBe(operationIdentity(request));
+  expect(() => parseCodingRequest({...input,rustContext:[context,context]})).toThrow();
+  expect(() => parseCodingRequest({...input,rustContext:Array.from({length:12},(_,index)=>({...context,path:`src/m${index}/mod.rs`}))})).toThrow(/bounded/);
+  expect(() => parseCodingRequest({...input,rustContext:[{...context,path:"../secret"}]})).toThrow();
+  expect(() => parseCodingRequest({...input,rustContext:[{...context,content:"x".repeat(256*1024+1)}]})).toThrow();
+  expect(() => parseCodingRequest({...input,rustContext:[{...context,content:"é".repeat(128*1024+1)}]})).toThrow();
+  expect(() => parseCodingRequest({...input,diagnosisTask:true,source:{...input.source,changedPaths:[],auditPaths:["src/bug.rs"],diff:""},rustContext:[context]})).toThrow(/read-only/);
+  let starts=0;
+  const env={CODER_API_TOKEN:"fixture-token",CODER:{getByName:(id:string)=>({
+    start:async()=>{starts++;return {id,accepted:true};},status:async()=>({id,status:"done"}),
+  })}};
+  const send=(body:unknown)=>handleCoderRequest(new Request("https://coder.test/operations",{method:"POST",
+    headers:{Authorization:"Bearer fixture-token"},body:JSON.stringify(body)}),env,async()=>{});
+  const invalid=await send({...input,rustContext:[{...context,content:"changed"}]});
+  expect(invalid.status).toBe(400);
+  expect(starts).toBe(0);
+  expect((await send(request)).status).toBe(202);
+  expect(starts).toBe(1);
+});
+
 test("missing mandatory skills blocks API admission before any durable operation starts", async () => {
   let starts = 0;
 

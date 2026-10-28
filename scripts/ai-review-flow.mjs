@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { Schema } from "effect";
 import { collectCandidateSources } from "./ai-review-candidate.mjs";
 import { collectRuntimeSources, acknowledgeRuntimeSources } from "./sentry-review-input.mjs";
-import { admitCoderResult, coderEndpoint } from "./ai-coder-client.mjs";
+import { admitCoderResult, coderEndpoint, readCoderNoRepairDiagnostic } from "./ai-coder-client.mjs";
 import { parseCodingRequest, operationIdentity } from "../services/ci-coder/src/request.ts";
 import { proposalDigest, publishAiReview, sha256, canonicalJson } from "./ai-review-publication.mjs";
 import { ciPolicy, verifyPublicationProof } from "./ai-review-proof.mjs";
@@ -38,6 +38,7 @@ import {
 } from "./review-source-evidence.mjs";
 import { validateReviewProposal, REVIEW_SOURCE_BYTES } from "../services/ci-inspector/src/review-contract.ts";
 import { collectIssueSources, assertIssueUnchanged } from "./github-issue-source.mjs";
+import { collectRustRepairContext } from "./rust-repair-context.mjs";
 import { ciImageInputsSha256 } from "./ci-image-inputs.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -717,10 +718,11 @@ export async function runReviewFlow({ target, io }) {
             candidateCount++;
             const adapted = await io.adapt(evidence.sourceInput, proposal, index);
 
-            if (!adapted) {
+            if (!adapted||adapted.kind==="no-repair") {
                 result.candidateOutcomes.push({
                     title: candidate.title,
                     outcome: "coding-agent-produced-no-repair",
+                    ...(adapted?.kind==="no-repair"?{diagnostic:adapted.diagnostic}:{}),
                 });
                 continue;
             }
@@ -1235,6 +1237,7 @@ async function createController(github, controllerRevision, transition) {
         throw new Error("Exact GitHub run identity is required.");
 
     const code = async (input, review, candidateIndex, testAuditTask) => {
+            const rustContext=testAuditTask?[]:await collectRustRepairContext({source:input,directory:root});
             const request = parseCodingRequest({
                 repository: input.repository,
                 sha: input.sha,
@@ -1242,6 +1245,7 @@ async function createController(github, controllerRevision, transition) {
                 runId,
                 attempt,
                 source: input,
+                ...(rustContext.length?{rustContext}:{}),
                 ...(testAuditTask ? {testAuditTask} : {hypothesis:review,candidateIndex}),
             });
 
@@ -1269,7 +1273,11 @@ async function createController(github, controllerRevision, transition) {
                 if (state.status === "done") {
                     const adapted = admitCoderResult(state, request, codingPolicy);
 
-                    return adapted ? { ...adapted, coding: { id, request } } : null;
+                    if(adapted)return {...adapted,coding:{id,request}};
+                    if(testAuditTask)return null;
+                    return {kind:"no-repair",diagnostic:await readCoderNoRepairDiagnostic(()=>
+                        fetchJson(new URL(`/operations/${id}?diagnosis_history=1`,codingEndpoint),
+                            codingToken,undefined,512*1024+4096),request)};
                 }
 
                 if (!["queued", "running"].includes(state.status) || Date.now() >= deadline)

@@ -3,6 +3,24 @@ import { proposalDigest } from "./ai-review-publication.mjs";
 import { operationIdentity } from "../services/ci-coder/src/request.ts";
 import { Schema } from "effect";
 
+export async function readCoderNoRepairDiagnostic(readHistory,request) {
+    try {return coderNoRepairDiagnostic(await readHistory(),request);}
+    catch {return {operationId:operationIdentity(request),scope:"Unverified agent conclusion, not test or repair proof",
+        agentConclusion:null,omissionReason:"Opt-in history unavailable or rejected; no repair produced"};}
+}
+
+export function coderNoRepairDiagnostic(response,request) {
+    const history=Schema.decodeUnknownSync(Schema.Struct({
+        id:Schema.Literal(operationIdentity(request)),status:Schema.Literal("done"),
+        diagnosisHistory:Schema.Array(Schema.Struct({id:Schema.String,text:Schema.Array(Schema.String)})),
+    }))({id:response.id,status:response.status,diagnosisHistory:response.diagnosisHistory});
+    const conclusion=history.diagnosisHistory.map(message=>message.text.join("\n")).filter(text=>text.trim()).at(-1);
+    const omitted=conclusion!==undefined&&Buffer.byteLength(conclusion,"utf8")>8000;
+    return {operationId:history.id,scope:"Unverified agent conclusion, not test or repair proof",
+        agentConclusion:omitted?null:conclusion??null,
+        omissionReason:omitted?"Complete message exceeds the 8000-byte diagnostic summary budget; opt-in history retains it":null};
+}
+
 export function coderEndpoint(config) {
     if (
         config.endpoint !== "https://omg-ci-coder.latham.workers.dev/" ||

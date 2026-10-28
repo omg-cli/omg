@@ -6,7 +6,7 @@ import { createRequiredSkillsPlugin } from "../src/skills";
 import { parseCodingRequest } from "../src/request";
 import { gitBlobSha } from "../../../scripts/ai-review-candidate.mjs";
 
-async function fixture(deliver = true) {
+async function fixture(deliver = true, repair = false) {
     const content =
         "// fixture line\n".repeat(1700) +
         "#[test]\nfn selected_case() { assert_eq!(value(), 1); }\n" +
@@ -30,12 +30,15 @@ async function fixture(deliver = true) {
             sourceFiles: [{ path, blobSha, content }],
             ciFailures: [],
         },
-        testAuditTask: {
+        ...(repair ? {hypothesis:{kind:"candidates",summary:"Supported source hypothesis",candidates:[{
+            title:"Wrong source behavior",impact:"The public result is incorrect.",proposedFix:null,
+            evidence:[{path,blobSha,lineStart:1702,lineEnd:1703,quote:content.split("\n").slice(1701,1703).join("\n")}],
+        }]},candidateIndex:0,rustContext:[{path:"src/lib.rs",content:"pub mod fixture;\n",blobSha:gitBlobSha("pub mod fixture;\n")}]} : {testAuditTask: {
             path,
             target: "lib",
             testName: "module::selected_case",
             originalBlobSha: blobSha,
-        },
+        }}),
     });
     const skills = await createRequiredSkillsPlugin(),
         sessionID = Session.ID.create();
@@ -84,6 +87,47 @@ test("recovered audit context locates the exact selected test without scanning t
     assert.ok(read.content.includes("fn selected_case()"));
     assert.equal(f.state().calls, 3);
     assert.equal(f.state().reads.length, 1);
+});
+
+test("repair context directs real reads to candidate evidence and keeps API context outside editable source", async () => {
+    const f=await fixture(true,true);
+    const context=JSON.parse((await f.actions.read_context.execute({},f.context)).content);
+    assert.deepEqual(context.repairWindows,[{path:"src/fixture.rs",start:1692,lines:37}]);
+    assert.deepEqual(context.rustContext,f.request.rustContext);
+    assert.equal(f.state().reads.length,0);
+    const read=JSON.parse((await f.actions.read_source.execute(context.repairWindows[0],f.context)).content);
+    assert.ok(read.content.includes("fn selected_case()"));
+    await assert.rejects(f.actions.read_source.execute({path:"src/lib.rs",start:1,lines:1},f.context),/outside|Unknown/i);
+    const evidence=f.request.hypothesis?.kind==="candidates"?f.request.hypothesis.candidates[0]!.evidence:[];
+    await assert.rejects(f.actions.propose_fix.execute({kind:"candidates",summary:"Invalid context edit",candidates:[{
+        title:"Wrong source behavior",impact:"The result is incorrect.",evidence,
+        proposedFix:{edits:[{path:"src/lib.rs",oldText:"pub mod fixture;",newText:"pub mod other;"}],
+            regressionTest:{path:`tests/ci-review-${f.request.sha.slice(0,12)}-1.rs`,content:'#[path="../src/fixture.rs"] mod fixture; #[test] fn result() { assert_eq!(fixture::value(), 2); }',expectedTestName:"result"}},
+    }]},f.context),/admitted source|source snapshot/i);
+    assert.equal(f.state().proposal,undefined);
+    assert.equal(f.state().verificationJob,undefined);
+});
+
+test("repair navigation covers an entire eighty-line evidence span without exceeding the read bound",async()=>{
+    const f=await fixture(true,true);
+    if(f.request.hypothesis?.kind!=="candidates")throw new Error("Repair fixture missing");
+    const file=f.request.source.sourceFiles[0]!;
+    f.request.hypothesis.candidates[0]!.evidence=[{path:file.path,blobSha:file.blobSha,lineStart:1400,lineEnd:1479,
+        quote:file.content.split("\n").slice(1399,1479).join("\n")}];
+    const context=JSON.parse((await f.actions.read_context.execute({},f.context)).content);
+    assert.deepEqual(context.repairWindows,[{path:file.path,start:1400,lines:80}]);
+    await f.actions.read_source.execute(context.repairWindows[0],f.context);
+    assert.deepEqual(f.state().reads,[{path:file.path,start:1400,end:1479}]);
+});
+
+test("ordinary discovery keeps read-only API context even without a selected hypothesis",async()=>{
+    const f=await fixture(true,true);
+    delete f.request.hypothesis;
+    delete f.request.candidateIndex;
+    const context=JSON.parse((await f.actions.read_context.execute({},f.context)).content);
+    assert.deepEqual(context.rustContext,f.request.rustContext);
+    assert.equal(context.repairWindows,undefined);
+    assert.equal(f.state().reads.length,0);
 });
 
 test("literal source search is skill-gated, bounded and grants no fabricated read evidence", async () => {
