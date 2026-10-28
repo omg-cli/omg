@@ -152,6 +152,10 @@ export class SourceReviewFailure extends Error {
     }
 }
 
+export const designatedRegressionPath=(sha:string,index:number,rust:boolean)=>rust
+    ? `tests/ci-review-${sha.slice(0,12)}-${index+1}.rs`
+    : `tests/unit/ci-review-${sha.slice(0,12)}-${index+1}.test.mjs`;
+
 export function validateReviewProposal(
     input: SourceReviewInput,
     value: Parameters<typeof sourceReviewProposalSchema.parse>[0],
@@ -219,9 +223,7 @@ export function validateReviewProposal(
 
         const test = fix.regressionTest;
         const rust = fix.edits.every((edit) => edit.path.endsWith(".rs"));
-        const expectedPath = rust
-            ? `tests/ci-review-${input.sha.slice(0, 12)}-${index + 1}.rs`
-            : `tests/unit/ci-review-${input.sha.slice(0, 12)}-${index + 1}.test.mjs`;
+        const expectedPath = designatedRegressionPath(input.sha,index,rust);
 
         if (
             test.path !== expectedPath ||
@@ -229,7 +231,7 @@ export function validateReviewProposal(
             input.changedPaths.includes(test.path) ||
             !test.content.includes(test.expectedTestName)
         )
-            throw new Error("Regression test must use a new designated path and named case");
+            throw new Error(`Regression test must use a new designated path and named case; expected ${expectedPath}`);
     }
 
     return proposal;

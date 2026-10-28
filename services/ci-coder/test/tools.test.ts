@@ -222,7 +222,11 @@ test("coding tools reject a model acknowledgement without actual mandatory skill
 test("the actual read_context tool delivers optional runtime evidence as an uncorroborated historical lead", async () => {
   const f = await fixture();
   const original = JSON.parse((await f.actions.read_context.execute({}, f.context)).content);
-  assert.deepEqual(original, { diff: "a value change", ciFailures: [], hypothesis: null, candidateIndex: null });
+  const {regressionContract,...originalEvidence}=original;
+  assert.deepEqual(originalEvidence, { diff: "a value change", ciFailures: [], hypothesis: null, candidateIndex: null });
+  assert.equal(regressionContract.path, `tests/ci-review-${f.request.sha.slice(0,12)}-1.rs`);
+  assert.deepEqual(regressionContract.expectedTestName, {$schema:"https://json-schema.org/draft/2020-12/schema",
+    type:"string",pattern:"^[A-Za-z_][A-Za-z0-9_]*$",maxLength:200});
   const evidence: NonNullable<CodingRequest["source"]["runtimeEvidence"]>[number] = {
     kind: "sentry-runtime", organization: "omg", projectId: "12", eventId: "b".repeat(32),
     issueId: "34", bodySha256: "c".repeat(64), sourceSha: "d".repeat(40),

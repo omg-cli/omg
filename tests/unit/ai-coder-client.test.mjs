@@ -1,9 +1,25 @@
 import assert from "node:assert/strict";
 import { test } from "bun:test";
-import { admitCoderResult } from "../../scripts/ai-coder-client.mjs";
+import { admitCoderResult, coderNoRepairDiagnostic } from "../../scripts/ai-coder-client.mjs";
 import { proposalDigest } from "../../scripts/ai-review-publication.mjs";
 import { operationIdentity, parseCodingRequest } from "../../services/ci-coder/src/request.ts";
 import { testAuditProofFixture } from "./fixtures/test-audit-proof.mjs";
+
+test("no-repair diagnostics bind the actual operation and retain only a bounded complete unverified conclusion",()=>{
+    const {request}=fixture(),id=operationIdentity(request);
+    const response={id,status:"done",diagnosisHistory:[{id:"m1",text:["Read source"]},{id:"m2",text:[]},
+        {id:"m3",text:["The designated regression path was unavailable."]}]};
+    assert.deepEqual(coderNoRepairDiagnostic(response,request),{operationId:id,
+        scope:"Unverified agent conclusion, not test or repair proof",agentConclusion:"The designated regression path was unavailable.",omissionReason:null});
+    assert.throws(()=>coderNoRepairDiagnostic({...response,id:"other"},request));
+    assert.throws(()=>coderNoRepairDiagnostic({...response,status:"running"},request));
+    const large={...response,diagnosisHistory:[{id:"m4",text:["é".repeat(4001)]}]};
+    const original=JSON.stringify(large);
+    const result=coderNoRepairDiagnostic(large,request);
+    assert.equal(result.agentConclusion,null);
+    assert.match(result.omissionReason,/Complete message exceeds/);
+    assert.equal(JSON.stringify(large),original);
+});
 
 function auditFixture() {
     const proof = testAuditProofFixture();

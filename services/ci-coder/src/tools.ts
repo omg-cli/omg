@@ -11,7 +11,7 @@ import { sourceReviewProposalSchema } from "../../ci-inspector/src/review-contra
 import { verifyPublicationProof } from "../../../scripts/ai-review-proof.mjs";
 import { verifyCloudCiObjects } from "../../../scripts/cloud-ci-evidence.mjs";
 import { createDependencyTool, dependencyLockRange, type DependencyPlan } from "./dependency";
-import { testAuditContext, createSourceSearch } from "./source-navigation";
+import { testAuditContext, repairContext, createSourceSearch } from "./source-navigation";
 
 type Json = z.infer<ReturnType<typeof z.json>>;
 
@@ -419,6 +419,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
           ...(request.dependencyTask ? {dependencyTask:request.dependencyTask,
             lockRanges:request.dependencyTask.targets.map(target=>({...target,...dependencyLockRange(request.source.sourceFiles.find(file=>file.path==="Cargo.lock")!.content,target)}))} : {}),
           ...testAuditContext(request),
+          ...repairContext(request),
         }));
       },
     },
@@ -478,7 +479,7 @@ export function createCodingActions({ getRequest, env, skills, update }: Actions
     propose_fix: {
       input: sourceReviewProposalSchema,
       description:
-        "Propose exactly one evidenced repair with exact unique replacements and one new regression test. Does not publish or execute code.",
+        "Propose exactly one evidenced repair with exact unique replacements and one new regression test. Use read_context.regressionContract for its exact accepted path and test-name constraints. Does not publish or execute code.",
       async execute(input: z.infer<typeof sourceReviewProposalSchema>, context: ToolContext) {
         const request = await enter(context, true);
         if (request.testAuditTask) throw new Error("Use the separate existing-test audit tools");

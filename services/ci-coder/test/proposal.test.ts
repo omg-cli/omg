@@ -3,6 +3,8 @@ import { gitBlobSha } from "../../../scripts/ai-review-candidate.mjs";
 import { proposalDigest, sha256 } from "../../../scripts/ai-review-publication.mjs";
 import type { SourceReviewProposal } from "../../ci-inspector/src/review-contract";
 import { createCoderProposal, type CoderProposalRequest } from "../src/proposal";
+import {parseCodingRequest} from "../src/request";
+import {repairContext} from "../src/source-navigation";
 
 function fixture() {
   const content = "pub const VALUE: u32 = 1;\n";
@@ -56,6 +58,22 @@ function fixture() {
 
   return { request, candidate };
 }
+
+test("published regression contract is accepted by the unchanged proposal and verification schemas",()=>{
+  const {request,candidate}=fixture();
+  const context=repairContext(parseCodingRequest({...request,hypothesis:{...candidate,
+    candidates:candidate.candidates.map(item=>({...item,proposedFix:null}))},candidateIndex:0}));
+  expect(context.regressionContract?.path).toBe(`tests/ci-review-${request.sha.slice(0,12)}-1.rs`);
+  expect(context.regressionContract?.expectedTestName.pattern).toBe("^[A-Za-z_][A-Za-z0-9_]*$");
+  const selected=candidate.candidates[0]!;
+  if(!selected.proposedFix||!context.regressionContract)throw new Error("Missing repair contract");
+  selected.proposedFix.regressionTest.path=context.regressionContract.path;
+  const accepted=createCoderProposal(request,candidate);
+  expect(accepted.regression.testName).toBe("value_is_two");
+  expect(accepted.proposal.changes[0]?.newContent).toBe("pub const VALUE: u32 = 2;\n");
+  selected.proposedFix.regressionTest.path="tests/guessed-name.rs";
+  expect(()=>createCoderProposal(request,candidate)).toThrow(context.regressionContract.path);
+});
 
 test("coder proposal binds declared source and complete replacement bytes without executing or formatting them", () => {
   const { request, candidate } = fixture();
