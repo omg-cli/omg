@@ -1,6 +1,6 @@
 import { expect, mock, test } from "bun:test";
 
-mock.module("cloudflare:workers", () => ({ DurableObject: class {}, WorkerEntrypoint: class {} }));
+mock.module("cloudflare:workers", () => ({ DurableObject: class {}, RpcTarget: class {}, WorkerEntrypoint: class {}, tracing: undefined }));
 const { Container } = await import("@cloudflare/containers");
 
 function host(fenced) {

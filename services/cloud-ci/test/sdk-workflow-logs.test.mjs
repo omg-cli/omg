@@ -8,16 +8,17 @@ const bytes=mode==='inline'?new TextEncoder().encode('small'):largeBytes;
 const events=[];
 let destroyed=false;
 let executions=0;let backgroundCalls=0;let backups=0;
-const startedAt=Date.now();
+let startedAt;
 const invalidExits={
  'command-signal':null,'command-missing-exit':undefined,'command-negative':-1,
  'command-fractional':0.5,'command-nan':NaN,'command-infinite':Infinity,
  'command-string':'0','command-unsafe':Number.MAX_SAFE_INTEGER+1,
 };
 const sandbox={
- async waitForConfiguration(){},
+ async waitForConfiguration(){if(mode==='command-read-late')await new Promise(resolve=>setTimeout(resolve,300));},
  async exec(command){assert.equal(command.startsWith('(trusted fixture)'),false,'the acknowledged command cannot be launched again');return {exitCode:0,stdout:'preview',stderr:''};},
  async startProcess(command,options){
+   startedAt=Date.now();
    executions++;assert.equal(options.cwd,'/workspace');assert.equal(options.env.CI,'true');
    assert.equal(command,'(trusted fixture) > /tmp/ci-step.out 2> /tmp/ci-step.err');
    if(mode.startsWith('command-interrupted'))throw new OperationInterruptedError({reason:'runtime_replaced',operation:'sandbox.startProcess',phase:'execute',admitted:false,retryable:mode.endsWith('-retryable')});

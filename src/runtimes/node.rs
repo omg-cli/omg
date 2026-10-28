@@ -1159,65 +1159,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn https_node_install_verifies_extracts_and_activates_without_vendor_network()
-    -> Result<()> {
-        use sha2::Digest as _;
-
-        let version = "22.0.0";
-        let root = format!("node-v{version}-{}", node_platform()?);
-        let filename = format!("{root}.tar.xz");
-        let payload = b"#!/bin/sh\nprintf 'v22.0.0\\n'\n";
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_mode(0o755);
-        header.set_size(payload.len() as u64);
-        header.set_cksum();
-        builder.append_data(&mut header, format!("{root}/bin/node"), payload.as_slice())?;
-        let mut archive = Vec::new();
-        lzma_rs::xz_compress(
-            &mut std::io::Cursor::new(builder.into_inner()?),
-            &mut archive,
-        )?;
-        let digest = format!("{:x}", sha2::Sha256::digest(&archive));
-        let checksum_path = format!("/dist/v{version}/SHASUMS256.txt");
-        let archive_path = format!("/dist/v{version}/{filename}");
-        let fixture = super::super::test_https::HttpsFixture::new(
-            "nodejs.org",
-            vec![
-                (
-                    checksum_path.clone(),
-                    format!("{digest}  {filename}\n").into_bytes(),
-                ),
-                (archive_path.clone(), archive),
-            ],
-        )
-        .await?;
-        let directory = tempfile::tempdir()?;
-        let manager = NodeManager {
-            versions_dir: directory.path().to_path_buf(),
-            client: Box::leak(Box::new(fixture.client(true)?)),
-        };
-        manager.install(version).await?;
-        assert_eq!(
-            fs::read(directory.path().join(version).join("bin/node"))?,
-            payload
-        );
-        assert_eq!(manager.current_version(), Some(version.to_owned()));
-        assert_eq!(manager.list_installed()?, vec![version.to_owned()]);
-        manager.install(version).await?;
-        assert_eq!(
-            fixture.finish().await?,
-            vec![
-                format!("GET {checksum_path} HTTP/1.1"),
-                format!("GET {archive_path} HTTP/1.1")
-            ]
-        );
-        Ok(())
-    }
-
     #[tokio::test]
     async fn metadata_retry_recovers_node_checksum_without_skipping_integrity() -> Result<()> {
         let filename = "node-v24.21.0-linux-x64.tar.xz";

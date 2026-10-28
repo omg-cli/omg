@@ -7,6 +7,7 @@ import tempfile
 import importlib.util
 from pathlib import Path
 import unittest
+import textwrap
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
@@ -109,6 +110,35 @@ class BaseCoverageTests(unittest.TestCase):
                 coverage.sha(value)
         with self.assertRaises(ValueError):
             coverage.identities("schedule", {}, SHA)
+
+
+class GenuineNodeCoverageTests(unittest.TestCase):
+    def test_actual_workflow_admits_only_one_executed_first_attempt(self):
+        repository = Path(__file__).resolve().parent.parent
+        workflow = (repository / '.github/workflows/coverage.yml').read_text()
+        step = workflow.split('      - name: Cover genuine Node installation and activation\n', 1)[1]
+        program = textwrap.dedent(step.split("python3 - <<'PY'\n", 1)[1].split('\n          PY', 1)[0])
+        case = '<testcase classname="omg::e2e_runtime_management" name="test_use_node_with_version" time="0.1">{}</testcase>'
+        for body, accepted in [
+            (case.format(''), True),
+            ('', False),
+            (case.format('') * 2, False),
+            (case.format('<skipped/>'), False),
+            (case.format('<failure>install failed</failure>'), False),
+            (case.format('<system-err>[omg-skip] network unavailable</system-err>'), False),
+            (case.format('<flakyFailure time="0.1">first failure</flakyFailure>'), False),
+        ]:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'scripts').mkdir()
+                for name in ('check-test-selection.py', 'check-contract-coverage.py'):
+                    (root / 'scripts' / name).write_bytes((repository / 'scripts' / name).read_bytes())
+                report = root / 'target/nextest/ci/junit.xml'
+                report.parent.mkdir(parents=True)
+                report.write_text('<testsuites><testsuite name="omg::e2e_runtime_management">' + body + '</testsuite></testsuites>')
+                result = subprocess.run([sys.executable, '-I', '-c', program], cwd=root, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                self.assertEqual((root / 'node-install-coverage.receipt.json').exists(), accepted)
 
 
 class DownloadMemberBehaviorTests(unittest.TestCase):
