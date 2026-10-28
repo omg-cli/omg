@@ -3,6 +3,12 @@ import { proposalDigest } from "./ai-review-publication.mjs";
 import { operationIdentity } from "../services/ci-coder/src/request.ts";
 import { Schema } from "effect";
 
+export async function readCoderNoRepairDiagnostic(readHistory,request) {
+    try {return coderNoRepairDiagnostic(await readHistory(),request);}
+    catch {return {operationId:operationIdentity(request),scope:"Unverified agent conclusion, not test or repair proof",
+        agentConclusion:null,omissionReason:"Opt-in history unavailable or rejected; no repair produced"};}
+}
+
 export function coderNoRepairDiagnostic(response,request) {
     const history=Schema.decodeUnknownSync(Schema.Struct({
         id:Schema.Literal(operationIdentity(request)),status:Schema.Literal("done"),

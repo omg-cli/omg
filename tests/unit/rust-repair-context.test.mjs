@@ -28,8 +28,10 @@ async function fixture(run) {
     }
 }
 
-test("Rust repair context contains complete committed Cargo and public export blobs without widening editable source", async()=>fixture(async({directory,git,files,source})=>{
+test("Rust repair context contains complete committed Cargo and public export blobs without widening editable source", async()=>fixture(async({directory,git,commit,files,source})=>{
     await writeFile(path.join(directory,"Cargo.toml"),'uncommitted manifest');
+    commit();
+    assert.notEqual(git("rev-parse","HEAD"),source.sha);
     const before=JSON.stringify(source);
     const context=await collectRustRepairContext({source,directory});
     assert.deepEqual(context,["Cargo.toml","src/lib.rs","src/core/mod.rs","src/core/env/mod.rs"].map(file=>({

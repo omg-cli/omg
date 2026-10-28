@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
 import { Schema } from "effect";
 import { collectCandidateSources } from "./ai-review-candidate.mjs";
 import { collectRuntimeSources, acknowledgeRuntimeSources } from "./sentry-review-input.mjs";
-import { admitCoderResult, coderEndpoint, coderNoRepairDiagnostic } from "./ai-coder-client.mjs";
+import { admitCoderResult, coderEndpoint, readCoderNoRepairDiagnostic } from "./ai-coder-client.mjs";
 import { parseCodingRequest, operationIdentity } from "../services/ci-coder/src/request.ts";
 import { proposalDigest, publishAiReview, sha256, canonicalJson } from "./ai-review-publication.mjs";
 import { ciPolicy, verifyPublicationProof } from "./ai-review-proof.mjs";
@@ -1275,9 +1275,9 @@ async function createController(github, controllerRevision, transition) {
 
                     if(adapted)return {...adapted,coding:{id,request}};
                     if(testAuditTask)return null;
-                    const history=await fetchJson(new URL(`/operations/${id}?diagnosis_history=1`,codingEndpoint),
-                        codingToken,undefined,512*1024+4096);
-                    return {kind:"no-repair",diagnostic:coderNoRepairDiagnostic(history,request)};
+                    return {kind:"no-repair",diagnostic:await readCoderNoRepairDiagnostic(()=>
+                        fetchJson(new URL(`/operations/${id}?diagnosis_history=1`,codingEndpoint),
+                            codingToken,undefined,512*1024+4096),request)};
                 }
 
                 if (!["queued", "running"].includes(state.status) || Date.now() >= deadline)

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "bun:test";
-import { admitCoderResult, coderNoRepairDiagnostic } from "../../scripts/ai-coder-client.mjs";
+import { admitCoderResult, coderNoRepairDiagnostic, readCoderNoRepairDiagnostic } from "../../scripts/ai-coder-client.mjs";
 import { proposalDigest } from "../../scripts/ai-review-publication.mjs";
 import { operationIdentity, parseCodingRequest } from "../../services/ci-coder/src/request.ts";
 import { testAuditProofFixture } from "./fixtures/test-audit-proof.mjs";
@@ -19,6 +19,16 @@ test("no-repair diagnostics bind the actual operation and retain only a bounded 
     assert.equal(result.agentConclusion,null);
     assert.match(result.omissionReason,/Complete message exceeds/);
     assert.equal(JSON.stringify(large),original);
+});
+
+test("unavailable or invalid optional history preserves a completed no-repair outcome without trusting diagnostic bytes",async()=>{
+    const {request}=fixture(),id=operationIdentity(request);
+    const expected={operationId:id,scope:"Unverified agent conclusion, not test or repair proof",agentConclusion:null,
+        omissionReason:"Opt-in history unavailable or rejected; no repair produced"};
+    assert.deepEqual(await readCoderNoRepairDiagnostic(async()=>{throw new Error("Bearer private-fixture-token");},request),expected);
+    assert.deepEqual(await readCoderNoRepairDiagnostic(async()=>({id:"wrong",status:"done",diagnosisHistory:[]}),request),expected);
+    const response={id,status:"done",diagnosisHistory:[{id:"m1",text:["No supported repair"]}]};
+    assert.deepEqual(await readCoderNoRepairDiagnostic(async()=>response,request),coderNoRepairDiagnostic(response,request));
 });
 
 function auditFixture() {
