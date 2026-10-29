@@ -234,6 +234,7 @@ mod tests {
             selected["url"] = json!(bad);
             assert!(parse_catalog(catalog(selected), target).is_err());
         }
+        assert!(parse_catalog(catalog(original.clone()), target).is_ok());
     }
 
     #[test]
