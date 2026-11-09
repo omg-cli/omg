@@ -176,18 +176,49 @@ def region_evidence(path, coverage, sources):
     return data["functions"], sections
 
 
+def source_owner_span(owner, name, files, source):
+    if (len(owner["filenames"]) != 1 or files.get(owner["filenames"][0]) != name
+            or not owner["regions"]
+            or any(len(region) != 8 or any(type(value) is not int for value in region)
+                   or min(region[:4]) < 1 or region[0] > region[2]
+                   or region[2] > len(source)
+                   or region[1] > len(source[region[0] - 1].encode("utf-8")) + 1
+                   or region[3] > len(source[region[2] - 1].encode("utf-8")) + 1
+                   or (region[0] == region[2] and region[1] >= region[3])
+                   or region[4] < 0 or region[5:] != [0, 0, 0]
+                   for region in owner["regions"])):
+        return None
+    start, end = min(r[0] for r in owner["regions"]), max(r[2] for r in owner["regions"])
+    declaration = source[start - 1]
+    function = re.fullmatch(
+        r"([ \t]*)(?:(?:pub(?:\([^()]*\))?|async|unsafe|const)\s+)*fn\s+[A-Za-z_]\w*[^{}]*\{\s*",
+        declaration)
+    header = declaration if function else None
+    if not (function and source[end - 1].rstrip() == function[1] + "}"
+            and any(r[2] == end and r[3] > len(function[1]) + 1 for r in owner["regions"])):
+        declaration = None
+    return start, end, declaration, header
+
+
+def owner_covers_lines(regions, start, end):
+    return all(any(region[0] <= line < region[2] or line == region[2] and region[3] > 1
+                   for region in regions) for line in range(start, end + 1))
+
+
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
     bf, bs = region_evidence(base_regions, base, base_sources)
     hf, hs = region_evidence(head_regions, head, head_sources)
     if bs.keys() != hs.keys():
         raise ValueError("Added or removed coverage file requires explicit review")
-    head_owners = {}
-    for function in hf:
-        head_owners.setdefault(function["name"], []).append(function)
-    head_names = set(head_owners)
-    base_name_counts = {}
     base_files = {path: canonical_source(path, base_sources) for path in base.sections}
     head_files = {path: canonical_source(path, head_sources) for path in head.sections}
+    head_owners = {}; head_owners_by_file = {}
+    for function in hf:
+        head_owners.setdefault(function["name"], []).append(function)
+        for name in {head_files[path] for path in function["filenames"] if path in head_files}:
+            head_owners_by_file.setdefault(name, []).append(function)
+    head_names = set(head_owners)
+    base_name_counts = {}
     owners_by_file = {}
     for function in bf:
         base_name_counts[function["name"]] = base_name_counts.get(function["name"], 0) + 1
@@ -200,36 +231,49 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         before, after = bs[name]["counts"], hs[name]["counts"]
         if any(line > len(old) for line in before) or any(line > len(new) for line in after):
             raise ValueError("Coverage line exceeds exact source blob")
-        retained = {}; gone = set()
-        for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
-            if tag == "equal":
-                if old != new and any(before.get(line, 0) > 0 for line in range(a + 1, b + 1)):
-                    block = "\n" + "\n".join(old[a:b]) + "\n"
-                    anchored_suffix = b == len(old) and d == len(new)
-                    if not anchored_suffix and (("\n" + "\n".join(old) + "\n").count(block) != 1 or
-                                                ("\n" + "\n".join(new) + "\n").count(block) != 1):
-                        raise ValueError("Ambiguous unchanged source correspondence")
-                retained.update(zip(range(a + 1, b + 1), range(c + 1, d + 1)))
-            elif tag == "delete":
-                gone.update(range(a + 1, b + 1))
-            # Replacement is not proven deletion. Its old counts stay in the
-            # strict base ratios, and its new uncovered mappings are refused.
-        anchored = {}
+        source_owners = []
+        for functions, files, source in [(owners_by_file.get(name, []), base_files, old),
+                                         (head_owners_by_file.get(name, []), head_files, new)]:
+            spans = {}; declarations = {}; headers = {}
+            for function in functions:
+                span = source_owner_span(function, name, files, source)
+                if span is not None:
+                    spans[id(function)] = span
+                    if span[2] is not None and source.count(span[2]) == 1:
+                        declarations.setdefault(span[2], []).append(function)
+                    if span[3] is not None and source.count(span[3]) == 1:
+                        headers.setdefault(span[3], []).append(function)
+            source_owners.append((spans, declarations, headers))
+        (base_spans, base_declarations, base_headers), (head_spans, head_declarations, head_headers) = source_owners
+        anchored = {}; owner_spans = []
         for owner in owners_by_file.get(name, []):
-            matches = head_owners.get(owner["name"], [])
-            if base_name_counts[owner["name"]] != 1 or len(matches) != 1:
+            span = base_spans.get(id(owner))
+            if span is None or base_name_counts[owner["name"]] != 1:
+                continue
+            allow_anchors = True
+            matches = head_declarations.get(span[2], []) if span[2] is not None else []
+            if len(base_declarations.get(span[2], [])) != 1 or len(matches) != 1:
+                matches = head_owners.get(owner["name"], [])
+                raw_span = head_spans.get(id(matches[0])) if len(matches) == 1 else None
+                if raw_span is None or (span[3] is None) != (raw_span[3] is None):
+                    matches = head_headers.get(span[3], []) if span[3] is not None else []
+                    if len(base_headers.get(span[3], [])) != 1:
+                        matches = []
+                    # Header identity proves positive candidates, not an unchanged body.
+                    allow_anchors = False
+            if len(matches) != 1 or len(head_owners[matches[0]["name"]]) != 1:
                 continue
             current = matches[0]
-            if (len(owner["filenames"]) != 1 or len(current["filenames"]) != 1
-                    or base_files.get(owner["filenames"][0]) != name
-                    or head_files.get(current["filenames"][0]) != name
-                    or not owner["regions"] or not current["regions"]
-                    or any(region[5:] != [0, 0, 0] for region in owner["regions"] + current["regions"])):
+            current_span = head_spans.get(id(current))
+            if current_span is None or (span[3] is None) != (current_span[3] is None):
                 continue
-            start, end = min(r[0] for r in owner["regions"]), max(r[2] for r in owner["regions"])
-            newstart, newend = min(r[0] for r in current["regions"]), max(r[2] for r in current["regions"])
-            if not (1 <= start <= end <= len(old) and 1 <= newstart <= newend <= len(new)):
-                raise ValueError("Function owner exceeds exact source blob")
+            if span[3] is not None and (span[2] is None or current_span[2] is None):
+                allow_anchors = False
+            start, end = span[:2]
+            newstart, newend = current_span[:2]
+            owner_spans.append((start, end, newstart, newend, owner["regions"], current["regions"]))
+            if not allow_anchors:
+                continue
             if old[start - 1:end] == new[newstart - 1:newend]:
                 pairs = zip(range(start, end + 1), range(newstart, newend + 1))
             elif (old[end - 1].strip() == new[newend - 1].strip() == "}"
@@ -242,6 +286,38 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if oldline in anchored and anchored[oldline] != newline:
                     raise ValueError("Ambiguous retained function owner")
                 anchored[oldline] = newline
+        retained = {}; gone = set()
+        for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            if tag == "equal":
+                if old != new and any(before.get(line, 0) > 0 for line in range(a + 1, b + 1)):
+                    block = "\n" + "\n".join(old[a:b]) + "\n"
+                    anchored_suffix = b == len(old) and d == len(new)
+                    if not anchored_suffix and (("\n" + "\n".join(old) + "\n").count(block) != 1 or
+                                                ("\n" + "\n".join(new) + "\n").count(block) != 1):
+                        pending = [line for line in range(a + 1, b + 1)
+                                   if line in before and line not in anchored]
+                        if pending:
+                            scopes = [span for span in owner_spans
+                                      if span[0] <= a + 1 <= b <= span[1]
+                                      and span[2] <= c + 1 <= d <= span[3]
+                                      and owner_covers_lines(span[4], a + 1, b)
+                                      and owner_covers_lines(span[5], c + 1, d)]
+                            starts = [offset for offset in range(scopes[0][2] - 1, scopes[0][3] - (b - a) + 1)
+                                      if new[offset:offset + b - a] == old[a:b]] if len(scopes) == 1 else []
+                            if (c not in starts or any(not owner_covers_lines(scopes[0][5], offset + 1, offset + b - a)
+                                                     for offset in starts)
+                                    or any(after.get(offset + line - a, 0) <= 0
+                                           for offset in starts for line in pending)):
+                                raise ValueError(
+                                    f"Ambiguous unchanged source correspondence: {name}:{a + 1}-{b} -> {c + 1}-{d}")
+                            retained.update((line, c + line - a) for line in pending)
+                        # Repeated text is retained only through its proven function owner.
+                        continue
+                retained.update(zip(range(a + 1, b + 1), range(c + 1, d + 1)))
+            elif tag == "delete":
+                gone.update(range(a + 1, b + 1))
+            # Replacement is not proven deletion. Its old counts stay in the
+            # strict base ratios, and its new uncovered mappings are refused.
         gone.difference_update(anchored)
         anchored_new = set(anchored.values())
         for oldline, newline in list(retained.items()):

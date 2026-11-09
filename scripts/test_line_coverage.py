@@ -437,6 +437,247 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 coverage.require_source_no_regression(value, value, region_path, region_path,
                     {"example.rs": old}, {"example.rs": new})
 
+    def repeated_owned_brace_compare(self, missing=None, lost=False, mutate=None):
+        old = b"fn first(old: bool) {\n  consume(old);\n}\nfn second(old: bool) {\n  consume_again(old);\n}\nfn kept() {\n  keep();\n}\n"
+        new = old.replace(b"old", b"new")
+        before = [(line, 1) for line in range(1, 10)]
+        after = [(line, int(not lost or line != 3)) for line in range(1, 10)]
+
+        def owners(base, head):
+            for value, rows in [(base, before), (head, after)]:
+                counts = dict(rows)
+                value["data"][0]["functions"] = [
+                    {"name": name, "filenames": ["/src/example.rs"],
+                     "regions": [[line, 1, line, 2, counts[line], 0, 0, 0]
+                                 for line in range(start, start + 3)]}
+                    for name, start in [("first", 1), ("second", 4), ("kept", 7)]]
+            if missing == "missing":
+                head["data"][0]["functions"].pop(0)
+            elif missing == "duplicate":
+                head["data"][0]["functions"].append(
+                    copy.deepcopy(head["data"][0]["functions"][0]))
+            elif missing == "multifile":
+                head["data"][0]["functions"][0]["filenames"].append("/src/other.rs")
+            if mutate:
+                mutate(base, head)
+
+        return self.compare(before=before, after=after, mutate=owners,
+                            sources=({"example.rs": old}, {"example.rs": new}))
+
+    def test_unique_function_owners_resolve_repeated_covered_braces(self):
+        self.assertEqual(self.repeated_owned_brace_compare(), {
+            "deleted_summary_found": 0, "deleted_summary_hit": 0,
+            "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def test_owned_repeated_brace_still_rejects_coverage_loss(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.repeated_owned_brace_compare(lost=True)
+
+    def test_repeated_brace_without_unique_same_file_owner_is_refused(self):
+        for missing in ["missing", "duplicate", "multifile"]:
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                    ValueError, "Ambiguous unchanged source"):
+                self.repeated_owned_brace_compare(missing=missing)
+
+    def test_malformed_function_region_cannot_resolve_repeated_text(self):
+        invalid = [
+            [1, 1, 1, 2, -1, 0, 0, 0],
+            [2, 1, 1, 2, 1, 0, 0, 0],
+            [1, 1, 1, 0, 1, 0, 0, 0],
+            [1, 1, 1, 2, True, 0, 0, 0],
+            [1, 999, 1, 1000, 1, 0, 0, 0],
+            [1, 1, 99, 2, 1, 0, 0, 0],
+        ]
+        for side in [0, 1]:
+            for region in invalid:
+                def corrupt(base, head):
+                    [base, head][side]["data"][0]["functions"][0]["regions"][0] = region
+                with self.subTest(side=side, region=region), self.assertRaisesRegex(
+                        ValueError, "Ambiguous unchanged source"):
+                    self.repeated_owned_brace_compare(mutate=corrupt)
+
+    def test_exclusive_endpoint_cannot_prove_repeated_brace_ownership(self):
+        def exclusive(base, head):
+            for value in [base, head]:
+                value["data"][0]["functions"][0]["regions"] = [[1, 1, 3, 1, 1, 0, 0, 0]]
+        with self.assertRaises(ValueError):
+            self.repeated_owned_brace_compare(mutate=exclusive)
+
+    def duplicated_owned_calls_compare(self, before=None, after=None, head_source=None, mutate=None):
+        old = b"fn retained(old: bool) {\n  first_input(old);\n  collect();\n  finish();\n  first_expected(old);\n  second_input(old);\n  collect();\n  finish();\n  second_expected(old);\n}\nfn tail() {\n  keep();\n}\n"
+        new = head_source or old.replace(b"old", b"new")
+        before = before if before is not None else [(line, 1) for line in range(1, 14)]
+        after = after if after is not None else [(line, 1) for line in range(1, 14)]
+
+        def owners(base, head):
+            for value, rows in [(base, before), (head, after)]:
+                counts = dict(rows)
+                value["data"][0]["functions"] = [
+                    {"name": name, "filenames": ["/src/example.rs"],
+                     "regions": [[line, 1, line, 2, counts.get(line, 0), 0, 0, 0]
+                                 for line in range(start, end + 1)]}
+                    for name, start, end in [("retained", 1, 10), ("tail", 11, 13)]]
+            if mutate:
+                mutate(base, head)
+
+        return self.compare(before=before, after=after, mutate=owners,
+                            sources=({"example.rs": old}, {"example.rs": new}))
+
+    def test_covered_duplicates_within_the_same_function_preserve_coverage(self):
+        self.assertEqual(self.duplicated_owned_calls_compare(), {
+            "deleted_summary_found": 0, "deleted_summary_hit": 0,
+            "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def test_every_in_owner_duplicate_requires_a_positive_head_counter(self):
+        for line in [3, 4, 7, 8]:
+            for missing in [False, True]:
+                rows = [(at, int(at != line)) for at in range(1, 14)
+                        if not missing or at != line]
+                with self.subTest(line=line, missing=missing), self.assertRaises(ValueError):
+                    self.duplicated_owned_calls_compare(after=rows)
+
+    def test_covered_duplicates_cannot_exempt_an_unanchored_zero_head(self):
+        with self.assertRaises(ValueError):
+            self.duplicated_owned_calls_compare(
+                before=[(line, int(line not in (4, 8))) for line in range(1, 14)],
+                after=[(line, int(line not in (4, 8))) for line in range(1, 14)])
+
+    def test_duplicate_candidate_outside_its_profile_regions_is_refused(self):
+        def missing_region(base, head):
+            owner = head["data"][0]["functions"][0]
+            owner["regions"] = [region for region in owner["regions"] if region[0] != 7]
+        with self.assertRaises(ValueError):
+            self.duplicated_owned_calls_compare(mutate=missing_region)
+
+    def test_owned_duplicate_can_improve_from_uncovered_to_covered(self):
+        self.assertEqual(self.duplicated_owned_calls_compare(
+            before=[(line, int(line != 4)) for line in range(1, 14)]), {
+                "deleted_summary_found": 0, "deleted_summary_hit": 0,
+                "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def test_duplicate_text_from_another_function_does_not_prove_retention(self):
+        new = b"fn retained(new: bool) {\n  only_new(new);\n}\nfn foreign() {\n  collect();\n  finish();\n  gap();\n  collect();\n  finish();\n}\nfn tail() {\n  keep();\n}\n"
+        def foreign_owner(base, head):
+            first = head["data"][0]["functions"][0]
+            first["regions"] = first["regions"][:3]
+            head["data"][0]["functions"].append({
+                "name": "foreign", "filenames": ["/src/example.rs"],
+                "regions": [[line, 1, line, 2, 1, 0, 0, 0] for line in range(4, 11)]})
+        with self.assertRaises(ValueError):
+            self.duplicated_owned_calls_compare(head_source=new, mutate=foreign_owner)
+
+    def test_covered_duplicates_do_not_excuse_unrelated_new_zero_lines(self):
+        base = b"fn retained(old: bool) {\n  first_input(old);\n  collect();\n  finish();\n  first_expected(old);\n  second_input(old);\n  collect();\n  finish();\n  second_expected(old);\n}\nfn tail() {\n  keep();\n}\n"
+        new = base.replace(b"old", b"new") + b"fn untested() {\n  missed();\n}\n"
+        rows = [(line, int(line < 14)) for line in range(1, 17)]
+        with self.assertRaisesRegex(ValueError, "New uncovered"):
+            self.duplicated_owned_calls_compare(after=rows, head_source=new)
+
+    def changed_profile_role_compare(self, after=None, mutate=None, head_source=None, duplicate_declaration=None, partial_base=False):
+        old = b"fn checked() {\n  if isolated(old) {\n    return;\n  }\n  first(old);\n  probe();\n  finish();\n  second(old);\n  probe();\n  finish();\n}\nfn other() {\n  if unrelated() {\n    return;\n  }\n}\n"
+        new = head_source or b"fn checked() {\n  if isolated(new) {\n    return;\n  }\n  with_env(|| {\n  first(new);\n  probe();\n  finish();\n  second(new);\n  probe();\n  finish();\n  });\n}\nfn other() {\n  if unrelated() {\n    return;\n  }\n}\n"
+        if duplicate_declaration == "base":
+            old += b"mod nested {\nfn checked() {\n}\n}\n"
+        elif duplicate_declaration == "head":
+            new += b"mod nested {\nfn checked() {\n}\n}\n"
+        before = [(line, int(line != 3)) for line in range(1, 17)]
+        after = after if after is not None else [(line, 1) for line in range(1, len(new.splitlines()) + 1)]
+
+        def owners(base, head):
+            def function(name, start, end, rows):
+                counts = dict(rows)
+                return {"name": name, "filenames": ["/src/example.rs"],
+                        "regions": [[line, 1, line, 2, counts.get(line, 0), 0, 0, 0]
+                                    for line in range(start, end + 1)]}
+            base["data"][0]["functions"] = [
+                function("closure_0", 1, 11, before), function("other", 12, 16, before)]
+            if partial_base:
+                base["data"][0]["functions"][0]["regions"].pop()
+            head["data"][0]["functions"] = [
+                function("plain_checked", 1, 13, after),
+                function("closure_0", 5, 12, after), function("other", 14, 18, after)]
+            if mutate:
+                mutate(base, head)
+
+        return self.compare(before=before, after=after, mutate=owners,
+                            sources=({"example.rs": old}, {"example.rs": new}))
+
+    def test_source_declaration_survives_a_profile_symbol_changing_role(self):
+        self.assertEqual(self.changed_profile_role_compare(), {
+            "deleted_summary_found": 0, "deleted_summary_hit": 0,
+            "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def test_source_header_can_pair_a_profile_that_ends_inside_the_function(self):
+        self.assertEqual(self.changed_profile_role_compare(partial_base=True), {
+            "deleted_summary_found": 0, "deleted_summary_hit": 0,
+            "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def test_source_header_pair_requires_every_candidate_counter(self):
+        for lost in [3, 4, 7, 8, 10, 11]:
+            for missing in [False, True]:
+                with self.subTest(lost=lost, missing=missing), self.assertRaises(ValueError):
+                    self.changed_profile_role_compare(partial_base=True,
+                        after=[(line, int(line != lost)) for line in range(1, 19)
+                               if not missing or line != lost])
+
+    def test_partial_header_raw_owner_cannot_anchor_a_new_nested_zero(self):
+        old = b"fn checked() {\n  if flag_old {\n    work();\n  }\n  before_old();\n}\nfn tail() {\n  keep();\n}\n"
+        new = b"fn checked() {\n  if flag_new {\n    work();\n  }\n  if extra {\n    exercised();\n  }\n  before_new();\n}\nfn tail() {\n  keep();\n}\n"
+        before = [(line, int(line != 4)) for line in range(1, 10)]
+        after = [(line, int(line != 7)) for line in range(1, 13)]
+
+        def owners(base, head):
+            for value, source, rows, partial_end, tail in [
+                    (base, old, before, 4, (7, 9)), (head, new, after, 7, (10, 12))]:
+                lines = source.decode().splitlines()
+                counts = dict(rows)
+                value["data"][0]["functions"] = [
+                    {"name": name, "filenames": ["/src/example.rs"],
+                     "regions": [[line, 1, line, len(lines[line - 1].encode()) + 1,
+                                  counts[line], 0, 0, 0]
+                                 for line in range(start, end + 1)]}
+                    for name, start, end in [("checked", 1, partial_end), ("tail", *tail)]]
+
+        with self.assertRaisesRegex(ValueError, "New uncovered instrumented line: example.rs:7"):
+            self.compare(before=before, after=after, mutate=owners,
+                         sources=({"example.rs": old}, {"example.rs": new}))
+
+    def test_source_declaration_pair_still_requires_covered_candidates(self):
+        for lost in [3, 4, 7, 8, 10, 11]:
+            with self.subTest(lost=lost), self.assertRaises(ValueError):
+                self.changed_profile_role_compare(
+                    after=[(line, int(line != lost)) for line in range(1, 19)])
+
+    def test_source_declaration_pair_refuses_incomplete_owner_proof(self):
+        mutations = {
+            "missing": lambda base, head: head["data"][0]["functions"].pop(0),
+            "duplicate": lambda base, head: head["data"][0]["functions"].append(
+                copy.deepcopy(head["data"][0]["functions"][0])),
+            "multifile": lambda base, head: head["data"][0]["functions"][0]["filenames"].append("/src/other.rs"),
+            "malformed": lambda base, head: head["data"][0]["functions"][0]["regions"][0].__setitem__(4, -1),
+            "before_candidate": lambda base, head: head["data"][0]["functions"][0].__setitem__(
+                "regions", head["data"][0]["functions"][0]["regions"][:2]),
+            "duplicate_base": lambda base, head: base["data"][0]["functions"].append(
+                copy.deepcopy(base["data"][0]["functions"][0])),
+            "malformed_base": lambda base, head: base["data"][0]["functions"][0]["regions"][0].__setitem__(4, -1),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.changed_profile_role_compare(mutate=mutate)
+
+    def test_source_declaration_pair_refuses_repeated_declarations(self):
+        for side in ["base", "head"]:
+            with self.subTest(side=side), self.assertRaisesRegex(ValueError, "Ambiguous unchanged"):
+                self.changed_profile_role_compare(duplicate_declaration=side)
+
+    def test_source_declaration_pair_cannot_exempt_unrelated_new_zero(self):
+        source = b"fn checked() {\n  if isolated(new) {\n    return;\n  }\n  with_env(|| {\n  first(new);\n  probe();\n  finish();\n  second(new);\n  probe();\n  finish();\n  });\n}\nfn other() {\n  if unrelated() {\n    return;\n  }\n}\nfn missed() {\n  pending();\n}\n"
+        for partial in [False, True]:
+            with self.subTest(partial=partial), self.assertRaisesRegex(ValueError, "New uncovered"):
+                self.changed_profile_role_compare(
+                    head_source=source, partial_base=partial,
+                    after=[(line, int(line <= 18)) for line in range(1, 22)])
+
     def test_covered_file_suffix_survives_repeated_closing_braces(self):
         old = b"mod tests {\n    fn first() {\n        first();\n    }\n}\nmod last {\n    fn changed() {\n        old();\n    }\n}\n"
         new = old.replace(b"        old();", b"        new();\n        checked();")
