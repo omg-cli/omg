@@ -3878,7 +3878,7 @@ mod tests {
         assert_eq!(error.to_string(), "synthetic lookup failure");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        let mut empty = Transaction::new();
+        let empty = Transaction::new();
         empty
             .execute_removal_with(|_| Ok(true), sentinel(calls.clone()))
             .await

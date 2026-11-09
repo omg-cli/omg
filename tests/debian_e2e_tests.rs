@@ -687,9 +687,9 @@ fn command_timeout_terminates_pipe_inheriting_descendants() {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let first = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+    let first = std::fs::metadata(&heartbeat).map_or(0, |m| m.len());
     std::thread::sleep(std::time::Duration::from_millis(200));
-    let second = std::fs::metadata(&heartbeat).map(|m| m.len()).unwrap_or(0);
+    let second = std::fs::metadata(&heartbeat).map_or(0, |m| m.len());
     let group = nix::unistd::Pid::from_raw(i32::try_from(control.id()).unwrap());
     nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
         .expect("stop heartbeat control group");
