@@ -43,6 +43,9 @@ jobs:
     if: needs.changes.outputs.coverage_required == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      RUSTFLAGS: -C llvm-args=-runtime-counter-relocation
+      LLVM_PROFILE_FILE_NAME: omg-%p-%m%c.profraw
     container:
       image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
 
@@ -91,14 +94,14 @@ jobs:
       - name: Install coverage tools
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         with:
-          tool: cargo-llvm-cov,nextest
+          tool: cargo-llvm-cov@0.9.0,nextest
 
       - name: Cache instrumented dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         env:
           ZSTD_CLEVEL: "6"
         with:
-          prefix-key: v2-coverage-dependencies
+          prefix-key: v3-coverage-continuous-dependencies
           shared-key: arch-f3691b4dde62ba4c4-arch-pgp-license
           # Keep main's reusable cache; PR merge-ref writes cannot warm main.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -176,6 +179,7 @@ jobs:
           retention-days: 14
 
       - name: Cover sandbox descendant cancellation
+        id: native_fixture_tests
         shell: bash
         timeout-minutes: 5
         run: |
@@ -186,6 +190,9 @@ jobs:
           mapfile -d '' binaries < <(find "$profile_dir/debug/deps" -maxdepth 1 -type f -name 'omg_lib-*' -executable -print0)
           test "${#binaries[@]}" -eq 1
           binary=${binaries[0]}
+          evidence_dir="$RUNNER_TEMP/native-coverage-evidence"
+          mkdir -p "$evidence_dir"
+          sha256sum "$binary" > "$evidence_dir/binary.sha256"
 
           docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
@@ -200,21 +207,105 @@ jobs:
           container=$(docker create --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
             --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json \
             --network none --pids-limit 128 --memory 1g --cpus 2 \
-            --env LLVM_PROFILE_FILE='/profiles/omg-sandbox-%p-%m.profraw' \
             omg-coverage-sandbox /bin/bash -euo pipefail -c '
-              mkdir /profiles
+              mkdir -m 1777 /profiles
+              mkdir /evidence
+              fixture_binary=/fixture
+              fixture_profiles=/profiles
+              fixture_evidence=/evidence
               command -v fakeroot
               bwrap --ro-bind / / --unshare-pid --proc /proc -- /bin/true
               bwrap --unshare-user --uid "$(id -u nobody)" --gid "$(id -g nobody)" \
                 --cap-drop ALL --ro-bind / / --proc /proc -- /usr/bin/id
-              /fixture --exact package_managers::aur::client::tests::cancelling_logged_sandbox_build_terminates_descendants --ignored --nocapture
+              /fixture --include-ignored --list > /evidence/registry.txt
+              run_case() {
+                local test_name=$1
+                local case_id=${test_name//::/_}
+                local log="$fixture_evidence/$case_id.log"
+                grep -Fx "$test_name: test" "$fixture_evidence/registry.txt"
+                LLVM_PROFILE_FILE="$fixture_profiles/omg-fixture-$case_id-%p-%m%c.profraw" \
+                  timeout --kill-after=2s 35s "$fixture_binary" --exact "$test_name" \
+                  --include-ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+                grep -Eq "^test result: ok\. 1 passed; 0 failed; 0 ignored;" "$log"
+                if grep -Eq "\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)" "$log"; then
+                  return 1
+                fi
+                local profiles=("$fixture_profiles/omg-fixture-$case_id-"*.profraw)
+                for profile in "${profiles[@]}"; do test -s "$profile"; done
+                printf "%s\t%s\n" "$test_name" "${#profiles[@]}" >> "$fixture_evidence/passed.tsv"
+              }
+              cases=(
+                package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman
+                package_managers::aur::client::tests::cancelling_logged_sandbox_build_terminates_descendants
+                cli::self_update::tests::elevated_verifier_rejects_another_users_helper
+                core::pacman_conf::tests::missing_pacman_config_is_not_replaced_with_fabricated_repositories
+                daemon::handlers::tests::daemon_native_initializer_does_not_block_the_async_executor
+                daemon::handlers::tests::daemon_native_retirement_releases_backend_lock_and_executor
+                daemon::handlers::tests::daemon_native_cancelled_request_retains_serialization_until_work_finishes
+                daemon::handlers::tests::daemon_native_retirement_keeps_final_join_off_the_request_executor
+                package_managers::alpm_direct::tests::security_update_eligibility_respects_repository_priority_and_ignore_filters
+                package_managers::alpm_direct::tests::list_installed_fast_includes_pacman
+                package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller
+                package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db
+                package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_preserve_distinct_soname_dependencies
+                core::usage::tests::elevated_state_roundtrip_preserves_caller_files
+              )
+              printf "%s\n" "${cases[@]}" > /evidence/expected-tests.txt
+              for test_name in "${cases[@]}"; do
+                if [ "$test_name" = core::usage::tests::elevated_state_roundtrip_preserves_caller_files ]; then
+                  mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib
+                  printf isolated > /var/lib/.omg-state-isolation-fixture
+                  caller=$(mktemp -d /tmp/omg-state-caller.XXXXXX)
+                  printf caller-history-sentinel > "$caller/history-target"
+                  ln -s history-target "$caller/history.json"
+                  printf caller-usage-sentinel > "$caller/usage.json"
+                  chown -hR nobody: "$caller"
+                  OMG_DATA_DIR="$caller" run_case "$test_name"
+                else
+                  run_case "$test_name"
+                fi
+              done
             ')
           trap 'docker rm --force "$container"' EXIT
           docker cp "$binary" "$container:/fixture"
-          timeout --kill-after=5s 90s docker start --attach "$container" | tee /tmp/coverage-sandbox.log
-          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' /tmp/coverage-sandbox.log
-          docker cp "$container:/profiles/." "$profile_dir/"
-          test -n "$(find "$profile_dir" -maxdepth 1 -name 'omg-sandbox-*.profraw' -print -quit)"
+          if timeout --kill-after=5s 180s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
+            run_status=0
+          else
+            run_status=$?
+          fi
+          collection_status=0
+          docker cp "$container:/evidence/." "$evidence_dir/" || collection_status=$?
+          docker cp "$container:/profiles/." "$profile_dir/" || collection_status=$?
+          if [ "$run_status" -ne 0 ]; then exit "$run_status"; fi
+          test "$collection_status" -eq 0
+          python3 - "$binary" "$profile_dir" "$evidence_dir" "$(git rev-parse HEAD)" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          binary, profiles, evidence = map(Path, sys.argv[1:4])
+          expected = (evidence / 'expected-tests.txt').read_text().splitlines()
+          passed = [line.split('\t') for line in (evidence / 'passed.tsv').read_text().splitlines()]
+          assert expected and len(expected) == len(set(expected)), 'Invalid fixture selection'
+          assert [row[0] for row in passed] == expected, 'Incomplete or reordered fixture results'
+          tests = []
+          for name, count in passed:
+              files = sorted(profiles.glob('omg-fixture-' + name.replace('::', '_') + '-*.profraw'))
+              assert len(files) == int(count) and files, 'Missing fixture profiles'
+              assert all(path.is_file() and not path.is_symlink() and path.stat().st_size > 0 for path in files), 'Empty or unsafe fixture profile'
+              tests.append({'name': name, 'profiles': [
+                  {'name': path.name, 'bytes': path.stat().st_size,
+                   'sha256': hashlib.sha256(path.read_bytes()).hexdigest()} for path in files]})
+          receipt = {'source_commit': sys.argv[4], 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'tests': tests}
+          (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PY
+
+      - name: Preserve native fixture coverage evidence
+        if: ${{ !cancelled() && (steps.native_fixture_tests.outcome == 'success' || steps.native_fixture_tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage-native-fixtures
+          path: ${{ runner.temp }}/native-coverage-evidence/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Generate LCOV report
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
