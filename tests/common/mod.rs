@@ -14,7 +14,7 @@ pub mod mocks;
 
 #[cfg(test)]
 #[path = "../../src/core/testing/isolated.rs"]
-mod isolated_fixture;
+pub(crate) mod isolated_fixture;
 
 use anyhow::Result;
 use std::env;

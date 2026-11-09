@@ -12,10 +12,8 @@
 //! `is_enhanced_telemetry_enabled()` cannot be true in a test process.
 //! The gate itself IS tested below from the disabled side.
 
-#[path = "../src/core/testing/isolated.rs"]
-mod isolated_fixture;
-
 pub mod common;
+use common::isolated_fixture;
 use common::*;
 
 use std::fs;
