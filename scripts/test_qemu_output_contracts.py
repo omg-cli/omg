@@ -1360,6 +1360,30 @@ esac
         self.assertIn('help', result.stderr)
         self.assertEqual(self.run_oracle(safety='help-boundary', stdout='Usage: omg search\n').returncode, 0)
 
+    def test_doctor_turbo_requires_one_guest_state_receipt(self):
+        assertion = 'doctor-turbo-state'
+        receipt = 'OMG_QEMU_DOCTOR_TURBO:verified\n'
+        self.assertEqual(self.run_oracle(assertion=assertion, stdout=receipt).returncode, 0)
+        for code, stdout in ((0, ''), (0, receipt * 2), (1, receipt)):
+            with self.subTest(code=code, stdout=stdout):
+                self.assertNotEqual(self.run_oracle(assertion=assertion, code=code,
+                                                    stdout=stdout).returncode, 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_doctor_turbo_oracle_crash_is_harness_error(self):
+        row = next(line for line in
+                   (ROOT / 'tests/cli_behavior_inventory.tsv').read_text(encoding='utf-8').splitlines()
+                   if line.startswith('doctor-turbo\t'))
+        for diagnostic, expected in (('unexpected Python failure', 'HARNESS_ERROR'),
+                                     ('PRODUCT_FAIL: sudo validation failed', 'FAIL')):
+            with self.subTest(expected=expected):
+                native = {'sudo': f'printf "%s\\n" {shlex.quote(diagnostic)} >&2\nexit 1\n'}
+                result, evidence, logs = self.run_inventory('', [row],
+                                                            native_commands=native,
+                                                            tiers='qemu,pty', allow_mutations=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(evidence[0]['result'], expected, logs)
+
     def test_package_rows_bind_native_state_to_success(self):
         for assertion in ('native-tree-installed', 'native-tree-absent'):
             self.assertEqual(self.run_oracle(assertion=assertion, tree_oracle_status=0).returncode, 0)

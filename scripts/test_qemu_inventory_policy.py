@@ -220,6 +220,13 @@ class PolicyTests(unittest.TestCase):
             "id": "doctor-eol", "tiers": ["container"],
             "allowed_skips": {}, "network_scope": "offline",
         })
+        self.assertEqual(by_id["doctor-turbo"], {
+            "id": "doctor-turbo", "tiers": ["qemu", "pty"],
+            "allowed_skips": {}, "network_scope": "network",
+        })
+        staged = set(rules["profiles"]["hermetic,qemu,container,pty"])
+        self.assertTrue(set(by_id["doctor-turbo"]["tiers"]) & staged)
+        self.assertNotIn("network", staged)
         for runtime in ("node", "python", "go"):
             with self.subTest(runtime=runtime):
                 self.assertEqual(by_id[f"runtime-{runtime}-uninstall"], {
@@ -232,9 +239,11 @@ class PolicyTests(unittest.TestCase):
                         "id": case_id, "tiers": ["container"],
                         "allowed_skips": {}, "network_scope": "offline",
                     })
-        workflow = (ROOT / ".github/workflows/qemu-matrix.yml").read_text() + (ROOT / ".github/workflows/qemu-lane.yml").read_text()
-        self.assertEqual(workflow.count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
-        self.assertIn('--inventory-tiers "hermetic,container"', workflow)
+        matrix = (ROOT / ".github/workflows/qemu-matrix.yml").read_text()
+        lane = (ROOT / ".github/workflows/qemu-lane.yml").read_text()
+        self.assertEqual((matrix + lane).count("--inventory-policy tests/qemu-inventory-policy.json"), 2)
+        self.assertIn('args+=(--staged-dir staged --inventory-tiers "hermetic,qemu,container,pty"', lane)
+        self.assertIn('--staged-dir staged --inventory-tiers hermetic,qemu,container,pty', matrix)
 
 
 if __name__ == "__main__":

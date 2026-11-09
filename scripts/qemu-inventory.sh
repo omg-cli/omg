@@ -5,7 +5,7 @@
 # The guest must already be up (see scripts/benchmark-qemu.sh, which calls
 # this when --inventory-tiers is set). Rows run in file order so the
 # TSV `requires` DAG is satisfied naturally. Disposable guests make
-# package/service-mutation rows safe, but they still need --allow-mutations.
+# package/service/privilege-mutation rows safe, but they still need --allow-mutations.
 set -euo pipefail
 # BEGIN PRODUCT OUTPUT ORACLE
 # This exact function is sent to the guest and exercised by fault-injection tests.
@@ -956,6 +956,11 @@ check_product_output() {
       printf 'assertion failed: doctor network did not report a failed diagnostic run\n' >&2; return 1
     fi
   fi
+  if [[ "$assertion" == doctor-turbo-state ]]; then
+    if [[ "$code" != 0 ]] || [[ $(grep -Fxc 'OMG_QEMU_DOCTOR_TURBO:verified' "$stdout" || true) != 1 ]]; then
+      printf 'assertion failed: Doctor turbo lacked sudo-cache and file-capability evidence\n' >&2; return 1
+    fi
+  fi
   if [[ "$code" == 0 ]]; then
     case "$assertion" in
       task-executed)
@@ -1174,6 +1179,7 @@ case "$distro" in arch|debian|ubuntu|fedora) ;; *) exit 2 ;; esac
 for tool in ssh jq timeout sha256sum; do command -v "$tool" >/dev/null || exit 3; done
 overlap_fixture=$(jq -rn --rawfile fixture "$(dirname "$0")/workspace-overlap-fixture.sh" '$fixture | @sh')
 license_oracle_path="$(dirname "$0")/qemu-license-oracle.py"
+doctor_turbo_oracle_path="$(dirname "$0")/qemu-doctor-turbo-check.py"
 license_oracle=$(jq -rn --rawfile fixture "$license_oracle_path" '$fixture | @sh')
 [[ "$binary" == /* && "$binary" != *$'\n'* ]] || exit 2
 [[ "$ssh_user" =~ ^[a-z_][a-z0-9_-]*$ && "$ssh_port" =~ ^[0-9]+$ ]] || exit 2
@@ -1199,7 +1205,7 @@ out="$root/inventory"
 # Refuse to overwrite evidence from a previous invocation.
 [[ ! -e "$out" ]] || { printf 'error: inventory evidence already exists: %s\n' "$out" >&2; exit 2; }
 mkdir -p "$out/rows"
-sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" > "$out/input-sha256.txt"
+sha256sum "${BASH_SOURCE[0]}" "$tsv" "$license_oracle_path" "$doctor_turbo_oracle_path" > "$out/input-sha256.txt"
 jq -n --arg release "$tag" --arg distro "$distro" --arg tiers "$tiers" --arg binary "$binary" \
   --argjson mutations "$allow_mutations" --argjson credentialed "$allow_credentialed" --argjson deadline "$row_timeout" \
   '{release:$release,distro:$distro,tiers:$tiers,binary:$binary,allow_mutations:$mutations,allow_credentialed:$credentialed,row_timeout_seconds:$deadline}' > "$out/metadata.json"
@@ -1274,7 +1280,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   elif [[ "$a" == native-count ]]; then
     exit 2
   fi
-  case "$s" in read|isolated-write|controlled-error|help-boundary|interactive|package-mutation|service-mutation) ;; *) exit 2 ;; esac
+  case "$s" in read|isolated-write|controlled-error|help-boundary|interactive|package-mutation|service-mutation|privilege-mutation) ;; *) exit 2 ;; esac
   case "$u" in pass|declared) ;; *) exit 2 ;; esac
   [[ "$t" != *, && "$t" != ,* && "$t" != *,,* ]] || exit 2
   IFS=',' read -ra input_tiers <<< "$t"
@@ -1294,7 +1300,7 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   fi
   resolved=""
   if [[ "$u" != declared ]]; then resolved=$(resolve_exit "$e") || exit 2; fi
-  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
+  case "$a" in license-audit-json|license-audit-mit-json|license-audit-csv|license-enterprise-text|license-enterprise-json|-|native-count|audit-source-failure|audit-fix-refusal|audit-secret-scoped|audit-secret-critical|audit-eol-state|sbom-source-failure|sbom-inventory-only|json-stdout|hooks-installed|hooks-absent|workspace-filtered-output|workspace-all-output|ci-github-workflow|ci-github-workflow-advanced|task-executed|parallel-tasks-executed|all-tasks-executed|package-dry-run-install|package-dry-run-remove|package-dry-run-recursive|artifact:manifest.json|artifact:privacy.json|artifact:sbom.json|fingerprint:snapshot-create|fingerprint:migrate-export|fingerprint:migrate-import|fingerprint:env-capture|fingerprint:env-check|fingerprint:team-status|fingerprint:team-push|fingerprint:team-pull|update-fast-output|update-turbo-output|daemon-foreground-lifecycle|search-official-limit-three|search-official-tree-output|native-tree-installed|native-tree-absent|native-apt-orphan-removed|self-update-downgrade-refusal|env-share-missing-lock|status-native-fast|status-native-full|outdated-native-count|outdated-json-native-count|doctor-native-backend|doctor-eol-state|doctor-network-state|doctor-turbo-state|info-native-package|config-set-persisted|config-get-persisted|config-list-persisted|config-validate-persisted|config-path-isolated|config-reset-defaults|privacy-opted-out|privacy-status-disabled|privacy-opted-in|privacy-status-enabled|runtime-version-removed|runtime-list-state|runtime-switch-state) ;; *) exit 2 ;; esac
   if [[ "$id" == run ]]; then
     [[ "$a" == task-executed && "$s" == read && "$resolved" == 0 ]] || exit 2
     jq -e '. == ["run", "smoke", "--using", "make"]' <<< "$aj" >/dev/null || exit 2
@@ -1395,6 +1401,12 @@ while IFS=$'\t' read -r id aj s e u r t tg a cleanup; do
   elif [[ "$a" == doctor-native-backend ]]; then
     exit 2
   fi
+  if [[ "$id" == doctor-turbo ]]; then
+    [[ "$a" == doctor-turbo-state && "$s" == privilege-mutation && "$resolved" == 0 && "$t" == qemu,pty ]] || exit 2
+    jq -e '. == ["doctor", "--turbo"]' <<< "$aj" >/dev/null || exit 2
+  elif [[ "$a" == doctor-turbo-state ]]; then
+    exit 2
+  fi
   if [[ "$id" == doctor-eol ]]; then
     [[ "$a" == doctor-eol-state && "$s" == controlled-error && "$resolved" == 1 && "$t" == container ]] || exit 2
     jq -e '. == ["doctor", "--eol"]' <<< "$aj" >/dev/null || exit 2
@@ -1489,7 +1501,7 @@ prereq_runnable() { # id -> 0 when replayable
   if [[ ",${row_tier[$id]}," == *",credentialed,"* && "$allow_credentialed" == false ]]; then return 1; fi
   case "${row_safety[$id]}" in
     interactive) return 1 ;;
-    package-mutation|service-mutation)
+    package-mutation|service-mutation|privilege-mutation)
       [[ "$allow_mutations" == true ]] || return 1 ;;
   esac
   return 0
@@ -1544,7 +1556,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   # Safety gate.
   case "$safety" in
     interactive) record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue ;;
-    package-mutation|service-mutation)
+    package-mutation|service-mutation|privilege-mutation)
       if [[ "$allow_mutations" == false ]]; then
         record "qemu-$distro-$case" SKIPPED -1 0; skipped=$((skipped+1)); continue
       fi ;;
@@ -1697,6 +1709,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   elif [[ "$case" == daemon-foreground ]]; then
     command_timeout=240
     remote+="; mkdir -p daemon-evidence"
+  elif [[ "$case" == doctor-turbo ]]; then
+    command_timeout=180
   fi
   counter=$(counter_for_case "$case")
   if [[ -n "$counter" ]]; then
@@ -1742,6 +1756,8 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$command_timeout' sudo -n bash \"\$HOME/qemu-fedora-update-fixture.sh\" '${case#update-}' $quoted_binary '$ssh_user' > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$case" == daemon-foreground ]]; then
     remote+="; run_omg '$command_timeout' bash \"\$HOME/qemu-daemon-check.sh\" $quoted_binary \"\$rowdir/daemon-evidence\" > command.stdout.log 2> command.stderr.log; assertion=0"
+  elif [[ "$case" == doctor-turbo ]]; then
+    remote+="; run_omg '$command_timeout' sudo -n python3 \"\$HOME/qemu-doctor-turbo-check.py\" $quoted_binary > command.stdout.log 2> command.stderr.log; assertion=0"
   elif [[ "$distro" == fedora && "$case" == doctor ]]; then
     remote+="; if ! command -v strace >/dev/null || ! strace --seccomp-bpf -f -qq -e trace=execve -o doctor.preflight.log true; then printf '\nOMG_QEMU_RECEIPT:dependency:2:1\n'; exit 0; fi"
     remote+="; run_omg '$command_timeout' strace --seccomp-bpf -f -qq -e trace=execve -o doctor.exec.log $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
@@ -1749,6 +1765,9 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
     remote+="; run_omg '$command_timeout' $quoted_binary $arg_string > command.stdout.log 2> command.stderr.log; assertion=0"
   fi
   remote+="; cat command.stdout.log; cat command.stderr.log >&2"
+  if [[ "$case" == doctor-turbo ]]; then
+    remote+="; if [[ \"\$execution_phase\" == product ]]; then if [[ \"\$rc\" == 1 ]] && grep -Fq 'PRODUCT_FAIL:' command.stderr.log; then :; elif [[ \"\$rc\" == 0 ]] && grep -Fqx 'OMG_QEMU_DOCTOR_TURBO:verified' command.stdout.log; then :; else execution_phase=fixture; printf 'HARNESS_ERROR: Doctor turbo oracle returned an invalid or incomplete receipt\\n' >&2; fi; fi"
+  fi
   remote+="; if [ \"\$execution_phase\" = executor ]; then printf 'assertion failed: command exceeded ${command_timeout}s QEMU row deadline (executor exit %s)\n' \"\$rc\" >&2; assertion=1; elif ! check_product_output '$safety' '$assertions' \"\$rc\" command.stdout.log command.stderr.log '$distro'; then assertion=1; fi"
   if [[ "$assertions" == package-dry-run-* ]]; then
     if [[ "$assertions" != package-dry-run-install && "$assertions" != package-dry-run-recursive || "$assertions" == package-dry-run-recursive && "$distro" == arch ]]; then
@@ -1851,10 +1870,11 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   elapsed=$(( (10#${uptime/./} - 10#$start_centis) / 100 ))
   verdict=HARNESS_ERROR; rc=$transport
   receipt=$(tail -n 1 "$out/rows/$case.stdout.log")
-  if [[ "$transport" == 0 && "$receipt" =~ ^OMG_QEMU_RECEIPT:(product|executor|dependency):([0-9]{1,3}):([01])$ ]]; then
+  if [[ "$transport" == 0 && "$receipt" =~ ^OMG_QEMU_RECEIPT:(product|executor|dependency|fixture):([0-9]{1,3}):([01])$ ]]; then
     phase=${BASH_REMATCH[1]}; rc=${BASH_REMATCH[2]}; assertion_rc=${BASH_REMATCH[3]}
     verdict=FAIL
-    if [[ "$phase" == dependency ]]; then verdict=BLOCKED
+    if [[ "$phase" == fixture ]]; then verdict=HARNESS_ERROR
+    elif [[ "$phase" == dependency ]]; then verdict=BLOCKED
     elif [[ "$phase" == executor ]]; then
       [[ "$rc" == 124 || "$rc" == 137 ]] || verdict=HARNESS_ERROR
     elif [[ "$rc" == "${row_exit[$case]}" && "$assertion_rc" == 0 ]]; then

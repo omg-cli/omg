@@ -1001,7 +1001,7 @@ omg doctor [OPTIONS]
 | -------- | ------------- |
 | `--network` | Test network connectivity to package mirrors |
 | `--eol` | Check installed Node.js, Python, Rust, Go, Ruby, Java, Bun, and Deno versions for end-of-life dates |
-| `--turbo` | Prime sudo credentials and remove legacy file capabilities; does not grant capability-based package access |
+| `--turbo` | Linux only: validate a usable sudo credential cache and remove legacy file capabilities; fails when caching is disabled and does not grant capability-based package access |
 
 **Checks performed:**
 

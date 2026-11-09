@@ -589,6 +589,7 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-inventory.sh" "$work/qemu-inventory.sh"
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
+  cp "$here/qemu-doctor-turbo-check.py" "$work/qemu-doctor-turbo-check.py"
   cp "$here/qemu-fedora-update-fixture.sh" "$work/qemu-fedora-update-fixture.sh"
   cp "$here/workspace-overlap-fixture.sh" "$work/workspace-overlap-fixture.sh"
   cp "$tsv" "$work/cases.tsv"
@@ -726,9 +727,9 @@ esac
 # never acceptable product refusals. Keep this after the lifecycle probe.
 if [[ -n "$inventory_tiers" ]]; then
   case "$distro" in
-    arch) sudo -n pacman -S --noconfirm --needed git make curl python strace ;;
-    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace ;;
-    fedora) sudo -n dnf install -y git make curl python3 strace podman rpm-build createrepo_c ;;
+    arch) sudo -n pacman -S --noconfirm --needed git make curl python strace libcap ;;
+    debian|ubuntu) sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git make curl python3 strace libcap2-bin ;;
+    fedora) sudo -n dnf install -y git make curl python3 strace libcap podman rpm-build createrepo_c ;;
   esac > evidence/inventory-setup.txt 2>&1 || exit 120
   # The hermetic `new` row exercises the missing-toolchain refusal. A guest
   # with Cargo installed is a different fixture, not a product failure.
@@ -757,6 +758,7 @@ fi
 if [[ -n "$inventory_tiers" ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fedora-update-fixture.sh bench@127.0.0.1:qemu-fedora-update-fixture.sh
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-fingerprint-oracle.py bench@127.0.0.1:qemu-fingerprint-oracle.py
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-doctor-turbo-check.py bench@127.0.0.1:qemu-doctor-turbo-check.py
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then

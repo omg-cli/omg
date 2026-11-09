@@ -264,6 +264,7 @@ enum Safety {
     HelpBoundary,
     PackageMutation,
     ServiceMutation,
+    PrivilegeMutation,
     Interactive,
 }
 
@@ -276,6 +277,7 @@ impl Safety {
             "help-boundary" => Self::HelpBoundary,
             "package-mutation" => Self::PackageMutation,
             "service-mutation" => Self::ServiceMutation,
+            "privilege-mutation" => Self::PrivilegeMutation,
             "interactive" => Self::Interactive,
             other => {
                 panic!("unknown safety class on behavior inventory line {line_number}: {other}")
@@ -291,6 +293,7 @@ impl Safety {
             Self::HelpBoundary => "help-boundary",
             Self::PackageMutation => "package-mutation",
             Self::ServiceMutation => "service-mutation",
+            Self::PrivilegeMutation => "privilege-mutation",
             Self::Interactive => "interactive",
         }
     }
@@ -813,7 +816,10 @@ impl BehaviorCase {
                     assert!(
                         !matches!(
                             self.safety,
-                            Safety::PackageMutation | Safety::ServiceMutation | Safety::Interactive
+                            Safety::PackageMutation
+                                | Safety::ServiceMutation
+                                | Safety::PrivilegeMutation
+                                | Safety::Interactive
                         ),
                         "case {} on line {}: mutation and interactive cases cannot run hermetically",
                         self.id,

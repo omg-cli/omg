@@ -478,7 +478,7 @@ jobs:
             --benchmark-transactions 1 \
             --storage-faults \
             --restrict-egress \
-            --staged-dir staged --inventory-tiers hermetic,container --inventory-allow-mutations
+            --staged-dir staged --inventory-tiers hermetic,qemu,container,pty --inventory-allow-mutations
 
       - name: Preserve setup failure evidence
         if: always()

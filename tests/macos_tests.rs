@@ -7,6 +7,20 @@ pub mod platform_semantics;
 
 use platform_semantics::{assert_no_arch_terms, assert_no_debian_terms, assert_no_fedora_terms};
 
+#[test]
+fn doctor_turbo_rejects_unsupported_macos() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omg"))
+        .args(["doctor", "--turbo"])
+        .output()
+        .expect("run macOS doctor turbo");
+    assert!(!output.status.success(), "unsupported turbo mode must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Turbo setup is only available on Linux"),
+        "unexpected refusal: {stderr}"
+    );
+}
+
 mod homebrew_integration {
     use super::*;
 
