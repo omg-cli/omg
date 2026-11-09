@@ -314,9 +314,16 @@ mod tests {
 
     #[test]
     fn sudo_as_user_command_rejects_unsafe_identity_and_paths() {
-        assert!(sudo_as_user_program("-n", "rm").is_err());
-        assert!(sudo_as_user_command("builder", "rm", &["-rf"], Path::new("-cache")).is_err());
-        assert!(sudo_as_user_command("builder", "rm", &["-rf"], Path::new("/")).is_err());
+        let error = sudo_as_user_program("-n", "rm").expect_err("unsafe user must fail");
+        assert_eq!(error.to_string(), "Invalid original user name");
+        for path in ["-cache", "/"] {
+            let error = sudo_as_user_command("builder", "rm", &["-rf"], Path::new(path))
+                .expect_err("unsafe path must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("Refusing unsafe user-owned path: {path}")
+            );
+        }
     }
 
     #[test]
@@ -337,8 +344,8 @@ mod tests {
     #[test]
     fn is_symlink_fails_closed_for_missing_path() {
         // Fail-closed contract: an undecidable path is an Err, never `false`.
-        let missing = std::env::temp_dir().join("omg-is-symlink-does-not-exist");
-        let _ = std::fs::remove_file(&missing);
+        let temp = tempfile::tempdir().expect("private temp dir");
+        let missing = temp.path().join("missing");
         assert!(
             is_symlink(&missing).is_err(),
             "missing path must propagate an error instead of reporting 'not a symlink'"

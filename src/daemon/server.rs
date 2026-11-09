@@ -1659,8 +1659,8 @@ mod tests {
         // If the reader TTL is shorter than the writer interval, the
         // zero-IPC fast path rejects every file between daemon refreshes.
         assert_eq!(
-            STATUS_REFRESH_INTERVAL.as_secs(),
-            crate::core::fast_status::FAST_STATUS_FRESHNESS_SECS,
+            STATUS_REFRESH_INTERVAL,
+            Duration::from_secs(crate::core::fast_status::FAST_STATUS_FRESHNESS_SECS),
             "FastStatus TTL must equal the daemon writer interval"
         );
     }

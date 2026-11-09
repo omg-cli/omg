@@ -144,8 +144,23 @@ mod tests {
     #[cfg(feature = "arch")]
     #[test]
     fn arch_accepts_explicit_and_recursive_removal_modes() {
-        validate_removal_mode(false).unwrap();
-        validate_removal_mode(true).unwrap();
+        const NAME: &str =
+            "cli::packages::remove::tests::arch_accepts_explicit_and_recursive_removal_modes";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        temp_env::with_vars(
+            [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
+            || {
+                assert_eq!(
+                    crate::core::env::distro::detect_distro(),
+                    crate::core::env::distro::Distro::Arch,
+                    "this test requires a native Arch host"
+                );
+                validate_removal_mode(false).unwrap();
+                validate_removal_mode(true).unwrap();
+            },
+        );
     }
 
     #[cfg(not(feature = "arch"))]

@@ -871,6 +871,7 @@ mod tests {
     #[test]
     #[ignore = "requires isolated user/mount namespaces with the state fixture mounted at /var/lib"]
     fn elevated_state_roundtrip_preserves_caller_files() -> Result<()> {
+        use std::io::Write as _;
         use std::os::unix::fs::MetadataExt;
 
         anyhow::ensure!(crate::core::is_root(), "Requires namespace UID 0");
@@ -910,16 +911,21 @@ mod tests {
         };
         let caller_license = caller_dir.join("license.json");
         let license_before = serde_json::to_vec(&license)?;
-        std::fs::write(&caller_license, &license_before)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&caller_license)?
+            .write_all(&license_before)?;
         assert!(crate::core::license::load_license().is_none());
         license.key = "system-synthetic-only".to_string();
-        std::fs::write("/var/lib/omg/license.json", serde_json::to_vec(&license)?)?;
+        crate::core::license::save_license(&license)?;
         assert_eq!(
             crate::core::license::load_license()
                 .expect("root fixture license")
                 .key,
             "system-synthetic-only"
         );
+        assert_eq!(std::fs::metadata("/var/lib/omg/license.json")?.uid(), 0);
         assert_eq!(std::fs::read(&caller_license)?, license_before);
         assert_eq!(std::fs::read(&caller_history)?, history_before);
         assert_eq!(std::fs::read(&caller_usage)?, usage_before);

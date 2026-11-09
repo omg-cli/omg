@@ -12,6 +12,10 @@ pub mod assertions;
 pub mod fixtures;
 pub mod mocks;
 
+#[cfg(test)]
+#[path = "../../src/core/testing/isolated.rs"]
+mod isolated_fixture;
+
 use anyhow::Result;
 use std::env;
 use std::fmt::Write as _;
@@ -1089,7 +1093,15 @@ mod tests {
 
     #[test]
     fn explicit_timeout_overrides_inherited_timeout() {
-        let timeout = command_timeout(&[("OMG_TEST_COMMAND_TIMEOUT_SECS", "2")]);
-        assert_eq!(timeout, Duration::from_secs(2));
+        if super::isolated_fixture::run_isolated_test(
+            "common::tests::explicit_timeout_overrides_inherited_timeout",
+        ) {
+            return;
+        }
+        temp_env::with_var("OMG_TEST_COMMAND_TIMEOUT_SECS", Some("7"), || {
+            let timeout = command_timeout(&[("OMG_TEST_COMMAND_TIMEOUT_SECS", "2")]);
+            assert_eq!(timeout, Duration::from_secs(2));
+            assert_eq!(command_timeout(&[]), Duration::from_secs(7));
+        });
     }
 }

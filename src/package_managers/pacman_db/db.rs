@@ -2790,10 +2790,27 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let older = AlpmCatalogEpoch::UNIX_EPOCH;
         std::fs::write(temp_dir.path().join("ALPM_DB_VERSION"), b"9\n").unwrap();
+        let before = LocalDbEpoch::from_local_dir(temp_dir.path()).unwrap();
+        assert_eq!(
+            before,
+            LocalDbEpoch::from_local_dir(temp_dir.path()).unwrap()
+        );
+        let package = temp_dir.path().join("fixture-1.0-1");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(package.join("desc"), b"%NAME%\nfixture\n").unwrap();
         let newer = AlpmCatalogEpoch {
             sync: SyncDbEpoch::UNIX_EPOCH,
             local: LocalDbEpoch::from_local_dir(temp_dir.path()).unwrap(),
         };
+        assert_ne!(
+            newer.local, before,
+            "local package change must alter the epoch"
+        );
+        assert_eq!(
+            newer.local,
+            LocalDbEpoch::from_local_dir(temp_dir.path()).unwrap(),
+            "unchanged local database must keep the same epoch"
+        );
         assert_ne!(newer, older);
         assert_ne!(newer.local, older.local);
         assert_eq!(newer.sync, older.sync);
@@ -3391,11 +3408,26 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn fast_path_and_libalpm_counts_agree_on_fixture_local_db() {
+        if crate::config::Settings::rerun_test_unprivileged(
+            "package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db",
+        ) {
+            return;
+        }
+        println!(
+            "[omg-count-fixture-identity] uid={} euid={} groups={:?}",
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getgroups().expect("read fixture supplementary groups")
+        );
         if crate::core::testing::run_isolated_test(
             "package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db",
         ) {
             return;
         }
+        assert!(
+            !crate::core::is_root(),
+            "count fixture must run unprivileged"
+        );
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
         let db_dir = root.join("var/lib/pacman");
@@ -3429,9 +3461,11 @@ mod tests {
         std::fs::write(&conf, "[options]\n").unwrap();
         let cache_dir = temp.path().join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
+        let config_dir = temp.path().join("omg-config");
+        std::fs::create_dir_all(&config_dir).unwrap();
 
         crate::package_managers::alpm_direct::clear_alpm_cache();
-        crate::core::paths::set_test_overrides(Some(root), Some(db_dir));
+        crate::core::paths::set_test_overrides(Some(root), Some(db_dir.clone()));
         struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -3444,10 +3478,27 @@ mod tests {
         let expected = (7, 3, 1);
         temp_env::with_vars(
             [
+                ("OMG_TEST_MODE", None),
+                ("OMG_TEST_DISTRO", None),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+                ("HOME", Some(temp.path().to_str().unwrap())),
+                ("XDG_CONFIG_HOME", Some(temp.path().to_str().unwrap())),
+                ("OMG_CONFIG_DIR", Some(config_dir.to_str().unwrap())),
                 ("OMG_PACMAN_CONF", Some(conf.to_str().unwrap())),
                 ("OMG_CACHE_DIR", Some(cache_dir.to_str().unwrap())),
             ],
             || {
+                assert_eq!(
+                    crate::core::paths::pacman_local_dir_result().unwrap(),
+                    local_dir
+                );
+                assert_eq!(
+                    crate::core::paths::pacman_sync_dir_result().unwrap(),
+                    db_dir.join("sync")
+                );
+                assert_eq!(crate::core::paths::cache_dir(), cache_dir);
+                assert_eq!(crate::core::paths::config_dir(), config_dir);
                 let fast = get_counts_fast().expect("fast-path counts must succeed");
                 let ffi = crate::package_managers::alpm_direct::get_counts()
                     .expect("libalpm counts must succeed");
@@ -3492,10 +3543,16 @@ mod tests {
     }
 
     fn assert_distinct_soname_providers_have_one_orphan(test_name: &str, app_relation: &str) {
-        if crate::core::testing::run_isolated_test(test_name) {
+        if crate::config::Settings::rerun_test_unprivileged(test_name) {
             return;
         }
-        if crate::config::Settings::rerun_test_unprivileged(test_name) {
+        println!(
+            "[omg-count-fixture-identity] uid={} euid={} groups={:?}",
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getgroups().expect("read fixture supplementary groups")
+        );
+        if crate::core::testing::run_isolated_test(test_name) {
             return;
         }
         assert!(
@@ -3529,6 +3586,8 @@ mod tests {
         std::fs::write(&conf, "[options]\n").expect("private pacman configuration");
         let cache_dir = temp.path().join("omg-cache");
         std::fs::create_dir_all(&cache_dir).expect("private OMG cache");
+        let config_dir = temp.path().join("omg-config");
+        std::fs::create_dir_all(&config_dir).expect("private OMG config");
         let database_before = soname_fixture_catalog(&db_dir);
         let configuration_before = soname_fixture_catalog(&conf);
 
@@ -3545,6 +3604,12 @@ mod tests {
         temp_env::with_vars(
             [
                 ("OMG_TEST_MODE", None),
+                ("OMG_TEST_DISTRO", None),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+                ("HOME", Some(temp.path().to_str().unwrap())),
+                ("XDG_CONFIG_HOME", Some(temp.path().to_str().unwrap())),
+                ("OMG_CONFIG_DIR", Some(config_dir.to_str().unwrap())),
                 (
                     "OMG_PACMAN_CONF",
                     Some(conf.to_str().expect("configuration path")),
@@ -3557,6 +3622,16 @@ mod tests {
             || {
                 assert!(std::env::var_os("OMG_TEST_MODE").is_none());
                 assert!(!crate::core::paths::test_mode());
+                assert_eq!(
+                    crate::core::paths::pacman_local_dir_result().unwrap(),
+                    local_dir
+                );
+                assert_eq!(
+                    crate::core::paths::pacman_sync_dir_result().unwrap(),
+                    db_dir.join("sync")
+                );
+                assert_eq!(crate::core::paths::cache_dir(), cache_dir);
+                assert_eq!(crate::core::paths::config_dir(), config_dir);
                 let native = crate::package_managers::alpm_direct::get_counts()
                     .expect("real libalpm counts");
                 assert_eq!(
