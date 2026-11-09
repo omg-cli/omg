@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Require complete LCOV line coverage to meet the exact base report."""
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
@@ -205,6 +206,150 @@ def owner_covers_lines(regions, start, end):
                    for region in regions) for line in range(start, end + 1))
 
 
+def source_opcodes(old, new, function_scopes, mapped):
+    old_text, new_text = "\n" + "\n".join(old) + "\n", "\n" + "\n".join(new) + "\n"
+    local = {}
+    for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        block = "\n" + "\n".join(old[a:b]) + "\n"
+        suffix = b == len(old) and d == len(new)
+        if tag != "equal":
+            yield tag, a, b, c, d, block, suffix
+            continue
+        unique = old_text.count(block) == new_text.count(block) == 1
+        source_words = any(line + 1 in mapped and re.search(r"\w", old[line])
+                           for line in range(a, b))
+        selected = [(scope, max(a, scope[0] - 1), min(b, scope[1])) for scope in function_scopes
+                    if not suffix and max(a, scope[0] - 1) < min(b, scope[1])
+                    and (not unique or not source_words and any(
+                        line + 1 in mapped and not scope[2] - 1 <= c + line - a < scope[3]
+                        for line in range(max(a, scope[0] - 1), min(b, scope[1]))))]
+        # Unmapped text cannot authorize gray mappings; proven owner anchors still apply.
+        weak_gray = old != new and not source_words
+        if not selected and not weak_gray:
+            # Unique global blocks retain ancestry through extraction and renaming.
+            yield tag, a, b, c, d, block, suffix
+            continue
+        # A delimiter's uniqueness cannot prove a moved body against its function owner.
+        masked = {line for _, start, end in selected for line in range(start, end)}
+        run = None
+        for offset in range(b - a + 1):
+            available = (offset < b - a and a + offset not in masked
+                         and (not weak_gray or mapped.get(a + offset + 1, 0) > 0))
+            if available and run is None:
+                run = offset
+            if not available and run is not None:
+                yield tag, a + run, a + offset, c + run, c + offset, block, suffix
+                run = None
+        for scope, low, high in selected:
+            start, end, newstart, newend = scope
+            if scope not in local:
+                local_old, local_new = old[start - 1:end], new[newstart - 1:newend]
+                local[scope] = difflib.SequenceMatcher(None, local_old, local_new, autojunk=False).get_opcodes()
+            for local_tag, x, y, u, v in local[scope]:
+                first, last = max(low, x + start - 1), min(high, y + start - 1)
+                if local_tag == "equal" and first < last:
+                    target = u + newstart - 1 + first - (x + start - 1)
+                    # Local suffixes are not file EOF and local deletion earns no credit.
+                    yield ("equal", first, last, target, target + last - first,
+                           "\n" + "\n".join(old[x + start - 1:y + start - 1]) + "\n", False)
+
+
+def retained_wrapper_paint(name, old, new, before, after, base, head, base_files, head_files, retained):
+    names = [Counter(owner["name"] for owner in owners) for owners in (base, head)]
+
+    def async_test(source, start):
+        if not re.fullmatch(r"\s*async\s+fn\s+[A-Za-z_]\w*\s*\(\s*\)\s*(?:->[^{}]+)?\{\s*", source[start - 1]):
+            return False
+        attributes = []
+        for line in reversed(source[:start - 1]):
+            if not re.fullmatch(r"\s*#\[[^\n]+\]\s*", line):
+                break
+            attributes.append(line.strip())
+        return len(attributes) == 2 and set(attributes) == {"#[tokio::test]", "#[serial_test::serial]"}
+
+    def occurrences(source, block):
+        return [n for n in range(len(source) - len(block) + 1) if source[n:n + len(block)] == block]
+
+    def project(owners, files, source, start, end, first_column, last_column, name_counts):
+        groups = {}
+        for owner in owners:
+            if not any(files.get(path) == name for path in owner["filenames"]):
+                continue
+            if any(len(r) != 8 or any(type(v) is not int for v in r) for r in owner["regions"]):
+                return None
+            touched = [r for r in owner["regions"]
+                       if (r[0], r[1]) < (end, last_column) and (r[2], r[3]) > (start, first_column)]
+            if not touched:
+                continue
+            if name_counts[owner["name"]] != 1 or source_owner_span(owner, name, files, source) is None:
+                return None
+            if any((r[0], r[1]) < (start, first_column) or (r[2], r[3]) > (end, last_column)
+                   for r in touched):
+                return None
+            group = tuple(sorted(tuple([r[0] - start, r[1], r[2] - start] + r[3:]) for r in touched))
+            groups[id(owner)] = group
+        return groups
+
+    result = []
+    for coarse in base:
+        span = source_owner_span(coarse, name, base_files, old)
+        if (span is None or span[3] is None or old.count(span[3]) != 1 or len(coarse["regions"]) != 2
+                or names[0][coarse["name"]] != 1 or not async_test(old, span[0])):
+            continue
+        header, body = sorted(coarse["regions"])
+        last = old[body[2] - 1]
+        first_code_column = len(last[:len(last) - len(last.lstrip())].encode()) + 1
+        if not (header[0] == header[2] == span[0] and header[3] == header[1] + 1
+                and old[header[0] - 1].encode()[header[1] - 1:header[3] - 1] == b"{"
+                and body[0] > header[0] and body[4] == header[4] > 0
+                and body[3] > first_code_column):
+            continue
+        detailed = [owner for owner in base if owner is not coarse and len(owner["regions"]) > 2
+                    and names[0][owner["name"]] == 1 and header in owner["regions"]
+                    and (other := source_owner_span(owner, name, base_files, old)) is not None
+                    and other[:2] == span[:2]]
+        if len(detailed) != 1:
+            continue
+        start, end = body[0], body[2]
+        block = old[start - 1:end]
+        locations = occurrences(new, block)
+        if occurrences(old, block) != [start - 1] or len(locations) != 1:
+            continue
+        target = locations[0] + 1
+        bg = project(base, base_files, old, start, end, body[1], body[3], names[0])
+        hg = project(head, head_files, new, target, target + end - start, body[1], body[3], names[1])
+        if bg is None or hg is None or id(coarse) not in bg:
+            continue
+        coarse_group = bg.pop(id(coarse))
+        expected_coarse = tuple([0, body[1], end - start] + body[3:])
+        if coarse_group != (expected_coarse,) or id(detailed[0]) not in bg:
+            continue
+        before_groups, after_groups = Counter(bg.values()), Counter(hg.values())
+        if (not before_groups or before_groups != after_groups
+                or any(count != 1 for count in before_groups.values())
+                or coarse_group in before_groups):
+            continue
+        fine = [region for group in bg.values() for region in group]
+        pairs = []
+        for line in range(start, end + 1):
+            current = target + line - start
+            # LCOV obligations cover whole lines, including bytes outside a partial boundary.
+            if (not owner_covers_lines([body], line, line) or retained.get(line) != current
+                    or line == start and body[1] != 1
+                    or line == end and body[3] != len(old[line - 1].encode()) + 1
+                    or before.get(line) != body[4] or after.get(current, 0) > 0):
+                continue
+            offset = line - start
+            precise = max((r[4] for r in fine if r[0] <= offset < r[2]
+                           or offset == r[2] and r[3] > 1), default=None)
+            if precise in (None, 0) and after.get(current) == precise:
+                pairs.append([line, current])
+        if pairs:
+            result.append(dict(file=name, base_range=[start, end], head_range=[target, target + end - start],
+                precise_group_sizes=sorted(len(group) for group in before_groups), pairs=pairs))
+    return result
+
+
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
     bf, bs = region_evidence(base_regions, base, base_sources)
     hf, hs = region_evidence(head_regions, head, head_sources)
@@ -224,7 +369,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         base_name_counts[function["name"]] = base_name_counts.get(function["name"], 0) + 1
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
-    removed = {}; deleted_mapped = deleted_hit = 0
+    removed = {}; deleted_mapped = deleted_hit = 0; paint_receipts = []
     for name in bs:
         old = base_sources[name].decode("utf-8").splitlines()
         new = head_sources[name].decode("utf-8").splitlines()
@@ -245,7 +390,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         headers.setdefault(span[3], []).append(function)
             source_owners.append((spans, declarations, headers))
         (base_spans, base_declarations, base_headers), (head_spans, head_declarations, head_headers) = source_owners
-        anchored = {}; owner_spans = []
+        anchored = {}; owner_spans = []; function_scopes = []
         for owner in owners_by_file.get(name, []):
             span = base_spans.get(id(owner))
             if span is None or base_name_counts[owner["name"]] != 1:
@@ -272,6 +417,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             start, end = span[:2]
             newstart, newend = current_span[:2]
             owner_spans.append((start, end, newstart, newend, owner["regions"], current["regions"]))
+            if (span[2] is not None and span[2] == current_span[2]
+                    and len(base_declarations.get(span[2], [])) == 1
+                    and len(head_declarations.get(span[2], [])) == 1):
+                function_scopes.append((start, end, newstart, newend))
             if not allow_anchors:
                 continue
             if old[start - 1:end] == new[newstart - 1:newend]:
@@ -286,12 +435,14 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if oldline in anchored and anchored[oldline] != newline:
                     raise ValueError("Ambiguous retained function owner")
                 anchored[oldline] = newline
+        function_scopes = [scope for scope in function_scopes if not any(
+            scope != other and (max(scope[0], other[0]) <= min(scope[1], other[1])
+                                or max(scope[2], other[2]) <= min(scope[3], other[3]))
+            for other in function_scopes)]
         retained = {}; gone = set()
-        for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        for tag, a, b, c, d, block, anchored_suffix in source_opcodes(old, new, function_scopes, before):
             if tag == "equal":
                 if old != new and any(before.get(line, 0) > 0 for line in range(a + 1, b + 1)):
-                    block = "\n" + "\n".join(old[a:b]) + "\n"
-                    anchored_suffix = b == len(old) and d == len(new)
                     if not anchored_suffix and (("\n" + "\n".join(old) + "\n").count(block) != 1 or
                                                 ("\n" + "\n".join(new) + "\n").count(block) != 1):
                         pending = [line for line in range(a + 1, b + 1)
@@ -320,11 +471,17 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             # strict base ratios, and its new uncovered mappings are refused.
         gone.difference_update(anchored)
         anchored_new = set(anchored.values())
+        paint = []
+        final_pairs = {**retained, **anchored}
+        if any(before.get(a, 0) > 0 and after.get(b, 0) == 0 for a, b in final_pairs.items()):
+            paint = retained_wrapper_paint(name, old, new, before, after, bf, hf, base_files, head_files, final_pairs)
+        painted = {(a, b) for witness in paint for a, b in witness["pairs"]}
+        paint_receipts.extend(paint)
         for oldline, newline in list(retained.items()):
             if oldline in anchored:
                 continue
             displaced = newline in anchored_new
-            lost = before.get(oldline, 0) > 0 and newline not in after
+            lost = before.get(oldline, 0) > 0 and newline not in after and (oldline, newline) not in painted
             if displaced or lost:
                 if old[oldline - 1].strip() == "}" and oldline - 1 in gone:
                     owners = [function for function in owners_by_file.get(name, []) if any(
@@ -350,7 +507,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         if len(set(retained.values())) != len(retained):
             raise ValueError("Ambiguous retained source correspondence")
         for oldline, newline in retained.items():
-            if before.get(oldline, 0) > 0 and after.get(newline, 0) == 0:
+            if before.get(oldline, 0) > 0 and after.get(newline, 0) == 0 and (oldline, newline) not in painted:
                 raise ValueError("Retained covered line lost coverage or mapping")
         retained_new = set(retained.values())
         uncovered = next((line for line, count in after.items()
@@ -360,11 +517,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         removed[name] = gone
         deleted_mapped += sum(line in gone for line in before)
         deleted_hit += sum(line in gone and count > 0 for line, count in before.items())
+    paint_receipt = {"retained_wrapper_paint": paint_receipts} if paint_receipts else {}
     if (head.hit * base.found >= base.hit * head.found and
             head.mapped_hit * base.mapped >= base.mapped_hit * head.mapped):
         require_no_regression(base, head)
         return {"deleted_summary_found": 0, "deleted_summary_hit": 0,
-                "deleted_mapped": 0, "deleted_mapped_hit": 0}
+                "deleted_mapped": 0, "deleted_mapped_hit": 0, **paint_receipt}
     deleted_found = deleted_summary_hit = 0
     accounted = {name: set() for name in bs}
     deleted_summaries = {name: [0, 0] for name in bs}
@@ -423,7 +581,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         raise ValueError("Deletion leaves no comparable coverage")
     require_no_regression(normalized, head)
     return {"deleted_summary_found": deleted_found, "deleted_summary_hit": deleted_summary_hit,
-            "deleted_mapped": deleted_mapped, "deleted_mapped_hit": deleted_hit}
+            "deleted_mapped": deleted_mapped, "deleted_mapped_hit": deleted_hit, **paint_receipt}
 
 
 def main():
