@@ -365,23 +365,37 @@ pub(crate) fn license_matches_allowlist(license: &str, allowed: &[String]) -> bo
     let Some(expr) = SpdxParser::parse_expression(license) else {
         return false;
     };
-    spdx_expr_allowed(&expr, allowed)
+    let permitted = spdx_expr_allowed(&expr, allowed);
+    if !permitted {
+        let mut exceptions = Vec::new();
+        spdx_expr_exceptions(&expr, &mut exceptions);
+        for exception in exceptions {
+            tracing::warn!(
+                "license expression '{license}' is not permitted: '{exception}' is a \
+                 license exception and the policy allowlist does not list the full \
+                 '<id> WITH <exception>' entry"
+            );
+        }
+    }
+    permitted
 }
 
 /// A parsed SPDX license expression: an identifier (optionally carrying a
-/// `WITH` exception, evaluated by its base identifier), a conjunction, a
-/// disjunction, or a parenthesized grouping.
+/// `WITH` exception, which is only permitted when the allowlist lists the
+/// complete `<id> WITH <exception>` entry), a conjunction, a disjunction, or a
+/// parenthesized grouping.
 #[derive(Debug, Clone, PartialEq)]
 enum SpdxExpr {
     Id(String),
-    With { id: String },
+    With { id: String, exception: String },
     And(Box<SpdxExpr>, Box<SpdxExpr>),
     Or(Box<SpdxExpr>, Box<SpdxExpr>),
 }
 
 fn spdx_expr_allowed(expr: &SpdxExpr, allowed: &[String]) -> bool {
     match expr {
-        SpdxExpr::Id(id) | SpdxExpr::With { id } => spdx_id_allowed(id, allowed),
+        SpdxExpr::Id(id) => spdx_id_allowed(id, allowed),
+        SpdxExpr::With { id, exception } => spdx_with_allowed(id, exception, allowed),
         SpdxExpr::And(left, right) => {
             spdx_expr_allowed(left, allowed) && spdx_expr_allowed(right, allowed)
         }
@@ -389,6 +403,44 @@ fn spdx_expr_allowed(expr: &SpdxExpr, allowed: &[String]) -> bool {
             spdx_expr_allowed(left, allowed) || spdx_expr_allowed(right, allowed)
         }
     }
+}
+
+/// Collect every license exception named by the expression.
+fn spdx_expr_exceptions(expr: &SpdxExpr, out: &mut Vec<String>) {
+    match expr {
+        SpdxExpr::Id(_) => {}
+        SpdxExpr::With { exception, .. } => {
+            let exception = exception.clone();
+            if !out.contains(&exception) {
+                out.push(exception);
+            }
+        }
+        SpdxExpr::And(left, right) | SpdxExpr::Or(left, right) => {
+            spdx_expr_exceptions(left, out);
+            spdx_expr_exceptions(right, out);
+        }
+    }
+}
+
+/// A `WITH` expression carries obligations that its base identifier does not.
+/// It is therefore permitted only when the allowlist names the complete
+/// `<id> WITH <exception>` entry, e.g. `GPL-2.0 WITH Classpath-exception-2.0`.
+/// An allowlist that lists only the base identifier fails closed, because a
+/// policy cannot distinguish the excepted (weaker) terms without saying so.
+fn spdx_with_allowed(id: &str, exception: &str, allowed: &[String]) -> bool {
+    allowed
+        .iter()
+        .filter_map(|entry| SpdxParser::parse_expression(entry))
+        .any(|entry| match entry {
+            SpdxExpr::With {
+                id: entry_id,
+                exception: entry_exception,
+            } => {
+                entry_id.eq_ignore_ascii_case(id)
+                    && entry_exception.eq_ignore_ascii_case(exception)
+            }
+            _ => false,
+        })
 }
 
 /// Whole-token identifier match preserving the historical `+` suffix rules:
@@ -524,13 +576,11 @@ impl SpdxParser {
                 let id = id.clone();
                 self.pos += 1;
                 if self.eat(&SpdxToken::With) {
-                    match self.peek() {
-                        Some(SpdxToken::Id(_)) => {
-                            self.pos += 1;
-                            Some(SpdxExpr::With { id })
-                        }
-                        _ => None,
-                    }
+                    let Some(SpdxToken::Id(exception)) = self.peek().cloned() else {
+                        return None;
+                    };
+                    self.pos += 1;
+                    Some(SpdxExpr::With { id, exception })
                 } else {
                     Some(SpdxExpr::Id(id))
                 }
@@ -1090,11 +1140,36 @@ mod tests {
             mit_apache
         ));
 
-        // WITH exceptions evaluate by their base identifier.
+        // WITH exceptions are not covered by a base-identifier entry.
         let gpl = &["GPL-2.0".to_string()];
-        assert!(license_matches_allowlist(
+        assert!(!license_matches_allowlist(
             "GPL-2.0 WITH Classpath-exception-2.0",
             gpl
+        ));
+        // The full entry (and only the full entry) permits the exception.
+        let gpl_classpath = &["GPL-2.0 WITH Classpath-exception-2.0".to_string()];
+        assert!(license_matches_allowlist(
+            "GPL-2.0 WITH Classpath-exception-2.0",
+            gpl_classpath
+        ));
+        assert!(license_matches_allowlist(
+            "gpl-2.0 with classpath-exception-2.0",
+            gpl_classpath
+        ));
+        assert!(!license_matches_allowlist(
+            "GPL-2.0 WITH LLVM-exception",
+            gpl_classpath
+        ));
+        // A base-only allowlist still permits the bare identifier it names.
+        assert!(license_matches_allowlist("GPL-2.0", gpl));
+        // A plain allowlist entry is unaffected by exceptions elsewhere.
+        assert!(license_matches_allowlist(
+            "MIT OR GPL-2.0 WITH Classpath-exception-2.0",
+            mit
+        ));
+        assert!(!license_matches_allowlist(
+            "MIT AND GPL-2.0 WITH Classpath-exception-2.0",
+            mit_apache
         ));
 
         // Malformed expressions fail closed instead of matching loosely.
