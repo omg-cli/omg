@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import tomllib
@@ -23,6 +24,115 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_privileged_coverage_case_requires_real_execution_and_profiles(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        self.assertIn('run_case() {', script)
+        function = textwrap.dedent(re.search(r'(?ms)^ +run_case\(\) \{.*?^ +\}', script).group())
+        fixture = """\
+        #!/bin/bash
+        set -eu
+        test "$1" = --exact
+        test "$3" = --include-ignored
+        profile=${LLVM_PROFILE_FILE//%p/123}
+        profile=${profile//%m/1}
+        profile=${profile//%c/}
+        case "$FIXTURE_BEHAVIOR" in
+          fail) exit 23 ;;
+          missing-profile) ;;
+          empty-profile) : > "$profile" ;;
+          *) printf counters > "$profile" ;;
+        esac
+        case "$FIXTURE_BEHAVIOR" in
+          skipped) printf '[omg-skip] fixture did not execute\\n' ;;
+          profile-error) printf 'LLVM Profile Error: cannot write profile\\n' >&2 ;;
+        esac
+        if [ "$FIXTURE_BEHAVIOR" = empty-selection ]; then
+          printf 'test result: ok. 0 passed; 0 failed; 0 ignored;\\n'
+        else
+          printf 'test result: ok. 1 passed; 0 failed; 0 ignored;\\n'
+        fi
+        """
+        for behavior in ('pass', 'fail', 'skipped', 'profile-error', 'empty-selection',
+                         'missing-profile', 'empty-profile', 'missing-registry'):
+            with self.subTest(behavior=behavior), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / 'fixture'
+                binary.write_bytes(textwrap.dedent(fixture).encode())
+                binary.chmod(0o755)
+                profiles, evidence = root / 'profiles', root / 'evidence'
+                profiles.mkdir(); evidence.mkdir()
+                (evidence / 'registry.txt').write_bytes(b'' if behavior == 'missing-registry' else b'probe::case: test\n')
+                body = '\n'.join((function,
+                    'fixture_binary=$TEST_BINARY', 'fixture_profiles=$TEST_PROFILES',
+                    'fixture_evidence=$TEST_EVIDENCE', 'run_case probe::case'))
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', body],
+                    env=dict(os.environ, TEST_BINARY=binary.as_posix(), TEST_PROFILES=profiles.as_posix(),
+                             TEST_EVIDENCE=evidence.as_posix(), FIXTURE_BEHAVIOR=behavior),
+                    capture_output=True, text=True)
+                if behavior == 'pass':
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual((evidence / 'passed.tsv').read_text(), 'probe::case\t1\n')
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse((evidence / 'passed.tsv').exists())
+
+    def test_privileged_coverage_keeps_isolation_and_state_mount_last(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        cases = re.search(r'(?ms)^ +cases=\(\n(.*?)^ +\)', script)
+        self.assertIsNotNone(cases, 'coverage must select its required fixture cases explicitly')
+        selected = [line.strip() for line in cases.group(1).splitlines() if line.strip()]
+        self.assertEqual(len(selected), len(set(selected)))
+        self.assertEqual(len(selected), 14)
+        self.assertEqual(selected[0], 'package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman')
+        self.assertEqual(selected[-1], 'core::usage::tests::elevated_state_roundtrip_preserves_caller_files')
+        self.assertIn('mkdir -m 1777 /profiles', script)
+        self.assertIn('--network none --pids-limit 128 --memory 1g --cpus 2', script)
+        self.assertIn('mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib', script)
+        self.assertNotIn('--env GH_TOKEN', script)
+        self.assertNotIn('--env GITHUB_TOKEN', script)
+
+    def test_privileged_coverage_receipt_requires_complete_nonempty_profiles(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        payload = re.search(r"(?ms)^python3 - .* <<'PY'\n(.*?)^PY$", script).group(1)
+        for behavior in ('pass', 'missing-result', 'duplicate-result', 'reordered-results',
+                         'missing-profile', 'empty-profile', 'wrong-profile-count'):
+            with self.subTest(behavior=behavior), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary, profiles, evidence = root / 'fixture', root / 'profiles', root / 'evidence'
+                binary.write_bytes(b'fixture binary')
+                profiles.mkdir(); evidence.mkdir()
+                names = ['probe::first', 'probe::second']
+                (evidence / 'expected-tests.txt').write_text('\n'.join(names) + '\n')
+                rows = [name + '\t1' for name in names]
+                if behavior == 'missing-result': rows.pop()
+                if behavior == 'duplicate-result': rows.append(rows[0])
+                if behavior == 'reordered-results': rows.reverse()
+                if behavior == 'wrong-profile-count': rows[0] = names[0] + '\t2'
+                (evidence / 'passed.tsv').write_text('\n'.join(rows) + '\n')
+                for name in names:
+                    profile = profiles / ('omg-fixture-' + name.replace('::', '_') + '-123-1.profraw')
+                    if behavior != 'missing-profile' or name != names[0]:
+                        profile.write_bytes(b'' if behavior == 'empty-profile' else b'counters')
+                result = subprocess.run([sys.executable, '-c', payload, str(binary), str(profiles),
+                                         str(evidence), 'a' * 40], capture_output=True, text=True)
+                receipt = evidence / 'receipt.json'
+                if behavior == 'pass':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    value = json.loads(receipt.read_text())
+                    self.assertEqual(value['binary_sha256'], hashlib.sha256(b'fixture binary').hexdigest())
+                    self.assertEqual([case['name'] for case in value['tests']], names)
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(receipt.exists())
+
+    def test_continuous_profiles_require_the_verified_coverage_toolchain(self):
+        workflow = (WORKFLOWS / 'coverage.yml').read_text()
+        self.assertNotIn('runtime-counter-relocation', workflow.split('jobs:', 1)[0])
+        coverage = workflow.split('  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
+        self.assertIn('RUSTFLAGS: -C llvm-args=-runtime-counter-relocation', coverage)
+        self.assertIn('LLVM_PROFILE_FILE_NAME: omg-%p-%m%c.profraw', coverage)
+        self.assertIn('tool: cargo-llvm-cov@0.9.0,nextest', coverage)
+
     def test_sandbox_coverage_requires_one_existing_instrumented_binary(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
         selection = script.split('docker build', 1)[0]
@@ -37,7 +147,8 @@ class OptimizationContracts(unittest.TestCase):
                 result = subprocess.run(
                     [BASH, '-c', 'cargo() { return 97; };\n' + selection
                      + 'printf "%s" "$binary"'],
-                    env={**os.environ, 'GITHUB_WORKSPACE': Path(directory).as_posix()},
+                    env={**os.environ, 'GITHUB_WORKSPACE': Path(directory).as_posix(),
+                         'RUNNER_TEMP': Path(directory).as_posix()},
                     text=True, capture_output=True)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 if count == 1:

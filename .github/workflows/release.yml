@@ -355,7 +355,7 @@ jobs:
   build-macos:
     name: "Build macOS (ARM64)"
     needs: gate-on-ci
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     outputs:
       archive_sha256: ${{ steps.package.outputs.archive_sha256 }}
@@ -556,7 +556,7 @@ jobs:
   smoke-macos:
     name: "Staged macOS release smoke"
     needs: build-macos
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"

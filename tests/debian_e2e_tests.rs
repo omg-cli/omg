@@ -662,6 +662,82 @@ fn run_omg_debian(args: &[&str], extra_env: &[(&str, &str)]) -> CommandResult {
     common::run_omg_with_env(args, &env)
 }
 
+#[cfg(unix)]
+#[test]
+fn command_timeout_terminates_pipe_inheriting_descendants() {
+    use std::os::unix::process::CommandExt;
+
+    let directory = TempDir::new().unwrap();
+    let heartbeat = directory.path().join("heartbeat");
+    std::fs::write(
+        directory.path().join("heartbeat.sh"),
+        "i=0\nwhile [ \"$i\" -lt 100 ]; do printf x >> heartbeat; sleep 0.05; i=$((i + 1)); done\n",
+    )
+    .unwrap();
+    let mut control = std::process::Command::new("/bin/sh")
+        .arg("heartbeat.sh")
+        .current_dir(directory.path())
+        .env("PATH", "/usr/bin:/bin")
+        .process_group(0)
+        .spawn()
+        .expect("start heartbeat control");
+    let started = std::time::Instant::now();
+    while std::fs::metadata(&heartbeat).map_or(true, |m| m.len() < 2)
+        && started.elapsed() < std::time::Duration::from_secs(2)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let first = std::fs::metadata(&heartbeat).map_or(0, |m| m.len());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let second = std::fs::metadata(&heartbeat).map_or(0, |m| m.len());
+    let group = nix::unistd::Pid::from_raw(i32::try_from(control.id()).unwrap());
+    nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL)
+        .expect("stop heartbeat control group");
+    control.wait().expect("reap heartbeat control");
+    assert!(
+        first >= 2 && second > first,
+        "heartbeat control did not advance"
+    );
+    std::fs::remove_file(&heartbeat).unwrap();
+    std::fs::write(
+        directory.path().join("mise.toml"),
+        "[tasks.hold]\nrun = 'sh ./heartbeat.sh & wait'\n",
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let result = common::run_omg_with_options(
+        &["run", "hold"],
+        Some(directory.path()),
+        &[
+            ("OMG_TEST_COMMAND_TIMEOUT_SECS", "1"),
+            ("PATH", "/usr/bin:/bin"),
+        ],
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "descendant retained output pipes after timeout"
+    );
+    assert!(!result.success);
+    assert!(
+        result.stderr.contains("[test harness timeout]"),
+        "expected a harness timeout; exit={}, stdout={:?}, stderr={:?}",
+        result.exit_code,
+        result.stdout,
+        result.stderr
+    );
+    let stopped = std::fs::metadata(&heartbeat)
+        .expect("descendant did not start")
+        .len();
+    assert!(stopped >= 2, "descendant heartbeat did not advance");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        std::fs::metadata(&heartbeat).unwrap().len(),
+        stopped,
+        "descendant heartbeat continued after timeout"
+    );
+}
+
+#[cfg(not(unix))]
 #[test]
 fn command_timeout_terminates_pipe_inheriting_descendants() {
     let directory = TempDir::new().unwrap();
@@ -676,10 +752,7 @@ fn command_timeout_terminates_pipe_inheriting_descendants() {
         Some(directory.path()),
         &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "1")],
     );
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(3),
-        "descendant retained output pipes after timeout"
-    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(3));
     assert!(!result.success);
     assert!(result.stderr.contains("[test harness timeout]"));
 }
@@ -812,20 +885,15 @@ fn test_cli_update_check_debian() {
 
 #[test]
 fn cli_receipt_rejects_a_different_product_executable() {
-    const CHILD: &str = "OMG_RECEIPT_IDENTITY_NEGATIVE_CHILD";
-    if std::env::var(CHILD).as_deref() == Ok("1") {
-        run_omg_cli(&["--version"]).assert_success();
-        return;
-    }
     let harness = std::env::current_exe().unwrap();
     let output = std::process::Command::new(&harness)
         .args([
             "--exact",
-            "cli_receipt_rejects_a_different_product_executable",
+            "cli_receipt_identity_negative_child",
+            "--ignored",
             "--nocapture",
             "--test-threads=1",
         ])
-        .env(CHILD, "1")
         .env("OMG_CONTRACT_EXPECTED_CLI", &harness)
         .output()
         .expect("run receipt identity negative control");
@@ -834,6 +902,12 @@ fn cli_receipt_rejects_a_different_product_executable() {
         String::from_utf8_lossy(&output.stderr)
             .contains("CLI fixture executable differs from the admitted receipt subject")
     );
+}
+
+#[test]
+#[ignore = "run only as the receipt identity negative control"]
+fn cli_receipt_identity_negative_child() {
+    run_omg_cli(&["--version"]).assert_success();
 }
 
 #[test]

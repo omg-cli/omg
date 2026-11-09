@@ -558,7 +558,12 @@ fn platform_socket_path() -> PathBuf {
 
 #[cfg(unix)]
 fn uid_temp_socket_path(uid: u32) -> PathBuf {
-    let fallback = PathBuf::from(format!("/tmp/omg-{uid}"));
+    uid_temp_socket_path_in(uid, std::path::Path::new("/tmp"))
+}
+
+#[cfg(unix)]
+fn uid_temp_socket_path_in(uid: u32, root: &std::path::Path) -> PathBuf {
+    let fallback = root.join(format!("omg-{uid}"));
     // Sticky /tmp lets any local user pre-create our fallback directory
     // (macOS always lands here; minimal Linux without logind too). The
     // parent validation below would then fail every daemon start until
@@ -949,30 +954,45 @@ mod tests {
         assert!(!path.as_os_str().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_tmp_fallback_stays_on_tmp_path() {
+        let root = tempfile::tempdir().expect("private temporary root");
         assert_eq!(
-            uid_temp_socket_path(424_243),
-            PathBuf::from("/tmp/omg-424243/omg.sock")
+            uid_temp_socket_path_in(424_243, root.path()),
+            root.path().join("omg-424243/omg.sock")
         );
     }
 
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial]
     fn squatted_tmp_fallback_diverts_to_home_directory() {
-        // Simulate another local user squatting the /tmp fallback with a
-        // directory we do not own as that uid (fake uid keeps the real
-        // daemon path untouched).
-        let squat = PathBuf::from("/tmp/omg-424242");
-        let _ = std::fs::remove_dir(&squat);
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("private temporary root");
+        let squat = root.path().join("omg-424242");
         std::fs::create_dir(&squat).expect("squat dir");
-        let diverted = uid_temp_socket_path(424_242);
-        std::fs::remove_dir(&squat).expect("squat cleanup");
-        assert_eq!(diverted, home_fallback_socket_path());
+        std::fs::set_permissions(&squat, std::fs::Permissions::from_mode(0o777))
+            .expect("insecure fixture mode");
+        let sentinel = squat.join("sentinel");
+        std::fs::write(&sentinel, b"unchanged").expect("fixture sentinel");
+        let error = validate_socket_parent(&squat.join("omg.sock"))
+            .expect_err("world-accessible socket parent must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let diverted = uid_temp_socket_path_in(424_242, root.path());
+        assert_eq!(diverted, data_dir().join("run/omg.sock"));
         assert!(
             diverted.starts_with(data_dir()),
             "fallback must live under our own data dir: {}",
             diverted.display()
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        std::fs::set_permissions(&squat, std::fs::Permissions::from_mode(0o700))
+            .expect("secure fixture mode");
+        assert_eq!(
+            uid_temp_socket_path_in(424_242, root.path()),
+            squat.join("omg.sock")
         );
     }
 
@@ -1031,9 +1051,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn temp_socket_fallback_is_scoped_to_the_uid() {
+        let root = tempfile::tempdir().expect("private temporary root");
         assert_eq!(
-            uid_temp_socket_path(42),
-            PathBuf::from("/tmp/omg-42/omg.sock")
+            uid_temp_socket_path_in(42, root.path()),
+            root.path().join("omg-42/omg.sock")
         );
     }
 
@@ -1103,17 +1124,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn pacman_paths_honor_rootdir_and_dbpath_from_configuration() {
-        if crate::core::testing::run_isolated_test(
-            "core::paths::tests::pacman_paths_honor_rootdir_and_dbpath_from_configuration",
-        ) {
+        const NAME: &str =
+            "core::paths::tests::pacman_paths_honor_rootdir_and_dbpath_from_configuration";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
             return;
         }
-        if crate::core::is_root() {
-            // Elevated processes ignore OMG_PACMAN_* overrides, so this
-            // fixture test only applies to unprivileged runs.
-            eprintln!("skipped: elevated processes ignore caller path overrides");
-            return;
-        }
+        assert!(!crate::core::is_root(), "fixture requires an ordinary user");
         let directory = tempfile::tempdir().expect("temporary config directory");
         let config = directory.path().join("pacman.conf");
         std::fs::write(&config, "[options]\nRootDir = /srv/arch-root\n")

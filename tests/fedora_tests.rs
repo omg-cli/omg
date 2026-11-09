@@ -232,23 +232,92 @@ mod dnf_integration {
             observed.is_current()?,
             "new native observation is already stale"
         );
-        for (program, arguments) in [
-            ("/usr/bin/rpm", vec!["-q", "bash"]),
-            ("/usr/bin/dnf", vec!["repoquery", "--available", "bash"]),
-        ] {
-            let output = std::process::Command::new(program)
-                .args(arguments)
-                .output()?;
-            anyhow::ensure!(
-                output.status.success(),
-                "read-only native query failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            anyhow::ensure!(
-                observed.is_current()?,
-                "read-only {program} query invalidated unchanged installed RPM inventory"
-            );
+        let output = std::process::Command::new("/usr/bin/timeout")
+            .args(["--kill-after=2s", "60s", "/usr/bin/rpm", "-q", "bash"])
+            .env_clear()
+            .output()?;
+        anyhow::ensure!(output.status.success(), "native RPM query failed");
+        anyhow::ensure!(
+            observed.is_current()?,
+            "RPM query invalidated unchanged inventory"
+        );
+
+        let fixture = tempfile::tempdir_in("/tmp")?;
+        let root = fixture.path();
+        for dir in ["repo", "repos", "cache", "persist", "log", "home"] {
+            std::fs::create_dir(root.join(dir))?;
         }
+        std::fs::write(
+            root.join("repo/observer-fixture.rpm"),
+            include_bytes!("data/fedora/observer-fixture.rpm"),
+        )?;
+        std::fs::create_dir(root.join("repo/repodata"))?;
+        for (name, contents) in [
+            (
+                "repomd.xml",
+                &include_bytes!("data/fedora/repodata/repomd.xml")[..],
+            ),
+            (
+                "primary.xml.zst",
+                &include_bytes!("data/fedora/repodata/primary.xml.zst")[..],
+            ),
+            (
+                "filelists.xml.zst",
+                &include_bytes!("data/fedora/repodata/filelists.xml.zst")[..],
+            ),
+            (
+                "other.xml.zst",
+                &include_bytes!("data/fedora/repodata/other.xml.zst")[..],
+            ),
+        ] {
+            std::fs::write(root.join("repo/repodata").join(name), contents)?;
+        }
+        let config = root.join("dnf.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "[main]\nplugins=0\nreposdir={0}/repos\ncachedir={0}/cache\nsystem_cachedir={0}/cache\npersistdir={0}/persist\nlogdir={0}/log\n",
+                root.display()
+            ),
+        )?;
+        #[expect(
+            clippy::literal_string_with_formatting_args,
+            reason = "DNF interprets the RPM query format placeholders"
+        )]
+        let output = std::process::Command::new("/usr/bin/timeout")
+            .args(["--kill-after=2s", "60s", "/usr/bin/dnf"])
+            .arg(format!("--config={}", config.display()))
+            .arg(format!(
+                "--repofrompath=observer,file://{}/repo",
+                root.display()
+            ))
+            .args([
+                "--repo=observer",
+                "repoquery",
+                "--available",
+                "--queryformat",
+                "%{name}:%{evr}\n",
+                "omg-observer-fixture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C")
+            .env("HOME", root.join("home"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "private DNF query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            std::str::from_utf8(&output.stdout)?.trim() == "omg-observer-fixture:1-1",
+            "private DNF query missed fixture package"
+        );
+        anyhow::ensure!(
+            observed.is_current()?,
+            "DNF query invalidated unchanged inventory"
+        );
         Ok(())
     }
 
@@ -393,10 +462,13 @@ mod dnf_integration {
         let expected_name = format!("{package}.{}", std::env::consts::ARCH);
         let pm = DnfPackageManager::new();
         assert!(
-            !pm.list_installed()
-                .await?
-                .iter()
-                .any(|installed| installed.name == package),
+            !pm.list_installed().await?.iter().any(|installed| {
+                installed.name == package
+                    || installed
+                        .name
+                        .rsplit_once('.')
+                        .is_some_and(|(name, _)| name == package)
+            }),
             "native RPM reports {package} absent but OMG reports it installed"
         );
         let search = pm.search(package).await?;
@@ -412,16 +484,47 @@ mod dnf_integration {
         assert_eq!(info.name, expected_name);
         assert!(!info.installed);
 
-        for arguments in [vec!["info", package], vec!["--json", "info", package]] {
+        for (json, arguments) in [
+            (false, vec!["info", package]),
+            (true, vec!["--json", "info", package]),
+        ] {
             let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("omg"))
                 .args(arguments)
+                .env("OMG_DISABLE_DAEMON", "1")
+                .env("OMG_DISABLE_TELEMETRY", "1")
+                .env("OMG_TEST_MODE", "0")
+                .env_remove("OMG_TEST_DISTRO")
+                .env_remove("OMG_TEST_BACKEND")
+                .env("NO_COLOR", "1")
                 .output()?;
             assert!(
                 output.status.success(),
                 "CLI info failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(String::from_utf8_lossy(&output.stdout).contains(package));
+            if json {
+                let actual: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                assert_eq!(actual["name"], info.name);
+                assert_eq!(actual["version"], info.version.to_string());
+                assert_eq!(actual["installed"], false);
+            } else {
+                let actual = std::str::from_utf8(&output.stdout)?;
+                assert!(
+                    actual.contains(&info.name),
+                    "missing package identity: {actual}"
+                );
+                assert!(
+                    actual.contains(&info.version.to_string()),
+                    "missing version: {actual}"
+                );
+                assert!(
+                    actual
+                        .lines()
+                        .any(|line| line.trim_start().starts_with("Installed")
+                            && line.trim_end().ends_with("no")),
+                    "missing uninstalled state: {actual}"
+                );
+            }
         }
         Ok(())
     }
@@ -581,15 +684,128 @@ mod dnf_integration {
         Ok(())
     }
 
+    async fn bounded_child_output(
+        child: &mut tokio::process::Child,
+        deadline: std::time::Duration,
+    ) -> Result<std::process::Output> {
+        use tokio::io::AsyncReadExt as _;
+
+        const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
+        async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(
+            reader: R,
+            label: &str,
+        ) -> Result<Vec<u8>> {
+            let mut bytes = Vec::new();
+            reader
+                .take(OUTPUT_LIMIT + 1)
+                .read_to_end(&mut bytes)
+                .await?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= OUTPUT_LIMIT,
+                "CLI {label} exceeds limit"
+            );
+            Ok(bytes)
+        }
+        let stdout = child.stdout.take().context("missing child stdout")?;
+        let stderr = child.stderr.take().context("missing child stderr")?;
+        let captured = tokio::time::timeout(deadline, async {
+            tokio::try_join!(
+                async { child.wait().await.context("wait for CLI child") },
+                read_bounded(stdout, "stdout"),
+                read_bounded(stderr, "stderr")
+            )
+        })
+        .await;
+
+        let result = match captured {
+            Ok(Ok((status, stdout_bytes, stderr_bytes))) => {
+                return Ok(std::process::Output {
+                    status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                });
+            }
+            Ok(Err(error)) => error,
+            Err(error) => anyhow::Error::from(error).context("CLI command timed out"),
+        };
+        if child
+            .try_wait()
+            .context("check CLI child status")?
+            .is_none()
+        {
+            child.start_kill().context("terminate CLI child")?;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .context("reaping CLI child timed out")?
+            .context("reap CLI child")?;
+        Err(result)
+    }
+
+    fn spawn_bounded_child(command: &mut tokio::process::Command) -> Result<tokio::process::Child> {
+        use std::process::Stdio;
+
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawn CLI child")
+    }
+
+    #[tokio::test]
+    async fn bounded_cli_child_is_terminated_and_reaped_after_timeout() -> Result<()> {
+        let mut command = tokio::process::Command::new("/usr/bin/sleep");
+        command.arg("30");
+        let mut child = spawn_bounded_child(&mut command)?;
+        let error = bounded_child_output(&mut child, std::time::Duration::from_millis(200))
+            .await
+            .expect_err("stalled child must time out");
+        assert!(
+            error.to_string().contains("CLI command timed out"),
+            "{error:#}"
+        );
+        assert!(child.id().is_none(), "timed-out child must be reaped");
+        assert!(
+            child.try_wait()?.is_some(),
+            "timed-out child must have an exit status"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_cli_child_rejects_excess_output() -> Result<()> {
+        let mut command = tokio::process::Command::new("/usr/bin/head");
+        command.args(["-c", "16777217", "/dev/zero"]);
+        let mut child = spawn_bounded_child(&mut command)?;
+        let error = bounded_child_output(&mut child, std::time::Duration::from_secs(10))
+            .await
+            .expect_err("excess child output must fail");
+        assert!(
+            error.to_string().contains("CLI stdout exceeds limit"),
+            "{error:#}"
+        );
+        assert!(child.id().is_none(), "output producer must be reaped");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn explicit_cli_matches_native_backend_without_a_daemon() -> Result<()> {
         let mut expected = DnfPackageManager::new().list_explicit().await?;
         expected.sort();
         expected.dedup();
         let binary = assert_cmd::cargo::cargo_bin!("omg");
-        let listing = std::process::Command::new(binary)
+        let mut listing = tokio::process::Command::new(binary);
+        listing
             .args(["--json", "explicit"])
-            .output()?;
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_NATIVE_TEST_DATA_DIR");
+        let mut child = spawn_bounded_child(&mut listing)?;
+        let listing = bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
         assert!(
             listing.status.success(),
             "{}",
@@ -597,9 +813,16 @@ mod dnf_integration {
         );
         let listing: serde_json::Value = serde_json::from_slice(&listing.stdout)?;
         assert_eq!(listing["packages"], serde_json::json!(expected));
-        let count = std::process::Command::new(binary)
+        let mut count = tokio::process::Command::new(binary);
+        count
             .args(["--json", "explicit", "--count"])
-            .output()?;
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_DISABLE_TELEMETRY", "1")
+            .env("OMG_TEST_MODE", "0")
+            .env_remove("OMG_TEST_DISTRO")
+            .env_remove("OMG_NATIVE_TEST_DATA_DIR");
+        let mut child = spawn_bounded_child(&mut count)?;
+        let count = bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
         assert!(
             count.status.success(),
             "{}",
@@ -962,6 +1185,7 @@ mod dnf_integration {
     }
 
     #[test]
+    #[ignore = "requires a disposable Fedora environment; installs and removes native packages"]
     fn native_transactions_record_install_remove_and_ignore_noops() -> Result<()> {
         use omg_lib::core::history::{HistoryManager, TransactionType};
         let package = uninstalled_repository_package()?;
@@ -1085,6 +1309,7 @@ mod dnf_integration {
     }
 
     #[tokio::test]
+    #[ignore = "requires a disposable Fedora environment; installs and removes native packages"]
     #[serial_test::serial(history_ownership)]
     async fn native_history_honors_custom_and_disabled_service_history() -> Result<()> {
         use omg_lib::core::history::HistoryManager;
@@ -1206,6 +1431,9 @@ mod dnf_integration {
     #[tokio::test]
     async fn test_search_nonexistent_package() -> Result<()> {
         let pm = DnfPackageManager::new();
+
+        let installed = pm.search("bash").await?;
+        assert_installed_rpm_selection(&installed, "bash")?;
 
         let results = pm.search("nonexistent-package-xyz-12345").await?;
 

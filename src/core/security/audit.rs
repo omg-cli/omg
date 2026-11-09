@@ -1415,7 +1415,7 @@ mod tests {
 
         #[test]
         fn cross_filesystem_migration_copies_history_byte_for_byte() -> anyhow::Result<()> {
-            let parent = tempfile::tempdir()?;
+            let parent = tempfile::tempdir_in("/var/tmp")?;
             let legacy = tempfile::tempdir_in("/dev/shm")?;
             assert_ne!(
                 std::fs::metadata(parent.path())?.dev(),
@@ -1440,6 +1440,10 @@ mod tests {
             std::fs::write(nested.join("segment"), b"archived segment")?;
             let directory = prepare_system_audit_directory(parent.path(), legacy.path())?;
             assert!(!original.exists());
+            assert_eq!(
+                std::fs::read(directory.join("audit.jsonl"))?,
+                original_bytes
+            );
             assert_eq!(
                 std::fs::read(directory.join("audit.jsonl.1"))?,
                 original_bytes
@@ -1471,7 +1475,7 @@ mod tests {
         #[test]
         fn cross_filesystem_migration_refuses_symlinks_without_touching_legacy()
         -> anyhow::Result<()> {
-            let parent = tempfile::tempdir()?;
+            let parent = tempfile::tempdir_in("/var/tmp")?;
             let legacy = tempfile::tempdir_in("/dev/shm")?;
             assert_ne!(
                 std::fs::metadata(parent.path())?.dev(),
@@ -1481,8 +1485,18 @@ mod tests {
             std::fs::create_dir(&original)?;
             let history = original.join("audit.jsonl");
             std::fs::write(&history, b"retained history")?;
-            symlink(&history, original.join("alias"))?;
-            assert!(prepare_system_audit_directory(parent.path(), legacy.path()).is_err());
+            let alias = original.join("alias");
+            symlink(&history, &alias)?;
+            let error = prepare_system_audit_directory(parent.path(), legacy.path())
+                .expect_err("symlinked history must be refused");
+            let cause = error
+                .downcast_ref::<std::io::Error>()
+                .expect("original I/O error must remain available");
+            assert_eq!(cause.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                cause.to_string(),
+                format!("Refusing to migrate symlink at {}", alias.display())
+            );
             assert_eq!(std::fs::read(&history)?, b"retained history");
             assert!(!parent.path().join("audit").exists());
             Ok(())

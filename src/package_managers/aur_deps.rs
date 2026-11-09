@@ -257,22 +257,33 @@ mod tests {
 
     #[test]
     fn same_base_build_requirement_accepts_an_installed_virtual_provider() {
+        use std::fmt::Write as _;
+
         let srcinfo = split_fixture(
             "\tmakedepends = example-helper>=1.0\n",
             "pkgname = example-cli\npkgname = example-helper\n",
         );
-        let (directory, alpm) = installed_fixture(&[("bootstrap-tool", "7.0-1")]);
-        let desc = directory.path().join("db/local/bootstrap-tool-7.0-1/desc");
-        let mut content = std::fs::read_to_string(&desc).expect("fixture description");
-        content.push_str("%PROVIDES%\nexample-helper=1.0\n\n");
-        std::fs::write(desc, content).expect("fixture provision");
-        let installed = alpm.localdb().pkgs();
-        let plan = dependency_info(&srcinfo, &["example-cli".to_string()], |dependency| {
-            installed.find_satisfier(dependency.to_string()).is_some()
-        })
-        .expect("installed compatible provider");
-        assert!(plan.missing.is_empty());
-        assert_eq!(plan.package_outputs, ["example-cli"]);
+        for (provided, accepted) in [("1.0", true), ("0.9", false)] {
+            let (directory, alpm) = installed_fixture(&[("bootstrap-tool", "7.0-1")]);
+            let desc = directory.path().join("db/local/bootstrap-tool-7.0-1/desc");
+            let mut content = std::fs::read_to_string(&desc).expect("fixture description");
+            write!(content, "%PROVIDES%\nexample-helper={provided}\n\n")
+                .expect("fixture provision format");
+            std::fs::write(desc, content).expect("fixture provision");
+            let installed = alpm.localdb().pkgs();
+            let result = dependency_info(&srcinfo, &["example-cli".to_string()], |dependency| {
+                installed.find_satisfier(dependency.to_string()).is_some()
+            });
+            if accepted {
+                let plan = result.expect("installed compatible provider");
+                assert!(plan.missing.is_empty());
+                assert_eq!(plan.package_outputs, ["example-cli"]);
+            } else {
+                let error = result.expect_err("older provider must not satisfy the prerequisite");
+                assert!(error.to_string().contains("example-helper>=1.0"));
+                assert!(error.to_string().contains("installed before building"));
+            }
+        }
     }
 
     #[test]
@@ -328,6 +339,7 @@ mod tests {
             ("example-lib>1.0", "2.0-1", true),
             ("example-lib<2.0", "1.0-1", true),
             ("example-lib<=1.0", "1.0-1", true),
+            ("example-lib<=1.0", "2.0-1", false),
         ] {
             assert_eq!(
                 output_version_satisfies(requirement, candidate),

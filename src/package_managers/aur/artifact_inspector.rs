@@ -451,16 +451,22 @@ mod tests {
             let file = tempfile::NamedTempFile::new()?;
             std::fs::write(file.path(), compressed)?;
             let rejected = archive_reader_with_limit(file.path(), 1024);
-            match rejected {
-                Err(_) => {}
+            let error = match rejected {
+                Err(error) => format!("{error:#}"),
                 Ok(mut reader) => {
                     let mut output = Vec::new();
-                    assert!(
-                        reader.read_to_end(&mut output).is_err(),
-                        "{kind} expansion must be bounded"
-                    );
+                    reader
+                        .read_to_end(&mut output)
+                        .expect_err("expansion must be bounded")
+                        .to_string()
                 }
-            }
+            };
+            let expected = if kind == "xz" {
+                "decompressed archive exceeds the 1024 byte limit"
+            } else {
+                "decompressed data exceeds the configured limit of 1024 bytes"
+            };
+            assert!(error.contains(expected), "{kind}: {error}");
             let mut accepted = Vec::new();
             archive_reader_with_limit(file.path(), 4096)?.read_to_end(&mut accepted)?;
             assert_eq!(accepted, raw, "{kind} ordinary archive stream must survive");
@@ -547,6 +553,20 @@ mod tests {
         );
         assert!(parse_buildinfo(&format!("{valid}pkgname = substitute\n")).is_err());
         assert!(parse_buildinfo("format = 2\npkgname = demo\n").is_err());
+        for (field, value) in [
+            ("format", "2"),
+            ("pkgname", "demo"),
+            ("pkgver", "1.0-1"),
+            ("pkgbase", "demo"),
+            ("pkgarch", "x86_64"),
+        ] {
+            let error = parse_buildinfo(&format!("{valid}{field} = {value}\n"))
+                .expect_err("duplicate identity field must be rejected");
+            assert_eq!(
+                error.to_string(),
+                format!("AUR archive .BUILDINFO must contain one {field}")
+            );
+        }
     }
 
     #[test]

@@ -450,15 +450,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn security_update_eligibility_respects_repository_priority_and_ignore_filters() {
-        if crate::core::testing::run_isolated_test(
-            "package_managers::alpm_direct::tests::security_update_eligibility_respects_repository_priority_and_ignore_filters",
-        ) {
+        const NAME: &str = "package_managers::alpm_direct::tests::security_update_eligibility_respects_repository_priority_and_ignore_filters";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
             return;
         }
-        if crate::core::is_root() {
-            eprintln!("skipped: fixture overrides require an unprivileged process");
+        if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
         struct Restore;
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -515,6 +514,9 @@ mod tests {
             temp_env::with_vars(
                 [
                     ("OMG_PACMAN_CONF", Some(config.to_str().unwrap())),
+                    ("OMG_PACMAN_LOCAL_DIR", None),
+                    ("OMG_PACMAN_SYNC_DIR", None),
+                    ("OMG_CONFIG_DIR", Some(directory.path().to_str().unwrap())),
                     ("OMG_CACHE_DIR", Some(directory.path().to_str().unwrap())),
                 ],
                 || {
@@ -577,10 +579,65 @@ mod tests {
         );
     }
 
-    /// The libalpm-backed queries read the real system database; skip them in
-    /// environments without an installed pacman local db (CI containers).
-    fn real_pacman_db_available() -> bool {
-        paths::pacman_local_dir_result().is_ok_and(|path| path.exists())
+    fn with_private_alpm(name: &str, run: impl FnOnce()) {
+        if crate::config::Settings::rerun_test_unprivileged(name) {
+            return;
+        }
+        if crate::core::testing::run_isolated_test(name) {
+            return;
+        }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
+
+        let directory = tempfile::tempdir().expect("private ALPM fixture");
+        let root = directory.path().join("root");
+        let database = root.join("var/lib/pacman");
+        let local = database.join("local");
+        let sync = database.join("sync");
+        std::fs::create_dir_all(local.join("pacman-1.0-1")).unwrap();
+        std::fs::create_dir_all(&sync).unwrap();
+        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+        std::fs::write(
+            local.join("pacman-1.0-1/desc"),
+            "%NAME%\npacman\n\n%VERSION%\n1.0-1\n\n%DESC%\nfixture package manager\n\n%ARCH%\nx86_64\n\n%REASON%\n0\n",
+        )
+        .unwrap();
+        let content =
+            "%NAME%\nlinux\n\n%VERSION%\n6.1.0-1\n\n%DESC%\nfixture kernel\n\n%ARCH%\nx86_64\n";
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(sync.join("core.db")).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "linux-6.1.0-1/desc", content.as_bytes())
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+        let config = directory.path().join("pacman.conf");
+        std::fs::write(&config, "[options]\nSigLevel = Never\n[core]\nServer = https://example.invalid/$repo/os/$arch\n").unwrap();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ALPM_HANDLE.with(|cell| *cell.borrow_mut() = None);
+                paths::reset_test_overrides();
+                clear_alpm_cache();
+            }
+        }
+        let _restore = Restore;
+        paths::set_test_overrides(Some(root), Some(database));
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
+            ],
+            run,
+        );
     }
 
     #[test]
@@ -654,33 +711,53 @@ mod tests {
 
     #[test]
     fn nested_handle_access_returns_an_error_instead_of_panicking() {
-        if !real_pacman_db_available() {
-            return;
-        }
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(nested_handle_access_returns_an_error_instead_of_panicking)
+            ),
+            || {
+                let result = with_handle(|_| with_handle(|_| Ok(())));
 
-        let result = with_handle(|_| with_handle(|_| Ok(())));
-
-        let error = result.expect_err("nested ALPM access must fail");
-        assert!(error.to_string().contains("Nested ALPM handle access"));
+                let error = result.expect_err("nested ALPM access must fail");
+                assert!(error.to_string().contains("Nested ALPM handle access"));
+            },
+        );
     }
 
     #[test]
     fn search_sync_returns_results() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        let result = search_sync("linux");
-        assert!(result.is_ok());
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(search_sync_returns_results)
+            ),
+            || {
+                let result = search_sync("linux");
+                assert!(result.is_ok());
+                let packages = result.unwrap();
+                assert_eq!(packages.len(), 1);
+                assert_eq!(packages[0].name, "linux");
+                assert_eq!(packages[0].repo, "core");
+            },
+        );
     }
 
     #[test]
     fn get_package_info_finds_installed_pacman() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        let info = get_package_info("pacman").expect("query should succeed");
-        let pkg = info.expect("pacman should be installed");
-        assert_eq!(pkg.name, "pacman");
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(get_package_info_finds_installed_pacman)
+            ),
+            || {
+                let info = get_package_info("pacman").expect("query should succeed");
+                let pkg = info.expect("pacman should be installed");
+                assert_eq!(pkg.name, "pacman");
+                assert_eq!(pkg.repo, "local");
+                assert!(pkg.installed);
+            },
+        );
     }
 
     #[test]
@@ -692,24 +769,37 @@ mod tests {
 
     #[test]
     fn list_installed_fast_includes_pacman() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        let packages = list_installed_fast().expect("list should succeed");
-        assert!(!packages.is_empty(), "should have installed packages");
-        assert!(
-            packages.iter().any(|p| p.name == "pacman"),
-            "pacman should be installed"
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(list_installed_fast_includes_pacman)
+            ),
+            || {
+                let packages = list_installed_fast().expect("list should succeed");
+                assert!(!packages.is_empty(), "should have installed packages");
+                assert_eq!(packages.len(), 1);
+                assert_eq!(packages[0].name, "pacman");
+                assert!(
+                    packages.iter().any(|p| p.name == "pacman"),
+                    "pacman should be installed"
+                );
+            },
         );
     }
 
     #[test]
     fn list_explicit_fast_is_nonempty_on_real_systems() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        let packages = list_explicit_fast().expect("list should succeed");
-        assert!(!packages.is_empty(), "should have explicit packages");
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(list_explicit_fast_is_nonempty_on_real_systems)
+            ),
+            || {
+                let packages = list_explicit_fast().expect("list should succeed");
+                assert!(!packages.is_empty(), "should have explicit packages");
+                assert_eq!(packages, ["pacman"]);
+            },
+        );
     }
 
     #[test]
@@ -720,12 +810,21 @@ mod tests {
 
     #[test]
     fn is_installed_fast_detects_pacman() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        assert!(
-            is_installed_fast("pacman").expect("query should succeed"),
-            "pacman should be installed"
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(is_installed_fast_detects_pacman)
+            ),
+            || {
+                assert!(
+                    is_installed_fast("pacman").expect("query should succeed"),
+                    "pacman should be installed"
+                );
+                assert!(
+                    !is_installed_fast("this-package-definitely-does-not-exist-12345")
+                        .expect("query should succeed")
+                );
+            },
         );
     }
 
@@ -738,51 +837,287 @@ mod tests {
 
     #[test]
     fn counts_are_consistent() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        let (total, explicit, _orphans) = get_counts().expect("counts should succeed");
-        assert!(total > 0, "should have installed packages");
-        assert!(explicit > 0, "should have explicit packages");
-        assert!(explicit <= total, "explicit should be <= total");
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(counts_are_consistent)
+            ),
+            || {
+                let (total, explicit, orphans) = get_counts().expect("counts should succeed");
+                assert!(total > 0, "should have installed packages");
+                assert!(explicit > 0, "should have explicit packages");
+                assert!(explicit <= total, "explicit should be <= total");
+                assert_eq!((total, explicit, orphans), (1, 1, 0));
+            },
+        );
     }
 
     #[test]
     fn all_package_names_are_sorted_and_include_pacman() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        let names = list_all_package_names().expect("names should succeed");
-        assert!(!names.is_empty());
-        assert!(names.contains(&"pacman".to_string()));
-        let is_sorted = names.windows(2).all(|w| w[0] <= w[1]);
-        assert!(is_sorted, "package names should be sorted");
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(all_package_names_are_sorted_and_include_pacman)
+            ),
+            || {
+                let names = list_all_package_names().expect("names should succeed");
+                assert!(!names.is_empty());
+                assert!(names.contains(&"pacman".to_string()));
+                let is_sorted = names.windows(2).all(|w| w[0] <= w[1]);
+                assert!(is_sorted, "package names should be sorted");
+                assert_eq!(names, ["linux", "pacman"]);
+            },
+        );
     }
 
     #[test]
     fn local_packages_have_valid_fields() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        let packages = list_installed_fast().expect("list should succeed");
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(local_packages_have_valid_fields)
+            ),
+            || {
+                let packages = list_installed_fast().expect("list should succeed");
+                assert_eq!(packages.len(), 1);
+                assert_eq!(packages[0].name, "pacman");
+                assert_eq!(packages[0].reason, "explicit");
 
-        for pkg in packages.iter().take(5) {
-            assert!(!pkg.name.is_empty(), "package name should not be empty");
-            assert!(
-                pkg.reason == "explicit" || pkg.reason == "dependency",
-                "reason should be explicit or dependency"
+                for pkg in packages.iter().take(5) {
+                    assert!(!pkg.name.is_empty(), "package name should not be empty");
+                    assert!(
+                        pkg.reason == "explicit" || pkg.reason == "dependency",
+                        "reason should be explicit or dependency"
+                    );
+                }
+            },
+        );
+    }
+
+    fn native_pacman_query(args: &[&str]) -> Result<String> {
+        let output = crate::core::privilege::system_command("pacman")?
+            .env("LC_ALL", "C")
+            .args(args)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "pacman {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            output.stdout.len() <= 16 * 1024 * 1024,
+            "pacman output exceeds bound"
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn parse_pacman_sync_rows(output: &str) -> Result<Vec<(String, String, String)>> {
+        let mut rows = Vec::new();
+        for line in output.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 3
+                    || (fields.len() == 4 && fields[3] == "[installed]")
+                    || (fields.len() == 5
+                        && fields[3] == "[installed:"
+                        && fields[4]
+                            .strip_suffix(']')
+                            .is_some_and(|version| !version.is_empty())),
+                "malformed pacman sync row: {line}"
+            );
+            rows.push((
+                fields[0].to_owned(),
+                fields[1].to_owned(),
+                fields[2].to_owned(),
+            ));
+        }
+        rows.sort();
+        Ok(rows)
+    }
+
+    #[test]
+    fn pacman_sync_rows_preserve_available_identity_in_native_output_shapes() -> Result<()> {
+        for line in [
+            "core pacman 7.0-1",
+            "core pacman 7.0-1 [installed]",
+            "core pacman 7.0-1 [installed: 6.1-1]",
+        ] {
+            assert_eq!(
+                parse_pacman_sync_rows(line)?,
+                vec![("core".to_owned(), "pacman".to_owned(), "7.0-1".to_owned())]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pacman_sync_rows_reject_incomplete_and_malformed_rows() {
+        for line in [
+            " ",
+            "core pacman",
+            "core pacman 7.0-1 [unknown]",
+            "core pacman 7.0-1 [installed: ]",
+            "core pacman 7.0-1 [installed: 6.1-1",
+            "core pacman 7.0-1 [unknown: 6.1-1]",
+            "core pacman 7.0-1 [installed: 6.1-1] extra",
+        ] {
+            let error = parse_pacman_sync_rows(line).expect_err("malformed native row");
+            assert_eq!(
+                error.to_string(),
+                format!("malformed pacman sync row: {line}")
             );
         }
     }
 
     #[test]
+    fn pacman_sync_rows_sort_without_dropping_repository_duplicates() -> Result<()> {
+        assert_eq!(
+            parse_pacman_sync_rows("extra pacman 7.0-1\ncore pacman 7.0-1\ncore pacman 7.0-1\n")?,
+            vec![
+                ("core".to_owned(), "pacman".to_owned(), "7.0-1".to_owned()),
+                ("core".to_owned(), "pacman".to_owned(), "7.0-1".to_owned()),
+                ("extra".to_owned(), "pacman".to_owned(), "7.0-1".to_owned()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_pacman_query_rejects_real_option_errors_with_stderr() {
+        let error = native_pacman_query(&["--omg-invalid-read-only-fixture-option"])
+            .expect_err("pacman must reject an unknown option");
+        let message = error.to_string();
+        assert!(message.contains("pacman ["), "{message}");
+        assert!(message.contains("unrecognized option"), "{message}");
+        assert!(
+            message.contains("--omg-invalid-read-only-fixture-option"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly selected native Arch host with local and sync databases"]
+    fn native_inventory_and_search_match_pacman() -> Result<()> {
+        use crate::package_managers::types::VersionDisplay as _;
+
+        anyhow::ensure!(
+            !crate::core::paths::test_mode()
+                && !std::env::vars_os()
+                    .any(|(key, _)| key.to_string_lossy().starts_with("OMG_PACMAN_")),
+            "native comparison requires test mode and pacman overrides to be unset"
+        );
+        anyhow::ensure!(
+            paths::pacman_local_dir_result()?
+                .join("ALPM_DB_VERSION")
+                .is_file()
+                && paths::pacman_sync_dir_result()?.is_dir(),
+            "native comparison requires existing local and sync databases"
+        );
+        let local_rows = |args: &[&str]| -> Result<Vec<(String, String)>> {
+            let output = native_pacman_query(args)?;
+            let mut rows = Vec::new();
+            for line in output.lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                anyhow::ensure!(fields.len() == 2, "malformed pacman local row: {line}");
+                rows.push((fields[0].to_owned(), fields[1].to_owned()));
+            }
+            rows.sort();
+            Ok(rows)
+        };
+        let sync_rows = || -> Result<Vec<(String, String, String)>> {
+            parse_pacman_sync_rows(&native_pacman_query(&["-Sl", "--color", "never"])?)
+        };
+        let installed = local_rows(&["-Q"])?;
+        let explicit = local_rows(&["-Qe"])?;
+        let sync = sync_rows()?;
+        anyhow::ensure!(
+            installed.iter().any(|(name, _)| name == "pacman")
+                && !explicit.is_empty()
+                && !sync.is_empty(),
+            "native pacman inventory is incomplete"
+        );
+        let expected_search: Vec<_> = sync
+            .iter()
+            .filter(|(_, name, _)| name.contains("linux"))
+            .cloned()
+            .collect();
+        anyhow::ensure!(
+            !expected_search.is_empty(),
+            "native sync database has no linux-named package"
+        );
+
+        let mut actual_installed: Vec<_> = list_installed_fast()?
+            .into_iter()
+            .map(|package| (package.name, package.version.version_string()))
+            .collect();
+        actual_installed.sort();
+        let mut actual_explicit = list_explicit_fast()?;
+        actual_explicit.sort();
+        let mut actual_search: Vec<_> = search_sync("linux")?
+            .into_iter()
+            .filter(|package| package.name.contains("linux"))
+            .map(|package| (package.repo, package.name, package.version.version_string()))
+            .collect();
+        actual_search.sort();
+        let expected_explicit: Vec<_> = explicit.iter().map(|(name, _)| name.clone()).collect();
+        let mut expected_names: Vec<_> = installed
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(sync.iter().map(|(_, name, _)| name.clone()))
+            .collect();
+        expected_names.sort();
+        expected_names.dedup();
+        let (total, explicit_count, _) = get_counts()?;
+        let info = get_package_info("pacman")?.context("native pacman package missing")?;
+        let pacman_version = installed
+            .iter()
+            .find(|(name, _)| name == "pacman")
+            .context("native pacman package missing")?;
+        assert_eq!(actual_installed, installed);
+        assert_eq!(actual_explicit, expected_explicit);
+        assert_eq!(actual_search, expected_search);
+        assert_eq!(list_all_package_names()?, expected_names);
+        assert_eq!(total, installed.len());
+        assert_eq!(explicit_count, explicit.len());
+        assert_eq!(info.name, "pacman");
+        assert_eq!(info.version.version_string(), pacman_version.1);
+        assert_eq!(info.repo, "local");
+        assert!(info.installed);
+        assert!(is_installed_fast("pacman")?);
+        assert_eq!(
+            local_rows(&["-Q"])?,
+            installed,
+            "native inventory changed during comparison"
+        );
+        assert_eq!(
+            local_rows(&["-Qe"])?,
+            explicit,
+            "explicit inventory changed during comparison"
+        );
+        assert_eq!(
+            sync_rows()?,
+            sync,
+            "sync inventory changed during comparison"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sync_results_carry_repo_names() {
-        if !real_pacman_db_available() {
-            return;
-        }
-        let packages = search_sync("linux").expect("search should succeed");
-        for pkg in packages.iter().take(5) {
-            assert!(!pkg.repo.is_empty(), "repo should not be empty");
-        }
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(sync_results_carry_repo_names)
+            ),
+            || {
+                let packages = search_sync("linux").expect("search should succeed");
+                assert_eq!(packages.len(), 1);
+                assert_eq!(packages[0].name, "linux");
+                assert_eq!(packages[0].repo, "core");
+                for pkg in packages.iter().take(5) {
+                    assert!(!pkg.repo.is_empty(), "repo should not be empty");
+                }
+            },
+        );
     }
 }

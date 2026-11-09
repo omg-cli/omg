@@ -341,6 +341,8 @@ mod tests {
     fn future_cache_timestamp_is_not_fresh() {
         let future = SystemTime::now() + Duration::from_hours(1);
         assert!(!modified_within_ttl(future, Duration::from_hours(2)));
+        let past = SystemTime::now() - Duration::from_secs(1);
+        assert!(modified_within_ttl(past, Duration::from_hours(2)));
     }
 
     #[test]
@@ -405,6 +407,7 @@ mod tests {
 
         validate_and_publish_metadata(&archive, &index, &json).unwrap();
 
+        assert_eq!(std::fs::read(&archive).unwrap(), json);
         assert_eq!(
             read_metadata_archive(&archive).unwrap()[0].name,
             "aur-helper",
@@ -446,16 +449,36 @@ mod tests {
         let archive = directory.path().join("metadata.json.gz");
         let index = directory.path().join("metadata.rkyv");
         let sidecar = directory.path().join("metadata.gz.meta");
-        std::fs::write(&archive, b"old archive").unwrap();
-        std::fs::write(&index, b"old index").unwrap();
+        let mut valid = Vec::new();
+        let mut encoder = flate2::write::GzEncoder::new(&mut valid, flate2::Compression::default());
+        serde_json::to_writer(
+            &mut encoder,
+            &serde_json::json!([{"Name": "old-package", "Version": "1.0-1"}]),
+        )
+        .unwrap();
+        encoder.finish().unwrap();
+        validate_and_publish_metadata(&archive, &index, &valid).unwrap();
+        let archive_before = std::fs::read(&archive).unwrap();
+        let index_before = std::fs::read(&index).unwrap();
+        {
+            let old_index = crate::package_managers::aur_index::AurIndex::open(&index).unwrap();
+            let old_entry = old_index.get("old-package").unwrap().unwrap();
+            assert_eq!(old_entry.version.as_str(), "1.0-1");
+        }
         std::fs::write(&sidecar, b"old validators").unwrap();
 
         let error = validate_and_publish_metadata(&archive, &index, b"invalid gzip")
             .expect_err("invalid metadata must fail validation");
-        assert!(!error.to_string().is_empty());
-        assert_eq!(std::fs::read(&archive).unwrap(), b"old archive");
-        assert_eq!(std::fs::read(&index).unwrap(), b"old index");
+        assert_eq!(
+            error.to_string(),
+            "Failed to parse bounded AUR JSON metadata"
+        );
+        assert_eq!(std::fs::read(&archive).unwrap(), archive_before);
+        assert_eq!(std::fs::read(&index).unwrap(), index_before);
         assert_eq!(std::fs::read(&sidecar).unwrap(), b"old validators");
+        let preserved_index = crate::package_managers::aur_index::AurIndex::open(&index).unwrap();
+        let preserved = preserved_index.get("old-package").unwrap().unwrap();
+        assert_eq!(preserved.version.as_str(), "1.0-1");
     }
 
     #[test]

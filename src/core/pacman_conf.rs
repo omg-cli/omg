@@ -361,17 +361,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn missing_pacman_config_is_not_replaced_with_fabricated_repositories() {
-        if crate::core::testing::run_isolated_test(
-            "core::pacman_conf::tests::missing_pacman_config_is_not_replaced_with_fabricated_repositories",
-        ) {
+        const NAME: &str = "core::pacman_conf::tests::missing_pacman_config_is_not_replaced_with_fabricated_repositories";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
             return;
         }
-        if crate::core::is_root() {
-            // Elevated processes ignore OMG_PACMAN_* overrides, so this
-            // fixture test only applies to unprivileged runs.
-            eprintln!("skipped: elevated processes ignore caller path overrides");
+        if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
         let directory = tempfile::tempdir().expect("temp dir");
         let missing = directory.path().join("missing-pacman.conf");
 

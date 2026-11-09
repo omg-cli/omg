@@ -586,26 +586,89 @@ mod tests {
     }
 
     #[cfg(feature = "arch")]
-    #[tokio::test]
-    async fn local_archive_cannot_bypass_a_banned_package_policy() -> Result<()> {
-        let directory = tempfile::tempdir()?;
+    #[test]
+    fn local_archive_cannot_bypass_a_banned_package_policy() -> Result<()> {
+        const NAME: &str =
+            "core::packages::service::tests::local_archive_cannot_bypass_a_banned_package_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        temp_env::with_vars(
+            [
+                ("SUDO_USER", None::<&str>),
+                ("SUDO_HOME", None),
+                ("DOAS_USER", None),
+                ("OMG_TEST_MODE", None),
+                ("OMG_TEST_DISTRO", None),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(local_archive_policy_fixture())
+            },
+        )
+    }
+
+    #[cfg(feature = "arch")]
+    async fn local_archive_policy_fixture() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir_in("/var/tmp")?;
+        let database = directory.path().join("var/lib/pacman");
+        std::fs::create_dir_all(database.join("local"))?;
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), b"9\n")?;
+        struct ResetPaths;
+        impl Drop for ResetPaths {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+            }
+        }
+        crate::core::paths::set_test_overrides(
+            Some(directory.path().to_path_buf()),
+            Some(database.clone()),
+        );
+        let _reset = ResetPaths;
+        {
+            let handle = crate::package_managers::alpm_ops::open_default_alpm()?;
+            assert_eq!(std::path::Path::new(handle.root()), directory.path());
+            assert_eq!(std::path::Path::new(handle.dbpath()), database);
+        }
+
         let archive = directory.path().join("renamed-1.0-1-x86_64.pkg.tar.gz");
         write_fake_local_package(&archive, "banned-local", "1.0-1")?;
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600))?;
+        let allowed = directory.path().join("allowed-1.0-1-x86_64.pkg.tar.gz");
+        write_fake_local_package(&allowed, "allowed-local", "1.0-1")?;
+        std::fs::set_permissions(&allowed, std::fs::Permissions::from_mode(0o600))?;
 
         let mut policy = SecurityPolicy::default();
         policy.banned_packages.push("banned-local".to_string());
-        let service =
-            PackageService::builder(Arc::new(crate::core::testing::TestPackageManager::new()))
-                .policy(policy)
-                .vulnerability_source(Arc::new(CleanVulnerabilitySource))
-                .without_history()
-                .build()?;
+        let backend = Arc::new(crate::core::testing::TestPackageManager::new());
+        let service = PackageService::builder(backend.clone())
+            .policy(policy)
+            .vulnerability_source(Arc::new(CleanVulnerabilitySource))
+            .without_history()
+            .build()?;
 
+        assert_eq!(backend.get_status(true).await?.1, 0);
         let error = service
             .install(&[archive.display().to_string()], false)
             .await
             .expect_err("local package metadata must be checked by policy before installation");
-        assert!(error.to_string().contains("banned-local"), "{error:#}");
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::core::security::policy::PolicyError>(),
+                Some(crate::core::security::policy::PolicyError::Banned { name })
+                    if name == "banned-local"
+            ),
+            "unexpected policy error: {error:#}"
+        );
+        assert_eq!(backend.get_status(true).await?.1, 0);
+        service
+            .install(&[allowed.display().to_string()], false)
+            .await?;
+        assert_eq!(backend.get_status(true).await?.1, 1);
         Ok(())
     }
 

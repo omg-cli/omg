@@ -231,17 +231,14 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn initialization_errors_are_returned_to_the_caller() {
-        if crate::core::testing::run_isolated_test(
-            "package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller",
-        ) {
+        const NAME: &str = "package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
             return;
         }
-        if crate::core::is_root() {
-            // Elevated processes ignore OMG_PACMAN_* overrides, so this
-            // fixture test only applies to unprivileged runs.
-            eprintln!("skipped: elevated processes ignore caller path overrides");
+        if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
         let directory = tempfile::tempdir().expect("temporary ALPM paths");
         let database = directory.path().join("db");
         std::fs::create_dir(&database).expect("database directory");
@@ -258,9 +255,9 @@ mod tests {
                 ("OMG_PACMAN_CONF", Some(config.as_os_str())),
             ],
             || {
-                let Err(error) = AlpmWorker::new() else {
-                    panic!("invalid worker policy must fail");
-                };
+                let error = AlpmWorker::new()
+                    .err()
+                    .expect("invalid worker policy must fail");
                 assert!(error.to_string().contains("PackageSometimes"), "{error:#}");
             },
         );

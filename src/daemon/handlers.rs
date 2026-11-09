@@ -2949,15 +2949,15 @@ pub(super) mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_initializer_does_not_block_the_async_executor() -> anyhow::Result<()> {
-        if crate::core::testing::run_isolated_test(
-            "daemon::handlers::tests::daemon_native_initializer_does_not_block_the_async_executor",
-        ) {
+        const NAME: &str =
+            "daemon::handlers::tests::daemon_native_initializer_does_not_block_the_async_executor";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
             return Ok(());
         }
-        if crate::core::is_root() {
-            eprintln!("skipped: native path overrides require an unprivileged fixture run");
+        if crate::core::testing::run_isolated_test(NAME) {
             return Ok(());
         }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
         with_native_backend_fixture(|state, directory| {
             let config = directory.join("pacman.conf");
             std::fs::remove_file(&config)?;
@@ -2997,15 +2997,15 @@ pub(super) mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_retirement_releases_backend_lock_and_executor() -> anyhow::Result<()> {
-        if crate::core::testing::run_isolated_test(
-            "daemon::handlers::tests::daemon_native_retirement_releases_backend_lock_and_executor",
-        ) {
+        const NAME: &str =
+            "daemon::handlers::tests::daemon_native_retirement_releases_backend_lock_and_executor";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
             return Ok(());
         }
-        if crate::core::is_root() {
-            eprintln!("skipped: native path overrides require an unprivileged fixture run");
+        if crate::core::testing::run_isolated_test(NAME) {
             return Ok(());
         }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
         with_native_backend_fixture(|state, _directory| {
             let (started, shutdown_started) = std::sync::mpsc::channel();
             let notify = Arc::new(tokio::sync::Notify::new());
@@ -3065,34 +3065,49 @@ pub(super) mod tests {
     #[serial_test::serial]
     fn daemon_native_cancelled_request_retains_serialization_until_work_finishes()
     -> anyhow::Result<()> {
-        if crate::core::testing::run_isolated_test(
-            "daemon::handlers::tests::daemon_native_cancelled_request_retains_serialization_until_work_finishes",
-        ) {
+        const NAME: &str = "daemon::handlers::tests::daemon_native_cancelled_request_retains_serialization_until_work_finishes";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
             return Ok(());
         }
-        if crate::core::is_root() {
-            eprintln!("skipped: native path overrides require an unprivileged fixture run");
+        if crate::core::testing::run_isolated_test(NAME) {
             return Ok(());
         }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
         with_native_backend_fixture(|state, directory| {
             let config = directory.join("pacman.conf");
-            std::fs::remove_file(&config)?;
-            nix::unistd::mkfifo(&config, nix::sys::stat::Mode::S_IRWXU)?;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
                 .block_on(async {
-                    let request_state = Arc::clone(&state);
-                    let request = tokio::spawn(async move {
-                        let guard = Arc::clone(&request_state.refresh_lock).lock_owned().await;
-                        request_state.refresh_system_backends(guard, None).await
-                    });
-                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                        while state.native_tasks.is_empty() {
-                            tokio::task::yield_now().await;
-                        }
-                    })
+                    let spawn_request = |request_state: Arc<DaemonState>| {
+                        tokio::spawn(async move {
+                            let guard = Arc::clone(&request_state.refresh_lock).lock_owned().await;
+                            request_state.refresh_system_backends(guard, None).await
+                        })
+                    };
+                    let wait_for_tracker_empty = async |expected: bool| {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            while state.native_tasks.is_empty() != expected {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                    };
+                    let completed = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        spawn_request(Arc::clone(&state)),
+                    )
                     .await?;
+                    drop(completed??);
+                    wait_for_tracker_empty(true).await?;
+                    assert!(
+                        state.refresh_lock.try_lock().is_ok(),
+                        "completed refresh must release its serialization lease"
+                    );
+                    std::fs::remove_file(&config)?;
+                    nix::unistd::mkfifo(&config, nix::sys::stat::Mode::S_IRWXU)?;
+                    let request = spawn_request(Arc::clone(&state));
+                    wait_for_tracker_empty(false).await?;
                     request.abort();
                     assert!(
                         request
@@ -3171,15 +3186,14 @@ pub(super) mod tests {
     #[cfg(feature = "arch")]
     #[serial_test::serial]
     fn daemon_native_retirement_keeps_final_join_off_the_request_executor() -> anyhow::Result<()> {
-        if crate::core::testing::run_isolated_test(
-            "daemon::handlers::tests::daemon_native_retirement_keeps_final_join_off_the_request_executor",
-        ) {
+        const NAME: &str = "daemon::handlers::tests::daemon_native_retirement_keeps_final_join_off_the_request_executor";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
             return Ok(());
         }
-        if crate::core::is_root() {
-            eprintln!("skipped: native path overrides require an unprivileged fixture run");
+        if crate::core::testing::run_isolated_test(NAME) {
             return Ok(());
         }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
         with_native_backend_fixture(|state, _directory| {
             let (started, shutdown_started) = std::sync::mpsc::channel();
             let notify = Arc::new(tokio::sync::Notify::new());
@@ -3255,7 +3269,9 @@ pub(super) mod tests {
         let root = directory.path().join("root");
         let database = directory.path().join("db");
         let config = directory.path().join("pacman.conf");
+        let omg_config = directory.path().join("omg-config");
         std::fs::create_dir(&root)?;
+        std::fs::create_dir(&omg_config)?;
         std::fs::create_dir_all(database.join("local"))?;
         std::fs::create_dir_all(database.join("sync"))?;
         std::fs::write(&config, NATIVE_FIXTURE_CONFIG)?;
@@ -3267,6 +3283,8 @@ pub(super) mod tests {
         )?);
         temp_env::with_vars(
             [
+                ("OMG_CONFIG_DIR", Some(omg_config.as_os_str())),
+                ("OMG_TEST_MODE", None),
                 ("OMG_PACMAN_ROOT", Some(root.as_os_str())),
                 ("OMG_PACMAN_DB_DIR", Some(database.as_os_str())),
                 ("OMG_PACMAN_CONF", Some(config.as_os_str())),
@@ -3280,8 +3298,12 @@ pub(super) mod tests {
                         directory.path(),
                     )),
                 )?);
-                *state.system_backends.write().expect("fixture backend lock") =
-                    SystemBackendAccess::production()?;
+                let backend = SystemBackendAccess::production()?;
+                anyhow::ensure!(
+                    backend.has_alpm_worker(),
+                    "fixture requires a native ALPM worker"
+                );
+                *state.system_backends.write().expect("fixture backend lock") = backend;
                 run(state, directory.path())
             },
         )

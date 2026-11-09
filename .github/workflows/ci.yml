@@ -1337,7 +1337,7 @@ jobs:
     # `!github.event.act` skips this leg during local act runs (no macOS
     # containers exist); the condition is always true on GitHub.
     if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
@@ -1439,7 +1439,7 @@ jobs:
     name: "macOS nextest source contract"
     needs: quick-gate
     if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     permissions:
       contents: read

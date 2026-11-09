@@ -1105,10 +1105,47 @@ mod new_features {
     #[test]
     fn test_diff_command() {
         let project = TestProject::new();
+        let from = omg_lib::core::env::fingerprint::EnvironmentState {
+            schema_version: 1,
+            runtimes: std::collections::BTreeMap::from([("node".into(), "20".into())]),
+            packages: vec!["curl".into(), "git".into()],
+            timestamp: 1_700_000_000,
+            hash: String::new(),
+        };
+        let to = omg_lib::core::env::fingerprint::EnvironmentState {
+            schema_version: 1,
+            runtimes: std::collections::BTreeMap::from([("node".into(), "22".into())]),
+            packages: vec!["curl".into(), "wget".into()],
+            timestamp: 1_700_000_000,
+            hash: String::new(),
+        };
+        from.save(project.path().join("before.lock"))
+            .expect("save source lock");
+        to.save(project.path().join("after.lock"))
+            .expect("save target lock");
+        let before = std::fs::read(project.path().join("before.lock")).expect("read source lock");
+        let after = std::fs::read(project.path().join("after.lock")).expect("read target lock");
+        let comparison = project.run_with_env(
+            &["diff", "--from", "before.lock", "after.lock"],
+            &[("NO_COLOR", "1")],
+        );
+        comparison.assert_success();
+        for expected in ["node 20 → 22", "+ wget", "- git", "Packages:  +1 -1"] {
+            comparison.assert_stdout_contains(expected);
+        }
+        assert_eq!(
+            std::fs::read(project.path().join("before.lock")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(project.path().join("after.lock")).unwrap(),
+            after
+        );
         project.with_omg_lock(locks::VALID_LOCK);
 
         let result = project.run(&["diff", "omg.lock"]);
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        project.close_checked();
     }
 
     #[test]
@@ -1378,17 +1415,61 @@ mod security {
 
     #[test]
     fn test_audit_secrets_scan() {
-        let project = TestProject::new();
-        project.create_file("config.txt", "AWS_SECRET_KEY=AKIAIOSFODNN7EXAMPLE");
+        let project = TestProject::for_distro("debian");
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let content = format!("AWS_SECRET_KEY={secret}\n");
+        project.create_file("config.txt", &content);
+        project.create_file("clean.txt", "no credentials here\n");
+
+        let clean = project.run(&["audit", "secrets", "--path", "clean.txt"]);
+        clean.assert_success();
+        clean.assert_stdout_contains("No secrets detected.");
 
         let result = project.run(&["audit", "secrets"]);
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        result.assert_failure();
+        result.assert_stdout_contains("Found 1 potential secrets:");
+        result.assert_stdout_contains("AWS Access Key in ./config.txt:1");
+        result.assert_stderr_contains("Secret scan failed: 1 critical secret finding(s)");
+        assert!(
+            !result.combined_output().contains(secret),
+            "secret must be redacted"
+        );
+        assert_eq!(project.read_file("config.txt").unwrap(), content);
+        assert_eq!(
+            project.read_file("clean.txt").unwrap(),
+            "no credentials here\n"
+        );
+        project.close_checked();
     }
 
     #[test]
     fn test_injection_prevention_search() {
-        for input in validation::INJECTION_ATTEMPTS {
-            let result = run_omg(&["search", input]);
+        let project = TestProject::for_distro("debian");
+        project.mock_install("git", "2.43.0").expect("seed git");
+        let state_path = project.data_dir.path().join("mock_state_apt.json");
+        let before = std::fs::read(&state_path).expect("read package state");
+        let valid = project.run(&["search", "git", "--no-aur", "--json"]);
+        valid.assert_success();
+        let packages: serde_json::Value = serde_json::from_str(&valid.stdout).expect("search JSON");
+        assert!(
+            packages
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|package| package["name"] == "git")
+        );
+        for input in [
+            ";touch injection-sentinel",
+            "$(touch injection-sentinel)",
+            "|touch injection-sentinel",
+            "&&touch injection-sentinel",
+            "'; SELECT literal;--",
+            "<script>",
+        ] {
+            let result = project.run(&["search", input, "--no-aur"]);
+            result.assert_failure();
+            result.assert_stderr_contains("Invalid search query: shell metacharacters detected");
             assert!(
                 !result.stdout_contains("pwned"),
                 "Should prevent injection: {input}"
@@ -1398,24 +1479,82 @@ mod security {
                 "Should prevent path traversal"
             );
             assert_debian_platform_purity(&result, "Debian injection prevention search");
+            assert!(!project.file_exists("injection-sentinel"));
         }
+        let traversal = project.run(&["search", "../outside", "--no-aur"]);
+        traversal.assert_failure();
+        traversal.assert_stderr_contains("Invalid search query: path traversal detected");
+        let encoded = project.run(&["search", "/outside%00.txt", "--no-aur"]);
+        encoded.assert_failure();
+        encoded.assert_stderr_contains("Invalid search query: path traversal detected");
+        let literal = project.run(&["search", "`touch injection-sentinel`", "--no-aur"]);
+        literal.assert_success();
+        assert!(!project.file_exists("injection-sentinel"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        project.close_checked();
     }
 
     #[test]
     fn test_injection_prevention_info() {
-        for input in validation::INJECTION_ATTEMPTS {
-            let result = run_omg(&["info", input]);
+        let project = TestProject::for_distro("debian");
+        project.mock_install("git", "2.43.0").expect("seed git");
+        let state_path = project.data_dir.path().join("mock_state_apt.json");
+        let before = std::fs::read(&state_path).expect("read package state");
+        let valid = project.run(&["info", "git"]);
+        valid.assert_success();
+        valid.assert_stdout_contains("git");
+        for (input, diagnostic) in [
+            (";touch injection-sentinel", "Invalid character ';'"),
+            ("$(touch injection-sentinel)", "Invalid character '$'"),
+            ("`touch injection-sentinel`", "Invalid character '`'"),
+            ("|touch injection-sentinel", "Invalid character '|'"),
+            ("&&touch injection-sentinel", "Invalid character '&'"),
+            ("'; SELECT literal;--", "Invalid character '\\''"),
+            ("<script>", "Invalid character '<'"),
+            ("../outside", "Package name cannot start with '.'"),
+            ("/outside%00.txt", "Invalid character '%'"),
+        ] {
+            let result = project.run(&["info", input]);
+            result.assert_failure();
+            result.assert_stderr_contains(diagnostic);
             assert!(!result.stdout_contains("pwned"), "Should prevent injection");
             assert_debian_platform_purity(&result, "Debian injection prevention info");
+            assert!(!project.file_exists("injection-sentinel"));
         }
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        project.close_checked();
     }
 
     #[test]
     fn test_apt_source_validation() {
-        // OMG should validate APT sources
-        let result = run_omg(&["status"]);
+        let project = TestProject::for_distro("debian");
+        let result = project.run(&["status"]);
         result.assert_success();
         assert_debian_platform_purity(&result, "Debian apt source validation");
+        // Parsing a source entry does not authenticate its repository.
+        let content = "deb [arch=amd64 signed-by=/fixture-keyring.gpg] https://example.invalid/repo stable main contrib\ndeb [signed-by=/fixture-keyring.gpg https://invalid.example/repo stable main\n";
+        let path = project.create_file("sources.list", content);
+        let repos =
+            omg_lib::package_managers::debian_db::parse_sources_list_content(content, &path)
+                .expect("parse local source fixture");
+        assert_eq!(repos.len(), 1);
+        let repo = &repos[0];
+        assert_eq!(
+            repo.repo_type,
+            omg_lib::package_managers::debian_db::RepoType::Binary
+        );
+        assert_eq!(repo.uri, "https://example.invalid/repo");
+        assert_eq!(repo.suite, "stable");
+        assert_eq!(repo.components, ["main", "contrib"]);
+        assert_eq!(repo.arch.as_deref(), Some("amd64"));
+        assert_eq!(
+            repo.signed_by.as_deref(),
+            Some(std::path::Path::new("/fixture-keyring.gpg"))
+        );
+        assert!(repo.enabled);
+        assert_eq!(repo.source_file, path);
+        assert_eq!(project.read_file("sources.list").unwrap(), content);
+        project.close_checked();
     }
 
     #[test]
@@ -1459,23 +1598,60 @@ mod edge_cases {
 
     #[test]
     fn test_very_long_query() {
-        let long_query = validation::very_long_input(10000);
-        let result = run_omg(&["search", &long_query]);
-        assert!(
-            !result.stderr_contains("panicked at"),
-            "Should handle long input"
+        let project = TestProject::for_distro("debian");
+        let allowed = validation::very_long_input(100);
+        let result = project.run(&["search", &allowed, "--json", "--no-aur"]);
+        common::assertions::assert_process_completed(&result);
+        result.assert_success();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.stdout).unwrap(),
+            serde_json::json!([])
         );
+        for length in [101, 10000] {
+            let query = validation::very_long_input(length);
+            let result = project.run(&["search", &query, "--json", "--no-aur"]);
+            common::assertions::assert_process_completed(&result);
+            assert_eq!(result.exit_code, 1, "{result:?}");
+            assert_eq!(
+                result.stderr.trim(),
+                "Error: Search query too long (max 100 characters)"
+            );
+        }
+        project.close_checked();
     }
 
     #[test]
     fn test_empty_inputs() {
+        let project = TestProject::for_distro("debian");
+        project.mock_available("search-fixture", "1.0").unwrap();
         for input in validation::EMPTY_INPUTS {
-            let result = run_omg(&["search", input]);
-            assert!(
-                !result.stderr_contains("panicked at"),
-                "Should handle empty input"
-            );
+            let result = project.run(&["search", input, "--json", "--no-aur"]);
+            common::assertions::assert_process_completed(&result);
+            if input.chars().any(char::is_control) {
+                assert_eq!(result.exit_code, 1, "{input:?}: {result:?}");
+                assert_eq!(
+                    result.stderr.trim(),
+                    "Error: Search query contains invalid characters"
+                );
+            } else {
+                result.assert_success();
+                let rows: Vec<serde_json::Value> = serde_json::from_str(&result.stdout).unwrap();
+                if input.is_empty() {
+                    assert!(
+                        rows.iter()
+                            .any(|row| row["name"] == "search-fixture" && row["version"] == "1.0"),
+                        "{input:?}: {rows:?}"
+                    );
+                } else {
+                    let names: Vec<_> = rows
+                        .iter()
+                        .map(|row| row["name"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(names, ["apt", "firefox-esr", "git"]);
+                }
+            }
         }
+        project.close_checked();
     }
 
     #[test]
@@ -1502,28 +1678,36 @@ mod migration {
 
     #[test]
     fn test_migrate_export_format() {
-        let project = TestProject::new();
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("git", "2.43.0")
+            .expect("seed installed git");
+        let state_path = project.data_dir.path().join("mock_state_apt.json");
+        let before = std::fs::read(&state_path).expect("read package state");
         let result = project.run(&["migrate", "export", "--output", "manifest.toml"]);
-
-        if result.success {
-            assert!(
-                project.file_exists("manifest.toml"),
-                "successful export must create the manifest file"
-            );
-            let manifest = project
+        result.assert_success();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &project
                 .read_file("manifest.toml")
-                .expect("manifest readable");
-            assert!(
-                !manifest.trim().is_empty(),
-                "exported manifest must have content"
-            );
-        } else {
-            assert!(
-                !result.stderr.trim().is_empty(),
-                "failed export must explain why on stderr. stdout:\n{}",
-                result.stdout
-            );
-        }
+                .expect("manifest readable"),
+        )
+        .expect("exported manifest must be JSON");
+        assert_eq!(manifest["version"], "1.0");
+        assert_eq!(manifest["source_distro"], "debian");
+        assert_eq!(
+            manifest["packages"],
+            serde_json::json!([{
+                "original_name": "git", "category": "application",
+                "description": null, "alternatives": ["git"]
+            }])
+        );
+        project.create_file("blocker", "keep");
+        let failure = project.run(&["migrate", "export", "--output", "blocker/manifest.json"]);
+        failure.assert_failure();
+        failure.assert_stderr_contains("Failed to create parent directory");
+        assert_eq!(project.read_file("blocker").unwrap(), "keep");
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        project.close_checked();
     }
 
     #[test]
@@ -1591,11 +1775,39 @@ curl = "8.5.0"
 
     #[test]
     fn test_package_name_mapping() {
-        // Some packages have different names across distros
-        // e.g., python3-pip vs python-pip
-        let project = TestProject::new();
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("git", "2.43.0")
+            .expect("seed installed git");
+        let state_path = project.data_dir.path().join("mock_state_apt.json");
+        let before = std::fs::read(&state_path).expect("read package state");
         let result = project.run(&["migrate", "export", "--output", "test.toml"]);
+        result.assert_success();
         assert!(!result.stderr_contains("panicked at"), "Should not panic");
+        project.create_file("mapping.json", r#"{
+            "version": "1.0", "source_distro": "arch", "created_at": 1700000000,
+            "runtimes": {},
+            "packages": [
+                {"original_name": "python-pip", "category": "application", "description": null, "alternatives": []},
+                {"original_name": "git", "category": "application", "description": null, "alternatives": []}
+            ]
+        }"#);
+        let preview = project.run_with_env(
+            &["migrate", "import", "--dry-run", "mapping.json"],
+            &[("NO_COLOR", "1")],
+        );
+        preview.assert_success();
+        for expected in [
+            "Source: arch → Target: debian",
+            "python-pip → python3-pip",
+            "Mapped: 1/2 packages (1 unmapped)",
+            "- git",
+            "No changes made (dry run)",
+        ] {
+            preview.assert_stdout_contains(expected);
+        }
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        project.close_checked();
     }
 }
 
@@ -1608,31 +1820,91 @@ mod integration_scenarios {
 
     #[test]
     fn scenario_full_workflow() {
-        let project = TestProject::new();
+        let project = TestProject::for_distro("debian");
+        project
+            .mock_install("git", "2.43.0")
+            .expect("seed installed package");
+        let package_state = project.data_dir.path().join("mock_state_apt.json");
+        let package_state_before = std::fs::read(&package_state).expect("read package state");
         project.with_tool_versions(&[("nodejs", "20.10.0"), ("python", "3.11.0")]);
 
         // 1. Check status
         let result = project.run(&["status"]);
         result.assert_success();
+        let json_status = project.run(&["status", "--json"]);
+        json_status.assert_success();
+        let status: serde_json::Value =
+            serde_json::from_str(&json_status.stdout).expect("status JSON");
+        assert_eq!(status["total_packages"], 1);
+        assert_eq!(status["explicit_packages"], 1);
+        assert_eq!(status["orphan_packages"], 0);
+        assert_eq!(status["updates_available"], 0);
 
         // 2. Capture environment
         let result = project.run(&["env", "capture"]);
         result.assert_success();
         assert!(project.file_exists("omg.lock"), "Should create omg.lock");
+        let lock_path = project.path().join("omg.lock");
+        let lock_before = std::fs::read(&lock_path).expect("read captured lock");
+        let captured = omg_lib::core::env::fingerprint::EnvironmentState::load(&lock_path)
+            .expect("captured lock is valid");
+        assert_eq!(captured.packages, ["git"]);
 
         // 3. Check environment
         let result = project.run(&["env", "check"]);
         assert!(!result.stderr_contains("panicked at"));
+        result.assert_success();
+        result.assert_stdout_contains("Environment is in sync");
 
         // 4. Create snapshot
         let result = project.run(&["snapshot", "create", "--message", "Initial"]);
         assert!(!result.stderr_contains("panicked at"));
+        result.assert_success();
+        result.assert_stdout_contains("Snapshot created!");
+        let snapshots = project.data_dir.path().join("snapshots");
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(snapshots.join("index.json")).expect("read snapshot index"),
+        )
+        .expect("snapshot index JSON");
+        let entries = index["snapshots"].as_array().expect("snapshot entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["message"], "Initial");
+        let id = entries[0]["id"].as_str().expect("snapshot ID");
+        assert!(
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+            "invalid snapshot ID: {id}"
+        );
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(snapshots.join(format!("{id}.json"))).expect("read snapshot"),
+        )
+        .expect("snapshot JSON");
+        assert_eq!(snapshot["id"], id);
+        assert_eq!(snapshot["message"], "Initial");
+        assert_eq!(snapshot["state"]["packages"], serde_json::json!(["git"]));
+        assert_eq!(snapshot["state"]["hash"], captured.hash);
+        assert_eq!(entries[0]["hash"], captured.hash);
+        assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before);
+        assert_eq!(std::fs::read(&package_state).unwrap(), package_state_before);
+        project.close_checked();
     }
 
     #[test]
     fn scenario_debian_to_ubuntu_migration() {
         let debian_project = TestProject::for_distro("debian");
         let ubuntu_project = TestProject::for_distro("ubuntu");
+        debian_project
+            .mock_install("git", "2.43.0")
+            .expect("seed Debian package");
+        ubuntu_project
+            .mock_install("curl", "8.5.0")
+            .expect("seed Ubuntu package");
+        let source_state = debian_project.data_dir.path().join("mock_state_apt.json");
+        let target_state = ubuntu_project.data_dir.path().join("mock_state_apt.json");
+        let source_before = std::fs::read(&source_state).expect("read Debian packages");
+        let target_before = std::fs::read(&target_state).expect("read Ubuntu packages");
 
         // Simulate Debian environment
         debian_project.with_tool_versions(&[("nodejs", "20.10.0")]);
@@ -1646,22 +1918,52 @@ mod integration_scenarios {
             .read_file("manifest.toml")
             .expect("migrate export must produce manifest.toml");
         assert!(!manifest.trim().is_empty(), "manifest must have content");
+        let parsed: serde_json::Value = serde_json::from_str(&manifest).expect("manifest JSON");
+        assert_eq!(parsed["source_distro"], "debian");
+        assert_eq!(
+            parsed["packages"],
+            serde_json::json!([{
+                "original_name": "git", "category": "application",
+                "description": null, "alternatives": ["git"]
+            }])
+        );
 
         ubuntu_project.create_file("manifest.toml", &manifest);
 
         // Dry run import on "Ubuntu"
-        let result = ubuntu_project.run(&["migrate", "import", "--dry-run", "manifest.toml"]);
+        let result = ubuntu_project.run_with_env(
+            &["migrate", "import", "--dry-run", "manifest.toml"],
+            &[("NO_COLOR", "1")],
+        );
         assert!(
             !result.combined_output().contains("panicked at"),
             "dry-run import must not panic. Output:\n{}",
             result.combined_output()
         );
+        result.assert_success();
+        for expected in [
+            "Source: debian → Target: ubuntu",
+            "Mapped: 0/1 packages (1 unmapped)",
+            "- git",
+            "No changes made (dry run)",
+        ] {
+            result.assert_stdout_contains(expected);
+        }
+        assert_eq!(ubuntu_project.read_file("manifest.toml").unwrap(), manifest);
+        assert_eq!(std::fs::read(&source_state).unwrap(), source_before);
+        assert_eq!(std::fs::read(&target_state).unwrap(), target_before);
+        debian_project.close_checked();
+        ubuntu_project.close_checked();
     }
 
     #[test]
     fn scenario_team_collaboration() {
-        let dev1 = TestProject::new();
-        let dev2 = TestProject::new();
+        let dev1 = TestProject::for_distro("debian");
+        let dev2 = TestProject::for_distro("debian");
+        dev1.mock_install("git", "2.43.0")
+            .expect("seed first developer");
+        dev2.mock_install("git", "2.43.0")
+            .expect("seed second developer");
 
         // Dev1 sets up project
         dev1.with_tool_versions(&[("nodejs", "20.10.0")]);
@@ -1682,26 +1984,50 @@ mod integration_scenarios {
             "env check with a shared lock must not panic. Output:\n{}",
             result.combined_output()
         );
+        result.assert_success();
+        result.assert_stdout_contains("Environment is in sync");
+        dev2.mock_install("curl", "8.5.0").expect("introduce drift");
+        let drift = dev2.run(&["env", "check"]);
+        drift.assert_failure();
+        drift.assert_stdout_contains("Environment drift detected");
+        assert_eq!(dev2.read_file("omg.lock").unwrap(), lock);
+        assert_eq!(dev1.read_file("omg.lock").unwrap(), lock);
+        dev1.close_checked();
+        dev2.close_checked();
     }
 
     #[test]
     fn scenario_ci_pipeline_simulation() {
-        let project = TestProject::new();
+        let project = TestProject::for_distro("debian");
         project.with_tool_versions(&[("nodejs", "20.10.0")]);
-        project.with_omg_lock(locks::VALID_LOCK);
+        let state_path = project.data_dir.path().join("mock_state_apt.json");
+        std::fs::write(&state_path, r#"{"installed":{},"available":{}}"#)
+            .expect("seed empty package inventory");
+        project.run(&["env", "capture"]).assert_success();
+        let lock = project.read_file("omg.lock").expect("captured lock");
+        let state = std::fs::read(&state_path).expect("read package inventory");
 
         // CI would run these steps:
         // 1. Validate environment against lock
         let result = project.run(&["ci", "validate"]);
         assert!(!result.stderr_contains("panicked at"));
+        result.assert_success();
+        result.assert_stdout_contains("Environment matches omg.lock");
 
         // 2. Check for drift
         let result = project.run(&["env", "check"]);
         assert!(!result.stderr_contains("panicked at"));
+        result.assert_success();
+        result.assert_stdout_contains("Environment is in sync");
 
         // 3. Run security audit
         let result = project.run(&["audit"]);
         assert!(!result.stderr_contains("panicked at"));
+        result.assert_success();
+        result.assert_stdout_contains("No vulnerabilities found in scanned packages.");
+        assert_eq!(project.read_file("omg.lock").unwrap(), lock);
+        assert_eq!(std::fs::read(&state_path).unwrap(), state);
+        project.close_checked();
     }
 }
 
