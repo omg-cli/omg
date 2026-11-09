@@ -1,7 +1,0 @@
-# Global owners (fallback for paths not listed below)
-* @PyRo1121
-
-# Documentation and workflow/CI ownership
-/docs/        @PyRo1121
-/.github/     @PyRo1121
-/scripts/     @PyRo1121

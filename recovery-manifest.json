@@ -1,0 +1,962 @@
+{
+  "created": "2026-11-09T13:44:39.942202+00:00",
+  "purpose": "Recovery history for consolidation into one OMG checkout. These snapshots are not claims of tested or integrated behavior.",
+  "branches": [
+    {
+      "name": "PER-1005",
+      "commit": "96d6f86e113f5ebcdfa7317d56bd054af7f6eb0c"
+    },
+    {
+      "name": "PER-1047",
+      "commit": "aa758acc5f9ba1ad72b6331b95c77e69310cf2a8"
+    },
+    {
+      "name": "PER-1057",
+      "commit": "00b96f872dbef011beaa9a4b4ac1114b98ddfe2b"
+    },
+    {
+      "name": "PER-1059",
+      "commit": "39e13f016f3ec5120edf44f98fc7588e9c1252a9"
+    },
+    {
+      "name": "PER-1069",
+      "commit": "38e9920790c3a26e942cf2b71fd3b951ba6c97aa"
+    },
+    {
+      "name": "PER-1086",
+      "commit": "c4554a52b9d2404278f1af2212108d3d59ae0ee6"
+    },
+    {
+      "name": "PER-1097",
+      "commit": "c62d921a4726821d3dedbbe150b78fcf90214082"
+    },
+    {
+      "name": "PER-1100",
+      "commit": "b69a6b8e3a4cd8a5fd528fb3b447f8c13281887b"
+    },
+    {
+      "name": "PER-1103",
+      "commit": "79d0bd10c2eb5f8dda66e9547cf4db3a670076e0"
+    },
+    {
+      "name": "PER-1106",
+      "commit": "544e1339e69cf4d66d87f26a2a6634e47426638a"
+    },
+    {
+      "name": "PER-1141",
+      "commit": "7996023fa1e0fc7078dd7f0f7a22181da2a999b0"
+    },
+    {
+      "name": "PER-1160",
+      "commit": "bc57beb7bb950a5949d746b60e5cd260e89775f3"
+    },
+    {
+      "name": "PER-1163",
+      "commit": "21e64c3f04490637a6f8b4610b882fc3ecec5cfe"
+    },
+    {
+      "name": "PER-1170",
+      "commit": "b52ed16b02a5c46fa0d11f68bd1c987ca8844407"
+    },
+    {
+      "name": "PER-1171",
+      "commit": "9223bc95500d86c176e52b867ccccf4a8fa75cc0"
+    },
+    {
+      "name": "PER-1177",
+      "commit": "3e46b9291b5623a42d5f559b0dd9cbe01131f0a1"
+    },
+    {
+      "name": "PER-1202",
+      "commit": "3940dbc4ed0ee8514a735ad084a9c20c5b8dffef"
+    },
+    {
+      "name": "PER-1244",
+      "commit": "c6212923b657b2ef7299716503e8db9de6fdcf46"
+    },
+    {
+      "name": "PER-1246-fix-architecture-specific-failure-excerpts-in-qa-audit",
+      "commit": "d6d8125915a3c091885d4e1276774f0f87cee31f"
+    },
+    {
+      "name": "PER-1268",
+      "commit": "326019fb4a1ddec6467abd2064854882bccea413"
+    },
+    {
+      "name": "PER-1275-return-incomplete-audit-status-when-qa-audit-finds-no-evidence-files",
+      "commit": "8aac824671575a8e174cc6488872ce08efa7acc8"
+    },
+    {
+      "name": "PER-1292",
+      "commit": "76daf845388d21c70461e87b4db4d60d80edd7eb"
+    },
+    {
+      "name": "PER-1294",
+      "commit": "58cc5083f9cd29776909f78cdeb27d1537c65150"
+    },
+    {
+      "name": "PER-1310",
+      "commit": "ba92955e92e984655975cf27567866587b6413ef"
+    },
+    {
+      "name": "PER-1318",
+      "commit": "fdfb5e26cc001a3e15e6b55ab4f729ec0fc04156"
+    },
+    {
+      "name": "PER-1379",
+      "commit": "6008564ea54ca771253614715a72659378d1bdc3"
+    },
+    {
+      "name": "PER-1394",
+      "commit": "d7e884b53f30071f196476a8ee6e9c145dc1586f"
+    },
+    {
+      "name": "PER-1407",
+      "commit": "0f41ed920a5c8a85f30d027c92124ea43032975c"
+    },
+    {
+      "name": "PER-1411",
+      "commit": "75a98cc85a99d0d3e6a3c74270c5f6f311733358"
+    },
+    {
+      "name": "PER-1419",
+      "commit": "d5f7cc1eb8988cb6406c8392a93b04df37e9d0aa"
+    },
+    {
+      "name": "PER-1435",
+      "commit": "de5f14fc771eafa0bc3b26151f0d39c0bda9c582"
+    },
+    {
+      "name": "PER-1442",
+      "commit": "fd2042bb21650c37699c8c0e0e73776852127ba5"
+    },
+    {
+      "name": "PER-32",
+      "commit": "45522f91d237fa0bd9a4de58bc3d8c5b928d820a"
+    },
+    {
+      "name": "PER-40",
+      "commit": "12ccc052e56d8e9b80653a33abf85e6285e21c23"
+    },
+    {
+      "name": "PER-422",
+      "commit": "f237fd4395e982cae63c615cce2790928b2ea259"
+    },
+    {
+      "name": "PER-442",
+      "commit": "d7b6f4df329d175e890468e095fd76fdb5d01029"
+    },
+    {
+      "name": "PER-762-diagnose-pr821-macos-doctor-request-delivery-deadline-failure",
+      "commit": "efaa37130c4eefaa9b081977a9153cc27e840dd2"
+    },
+    {
+      "name": "PER-815",
+      "commit": "b3f7c7fe1302102228cb83efd4a2068a9e212584"
+    },
+    {
+      "name": "PER-825",
+      "commit": "b023e468175abe9c4212c33f8bc91effede5a843"
+    },
+    {
+      "name": "PER-835",
+      "commit": "c05f45b16a672ed211f0dbe83b8a0bd04516765c"
+    },
+    {
+      "name": "PER-836",
+      "commit": "7168e8c713f3aec737c9066678661414e3c82486"
+    },
+    {
+      "name": "PER-840",
+      "commit": "5d4f04e47ad9bfb0f7348420d45eaa0856b452a4"
+    },
+    {
+      "name": "PER-949",
+      "commit": "b0fbe0c6df4b396e3dc45e4b92bcbc4d7eb8d251"
+    },
+    {
+      "name": "PER-973",
+      "commit": "6caba9a09996348b1ca01a031684408836b7c281"
+    },
+    {
+      "name": "PER-995",
+      "commit": "d0465aea298d1dbb9c03d5fba3200eb4a8cd4a7f"
+    },
+    {
+      "name": "backup/qemu-audit-pre-rebase",
+      "commit": "1411665377e75ae7c2e0372cc94a23c8eb553481"
+    },
+    {
+      "name": "cline/0ccb0",
+      "commit": "4188acc777b3c8140e2563170c38c1761e8a5c07"
+    },
+    {
+      "name": "cline/98158",
+      "commit": "4188acc777b3c8140e2563170c38c1761e8a5c07"
+    },
+    {
+      "name": "codex/arch-clone-static-network",
+      "commit": "d0b7a16f46b5f79efad6b618f10045fe37ed6537"
+    },
+    {
+      "name": "codex/arch-fixture-and-native-admission",
+      "commit": "f37c4463a68401b5eb4e70976e058a773e48a2a0"
+    },
+    {
+      "name": "codex/arch-test-quality-wave10-20261015",
+      "commit": "3a8448921a9a88f171fdb4f9a8c12a877e4517d9"
+    },
+    {
+      "name": "codex/arch-wave10-proof-archive-20261016",
+      "commit": "0c609e6e8d3f1b2361ba3bb34c98743be277021b"
+    },
+    {
+      "name": "codex/archive-behavior-four",
+      "commit": "b52d690e11ab953d3c34137eff91bb52ae530c6b"
+    },
+    {
+      "name": "codex/ci-arch-recovery-handler-evidence-20261016",
+      "commit": "b15cdde995eb00b3c944076f46bcbcf8b51d35a8"
+    },
+    {
+      "name": "codex/cloud-audit-admission",
+      "commit": "f20406ba7fedb605b06805431dfa8d1aac5b1cb2"
+    },
+    {
+      "name": "codex/cloud-audit-diagnostics",
+      "commit": "3648ee590bf83785f1e6847d23bc083b9523ddf1"
+    },
+    {
+      "name": "codex/cloud-audit-navigation",
+      "commit": "5d52541576b14d937934672760a1b2e5ac4d4a8c"
+    },
+    {
+      "name": "codex/cloud-autonomy-pass-one",
+      "commit": "7573103f7c56cf3b61fb3b9f3b67819f52d344f1"
+    },
+    {
+      "name": "codex/cloud-caller-disconnect-evidence",
+      "commit": "0814674dbc8985655c5b106221a8e0f2aaa493a2"
+    },
+    {
+      "name": "codex/cloud-cancellation-boundary",
+      "commit": "5801385973922392be18a93a9002f3610c82a7ed"
+    },
+    {
+      "name": "codex/cloud-codeloud-recovery-batch",
+      "commit": "c21360001803b5e1059cf44a283be38b476489f0"
+    },
+    {
+      "name": "codex/cloud-coder-contracts",
+      "commit": "76ca715c50f0430493890b655306f5ab6b1368e9"
+    },
+    {
+      "name": "codex/cloud-coder-integrated",
+      "commit": "18a09ce0ea9815946ea4c32c8d557e661eb62a65"
+    },
+    {
+      "name": "codex/cloud-controller-epoch-recovery",
+      "commit": "addcd8389df616d24bda708950af639ccd91be4a"
+    },
+    {
+      "name": "codex/cloud-dependency-policy-repair",
+      "commit": "f0b6517d4d54391635448255a95ccadad6ae71e8"
+    },
+    {
+      "name": "codex/cloud-dependency-repair",
+      "commit": "510b20f8dd7069df4376e5322c535ac69b8fac5d"
+    },
+    {
+      "name": "codex/cloud-diagnostics-sdk-01214",
+      "commit": "dcf430039a6351b0124ff6ed865e898e9ae82c72"
+    },
+    {
+      "name": "codex/cloud-fedora-retry-proof",
+      "commit": "f1d5a4b505551161b4bd1569bbaf919d04ab7f51"
+    },
+    {
+      "name": "codex/cloud-issue-evidence",
+      "commit": "188ff8b811bfcdc87bb91fd457552a5ceaa4ceda"
+    },
+    {
+      "name": "codex/cloud-issue-intake",
+      "commit": "5807c7cc4c3ff736d96165b6f61afee3ffe6071b"
+    },
+    {
+      "name": "codex/cloud-lock-diagnostic",
+      "commit": "3e3b101adee7b5473d425c32a51e4daf522a2636"
+    },
+    {
+      "name": "codex/cloud-native-image-prerequisites",
+      "commit": "6b055fdd273dc8474d9c1e55d966333dd573fcc5"
+    },
+    {
+      "name": "codex/cloud-policy-fixture-recovery",
+      "commit": "89aa6b2814b5cb0bd0b78acfbdc0d4645ff34bd5"
+    },
+    {
+      "name": "codex/cloud-postmerge-review-routing",
+      "commit": "eb48aa1e91c8592fdba23f2eebe32e11171ab000"
+    },
+    {
+      "name": "codex/cloud-publication-policy",
+      "commit": "6836f6faeecbd64d3ace37ece1f8c52d905816a5"
+    },
+    {
+      "name": "codex/cloud-publication-proof-replay",
+      "commit": "b80f3432d3272a356c0be34293197238d8310111"
+    },
+    {
+      "name": "codex/cloud-regression-assertion-contract",
+      "commit": "4922108a057b68e1191048fb8e8dc4628ffc0526"
+    },
+    {
+      "name": "codex/cloud-repair-main-batch",
+      "commit": "ab24c2e30f1625f95e787c67464546c07b1f8ca2"
+    },
+    {
+      "name": "codex/cloud-retention-advisory-batch",
+      "commit": "d79ffd90e8655c800bd2dc2a6bd41f877a78861d"
+    },
+    {
+      "name": "codex/cloud-review-handoff",
+      "commit": "d9fd79f078165718b6798c040ac56fa93beb149c"
+    },
+    {
+      "name": "codex/cloud-runner-image-activation",
+      "commit": "5cd7384d74081d9e54ace0a223b23617e1c8df54"
+    },
+    {
+      "name": "codex/cloud-runner-source-guard",
+      "commit": "6246d60a92e2b64498330f13162144a86cc78603"
+    },
+    {
+      "name": "codex/cloud-verification-handoff",
+      "commit": "23f8c97b302080c8097cc6d25bcfac152a72bcb2"
+    },
+    {
+      "name": "codex/combined-thirteen-main75",
+      "commit": "98ee1f3b7447860157a00a90fa4e3421bdff7005"
+    },
+    {
+      "name": "codex/coverage-pair-diagnostic",
+      "commit": "56de380f35c02f85ebb4bfb7abddee87424f5200"
+    },
+    {
+      "name": "codex/debt-inventory-path-spans-20261013",
+      "commit": "0c189e0ea99128518714050c2886b22f0563b955"
+    },
+    {
+      "name": "codex/deno-alias-proof-20261013-v3",
+      "commit": "7d6a830645c4b1e822ee81a56bd6c95d752b388d"
+    },
+    {
+      "name": "codex/deno-alias-proof-20261013-v5",
+      "commit": "32f46a4603d642fed95fb1c48c0a28b2d25c8d88"
+    },
+    {
+      "name": "codex/deno-alias-proof-20261013-v6",
+      "commit": "e2fb2320f1ea6df57772be02a5e44d5d943511fd"
+    },
+    {
+      "name": "codex/deno-alias-proof-20261013-v9",
+      "commit": "717d832ebdc736a27946c63d9a6407ef20c8792d"
+    },
+    {
+      "name": "codex/deno-alias-proof-cargo-intact37-20261013-v2",
+      "commit": "c4d71248a585cbe5cc330e0e335af16dde48ca89"
+    },
+    {
+      "name": "codex/deno-alias-proof-registry-red-20261013-v3",
+      "commit": "407c6e455d7d343957fcd536dc36d4f3245f1856"
+    },
+    {
+      "name": "codex/distro-scrutiny-20261009",
+      "commit": "7e53dd37e7dc56f5f4233a4a977d1586a1b45fd5"
+    },
+    {
+      "name": "codex/fedora-cache-and-native-fixtures",
+      "commit": "93c9f1b402829224f22acc63137e0063ca84dae8"
+    },
+    {
+      "name": "codex/fedora-sqlite908-admission",
+      "commit": "2317f4d75044809d2b74447d7f5a5fd4db80335a"
+    },
+    {
+      "name": "codex/fedora-stdin-caller-input",
+      "commit": "4183b8c29f68ecae89ad591838f190fd90f3b20a"
+    },
+    {
+      "name": "codex/fix-account-link-hint",
+      "commit": "205b149365c0a55c2d399746f966ca921df2a8f0"
+    },
+    {
+      "name": "codex/fix-hyperfine2-qemu",
+      "commit": "159be13ceffe7e8ec7454b1a6b0366ff8abcf2c8"
+    },
+    {
+      "name": "codex/guest-behavior-batch3dab",
+      "commit": "6e37e274b8211fbcb2f9dfee1ba87c1a53e4f3ce"
+    },
+    {
+      "name": "codex/named-python-workflow-results",
+      "commit": "079a2d2618c97b28ac036d833d4ac7adf71ab5da"
+    },
+    {
+      "name": "codex/node-probe-cleanup-after-red-20261015",
+      "commit": "69526aa297ab7cc00762b9431f6e2853cb9ffcf0"
+    },
+    {
+      "name": "codex/omg-cloud-review-endpoint",
+      "commit": "c2b7f1bcb09e2fa83039be4626132bacba3d6d6a"
+    },
+    {
+      "name": "codex/omg-cloudflare-opencode",
+      "commit": "a4847fa80f969bb6bb043e3e6becfa91c5dd3806"
+    },
+    {
+      "name": "codex/parser-test-production-oracle",
+      "commit": "20f51a2735f733488969ffa67d8c8002dcb8ba17"
+    },
+    {
+      "name": "codex/pr982-current-main-20261026",
+      "commit": "8c28d6fedf75bc2ed84a1d8b2a6827d13ba2f303"
+    },
+    {
+      "name": "codex/proof-node-cleanup-first-red-20261015",
+      "commit": "b9afe62709458dfa16a3403c1160afe15f92a358"
+    },
+    {
+      "name": "codex/proof-node-linux-cleanup-red-20261015",
+      "commit": "6fc182a7637f0bb6ed8d03b025615ab5ff97badd"
+    },
+    {
+      "name": "codex/qemu-controller-bundle",
+      "commit": "f32486dc7a591c6de22b8fa92189fc61647421f3"
+    },
+    {
+      "name": "codex/qemu-display-matrix-tests",
+      "commit": "4938fbb4df872086e5d330a90cb9d8032bc001a9"
+    },
+    {
+      "name": "codex/qemu-process-identity",
+      "commit": "623e7f05378e376765b85c702f110406c7fa2fae"
+    },
+    {
+      "name": "codex/renderer-flush-observable",
+      "commit": "4a27cafb1b7992155318c199fcdb54d7dfdfe123"
+    },
+    {
+      "name": "codex/repair-pr936-coverage",
+      "commit": "8d47acda0d840fabe0bd5705ed1c4d8e2d506e89"
+    },
+    {
+      "name": "codex/runtime-coverage-proof-20261016",
+      "commit": "f3f01d7bf3f78006711bee94ca55a20434ccbc29"
+    },
+    {
+      "name": "codex/runtime-stream-cancellation",
+      "commit": "dc41a99de75f974962f3e9b4df273396c33f5318"
+    },
+    {
+      "name": "codex/rust-version-cache-behavior",
+      "commit": "62cadd9afe6b39287ff4bb5adbad3793519d4096"
+    },
+    {
+      "name": "codex/sqlite908-reopen-persistence",
+      "commit": "b103ca4c6e2438a78acf2bf06c362a0b592b6182"
+    },
+    {
+      "name": "codex/test-dotnet-host-rid",
+      "commit": "729c9f1626a31402f464f0b3c02ecc5766d3d0aa"
+    },
+    {
+      "name": "codex/test-java-host-platform",
+      "commit": "86732819cc06f9bd4ae36a23c5d7fc2a2f6be1ed"
+    },
+    {
+      "name": "codex/test-proof-integration",
+      "commit": "363b4cd4ed22c46c8dfe9aae63c68637ca4b8bb2"
+    },
+    {
+      "name": "codex/ui-aur-behavior-oracles",
+      "commit": "1a5a5b720a50ce0d3698013bd4b8d1615a1379bb"
+    },
+    {
+      "name": "codex/ui-completion-emission",
+      "commit": "fec067a39cd13850f84a76d4b13f5cbc66b3cc1f"
+    },
+    {
+      "name": "codex/update-completion-behavior",
+      "commit": "f2a9e9c334e5b083d7994d6c9b30193d857180f8"
+    },
+    {
+      "name": "codex/zip904-behavior-20261016",
+      "commit": "d4aa848edf56f0abd0a4c125a2f15aae65170fa8"
+    },
+    {
+      "name": "fix/arch-doctor-native-db-oracle",
+      "commit": "12e932cf5e5b16ad87f6a6cd6aed79d86e3c5ad7"
+    },
+    {
+      "name": "fix/ci-dependency-and-behavior-oracles",
+      "commit": "ba22c090de166745c3614fb1d9241cc11583818d"
+    },
+    {
+      "name": "fix/cloud-ci-capacity-headroom-d590",
+      "commit": "f6002060b4e2fc9f48f392256fa2da7f2731b712"
+    },
+    {
+      "name": "fix/cloud-interruption-contracts",
+      "commit": "577ffc1e6abf62024c54d77ed33cfb4175ac975a"
+    },
+    {
+      "name": "fix/cloud-interruption-recovery-77842918",
+      "commit": "26f52946d20e78fc58b88d6c6c798a4e61c869c6"
+    },
+    {
+      "name": "fix/cloud-socket-evidence-1d04",
+      "commit": "86a99b7a5753e32426127e80ccb2345ae07e4f50"
+    },
+    {
+      "name": "fix/coverage-region-evidence-20261010",
+      "commit": "2c97efc2958f22a6835e9cdbc76f090f68f61093"
+    },
+    {
+      "name": "fix/debian-doctor-health",
+      "commit": "f3dabd4f60fb8b531cb15220147d18a6dba1e2d9"
+    },
+    {
+      "name": "fix/doctor-connectivity-663",
+      "commit": "25eddb0f2859469187136954009e0e91ed1a3dc4"
+    },
+    {
+      "name": "fix/doctor-dependencies-685",
+      "commit": "474db1a1919e3e237fead1905e7e2b2d184d5625"
+    },
+    {
+      "name": "fix/doctor-turbo-guest",
+      "commit": "9c4c4b2e2f69c4bfe0c26e04fbc45d614e083384"
+    },
+    {
+      "name": "fix/fedora-doctor-negative-qemu",
+      "commit": "617c1aa2fd6ebb8845cfffbbd9f639d357683995"
+    },
+    {
+      "name": "fix/native-api-503-budget-20261004",
+      "commit": "a615ffaf3e83576336c630f458e050088063bb11"
+    },
+    {
+      "name": "fix/policy-license-allowlist",
+      "commit": "2dde572c770fbec2fd1088ea174953cb5efaa56f"
+    },
+    {
+      "name": "fix/policy-spdx-with",
+      "commit": "0c68d86b2868b7928b68f65afa70ade085e10742"
+    },
+    {
+      "name": "fix/qemu-apt-post-delta",
+      "commit": "213291ecc1b2bf5f1b3176bb13502d98224f08d0"
+    },
+    {
+      "name": "fix/qemu-apt7-phase1",
+      "commit": "5c292c56c3e9e8b42a64062bd172a22d9d85b6a1"
+    },
+    {
+      "name": "fix/qemu-apt7-reporter",
+      "commit": "2109277161d3a951de7cf828900b0f39483865dd"
+    },
+    {
+      "name": "fix/qemu-arch-native-update",
+      "commit": "6f96eaa3c0570702dc372778e61cac88f79efd61"
+    },
+    {
+      "name": "fix/qemu-bounded-apt-fixture",
+      "commit": "385b75c1d6ce50d7e2e57bc1c3899d53926163c1"
+    },
+    {
+      "name": "fix/qemu-cli-state-oracles",
+      "commit": "b336e52fd60218a5ad25c1da48ff0315ae3de4d0"
+    },
+    {
+      "name": "fix/qemu-container-argv",
+      "commit": "bc37107c3b65d38236379613c1d4073bb7a9e415"
+    },
+    {
+      "name": "fix/qemu-container-shell-build-oracles",
+      "commit": "8a69802f3697d617286bbe8406d153af7f39453c"
+    },
+    {
+      "name": "fix/qemu-disable-unused-sata-20261010",
+      "commit": "34ebc5a092d253e790bac37f9bbc77d117dbc5c7"
+    },
+    {
+      "name": "fix/qemu-disable-unused-vga-20261010",
+      "commit": "6c2884796775a361bce9aec0112ba27f04932dfa"
+    },
+    {
+      "name": "fix/qemu-evidence-rejection-diagnostics",
+      "commit": "0fa378604c270ca29272a609e03ef5a15dee76a3"
+    },
+    {
+      "name": "fix/qemu-file-output-oracles",
+      "commit": "abd3e1fa4b4ef6565553d4d336d53cd8be4f9317"
+    },
+    {
+      "name": "fix/qemu-prebuilt-controller-measurement",
+      "commit": "b0bb6b2051bd2ae9e3b185fa3fac71e0261ee107"
+    },
+    {
+      "name": "fix/qemu-renewal-deduplication-20261009",
+      "commit": "cb5fc72dd4341a6ec6c1a2d988a59d56e6fd79ba"
+    },
+    {
+      "name": "fix/qemu-semantic-oracles",
+      "commit": "644009f84251eab1c51a9d699a11eb9cce628b9c"
+    },
+    {
+      "name": "fix/qemu-shell-oracle-quoting-20261010",
+      "commit": "2dfccd1597acc934c9f6cca23afb7d6138e10300"
+    },
+    {
+      "name": "fix/runtime-consumer-oracles",
+      "commit": "e00d83f88935a39219ed746935f3ee77ff1655a6"
+    },
+    {
+      "name": "fix/rust-pattern-output-tests",
+      "commit": "0e2d0a338473af8ec734ec287329ca87851a46e3"
+    },
+    {
+      "name": "fix/tokio-lts-owned-pidfd",
+      "commit": "e8f821fb75a9f5c45d726e9e0fc078ccf090a223"
+    },
+    {
+      "name": "fix/wsl-kvm-private-alias",
+      "commit": "138e5c63d11fbb2de7340f999b1540935b83b7e4"
+    },
+    {
+      "name": "main",
+      "commit": "efc616588b21da2c16c91276e9b20e89a66b3b10"
+    },
+    {
+      "name": "orchestrate/20260929-arch",
+      "commit": "78e205ee5d83a5f45b3e84b4dfb191c659d42053"
+    },
+    {
+      "name": "orchestrate/20260929-backend",
+      "commit": "027d5d62c3b29b2014cabea7a6c94afa04caf577"
+    },
+    {
+      "name": "orchestrate/20260929-boot",
+      "commit": "cd390a3adc035f4e2162314b017d238f3247a72e"
+    },
+    {
+      "name": "orchestrate/20260929-continuation",
+      "commit": "d87dd6aa2eafbbd474ff081f994d380efe48a1c8"
+    },
+    {
+      "name": "orchestrate/20260929-debian",
+      "commit": "3feb847796f33b650d5f4471ec1c6dddb577904e"
+    },
+    {
+      "name": "orchestrate/20260929-dnf",
+      "commit": "38fba945b17a714b65fe7551f4283de632a7441a"
+    },
+    {
+      "name": "orchestrate/20260929-integration",
+      "commit": "f22aa5d03cece1001495f2da0ce89aa84f12de93"
+    },
+    {
+      "name": "orchestrate/20260929-license-oracle",
+      "commit": "03b989f0b140b91dee73dc227213e11add4e1e7e"
+    },
+    {
+      "name": "orchestrate/20260929-license-product",
+      "commit": "b3ac3424b2a4b62679d09760e314f0f7d44bc98c"
+    },
+    {
+      "name": "orchestrate/20260929-metrics",
+      "commit": "3bac79d67079d7433f1263cee1e46231e8307ff3"
+    },
+    {
+      "name": "orchestrate/20260929-runtime",
+      "commit": "338ba3fda139dd81cecd7d596938dbbeeff2bb92"
+    },
+    {
+      "name": "orchestrate/20260929-tests",
+      "commit": "809a66e2fb5140224dc6682aec52ba637a0c8de5"
+    },
+    {
+      "name": "preserve/dirty-index-20261003-194219",
+      "commit": "663aabc0fa71026324f31f76ee0730601b72778b"
+    },
+    {
+      "name": "preserve/dirty-working-20261003-194219",
+      "commit": "41eb5c9a56177225c9e597806a2cfb62cac7fddd"
+    },
+    {
+      "name": "rescue/qemu-apt-rollback-20261015",
+      "commit": "98d2333393420f9ab5580fc792f0b6ba1a7bba59"
+    },
+    {
+      "name": "rescue/swarm-proxy-recovery-20261001",
+      "commit": "cb03f001287fe54cc5787135f6d1fbca563a9c7f"
+    },
+    {
+      "name": "test/apt-status-digest-behavior",
+      "commit": "f3d9e1d99adf8ae7d51d0dce5980c07caa969eeb"
+    },
+    {
+      "name": "test/benchmark-row-contracts",
+      "commit": "f9e7c18057840228193b98d77805767de5e778c1"
+    },
+    {
+      "name": "test/completion-ordering-fst-oracles",
+      "commit": "171d5e5c9f7b1652fc5cf536b7071520a4561ba5"
+    },
+    {
+      "name": "test/fedora-release-smoke-row",
+      "commit": "baf0734e8a1fc885dad1c522f6d2019a239a8634"
+    },
+    {
+      "name": "test/fedora-sync-metadata-oracle",
+      "commit": "16ca954b17af444bdbfe7c42bcea9913ccd0704b"
+    },
+    {
+      "name": "test/go-heartbeat-field-assertions",
+      "commit": "a24fe06552f75c627200b0e08c360a6d8c47c9f0"
+    },
+    {
+      "name": "test/hook-lock-host-oracles",
+      "commit": "a4137ff0128ab4c11491a133dcf4e153b173bee6"
+    },
+    {
+      "name": "test/literal-advice-progress",
+      "commit": "e127ee1597c2bd2f0db144db2ecd92d9b1c9752e"
+    },
+    {
+      "name": "test/positive-heartbeat-counters",
+      "commit": "d85fd57c042b3791734ab5f11e5eb79a01b6b5df"
+    },
+    {
+      "name": "test/positive-heartbeat-counters-v2",
+      "commit": "e9f7fea1741f4f9b6ba26791ad1d50cee6354d49"
+    },
+    {
+      "name": "test/qemu-health-refusal-propagation",
+      "commit": "3858936321d4ef21f64c33963429a17ba28f3033"
+    },
+    {
+      "name": "test/qemu-sqlite-wal-regression-20261010",
+      "commit": "0de62f6587244573d3ab9fdcc9188c9ed37a3ac5"
+    },
+    {
+      "name": "test/real-metadata-subjects",
+      "commit": "825bb3767924a98f931c2cf1d2e495c10544de72"
+    },
+    {
+      "name": "test/release-observable-assertions",
+      "commit": "2eaca2e5ae91d01413dd8e8cfd9b5d3f12511071"
+    },
+    {
+      "name": "test/runtime-list-output-oracles",
+      "commit": "466103384e959ea74d3308ff91019879582453cd"
+    },
+    {
+      "name": "test/runtime-preview-and-response-oracles",
+      "commit": "bd43efe21d939fd0a4aabbab3346d7e21d8b245c"
+    }
+  ],
+  "dirty_snapshots": [
+    {
+      "label": "omg",
+      "base": "efc616588b21da2c16c91276e9b20e89a66b3b10",
+      "commit": "bfdf92949973f908cbdc8bd4ed296ae171ca44d8",
+      "untracked_source": [
+        "docs/omg-ci-cd-agent-handoff.md",
+        "docs/omg-founder-engineering-brief.md",
+        "plan.md"
+      ],
+      "changes": [
+        "M\tAGENTS.md",
+        "A\tdocs/omg-ci-cd-agent-handoff.md",
+        "A\tdocs/omg-founder-engineering-brief.md",
+        "A\tplan.md"
+      ]
+    },
+    {
+      "label": "doctor-turbo-guest",
+      "base": "9c4c4b2e2f69c4bfe0c26e04fbc45d614e083384",
+      "commit": "aba02c9c3fd4801245c74f89a49559510edca553",
+      "untracked_source": [
+        "scripts/qemu-doctor-turbo-check.py"
+      ],
+      "changes": [
+        "M\t.github/workflows/qemu-lane.yml",
+        "M\t.github/workflows/qemu-matrix.yml",
+        "M\tdocs/cli.md",
+        "M\tscripts/benchmark-qemu.sh",
+        "A\tscripts/qemu-doctor-turbo-check.py",
+        "M\tscripts/qemu-inventory.sh",
+        "M\tscripts/test_qemu_inventory_policy.py",
+        "M\tscripts/test_qemu_output_contracts.py",
+        "M\tsrc/cli/doctor.rs",
+        "M\ttests/cli_behavior_inventory.tsv",
+        "M\ttests/cli_comprehensive.rs",
+        "M\ttests/macos_tests.rs",
+        "M\ttests/qemu-inventory-policy.json"
+      ]
+    },
+    {
+      "label": "qemu-10014-controller",
+      "base": "f32486dc7a591c6de22b8fa92189fc61647421f3",
+      "commit": "d33418ebc0f60890492bbebe64a077dffdae5d46",
+      "untracked_source": [
+        "scripts/test_qemu_controller_cleanup.py"
+      ],
+      "changes": [
+        "M\t.github/workflows/qemu-matrix.yml",
+        "M\tscripts/build-qemu-controller.sh",
+        "A\tscripts/test_qemu_controller_cleanup.py",
+        "M\tscripts/test_qemu_output_contracts.py",
+        "M\ttests/test_qemu_workflow.py"
+      ]
+    },
+    {
+      "label": "rust-test-integrity",
+      "base": "efc616588b21da2c16c91276e9b20e89a66b3b10",
+      "commit": "09660d0ade260edf5144a77258f855ed185f72cd",
+      "untracked_source": [
+        "tests/data/fedora/observer-fixture.rpm",
+        "tests/data/fedora/observer-fixture.spec",
+        "tests/data/fedora/repodata/filelists.xml.zst",
+        "tests/data/fedora/repodata/other.xml.zst",
+        "tests/data/fedora/repodata/primary.xml.zst",
+        "tests/data/fedora/repodata/repomd.xml"
+      ],
+      "changes": [
+        "M\tsrc/bin/omg.rs",
+        "M\tsrc/cli/blame.rs",
+        "M\tsrc/cli/doctor.rs",
+        "M\tsrc/cli/license.rs",
+        "M\tsrc/cli/mod.rs",
+        "M\tsrc/cli/packages/clean.rs",
+        "M\tsrc/cli/packages/explicit.rs",
+        "M\tsrc/cli/packages/install/arch.rs",
+        "M\tsrc/cli/packages/remove.rs",
+        "M\tsrc/cli/packages/remove/arch.rs",
+        "M\tsrc/cli/packages/search.rs",
+        "M\tsrc/cli/packages/update/arch.rs",
+        "M\tsrc/cli/self_update.rs",
+        "M\tsrc/cli/size.rs",
+        "M\tsrc/cli/tea/mod.rs",
+        "M\tsrc/core/env/fingerprint.rs",
+        "M\tsrc/core/packages/service.rs",
+        "M\tsrc/core/pacman_conf.rs",
+        "M\tsrc/core/paths.rs",
+        "M\tsrc/core/security/audit.rs",
+        "M\tsrc/core/security/keyserver.rs",
+        "M\tsrc/core/security/pgp.rs",
+        "M\tsrc/core/testing/isolated.rs",
+        "M\tsrc/core/testing/mod.rs",
+        "M\tsrc/core/usage.rs",
+        "M\tsrc/daemon/handlers.rs",
+        "M\tsrc/daemon/server.rs",
+        "M\tsrc/package_managers/alpm_direct.rs",
+        "M\tsrc/package_managers/alpm_ops.rs",
+        "M\tsrc/package_managers/alpm_worker.rs",
+        "M\tsrc/package_managers/arch_advisory.rs",
+        "M\tsrc/package_managers/aur/approval.rs",
+        "M\tsrc/package_managers/aur/artifact_inspector.rs",
+        "M\tsrc/package_managers/aur/client.rs",
+        "M\tsrc/package_managers/aur/parallel_build.rs",
+        "M\tsrc/package_managers/aur/utils.rs",
+        "M\tsrc/package_managers/aur_deps.rs",
+        "M\tsrc/package_managers/aur_index.rs",
+        "M\tsrc/package_managers/aur_metadata.rs",
+        "M\tsrc/package_managers/aur_sources.rs",
+        "M\tsrc/package_managers/debian_db/db.rs",
+        "M\tsrc/package_managers/debian_db/sources.rs",
+        "M\tsrc/package_managers/debian_db/transaction.rs",
+        "M\tsrc/package_managers/pacman_db/db.rs",
+        "M\tsrc/package_managers/parallel_sync.rs",
+        "M\tsrc/package_managers/pkgbuild.rs",
+        "M\tsrc/package_managers/types.rs",
+        "M\tsrc/runtimes/node.rs",
+        "M\tsrc/runtimes/python/catalog.rs",
+        "M\tsrc/runtimes/rust.rs",
+        "M\tsrc/runtimes/tool_registry.rs",
+        "M\ttests/apt_version_ordering.rs",
+        "M\ttests/cli_comprehensive.rs",
+        "M\ttests/cli_surface.rs",
+        "M\ttests/common/mod.rs",
+        "M\ttests/coverage_10.rs",
+        "M\ttests/coverage_18.rs",
+        "A\ttests/data/fedora/observer-fixture.rpm",
+        "A\ttests/data/fedora/observer-fixture.spec",
+        "A\ttests/data/fedora/repodata/filelists.xml.zst",
+        "A\ttests/data/fedora/repodata/other.xml.zst",
+        "A\ttests/data/fedora/repodata/primary.xml.zst",
+        "A\ttests/data/fedora/repodata/repomd.xml",
+        "M\ttests/debian_e2e_tests.rs",
+        "M\ttests/debian_tests.rs",
+        "M\ttests/fedora_tests.rs",
+        "M\ttests/install_update_comprehensive.rs",
+        "M\ttests/test_qemu_workflow.py",
+        "M\ttests/update_integration.rs"
+      ]
+    },
+    {
+      "label": "test-proof-integration",
+      "base": "363b4cd4ed22c46c8dfe9aae63c68637ca4b8bb2",
+      "commit": "c36f6bb4115abf55bd10a4bc12f5ddce3743e838",
+      "untracked_source": [
+        "scripts/run_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness-sensitivity/class-setup-failure/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness-sensitivity/duplicate/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness-sensitivity/expected-failure/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness-sensitivity/expected-identities.json",
+        "tests/fixtures/qemu-companion-completeness-sensitivity/extra/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness-sensitivity/intact/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness-sensitivity/subtest-failure/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness/all-skipped/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness/expected-identities.json",
+        "tests/fixtures/qemu-companion-completeness/intact/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/fixtures/qemu-companion-completeness/partial-omission/scripts/test_qemu_boot_timeout_budget.py",
+        "tests/test_qemu_companion_completeness.py"
+      ],
+      "changes": [
+        "M\t.github/workflows/qemu-lane.yml",
+        "M\t.github/workflows/qemu-matrix.yml",
+        "M\tscripts/benchmark-qemu.sh",
+        "M\tscripts/run-native-contracts.py",
+        "A\tscripts/run_qemu_boot_timeout_budget.py",
+        "M\tscripts/test_qemu_boot_timeout_budget.py",
+        "M\tscripts/test_qemu_process_isolation.py",
+        "M\tsrc/package_managers/dnf.rs",
+        "A\ttests/fixtures/qemu-companion-completeness-sensitivity/class-setup-failure/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/fixtures/qemu-companion-completeness-sensitivity/duplicate/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/fixtures/qemu-companion-completeness-sensitivity/expected-failure/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/fixtures/qemu-companion-completeness-sensitivity/expected-identities.json",
+        "A\ttests/fixtures/qemu-companion-completeness-sensitivity/extra/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/fixtures/qemu-companion-completeness-sensitivity/intact/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/fixtures/qemu-companion-completeness-sensitivity/subtest-failure/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/fixtures/qemu-companion-completeness/all-skipped/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/fixtures/qemu-companion-completeness/expected-identities.json",
+        "A\ttests/fixtures/qemu-companion-completeness/intact/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/fixtures/qemu-companion-completeness/partial-omission/scripts/test_qemu_boot_timeout_budget.py",
+        "A\ttests/test_qemu_companion_completeness.py",
+        "M\ttests/test_qemu_workflow.py"
+      ]
+    },
+    {
+      "label": "omg-fix\\policy-spdx-with",
+      "base": "0c68d86b2868b7928b68f65afa70ade085e10742",
+      "commit": "ed37fbb3176728c1b03e3f69d6a19b4785d65d60",
+      "untracked_source": [],
+      "changes": [
+        "M\tsrc/core/security/policy.rs"
+      ]
+    }
+  ]
+}
