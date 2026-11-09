@@ -130,13 +130,11 @@ mod tests {
                 .expect("complete advisory must be accepted without installed packages");
             assert_eq!(result.total_vulnerabilities, 0);
             assert_eq!(result.high_severity, 0);
-            for field in ["packages", "issues"] {
-                let mut invalid = complete.clone();
-                match field {
-                    "packages" => invalid.packages.clear(),
-                    "issues" => invalid.issues.clear(),
-                    _ => unreachable!(),
-                }
+            let mut missing_packages = complete.clone();
+            missing_packages.packages.clear();
+            let mut missing_issues = complete.clone();
+            missing_issues.issues.clear();
+            for invalid in [missing_packages, missing_issues] {
                 let error = audit_result(&[], &[invalid])
                     .expect_err("empty advisory identity lists must be rejected");
                 assert_eq!(error.to_string(), "Incomplete Arch advisory identity");

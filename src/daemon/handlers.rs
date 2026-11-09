@@ -3075,23 +3075,39 @@ pub(super) mod tests {
         assert!(!crate::core::is_root(), "fixture must run as ordinary user");
         with_native_backend_fixture(|state, directory| {
             let config = directory.join("pacman.conf");
-            std::fs::remove_file(&config)?;
-            nix::unistd::mkfifo(&config, nix::sys::stat::Mode::S_IRWXU)?;
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
                 .block_on(async {
-                    let request_state = Arc::clone(&state);
-                    let request = tokio::spawn(async move {
-                        let guard = Arc::clone(&request_state.refresh_lock).lock_owned().await;
-                        request_state.refresh_system_backends(guard, None).await
-                    });
-                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                        while state.native_tasks.is_empty() {
-                            tokio::task::yield_now().await;
-                        }
-                    })
+                    let spawn_request = |request_state: Arc<DaemonState>| {
+                        tokio::spawn(async move {
+                            let guard = Arc::clone(&request_state.refresh_lock).lock_owned().await;
+                            request_state.refresh_system_backends(guard, None).await
+                        })
+                    };
+                    let wait_for_tracker_empty = async |expected: bool| {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            while state.native_tasks.is_empty() != expected {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                    };
+                    let completed = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        spawn_request(Arc::clone(&state)),
+                    )
                     .await?;
+                    drop(completed??);
+                    wait_for_tracker_empty(true).await?;
+                    assert!(
+                        state.refresh_lock.try_lock().is_ok(),
+                        "completed refresh must release its serialization lease"
+                    );
+                    std::fs::remove_file(&config)?;
+                    nix::unistd::mkfifo(&config, nix::sys::stat::Mode::S_IRWXU)?;
+                    let request = spawn_request(Arc::clone(&state));
+                    wait_for_tracker_empty(false).await?;
                     request.abort();
                     assert!(
                         request

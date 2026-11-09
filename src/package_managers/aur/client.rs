@@ -5836,9 +5836,40 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn spawn_logged_sandbox_fixture(
+        client: AurClient,
+        mut command: Command,
+        package: &'static str,
+    ) -> tokio::task::JoinHandle<Result<std::process::ExitStatus>> {
+        tokio::spawn(async move {
+            client
+                .run_logged_build_command(&mut command, package, BuildIsolation::ProcessGroup)
+                .await
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn logged_sandbox_fixture_readiness(
+        listener: &tokio::net::TcpListener,
+        runner: &mut tokio::task::JoinHandle<Result<std::process::ExitStatus>>,
+        log_path: &Path,
+    ) -> tokio::net::TcpStream {
+        tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(5), listener.accept()) => {
+                result.expect("build child must signal readiness").expect("accept readiness").0
+            }
+            result = runner => {
+                let log = std::fs::read_to_string(log_path).unwrap_or_default();
+                panic!("sandbox exited before child readiness: {result:?}\nlog:\n{log}");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires bubblewrap and permission to create PID namespaces"]
     async fn cancelling_logged_sandbox_build_terminates_descendants() {
+        use futures::FutureExt as _;
         use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
         use tokio::io::{AsyncBufReadExt, unix::AsyncFd};
 
@@ -5851,6 +5882,38 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port().to_string();
         let log_path = client.build_log_path("fixture");
+        let early_log = client.build_log_path("early-fixture");
+        let spawn_early_exit = |package| {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "printf 'early-exit-fixture\\n'; exit 23"]);
+            spawn_logged_sandbox_fixture(client.clone(), command, package)
+        };
+        let mut completed = spawn_early_exit("early-completion");
+        let _abort_completed = scopeguard::guard(completed.abort_handle(), |handle| handle.abort());
+        let status = tokio::time::timeout(Duration::from_secs(5), &mut completed)
+            .await
+            .expect("early-exit control must finish promptly")
+            .expect("early-exit build task must not panic")
+            .expect("early-exit build command must run");
+        assert_eq!(status.code(), Some(23));
+
+        let mut early_runner = spawn_early_exit("early-fixture");
+        let _abort_early = scopeguard::guard(early_runner.abort_handle(), |handle| handle.abort());
+        let failure = std::panic::AssertUnwindSafe(logged_sandbox_fixture_readiness(
+            &listener,
+            &mut early_runner,
+            &early_log,
+        ))
+        .catch_unwind()
+        .await
+        .expect_err("a build that exits before readiness must fail the fixture");
+        let diagnostic = failure
+            .downcast_ref::<String>()
+            .expect("readiness diagnostic");
+        assert!(diagnostic.contains("sandbox exited before child readiness"));
+        assert!(diagnostic.contains("early-exit-fixture"));
+        assert!(early_runner.is_finished());
+
         let mut command = sandbox_command(directory.path(), "builder").unwrap();
         // Keep the host /proc mount so the child can report its host PID after
         // PID isolation. Production mounts a fresh /proc instead. Do not bind
@@ -5888,21 +5951,9 @@ mod tests {
             ' child "$1" & wait"#,
         );
         command.arg("build").arg(port).stdin(Stdio::null());
-        let mut runner = tokio::spawn(async move {
-            client
-                .run_logged_build_command(&mut command, "fixture", BuildIsolation::ProcessGroup)
-                .await
-        });
+        let mut runner = spawn_logged_sandbox_fixture(client, command, "fixture");
         let _abort_runner = scopeguard::guard(runner.abort_handle(), |handle| handle.abort());
-        let (stream, _) = tokio::select! {
-            result = tokio::time::timeout(Duration::from_secs(5), listener.accept()) => {
-                result.expect("build child must signal readiness").expect("accept readiness")
-            }
-            result = &mut runner => {
-                let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                panic!("sandbox exited before child readiness: {result:?}\nlog:\n{log}");
-            }
-        };
+        let stream = logged_sandbox_fixture_readiness(&listener, &mut runner, &log_path).await;
         let mut readiness = tokio::io::BufReader::new(stream);
         let mut pid = String::new();
         tokio::time::timeout(Duration::from_secs(5), readiness.read_line(&mut pid))

@@ -506,12 +506,12 @@ mod tests {
         for tool in REGISTRY_TOOLS {
             crate::core::security::validate_package_name(tool.name)
                 .expect("registry name must be a safe path component");
-            let mut binary_components = std::path::Path::new(tool.binary).components();
             assert!(
-                matches!(
-                    binary_components.next(),
-                    Some(std::path::Component::Normal(_))
-                ) && binary_components.next().is_none()
+                std::path::Path::new(tool.binary)
+                    .components()
+                    .eq([std::path::Component::Normal(std::ffi::OsStr::new(
+                        tool.binary
+                    ))])
                     && !tool.binary.contains(['/', '\\'])
                     && !tool.binary.chars().any(char::is_control),
                 "{} needs a single safe binary path component: {:?}",

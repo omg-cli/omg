@@ -255,9 +255,9 @@ mod tests {
                 ("OMG_PACMAN_CONF", Some(config.as_os_str())),
             ],
             || {
-                let Err(error) = AlpmWorker::new() else {
-                    panic!("invalid worker policy must fail");
-                };
+                let error = AlpmWorker::new()
+                    .err()
+                    .expect("invalid worker policy must fail");
                 assert!(error.to_string().contains("PackageSometimes"), "{error:#}");
             },
         );

@@ -4005,6 +4005,54 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_lease_drop_reports_os_fault_without_unlocking_another_owner() -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl<'a> MakeWriter<'a> for Capture {
+            type Writer = <Mutex<Vec<u8>> as MakeWriter<'a>>::Writer;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                MakeWriter::make_writer(self.0.as_ref())
+            }
+        }
+
+        let temp = TempDir::new()?;
+        let lease = try_lock_runtime_file(temp.path(), ".mutation.lock")?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_PATH)
+            .open(temp.path().join(".mutation.lock"))?;
+        assert_eq!(file.metadata()?.ino(), lease.file.metadata()?.ino());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Capture(Arc::clone(&captured)))
+            .finish();
+        // O_PATH remains a valid owned handle, but cannot unlock. Inject it only into this fault fixture.
+        tracing::subscriber::with_default(subscriber, || drop(RuntimeLease { file }));
+        let log = String::from_utf8(captured.lock().unwrap().clone())?;
+        assert!(log.contains("WARN"));
+        assert!(log.contains("Failed to release runtime lease"));
+        assert!(log.contains(&io::Error::from_raw_os_error(nix::libc::EBADF).to_string()));
+
+        let error = try_lock_runtime_file(temp.path(), ".mutation.lock")
+            .expect_err("failed unlock must preserve the real owner's lease");
+        assert!(matches!(
+            error.downcast_ref::<fs::TryLockError>(),
+            Some(fs::TryLockError::WouldBlock)
+        ));
+        drop(lease);
+        let _next = try_lock_runtime_file(temp.path(), ".mutation.lock")?;
+        Ok(())
+    }
+
     #[test]
     fn runtime_install_lease_excludes_concurrent_recovery() -> anyhow::Result<()> {
         let temp = TempDir::new()?;

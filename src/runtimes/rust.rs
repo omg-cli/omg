@@ -1881,29 +1881,29 @@ mod tests {
             let ready = std::env::var_os("OMG_RUST_DEADLINE_READY").expect("ready marker path");
             std::fs::write(ready, b"child ready").expect("write ready marker");
             std::thread::sleep(std::time::Duration::from_secs(30));
-            panic!("deadline fixture child was not stopped");
-        }
-        let directory = tempfile::tempdir().expect("deadline fixture directory");
-        let ready = directory.path().join("ready");
-        temp_env::with_var("OMG_RUST_DEADLINE_READY", Some(ready.as_os_str()), || {
-            let failure = std::panic::catch_unwind(|| {
-                crate::core::testing::run_isolated_test_with_timeout(
-                    NAME,
-                    std::time::Duration::from_secs(5),
+        } else {
+            let directory = tempfile::tempdir().expect("deadline fixture directory");
+            let ready = directory.path().join("ready");
+            temp_env::with_var("OMG_RUST_DEADLINE_READY", Some(ready.as_os_str()), || {
+                let failure = std::panic::catch_unwind(|| {
+                    crate::core::testing::run_isolated_test_with_timeout(
+                        NAME,
+                        std::time::Duration::from_secs(5),
+                    );
+                })
+                .expect_err("the stalled child must exceed its deadline");
+                let message = failure
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| failure.downcast_ref::<&str>().copied())
+                    .expect("deadline failure must carry a message");
+                assert!(message.contains("exceeded its time or capture bound"));
+                assert_eq!(
+                    std::fs::read(&ready).expect("child became ready"),
+                    b"child ready"
                 );
-            })
-            .expect_err("the stalled child must exceed its deadline");
-            let message = failure
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| failure.downcast_ref::<&str>().copied())
-                .expect("deadline failure must carry a message");
-            assert!(message.contains("exceeded its time or capture bound"));
-            assert_eq!(
-                std::fs::read(&ready).expect("child became ready"),
-                b"child ready"
-            );
-        });
+            });
+        }
     }
 
     #[test]

@@ -894,6 +894,107 @@ mod tests {
         );
     }
 
+    fn native_pacman_query(args: &[&str]) -> Result<String> {
+        let output = crate::core::privilege::system_command("pacman")?
+            .env("LC_ALL", "C")
+            .args(args)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "pacman {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(
+            output.stdout.len() <= 16 * 1024 * 1024,
+            "pacman output exceeds bound"
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn parse_pacman_sync_rows(output: &str) -> Result<Vec<(String, String, String)>> {
+        let mut rows = Vec::new();
+        for line in output.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 3
+                    || (fields.len() == 4 && fields[3] == "[installed]")
+                    || (fields.len() == 5
+                        && fields[3] == "[installed:"
+                        && fields[4]
+                            .strip_suffix(']')
+                            .is_some_and(|version| !version.is_empty())),
+                "malformed pacman sync row: {line}"
+            );
+            rows.push((
+                fields[0].to_owned(),
+                fields[1].to_owned(),
+                fields[2].to_owned(),
+            ));
+        }
+        rows.sort();
+        Ok(rows)
+    }
+
+    #[test]
+    fn pacman_sync_rows_preserve_available_identity_in_native_output_shapes() -> Result<()> {
+        for line in [
+            "core pacman 7.0-1",
+            "core pacman 7.0-1 [installed]",
+            "core pacman 7.0-1 [installed: 6.1-1]",
+        ] {
+            assert_eq!(
+                parse_pacman_sync_rows(line)?,
+                vec![("core".to_owned(), "pacman".to_owned(), "7.0-1".to_owned())]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pacman_sync_rows_reject_incomplete_and_malformed_rows() {
+        for line in [
+            " ",
+            "core pacman",
+            "core pacman 7.0-1 [unknown]",
+            "core pacman 7.0-1 [installed: ]",
+            "core pacman 7.0-1 [installed: 6.1-1",
+            "core pacman 7.0-1 [unknown: 6.1-1]",
+            "core pacman 7.0-1 [installed: 6.1-1] extra",
+        ] {
+            let error = parse_pacman_sync_rows(line).expect_err("malformed native row");
+            assert_eq!(
+                error.to_string(),
+                format!("malformed pacman sync row: {line}")
+            );
+        }
+    }
+
+    #[test]
+    fn pacman_sync_rows_sort_without_dropping_repository_duplicates() -> Result<()> {
+        assert_eq!(
+            parse_pacman_sync_rows("extra pacman 7.0-1\ncore pacman 7.0-1\ncore pacman 7.0-1\n")?,
+            vec![
+                ("core".to_owned(), "pacman".to_owned(), "7.0-1".to_owned()),
+                ("core".to_owned(), "pacman".to_owned(), "7.0-1".to_owned()),
+                ("extra".to_owned(), "pacman".to_owned(), "7.0-1".to_owned()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_pacman_query_rejects_real_option_errors_with_stderr() {
+        let error = native_pacman_query(&["--omg-invalid-read-only-fixture-option"])
+            .expect_err("pacman must reject an unknown option");
+        let message = error.to_string();
+        assert!(message.contains("pacman ["), "{message}");
+        assert!(message.contains("unrecognized option"), "{message}");
+        assert!(
+            message.contains("--omg-invalid-read-only-fixture-option"),
+            "{message}"
+        );
+    }
+
     #[test]
     #[ignore = "requires an explicitly selected native Arch host with local and sync databases"]
     fn native_inventory_and_search_match_pacman() -> Result<()> {
@@ -912,24 +1013,8 @@ mod tests {
                 && paths::pacman_sync_dir_result()?.is_dir(),
             "native comparison requires existing local and sync databases"
         );
-        let pacman = |args: &[&str]| -> Result<String> {
-            let output = crate::core::privilege::system_command("pacman")?
-                .env("LC_ALL", "C")
-                .args(args)
-                .output()?;
-            anyhow::ensure!(
-                output.status.success(),
-                "pacman {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            anyhow::ensure!(
-                output.stdout.len() <= 16 * 1024 * 1024,
-                "pacman output exceeds bound"
-            );
-            Ok(String::from_utf8(output.stdout)?)
-        };
         let local_rows = |args: &[&str]| -> Result<Vec<(String, String)>> {
-            let output = pacman(args)?;
+            let output = native_pacman_query(args)?;
             let mut rows = Vec::new();
             for line in output.lines() {
                 let fields: Vec<_> = line.split_whitespace().collect();
@@ -940,26 +1025,7 @@ mod tests {
             Ok(rows)
         };
         let sync_rows = || -> Result<Vec<(String, String, String)>> {
-            let output = pacman(&["-Sl", "--color", "never"])?;
-            let mut rows = Vec::new();
-            for line in output.lines() {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                anyhow::ensure!(
-                    fields.len() == 3
-                        || (fields.len() == 4 && fields[3] == "[installed]")
-                        || (fields.len() == 5
-                            && fields[3] == "[installed:"
-                            && fields[4].ends_with(']')),
-                    "malformed pacman sync row: {line}"
-                );
-                rows.push((
-                    fields[0].to_owned(),
-                    fields[1].to_owned(),
-                    fields[2].to_owned(),
-                ));
-            }
-            rows.sort();
-            Ok(rows)
+            parse_pacman_sync_rows(&native_pacman_query(&["-Sl", "--color", "never"])?)
         };
         let installed = local_rows(&["-Q"])?;
         let explicit = local_rows(&["-Qe"])?;
