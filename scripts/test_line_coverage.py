@@ -452,6 +452,58 @@ class SourceAwareCoverageTests(unittest.TestCase):
             self.compare(before=[(9, 1)], after=[(10, 0)],
                          sources=({"example.rs": old}, {"example.rs": new}))
 
+    def changed_owner_brace_compare(self, owned_count=1, inserted_count=0, mutate=None):
+        old = b"fn retained() {\n  keep();\n}\nfn tail() {\n  tail();\n}\n"
+        new = b"fn retained() {\n  checked();\n  keep();\n}\nfn inserted() {\n  pending();\n}\nfn tail() {\n  tail();\n}\n"
+
+        def owners(base, head):
+            def owner(name, start, end, count):
+                return {"name": name, "filenames": ["/src/example.rs"],
+                        "regions": [[start, 1, end, 2, count, 0, 0, 0]]}
+            base["data"][0]["functions"] = [owner("retained", 1, 3, 1), owner("tail", 4, 6, 1)]
+            head["data"][0]["functions"] = [
+                owner("retained", 1, 4, owned_count),
+                owner("inserted", 5, 7, inserted_count), owner("tail", 8, 10, 1)]
+            if mutate:
+                mutate(base, head)
+
+        return self.compare(before=[(3, 1), (6, 1)],
+                            after=[(4, owned_count), (7, inserted_count), (10, 1)],
+                            mutate=owners, sources=({"example.rs": old}, {"example.rs": new}))
+
+    def test_changed_owner_brace_is_not_an_inserted_function_brace(self):
+        with self.assertRaisesRegex(ValueError, "New uncovered instrumented line: example.rs:7"):
+            self.changed_owner_brace_compare()
+
+    def test_changed_owner_brace_still_requires_coverage(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.changed_owner_brace_compare(owned_count=0, inserted_count=1)
+
+    def test_changed_owner_brace_duplicate_owner_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.changed_owner_brace_compare(mutate=lambda base, head:
+                head["data"][0]["functions"].append(copy.deepcopy(head["data"][0]["functions"][0])))
+
+    def test_changed_owner_brace_duplicate_base_owner_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.changed_owner_brace_compare(mutate=lambda base, head:
+                base["data"][0]["functions"].append(copy.deepcopy(base["data"][0]["functions"][0])))
+
+    def test_changed_owner_brace_missing_owner_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.changed_owner_brace_compare(mutate=lambda base, head:
+                head["data"][0]["functions"].pop(0))
+
+    def test_changed_owner_brace_multifile_owner_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.changed_owner_brace_compare(mutate=lambda base, head:
+                head["data"][0]["functions"][0]["filenames"].append("/src/other.rs"))
+
+    def test_changed_owner_brace_end_column_one_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.changed_owner_brace_compare(mutate=lambda base, head:
+                head["data"][0]["functions"][0]["regions"][0].__setitem__(3, 1))
+
 
     def test_covered_retained_function_edit_needs_no_deletion_credit(self):
         old = b"fn retained() {\n  obsolete_step();\n  keep();\n}\n"

@@ -231,10 +231,17 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             if not (1 <= start <= end <= len(old) and 1 <= newstart <= newend <= len(new)):
                 raise ValueError("Function owner exceeds exact source blob")
             if old[start - 1:end] == new[newstart - 1:newend]:
-                for oldline, newline in zip(range(start, end + 1), range(newstart, newend + 1)):
-                    if oldline in anchored and anchored[oldline] != newline:
-                        raise ValueError("Ambiguous retained function owner")
-                    anchored[oldline] = newline
+                pairs = zip(range(start, end + 1), range(newstart, newend + 1))
+            elif (old[end - 1].strip() == new[newend - 1].strip() == "}"
+                    and any(region[2] == end and region[3] > 1 for region in owner["regions"])
+                    and any(region[2] == newend and region[3] > 1 for region in current["regions"])):
+                pairs = [(end, newend)]
+            else:
+                continue
+            for oldline, newline in pairs:
+                if oldline in anchored and anchored[oldline] != newline:
+                    raise ValueError("Ambiguous retained function owner")
+                anchored[oldline] = newline
         gone.difference_update(anchored)
         anchored_new = set(anchored.values())
         for oldline, newline in list(retained.items()):
