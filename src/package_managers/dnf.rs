@@ -2621,12 +2621,15 @@ mod tests {
         let sizes = DnfPackageManager::parse_installed_sizes(
             b"kernel-core-0:1-1.x86_64\t4294967296\nkernel-core-0:2-1.x86_64\t12\nlib-1:3-1.i686\t0\nlib-1:3-1.x86_64\t8\n",
         ).expect("native size rows");
-        assert_eq!(sizes.len(), 4);
         assert_eq!(
-            sizes[0],
-            ("kernel-core-0:1-1.x86_64".to_owned(), 4_294_967_296)
+            sizes,
+            vec![
+                ("kernel-core-0:1-1.x86_64".to_owned(), 4_294_967_296),
+                ("kernel-core-0:2-1.x86_64".to_owned(), 12),
+                ("lib-1:3-1.i686".to_owned(), 0),
+                ("lib-1:3-1.x86_64".to_owned(), 8),
+            ]
         );
-        assert_eq!(sizes[2], ("lib-1:3-1.i686".to_owned(), 0));
         assert!(
             DnfPackageManager::parse_installed_sizes(b"")
                 .expect("empty RPM database")
@@ -3144,6 +3147,7 @@ mod tests {
         assert_eq!(upgrade.name, "a-b");
         assert_eq!(upgrade.old_version.as_deref(), Some("2:1-1"));
         assert_eq!(upgrade.new_version.as_deref(), Some("2:2-1"));
+        assert_eq!(upgrade.source, "dnf");
         for package in [
             NativeTransactionPackage {
                 nevra: "broken".to_owned(),
@@ -3256,10 +3260,16 @@ mod tests {
 
     #[test]
     fn native_result_selection_keeps_journal_and_command_outcomes_separate() {
-        use crate::core::history::{HistoryManager, TransactionType};
+        use crate::core::history::{HistoryManager, PackageChange, TransactionType};
         let directory = tempfile::tempdir().unwrap();
         let history = HistoryManager::new_in(directory.path().join("history.json")).unwrap();
         let result = DnfPackageManager::record_native_result;
+        let committed_changes = vec![PackageChange {
+            name: "tree".into(),
+            old_version: Some("0:2.2.1-4.fc44".into()),
+            new_version: None,
+            source: "dnf".into(),
+        }];
         result(
             TransactionType::Remove,
             &history,
@@ -3284,7 +3294,7 @@ mod tests {
             TransactionType::Remove,
             &history,
             Err(anyhow::anyhow!("original error")),
-            Ok(NativeOutcome::Committed(Vec::new())),
+            Ok(NativeOutcome::Committed(committed_changes.clone())),
         )
         .unwrap_err();
         assert_eq!(
@@ -3298,6 +3308,12 @@ mod tests {
             entries[1].success,
             "record native commitment honestly despite command error"
         );
+        let reopened = HistoryManager::new_in(directory.path().join("history.json"))
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(reopened[1].changes, committed_changes);
+        assert_eq!(reopened[1].transaction_type, TransactionType::Remove);
         for operation in [Ok(()), Err(anyhow::anyhow!("original error"))] {
             let error = result(
                 TransactionType::Remove,
@@ -3428,13 +3444,27 @@ mod tests {
         let directory = write_packages_db(&[blob.as_slice()]);
         let packages = DnfPackageManager::read_rpm_sqlite(&directory.path().join("rpmdb.sqlite"))
             .expect("translated native header");
-        assert_eq!(packages[0].name, "gnat-srpm-macros");
-        assert_eq!(packages[0].version, "7");
         assert_eq!(
-            packages[0].summary,
-            "RPM macros needed when source packages that need GNAT are built"
+            packages
+                .iter()
+                .map(|package| (
+                    package.name.as_str(),
+                    package.version.as_str(),
+                    package.release.as_str(),
+                    package.architecture.as_str(),
+                    package.summary.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![(
+                "gnat-srpm-macros",
+                "7",
+                "2.fc44",
+                "noarch",
+                "RPM macros needed when source packages that need GNAT are built",
+            )]
         );
     }
+
 
     #[test]
     fn string_arrays_require_every_declared_terminator() {
@@ -3468,7 +3498,7 @@ mod tests {
         assert!(result.is_ok());
 
         let tags = result.unwrap();
-        assert!(tags.contains_key(&1000));
+        assert_eq!(tags, HashMap::from([(1000, b"test".as_slice())]));
     }
 
     fn strict_header(entries: &[(u32, u32, i32, u32)], data: &[u8]) -> Vec<u8> {
