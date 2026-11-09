@@ -491,7 +491,7 @@ fn verify_x509_signature(
             verifying.verify_digest(hasher, &sig).is_ok()
         }
         "1.2.840.10045.4.3.2" => {
-            use p256::ecdsa::signature::DigestVerifier as _;
+            use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
             use p256::pkcs8::DecodePublicKey as _;
             let Ok(key) = p256::PublicKey::from_public_key_der(issuer_spki_der) else {
                 return false;
@@ -500,12 +500,12 @@ fn verify_x509_signature(
             let Ok(sig) = p256::ecdsa::Signature::from_der(signature_bits) else {
                 return false;
             };
-            let mut hasher = sha2::Sha256::new();
-            sha2::Digest::update(&mut hasher, tbs);
-            verifying.verify_digest(hasher, &sig).is_ok()
+            verifying
+                .verify_prehash(&sha2::Sha256::digest(tbs), &sig)
+                .is_ok()
         }
         "1.2.840.10045.4.3.3" => {
-            use p384::ecdsa::signature::DigestVerifier as _;
+            use p384::ecdsa::signature::hazmat::PrehashVerifier as _;
             use p384::pkcs8::DecodePublicKey as _;
             let Ok(key) = p384::PublicKey::from_public_key_der(issuer_spki_der) else {
                 return false;
@@ -514,9 +514,9 @@ fn verify_x509_signature(
             let Ok(sig) = p384::ecdsa::Signature::from_der(signature_bits) else {
                 return false;
             };
-            let mut hasher = sha2::Sha384::new();
-            sha2::Digest::update(&mut hasher, tbs);
-            verifying.verify_digest(hasher, &sig).is_ok()
+            verifying
+                .verify_prehash(&sha2::Sha384::digest(tbs), &sig)
+                .is_ok()
         }
         _ => false,
     }
@@ -2234,6 +2234,54 @@ mod tests {
             let der = decode_pem_body(pem, "CERTIFICATE").unwrap();
             let (_, certificate) = X509Certificate::from_der(&der).unwrap();
             assert!(fulcio_extensions_permit_role(&certificate, Some(count)));
+        }
+    }
+
+    #[test]
+    fn pinned_fulcio_p384_certificate_signature_rejects_tampering() {
+        use x509_parser::prelude::*;
+
+        let root_der = decode_pem_body(FULCIO_ROOT_PEM, "CERTIFICATE").unwrap();
+        let intermediate_der = decode_pem_body(FULCIO_INTERMEDIATE_PEM, "CERTIFICATE").unwrap();
+        let (_, root) = X509Certificate::from_der(&root_der).unwrap();
+        let (_, intermediate) = X509Certificate::from_der(&intermediate_der).unwrap();
+        let tbs = intermediate.tbs_certificate.as_ref();
+        let signature = intermediate.signature_value.data.as_ref();
+        let algorithm_oid = intermediate.signature_algorithm.algorithm.to_string();
+        assert_eq!(algorithm_oid, "1.2.840.10045.4.3.3");
+        assert!(verify_x509_signature(
+            root.public_key().raw,
+            tbs,
+            signature,
+            &algorithm_oid,
+        ));
+
+        let mut tampered_tbs = tbs.to_vec();
+        tampered_tbs[0] ^= 1;
+        for (spki, message, sig, oid) in [
+            (
+                root.public_key().raw,
+                tampered_tbs.as_slice(),
+                signature,
+                algorithm_oid.as_str(),
+            ),
+            (
+                intermediate.public_key().raw,
+                tbs,
+                signature,
+                algorithm_oid.as_str(),
+            ),
+            (&[][..], tbs, signature, algorithm_oid.as_str()),
+            (
+                root.public_key().raw,
+                tbs,
+                &signature[..signature.len() - 1],
+                algorithm_oid.as_str(),
+            ),
+            (root.public_key().raw, tbs, signature, "1.2.840.10045.4.3.2"),
+            (root.public_key().raw, tbs, signature, "1.2.3.4"),
+        ] {
+            assert!(!verify_x509_signature(spki, message, sig, oid));
         }
     }
 

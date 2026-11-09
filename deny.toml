@@ -85,5 +85,8 @@ unknown-registry = "deny"
 # Deny crates from unknown git repos
 unknown-git = "deny"
 # Allow specific git sources for supply chain security
-# Only the official Arch Linux ALPM repository is allowed
-allow-git = ["https://gitlab.archlinux.org/archlinux/alpm/alpm.git"]
+# Official ALPM and the pinned OpenSSL vendoring fix documented under vendor/.
+allow-git = [
+  "https://gitlab.archlinux.org/archlinux/alpm/alpm.git",
+  "https://github.com/rust-openssl/rust-openssl",
+]

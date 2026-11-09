@@ -435,7 +435,7 @@ jobs:
               timeout -k 10s 12m dnf \
                 --setopt='*.skip_if_unavailable=False' --disable-repo=fedora-cisco-openh264 \
                 install -y --setopt=install_weak_deps=False \
-                git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
+                git clang cmake make perl-core openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
                 rpm dnf sqlite yum-utils fedora-release
               rpm --initdb
             rust_install: |
