@@ -629,10 +629,11 @@ mod tests {
             Some(database.clone()),
         );
         let _reset = ResetPaths;
-        let handle = crate::package_managers::alpm_ops::open_default_alpm()?;
-        assert_eq!(std::path::Path::new(handle.root()), directory.path());
-        assert_eq!(std::path::Path::new(handle.dbpath()), database);
-        drop(handle);
+        {
+            let handle = crate::package_managers::alpm_ops::open_default_alpm()?;
+            assert_eq!(std::path::Path::new(handle.root()), directory.path());
+            assert_eq!(std::path::Path::new(handle.dbpath()), database);
+        }
 
         let archive = directory.path().join("renamed-1.0-1-x86_64.pkg.tar.gz");
         write_fake_local_package(&archive, "banned-local", "1.0-1")?;

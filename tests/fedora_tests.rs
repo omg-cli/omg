@@ -280,6 +280,10 @@ mod dnf_integration {
                 root.display()
             ),
         )?;
+        #[expect(
+            clippy::literal_string_with_formatting_args,
+            reason = "DNF interprets the RPM query format placeholders"
+        )]
         let output = std::process::Command::new("/usr/bin/timeout")
             .args(["--kill-after=2s", "60s", "/usr/bin/dnf"])
             .arg(format!("--config={}", config.display()))
@@ -801,7 +805,7 @@ mod dnf_integration {
             .env_remove("OMG_TEST_DISTRO")
             .env_remove("OMG_NATIVE_TEST_DATA_DIR");
         let mut child = spawn_bounded_child(&mut listing)?;
-        let listing = bounded_child_output(&mut child, std::time::Duration::from_secs(60)).await?;
+        let listing = bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
         assert!(
             listing.status.success(),
             "{}",
@@ -818,7 +822,7 @@ mod dnf_integration {
             .env_remove("OMG_TEST_DISTRO")
             .env_remove("OMG_NATIVE_TEST_DATA_DIR");
         let mut child = spawn_bounded_child(&mut count)?;
-        let count = bounded_child_output(&mut child, std::time::Duration::from_secs(60)).await?;
+        let count = bounded_child_output(&mut child, std::time::Duration::from_mins(1)).await?;
         assert!(
             count.status.success(),
             "{}",

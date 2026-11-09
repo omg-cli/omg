@@ -591,7 +591,7 @@ mod tests {
         )?;
         parent.add_transaction(
             crate::core::history::TransactionType::Update,
-            recorded.clone(),
+            recorded,
             true,
         )?;
         let parent_history = parent.load()?;

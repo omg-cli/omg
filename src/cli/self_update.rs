@@ -1544,6 +1544,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn attestation_rejects_an_invalid_tag_before_tool_lookup() {
+        let error = verify_attestation(std::path::Path::new("unused-archive"), "../release")
+            .expect_err("invalid release tag must refuse attestation");
+        assert_eq!(error.to_string(), "Invalid release tag");
+    }
+
     #[cfg(unix)]
     #[test]
     fn attestation_helper_rejects_writable_files_and_symlink_namespaces() {

@@ -843,11 +843,11 @@ mod tests {
                 stringify!(counts_are_consistent)
             ),
             || {
-                let (total, explicit, _orphans) = get_counts().expect("counts should succeed");
+                let (total, explicit, orphans) = get_counts().expect("counts should succeed");
                 assert!(total > 0, "should have installed packages");
                 assert!(explicit > 0, "should have explicit packages");
                 assert!(explicit <= total, "explicit should be <= total");
-                assert_eq!((total, explicit, _orphans), (1, 1, 0));
+                assert_eq!((total, explicit, orphans), (1, 1, 0));
             },
         );
     }

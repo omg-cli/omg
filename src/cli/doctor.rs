@@ -2178,6 +2178,35 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "arch", target_os = "linux"))]
+    #[tokio::test]
+    async fn native_lock_check_preserves_a_live_manager_lock() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manager = directory.path().join("pacman");
+        std::os::unix::fs::symlink("/usr/bin/sleep", &manager)?;
+        let mut child = tokio::process::Command::new(manager)
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()?;
+        let pid = child.id().context("live manager fixture PID")?;
+        let comm = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::fs::read_to_string(format!("/proc/{pid}/comm")),
+        )
+        .await??;
+        assert_eq!(comm.trim(), "pacman");
+
+        let database = directory.path().to_str().context("database fixture path")?;
+        assert_eq!(check_pacman_lock(Some(database)), 0);
+        let lock = directory.path().join("db.lck");
+        std::fs::write(&lock, b"live lock")?;
+        assert!(package_manager_running());
+        assert_eq!(check_pacman_lock(Some(database)), 0);
+        assert_eq!(std::fs::read(lock)?, b"live lock");
+        tokio::time::timeout(Duration::from_secs(2), child.kill()).await??;
+        Ok(())
+    }
+
     #[cfg(feature = "arch")]
     fn alpm_doctor_fixture(dependencies: &str) -> tempfile::TempDir {
         let temp = tempfile::TempDir::new().unwrap();

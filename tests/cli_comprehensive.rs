@@ -226,10 +226,12 @@ fn mock_fedora_sync_does_not_start_aur_metadata_io() {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
 
-    assert!(
-        cfg!(debug_assertions),
-        "mock CLI fixtures require a debug build"
-    );
+    const {
+        assert!(
+            cfg!(debug_assertions),
+            "mock CLI fixtures require a debug build"
+        );
+    }
     let fixture = tempfile::tempdir_in("/var/tmp").expect("private sync fixture");
     let home = fixture.path().join("home");
     std::fs::create_dir(&home).expect("private sync home");

@@ -2429,7 +2429,7 @@ mod tests {
         let unsealed = "/tmp/package.pkg.tar.zst".to_owned();
         for packages in [
             vec![sealed.clone(), unsealed.clone()],
-            vec![unsealed.clone(), sealed.clone()],
+            vec![unsealed, sealed.clone()],
         ] {
             let error =
                 validate_aur_artifact_handoffs(TransactionKind::InstallAurArtifact, &packages)

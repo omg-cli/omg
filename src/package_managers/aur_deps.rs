@@ -257,6 +257,8 @@ mod tests {
 
     #[test]
     fn same_base_build_requirement_accepts_an_installed_virtual_provider() {
+        use std::fmt::Write as _;
+
         let srcinfo = split_fixture(
             "\tmakedepends = example-helper>=1.0\n",
             "pkgname = example-cli\npkgname = example-helper\n",
@@ -265,7 +267,8 @@ mod tests {
             let (directory, alpm) = installed_fixture(&[("bootstrap-tool", "7.0-1")]);
             let desc = directory.path().join("db/local/bootstrap-tool-7.0-1/desc");
             let mut content = std::fs::read_to_string(&desc).expect("fixture description");
-            content.push_str(&format!("%PROVIDES%\nexample-helper={provided}\n\n"));
+            write!(content, "%PROVIDES%\nexample-helper={provided}\n\n")
+                .expect("fixture provision format");
             std::fs::write(desc, content).expect("fixture provision");
             let installed = alpm.localdb().pkgs();
             let result = dependency_info(&srcinfo, &["example-cli".to_string()], |dependency| {

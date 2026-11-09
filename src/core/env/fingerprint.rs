@@ -637,7 +637,7 @@ mod tests {
         println!(
             "[fingerprint-fixture-identity] euid={} groups={:?}",
             nix::unistd::geteuid().as_raw(),
-            nix::unistd::getgroups().expect("read fixture supplementary groups")
+            rustix::process::getgroups().expect("read fixture supplementary groups")
         );
         if crate::core::testing::run_isolated_test(NAME) {
             return;
