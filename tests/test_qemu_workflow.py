@@ -33,6 +33,42 @@ def step(name):
 
 
 class QemuWorkflowTests(unittest.TestCase):
+    def test_controller_upload_requires_successful_build_and_real_cleanup_dispatch(self):
+        body = PARENT.split('\n  build-controller:\n', 1)[1].split('\n  guest:\n', 1)[0]
+        blocks = re.split(r'(?=^      - )', body, flags=re.M)
+        commands = []
+        for block in blocks:
+            if 'uses: actions/upload-artifact@' in block:
+                commands.append('printf "upload\\n" >> "$EVENTS"')
+            elif re.search(r'^        run:', block, re.M):
+                run = re.search(r'^        run: (.*)$', block, re.M).group(1)
+                command = literal(block, 'run', 8) if run == '|' else run
+                image = re.search(r'^          QEMU_CLEANUP_TEST_IMAGE: (.*)$', block, re.M)
+                if image:
+                    command = 'export QEMU_CLEANUP_TEST_IMAGE="' + image.group(1) + '"\n' + command
+                commands.append(command)
+        script = '\n'.join(commands).replace('${{ github.run_id }}', '42').replace('${{ github.run_attempt }}', '3')
+        for failed, expected, events in (('', 0, ['verify', 'build', 'cleanup:omg-controller-builder:42-3', 'upload']),
+                                         ('build', 37, ['verify', 'build']),
+                                         ('cleanup', 37, ['verify', 'build', 'cleanup:omg-controller-builder:42-3'])):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tools = root / 'bin'
+                tools.mkdir()
+                (tools / 'bash').write_text('#!/bin/sh\nprintf "build\\n" >> "$EVENTS"\n[ "$FAILED" != build ] || exit 37\n')
+                (tools / 'python3').write_text('#!/bin/sh\ncase "$1" in\n'
+                    'scripts/test_qemu_controller_bundle.py) printf "verify\\n" >> "$EVENTS";;\n'
+                    'scripts/test_qemu_controller_cleanup.py) printf "cleanup:%s\\n" "$QEMU_CLEANUP_TEST_IMAGE" >> "$EVENTS"; [ "$FAILED" != cleanup ] || exit 37;;\n'
+                    '*) exit 99;;\nesac\n')
+                for tool in tools.iterdir():
+                    tool.chmod(0o755)
+                env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'],
+                           EVENTS=str(root / 'events'), FAILED=failed, RUNNER_TEMP=str(root))
+                result = subprocess.run([self.bash, '-euo', 'pipefail', '-c', script],
+                                        env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual((root / 'events').read_text().splitlines(), events)
+
     def _required_companion_prepare_control(self, mode):
         script = literal(step('Workflow selection regression checks'), 'run', 8)
         fixture_base = WORKFLOW.parents[2] / 'tests' / 'fixtures' / 'qemu-companion-completeness'

@@ -9,6 +9,10 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 mkdir "$output"
 output=$(cd "$output" && pwd)
 scratch=$(mktemp -d)
+scratch=$(realpath -e "$scratch")
+scratch_identity=$(stat -c '%d:%i' "$scratch")
+host_uid=$(id -u)
+host_gid=$(id -g)
 container="omg-controller-build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 builder="omg-controller-builder:$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 image="omg-qemu-controller:$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
@@ -16,9 +20,32 @@ runtime_record="omg-controller-record-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
 owned=false
 record_owned=false
 cleanup() {
-  if [[ "$owned" == true ]]; then docker rm --force "$container" >/dev/null; fi
+  local command_status=$? repair repair_status
+  [[ -d "$scratch" && ! -L "$scratch" && $(realpath -e "$scratch") == "$scratch" &&
+     $(stat -c '%d:%i' "$scratch") == "$scratch_identity" ]] || {
+    printf 'Owned controller scratch identity changed\n' >&2
+    return 2
+  }
+  if [[ "$owned" == true ]]; then
+    repair=$(timeout --kill-after=2s 15 docker create --name "$container-scratch" \
+      --network none --read-only --user 0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE \
+      --memory 128m --memory-swap 128m --cpus 1 --pids-limit 32 \
+      --mount "type=bind,source=$scratch,target=/scratch" "$builder" \
+      chown -hR "$host_uid:$host_gid" /scratch) || return $?
+    if timeout --kill-after=2s 60 docker start --attach "$repair"; then
+      repair_status=0
+    else
+      repair_status=$?
+    fi
+    timeout --kill-after=2s 15 docker rm --force "$repair" >/dev/null || return $?
+    [[ "$repair_status" == 0 ]] || return "$repair_status"
+    [[ ! -L "$scratch" && $(realpath -e "$scratch") == "$scratch" &&
+       $(stat -c '%d:%i' "$scratch") == "$scratch_identity" ]] || return 2
+    docker rm --force "$container" >/dev/null
+  fi
   if [[ "$record_owned" == true ]]; then docker rm "$runtime_record" >/dev/null; fi
   rm -rf -- "$scratch"
+  return "$command_status"
 }
 trap cleanup EXIT
 for suffix in tar.xz tar.xz.sig; do

@@ -3284,6 +3284,29 @@ esac
         self.assertNotIn('product refusal', logs['slow.log'])
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_go_timeout_preserves_product_download_diagnostics(self):
+        rows = ['runtime-go-install\t["use","go","1.27.1"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\ttempdir-drop']
+        product = (
+            'printf "Downloading go1.27.1.linux-amd64.tar.gz\\n"\n'
+            'printf "logging=%s test_mode=%s\\n" "$RUST_LOG" "$OMG_TEST_MODE" >&2\n'
+            'printf "Runtime download request started attempt=1 host=go.dev\\n" >&2\n'
+            'printf "Runtime download body progress attempt=1 host=go.dev bytes_received=8 downloaded=8 elapsed_ms=1\\n" >&2\n'
+            'sleep 4\n'
+        )
+        result, evidence, logs = self.run_inventory(product, rows, row_timeout=1)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(evidence[0]['result'], 'FAIL', logs)
+        self.assertEqual(evidence[0]['exit_code'], 124, logs)
+        self.assertEqual(logs['runtime-go-install.stdout.log'].splitlines(), [
+            'Downloading go1.27.1.linux-amd64.tar.gz', '',
+            'OMG_QEMU_RECEIPT:executor:124:1'])
+        self.assertEqual(logs['runtime-go-install.stderr.log'].splitlines(), [
+            'logging=warn,omg_lib::runtimes::common=info test_mode=0',
+            'Runtime download request started attempt=1 host=go.dev',
+            'Runtime download body progress attempt=1 host=go.dev bytes_received=8 downloaded=8 elapsed_ms=1',
+            'assertion failed: command exceeded 3s QEMU row deadline (executor exit 124)'])
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_system_update_transactions_outlive_the_generic_row_budget(self):
         rows = [
             'update-check\t["update","--check"]\tisolated-write\t0\tpass\t-\thermetic\thermetic:pass\t-\tnone',

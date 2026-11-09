@@ -244,6 +244,10 @@ jobs:
       - name: Build one controller for all x86 lanes
         id: build
         run: bash scripts/build-qemu-controller.sh "$RUNNER_TEMP/qemu-controller"
+      - name: Verify ordinary controller scratch retirement
+        env:
+          QEMU_CLEANUP_TEST_IMAGE: omg-controller-builder:${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 scripts/test_qemu_controller_cleanup.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: qemu-controller-${{ github.run_id }}-${{ github.run_attempt }}
