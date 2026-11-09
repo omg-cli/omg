@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::common::{
-    MAX_DECOMPRESSED_BYTES, activate_version_with_lease, begin_staged_install,
+    MAX_DECOMPRESSED_BYTES, RuntimeLease, activate_version_with_lease, begin_staged_install,
     complete_staged_install_with_lease, copy_regular_tree, download_with_progress,
     extract_component_tar_gz, extract_component_tar_xz, is_valid_version_dir, parse_sha256_digest,
     print_already_installed, print_installed, print_using, replace_staged_install_with_lease,
@@ -250,7 +250,7 @@ impl RustManager {
     /// The root-wide lease protects toolchain snapshots and the shared current pointer.
     /// Acquisition never waits, so holding it across downloads cannot block the executor.
     /// Keep the lock file in place; unlinking it would permit locks on different inodes.
-    fn lock_mutations(&self) -> Result<fs::File> {
+    fn lock_mutations(&self) -> Result<RuntimeLease> {
         fs::create_dir_all(&self.versions_dir)?;
         let path = self.versions_dir.join(".mutation.lock");
         let mut options = fs::OpenOptions::new();
@@ -263,8 +263,8 @@ impl RustManager {
         let lock = options
             .open(&path)
             .with_context(|| format!("Failed to open Rust mutation lock: {}", path.display()))?;
-        match lock.try_lock() {
-            Ok(()) => Ok(lock),
+        match RuntimeLease::try_lock(lock) {
+            Ok(lease) => Ok(lease),
             Err(fs::TryLockError::WouldBlock) => {
                 anyhow::bail!("Another Rust toolchain operation is running; retry when it finishes")
             }
@@ -281,7 +281,7 @@ impl RustManager {
     async fn refresh_rolling_toolchain(
         &self,
         toolchain: &RustToolchainSpec,
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<bool> {
         if !is_rolling_channel(toolchain) {
             return Ok(false);
@@ -373,7 +373,7 @@ impl RustManager {
     fn activate_toolchain(
         &self,
         toolchain: &RustToolchainSpec,
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let toolchain_name = toolchain.name();
         activate_version_with_lease(
@@ -428,7 +428,7 @@ impl RustManager {
         profile: &str,
         components: &[String],
         targets: &[String],
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let mut required_components = profile_components(profile)?;
         required_components.extend_from_slice(components);
@@ -455,7 +455,7 @@ impl RustManager {
         targets: &[String],
         manifest: &toml::Value,
         publication: ToolchainPublication,
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let version_dir = self.toolchain_dir(toolchain);
         let staging = begin_staged_install(&self.versions_dir)?;
@@ -520,7 +520,7 @@ impl RustManager {
         toolchain: &RustToolchainSpec,
         components: &[String],
         targets: &[String],
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let version_dir = self.toolchain_dir(toolchain);
         if !is_valid_version_dir(&version_dir) {
@@ -549,7 +549,7 @@ impl RustManager {
         components: &[String],
         targets: &[String],
         manifest: &toml::Value,
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let version_dir = self.toolchain_dir(toolchain);
         let mut metadata = Self::read_metadata(&version_dir)?;
@@ -1699,8 +1699,8 @@ mod tests {
         let version_dir = manager.toolchain_dir(&RustToolchainSpec::parse(&request.channel)?);
         fs::create_dir(&version_dir)?;
         fs::write(version_dir.join(RUST_METADATA_FILE), "[invalid metadata")?;
-        let lock = fs::File::create(versions.path().join(".mutation.lock"))?;
-        lock.lock()?;
+        let lock =
+            RuntimeLease::try_lock(fs::File::create(versions.path().join(".mutation.lock"))?)?;
 
         let busy = manager
             .ensure_toolchain(&request)

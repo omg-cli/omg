@@ -585,9 +585,26 @@ async fn probe_node_with_signals(
         .stderr(Stdio::piped());
     let mut command = tokio::process::Command::from(command);
     command.process_group(0).kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .context("Failed to execute Node.js version probe")?;
+    let probe_end = tokio::time::Instant::now() + deadline;
+    let startup_end =
+        probe_end.min(tokio::time::Instant::now() + std::time::Duration::from_millis(100));
+    // A concurrent fork can briefly retain a just-closed executable writer.
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.raw_os_error() == Some(nix::libc::ETXTBSY)
+                    && tokio::time::Instant::now() < startup_end =>
+            {
+                tokio::time::sleep_until(
+                    startup_end
+                        .min(tokio::time::Instant::now() + std::time::Duration::from_millis(10)),
+                )
+                .await;
+            }
+            Err(error) => return Err(error).context("Failed to execute Node.js version probe"),
+        }
+    };
     let Some(id) = child.id() else {
         child
             .wait()
@@ -623,7 +640,7 @@ async fn probe_node_with_signals(
         );
         Ok::<_, anyhow::Error>(bytes)
     };
-    let capture = tokio::time::timeout(deadline, async {
+    let capture = tokio::time::timeout_at(probe_end, async {
         let stdout = stdout.context("Missing Node.js version probe stdout")?;
         let stderr = stderr.context("Missing Node.js version probe stderr")?;
         tokio::try_join!(
@@ -1304,6 +1321,39 @@ mod tests {
             fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
         )?;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn node_probe_refuses_persistently_busy_binary_and_recovers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        write_node_probe(directory.path(), "printf 'v22.0.0\\n'", true)?;
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("bin/node"))?;
+        let inherited = writer.try_clone()?;
+        drop(writer);
+
+        let error = probe_node(
+            directory.path(),
+            "22.0.0",
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect_err("an executable with a live writer must remain an error");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .context("startup error must preserve its OS cause")?
+                .raw_os_error(),
+            Some(nix::libc::ETXTBSY)
+        );
+        let (result, ()) = tokio::join!(
+            biased;
+            probe_node(directory.path(), "22.0.0", std::time::Duration::from_secs(5)),
+            async move { drop(inherited) },
+        );
+        result
     }
 
     #[cfg(unix)]
