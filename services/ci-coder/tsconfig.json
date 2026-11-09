@@ -5,9 +5,6 @@
     "moduleResolution": "Bundler",
     "customConditions": ["workerd"],
     "paths": {
-      "#fff": [
-        "./node_modules/@opencode/core/dist/types/filesystem/fff.workerd.d.ts"
-      ],
       "#persistent-pty-binary": [
         "./node_modules/@opencode/core/dist/types/persistent-pty/binary.workerd.d.ts"
       ]

@@ -26,6 +26,12 @@ but its bundled C is not compiled or linked. This workaround does not mean
 that every downloaded source is patched. Verify the selected OpenSSL 4
 build and static linkage, and confirm that an unchanged repeat build is fresh.
 
+Linux final targets hide symbols from linked static archives. Arch's native
+ALPM and curl libraries use OpenSSL 3, whose versioned imports can otherwise
+bind to unversioned OpenSSL 4 definitions in the executable and crash.
+The linker rule covers Rust's bundled native objects inside `.rlib` archives.
+It leaves Rust's internal crypto calls and native callback pointers intact.
+
 The direct `openssl-sys` dependency only activates this feature for `pgp`.
 The Git source allowance in `deny.toml` is restricted to the official
 repository. No advisory exception is added.

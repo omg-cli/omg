@@ -111,7 +111,9 @@ const textOf = (content) => typeof content === "string" ? content : Array.isArra
 const messages = (input) => Array.isArray(input.messages) ? input.messages : [];
 const lastUser = (input) => { const all = messages(input); for (let i = all.length - 1; i >= 0; i--) { const m = all[i]; if (typeof m === "object" && m !== null && m.role === "user") return textOf(m.content); } return ""; };
 const toolResults = (input) => messages(input).filter((m) => typeof m === "object" && m !== null && m.role === "tool").map((m) => textOf(m.content));
-const ai = { aiGatewayLogId: null, async run(model, input) {
+const aiCalls = [];
+const ai = { aiGatewayLogId: null, async run(model, input, options) {
+  aiCalls.push({ model, gateway: options?.gateway ?? null });
   if (input.stream !== true || !Array.isArray(input.tools)) {
     if (input.stream === true) return sse("title");
     return Response.json({ choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "title" } }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } });
@@ -133,6 +135,7 @@ export class Coder extends BaseCoder {
   constructor(ctx, env) { super(ctx, { ...env, AI: ai, MODEL_PACER: { getByName() { return { async admit() { return { granted: true }; } }; } } }); }
   async debugState() { return (await this.ctx.storage.get("coding-result")) ?? null; }
   async debugPending() { return await this.harness.pending(); }
+  async debugAI() { return aiCalls; }
 }
 export default {
   async fetch(request, env) {
@@ -140,7 +143,7 @@ export default {
     if (path === "/__ci_calls") return env.CI_SERVICE.fetch("https://ci/__calls");
     if (path.startsWith("/__state/")) {
       const coder = env.CODER.getByName(path.slice(9));
-      return Response.json({ state: await coder.debugState(), pending: await coder.debugPending() });
+      return Response.json({ state: await coder.debugState(), pending: await coder.debugPending(), aiCalls: await coder.debugAI() });
     }
     return handler.fetch(request, env);
   },
@@ -202,7 +205,7 @@ try{
  const afterHandoff=(await (await read('/__ci_calls')).json()).filter(c=>c.method==='POST');
  const again=await (await read('/operations/'+id)).json();
  const afterRepeat=(await (await read('/__ci_calls')).json()).filter(c=>c.method==='POST');
- console.log(JSON.stringify({admitted,afterFirst:afterFirst.length,afterHandoff:afterHandoff.length,afterRepeat:afterRepeat.length,requests:afterHandoff.map(c=>c.body),handoffStatus,again:again.status,state:{job:state&&state.verificationJob,verification:state&&state.verification,audit:state&&state.testAudit&&state.testAudit.proposalSha256,sessionId:state&&state.sessionId,skill:state&&state.skillBundleSha256},status:firstStatus}));
+ console.log(JSON.stringify({admitted,aiCalls:debugged.aiCalls,afterFirst:afterFirst.length,afterHandoff:afterHandoff.length,afterRepeat:afterRepeat.length,requests:afterHandoff.map(c=>c.body),handoffStatus,again:again.status,state:{job:state&&state.verificationJob,verification:state&&state.verification,audit:state&&state.testAudit&&state.testAudit.proposalSha256,sessionId:state&&state.sessionId,skill:state&&state.skillBundleSha256},status:firstStatus}));
 }finally{await mf.dispose();}`;
   const child = Bun.spawn(["node", "--input-type=module", "-"], {
     stdin: new TextEncoder().encode(program), stdout: "pipe", stderr: "pipe", timeout: Math.max(1, deadline - Date.now()), killSignal: "SIGKILL",
@@ -217,6 +220,8 @@ try{
 test("an admitted existing-test audit reaches the real verify_patch through the real Coder status path", async () => {
   const result = await start();
   expect(result.admitted, JSON.stringify(result)).toBe(true);
+  expect(result.aiCalls.length).toBeGreaterThan(0);
+  expect(result.aiCalls.every(call => call.model === "@cf/deepseek-ai/deepseek-v4.1-flash-1017" && call.gateway === null)).toBe(true);
   expect(result.afterFirst, JSON.stringify(result)).toBe(0);
   expect(result.state.job, JSON.stringify(result)).not.toBeNull();
   expect(result.afterHandoff, JSON.stringify(result)).toBe(1);

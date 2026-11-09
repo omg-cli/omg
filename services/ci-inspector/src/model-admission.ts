@@ -58,6 +58,11 @@ export function pacedAI(binding: Ai, namespace: ModelPacerNamespace): Ai {
           } else if (performance.now() - startedAt < GRANT_LIFETIME_MS) {
             // This model's binding route returns 4007 without its documented body model.
             if (args[0] === PACING_MODEL) args[1] = {...args[1], model: PACING_MODEL};
+            if (args[2]?.gateway !== undefined) {
+              const directOptions = {...args[2]};
+              delete directOptions.gateway;
+              args[2] = directOptions;
+            }
             return target.run(...args);
           } else {
             await pause(PACING_INTERVAL_MS, signal);
