@@ -1020,7 +1020,7 @@ impl Transaction {
             .await
     }
 
-    async fn execute_removal_with<L, C, F>(&mut self, lookup: L, continuation: C) -> Result<()>
+    async fn execute_removal_with<L, C, F>(&self, lookup: L, continuation: C) -> Result<()>
     where
         L: Fn(&str) -> Result<bool> + Send + 'static,
         C: FnOnce(Vec<String>) -> F,
