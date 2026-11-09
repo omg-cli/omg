@@ -848,12 +848,43 @@ class SourceAwareCoverageTests(unittest.TestCase):
             "deleted_summary_found": 0, "deleted_summary_hit": 0,
             "deleted_mapped": 0, "deleted_mapped_hit": 0,
             "retained_wrapper_paint": [{"file": "example.rs", "base_range": [5, 9], "head_range": [6, 10],
+                                        "precise_counter_equivalence": "covered/uncovered",
                                         "precise_group_sizes": [4], "pairs": [[6, 7], [8, 9]]}]})
 
+    def test_async_wrapper_paint_accepts_positive_counter_frequency_changes(self):
+        expected = self.wrapper_paint_compare()
+
+        def old_positive_count_control(value):
+            value["head"][1]["regions"][1][4] = value["after"][6] = 4
+
+        def three_async_poll_counters(value):
+            for base_index, head_index, oldline, newline in [(2, 1, 5, 6), (4, 3, 7, 8), (5, 4, 9, 10)]:
+                value["base"][1]["regions"][base_index][4] = value["before"][oldline] = 3
+                value["head"][1]["regions"][head_index][4] = value["after"][newline] = 2
+
+        for mutate in [old_positive_count_control, three_async_poll_counters]:
+            with self.subTest(mutation=mutate.__name__):
+                self.assertEqual(self.wrapper_paint_compare(mutate=mutate), expected)
+
     def test_async_wrapper_paint_cannot_hide_precise_evidence_drift(self):
+        def fingerprint_collision(value):
+            for key, first, lines in [("base", 2, (5, 7, 9)), ("head", 1, (6, 8, 10))]:
+                extra = copy.deepcopy(value[key][1]); extra["name"] = "distinct_" + key
+                extra["regions"] = extra["regions"][first:]
+                for region in extra["regions"]:
+                    if region[4] > 0:
+                        region[4] = 17
+                value[key].append(extra)
+                for line in lines:
+                    value["before" if key == "base" else "after"][line] = 17
+
+        def zero_to_positive(value):
+            value["head"][1]["regions"][2][4] = value["after"][7] = 1
+
         mutations = {
             "genuine_hit_loss": lambda v: v["base"][1]["regions"][3].__setitem__(4, 1),
-            "other_counter_loss": lambda v: v["head"][1]["regions"][1].__setitem__(4, 4),
+            "zero_to_positive": zero_to_positive,
+            "fingerprint_collision": fingerprint_collision,
             "column_drift": lambda v: v["head"][1]["regions"][1].__setitem__(1, 6),
             "source_drift": lambda v: v["new"].__setitem__(8, "        changed_value"),
             "duplicate_precise": lambda v: v["head"].append({**copy.deepcopy(v["head"][1]), "name": "extra_precise"}),

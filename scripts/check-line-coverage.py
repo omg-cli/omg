@@ -255,6 +255,11 @@ def source_opcodes(old, new, function_scopes, mapped):
 
 
 def retained_wrapper_paint(name, old, new, before, after, base, head, base_files, head_files, retained):
+    """Prove retained wrapper paint through identical fine-region hit states.
+
+    Positive execution frequency may vary across async polls. Fine geometry and
+    covered/uncovered states must match; coarse counters and baseline DA stay exact.
+    """
     names = [Counter(owner["name"] for owner in owners) for owners in (base, head)]
 
     def async_test(source, start):
@@ -269,6 +274,9 @@ def retained_wrapper_paint(name, old, new, before, after, base, head, base_files
 
     def occurrences(source, block):
         return [n for n in range(len(source) - len(block) + 1) if source[n:n + len(block)] == block]
+
+    def fingerprint(group):
+        return tuple(region[:4] + (int(region[4] > 0),) + region[5:] for region in group)
 
     def project(owners, files, source, start, end, first_column, last_column, name_counts):
         groups = {}
@@ -324,10 +332,11 @@ def retained_wrapper_paint(name, old, new, before, after, base, head, base_files
         expected_coarse = tuple([0, body[1], end - start] + body[3:])
         if coarse_group != (expected_coarse,) or id(detailed[0]) not in bg:
             continue
-        before_groups, after_groups = Counter(bg.values()), Counter(hg.values())
+        before_groups = Counter(fingerprint(group) for group in bg.values())
+        after_groups = Counter(fingerprint(group) for group in hg.values())
         if (not before_groups or before_groups != after_groups
                 or any(count != 1 for count in before_groups.values())
-                or coarse_group in before_groups):
+                or fingerprint(coarse_group) in before_groups):
             continue
         fine = [region for group in bg.values() for region in group]
         pairs = []
@@ -346,6 +355,7 @@ def retained_wrapper_paint(name, old, new, before, after, base, head, base_files
                 pairs.append([line, current])
         if pairs:
             result.append(dict(file=name, base_range=[start, end], head_range=[target, target + end - start],
+                precise_counter_equivalence="covered/uncovered",
                 precise_group_sizes=sorted(len(group) for group in before_groups), pairs=pairs))
     return result
 
