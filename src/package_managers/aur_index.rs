@@ -347,10 +347,12 @@ mod tests {
 
     #[test]
     fn oversized_gzip_field_preserves_previous_index() -> Result<()> {
-        let directory = tempfile::tempdir()?;
+        let (directory, previous) = open_test_index(r#"[{"Name":"previous","Version":"1.0-1"}]"#)?;
         let json_path = directory.path().join("source.gz");
-        let index_path = directory.path().join("index.bin");
-        std::fs::write(&index_path, b"previous-index")?;
+        let index_path = directory.path().join("metadata.rkyv");
+        assert_eq!(previous.get("previous")?.unwrap().version.as_str(), "1.0-1");
+        drop(previous);
+        let before = std::fs::read(&index_path)?;
         let data = serde_json::json!([{"Name":"example", "Version":"1", "Description":"x".repeat(65537), "LastModified":1}]);
         let mut encoder = flate2::write::GzEncoder::new(
             File::create(&json_path)?,
@@ -358,8 +360,19 @@ mod tests {
         );
         encoder.write_all(data.to_string().as_bytes())?;
         encoder.finish()?;
-        assert!(build_index(&json_path, &index_path).is_err());
-        assert_eq!(std::fs::read(&index_path)?, b"previous-index");
+        let error =
+            build_index(&json_path, &index_path).expect_err("oversized metadata must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "Failed to parse bounded AUR JSON metadata"
+        );
+        assert!(format!("{error:#}").contains("AUR metadata exceeds record/field limit"));
+        assert_eq!(std::fs::read(&index_path)?, before);
+        let preserved = AurIndex::open(&index_path)?;
+        assert_eq!(
+            preserved.get("previous")?.unwrap().version.as_str(),
+            "1.0-1"
+        );
         Ok(())
     }
 
@@ -384,6 +397,21 @@ mod tests {
         // Test search
         let results = index.search("pkg", 10)?;
         assert_eq!(results.len(), 3); // pkg-a, pkg-b, Another-Pkg (contains 'pkg')
+        assert_eq!(
+            results
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.version.as_str()))
+                .collect::<Vec<_>>(),
+            [("Another-Pkg", "0.1"), ("pkg-a", "1.0"), ("pkg-b", "2.0")]
+        );
+        assert_eq!(
+            index
+                .search("pkg", 2)?
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Another-Pkg", "pkg-a"]
+        );
 
         let results = index.search("another", 10)?;
         assert_eq!(results.len(), 1);
@@ -509,13 +537,15 @@ mod tests {
 
         // Local version matches remote — no update
         let local_same = vec![("pkg-a".to_string(), v("1.0"))];
-        let (updates_same, _) = index.updates_for(&local_same)?;
+        let (updates_same, missing_same) = index.updates_for(&local_same)?;
         assert!(updates_same.is_empty());
+        assert!(missing_same.is_empty());
 
         // Local version ahead of remote — no update
         let local_ahead = vec![("pkg-a".to_string(), v("2.0"))];
-        let (updates_ahead, _) = index.updates_for(&local_ahead)?;
+        let (updates_ahead, missing_ahead) = index.updates_for(&local_ahead)?;
         assert!(updates_ahead.is_empty());
+        assert!(missing_ahead.is_empty());
 
         Ok(())
     }

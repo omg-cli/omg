@@ -1016,6 +1016,16 @@ impl Transaction {
     /// `indicatif` progress bars are thread-safe and keep drawing from the
     /// blocking thread.
     pub async fn execute_removal(&mut self) -> Result<()> {
+        self.execute_removal_with(super::is_installed_fast, execute_removal_native)
+            .await
+    }
+
+    async fn execute_removal_with<L, C, F>(&mut self, lookup: L, continuation: C) -> Result<()>
+    where
+        L: Fn(&str) -> Result<bool> + Send + 'static,
+        C: FnOnce(Vec<String>) -> F,
+        F: std::future::Future<Output = Result<()>>,
+    {
         anyhow::ensure!(
             cfg!(test),
             "Pure Debian mutations are disabled; use the native APT backend"
@@ -1029,21 +1039,25 @@ impl Transaction {
         let names_to_validate = package_names.clone();
         tokio::task::spawn_blocking(move || {
             for name in names_to_validate {
-                Self::require_package_installed(&name, super::is_installed_fast(&name)?)?;
+                Self::require_package_installed(&name, lookup(&name)?)?;
             }
             Ok::<(), anyhow::Error>(())
         })
         .await
         .context("Debian removal validation task failed")??;
 
-        let process_lock = Arc::clone(&DPKG_TRANSACTION_LOCK).lock_owned().await;
-        let dpkg_locks = acquire_dpkg_locks().await?;
-        let journal = DpkgTransactionJournalGuard::acquire("remove", &package_names).await?;
-        removal_on_blocking_pool(process_lock, dpkg_locks, journal, move || {
-            execute_removal_blocking(&package_names)
-        })
-        .await
+        continuation(package_names).await
     }
+}
+
+async fn execute_removal_native(package_names: Vec<String>) -> Result<()> {
+    let process_lock = Arc::clone(&DPKG_TRANSACTION_LOCK).lock_owned().await;
+    let dpkg_locks = acquire_dpkg_locks().await?;
+    let journal = DpkgTransactionJournalGuard::acquire("remove", &package_names).await?;
+    removal_on_blocking_pool(process_lock, dpkg_locks, journal, move || {
+        execute_removal_blocking(&package_names)
+    })
+    .await
 }
 
 async fn removal_on_blocking_pool(
@@ -3815,20 +3829,61 @@ mod tests {
 
     #[tokio::test]
     async fn execute_removal_reports_unknown_package_as_failure() {
-        // The blocking-pool route must still propagate per-package validation
-        // failures instead of silently completing.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sentinel = |calls: Arc<AtomicUsize>| {
+            move |names: Vec<String>| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(names, ["synthetic-installed"]);
+                std::future::ready(Err(anyhow::anyhow!("synthetic continuation reached")))
+            }
+        };
         let mut tx = Transaction::new();
-        tx.add_remove("omg-wave3-definitely-not-installed".to_string());
+        tx.add_remove("synthetic-missing".to_string());
         let error = tx
-            .execute_removal()
+            .execute_removal_with(
+                |name| Ok(name == "synthetic-installed"),
+                sentinel(calls.clone()),
+            )
             .await
             .expect_err("unknown package must fail loudly");
-        assert!(
-            error
-                .to_string()
-                .contains("omg-wave3-definitely-not-installed is not installed"),
-            "unexpected error: {error:#}"
+        assert_eq!(
+            error.to_string(),
+            "package synthetic-missing is not installed"
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let mut installed = Transaction::new();
+        installed.add_remove("synthetic-installed".to_string());
+        let error = installed
+            .execute_removal_with(
+                |name| Ok(name == "synthetic-installed"),
+                sentinel(calls.clone()),
+            )
+            .await
+            .expect_err("the synthetic continuation must be reached");
+        assert_eq!(error.to_string(), "synthetic continuation reached");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut failed_lookup = Transaction::new();
+        failed_lookup.add_remove("synthetic-installed".to_string());
+        let error = failed_lookup
+            .execute_removal_with(
+                |_| Err(anyhow::anyhow!("synthetic lookup failure")),
+                sentinel(calls.clone()),
+            )
+            .await
+            .expect_err("lookup errors must be propagated");
+        assert_eq!(error.to_string(), "synthetic lookup failure");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut empty = Transaction::new();
+        empty
+            .execute_removal_with(|_| Ok(true), sentinel(calls.clone()))
+            .await
+            .expect("empty removal must be a no-op");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

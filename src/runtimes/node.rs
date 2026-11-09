@@ -2089,9 +2089,14 @@ mod tests {
             crate::runtimes::common::resolve_partial_version(&names, "22"),
             None
         );
+        assert_eq!(crate::runtimes::resolve_version_request(&names, "22"), "22");
         // Garbage never reaches the vendor list: it is not partial, so the
         // manager passes it through to the existing not-found UX.
         assert!(!crate::runtimes::common::is_partial_version("garbage"));
+        assert_eq!(
+            crate::runtimes::resolve_version_request(&names, "garbage"),
+            "garbage"
+        );
     }
 
     #[test]

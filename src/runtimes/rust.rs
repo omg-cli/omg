@@ -1738,34 +1738,27 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn incremental_updates_require_matching_release_identity() -> Result<()> {
+    #[test]
+    fn incremental_updates_require_matching_release_identity() -> Result<()> {
+        const NAME: &str =
+            "runtimes::rust::tests::incremental_updates_require_matching_release_identity";
+        if crate::core::testing::run_isolated_test_with_timeout(
+            NAME,
+            std::time::Duration::from_secs(35),
+        ) {
+            return Ok(());
+        }
+        temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(incremental_updates_fixture())
+        })
+    }
+
+    async fn incremental_updates_fixture() -> Result<()> {
         use sha2::{Digest as _, Sha256};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        // The fixture downloads a component from a loopback HTTP server.
-        // Hermetic test mode is the only context where plain-HTTP loopback
-        // download targets are tolerated (release binaries always pin
-        // HTTPS); serialize because the switch is process-global.
-        struct TestModeGuard;
-        impl Drop for TestModeGuard {
-            fn drop(&mut self) {
-                // SAFETY: Test-only code, serialized by serial_test.
-                #[expect(unsafe_code)]
-                unsafe {
-                    std::env::remove_var("OMG_TEST_MODE");
-                }
-            }
-        }
-        // SAFETY: Test-only code, serialized by serial_test; no other test
-        // reads OMG_TEST_MODE concurrently.
-        #[expect(unsafe_code)]
-        unsafe {
-            std::env::set_var("OMG_TEST_MODE", "1");
-        }
-        let _test_mode = TestModeGuard;
-
         let archive = gzip_tar(&component_archive(
             "clippy/clippy/bin/cargo-clippy",
             EntryType::Regular,
@@ -1879,6 +1872,38 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn incremental_fixture_child_respects_its_deadline() {
+        const NAME: &str = "runtimes::rust::tests::incremental_fixture_child_respects_its_deadline";
+        if std::env::var("OMG_ISOLATED_FIXTURE_TEST").as_deref() == Ok(NAME) {
+            let ready = std::env::var_os("OMG_RUST_DEADLINE_READY").expect("ready marker path");
+            std::fs::write(ready, b"child ready").expect("write ready marker");
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            panic!("deadline fixture child was not stopped");
+        }
+        let directory = tempfile::tempdir().expect("deadline fixture directory");
+        let ready = directory.path().join("ready");
+        temp_env::with_var("OMG_RUST_DEADLINE_READY", Some(ready.as_os_str()), || {
+            let failure = std::panic::catch_unwind(|| {
+                crate::core::testing::run_isolated_test_with_timeout(
+                    NAME,
+                    std::time::Duration::from_secs(5),
+                );
+            })
+            .expect_err("the stalled child must exceed its deadline");
+            let message = failure
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| failure.downcast_ref::<&str>().copied())
+                .expect("deadline failure must carry a message");
+            assert!(message.contains("exceeded its time or capture bound"));
+            assert_eq!(
+                std::fs::read(&ready).expect("child became ready"),
+                b"child ready"
+            );
+        });
     }
 
     #[test]

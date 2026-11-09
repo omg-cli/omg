@@ -18,7 +18,7 @@ fn native_version_comparison_matches_dpkg_for_bounded_slices() {
             Ordering::Equal => "eq",
             Ordering::Greater => "gt",
         };
-        let oracle = std::process::Command::new("dpkg")
+        let oracle = std::process::Command::new("/usr/bin/dpkg")
             .args(["--compare-versions", left, operator, right])
             .status()
             .expect("dpkg oracle must be installed on native APT test hosts");

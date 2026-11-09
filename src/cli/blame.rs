@@ -369,8 +369,26 @@ mod ordering_tests {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn blame_without_backend_does_not_pretend_the_package_is_missing() {
+    #[test]
+    fn blame_without_backend_does_not_pretend_the_package_is_missing() {
+        const NAME: &str =
+            "cli::blame::tests::blame_without_backend_does_not_pretend_the_package_is_missing";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        temp_env::with_vars(
+            [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create isolated test runtime")
+                    .block_on(blame_without_backend_fixture());
+            },
+        );
+    }
+
+    async fn blame_without_backend_fixture() {
         let error = run("bash")
             .await
             .expect_err("blame with no backend must not look like not-installed");

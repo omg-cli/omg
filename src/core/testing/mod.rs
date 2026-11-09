@@ -12,4 +12,4 @@ pub use mocks::TestPackageManager;
 mod isolated;
 
 #[cfg(test)]
-pub(crate) use isolated::run_isolated_test;
+pub(crate) use isolated::{run_isolated_test, run_isolated_test_with_timeout};

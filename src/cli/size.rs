@@ -443,8 +443,31 @@ mod tests {
         feature = "debian-pure",
         feature = "fedora"
     )))]
-    #[tokio::test]
-    async fn size_without_backend_is_an_error() {
+    #[test]
+    fn size_without_backend_is_an_error() {
+        const NAME: &str = "cli::size::tests::size_without_backend_is_an_error";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        temp_env::with_vars(
+            [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create isolated test runtime")
+                    .block_on(size_without_backend_fixture());
+            },
+        );
+    }
+
+    #[cfg(not(any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )))]
+    async fn size_without_backend_fixture() {
         let error = run(None, 20).await.expect_err("size requires a backend");
         use crate::core::env::distro::Distro;
         let expected = match crate::core::env::distro::detect_distro() {

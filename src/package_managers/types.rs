@@ -371,7 +371,13 @@ mod tests {
     #[cfg(feature = "arch")]
     #[test]
     fn unparseable_version_is_rejected_and_valid_versions_keep_their_value() {
-        for bad in ["not a version", "版本-1", "1.0-1-1"] {
+        for bad in [
+            "not a version",
+            "版本-1",
+            "1.0-1-1",
+            "999999999999999999999999999999:1.0-1",
+            "1.0-999999999999999999999999999999",
+        ] {
             assert!(
                 parse_version(bad).is_none(),
                 "{bad:?} must fail the strict parser"

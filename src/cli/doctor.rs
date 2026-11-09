@@ -945,11 +945,16 @@ fn any_manager_running(proc_root: &std::path::Path, self_pid: u32) -> bool {
 /// it blocks every future transaction until removed.
 #[cfg(feature = "arch")]
 fn check_pacman_lock(db_path: Option<&str>) -> usize {
+    check_pacman_lock_with(db_path, package_manager_running)
+}
+
+#[cfg(feature = "arch")]
+fn check_pacman_lock_with(db_path: Option<&str>, manager_running: impl FnOnce() -> bool) -> usize {
     let lock = std::path::Path::new(db_path.unwrap_or("/var/lib/pacman")).join("db.lck");
     if !lock.exists() {
         return 0;
     }
-    if package_manager_running() {
+    if manager_running() {
         println!(
             "  {} Database lock held by a running package manager ({})",
             style::success("✓"),
@@ -2133,22 +2138,44 @@ mod tests {
         assert!(any_manager_running(proc.path(), self_pid));
     }
 
-    /// A lock file with no package manager behind it is stale and counts
-    /// as an issue; a missing lock is healthy. The live-manager branch is
-    /// not unit-tested: it depends on real process state.
     #[cfg(feature = "arch")]
     #[test]
     fn stale_lock_without_a_manager_is_an_issue() {
-        // Host-state dependent: a genuinely running manager means the lock
-        // is live, so the stale assertion only runs on quiet machines.
-        if package_manager_running() {
-            return;
-        }
         let dir = tempfile::TempDir::new().expect("isolated db dir");
+        let proc = tempfile::TempDir::new().expect("isolated proc dir");
         let dir_str = dir.path().to_string_lossy().into_owned();
-        assert_eq!(check_pacman_lock(Some(&dir_str)), 0);
-        std::fs::write(dir.path().join("db.lck"), b"").expect("stale lock");
-        assert_eq!(check_pacman_lock(Some(&dir_str)), 1);
+        assert_eq!(
+            check_pacman_lock_with(Some(&dir_str), || panic!("no lock must not scan processes")),
+            0
+        );
+
+        let lock = dir.path().join("db.lck");
+        std::fs::write(&lock, b"sentinel").expect("stale lock");
+        let self_pid = 4242;
+        std::fs::create_dir(proc.path().join("4242")).expect("self pid dir");
+        std::fs::write(proc.path().join("4242/comm"), "omg\n").expect("self comm");
+        std::fs::create_dir(proc.path().join("999")).expect("other pid dir");
+        std::fs::write(proc.path().join("999/comm"), "bash\n").expect("other comm");
+        assert_eq!(
+            check_pacman_lock_with(Some(&dir_str), || any_manager_running(
+                proc.path(),
+                self_pid
+            )),
+            1
+        );
+
+        std::fs::write(proc.path().join("999/comm"), "pacman\n").expect("manager comm");
+        assert_eq!(
+            check_pacman_lock_with(Some(&dir_str), || any_manager_running(
+                proc.path(),
+                self_pid
+            )),
+            0
+        );
+        assert_eq!(
+            std::fs::read(lock).expect("lock remains intact"),
+            b"sentinel"
+        );
     }
 
     #[cfg(feature = "arch")]

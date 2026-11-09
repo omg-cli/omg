@@ -14,6 +14,14 @@ pub mod common;
 
 use common::*;
 
+fn pending_update_fixture() -> (TestProject, Vec<u8>) {
+    let project = TestProject::for_distro("debian");
+    project.mock_install("git", "1.0").unwrap();
+    project.mock_available("git", "1.1").unwrap();
+    let before = std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap();
+    (project, before)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // CHECK MODE TESTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -92,7 +100,8 @@ mod non_interactive_tests {
 
     #[test]
     fn test_yes_flag_without_tty() {
-        let result = run_omg_with_env(&["update", "--yes"], &[("CI", "1")]);
+        let (project, before) = pending_update_fixture();
+        let result = project.run_with_env(&["update", "--yes"], &[("CI", "1"), ("NO_COLOR", "1")]);
         assert_runs_without_panic(&result);
         // --yes opts into non-interactive operation; complaining about
         // interactive terminals defeats its purpose.
@@ -101,69 +110,63 @@ mod non_interactive_tests {
             !combined.contains("requires an interactive terminal"),
             "--yes must not demand a TTY. Got:\n{combined}"
         );
+        result.assert_success();
+        result.assert_stdout_contains("git 1.0 → 1.1 (main)");
+        result.assert_stdout_contains("Upgraded 1 packages");
+        assert_eq!(
+            std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap(),
+            before
+        );
+        project.close_checked();
     }
 
     #[test]
     fn test_short_y_flag() {
-        let result = run_omg(&["update", "-y"]);
-        if result.success {
-            assert!(!result.stdout.is_empty(), "-y success shows its work");
-        } else {
-            let combined = result.combined_output().to_lowercase();
-            assert!(
-                combined.contains("sudo")
-                    || combined.contains("permission")
-                    || combined.contains("root")
-                    || combined.contains("development"),
-                "-y failure must name the blocker. Got:\n{combined}"
-            );
-        }
+        let (project, before) = pending_update_fixture();
+        let result = project.run_with_env(&["update", "-y"], &[("NO_COLOR", "1")]);
+        result.assert_success();
+        result.assert_stdout_contains("git 1.0 → 1.1 (main)");
+        result.assert_stdout_contains("Upgraded 1 packages");
+        assert_eq!(
+            std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap(),
+            before
+        );
+        project.close_checked();
     }
 
     #[test]
     fn test_ci_mode_with_yes() {
-        let result = run_omg_with_env(
+        let (project, before) = pending_update_fixture();
+        let result = project.run_with_env(
             &["update", "--yes"],
-            &[("CI", "1"), ("OMG_NON_INTERACTIVE", "1")],
+            &[("CI", "1"), ("OMG_NON_INTERACTIVE", "1"), ("NO_COLOR", "1")],
         );
 
         assert_runs_without_panic(&result);
-        if !result.success {
-            let combined = result.combined_output().to_lowercase();
-            assert!(
-                combined.contains("sudo")
-                    || combined.contains("permission")
-                    || combined.contains("root")
-                    || combined.contains("development"),
-                "CI --yes failure must name the blocker. Got:\n{combined}"
-            );
-        }
+        result.assert_success();
+        result.assert_stdout_contains("git 1.0 → 1.1 (main)");
+        result.assert_stdout_contains("Upgraded 1 packages");
+        assert_eq!(
+            std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap(),
+            before
+        );
+        project.close_checked();
     }
 
     #[test]
     fn test_ci_mode_without_yes_fails_gracefully() {
-        let result = run_omg_with_env(&["update"], &[("CI", "1")]);
+        let (project, before) = pending_update_fixture();
+        let result = project.run_with_env(&["update"], &[("CI", "1"), ("NO_COLOR", "1")]);
         assert_no_password_prompt(&result);
 
-        let combined = result.combined_output();
-
-        if !result.success {
-            // Pending updates + non-attended stdin must bail with the --yes
-            // blocker (src/cli/packages/common.rs update_official_only:
-            // `anyhow::bail!("Use --yes for non-interactive updates")`).
-            assert!(
-                combined.contains("--yes"),
-                "non-interactive failure must name the --yes blocker. Got:\n{combined}"
-            );
-        } else {
-            // Nothing to upgrade: the command must report the checked status
-            // (print_up_to_date / "Found N update(s)") rather than exiting
-            // silently.
-            assert!(
-                combined.contains("up to date") || combined.contains("Found"),
-                "successful no-op update must report its status. Got:\n{combined}"
-            );
-        }
+        result.assert_failure();
+        result.assert_stderr_contains("Use --yes for non-interactive updates");
+        result.assert_stdout_contains("git 1.0 → 1.1 (main)");
+        assert_eq!(
+            std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap(),
+            before
+        );
+        project.close_checked();
     }
 }
 
@@ -259,15 +262,25 @@ mod elm_workflow_tests {
     #[test]
     fn test_elm_model_initialization() {
         // Test that Elm model initializes correctly
-        let result = run_omg(&["update", "--check"]);
+        let (project, before) = pending_update_fixture();
+        let result = project.run_with_env(&["update", "--check"], &[("NO_COLOR", "1")]);
         assert_runs_without_panic(&result);
+        result.assert_success();
+        result.assert_stdout_contains("1 update available");
+        result.assert_stdout_contains("git 1.0 → 1.1 (main)");
+        assert_eq!(
+            std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap(),
+            before
+        );
+        project.close_checked();
     }
 
     #[test]
     fn test_elm_update_cycle() {
         // The Model-Update-View cycle completes and the View renders its
         // outcome on stdout (phase header, up-to-date notice, or findings).
-        let result = run_omg(&["update", "--check"]);
+        let (project, before) = pending_update_fixture();
+        let result = project.run_with_env(&["update", "--check"], &[("NO_COLOR", "1")]);
         assert_runs_without_panic(&result);
 
         let combined = result.combined_output();
@@ -275,6 +288,14 @@ mod elm_workflow_tests {
             !combined.contains("unwrap") && !combined.contains("expect"),
             "Elm cycle should not leak debug helpers into output. Got:\n{combined}"
         );
+        result.assert_success();
+        result.assert_stdout_contains("1 update available");
+        result.assert_stdout_contains("git 1.0 → 1.1 (main)");
+        assert_eq!(
+            std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap(),
+            before
+        );
+        project.close_checked();
     }
 }
 
@@ -330,13 +351,13 @@ mod error_handling_tests {
 
 mod output_format_tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_check_mode_writes_status_to_stdout() {
         // Check mode renders its human-readable status on stdout, not only
         // diagnostics on stderr.
-        let result = run_omg(&["update", "--check"]);
+        let (project, before) = pending_update_fixture();
+        let result = project.run_with_env(&["update", "--check"], &[("NO_COLOR", "1")]);
         assert_runs_without_panic(&result);
 
         assert!(
@@ -344,20 +365,46 @@ mod output_format_tests {
             "--check must write its status to stdout\nstderr: {}",
             result.stderr
         );
+        result.assert_success();
+        result.assert_stdout_contains("1 update available");
+        result.assert_stdout_contains("git 1.0 → 1.1 (main)");
+        assert_eq!(
+            std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap(),
+            before
+        );
+        project.close_checked();
     }
 
     #[test]
     fn test_output_does_not_leak_paths() {
-        let result = run_omg(&["update", "--check"]);
+        let (project, before) = pending_update_fixture();
+        let result = project.run_with_env(&["update", "--check"], &[("NO_COLOR", "1")]);
+        result.assert_success();
+        result.assert_stdout_contains("git 1.0 → 1.1 (main)");
 
         let combined = result.combined_output();
 
         // Should not expose sensitive paths
         assert!(
-            !combined.contains("/home/")
-                && !combined.contains(env::var("HOME").unwrap_or_default().as_str()),
+            !combined.contains("/home/"),
             "Should not expose home directory path"
         );
+        for path in [
+            project.home_dir.path(),
+            project.data_dir.path(),
+            project.config_dir.path(),
+        ] {
+            assert!(
+                !combined.contains(path.to_str().unwrap()),
+                "Should not expose {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(project.data_dir.path().join("mock_state_apt.json")).unwrap(),
+            before
+        );
+        project.close_checked();
     }
 
     // test_error_messages_are_user_friendly was merged into

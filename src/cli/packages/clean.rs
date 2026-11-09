@@ -565,6 +565,26 @@ fn report_cache_clean(result: Result<(usize, u64)>) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "arch"))]
+    fn run_without_test_mode<F: std::future::Future<Output = ()>>(
+        name: &str,
+        fixture: impl FnOnce() -> F,
+    ) {
+        if crate::core::testing::run_isolated_test(name) {
+            return;
+        }
+        temp_env::with_vars(
+            [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create isolated test runtime")
+                    .block_on(fixture());
+            },
+        );
+    }
+
     #[test]
     fn apt_all_requests_unsupported_cache_cleanup() {
         assert!(apt_cleanup_requests_unsupported_work(false, false, true));
@@ -595,14 +615,27 @@ mod tests {
         assert!(report_cache_clean(Ok((3, 4096))).is_ok());
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(not(any(
         feature = "arch",
         feature = "debian",
         feature = "debian-pure",
         feature = "fedora"
     )))]
-    async fn clean_orphans_without_backend_fails() {
+    fn clean_orphans_without_backend_fails() {
+        run_without_test_mode(
+            "cli::packages::clean::tests::clean_orphans_without_backend_fails",
+            clean_orphans_without_backend_fixture,
+        );
+    }
+
+    #[cfg(not(any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )))]
+    async fn clean_orphans_without_backend_fixture() {
         let error = clean(true, false, false, false, false, true)
             .await
             .expect_err("orphan removal with no backend must not look like success");
@@ -632,14 +665,27 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(not(any(
         feature = "arch",
         feature = "debian",
         feature = "debian-pure",
         feature = "fedora"
     )))]
-    async fn clean_cache_without_backend_fails() {
+    fn clean_cache_without_backend_fails() {
+        run_without_test_mode(
+            "cli::packages::clean::tests::clean_cache_without_backend_fails",
+            clean_cache_without_backend_fixture,
+        );
+    }
+
+    #[cfg(not(any(
+        feature = "arch",
+        feature = "debian",
+        feature = "debian-pure",
+        feature = "fedora"
+    )))]
+    async fn clean_cache_without_backend_fixture() {
         let error = clean(false, true, false, false, false, true)
             .await
             .expect_err("cache cleanup with no backend must not look like success");
@@ -669,9 +715,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test]
     #[cfg(not(feature = "arch"))]
-    async fn clean_aur_without_arch_fails() {
+    fn clean_aur_without_arch_fails() {
+        run_without_test_mode(
+            "cli::packages::clean::tests::clean_aur_without_arch_fails",
+            clean_aur_without_arch_fixture,
+        );
+    }
+
+    #[cfg(not(feature = "arch"))]
+    async fn clean_aur_without_arch_fixture() {
         let error = clean(false, false, true, false, false, true)
             .await
             .expect_err("AUR cleanup without the Arch backend must not look like success");

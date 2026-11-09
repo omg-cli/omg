@@ -4447,6 +4447,11 @@ mod tests {
                 .contains("Failed to read APT lists directory"),
             "got: {error}"
         );
+        let cause = error
+            .downcast_ref::<std::io::Error>()
+            .expect("original I/O error must remain available");
+        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(cause.to_string(), "denied");
     }
 
     #[test]
@@ -4473,6 +4478,11 @@ mod tests {
                 .contains("Failed to read APT lists directory entry"),
             "got: {error}"
         );
+        let cause = error
+            .downcast_ref::<std::io::Error>()
+            .expect("original I/O error must remain available");
+        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(cause.to_string(), "denied");
     }
 
     #[test]

@@ -362,29 +362,49 @@ mod tests {
     #[test]
     fn test_verify_detached_missing_signature() {
         let verifier = PgpVerifier::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sig");
 
         let mut data_file = NamedTempFile::new().unwrap();
         writeln!(data_file, "test data").unwrap();
         data_file.flush().unwrap();
 
         let err = verifier
-            .verify_detached(data_file.path(), std::path::Path::new("/nonexistent.sig"))
+            .verify_detached(data_file.path(), &missing)
             .expect_err("missing signature must fail");
-        assert!(matches!(err, PgpError::SignatureOpen { .. }), "got: {err}");
+        assert!(
+            matches!(
+                &err,
+                PgpError::SignatureOpen { path, source }
+                    if path == &missing.display().to_string()
+                        && source.kind() == std::io::ErrorKind::NotFound
+            ),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn test_verify_detached_missing_data_file() {
         let verifier = PgpVerifier::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.data");
 
         let mut sig_file = NamedTempFile::new().unwrap();
         writeln!(sig_file, "fake signature").unwrap();
         sig_file.flush().unwrap();
 
         let err = verifier
-            .verify_detached(std::path::Path::new("/nonexistent.data"), sig_file.path())
+            .verify_detached(&missing, sig_file.path())
             .expect_err("missing package blob must fail");
-        assert!(matches!(err, PgpError::PackageOpen { .. }), "got: {err}");
+        assert!(
+            matches!(
+                &err,
+                PgpError::PackageOpen { path, source }
+                    if path == &missing.display().to_string()
+                        && source.kind() == std::io::ErrorKind::NotFound
+            ),
+            "got: {err}"
+        );
     }
 
     fn signed_fixture(hash: openpgp::types::HashAlgorithm) -> (PgpVerifier, Vec<u8>) {

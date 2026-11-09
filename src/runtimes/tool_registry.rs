@@ -506,11 +506,35 @@ mod tests {
         for tool in REGISTRY_TOOLS {
             crate::core::security::validate_package_name(tool.name)
                 .expect("registry name must be a safe path component");
-            assert!(!tool.binary.is_empty(), "{} needs a binary", tool.name);
+            let mut binary_components = std::path::Path::new(tool.binary).components();
             assert!(
-                tool.repo.contains('/') && !tool.repo.starts_with('/') && !tool.repo.ends_with('/'),
-                "{} needs an owner/repo path",
-                tool.name
+                matches!(
+                    binary_components.next(),
+                    Some(std::path::Component::Normal(_))
+                ) && binary_components.next().is_none()
+                    && !tool.binary.contains(['/', '\\'])
+                    && !tool.binary.chars().any(char::is_control),
+                "{} needs a single safe binary path component: {:?}",
+                tool.name,
+                tool.binary
+            );
+            let mut repo_components = tool.repo.split('/');
+            let owner = repo_components.next().unwrap_or_default();
+            let repo = repo_components.next().unwrap_or_default();
+            let safe_component = |component: &str| {
+                let mut components = std::path::Path::new(component).components();
+                !component.is_empty()
+                    && !matches!(component, "." | "..")
+                    && matches!(components.next(), Some(std::path::Component::Normal(_)))
+                    && components.next().is_none()
+                    && !component.contains(['\\', '?', '#', '%'])
+                    && !component.chars().any(char::is_control)
+            };
+            assert!(
+                repo_components.next().is_none() && safe_component(owner) && safe_component(repo),
+                "{} needs a safe owner/repo path: {:?}",
+                tool.name,
+                tool.repo
             );
         }
     }

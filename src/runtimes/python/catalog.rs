@@ -205,46 +205,90 @@ mod tests {
     #[test]
     fn rejects_inconsistent_or_unsafe_selected_downloads() {
         let target = "x86_64-unknown-linux-gnu";
-        for (field, bad) in [
-            ("sha256", json!("a".repeat(63))),
-            ("sha256", json!(format!("{} trailing", "a".repeat(64)))),
-            ("sha256", Value::Null),
-            ("build", json!("../20260901")),
-            ("prerelease", json!("t")),
-            ("url", json!("https://evil.example/python.tar.gz")),
+        let original = entry(target, "3.12.14");
+        assert_eq!(
+            parse_catalog(catalog(original.clone()), target)
+                .unwrap()
+                .len(),
+            1
+        );
+        for (field, bad, expected) in [
+            (
+                "sha256",
+                json!("a".repeat(63)),
+                "Invalid Python catalog SHA-256",
+            ),
+            (
+                "sha256",
+                json!(format!("{} trailing", "a".repeat(64))),
+                "Invalid Python catalog SHA-256",
+            ),
+            ("sha256", Value::Null, "Invalid Python catalog entry"),
+            (
+                "build",
+                json!("../20260901"),
+                "Invalid Python catalog build",
+            ),
+            ("prerelease", json!("t"), "Invalid Python catalog version"),
+            (
+                "url",
+                json!("https://evil.example/python.tar.gz"),
+                "Untrusted Python catalog URL",
+            ),
         ] {
-            let mut selected = entry(target, "3.12.14");
+            let mut selected = original.clone();
             selected[field] = bad;
+            let error = parse_catalog(catalog(selected), target).unwrap_err();
             assert!(
-                parse_catalog(catalog(selected), target).is_err(),
-                "accepted {field}"
+                error.to_string().starts_with(expected),
+                "{field}: {error:#}"
             );
         }
-        let original = entry(target, "3.12.14");
         let url = original["url"].as_str().unwrap();
-        for bad in [
-            url.replace("3.12.14", "3.12.13"),
-            url.replace("x86_64", "aarch64"),
-            url.replace("https:", "http:"),
-            url.replace("github.com/", "github.com.evil.example/"),
-            format!("{url}?token=x"),
-            format!("{url}#fragment"),
+        for (bad, expected) in [
+            (
+                url.replace("3.12.14", "3.12.13"),
+                "Python catalog archive disagrees with version or target",
+            ),
+            (
+                url.replace("x86_64", "aarch64"),
+                "Python catalog archive disagrees with version or target",
+            ),
+            (
+                url.replace("https:", "http:"),
+                "Untrusted Python catalog URL",
+            ),
+            (
+                url.replace("github.com/", "github.com.evil.example/"),
+                "Untrusted Python catalog URL",
+            ),
+            (format!("{url}?token=x"), "Untrusted Python catalog URL"),
+            (format!("{url}#fragment"), "Untrusted Python catalog URL"),
         ] {
             let mut selected = original.clone();
             selected["url"] = json!(bad);
-            assert!(parse_catalog(catalog(selected), target).is_err());
+            let error = parse_catalog(catalog(selected), target).unwrap_err();
+            assert!(error.to_string().starts_with(expected), "{error:#}");
         }
     }
 
     #[test]
     fn rejects_unknown_schema_and_key_disagreement() {
         let target = "x86_64-unknown-linux-gnu";
-        for value in [
-            json!([]),
-            json!({"version": 2}),
-            json!({"incorrect-key": entry(target, "3.12.14")}),
+        let valid = catalog(entry(target, "3.12.14"));
+        assert_eq!(parse_catalog(valid.clone(), target).unwrap().len(), 1);
+        let mut unknown_schema = valid;
+        unknown_schema["version"] = json!(2);
+        for (value, expected) in [
+            (json!([]), "Python catalog must be an object"),
+            (unknown_schema, "Unsupported Python catalog schema"),
+            (
+                json!({"incorrect-key": entry(target, "3.12.14")}),
+                "Python catalog key disagrees with metadata",
+            ),
         ] {
-            assert!(parse_catalog(value, target).is_err());
+            let error = parse_catalog(value, target).unwrap_err();
+            assert!(error.to_string().starts_with(expected), "{error:#}");
         }
     }
 

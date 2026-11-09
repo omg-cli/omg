@@ -4816,8 +4816,12 @@ mod tests {
         let requested = &["aur-demo", "other-demo", "gone-demo"];
         let response =
             s72_info_reply(&[("other-demo", "2.0-1"), ("aur-demo", "2.0-1")], requested).await?;
-        assert_eq!(response.results.len(), 2);
-        assert_eq!(response.results[0].name, "other-demo");
+        let identities: Vec<_> = response
+            .results
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.as_str()))
+            .collect();
+        assert_eq!(identities, [("other-demo", "2.0-1"), ("aur-demo", "2.0-1")]);
         let empty = s72_info_reply(&[], requested).await?;
         assert!(
             empty.results.is_empty(),
@@ -5271,6 +5275,8 @@ mod tests {
         assert_eq!(compiler_job_flags(None, None, 8, 8), "");
         assert_eq!(compiler_job_flags(Some("-j2"), None, 16, 8), "-j2");
         assert_eq!(compiler_job_flags(None, Some("-j32"), 16, 8), "-j32");
+        assert_eq!(compiler_job_flags(Some("-j2"), Some("-j32"), 16, 8), "-j2");
+        assert_eq!(compiler_job_flags(None, None, 16, 0), "-j16");
     }
 
     #[tokio::test]
@@ -5550,6 +5556,14 @@ mod tests {
         .expect("valid AUR RPC response");
 
         assert!(response.results.is_empty());
+        let response = decode_aur_rpc_body::<AurResponse>(&s72_rpc_json(&[("aur-demo", "2.0-1")]))
+            .expect("valid nonempty AUR RPC response");
+        let identities: Vec<_> = response
+            .results
+            .iter()
+            .map(|package| (package.name.as_str(), package.version.as_str()))
+            .collect();
+        assert_eq!(identities, [("aur-demo", "2.0-1")]);
     }
 
     #[test]
@@ -7295,14 +7309,21 @@ mod tests {
 
     #[test]
     fn cache_key_binds_auxiliary_files() {
-        let client = AurClient::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let client = AurClient {
+            build_dir: dir.path().join("build"),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
         std::fs::write(dir.path().join("PKGBUILD"), "pkgname=demo\n").unwrap();
         std::fs::write(dir.path().join(".SRCINFO"), "pkgbase = demo\n").unwrap();
         std::fs::write(dir.path().join("fix.patch"), "original").unwrap();
         let before = client.cache_key(dir.path(), "").unwrap();
+        assert_eq!(before, client.cache_key(dir.path(), "").unwrap());
         std::fs::write(dir.path().join("fix.patch"), "modified").unwrap();
         assert_ne!(before, client.cache_key(dir.path(), "").unwrap());
+        std::fs::write(dir.path().join("fix.patch"), "original").unwrap();
+        assert_eq!(before, client.cache_key(dir.path(), "").unwrap());
     }
 
     #[tokio::test]
