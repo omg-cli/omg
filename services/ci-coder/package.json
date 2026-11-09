@@ -9,12 +9,12 @@
   },
   "dependencies": {
     "@ai-sdk/provider": "4.0.31",
-    "@opencode/plugin": "2.1.1",
-    "@opencode/schema": "2.1.1",
-    "@opencode/sdk": "2.1.1",
+    "@opencode/plugin": "2.2.1",
+    "@opencode/schema": "2.2.1",
+    "@opencode/sdk": "2.2.1",
     "agents": "0.29.0",
     "effect": "4.0.1",
-    "zod": "4.5.4"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261019.1",
@@ -22,7 +22,15 @@
     "@types/json-schema": "7.0.15",
     "@types/node": "26.6.5",
     "typescript": "7.0.2",
-    "wrangler": "4.151.2"
+    "wrangler": "4.153.0"
+  },
+  "overrides": {
+    "gitlab-ai-provider@6.23.1>zod": "4.6.7",
+    "glob": "14.0.2",
+    "minimatch": "11.0.1"
+  },
+  "patchedDependencies": {
+    "gitlab-ai-provider@6.23.1": "patches/gitlab-ai-provider@6.23.1.patch"
   },
   "packageManager": "bun@1.4.4"
 }

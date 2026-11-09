@@ -140,7 +140,7 @@ class FedoraSetupSourceTests(unittest.TestCase):
                             self.assertEqual(result.returncode, 0 if unavailable == "fedora-cisco-openh264" else 44, result.stderr)
                     arguments = json.loads(receipt.read_text(encoding="utf-8"))
                     package_index = arguments.index("--setopt=install_weak_deps=False") + 1
-                    expected = ["git", "clang", "cmake", "openssl-devel", "pkgconfig", "findutils", "curl"]
+                    expected = ["git", "clang", "cmake", "make", "perl-core", "openssl-devel", "pkgconfig", "findutils", "curl"]
                     if workflow != "release.yml":
                         expected.append("procps-ng")
                     if workflow == "ci.yml":

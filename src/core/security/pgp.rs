@@ -278,13 +278,17 @@ impl PgpVerifier {
     /// Returns [`PgpError::HashContext`] when the signature's hash algorithm
     /// has no usable context (unsupported or disabled algorithm).
     fn signature_hasher(sig: &openpgp::packet::Signature) -> Result<Context, PgpError> {
-        Ok(sig
+        let mut hasher = sig
             .hash_algo()
             .context()
             .map_err(|source| PgpError::HashContext {
                 source: SequoiaSource(source),
             })?
-            .for_signature(sig.version()))
+            .for_signature(sig.version());
+        if let Some(salt) = sig.salt() {
+            hasher.update(salt);
+        }
+        Ok(hasher)
     }
 
     /// Try `sig` against every signing-capable key of every cert that
@@ -412,6 +416,8 @@ mod tests {
             hash,
             std::time::SystemTime::now(),
             std::time::Duration::from_hours(1),
+            openpgp::cert::CipherSuite::Cv25519,
+            openpgp::Profile::RFC4880,
         )
     }
 
@@ -419,6 +425,8 @@ mod tests {
         hash: openpgp::types::HashAlgorithm,
         created: std::time::SystemTime,
         validity: std::time::Duration,
+        suite: openpgp::cert::CipherSuite,
+        profile: openpgp::Profile,
     ) -> (PgpVerifier, Vec<u8>) {
         use openpgp::cert::prelude::CertBuilder;
         use openpgp::packet::signature::SignatureBuilder;
@@ -426,6 +434,9 @@ mod tests {
         use openpgp::types::SignatureType;
 
         let (cert, _) = CertBuilder::general_purpose(Some("omg-test@example.invalid"))
+            .set_cipher_suite(suite)
+            .set_profile(profile)
+            .expect("certificate profile")
             .set_creation_time(std::time::SystemTime::now() - std::time::Duration::from_hours(24))
             .generate()
             .expect("generate test certificate");
@@ -456,7 +467,7 @@ mod tests {
         (
             PgpVerifier {
                 policy: StandardPolicy::new(),
-                certs: vec![cert],
+                certs: vec![cert.strip_secret_key_material()],
             },
             serialized,
         )
@@ -491,6 +502,68 @@ mod tests {
     }
 
     #[test]
+    fn crypto_backend_retains_classical_and_post_quantum_signatures() {
+        use openpgp::Profile::{RFC4880, RFC9580};
+        use openpgp::cert::CipherSuite;
+        use openpgp::types::HashAlgorithm;
+
+        let (unknown_verifier, _) = signed_fixture(HashAlgorithm::SHA512);
+        for (suite, profile) in [
+            (CipherSuite::Cv25519, RFC4880),
+            (CipherSuite::Cv448, RFC4880),
+            (CipherSuite::RSA2k, RFC4880),
+            (CipherSuite::P256, RFC4880),
+            (CipherSuite::P384, RFC4880),
+            (CipherSuite::P521, RFC4880),
+            (CipherSuite::Cv25519, RFC9580),
+            (CipherSuite::MLDSA65_Ed25519, RFC9580),
+            (CipherSuite::MLDSA87_Ed448, RFC9580),
+        ] {
+            let (verifier, signature) = signed_fixture_at(
+                HashAlgorithm::SHA512,
+                std::time::SystemTime::now(),
+                std::time::Duration::from_hours(1),
+                suite,
+                profile,
+            );
+            assert!(
+                verifier.verify_memory(b"test data", &signature).is_ok(),
+                "{suite:?} {profile:?} valid memory signature"
+            );
+            assert!(matches!(
+                verifier.verify_memory(b"altered data", &signature),
+                Err(PgpError::NoValidSignature)
+            ));
+            assert!(matches!(
+                unknown_verifier.verify_memory(b"test data", &signature),
+                Err(PgpError::NoValidSignature)
+            ));
+
+            let mut data_file = NamedTempFile::new().unwrap();
+            data_file.write_all(b"test data").unwrap();
+            data_file.flush().unwrap();
+            let mut sig_file = NamedTempFile::new().unwrap();
+            sig_file.write_all(&signature).unwrap();
+            sig_file.flush().unwrap();
+            assert!(
+                verifier
+                    .verify_detached(data_file.path(), sig_file.path())
+                    .is_ok(),
+                "{suite:?} {profile:?} valid detached signature"
+            );
+            assert!(matches!(
+                unknown_verifier.verify_detached(data_file.path(), sig_file.path()),
+                Err(PgpError::NoValidSignature)
+            ));
+            std::fs::write(data_file.path(), b"altered data").unwrap();
+            assert!(matches!(
+                verifier.verify_detached(data_file.path(), sig_file.path()),
+                Err(PgpError::NoValidSignature)
+            ));
+        }
+    }
+
+    #[test]
     fn expired_and_future_signatures_are_rejected() {
         let now = std::time::SystemTime::now();
         for created in [
@@ -501,6 +574,8 @@ mod tests {
                 openpgp::types::HashAlgorithm::SHA256,
                 created,
                 std::time::Duration::from_mins(1),
+                openpgp::cert::CipherSuite::Cv25519,
+                openpgp::Profile::RFC4880,
             );
             assert!(matches!(
                 verifier.verify_memory(b"test data", &signature),
