@@ -280,6 +280,18 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         ci = (WORKFLOWS / 'ci.yml').read_text(encoding='utf-8')
         self.assertIn("should-build: ${{ github.event_name == 'push' || steps.changes.outputs.required == 'true' }}", ci)
 
+    def test_benchmark_measurement_and_helpers_run_independently_but_both_gate_history(self):
+        workflow = (WORKFLOWS / 'benchmark.yml').read_text(encoding='utf-8')
+        for job in ('benchmark', 'workflow-helpers'):
+            with self.subTest(job=job):
+                self.assertNotRegex(job_block(workflow, job).split('    steps:', 1)[0],
+                                    r'(?m)^    needs:')
+        history = job_block(workflow, 'commit-results').split('    steps:', 1)[0]
+        dependencies = re.search(r'(?m)^    needs: \[([^\]]+)\]$', history)
+        self.assertIsNotNone(dependencies)
+        self.assertEqual(set(dependencies.group(1).split(', ')), {'benchmark', 'workflow-helpers'})
+        self.assertNotRegex(history, r'\balways\(')
+
     def test_publication_requires_tag_but_branch_dry_run_remains_valid(self):
         text = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         script = step_script(job_block(text, 'gate-on-ci'), 'Require successful CI and benchmark runs for this commit')

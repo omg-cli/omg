@@ -118,7 +118,6 @@ jobs:
   benchmark:
     name: Run Benchmarks
     if: inputs.rust-comparison != true
-    needs: workflow-helpers
     runs-on: ubuntu-24.04
     container: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
     timeout-minutes: 30
@@ -242,7 +241,7 @@ jobs:
 
   commit-results:
     name: Prepare Benchmark History for Review
-    needs: benchmark
+    needs: [benchmark, workflow-helpers]
     if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
     concurrency:
       group: benchmark-history-review
