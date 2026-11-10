@@ -4,7 +4,7 @@ import type * as Workers from "@cloudflare/workers-types/index.ts";
 import { reviewRecords } from "./review-records";
 import { diagnosticsHttp } from "./diagnostics-http";
 import { receiveSentry, sentryRecords, type SentryBindings } from "./sentry-intake";
-import { cloudCiChecks, planIdentity } from "../runner/plan.mjs";
+import { selectCloudPlan } from "../runner/plan.mjs";
 import { testAuditReportNames } from "../runner/test-audit.mjs";
 import {
     nativeParams,
@@ -35,6 +35,7 @@ const json = <T>(value: T, status = 200) =>
 
 type HttpBindings = Omit<SentryBindings, "BACKUP_BUCKET"> & {
     CI_API_TOKEN: string;
+    CI_WORKLOAD?: "ubuntu-native-pilot";
     ARTIFACTS: {
         get(name: string): Promise<{
             createToken(
@@ -88,6 +89,7 @@ export async function fetchCi(request: Request, env: HttpBindings): Promise<Resp
 
 async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
     const url = new URL(request.url);
+    const { checks: cloudCiChecks, identity: planIdentity } = selectCloudPlan(env.CI_WORKLOAD);
 
     if (url.pathname === "/sentry/poll" || url.pathname === "/sentry/events" || url.pathname.startsWith("/sentry/events/"))
         return sentryRecords(request, env.BACKUP_BUCKET);
@@ -144,6 +146,8 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
 
             if (url.pathname === "/runs") {
                 input = parseStart(document);
+                if (env.CI_WORKLOAD && (input.verification || input.testAudit))
+                    return json({ error: "Native pilot accepts ordinary checks only" }, 400);
                 if (size > (input.testAudit ? 1024 * 1024 : 65536)) return json({ error: "CI request too large" }, 413);
             }
             else z.strictObject({}).parse(document);
@@ -250,6 +254,7 @@ async function routeCi(request: Request, env: HttpBindings): Promise<Response> {
             ![
                 "rust-pgp-license-junit.xml",
                 "rust-debian-pure-junit.xml",
+                ...(env.CI_WORKLOAD ? ["ubuntu-native.json", "ubuntu-daemon.json"] : []),
 
                 "regression-baseline.json",
                 "regression-patched.json",

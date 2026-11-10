@@ -7,6 +7,7 @@ import {
     verifyCloudCiReceipt,
     verifyCloudCiObjects,
     admitCloudCiRuntime,
+    cloudCiTarget,
 } from "./cloud-ci-evidence.mjs";
 
 const [sha, branch, runId, attempt, output] = process.argv.slice(2);
@@ -28,11 +29,13 @@ if (process.env.SOURCE_BASE_SHA) input.sourceBaseSha = process.env.SOURCE_BASE_S
 
 const request = parseCloudCiRequest(input);
 
-const config = JSON.parse(await readFile(path.join(homedir(), "ci/omg-cloud-ci.json"), "utf8"));
+const workload = process.env.OMG_CI_WORKLOAD;
+const target = cloudCiTarget(workload);
+const config = JSON.parse(await readFile(path.join(homedir(), "ci", `${target.service}.json`), "utf8"));
 
 const endpoint = new URL(config.endpoint);
 
-if (endpoint.href !== "https://omg-cloud-ci.latham.workers.dev/")
+if (endpoint.href !== target.endpoint)
     throw new Error("Cloudflare CI endpoint must be the dedicated Worker.");
 
 const token = (await readFile(config.tokenFile, "utf8")).trim();
@@ -45,7 +48,7 @@ const runtime = await fetch(new URL("/health", endpoint), {
     headers, redirect: "error", signal: AbortSignal.timeout(30000),
 });
 if (!runtime.ok) throw new Error(`Cloudflare CI preflight failed: HTTP ${runtime.status}.`);
-admitCloudCiRuntime(await runtime.json());
+admitCloudCiRuntime(await runtime.json(), workload);
 
 const start = await fetch(new URL("/runs", endpoint), {
     method: "POST",
@@ -106,6 +109,7 @@ if (!response.ok) throw new Error(`Cloudflare CI proof unavailable: HTTP ${respo
 
 const receipt = verifyCloudCiReceipt(await response.json(), request, {
     imageDigest: config.imageDigest,
+    workload,
 });
 
 await verifyCloudCiObjects(receipt, (key) => {
@@ -116,7 +120,7 @@ await verifyCloudCiObjects(receipt, (key) => {
         redirect: "error",
         signal: AbortSignal.timeout(120000),
     });
-});
+}, { workload });
 
 await writeFile(output, JSON.stringify(receipt, null, 2));
 

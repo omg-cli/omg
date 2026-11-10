@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { Schema } from "effect";
+import { cloudCiTarget } from "./cloud-ci-evidence.mjs";
 
 export const artifactsRemote =
     "https://f1e95b3e1b502cf366dfc81a863695fa.artifacts.cloudflare.net/git/omg-ci/omg.git";
@@ -49,12 +50,13 @@ export function mirrorRequest(sha, token) {
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
     const sha = process.argv[2];
+    const target = cloudCiTarget(process.env.OMG_CI_WORKLOAD);
 
     const config = JSON.parse(
-        await readFile(path.join(homedir(), "ci", "omg-cloud-ci.json"), "utf8"),
+        await readFile(path.join(homedir(), "ci", `${target.service}.json`), "utf8"),
     );
 
-    if (config.endpoint !== "https://omg-cloud-ci.latham.workers.dev/")
+    if (config.endpoint !== target.endpoint)
         throw new Error("Source credentials require the dedicated CI Worker.");
 
     const ownerToken = (await readFile(config.tokenFile, "utf8")).trim();

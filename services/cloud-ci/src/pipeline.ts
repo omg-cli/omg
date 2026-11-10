@@ -15,7 +15,7 @@ import { parseStart, parseVerificationEvidence, receiptKey, requestKey, source }
 import {
     expectedCloudChecks,
     inapplicableCloudChecks,
-    planIdentity,
+    selectCloudPlan,
     runSourceFormat,
     rustTimeouts,
     scriptTimeouts,
@@ -24,6 +24,7 @@ import { z } from "zod";
 import { backupTransferMode } from "./backup-policy";
 import { parseTestAuditEvidence, testAuditStateEntries } from "./test-audit-contract";
 import { encodeVerificationEnvironment } from "../runner/verification-envelope.mjs";
+import { validateUbuntuReport } from "../runner/ubuntu-native.mjs";
 
 declare const Response: typeof import("@cloudflare/workers-types/index.ts").Response;
 
@@ -53,6 +54,8 @@ const reportSchema = z.strictObject({
     name: z.enum([
         "rust-pgp-license-junit.xml",
         "rust-debian-pure-junit.xml",
+        "ubuntu-native.json",
+        "ubuntu-daemon.json",
 
         "regression-baseline.json",
         "regression-patched.json",
@@ -89,8 +92,11 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
 
         if (!/^sha256:[a-f0-9]{64}$/.test(this.env.CI_IMAGE_DIGEST ?? ""))
             throw new Error("Trusted image digest must be configured before CI admission");
-        const planSha256 = await digest(planIdentity);
-        const requiredChecks = expectedCloudChecks(request.ref);
+        const plan = selectCloudPlan(this.env.CI_WORKLOAD);
+        const planSha256 = await digest(plan.identity);
+        const requiredChecks = expectedCloudChecks(request.ref, this.env.CI_WORKLOAD);
+        if (this.env.CI_WORKLOAD && (request.verification || request.testAudit))
+            throw new Error("Native pilot accepts ordinary checks only");
 
         if (
             (request.verification || request.testAudit) &&
@@ -131,6 +137,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                     await this.env.BACKUP_BUCKET.put(`${prefix}.stdout`, stdout);
                     await this.env.BACKUP_BUCKET.put(`${prefix}.stderr`, stderr);
                     const reports: { name: string; key: string; sha256: string }[] = [];
+                    const nativeReports = new Map<string, string>();
                     let verification: ReturnType<typeof parseVerificationEvidence> | null = null;
                     let audit: ReturnType<typeof parseTestAuditEvidence> | null = null;
 
@@ -153,6 +160,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                         const report = reportSchema.parse(
                             JSON.parse(line.slice("OMG_REPORT=".length)),
                         );
+                        if (name === "ubuntu-native-readonly") nativeReports.set(report.name, report.content);
 
                         if (reports.some((previous) => previous.name === report.name))
                             throw new Error("Duplicate CI report identity");
@@ -183,6 +191,13 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                             evidence.reportSha256))
                             throw new Error("Four-state audit reports are missing or differ from exact evidence");
                     }
+                    if (name === "ubuntu-native-readonly") {
+                        const summary = nativeReports.get("ubuntu-native.json");
+                        const daemon = nativeReports.get("ubuntu-daemon.json");
+                        if (!summary || !daemon || nativeReports.size !== 2)
+                            throw new Error("Native Ubuntu reports are missing or unexpected");
+                        validateUbuntuReport(JSON.parse(summary), daemon, request.sha);
+                    }
 
                     return {
                         stdoutSha256: await digest(stdout),
@@ -209,7 +224,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
         try {
             const deps = await ci.runner({
                 name: "frozen-dependencies",
-                command: "node /opt/omg-ci/run.mjs install",
+                command: `node /opt/omg-ci/run.mjs ${plan.install}`,
                 config,
                 env: {
                     OMG_CI_IMAGE: this.env.CI_IMAGE_DIGEST,
@@ -311,7 +326,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                         const result: CheckResult = await deps.runner({
                             name,
                             command: `node /opt/omg-ci/run.mjs ${name}`,
-                            config: name === "rust-portable-tests" ? rustConfig
+                            config: name === "rust-portable-tests" || name === "ubuntu-native-readonly" ? rustConfig
                                 : name === "script-contracts" ? scriptConfig : config,
                             env,
                         });
@@ -387,7 +402,7 @@ export class CI extends CIWorkflow<CloudflareArtifacts, Env> {
                                         requiredChecks.indexOf(right.name),
                                 ),
                             requiredChecks,
-                            inapplicableChecks: inapplicableCloudChecks(request.ref),
+                            inapplicableChecks: inapplicableCloudChecks(request.ref, this.env.CI_WORKLOAD),
                             nativeAcceptance: false,
                             imageDigest: this.env.CI_IMAGE_DIGEST,
                             planSha256,

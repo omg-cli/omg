@@ -5,4 +5,5 @@ export type Env = CiBindings & Omit<SentryBindings, "BACKUP_BUCKET"> & {
   CI_API_TOKEN: string;
   CI_IMAGE_DIGEST: string;
   CI_VERIFIER_REVISION: string;
+  CI_WORKLOAD?: "ubuntu-native-pilot";
 };

@@ -1,9 +1,11 @@
 import { Schema } from "effect";
 import { createHash } from "node:crypto";
+import { validateUbuntuReport } from "../services/cloud-ci/runner/ubuntu-native.mjs";
 import {
     expectedCloudChecks,
     expectedCloudReports,
     planIdentity,
+    selectCloudPlan,
 } from "../services/cloud-ci/runner/plan.mjs";
 
 const start = Schema.Struct({
@@ -28,12 +30,21 @@ export class CloudCiEngineFailure extends Error {
     }
 }
 
-export function admitCloudCiRuntime(runtime) {
-    if (runtime?.ok !== true || runtime.engine !== "@cloudflare/ci@0.2.0" || runtime.planSha256 !== cloudCiPlanSha256)
+export function cloudCiTarget(workload) {
+    selectCloudPlan(workload);
+    return workload === "ubuntu-native-pilot"
+        ? { service: "omg-cloud-ci-ubuntu-pilot", endpoint: "https://omg-cloud-ci-ubuntu-pilot.latham.workers.dev/" }
+        : { service: "omg-cloud-ci", endpoint: "https://omg-cloud-ci.latham.workers.dev/" };
+}
+
+export function admitCloudCiRuntime(runtime, workload) {
+    const planSha256 = createHash("sha256").update(selectCloudPlan(workload).identity).digest("hex");
+    if (runtime?.ok !== true || runtime.engine !== "@cloudflare/ci@0.2.0" || runtime.planSha256 !== planSha256)
         throw new Error("Cloudflare CI runtime plan differs from the trusted controller.");
 }
 
-export async function verifyCloudCiObjects(receipt, load) {
+export async function verifyCloudCiObjects(receipt, load, policy = {}) {
+    const nativeReports = new Map();
     const objects = [
         ...receipt.checks.flatMap((check) => [
             { key: check.stdoutKey, sha256: check.stdoutSha256 },
@@ -48,9 +59,27 @@ export async function verifyCloudCiObjects(receipt, load) {
         if (!response.ok || !response.body)
             throw new Error(`Cloudflare CI evidence unavailable: ${object.key}.`);
         const hash = createHash("sha256");
-        for await (const chunk of response.body) hash.update(chunk);
+        const native = policy.workload === "ubuntu-native-pilot" &&
+            ["ubuntu-native.json", "ubuntu-daemon.json"].includes(object.name);
+        const chunks = [];
+        let bytes = 0;
+        for await (const chunk of response.body) {
+            hash.update(chunk);
+            if (native) {
+                bytes += chunk.byteLength;
+                if (bytes > 20_000_000) throw new Error("Native report exceeds its byte budget.");
+                chunks.push(Buffer.from(chunk));
+            }
+        }
         if (hash.digest("hex") !== object.sha256)
             throw new Error(`Cloudflare CI evidence hash mismatch: ${object.key}.`);
+        if (native) nativeReports.set(object.name, Buffer.concat(chunks).toString("utf8"));
+    }
+    if (policy.workload === "ubuntu-native-pilot") {
+        const summary = nativeReports.get("ubuntu-native.json");
+        const daemon = nativeReports.get("ubuntu-daemon.json");
+        if (!summary || !daemon) throw new Error("Native Ubuntu proof is missing.");
+        validateUbuntuReport(JSON.parse(summary), daemon, receipt.sha);
     }
 }
 
@@ -104,12 +133,13 @@ export function verifyCloudCiReceipt(receipt, expected, policy) {
     )
         throw new Error("Cloudflare CI image differs from the trusted controller.");
 
-    if (receipt.planSha256 !== cloudCiPlanSha256)
+    const planSha256 = createHash("sha256").update(selectCloudPlan(policy.workload).identity).digest("hex");
+    if (receipt.planSha256 !== planSha256)
         throw new Error("Cloudflare CI plan differs from the trusted controller.");
 
     if (!Schema.is(proof)(receipt)) throw new Error("Cloudflare CI checks lack passing evidence.");
 
-    const required = expectedCloudChecks(request.ref);
+    const required = expectedCloudChecks(request.ref, policy.workload);
 
     for (const names of [receipt.requiredChecks, receipt.checks.map((entry) => entry.name)])
         if (
@@ -132,13 +162,13 @@ export function verifyCloudCiReceipt(receipt, expected, policy) {
             new Set(check.reports.map((report) => report.name)).size !== check.reports.length ||
             check.reports.some(
                 (report) =>
-                    !expectedCloudReports(check.name).includes(report.name) ||
+                    !expectedCloudReports(check.name, policy.workload).includes(report.name) ||
                     report.key !== `reports/${id}/${report.name}`,
             )
         )
             throw new Error("Cloudflare CI object identity mismatch.");
 
-        const requiredReports = expectedCloudReports(check.name);
+        const requiredReports = expectedCloudReports(check.name, policy.workload);
 
         if (
             check.reports.length !== requiredReports.length ||

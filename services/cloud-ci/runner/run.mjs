@@ -5,6 +5,7 @@ import { readFileSync, existsSync, writeFileSync, lstatSync } from "node:fs";
 import { pruneRestoredSource } from "./source-tree.mjs";
 import { runServiceCheck, rustProfiles, rustTimeouts, scriptTimeouts, toolchain } from "./plan.mjs";
 import { preparePortable, runPortable } from "./portable-process.mjs";
+import { prepareUbuntuNative, runUbuntuNative } from "./ubuntu-native.mjs";
 import { applyTestAudit } from "./audit-verifier.mjs";
 import {
     applyValidatedProposal,
@@ -23,9 +24,10 @@ const query = (args) => {
     return result.stdout;
 };
 const sha = query(["rev-parse", "HEAD"]).trim();
+const installing = ["install", "ubuntu-install"].includes(process.argv[2]);
 if (
     !/^[a-f0-9]{40}$/.test(sha) ||
-    (process.argv[2] !== "install" && sha !== process.env.OMG_EXPECTED_SHA)
+    (!installing && sha !== process.env.OMG_EXPECTED_SHA)
 )
     throw new Error("Checkout does not match requested SHA");
 if (
@@ -37,7 +39,7 @@ const tracked = query(["ls-tree", "--name-only", "-r", "-z", "HEAD"]).split("\0"
 pruneRestoredSource("/workspace", tracked);
 // A read-only gitdir pointer permits existing source-identity helpers without leaking GIT_DIR into their subprocess fixtures.
 writeFileSync("/workspace/.git", "gitdir: /tmp/ci-source/.git\n", { flag: "wx", mode: 0o444 });
-const request = process.argv[2] === "install" ? null : verificationRequest();
+const request = installing ? null : verificationRequest();
 if (request && !["regression-red-green", "test-audit-four-state", "test-audit-sensitivity"].includes(process.argv[2])) {
     if (request.testAudit) await applyTestAudit(request.testAudit.proposal, verificationContext(request));
     else await applyValidatedProposal(request.verification.proposal, verificationContext(request));
@@ -75,6 +77,12 @@ console.log(
     }),
 );
 switch (process.argv[2]) {
+    case "ubuntu-install":
+        await prepareUbuntuNative({ portable, onOutput: (name, chunk) => process[name].write(chunk) });
+        break;
+    case "ubuntu-native-readonly":
+        await runUbuntuNative({ sha, portable, report, onOutput: (name, chunk) => process[name].write(chunk) });
+        break;
     case "install":
         await run("cargo", ["fetch", "--locked"]);
         await run("bun", ["install", "--frozen-lockfile", "--ignore-scripts"]);

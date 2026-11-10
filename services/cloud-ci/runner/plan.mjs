@@ -7,17 +7,18 @@ export const cloudCiChecks = [
     "ci-coder-service",
     "ci-inspector-service",
 ];
-export function expectedCloudChecks(ref) {
+export function expectedCloudChecks(ref, workload) {
     if (ref !== "refs/heads/main") throw new Error("Unsupported CI branch");
-    return [...cloudCiChecks];
+    return [...selectCloudPlan(workload).checks];
 }
-export function inapplicableCloudChecks(ref) {
-    expectedCloudChecks(ref);
+export function inapplicableCloudChecks(ref, workload) {
+    expectedCloudChecks(ref, workload);
     return [];
 }
-export function expectedCloudReports(name) {
-    if (!cloudCiChecks.includes(name) && name !== "regression-red-green")
+export function expectedCloudReports(name, workload) {
+    if (!selectCloudPlan(workload).checks.includes(name) && name !== "regression-red-green")
         throw new Error("Unknown trusted check");
+    if (name === "ubuntu-native-readonly") return ["ubuntu-native.json", "ubuntu-daemon.json"];
     if (name === "rust-portable-tests")
         return ["rust-pgp-license-junit.xml", "rust-debian-pure-junit.xml"];
     if (name === "regression-red-green")
@@ -59,8 +60,29 @@ export const planIdentity = JSON.stringify({
         mode: "new-rust-regression-only",
         held: ["existing-test-strengthening-needs-four-states", "dependency-changes-need-receipts"],
     },
-    applicability: { main: expectedCloudChecks("refs/heads/main") },
+    applicability: { main: [...cloudCiChecks] },
 });
+const ubuntuChecks = ["frozen-dependencies", "source-format", "ubuntu-native-readonly"];
+export const ubuntuPlanIdentity = JSON.stringify({
+    version: 1,
+    repository: "omg-cli/omg",
+    workload: "ubuntu-native-pilot",
+    checks: ubuntuChecks,
+    distro: "ubuntu",
+    versionId: "24.04",
+    features: "debian,pgp,license",
+    profile: "release",
+    toolchain,
+    rustTimeouts,
+    nativeAcceptance: false,
+});
+export function selectCloudPlan(workload) {
+    if (workload === undefined)
+        return { checks: cloudCiChecks, identity: planIdentity, install: "install" };
+    if (workload === "ubuntu-native-pilot")
+        return { checks: ubuntuChecks, identity: ubuntuPlanIdentity, install: "ubuntu-install" };
+    throw new Error("Unsupported trusted CI workload");
+}
 export async function runSourceFormat(dependencies, config, env) {
     const result = await dependencies.runner({
         name: "source-format",

@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: Run portable checks, dependency repair, a rollout lock, or a runtime probe
+        description: Run checks, dependency repair, rollout operations, or build the Ubuntu pilot image
         type: choice
-        options: [portable, dependencies, rollout-lock, runtime-probe]
+        options: [portable, dependencies, rollout-lock, runtime-probe, ubuntu-image]
         default: portable
       expected_controller:
         description: Exact accepted main controller SHA (runtime-probe only)
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ inputs.task == 'runtime-probe' && 'omg-ci-operator-probe' || (github.event_name == 'workflow_run' || inputs.task == 'dependencies') && 'omg-cloud-dependencies' || 'omg-ai-review-global' }}
+  group: ${{ inputs.task == 'ubuntu-image' && 'omg-ci-ubuntu-image' || inputs.task == 'runtime-probe' && 'omg-ci-operator-probe' || (github.event_name == 'workflow_run' || inputs.task == 'dependencies') && 'omg-cloud-dependencies' || 'omg-ai-review-global' }}
   cancel-in-progress: false
   queue: max
 
@@ -33,6 +33,55 @@ env:
   CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false"
 
 jobs:
+  ubuntu-image:
+    name: Build and verify the Ubuntu Cloudflare image
+    if: >-
+      github.repository == 'omg-cli/omg' && github.event_name == 'workflow_dispatch' &&
+      inputs.task == 'ubuntu-image'
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24.22.1"
+          package-manager-cache: false
+      - name: Install verified Bun
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/omg-bun-1.4.4"
+          mkdir -m 700 -p "$tools"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
+            https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$tools/bun.zip"
+          unzip -q "$tools/bun.zip" -d "$tools"
+          directory="$tools/bun-linux-x64"
+          printf '%s  %s\n' '10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235' "$directory/bun" | sha256sum -c -
+          test "$("$directory/bun" --revision)" = '1.4.4+38afee6c8'
+          printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - name: Install frozen image builder dependencies
+        run: bun install --cwd services/cloud-ci --frozen-lockfile --ignore-scripts
+      - name: Build, smoke-test and publish the exact-source pilot image
+        id: image
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node scripts/build-cloud-ubuntu-image.mjs "$RUNNER_TEMP/ubuntu-image-proof.json"
+      - name: Retain Ubuntu image identity proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ubuntu-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ubuntu-image-proof.json
+          if-no-files-found: warn
+          retention-days: 14
+
   rollout-lock:
     name: Hold cloud admission groups for operator rollout
     permissions: {}
