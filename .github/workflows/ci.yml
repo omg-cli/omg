@@ -299,7 +299,8 @@ jobs:
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Ubuntu's cold validation build also needs room for slow package mirrors.
+    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && matrix.phase == 'validation' && 45 || 30 }}
     env:
       RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}
       DIAGNOSTIC_IMAGE: ${{ matrix.image }}

@@ -70,7 +70,10 @@ class NativePhaseMatrixTests(unittest.TestCase):
                 self.assertRegex(metadata, rf"(?m)^            {field}: .+")
             self.assertNotRegex(metadata, r"(?m)^            phase:")
         self.assertEqual(len(combinations), 10)
-        self.assertIn("    timeout-minutes: 30\n", self.job)
+        self.assertIn(
+            "    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && "
+            "matrix.phase == 'validation' && 45 || 30 }}\n", self.job,
+        )
         self.assertIn("      max-parallel: 5\n", self.job)
         self.assertIn("      fail-fast: false\n", self.job)
         self.assertNotIn("continue-on-error", self.job)
