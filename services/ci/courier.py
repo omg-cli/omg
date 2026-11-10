@@ -18,7 +18,7 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def validate(evidence, identity, image, mode, logs, workflow_status='complete'):
+def validate(evidence, identity, image, mode, logs, workflow_status='complete', artifact_manifest_sha256=None):
     require(evidence.get('schemaVersion') == 1 and evidence.get('input') == identity,
             'receipt identity mismatch')
     require(evidence.get('imageDigest') == image and evidence.get('mode') == mode,
@@ -38,6 +38,13 @@ def validate(evidence, identity, image, mode, logs, workflow_status='complete'):
                 report.get('effectiveCapabilities') == 0 and report.get('rootWriteDenied') is True,
                 'native permission canary proof is incomplete')
     else:
+        require(report.get('runtimeOnly') is True and report.get('buildExecutor') == 'github-actions-image-build' and
+                report.get('buildSourceSha') == identity['sourceSha'], 'build and runtime provenance differ')
+        require(isinstance(artifact_manifest_sha256, str) and re.fullmatch('[a-f0-9]{64}', artifact_manifest_sha256) and
+                report.get('artifactManifestSha256') == artifact_manifest_sha256,
+                'runtime artifacts differ from the verified image manifest')
+        require(isinstance(report.get('libtestSha256'), str) and re.fullmatch('[a-f0-9]{64}', report['libtestSha256']),
+                'missing compiled test executable identity')
         require(report.get('sourceSha') == identity['sourceSha'] and report.get('profile') == 'release' and
                 report.get('features') == 'debian,pgp,license', 'native recipe mismatch')
         oracle = runpy.run_path(str(Path(__file__).resolve().parents[2] / 'scripts/build-comparison.py'))
@@ -67,10 +74,14 @@ def main():
     parser.add_argument('--mode', choices=('canary', 'run'), required=True)
     parser.add_argument('--source-sha', required=True)
     parser.add_argument('--image-digest', required=True)
+    parser.add_argument('--artifact-manifest-sha256')
     parser.add_argument('--evidence-dir', type=Path, required=True)
     args = parser.parse_args()
     require(re.fullmatch('[a-f0-9]{40}', args.source_sha), 'invalid source SHA')
     require(re.fullmatch('sha256:[a-f0-9]{64}', args.image_digest), 'invalid image digest')
+    if args.mode == 'run':
+        require(isinstance(args.artifact_manifest_sha256, str) and
+                re.fullmatch('[a-f0-9]{64}', args.artifact_manifest_sha256), 'verified artifact manifest is required')
     identity = {'sourceSha': args.source_sha, 'runId': os.environ['GITHUB_RUN_ID'],
                 'attempt': int(os.environ['GITHUB_RUN_ATTEMPT'])}
     token = os.environ['OMG_NATIVE_CI_TOKEN']
@@ -110,7 +121,7 @@ def main():
         for stream in ('stdout', 'stderr'):
             logs[stream] = request(path + '/logs/' + stream)
             (args.evidence_dir / stream).write_bytes(logs[stream])
-        validate(evidence, identity, args.image_digest, args.mode, logs, state)
+        validate(evidence, identity, args.image_digest, args.mode, logs, state, args.artifact_manifest_sha256)
         accepted = True
         print('Cloudflare CI accepted; exact-source evidence and container cleanup verified.', flush=True)
     finally:

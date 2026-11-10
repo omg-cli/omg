@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { imageIdentity, pinnedConfiguration, providerReady, readProviderApplication } from '../deploy.mjs';
+import { imageIdentity, pinnedConfiguration, providerReady, readProviderApplication, validateRuntimeSmoke } from '../deploy.mjs';
 
 test('published image must match the tested local image and its registry digest', () => {
     const repository = 'registry.cloudflare.com/' + 'a'.repeat(32) + '/omg-native-ci';
@@ -47,4 +47,28 @@ test('readiness uses fresh application detail when the list still contains the p
     assert.equal(providerReady(stale, [rollout], image), false);
     assert.equal(providerReady(await readProviderApplication(get), [rollout], image), true);
     await assert.rejects(readProviderApplication(async suffix => suffix.startsWith('?') ? [stale] : { ...current, id: 'another' }));
+});
+
+test('offline smoke binds successful exact tests to the baked build and independently measured artifacts', () => {
+    const source = 'a'.repeat(40), hash = 'b'.repeat(64);
+    const files = Object.fromEntries(['omg', 'omgd', 'libtest'].map(name => [name, { sha256: hash, bytes: 1024 }]));
+    const releaseProfile = { lto: 'fat', 'codegen-units': 1, panic: 'unwind', strip: true, 'opt-level': 3, incremental: false };
+    const manifest = { schemaVersion: 1, sourceSha: source, profile: 'release', features: 'debian,pgp,license',
+        cargoTomlSha256: hash, compiler: 'rustc 1.95.0 (pinned)', releaseProfile, files };
+    const metadata = { manifest, artifactFiles: files, releaseProfile, tests: ['exact-one', 'exact-two'],
+        frozen: { 'Cargo.toml': hash }, artifactManifestSha256: hash, buildReceiptSha256: hash,
+        buildReceipt: { accepted: true, sourceSha: source, candidateProcessesStopped: true,
+            runtimeOnly: false, buildExecutor: 'github-actions-image-build', artifactManifestSha256: hash } };
+    const result = { accepted: true, sourceSha: source, runtimeOnly: true, buildExecutor: 'github-actions-image-build',
+        buildSourceSha: source, artifactManifestSha256: hash, libtestSha256: hash, candidateProcessesStopped: true,
+        binaryHashes: { omg: hash, omgd: hash }, buildMetadata: { manifest, buildReceiptSha256: hash },
+        tests: metadata.tests.map(name => ({ name, passed: 1, failed: 0, ignored: 0 })) };
+    const output = value => 'phase output\nOMG_CI_RESULT=' + JSON.stringify(value);
+    assert.deepEqual(validateRuntimeSmoke(output(result), source, metadata), result);
+    assert.throws(() => validateRuntimeSmoke(output(result), source, { ...metadata,
+        buildReceipt: { ...metadata.buildReceipt, buildExecutor: 'unverified' } }));
+    assert.throws(() => validateRuntimeSmoke(output({ ...result, accepted: false }), source, metadata));
+    assert.throws(() => validateRuntimeSmoke(output({ ...result, artifactManifestSha256: 'c'.repeat(64) }), source, metadata));
+    assert.throws(() => validateRuntimeSmoke(output({ ...result, tests: [] }), source, metadata));
+    assert.throws(() => validateRuntimeSmoke(output(result) + '\nOMG_CI_RESULT=' + JSON.stringify(result), source, metadata));
 });

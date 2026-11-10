@@ -174,7 +174,7 @@ export class NativeRunner extends DurableObject<Env> {
 
   private async execute(id: string, job: Job) {
     await this.assertRunning(id);
-    this.container.start(job.mode === 'canary' ? { entrypoint: ['sleep', 'infinity'], enableInternet: false } : { enableInternet: true });
+    this.container.start(job.mode === 'canary' ? { entrypoint: ['sleep', 'infinity'], enableInternet: false } : { enableInternet: false });
     await this.container.setInactivityTimeout(60000);
     if (job.mode === 'canary') {
       await this.assertRunning(id);

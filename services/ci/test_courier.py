@@ -13,6 +13,9 @@ class EvidenceChecks(unittest.TestCase):
         logs = {'stdout': b'', 'stderr': b''}
         names = runpy.run_path(str(Path(__file__).resolve().parents[2] / 'scripts/build-comparison.py'))['TESTS']
         report = {'accepted': True, 'sourceSha': identity['sourceSha'], 'profile': 'release',
+                  'runtimeOnly': True, 'buildExecutor': 'github-actions-image-build',
+                  'buildSourceSha': identity['sourceSha'], 'artifactManifestSha256': 'f' * 64,
+                  'libtestSha256': 'a' * 64,
                   'features': 'debian,pgp,license', 'binaryHashes': {'omg': 'c' * 64, 'omgd': 'd' * 64},
                   'tests': [{'name': name, 'stdout': f'test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;'} for name in names],
                   'inventory': {'completeNamesEqual': True, 'nativeStateUnchanged': True,
@@ -24,12 +27,21 @@ class EvidenceChecks(unittest.TestCase):
         receipt = {'schemaVersion': 1, 'input': identity, 'mode': 'run', 'imageDigest': image,
                    'accepted': True, 'exitCode': 0, 'containerDestroyed': True, 'error': None,
                    'report': report, 'logs': {name: {'bytes': 0, 'sha256': hashlib.sha256(b'').hexdigest()} for name in logs}}
-        validate(receipt, identity, image, 'run', logs)
+        validate(receipt, identity, image, 'run', logs, artifact_manifest_sha256='f' * 64)
         for hashes in ({}, {'omg': 'c' * 64}):
             changed = copy.deepcopy(receipt)
             changed['report']['binaryHashes'] = hashes
             with self.subTest(hashes=hashes), self.assertRaises(ValueError):
-                validate(changed, identity, image, 'run', logs)
+                validate(changed, identity, image, 'run', logs, artifact_manifest_sha256='f' * 64)
+        for field, value in [('runtimeOnly', False), ('buildExecutor', 'cloudflare'),
+                             ('buildSourceSha', '0' * 40), ('artifactManifestSha256', '0' * 64),
+                             ('libtestSha256', '')]:
+            changed = copy.deepcopy(receipt)
+            changed['report'][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate(changed, identity, image, 'run', logs, artifact_manifest_sha256='f' * 64)
+        with self.assertRaises(ValueError):
+            validate(receipt, identity, image, 'run', logs)
 
     def test_success_requires_exact_identity_logs_and_confirmed_cleanup(self):
         identity = {'sourceSha': 'a' * 40, 'runId': '10', 'attempt': 1}

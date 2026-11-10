@@ -21,12 +21,13 @@ function fixture(options: { image?: string; output?: string; destructionFailures
   const data = new Map<string, unknown>();
   const objects = new Map<string, unknown>();
   const calls: { argv: string[]; options: unknown }[] = [];
+  const startOptions: unknown[] = [];
   let starts = 0, destroys = 0, resets = 0, alarm: number | null = null;
   let releaseFailure = false;
   let initialization = Promise.resolve();
   const container = {
     running: false,
-    start() { starts++; this.running = true; },
+    start(options: unknown) { starts++; startOptions.push(options); this.running = true; },
     async setInactivityTimeout() {},
     async inspect() { return this.running ? { image: options.image ?? `registry/example@${imageDigest}` } : null; },
     async destroy() {
@@ -70,7 +71,7 @@ function fixture(options: { image?: string; output?: string; destructionFailures
     async put(key: string, value: unknown) { objects.set(key, structuredClone(value)); },
   } };
   const runner = new NativeRunner(ctx, env);
-  return { runner, ctx, env, data, objects, container, calls, ready: () => initialization,
+  return { runner, ctx, env, data, objects, container, calls, startOptions, ready: () => initialization,
     counts: () => ({ starts, destroys, alarm }), resets: () => resets,
     failRelease: () => { releaseFailure = true; },
     evidence: () => JSON.parse(String([...objects].find(([key]) => key.endsWith('/evidence.json'))?.[1])),
@@ -116,6 +117,7 @@ describe('native CI lifecycle', () => {
     await f.ready();
     expect(await f.runner.run({ input, mode: 'run' })).toEqual({ key: `run-123-1-${input.sourceSha}/evidence.json`, accepted: true });
     expect(f.calls).toEqual([{ argv: ['/usr/bin/python3', '-I', '/opt/ci/run.py', input.sourceSha], options: { stdout: 'pipe', stderr: 'pipe' } }]);
+    expect(f.startOptions).toEqual([{ enableInternet: false }]);
     expect(f.evidence()).toMatchObject({ accepted: true, input, imageDigest, containerDestroyed: true, report, exitCode: 0 });
     expect(f.counts()).toEqual({ starts: 1, destroys: 1, alarm: null });
     await expect(f.runner.run({ input, mode: 'run' })).rejects.toThrow('already submitted');

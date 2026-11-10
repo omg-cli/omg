@@ -1,37 +1,40 @@
-# Plain Cloudflare CI pilot
+# Plain Cloudflare runtime pilot
 
-As of November 10, 2026, OMG is retiring the autonomous Cloudflare issue, PR and AI repair system. Ordinary GitHub CI remains required. The replacement Ubuntu pilot runs builds and tests only. Codex stays local.
+OMG uses GitHub CI for builds, lint, coverage, native-host tests and QEMU acceptance. Cloudflare supplies the private compiler cache and an optional Ubuntu runtime pilot. Codex stays local. The pilot runs automatically on its development branch and can be dispatched manually on main.
 
 ## Retired automation
 
-The GitHub workflows `ai-review.yml`, `ai-fix-review.yml`, `ci-orchestration.yml` and `cloud-ci.yml` are disabled. The public and preview endpoints of `omg-ci-inspector`, `omg-ci-coder`, `omg-cloud-ci`, `omg-artifacts-ci-pilot`, `omg-cloud-ci-capability-pilot` and `omg-cloud-ci-ubuntu-pilot` are disabled. All had empty cron schedules when checked.
+The GitHub workflows `ai-review.yml`, `ai-fix-review.yml`, `ci-orchestration.yml` and `cloud-ci.yml` are disabled. Public and preview endpoints are disabled for `omg-ci-inspector`, `omg-ci-coder`, `omg-cloud-ci`, `omg-artifacts-ci-pilot`, `omg-cloud-ci-capability-pilot` and `omg-cloud-ci-ubuntu-pilot`. All six had empty cron schedules and no custom domains when checked on November 10, 2026. The three former production service configurations also disable those URLs on future deployments.
 
-The legacy Sandbox application and both experimental container applications were deleted after all their instances were confirmed inactive. Each application subsequently returned HTTP 404. Stored R2 data and Durable Object data were preserved. The abandoned pilot source is saved under Git tag `recovery/retired-sandbox-pilot-20261110`.
+The dashboard confirms builds are disabled for the three Git-connected legacy Workers, with no deploy hooks. The experimental Workers and fresh runner have no Git connection. Their cron, queue and email trigger sections are empty.
 
-These are separate from the website, SaaS Workers and other projects. Do not re-enable the old workflows or redeploy their service configurations.
+The legacy Sandbox application and both experimental container applications were deleted after every instance was confirmed inactive; all three subsequently returned HTTP 404. R2 and Durable Object owner data were preserved. The abandoned SDK pilot source is saved under Git tag `recovery/retired-sandbox-pilot-20261110`. These changes affect OMG CI, separate from the website, SaaS Workers and other projects.
 
-## Replacement boundary
+## Build on GitHub, verify runtime on Cloudflare
 
-The implementation in `services/ci` uses a native Durable Object Container API and one built-in Workflow step. It has no Sandbox SDK, `@cloudflare/ci`, OpenCode, model, issue publisher or PR repair dependency. GitHub supplies an immutable source commit, run ID and attempt. The container downloads the fixed public OMG repository at that commit and executes the frozen recipe.
+`services/ci` uses the native Durable Object Container API and one built-in Workflow step. Its immutable input is a source commit, run ID and attempt. It has no Sandbox SDK, `@cloudflare/ci`, OpenCode, model, issue publisher or PR repair dependency.
 
-The controller stays root inside the disposable container and runs candidate code as UID/GID 10001, with cleared capabilities and no new privileges. API, GitHub and R2 credentials never enter the container. A combined output limit, absolute deadline and whole-container destruction bound each run. Success requires verified source/image identity, real selected test executions, complete native inventory and daemon evidence, matching log hashes and confirmed container destruction.
+1. GitHub builds a multistage image with Rust 1.95.0 and the exact source. The unchanged release profile retains fat LTO and one codegen unit. The recipe verifies both release binaries, both exact release-library tests, native inventory and daemon catalogue before exporting artifacts.
+2. The final Ubuntu 24.04 image contains the two binaries, their actual release test executable, manifest, accepted build receipt and frozen oracles. Source, compiler, release profile and all three executable hashes are bound by the manifest. Rust and build tools remain in the builder stage.
+3. A fresh Docker container must pass the complete runtime recipe offline before publication. GitHub independently measures the manifest hash, pins the published image digest, and waits for exact application details, completed rollout and healthy capacity.
+4. Cloudflare runs both exact tests, CLI checks, complete native inventory and daemon catalogue/socket/metrics/shutdown checks offline. Its receipt must match the independently measured image manifest, source and image digest. Raw log hashes, terminal Workflow completion and confirmed whole-container destruction are also required.
 
-Use the **default scheduling policy**: Cloudflare documents that the `durable_object` policy grants root capabilities even to other UIDs. [Native Container API](https://developers.cloudflare.com/containers/api/durable-object-container/)
+Candidate processes use UID/GID 10001, cleared capabilities and no new privileges. Artifacts and oracles remain owned by root and protected from candidate writes. API, GitHub and R2 credentials never enter the container. Output and execution deadlines remain bounded.
 
-The image entrypoint is `sleep infinity`. Commands use the native argv API without an HTTP control server, FUSE mount or SDK process pool. Both output streams are drained concurrently. Killing a process alone does not guarantee descendant cleanup, so the whole container is destroyed before acceptance. [Execute commands](https://developers.cloudflare.com/containers/guides/execute-commands/)
+Use the **default scheduling policy**: Cloudflare documents that `durable_object` grants root capabilities even to other UIDs. [Native Container API](https://developers.cloudflare.com/containers/api/durable-object-container/)
 
-The image is pinned by its registry digest. Deployments must inspect the actual running image because application rollouts can temporarily serve the prior image. [Image management](https://developers.cloudflare.com/containers/guides/image-management/), [Rollouts](https://developers.cloudflare.com/containers/configuration/rollouts/)
+The entrypoint is `sleep infinity`; commands use native argv execution. Both output streams are drained concurrently. Killing one process does not guarantee descendant cleanup, so acceptance requires destroying the whole container. [Execute commands](https://developers.cloudflare.com/containers/guides/execute-commands/)
 
-The Workflow makes one execution call with no automatic command retry. Its step waits for the container job and returns small evidence references. Raw evidence lives in a private R2 bucket with 30-day expiry and one-day multipart cleanup. [Workflow limits](https://developers.cloudflare.com/workflows/reference/limits/), [R2 Workers API](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/), [Object lifecycles](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
+Worker deployment can finish before image rollout. Readiness uses the exact application's detail endpoint after ID discovery, with a ten-minute preparation bound. Candidate execution retains its separate deadline. [Image management](https://developers.cloudflare.com/containers/guides/image-management/), [Rollouts](https://developers.cloudflare.com/containers/configuration/rollouts/), [Application details](https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/get/)
 
-## Acceptance
+The Workflow makes one execution call without automatic command retries. Private R2 evidence expires after 30 days; incomplete multipart uploads expire after one day. [Workflow limits](https://developers.cloudflare.com/workflows/reference/limits/), [R2 Workers API](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/), [Object lifecycles](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
 
-Run the short native API canary before the real Ubuntu Rust recipe. A Docker smoke check, configuration deployment or canary is not a replacement for the actual CLI test job. QEMU, native-host, coverage and release gates remain required. Containers do not prove guest boot, kernel or block-device behavior.
+## Observed evidence and limits
 
-The first cold GitHub R2 compiler-cache run reached its 40-minute job cap. The following warm Portable Rust job passed in 21 minutes 32 seconds, with 1,876 Rust hits and 10 Rust misses. It recorded three assembler cache errors and zero cache write errors. Their cause is not diagnosed. This establishes cache operation and a successful warm job, not a controlled Cloudflare-versus-GitHub speed comparison. [GitHub job and cache receipt](../benchmarks/github-portable-r2-warm-2026-11-10.json)
+The first cold GitHub R2 compiler-cache run hit its 40-minute cap. The following warm Portable Rust job passed in 21 minutes 32 seconds, with 1,876 Rust hits and 10 misses, three assembler cache errors and zero cache write errors. Their exact cause and cold-run completion remain unresolved. [Cache receipt](../benchmarks/github-portable-r2-warm-2026-11-10.json)
 
-The locally submitted hosted native API canary passed after provider capacity became ready. Its Ubuntu 24.04 process ran as UID/GID 10001 with zero effective capabilities, could write its owned directory, could not write a root-owned file, and had confirmed whole-container destruction. The built-in Workflow completed with its configured 45-minute step envelope. This was a short test, not a 45-minute duration test. [Canary receipt](../benchmarks/cloudflare-native-api-canary-2026-11-10.json)
+The hosted native API canary passed on Ubuntu 24.04: UID/GID 10001, zero effective capabilities, protected-file write denial and confirmed destruction. Its short Workflow accepted a configured 45-minute step envelope; this was not a 45-minute duration test. [Canary receipt](../benchmarks/cloudflare-native-api-canary-2026-11-10.json)
 
-The first submission failed before execution because no container instance was available. It remained failed and confirmed cleanup. Deployment now needs a provider readiness check before submitting a job; configuration health alone is insufficient.
+Compilation inside Cloudflare did not finish both release binaries within 1,200 seconds on standard-4. Cleanup succeeded. Prior release-build samples completed in 520.53 seconds on GitHub and 337.02 seconds locally. The Cloudflare result is an incomplete lower bound under different host conditions; it does not identify the cause of slower execution. Compilation therefore moved to GitHub while preserving release settings. [Timeout receipt](../benchmarks/cloudflare-release-build-limit-2026-11-10.json), [Prior comparison](../benchmarks/local-vs-github-2026-11-10.md)
 
-The canary used an existing digest-pinned Ubuntu image with its entrypoint overridden through the native API. No Sandbox or CI SDK methods ran. The fresh plain image, full Rust pilot acceptance and performance remain unproven until their retained receipts are recorded here.
+The split is implemented; actual image build and hosted runtime acceptance remain pending. Deployment or Docker smoke alone is insufficient. QEMU, native-host, coverage and release gates remain required. Containers do not prove guest boot, kernel or block-device behavior. No Cloudflare speed advantage or QEMU replacement is claimed.

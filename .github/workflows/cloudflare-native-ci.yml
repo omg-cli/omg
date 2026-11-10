@@ -2,7 +2,7 @@ name: Cloudflare native CI
 
 on:
   push:
-    branches: [main, ci/plain-cloudflare]
+    branches: [ci/plain-cloudflare]
     paths:
       - services/ci/**
       - .github/workflows/cloudflare-native-ci.yml
@@ -38,6 +38,7 @@ jobs:
       deployment_version: ${{ steps.deploy.outputs.deployment_version }}
       endpoint: ${{ steps.deploy.outputs.endpoint }}
       source_sha: ${{ steps.deploy.outputs.source_sha }}
+      artifact_manifest_sha256: ${{ steps.deploy.outputs.artifact_manifest_sha256 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -82,12 +83,13 @@ jobs:
           OMG_NATIVE_CI_TOKEN: ${{ secrets.OMG_NATIVE_CI_TOKEN }}
         run: python3 services/ci/courier.py --mode canary --source-sha "$SOURCE_SHA" --image-digest "$IMAGE_DIGEST" --evidence-dir "$RUNNER_TEMP/canary-proof"
 
-      - name: Run real native Rust build and behavior checks
+      - name: Verify release executables and native behavior in Cloudflare
         env:
           SOURCE_SHA: ${{ steps.deploy.outputs.source_sha }}
           IMAGE_DIGEST: ${{ steps.deploy.outputs.image_digest }}
+          ARTIFACT_MANIFEST_SHA256: ${{ steps.deploy.outputs.artifact_manifest_sha256 }}
           OMG_NATIVE_CI_TOKEN: ${{ secrets.OMG_NATIVE_CI_TOKEN }}
-        run: python3 services/ci/courier.py --mode run --source-sha "$SOURCE_SHA" --image-digest "$IMAGE_DIGEST" --evidence-dir "$RUNNER_TEMP/native-proof"
+        run: python3 services/ci/courier.py --mode run --source-sha "$SOURCE_SHA" --image-digest "$IMAGE_DIGEST" --artifact-manifest-sha256 "$ARTIFACT_MANIFEST_SHA256" --evidence-dir "$RUNNER_TEMP/native-proof"
 
       - name: Preserve deployment and native evidence
         if: always()

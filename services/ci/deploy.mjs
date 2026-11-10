@@ -4,13 +4,14 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const endpoint = 'https://omg-native-ci.latham.workers.dev';
 const require = (condition, message) => { if (!condition) throw new Error(message); };
 const sha256 = value => createHash('sha256').update(value).digest('hex');
-const files = ['services/ci/Dockerfile', 'services/ci/run.py', 'scripts/build-comparison.py', 'scripts/test-debian-daemon-catalog.py', 'rust-toolchain.toml'];
+const files = ['services/ci/Dockerfile', 'services/ci/run.py', 'scripts/build-comparison.py', 'scripts/test-debian-daemon-catalog.py', 'rust-toolchain.toml', 'Cargo.toml'];
 
 export function imageIdentity(local, published, repository) {
     require(local.Id === published.Id && local.Os === 'linux' && local.Architecture === 'amd64' &&
@@ -53,6 +54,33 @@ export async function readProviderApplication(get) {
     return application;
 }
 
+export function validateRuntimeSmoke(stdout, source, metadata) {
+    const lines = stdout.trim().split('\n');
+    require(lines.filter(line => line.startsWith('OMG_CI_RESULT=')).length === 1 &&
+        lines.at(-1).startsWith('OMG_CI_RESULT='), 'runtime smoke footer missing or ambiguous');
+    const result = JSON.parse(lines.at(-1).slice('OMG_CI_RESULT='.length));
+    const manifest = metadata.manifest;
+    require(manifest.schemaVersion === 1 && manifest.sourceSha === source && manifest.profile === 'release' &&
+        manifest.features === 'debian,pgp,license' && manifest.cargoTomlSha256 === metadata.frozen['Cargo.toml'] &&
+        isDeepStrictEqual(manifest.releaseProfile, metadata.releaseProfile) &&
+        manifest.compiler.startsWith('rustc 1.95.0 ') && metadata.buildReceipt.accepted === true &&
+        metadata.buildReceipt.sourceSha === source && metadata.buildReceipt.candidateProcessesStopped === true &&
+        metadata.buildReceipt.runtimeOnly === false && metadata.buildReceipt.buildExecutor === 'github-actions-image-build' &&
+        metadata.buildReceipt.artifactManifestSha256 === metadata.artifactManifestSha256,
+        'baked build identity or acceptance mismatch');
+    require(isDeepStrictEqual(manifest.files, metadata.artifactFiles), 'baked artifact hashes or sizes differ');
+    require(result.accepted === true && result.sourceSha === source && result.runtimeOnly === true &&
+        result.buildExecutor === 'github-actions-image-build' && result.buildSourceSha === source &&
+        result.artifactManifestSha256 === metadata.artifactManifestSha256 && result.libtestSha256 === manifest.files.libtest.sha256 &&
+        isDeepStrictEqual(result.buildMetadata?.manifest, manifest) && result.buildMetadata.buildReceiptSha256 === metadata.buildReceiptSha256 &&
+        result.candidateProcessesStopped === true &&
+        ['omg', 'omgd'].every(name => result.binaryHashes?.[name] === manifest.files[name].sha256),
+        'offline runtime acceptance or artifact identity mismatch');
+    require(result.tests?.length === metadata.tests.length && metadata.tests.every(name => result.tests.some(test =>
+        test.name === name && test.passed === 1 && test.failed === 0 && test.ignored === 0)), 'offline exact tests incomplete');
+    return result;
+}
+
 export async function deploy() {
     require(process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_REPOSITORY === 'omg-cli/omg' &&
         ['refs/heads/main', 'refs/heads/ci/plain-cloudflare'].includes(process.env.GITHUB_REF) &&
@@ -72,7 +100,8 @@ export async function deploy() {
             'https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/get/',
             'https://developers.cloudflare.com/api/resources/containers/subresources/applications/subresources/rollouts/',
             'https://rust-lang.github.io/rustup/overrides.html',
-            'https://rust-lang.github.io/rustup/concepts/components.html'] };
+            'https://rust-lang.github.io/rustup/concepts/components.html',
+            'https://docs.docker.com/build/building/multi-stage/'] };
     let container;
     const redact = value => {
         let text = value ?? '';
@@ -113,43 +142,40 @@ export async function deploy() {
             proof.sourceFiles[name] = sha256(content.stdout);
         }
         const tag = 'omg-native-ci:' + source;
-        call('docker', ['build', '--platform', 'linux/amd64', '--file', path.join(context, 'services/ci/Dockerfile'), '--tag', tag, context]);
+        call('docker', ['build', '--platform', 'linux/amd64', '--build-arg', 'SOURCE_SHA=' + source,
+            '--file', path.join(context, 'services/ci/Dockerfile'), '--tag', tag, context], 2700000);
         const local = JSON.parse(call('docker', ['image', 'inspect', tag]))[0];
         container = call('docker', ['create', '--network', 'none', tag]);
         call('docker', ['start', container], 30000);
         require(JSON.parse(call('docker', ['inspect', container]))[0].State.Running, 'default image entrypoint did not stay running');
-        const smoke = `import apt_pkg,hashlib,json,os,pathlib,shutil,subprocess,tempfile
+        const smoke = `import apt_pkg,hashlib,json,os,pathlib,runpy,shutil,subprocess,tomllib
 assert os.getuid()==0
 release=dict(line.split('=',1) for line in pathlib.Path('/etc/os-release').read_text().splitlines() if '=' in line)
 assert release['ID']=='ubuntu' and release['VERSION_ID'].strip('"')=='24.04'
-assert subprocess.check_output(['rustc','--version'],text=True).startswith('rustc 1.95.0 ')
+assert all(shutil.which(name) is None for name in ('rustc','cargo','git','cc'))
 apt_pkg.init(); cache=apt_pkg.Cache(None); dep=apt_pkg.DepCache(cache)
 assert sum(1 for package in cache.packages if dep.get_candidate_ver(package) or package.current_ver)>=25000
 assert not any(name in os.environ for name in ['CLOUDFLARE_API_TOKEN','OMG_NATIVE_CI_TOKEN','CI_TOKEN'])
-frozen={name:hashlib.sha256(pathlib.Path('/opt/ci/'+name).read_bytes()).hexdigest() for name in ['run.py','build-comparison.py','test-debian-daemon-catalog.py','rust-toolchain.toml']}
-workspace=pathlib.Path(tempfile.mkdtemp(prefix='native-ci-toolchain-')); workspace.chmod(0o755)
-try:
- source=workspace/'source'; source.mkdir(); source.chmod(0o555)
- toolchain=source/'rust-toolchain.toml'; shutil.copyfile('/opt/ci/rust-toolchain.toml',toolchain); toolchain.chmod(0o444)
- home=workspace/'home'; home.mkdir(); os.chown(home,10001,10001)
- candidate='''import hashlib,json,os,pathlib,subprocess
-assert os.getuid()==10001 and os.getgid()==10001
-status=dict(line.split(":",1) for line in pathlib.Path("/proc/self/status").read_text().splitlines() if ":" in line)
-assert int(status["CapEff"].strip(),16)==0 and status["NoNewPrivs"].strip()=="1"
-assert not os.access("rust-toolchain.toml",os.W_OK) and not os.access("/usr/local/rustup",os.W_OK)
-compiler=subprocess.check_output(["rustc","-vV"],text=True)
-cargo=subprocess.check_output(["cargo","--version"],text=True)
-assert "release: 1.95.0" in compiler and cargo.startswith("cargo 1.95.0 ")
-print(json.dumps({"uid":os.getuid(),"gid":os.getgid(),"capEff":0,"noNewPrivs":1,"compiler":compiler,"cargo":cargo,"toolchainSha256":hashlib.sha256(pathlib.Path("rust-toolchain.toml").read_bytes()).hexdigest()}))'''
- command=['setpriv','--reuid=10001','--regid=10001','--clear-groups','--no-new-privs','--bounding-set=-all','--inh-caps=-all','--ambient-caps=-all','/usr/bin/env','-i','PATH=/usr/local/cargo/bin:/usr/bin:/bin','RUSTUP_HOME=/usr/local/rustup','HOME='+str(home),'CARGO_HOME='+str(home/'cargo'),'/usr/bin/python3','-I','-c',candidate]
- frozen['candidateToolchain']=json.loads(subprocess.check_output(command,cwd=source,text=True,timeout=30))
- assert frozen['candidateToolchain']['toolchainSha256']==frozen['rust-toolchain.toml']
-finally:
- shutil.rmtree(workspace)
-print(json.dumps(frozen))`;
-        const frozen = JSON.parse(call('docker', ['exec', container, '/usr/bin/python3', '-I', '-c', smoke], 60000));
-        for (const name of files.slice(1)) require(frozen[path.basename(name)] === proof.sourceFiles[name], 'frozen controller image mismatch');
-        proof.candidateToolchain = frozen.candidateToolchain;
+frozen={name:hashlib.sha256(pathlib.Path('/opt/ci/'+name).read_bytes()).hexdigest() for name in ['run.py','build-comparison.py','test-debian-daemon-catalog.py','rust-toolchain.toml','Cargo.toml']}
+artifacts=pathlib.Path('/opt/ci/artifacts'); actual={}; dependencies={}
+for name in ('omg','omgd','libtest','manifest.json','build-receipt.json'):
+ file=artifacts/name; status=file.stat()
+ assert not file.is_symlink() and status.st_uid==0 and status.st_mode & 0o022==0
+ if name in ('omg','omgd','libtest'):
+  assert file.read_bytes()[:4]==bytes([127,69,76,70])
+  actual[name]={'sha256':hashlib.sha256(file.read_bytes()).hexdigest(),'bytes':status.st_size}
+  dependencies[name]=subprocess.check_output(['ldd',str(file)],text=True,stderr=subprocess.STDOUT)
+  assert 'not found' not in dependencies[name]
+manifest_bytes=(artifacts/'manifest.json').read_bytes(); build_bytes=(artifacts/'build-receipt.json').read_bytes()
+print(json.dumps({'frozen':frozen,'manifest':json.loads(manifest_bytes),'buildReceipt':json.loads(build_bytes),'buildReceiptSha256':hashlib.sha256(build_bytes).hexdigest(),'artifactManifestSha256':hashlib.sha256(manifest_bytes).hexdigest(),'artifactFiles':actual,'elfDependencies':dependencies,'releaseProfile':tomllib.loads(pathlib.Path('/opt/ci/Cargo.toml').read_text())['profile']['release'],'tests':runpy.run_path('/opt/ci/build-comparison.py')['TESTS']}))`;
+        const metadata = JSON.parse(call('docker', ['exec', container, '/usr/bin/python3', '-I', '-c', smoke], 60000));
+        for (const name of files.slice(1)) require(metadata.frozen[path.basename(name)] === proof.sourceFiles[name], 'frozen controller image mismatch');
+        writeFileSync(path.join(evidence, 'baked-artifacts.json'), JSON.stringify(metadata, null, 2));
+        const runtime = call('docker', ['exec', container, '/usr/bin/python3', '-I', '/opt/ci/run.py', source], 2400000);
+        proof.offlineRuntime = validateRuntimeSmoke(runtime, source, metadata);
+        proof.artifactManifestSha256 = metadata.artifactManifestSha256;
+        writeFileSync(path.join(evidence, 'offline-runtime-proof.json'), JSON.stringify(proof.offlineRuntime, null, 2));
+        proof.bakedArtifacts = metadata;
         proof.defaultEntrypointSmoke = true;
         proof.localImageId = local.Id;
         call('docker', ['rm', '--force', container], 30000);
@@ -221,7 +247,8 @@ print(json.dumps(frozen))`;
         require(proof.providerReadiness.accepted, 'provider image rollout or healthy capacity was not ready within ten minutes');
         proof.accepted = true;
         for (const [name, value] of Object.entries({ image_digest: proof.imageDigest, endpoint,
-            deployment_version: version, source_sha: source })) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
+            deployment_version: version, source_sha: source, artifact_manifest_sha256: proof.artifactManifestSha256 }))
+            appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);
         return proof;
     } catch (error) {
         proof.error = error.message;
