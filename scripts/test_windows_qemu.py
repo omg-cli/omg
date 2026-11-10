@@ -3,12 +3,15 @@
 import copy
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -269,6 +272,111 @@ class MemoryAdmissionTests(unittest.TestCase):
             with self.subTest(refusal=error), patch.object(RUNNER, 'memory_status', return_value=memory):
                 with self.assertRaisesRegex(ValueError, error):
                     RUNNER.memory_guard(4096)
+
+
+class TemplatePublicationTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'native Windows runner publication')
+    def test_failed_publication_can_retry_and_legacy_templates_remain_usable(self):
+        scratch = ROOT / '.git/native-whpx-20261110/test-scratch'
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='template-publication-', dir=scratch) as temporary:
+            state = Path(temporary)
+            image = state / 'base.qcow2'
+            image.write_bytes(b'publisher base')
+            args = SimpleNamespace(state=state, tools=state, action='prepare', distro='ubuntu', image=image, jobs=2)
+            source = {'archiveSha256': 'a' * 64, 'rustVersion': '1.95.0', 'packageVersion': '0.1.224'}
+            record = {'stage': 'provisioned', 'passed': True}
+            backings = []
+
+            class FakeGuest:
+                def __init__(self, args, run, backing, online, receipt):
+                    self.run, self.receipt = run, receipt
+                    self.disk = run / 'disk.qcow2'
+                    self.vm = Mock()
+                    self.vm.wait.return_value = 0
+                    backings.append(backing)
+
+                def start(self):
+                    self.disk.write_bytes(b'prepared guest disk')
+                    self.receipt['bootId'] = self.run.name
+
+                def transfer(self, local, remote, download=False):
+                    if download:
+                        RUNNER.write_json(local, record)
+
+                def phase(self, mode, *arguments):
+                    log = self.run / (mode + '.log')
+                    log.write_text('{"scheduledPoweroff":true,"credentialsRemoved":true,"sourceAndTargetAbsent":true}\n')
+                    return log
+
+                def diagnostics(self):
+                    self.receipt['guestDiagnosticsSha256'] = 'b' * 64
+
+                def poweroff(self):
+                    self.vm.wait(timeout=45)
+
+                def close(self):
+                    if self.disk.exists():
+                        self.disk.unlink()
+
+            real_write_json = RUNNER.write_json
+
+            def fail_metadata(path, value):
+                if path.name == 'metadata.json' or path.parent.name == 'templates':
+                    raise OSError('injected metadata write failure')
+                real_write_json(path, value)
+
+            with patch.object(RUNNER, 'snapshot_source', return_value=source), \
+                    patch.object(RUNNER, 'freeze_recipe'), \
+                    patch.object(RUNNER.IMAGES, 'verify', return_value={}), \
+                    patch.object(RUNNER, 'template_key', return_value='c' * 64), \
+                    patch.object(RUNNER, 'Guest', FakeGuest):
+                with patch.object(RUNNER, 'write_json', side_effect=fail_metadata):
+                    with self.assertRaisesRegex(OSError, 'injected metadata write failure'):
+                        RUNNER.execute(args)
+                self.assertEqual(list((state / 'templates').iterdir()), [], 'failed preparation published a template')
+                self.assertEqual(image.read_bytes(), b'publisher base')
+                real_rename = Path.rename
+
+                def interrupt_publication(path, destination):
+                    if path.name == 'template':
+                        raise OSError('injected interruption before publication')
+                    return real_rename(path, destination)
+
+                with patch.object(Path, 'rename', autospec=True, side_effect=interrupt_publication):
+                    with self.assertRaisesRegex(OSError, 'injected interruption before publication'):
+                        RUNNER.execute(args)
+                self.assertEqual(list((state / 'templates').iterdir()), [])
+                unpublished = list(state.glob('run-*/template/disk.qcow2'))
+                self.assertEqual(len(unpublished), 1)
+                self.assertEqual(unpublished[0].read_bytes(), b'prepared guest disk')
+                RUNNER.execute(args)
+                bundle = state / 'templates' / ('ubuntu-' + 'c' * 64)
+                disk = bundle / 'disk.qcow2'
+                metadata = json.loads((bundle / 'metadata.json').read_text())
+                self.assertEqual(disk.read_bytes(), b'prepared guest disk')
+                self.assertEqual(metadata['templateSha256'], hashlib.sha256(b'prepared guest disk').hexdigest())
+                self.assertEqual(metadata['provisioning'], record)
+                self.assertEqual(image.read_bytes(), b'publisher base')
+                args.action = 'run'
+                with patch.object(RUNNER, 'verify_build') as verify:
+                    RUNNER.execute(args)
+                    verify.assert_called_once()
+                self.assertEqual(backings[-1], disk)
+                legacy = state / 'templates' / ('ubuntu-' + 'd' * 64 + '.qcow2')
+                legacy.write_bytes(b'legacy prepared disk')
+                legacy_metadata = dict(metadata, key='d' * 64, templateSha256=hashlib.sha256(legacy.read_bytes()).hexdigest())
+                real_write_json(legacy.with_suffix('.json'), legacy_metadata)
+                with patch.object(RUNNER, 'template_key', return_value='d' * 64), \
+                        patch.object(RUNNER, 'verify_build') as verify:
+                    RUNNER.execute(args)
+                    verify.assert_called_once()
+                self.assertEqual(backings[-1], legacy)
+                self.assertEqual(legacy.read_bytes(), b'legacy prepared disk')
+                self.assertEqual(disk.read_bytes(), b'prepared guest disk')
+                for retained in unpublished:
+                    retained.chmod(0o600)
+                disk.chmod(0o600)
 
 
 if __name__ == '__main__':

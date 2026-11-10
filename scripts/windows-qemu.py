@@ -417,8 +417,11 @@ def execute(args):
         key = template_key(source, args.distro, entry['digest'])
         templates = args.state / 'templates'
         templates.mkdir(exist_ok=True)
-        template = templates / (args.distro + '-' + key + '.qcow2')
-        metadata = template.with_suffix('.json')
+        bundle = owned(templates / (args.distro + '-' + key), templates)
+        legacy_template = bundle.with_suffix('.qcow2')
+        legacy_metadata = bundle.with_suffix('.json')
+        template = bundle / 'disk.qcow2' if bundle.exists() else legacy_template
+        metadata = bundle / 'metadata.json' if bundle.exists() else legacy_metadata
         backing = image
         if args.action == 'run':
             require(template.is_file() and metadata.is_file(), 'matching template is missing; prepare this distro first')
@@ -427,7 +430,8 @@ def execute(args):
             require(record['basePath'] == str(image) and record['baseDigest'] == entry['digest'], 'template backing image changed')
             backing = template
         else:
-            require(not template.exists() and not metadata.exists(), 'matching template already exists; run it instead')
+            require(not bundle.exists() and not legacy_template.exists() and not legacy_metadata.exists(),
+                    'matching template already exists; run it instead')
         receipt['templateKey'] = key
         before = digest(backing)
         guest = Guest(args, run, backing, args.action == 'prepare', receipt)
@@ -447,11 +451,15 @@ def execute(args):
             require(all(seal.get(k) is True for k in ('scheduledPoweroff', 'credentialsRemoved', 'sourceAndTargetAbsent')), 'template sanitation did not complete')
             require(guest.vm.wait(timeout=90) == 0, 'template did not power off')
             require(digest(backing) == before, 'publisher base changed')
-            guest.disk.rename(template)
-            template.chmod(0o444)
-            write_json(metadata, {'key': key, 'templateSha256': digest(template), 'basePath': str(image),
-                                 'baseDigest': entry['digest'], 'preparationBootId': receipt['bootId'],
-                                 'provisioning': result, 'sanitation': seal})
+            staging = owned(run / 'template', run)
+            staging.mkdir()
+            write_json(staging / 'metadata.json', {'key': key, 'templateSha256': digest(guest.disk),
+                       'basePath': str(image), 'baseDigest': entry['digest'],
+                       'preparationBootId': receipt['bootId'], 'provisioning': result, 'sanitation': seal})
+            guest.disk.rename(staging / 'disk.qcow2')
+            (staging / 'disk.qcow2').chmod(0o444)
+            staging.rename(bundle)
+            template = bundle / 'disk.qcow2'
             receipt['template'] = str(template)
         else:
             verify_build(result, {'distro': args.distro, 'sourceArchiveSha256': source['archiveSha256'],
