@@ -63,6 +63,7 @@ class SourceBoundaryTests(unittest.TestCase):
             path = self.repo / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding='utf-8', newline='\n')
+        (self.repo / 'scripts/windows-qemu-guest.sh').chmod(0o755)
         self.git('add', '.')
         self.git('update-index', '--chmod=+x', 'scripts/windows-qemu-guest.sh')
         self.git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
