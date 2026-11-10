@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import ast
 import json
-import itertools
 import os
 import re
 import subprocess
@@ -48,40 +47,42 @@ class NativePhaseMatrixTests(unittest.TestCase):
         ))
 
     def test_all_platforms_have_required_validation_and_clippy_with_five_runner_limit(self) -> None:
-        axes = {}
-        for axis in ("phase", "platform"):
-            match = re.search(rf"^        {axis}: \[([^\]]+)\]$", self.job, re.MULTILINE)
-            self.assertIsNotNone(match, f"explicit {axis} axis is required")
-            assert match is not None
-            axes[axis] = [value.strip() for value in match.group(1).split(",")]
-        self.assertEqual(axes["phase"], ["validation", "clippy"])
+        clippy = job_block(self.workflow, "linux-clippy")
+        self.assertIn("        phase: [validation]\n", self.job)
+        self.assertIn("        phase: [clippy]\n", clippy)
+        self.assertIn("    needs: [quick-gate, linux-matrix]\n", clippy)
         platforms = ["arch", "debian", "debian-trixie", "ubuntu-2604", "fedora"]
-        self.assertEqual(axes["platform"], platforms)
+        match = re.search(r"^        platform: &linux_platforms \[([^\]]+)\]$", self.job, re.MULTILINE)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.group(1).split(", "), platforms)
+        for field, anchor in (("platform", "linux_platforms"), ("include", "linux_images"),
+                              ("env", "linux_environment"), ("container", "linux_container"),
+                              ("steps", "linux_steps")):
+            self.assertRegex(self.job, rf"(?m)^\s+{field}: &{anchor}\b")
+            self.assertRegex(clippy, rf"(?m)^\s+{field}: \*{anchor}$")
         rows = re.findall(
             r"^          - platform: (\S+)\n(.*?)(?=^          - platform:|^    container:)",
             self.job, re.MULTILINE | re.DOTALL,
         )
         self.assertEqual([platform for platform, _ in rows], platforms)
-        combinations = [dict(zip(("phase", "platform"), values))
-                        for values in itertools.product(axes["phase"], axes["platform"])]
         for platform, metadata in rows:
-            matches = [item for item in combinations if item["platform"] == platform]
-            self.assertEqual(len(matches), 2)
             for field in ("image", "features", "setup", "rust_install", "rust_components"):
                 self.assertRegex(metadata, rf"(?m)^            {field}: .+")
             self.assertNotRegex(metadata, r"(?m)^            phase:")
-        self.assertEqual(len(combinations), 10)
         self.assertIn(
             "    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && "
             "matrix.phase == 'validation' && 45 || 30 }}\n", self.job,
         )
-        self.assertIn("      max-parallel: 5\n", self.job)
-        self.assertIn("      fail-fast: false\n", self.job)
-        self.assertNotIn("continue-on-error", self.job)
-        self.assertNotIn("exclude:", self.job)
+        for job in (self.job, clippy):
+            self.assertIn("      max-parallel: 5\n", job)
+            self.assertIn("      fail-fast: false\n", job)
+            self.assertNotIn("continue-on-error", job)
+            self.assertNotIn("exclude:", job)
         self.assertIn("matrix.phase == 'validation' && format('Linux ({0})', matrix.platform)", self.job)
         self.assertIn("format('Linux clippy ({0})', matrix.platform)", self.job)
         self.assertIn("linux-matrix", job_block(self.workflow, "ci-success").split("    steps:", 1)[0])
+        self.assertIn("linux-clippy", job_block(self.workflow, "ci-success").split("    steps:", 1)[0])
         self.assertIn("needs: [quick-gate, linux-matrix]", job_block(self.workflow, "sandbox-cancellation"))
         self.assertIn("needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]", job_block(self.workflow, "qemu"))
 

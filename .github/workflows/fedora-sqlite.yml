@@ -24,8 +24,13 @@ jobs:
           set -euo pipefail
           . /etc/os-release
           [[ "$ID" == fedora && "$VERSION_ID" == 44 ]]
+          diagnostics="$RUNNER_TEMP/fedora-sqlite/diagnostics/checkout"
+          mkdir -p "$diagnostics"
+          printf 'Checkout dependency installation attempted; command budget 600 seconds.\n' > "$diagnostics/attempt.txt"
           timeout --kill-after=10s 600s dnf --releasever=44 --disablerepo='*' \
             --enablerepo=fedora --enablerepo=updates --setopt=gpgcheck=1 \
+            --setopt=timeout=20 --setopt=minrate=100k --setopt=logdir="$diagnostics" \
+            --setopt=log_size=1M --setopt=log_rotate=1 \
             -y install git python3
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

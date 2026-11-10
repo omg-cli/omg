@@ -1,0 +1,40 @@
+{
+  "name": "Portable Rust",
+  "status": "completed",
+  "conclusion": "success",
+  "started_at": "2026-11-10T17:53:18Z",
+  "completed_at": "2026-11-10T18:14:50Z",
+  "run_id": 42869472537,
+  "id": 130016653005,
+  "head_sha": "329ed5b7a2d01ce40cbe0b0b70f42d66cfebd0ee",
+  "html_url": "https://github.com/omg-cli/omg/actions/runs/42869472537/job/130016653005",
+  "steps": [
+    {
+      "name": "Clippy",
+      "conclusion": "success",
+      "started_at": "2026-11-10T17:53:42Z",
+      "completed_at": "2026-11-10T17:58:37Z"
+    },
+    {
+      "name": "Run portable tests",
+      "conclusion": "success",
+      "started_at": "2026-11-10T18:01:15Z",
+      "completed_at": "2026-11-10T18:06:27Z"
+    },
+    {
+      "name": "Verify pure Debian parser and daemon contracts",
+      "conclusion": "success",
+      "started_at": "2026-11-10T18:12:19Z",
+      "completed_at": "2026-11-10T18:14:41Z"
+    }
+  ],
+  "cache": {
+    "rustHits": 1876,
+    "rustMisses": 10,
+    "totalHits": 6780,
+    "totalMisses": 16,
+    "cacheWriteErrors": 0,
+    "assemblerCacheErrors": 3
+  },
+  "limits": "Warm job only; cold first run timed out after40min. Three assembler cache errors were recorded; their cause is not diagnosed. Overall workflow success is separate."
+}

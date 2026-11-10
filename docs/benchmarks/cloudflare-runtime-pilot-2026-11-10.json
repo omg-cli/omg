@@ -1,0 +1,122 @@
+{
+  "observedAt": "2026-11-10",
+  "runUrl": "https://github.com/omg-cli/omg/actions/runs/42888307045",
+  "sourceSha": "b58aba89602b5bbdbfd5e2a700cfa9f417470b9b",
+  "accepted": true,
+  "imageDigest": "sha256:16754651c202101f640fc09ca22349ff1656d263043880057d56365c494ccfc4",
+  "artifactManifestSha256": "fd6814819069f8a4fb06070b74d7f725e6fbe908f4ca4d3938317fbf6a82529f",
+  "executors": {
+    "build": "GitHub Actions Ubuntu 24.04",
+    "runtime": "Cloudflare standard-4 Ubuntu 24.04 amd64, offline"
+  },
+  "timing": {
+    "wholeJobSeconds": 1156,
+    "imageBuildSeconds": 1001.524,
+    "hostedRuntimeStepSeconds": 32,
+    "comparison": "Single observations; no controlled Cloudflare speed comparison."
+  },
+  "manifest": {
+    "cargoTomlSha256": "70a02665cabfb057b8faa5708e6984a7ba9383dc117e3a4bcb9744dfea447c22",
+    "compiler": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+    "features": "debian,pgp,license",
+    "files": {
+      "libtest": {
+        "bytes": 35046432,
+        "sha256": "f0faa5abd772e43097ae6195d8a9faad98387373d549421d31e84c016f578f7b"
+      },
+      "omg": {
+        "bytes": 24849952,
+        "sha256": "8c7b2ad41b8534b9e628c6df7635e6663fda968bfac4ab5c671117ecc1e68bd2"
+      },
+      "omgd": {
+        "bytes": 14641544,
+        "sha256": "426a314ea7fc0910b2d2d4700291c3aec52e3d72478f00b62007fefa1e2ef29b"
+      }
+    },
+    "profile": "release",
+    "releaseProfile": {
+      "codegen-units": 1,
+      "incremental": false,
+      "lto": "fat",
+      "opt-level": 3,
+      "panic": "unwind",
+      "strip": true
+    },
+    "schemaVersion": 1,
+    "sourceSha": "b58aba89602b5bbdbfd5e2a700cfa9f417470b9b",
+    "version": "0.1.224"
+  },
+  "tests": [
+    {
+      "name": "package_managers::debian_db::db::tests::parse_packages_file_sync_reads_valid_packages",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "package_managers::debian_db::db::tests::installed_status_accepts_held_packages_but_not_partial_states",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    }
+  ],
+  "inventory": {
+    "nativeExplicitCount": 94,
+    "completeNamesEqual": true,
+    "nativeStateUnchanged": true,
+    "beforeSha256": "43999a1cdbc135d589baa6da8fde2ff2d1e8058a6582c341150b3e3835d5ecfd",
+    "afterSha256": "43999a1cdbc135d589baa6da8fde2ff2d1e8058a6582c341150b3e3835d5ecfd"
+  },
+  "daemon": {
+    "accepted": true,
+    "source_sha": "b58aba89602b5bbdbfd5e2a700cfa9f417470b9b",
+    "native_candidate_count": 88451,
+    "native_candidate_sha256": "12fa53cdf918a44bbcc420662b501701b8d6f760eda9a084b17c49329cc8d2d7",
+    "omg_sha256": "8c7b2ad41b8534b9e628c6df7635e6663fda968bfac4ab5c671117ecc1e68bd2",
+    "omgd_sha256": "426a314ea7fc0910b2d2d4700291c3aec52e3d72478f00b62007fefa1e2ef29b",
+    "readiness_budget_seconds": 30,
+    "readiness_elapsed_seconds": 5.012441453000001,
+    "info_requests_delta": 2,
+    "native_state_unchanged": {
+      "/var/lib/dpkg/status": "f464e7ebc1caaf5eea9782c97921fd5d6e6fb38ac4b9f6e8737f42355943cc7a",
+      "/var/lib/apt/extended_states": "d68fd4041e1d265f88705e0cf13af2fbcaef74ee95b3e4e8c124d9f0a44be150"
+    },
+    "shutdown_returncode": 0,
+    "socket_absent_after_shutdown": true,
+    "native_state_after_shutdown": {
+      "/var/lib/dpkg/status": "f464e7ebc1caaf5eea9782c97921fd5d6e6fb38ac4b9f6e8737f42355943cc7a",
+      "/var/lib/apt/extended_states": "d68fd4041e1d265f88705e0cf13af2fbcaef74ee95b3e4e8c124d9f0a44be150"
+    }
+  },
+  "candidate": {
+    "uid": 10001,
+    "gid": 10001,
+    "capabilities": "0",
+    "noNewPrivileges": true,
+    "controllerWritable": false
+  },
+  "canary": {
+    "accepted": true,
+    "ubuntu": "24.04",
+    "uid": 10001,
+    "gid": 10001,
+    "rootWriteDenied": true,
+    "effectiveCapabilities": 0
+  },
+  "cleanup": {
+    "candidateProcessesStopped": true,
+    "canaryContainerDestroyed": true,
+    "runtimeContainerDestroyed": true,
+    "providerInstanceState": "inactive"
+  },
+  "evidenceHashes": {
+    "image-proof/ci-deployment-proof.json": "4cbc18d31f16658c9426574f1e89dadf8ad55ee2e0413a646e770a2fa16aefc3",
+    "image-proof/baked-artifacts.json": "15168d49919854f9afac981ccf6dd04f858abdbcd3330c92e3de1be8f8080c4c",
+    "image-proof/offline-runtime-proof.json": "e29bffadaba97e26bdca8ead11a7c5dc796ee1975f7cc27c56b9694df5bb344d",
+    "native-proof/receipt.json": "69fd63741432bd08e4dfbffa2d0e3707378cda52b9414e911b048df1fbea8568",
+    "native-proof/stdout": "7ffa7063ecf0fd0fac4d13c6eab26a2cd31282a37481430e3209c71481912195",
+    "native-proof/stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "canary-proof/receipt.json": "2b8b88fe4660a25dd0da447ad1ba452b5164a1de3d01e928709dd8b0c64cdce8"
+  },
+  "limits": "Two exact tests and read-only inventory/daemon recipe only. No guest boot, package mutations, other distributions, full suite, or repeated performance proof. Daemon log content itself is not retained in this compact receipt."
+}

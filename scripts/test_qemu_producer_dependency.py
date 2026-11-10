@@ -3,6 +3,7 @@ from pathlib import Path
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 
 from test_ci_gates import job_block
@@ -12,6 +13,37 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class QemuProducerDependency(unittest.TestCase):
+    def test_guest_readiness_is_independent_of_linux_clippy_completion(self):
+        ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        native = job_block(ci, 'linux-matrix')
+        phases = re.search(r'^        phase: \[([^]]+)\]', native, re.MULTILINE)
+        self.assertIsNotNone(phases)
+        self.assertEqual(phases.group(1).split(', '), ['validation'])
+        clippy = job_block(ci, 'linux-clippy')
+        self.assertIn('needs: [quick-gate, linux-matrix]', clippy)
+        self.assertIn('!cancelled()', clippy)
+        self.assertNotIn('needs.linux-matrix.result', clippy)
+        self.assertIn('      max-parallel: 5\n', clippy)
+        self.assertNotIn('linux-clippy', job_block(ci, 'qemu').split('    steps:', 1)[0])
+        self.assertIn('linux-clippy', job_block(ci, 'ci-success').split('    steps:', 1)[0])
+
+    def test_failed_or_missing_linux_clippy_cannot_pass_final_admission(self):
+        ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        script = step_script(job_block(ci, 'ci-success'), 'Evaluate results')
+        results = dict(QUICK_GATE='success', WORKFLOW_CHECKS='success', BUILD_REQUIRED='true',
+                       STANDALONE_SUITES='success', PORTABLE='success', LINUX_MATRIX='success',
+                       FEDORA_SQLITE='success', SANDBOX_CANCELLATION='success',
+                       FEATURE_INTERSECTIONS='success', MACOS='success', MACOS_NEXTEST_SOURCE='success',
+                       UBUNTU='success', RUNTIME_USAGE='success', QEMU='success',
+                       QEMU_REQUIRED='true', DOCS_AUDIT='success')
+        for state in ('success', 'failure', 'cancelled', 'skipped', ''):
+            with self.subTest(clippy=state), tempfile.TemporaryDirectory() as directory:
+                result = subprocess.run([BASH, '-eu', '-c', script],
+                    env=dict(os.environ, **results, LINUX_CLIPPY=state,
+                             GITHUB_STEP_SUMMARY=str(Path(directory) / 'summary')),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0, state == 'success', result.stdout + result.stderr)
+
     def test_release_uses_integrated_ci_gate_without_external_qemu_wait(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         release = (ROOT / '.github/workflows/release.yml').read_text(encoding='utf-8')

@@ -1,0 +1,39 @@
+{
+  "executor": "local operator courier calling hosted native API",
+  "scope": "permission and native lifecycle only; no Rust source compiled or test job admitted",
+  "workflowStatus": "complete",
+  "receipt": {
+    "schemaVersion": 1,
+    "input": {
+      "sourceSha": "329ed5b7a2d01ce40cbe0b0b70f42d66cfebd0ee",
+      "runId": "42867399145",
+      "attempt": 1002
+    },
+    "mode": "canary",
+    "imageDigest": "sha256:1e1e3805ab6e1b742c19bd8e4a10eb62a1933ba2b7cd6ccdcaa4d2c19abb7a77",
+    "exitCode": 0,
+    "containerDestroyed": true,
+    "accepted": true,
+    "report": {
+      "accepted": true,
+      "ubuntu": "24.04",
+      "uid": 10001,
+      "gid": 10001,
+      "rootWriteDenied": true,
+      "effectiveCapabilities": 0
+    },
+    "logs": {
+      "stdout": {
+        "key": "canary-42867399145-1002-329ed5b7a2d01ce40cbe0b0b70f42d66cfebd0ee/stdout",
+        "sha256": "43cfe053904f36936371e9ca8fd26b45b0db182cb1b4b79a9a2381c7fa90d54f",
+        "bytes": 133
+      },
+      "stderr": {
+        "key": "canary-42867399145-1002-329ed5b7a2d01ce40cbe0b0b70f42d66cfebd0ee/stderr",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "bytes": 0
+      }
+    },
+    "error": null
+  }
+}

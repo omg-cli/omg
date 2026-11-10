@@ -1438,6 +1438,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn real_handler_delivers_frames_above_the_request_budget() {
         let directory = tempfile::tempdir().expect("private codec fixture");
         let state = Arc::new(

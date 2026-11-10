@@ -114,7 +114,8 @@ class MutationRunnerObserver(unittest.TestCase):
             child_code = (
                 "import json,os,time;from pathlib import Path;"
                 "memory=bytearray(8*1024*1024);"
-                f"Path({str(marker)!r}).write_text(json.dumps(dict(pid=os.getpid(),parent=os.getppid())));"
+                f"marker=Path({str(marker)!r});temporary=marker.with_suffix('.tmp');"
+                "temporary.write_text(json.dumps(dict(pid=os.getpid(),parent=os.getppid())));temporary.replace(marker);"
                 "time.sleep(5)"
             )
             code = (
@@ -126,7 +127,7 @@ class MutationRunnerObserver(unittest.TestCase):
                 " while time.monotonic()<end:\n"
                 "  if marker.exists():\n"
                 "   pid=json.loads(marker.read_text())['pid']\n"
-                "   rows=[json.loads(line) for line in report.read_text().splitlines()]\n"
+                "   rows=[json.loads(line) for line in report.read_bytes().split(b'\\n')[:-1]]\n"
                 "   if any(any(p['pid']==pid and p['rss_bytes']>=8*1024*1024 for p in row.get('command_processes',{}).get('largest',[])) for row in rows):\n"
                 "    raise SystemExit(0)\n"
                 "  time.sleep(0.01)\n"
@@ -232,7 +233,7 @@ class MutationRunnerObserver(unittest.TestCase):
             code = ("import json,time;from pathlib import Path;"
                     f"p=Path({str(report)!r});end=time.monotonic()+3\n"
                     "while time.monotonic()<end:\n"
-                    " if p.exists() and any(json.loads(line).get('phase')=='sample' for line in p.read_text().splitlines()):\n"
+                    " if p.exists() and any(json.loads(line).get('phase')=='sample' for line in p.read_bytes().split(b'\\n')[:-1]):\n"
                     "  print('sample-observed');raise SystemExit(0)\n"
                     " time.sleep(0.01)\n"
                     "raise SystemExit(19)")
@@ -277,7 +278,7 @@ class MutationRunnerObserver(unittest.TestCase):
                 ready = False
                 while time.monotonic() < deadline:
                     if marker.exists() and report.exists():
-                        records = [json.loads(line) for line in report.read_text().splitlines()]
+                        records = [json.loads(line) for line in report.read_bytes().split(b'\n')[:-1]]
                         ready = marker.read_text() == "ready" and any(row["phase"] == "spawn" for row in records)
                         if ready:
                             break

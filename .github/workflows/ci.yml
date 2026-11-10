@@ -302,7 +302,7 @@ jobs:
     runs-on: ubuntu-24.04
     # Ubuntu's cold validation build also needs room for slow package mirrors.
     timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && matrix.phase == 'validation' && 45 || 30 }}
-    env:
+    env: &linux_environment
       # Shell and upload action must use the same container path.
       FEDORA_IGNORED_EVIDENCE_DIR: /tmp/omg-fedora-ignored-${{ github.run_id }}-${{ github.run_attempt }}
       RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}
@@ -321,9 +321,9 @@ jobs:
       fail-fast: false
       max-parallel: 5
       matrix:
-        phase: [validation, clippy]
-        platform: [arch, debian, debian-trixie, ubuntu-2604, fedora]
-        include:
+        phase: [validation]
+        platform: &linux_platforms [arch, debian, debian-trixie, ubuntu-2604, fedora]
+        include: &linux_images
           - platform: arch
             image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
             features: arch,pgp,license
@@ -467,10 +467,10 @@ jobs:
             rust_components: |
               "$HOME/.cargo/bin/rustup" component add clippy rustfmt
 
-    container:
+    container: &linux_container
       image: ${{ matrix.image }}
 
-    steps:
+    steps: &linux_steps
       - name: Setup environment
         run: ${{ matrix.setup }}
 
@@ -1141,6 +1141,25 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
+  linux-clippy:
+    name: "Linux clippy (${{ matrix.platform }})"
+    needs: [quick-gate, linux-matrix]
+    if: >-
+      !cancelled() && needs.quick-gate.result == 'success' &&
+      (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env: *linux_environment
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        phase: [clippy]
+        platform: *linux_platforms
+        include: *linux_images
+    container: *linux_container
+    steps: *linux_steps
+
   sandbox-cancellation:
     name: "AUR sandbox security regressions"
     needs: [quick-gate, linux-matrix]
@@ -1772,7 +1791,7 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, workflow-checks, standalone-suites, portable, linux-matrix, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
+    needs: [quick-gate, workflow-checks, standalone-suites, portable, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1787,6 +1806,7 @@ jobs:
           STANDALONE_SUITES: ${{ needs.standalone-suites.result }}
           PORTABLE: ${{ needs.portable.result }}
           LINUX_MATRIX: ${{ needs.linux-matrix.result }}
+          LINUX_CLIPPY: ${{ needs.linux-clippy.result }}
           FEDORA_SQLITE: ${{ needs.fedora-sqlite.result }}
           SANDBOX_CANCELLATION: ${{ needs.sandbox-cancellation.result }}
           FEATURE_INTERSECTIONS: ${{ needs.feature-intersections.result }}
@@ -1807,6 +1827,7 @@ jobs:
           echo "| Standalone suites | $STANDALONE_SUITES |" >> $GITHUB_STEP_SUMMARY
           echo "| Portable Rust | $PORTABLE |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Matrix | $LINUX_MATRIX |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux Clippy | $LINUX_CLIPPY |" >> $GITHUB_STEP_SUMMARY
           echo "| Fedora SQLite supply | $FEDORA_SQLITE |" >> $GITHUB_STEP_SUMMARY
           echo "| AUR Sandbox Cancellation | $SANDBOX_CANCELLATION |" >> $GITHUB_STEP_SUMMARY
           echo "| Feature Intersections | $FEATURE_INTERSECTIONS |" >> $GITHUB_STEP_SUMMARY
@@ -1841,6 +1862,7 @@ jobs:
             ["Standalone suites"]="$STANDALONE_SUITES"
             ["Portable Rust"]="$PORTABLE"
             ["Linux Matrix"]="$LINUX_MATRIX"
+            ["Linux Clippy"]="$LINUX_CLIPPY"
             ["Fedora SQLite supply"]="$FEDORA_SQLITE"
             ["AUR Sandbox Cancellation"]="$SANDBOX_CANCELLATION"
             ["Feature Intersections"]="$FEATURE_INTERSECTIONS"
