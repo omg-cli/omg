@@ -9,6 +9,10 @@ import tempfile
 import uuid
 
 
+# cc-rs only inherits RUSTC_WRAPPER for known executable names such as sccache.
+COMPILER_WRAPPER = Path(__file__).resolve().with_name('ci-compiler') / 'sccache'
+
+
 def configuration(env):
     if env.get('OMG_R2_CACHE_ENABLED') != 'true':
         return {}
@@ -43,7 +47,7 @@ def configuration(env):
         'SCCACHE_S3_RW_MODE': 'READ_WRITE',
         'SCCACHE_IDLE_TIMEOUT': '0',
         'SCCACHE_SERVER_UDS': str(Path(tempfile.gettempdir()) / f'omg-r2-{uuid.uuid4().hex}.sock'),
-        'RUSTC_WRAPPER': 'sccache',
+        'RUSTC_WRAPPER': str(COMPILER_WRAPPER),
     }
 
 
@@ -69,7 +73,7 @@ def verify_cache(env, run=subprocess.run):
         name = 'omg_r2_probe_' + uuid.uuid4().hex
         source = root / 'probe.rs'
         source.write_text(f'pub const PROBE: &str = "{name}";\n', encoding='utf-8')
-        command = ['sccache', 'rustc', '--crate-name', name, '--crate-type', 'rlib',
+        command = [env['RUSTC_WRAPPER'], 'rustc', '--crate-name', name, '--crate-type', 'rlib',
                    '--emit=link', '--out-dir', str(root), str(source)]
         run(command, env=env, check=True, timeout=45, capture_output=True, text=True)
         first = cache_counters(env, run)

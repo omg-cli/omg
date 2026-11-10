@@ -3,6 +3,7 @@ import importlib.util
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,6 +31,30 @@ def statistics(writes=0, misses=0, hits=0, errors=0, language='Rust'):
 
 
 class R2CacheTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'portable compiler wrapper runs on Linux')
+    def test_assembler_help_reaches_compiler_while_real_builds_use_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compiler = root / 'cc'
+            cache = root / 'sccache'
+            for path, label, status in ((compiler, 'compiler', 17), (cache, 'cache', 23)):
+                path.write_text(f'#!/bin/sh\nprintf "%s\\n" {label} "$@"\nexit {status}\n')
+                path.chmod(0o755)
+            env = dict(os.environ, PATH=f'{root}{os.pathsep}{os.environ["PATH"]}')
+            wrapper = CACHE.configuration(trusted())['RUSTC_WRAPPER']
+            probe = ['-Wa,--help', '-c', '-o', 'null.123.o', '-x', 'assembler', '/dev/null']
+            direct = subprocess.run([wrapper, str(compiler), *probe], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual((direct.returncode, direct.stdout.splitlines()), (17, ['compiler', *probe]))
+            for tool, args in ((str(compiler), ['-c', 'real.S', '-o', 'real.o']),
+                               (str(compiler), [*probe[:-1], 'real.S']),
+                               ('rustc', ['--crate-name', 'fixture', 'file with spaces.rs'])):
+                with self.subTest(tool=tool, args=args):
+                    cached = subprocess.run([wrapper, tool, *args], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual((cached.returncode, cached.stdout.splitlines()),
+                                     (23, ['cache', tool, *args]))
+
     def test_release_owner_and_isolated_manual_generation_keep_the_cache_boundary(self):
         for job in ('portable', 'portable-release'):
             config = CACHE.configuration(dict(trusted(), GITHUB_JOB=job))
@@ -102,7 +127,7 @@ class R2CacheTests(unittest.TestCase):
                 runner, compilations = self.server(root)
                 CACHE.configure(env, runner)
                 content = (root / 'env').read_text()
-                self.assertIn('RUSTC_WRAPPER=sccache\n', content)
+                self.assertIn(f'RUSTC_WRAPPER={compilations[0][0]}\n', content)
                 self.assertIn('SCCACHE_REGION=auto\n', content)
                 self.assertNotIn('test-secret', content)
                 self.assertNotIn('test-access', content)
