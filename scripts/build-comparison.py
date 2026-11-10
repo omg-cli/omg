@@ -210,10 +210,13 @@ def run_wave(source, evidence, source_sha):
         receipt['system'] = system_information(source, evidence, environment)
         write_json(receipt_path, receipt)
         def phase(argv, label, kind, sample):
+            print(json.dumps({'event': 'phase-start', 'label': label, 'sample': sample}), flush=True)
             row = measure(argv, source, evidence, label, environment)
             row.update(kind=kind, sample=sample, cacheState='cold' if sample == 0 else 'warm')
             receipt['samples'].append(row)
             write_json(receipt_path, receipt)
+            print(json.dumps({'event': 'phase-end', 'label': label, 'sample': sample,
+                              'wallSeconds': row['wallSeconds'], 'exitCode': row['exitCode']}), flush=True)
             require(row['exitCode'] == 0 and not row['timedOut'], label + ' failed')
             return (evidence / (label + '.stdout')).read_text(encoding='utf-8')
         binary_hashes = None

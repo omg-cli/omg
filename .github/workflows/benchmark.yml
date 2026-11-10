@@ -13,9 +13,9 @@ on:
         type: boolean
         default: false
       source-sha:
-        description: Full application source commit for the Rust comparison
+        description: Full application source commit, blank uses the selected workflow commit
         type: string
-        default: 329ed5b7a2d01ce40cbe0b0b70f42d66cfebd0ee
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.rust-comparison && 'comparison' || 'standard' }}
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     env:
-      COMPARISON_SOURCE_SHA: ${{ inputs.source-sha }}
+      COMPARISON_SOURCE_SHA: ${{ inputs.source-sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

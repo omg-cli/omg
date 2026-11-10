@@ -1,0 +1,166 @@
+{
+  "status": "verified",
+  "sourceSha": "329ed5b7a2d01ce40cbe0b0b70f42d66cfebd0ee",
+  "sourceManifestSha256": "9128626db9e27d9376d60397baf66f7fdee3549c0efb8f15ceccdc81380c980b",
+  "scriptSha256": "8547944aa09b09acf467abc4c3f4763bc221df89043e4c412e2771ed6161c11b",
+  "githubRun": 42851732274,
+  "driverSha": "12a972cfd20560f97d29189ca2e0cc817f9174a4",
+  "local": {
+    "cpu": "Intel(R) Core(TM) i9-14900K",
+    "cpuCount": 4,
+    "gcc": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "memoryBefore": [
+      "MemTotal:        8131784 kB",
+      "MemFree:         7665684 kB",
+      "MemAvailable:    7698136 kB"
+    ],
+    "inventory": {
+      "nativeExplicitCount": 53,
+      "completeNamesEqual": true,
+      "nativeStateUnchanged": true,
+      "installedInventorySha256": "6a20f24bc3e4a7ccb914559304c07dd5961145cf9cf181368c3cea8bf2d7ead0"
+    },
+    "maxProcessRssKiB": 3489804,
+    "binaryHashes": {
+      "omg": "c6b72b3d8b013d9dda2e3a27ee4598ddbd7388bec94130132aab3d2627cc12d9",
+      "omgd": "c10f087bbd635a8df35416551000d7bec2d5520aca42f12489f9d01e99bedd93"
+    },
+    "testNames": [
+      "package_managers::debian_db::db::tests::installed_status_accepts_held_packages_but_not_partial_states",
+      "package_managers::debian_db::db::tests::parse_packages_file_sync_reads_valid_packages"
+    ]
+  },
+  "github": {
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "cpuCount": 4,
+    "gcc": "gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "memoryBefore": [
+      "MemTotal:       16367524 kB",
+      "MemFree:        12569744 kB",
+      "MemAvailable:   15076428 kB"
+    ],
+    "inventory": {
+      "nativeExplicitCount": 260,
+      "completeNamesEqual": true,
+      "nativeStateUnchanged": true,
+      "installedInventorySha256": "aebb206466316e7d068003defc0fc4c9460311fae02bb133c93e3459acc6082c"
+    },
+    "maxProcessRssKiB": 3602276,
+    "binaryHashes": {
+      "omg": "0f8a6177c498336feb1c3dcf9804709917bf511a6ab8d1383dcef635ddeecf16",
+      "omgd": "c81479cf71daa3ed8605889aa61ee5b311f8bed28a67e34379e171821d6eb0e7"
+    },
+    "testNames": [
+      "package_managers::debian_db::db::tests::installed_status_accepts_held_packages_but_not_partial_states",
+      "package_managers::debian_db::db::tests::parse_packages_file_sync_reads_valid_packages"
+    ]
+  },
+  "phases": {
+    "build": {
+      "local": {
+        "coldSeconds": 337.0182255,
+        "warmSeconds": [
+          0.35163890000001174,
+          0.25126740000001746,
+          0.3519867999999633
+        ],
+        "warmMedianSeconds": 0.35163890000001174
+      },
+      "github": {
+        "coldSeconds": 520.525236222,
+        "warmSeconds": [
+          0.401669462999962,
+          0.4015552299999854,
+          0.4016365999999607
+        ],
+        "warmMedianSeconds": 0.4016365999999607
+      },
+      "coldLocalSpeedFactor": 1.5445017415593743,
+      "coldLocalTimeReductionPercent": 35.25420055594301
+    },
+    "test-0": {
+      "local": {
+        "coldSeconds": 342.5449473,
+        "warmSeconds": [
+          0.5530618999999888,
+          0.502600799999982,
+          0.502595499999984
+        ],
+        "warmMedianSeconds": 0.502600799999982
+      },
+      "github": {
+        "coldSeconds": 416.34474152099995,
+        "warmSeconds": [
+          0.4015191920000234,
+          0.40172865299996374,
+          0.401700781000045
+        ],
+        "warmMedianSeconds": 0.401700781000045
+      },
+      "coldLocalSpeedFactor": 1.2154455781721583,
+      "coldLocalTimeReductionPercent": 17.725645807700822
+    },
+    "test-1": {
+      "local": {
+        "coldSeconds": 0.8045090000000528,
+        "warmSeconds": [
+          0.5525135999999975,
+          0.5025653000000148,
+          0.5526902999999947
+        ],
+        "warmMedianSeconds": 0.5525135999999975
+      },
+      "github": {
+        "coldSeconds": 0.4016013949999433,
+        "warmSeconds": [
+          0.401667026000041,
+          0.4016648130000249,
+          0.40171980600007373
+        ],
+        "warmMedianSeconds": 0.401667026000041
+      },
+      "coldLocalSpeedFactor": 0.49918819428983013,
+      "coldLocalTimeReductionPercent": -100.32525036427386
+    }
+  },
+  "schemaVersion": 1,
+  "kind": "local-github-release-build-comparison",
+  "date": "2026-11-10",
+  "features": "debian,pgp,license",
+  "jobs": 4,
+  "releaseProfile": {
+    "lto": "fat",
+    "codegen-units": 1,
+    "panic": "unwind",
+    "strip": true,
+    "opt-level": 3,
+    "incremental": false
+  },
+  "coldMeaning": "empty target with prefetched dependencies; OS page cache retained",
+  "warmMeaning": "unchanged source and target; Cargo builds can be near no-ops",
+  "testColdMeaning": "first libtest compile after release builds; second named test reuses it",
+  "successfulPhasesPerEnvironment": 17,
+  "successfulNamedTestExecutionsPerEnvironment": 8,
+  "allPhaseLogHashesVerified": true,
+  "githubArtifact": {
+    "id": 13780849275,
+    "sha256": "7fb1cc1324bf2c47376c50f5e8531648059f2f7a65e77bc5e6407b7c83ac4fc3",
+    "expiresAt": "2026-11-24T16:26:24Z"
+  },
+  "localHost": {
+    "guestMiB": 8192,
+    "minimumAvailablePhysicalMiB": 339.54296875,
+    "peakQemuWorkingSetGiB": 6.224609375,
+    "retiredChildAllocatedBytes": 1698234368,
+    "processStopped": true,
+    "overlayRetired": true
+  },
+  "limits": [
+    "One cold sample and three unchanged warm samples per phase",
+    "Local four-vCPU eight-GiB Windows WHPX guest versus GitHub four-vCPU sixteen-GiB Linux runner",
+    "Desktop activity retained; not an isolated CPU or full-PC throughput test",
+    "Warm build is unchanged-source validation, not an edited rebuild",
+    "RSS is maximum process RSS, not simultaneous total compiler memory",
+    "No VPS measurement and no full CI matrix timing comparison"
+  ]
+}

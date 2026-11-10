@@ -1,3 +1,4 @@
+from contextlib import redirect_stdout
 import importlib.util
 import io
 import json
@@ -61,7 +62,8 @@ class ComparisonTests(unittest.TestCase):
             source, evidence = self.source_fixture(Path(directory))
             with patch.object(RUNNER, 'measure', self.fake_measure), \
                  patch.object(RUNNER, 'system_information', return_value={}), \
-                 patch.object(RUNNER, 'native_inventory', return_value=(['bash\t1\tinstalled'], {'bash'})):
+                 patch.object(RUNNER, 'native_inventory', return_value=(['bash\t1\tinstalled'], {'bash'})), \
+                 redirect_stdout(io.StringIO()):
                 result = RUNNER.run_wave(source, evidence, 'a' * 40)
             self.assertEqual(result['status'], 'complete')
             self.assertEqual(len(result['samples']), 17)
@@ -84,13 +86,42 @@ class ComparisonTests(unittest.TestCase):
                 row = self.fake_measure(*arguments)
                 row['exitCode'] = 101
                 return row
-            with patch.object(RUNNER, 'measure', fail), patch.object(RUNNER, 'system_information', return_value={}):
+            with patch.object(RUNNER, 'measure', fail), patch.object(RUNNER, 'system_information', return_value={}), \
+                 redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(ValueError, 'build-0 failed'):
                     RUNNER.run_wave(source, evidence, 'a' * 40)
             result = json.loads((evidence / 'receipt.json').read_text())
             self.assertEqual(result['status'], 'failed')
             self.assertEqual(result['samples'][0]['exitCode'], 101)
             self.assertNotIn('summary', result)
+
+    def test_failed_cargo_streams_flushed_start_then_failed_end_without_completion(self):
+        class Output(io.StringIO):
+            def __init__(self):
+                super().__init__()
+                self.flushed = []
+            def flush(self):
+                self.flushed.append(self.getvalue())
+        with tempfile.TemporaryDirectory() as directory:
+            source, evidence = self.source_fixture(Path(directory))
+            output = Output()
+            def fail(*arguments):
+                self.assertEqual(len(output.flushed), 1)
+                start = json.loads(output.flushed[0])
+                self.assertEqual(start, {'event': 'phase-start', 'label': 'build-0', 'sample': 0})
+                row = self.fake_measure(*arguments)
+                row['exitCode'] = 101
+                return row
+            with patch.object(RUNNER, 'measure', fail), patch.object(RUNNER, 'system_information', return_value={}), \
+                 redirect_stdout(output):
+                with self.assertRaisesRegex(ValueError, 'build-0 failed'):
+                    RUNNER.run_wave(source, evidence, 'a' * 40)
+            events = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(events, [
+                {'event': 'phase-start', 'label': 'build-0', 'sample': 0},
+                {'event': 'phase-end', 'label': 'build-0', 'sample': 0, 'wallSeconds': 0.1, 'exitCode': 101}])
+            self.assertEqual(len(output.flushed), 2)
+            self.assertEqual(json.loads((evidence / 'receipt.json').read_text())['status'], 'failed')
 
     def test_successful_cargo_exit_with_zero_tests_leaves_failed_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -100,7 +131,8 @@ class ComparisonTests(unittest.TestCase):
                 if row['label'].startswith('test-'):
                     (evidence / (row['label'] + '.stdout')).write_text('test result: ok. 0 passed; 0 failed; 0 ignored;')
                 return row
-            with patch.object(RUNNER, 'measure', zero_tests), patch.object(RUNNER, 'system_information', return_value={}):
+            with patch.object(RUNNER, 'measure', zero_tests), patch.object(RUNNER, 'system_information', return_value={}), \
+                 redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(ValueError, 'did not execute'):
                     RUNNER.run_wave(source, evidence, 'a' * 40)
             self.assertEqual(json.loads((evidence / 'receipt.json').read_text())['status'], 'failed')
@@ -180,7 +212,8 @@ class ComparisonTests(unittest.TestCase):
                                    source_sha='a' * 40, memory_mib=8192)
             with patch.object(WINDOWS, 'ROOT', root), patch.object(WINDOWS.QEMU, 'MANIFEST', manifest), \
                  patch.object(WINDOWS.QEMU, 'command', command), patch.object(WINDOWS.QEMU, 'Guest', ExitedGuest), \
-                 patch.object(WINDOWS.QEMU.IMAGES, 'verify', return_value={'passed': True}):
+                 patch.object(WINDOWS.QEMU.IMAGES, 'verify', return_value={'passed': True}), \
+                 redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(ValueError, 'QEMU stopped'):
                     WINDOWS.execute(args)
             self.assertTrue(guests[0].preserve_disk)
