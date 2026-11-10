@@ -27,7 +27,7 @@ class RequiredResultsTests(unittest.TestCase):
         script = textwrap.dedent(block.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, QUICK_GATE="success", WORKFLOW_CHECKS="success", BUILD_REQUIRED=required,
-                       STANDALONE_SUITES="success", PORTABLE="success", LINUX_MATRIX="success", SANDBOX_CANCELLATION="success",
+                       STANDALONE_SUITES="success", PORTABLE="success", LINUX_MATRIX="success", LINUX_CLIPPY="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", MACOS_NEXTEST_SOURCE="success", UBUNTU="success",
                        DOCS_AUDIT="success", RUNTIME_USAGE="success", FEDORA_SQLITE="success",
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
