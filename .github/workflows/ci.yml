@@ -27,6 +27,10 @@ on:
         description: "Skip cache restoration"
         type: boolean
         default: false
+      isolated-cache:
+        description: "Use an isolated R2 cache; rerun the same run for a warm comparison"
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.head_ref || github.ref }}
@@ -64,6 +68,18 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Validate isolated cache selection
+        if: inputs.isolated-cache == true
+        env:
+          R2_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
+          SKIP_CACHE: ${{ inputs.skip-cache }}
+        run: |
+          test "$GITHUB_REPOSITORY" = omg-cli/omg
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$R2_ENABLED" = true
+          test "$SKIP_CACHE" = false
 
       - name: Detect changes
         id: changes
@@ -152,7 +168,6 @@ jobs:
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    # Serial cold debug/release checks reached the previous 30-minute job cap.
     timeout-minutes: 40
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
@@ -202,6 +217,7 @@ jobs:
         env:
           OMG_R2_CACHE_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
           OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          OMG_R2_CACHE_ISOLATED: ${{ inputs.isolated-cache == true && 'true' || 'false' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
         run: python3 scripts/ci-r2-cache.py
@@ -248,9 +264,6 @@ jobs:
       - name: Test isolated distro override harness
         run: cargo test --test distro_override --no-default-features --features pgp,license --locked
 
-      - name: Test release distro override guard
-        run: cargo test --release --test distro_override --no-default-features --features pgp,license --locked
-
       - name: Test root library documentation contracts
         run: cargo test --doc --no-default-features --features pgp,license --locked
 
@@ -280,6 +293,104 @@ jobs:
         run: |
           trap 'sccache --stop-server' EXIT
           sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache-stats.json"
+          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache-context.txt"
+
+      - name: Preserve portable compiler cache diagnostics
+        if: >-
+          always() && vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/omg-r2-cache.log
+            ${{ runner.temp }}/omg-r2-cache-stats.json
+            ${{ runner.temp }}/omg-r2-cache-context.txt
+          retention-days: 3
+          if-no-files-found: warn
+
+  portable-release:
+    name: "Portable release"
+    needs: quick-gate
+    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Setup cache
+        if: inputs.skip-cache != true
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
+        with:
+          # Reserve compiled-cache storage for native producers and coverage.
+          prefix-key: "v3-portable-registry"
+          shared-key: "portable"
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
+          # PRs restore main's cache; merge-ref writes only benefit that PR's reruns.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install portable compiler cache
+        if: >-
+          vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: sccache@0.18.0
+
+      - name: Configure portable R2 cache
+        id: r2-cache
+        if: >-
+          vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          OMG_R2_CACHE_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          OMG_R2_CACHE_ISOLATED: ${{ inputs.isolated-cache == true && 'true' || 'false' }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+        run: python3 scripts/ci-r2-cache.py
+
+      - name: Test release distro override guard
+        run: cargo test --release --test distro_override --no-default-features --features pgp,license --locked
+
+      - name: Report portable compiler cache
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        run: |
+          trap 'sccache --stop-server' EXIT
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache-stats.json"
+          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache-context.txt"
+
+      - name: Preserve portable compiler cache diagnostics
+        if: >-
+          always() && vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/omg-r2-cache.log
+            ${{ runner.temp }}/omg-r2-cache-stats.json
+            ${{ runner.temp }}/omg-r2-cache-context.txt
+          retention-days: 3
+          if-no-files-found: warn
 
   #############################################################################
   # STAGE 2: Platform Matrix (Linux containers)
@@ -1791,7 +1902,7 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, workflow-checks, standalone-suites, portable, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
+    needs: [quick-gate, workflow-checks, standalone-suites, portable, portable-release, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1805,6 +1916,7 @@ jobs:
           WORKFLOW_CHECKS: ${{ needs.workflow-checks.result }}
           STANDALONE_SUITES: ${{ needs.standalone-suites.result }}
           PORTABLE: ${{ needs.portable.result }}
+          PORTABLE_RELEASE: ${{ needs.portable-release.result }}
           LINUX_MATRIX: ${{ needs.linux-matrix.result }}
           LINUX_CLIPPY: ${{ needs.linux-clippy.result }}
           FEDORA_SQLITE: ${{ needs.fedora-sqlite.result }}
@@ -1826,6 +1938,7 @@ jobs:
           echo "| Workflow checks | $WORKFLOW_CHECKS |" >> $GITHUB_STEP_SUMMARY
           echo "| Standalone suites | $STANDALONE_SUITES |" >> $GITHUB_STEP_SUMMARY
           echo "| Portable Rust | $PORTABLE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Portable release | $PORTABLE_RELEASE |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Matrix | $LINUX_MATRIX |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Clippy | $LINUX_CLIPPY |" >> $GITHUB_STEP_SUMMARY
           echo "| Fedora SQLite supply | $FEDORA_SQLITE |" >> $GITHUB_STEP_SUMMARY
@@ -1861,6 +1974,7 @@ jobs:
           declare -A required_results=(
             ["Standalone suites"]="$STANDALONE_SUITES"
             ["Portable Rust"]="$PORTABLE"
+            ["Portable release"]="$PORTABLE_RELEASE"
             ["Linux Matrix"]="$LINUX_MATRIX"
             ["Linux Clippy"]="$LINUX_CLIPPY"
             ["Fedora SQLite supply"]="$FEDORA_SQLITE"

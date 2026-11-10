@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure an opt-in R2 compiler cache for the trusted portable CI job only."""
+"""Configure the opt-in R2 compiler cache for the two trusted portable jobs."""
 import json
 import os
 from pathlib import Path
@@ -15,8 +15,8 @@ def configuration(env):
     if (env.get('GITHUB_REPOSITORY') != 'omg-cli/omg'
             or env.get('GITHUB_REF') != 'refs/heads/main'
             or env.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch')
-            or env.get('GITHUB_JOB') != 'portable'):
-        raise ValueError('R2 compiler cache is restricted to the trusted main portable job')
+            or env.get('GITHUB_JOB') not in ('portable', 'portable-release')):
+        raise ValueError('R2 compiler cache is restricted to the trusted main portable jobs')
     account = env.get('OMG_R2_CACHE_ACCOUNT_ID', '')
     if not re.fullmatch(r'[a-f0-9]{32}', account):
         raise ValueError('a valid R2 account ID is required')
@@ -25,15 +25,27 @@ def configuration(env):
             raise ValueError('R2 cache credentials are missing or invalid')
     if env.get('RUSTC_WRAPPER') or env.get('RUSTC_WORKSPACE_WRAPPER'):
         raise ValueError('refusing to replace an existing compiler wrapper')
+    isolated = env.get('OMG_R2_CACHE_ISOLATED', 'false')
+    prefix = 'portable-v1/'
+    if isolated == 'true':
+        run_id = env.get('GITHUB_RUN_ID', '')
+        if env['GITHUB_EVENT_NAME'] != 'workflow_dispatch' or not re.fullmatch(r'[1-9][0-9]{0,19}', run_id):
+            raise ValueError('isolated R2 cache requires a trusted manual run identity')
+        prefix = f'portable-diagnostic-v1/{run_id}/'
+    elif isolated != 'false':
+        raise ValueError('invalid isolated cache selection')
     return {
         'SCCACHE_BUCKET': 'omg-ci-compiler-cache',
         'SCCACHE_ENDPOINT': f'https://{account}.r2.cloudflarestorage.com',
         'SCCACHE_REGION': 'auto',
         'SCCACHE_S3_USE_SSL': 'true',
-        'SCCACHE_S3_KEY_PREFIX': 'portable-v1/',
+        'SCCACHE_S3_KEY_PREFIX': prefix,
         'SCCACHE_S3_RW_MODE': 'READ_WRITE',
         'SCCACHE_IDLE_TIMEOUT': '0',
         'SCCACHE_SERVER_UDS': str(Path(tempfile.gettempdir()) / f'omg-r2-{uuid.uuid4().hex}.sock'),
+        'SCCACHE_ERROR_LOG': str(Path(env.get('RUNNER_TEMP', tempfile.gettempdir())) / 'omg-r2-cache.log'),
+        # This module records compiler args and process errors without tracing request environments.
+        'SCCACHE_LOG': r'off,sccache::compiler::compiler=debug/get_cached_or_compile:.*([.][sS]"|assembler)|process error',
         'RUSTC_WRAPPER': 'sccache',
     }
 

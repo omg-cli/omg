@@ -30,6 +30,26 @@ def statistics(writes=0, misses=0, hits=0, errors=0, language='Rust'):
 
 
 class R2CacheTests(unittest.TestCase):
+    def test_release_owner_and_isolated_manual_generation_keep_the_cache_boundary(self):
+        for job in ('portable', 'portable-release'):
+            config = CACHE.configuration(dict(trusted(), GITHUB_JOB=job))
+            self.assertEqual(config['SCCACHE_S3_KEY_PREFIX'], 'portable-v1/')
+            isolated = dict(trusted(), GITHUB_JOB=job, GITHUB_EVENT_NAME='workflow_dispatch',
+                            OMG_R2_CACHE_ISOLATED='true', GITHUB_RUN_ID='123456789')
+            self.assertEqual(CACHE.configuration(isolated)['SCCACHE_S3_KEY_PREFIX'],
+                             'portable-diagnostic-v1/123456789/')
+            for name, value in [('GITHUB_EVENT_NAME', 'push'), ('GITHUB_RUN_ID', '0'),
+                                ('GITHUB_RUN_ID', '../123'), ('GITHUB_RUN_ID', '1\nINJECT=true'),
+                                ('OMG_R2_CACHE_ISOLATED', 'yes')]:
+                with self.subTest(job=job, name=name, value=value), self.assertRaises(ValueError):
+                    CACHE.configuration(dict(isolated, **{name: value}))
+
+    def test_diagnostics_do_not_enable_environment_or_storage_logging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = CACHE.configuration(dict(trusted(), RUNNER_TEMP=directory))
+            self.assertEqual(Path(config['SCCACHE_ERROR_LOG']), Path(directory) / 'omg-r2-cache.log')
+            self.assertEqual(config['SCCACHE_LOG'].partition('/')[0], 'off,sccache::compiler::compiler=debug')
+
     def server(self, root, snapshots=None, failure=None, corrupt_replay=False):
         snapshots = iter(snapshots if snapshots is not None else
                          [statistics(), statistics(1, 1), statistics(1, 1, 1)])
@@ -81,10 +101,10 @@ class R2CacheTests(unittest.TestCase):
     def test_outputs_follow_write_and_replay_without_client_credentials(self):
         names = []
         sockets = []
-        for _ in range(2):
+        for job in ('portable', 'portable-release'):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                env = dict(trusted(), GITHUB_ENV=str(root / 'env'), GITHUB_OUTPUT=str(root / 'output'))
+                env = dict(trusted(), GITHUB_JOB=job, GITHUB_ENV=str(root / 'env'), GITHUB_OUTPUT=str(root / 'output'))
                 runner, compilations = self.server(root)
                 CACHE.configure(env, runner)
                 content = (root / 'env').read_text()
@@ -158,13 +178,14 @@ class R2CacheTests(unittest.TestCase):
 
     def test_workflow_cache_is_portable_only_and_no_pr_credentials(self):
         source = CI_YML.read_text()
-        portable = job_block(source, 'portable')
-        self.assertIn('python3 scripts/ci-r2-cache.py', portable)
-        self.assertIn("github.event_name == 'push' || github.event_name == 'workflow_dispatch'", portable)
-        self.assertIn("github.ref == 'refs/heads/main'", portable)
-        self.assertIn("inputs.skip-cache != true", portable)
-        self.assertIn('sccache@0.18.0', portable)
-        self.assertIn('sccache --show-stats', portable)
+        for job in ('portable', 'portable-release'):
+            portable = job_block(source, job)
+            self.assertIn('python3 scripts/ci-r2-cache.py', portable)
+            self.assertIn("github.event_name == 'push' || github.event_name == 'workflow_dispatch'", portable)
+            self.assertIn("github.ref == 'refs/heads/main'", portable)
+            self.assertIn("inputs.skip-cache != true", portable)
+            self.assertIn('sccache@0.18.0', portable)
+            self.assertIn('sccache --show-stats', portable)
         for job in ('linux-matrix', 'ubuntu', 'macos', 'qemu'):
             block = job_block(source, job)
             self.assertNotIn('ci-r2-cache.py', block)

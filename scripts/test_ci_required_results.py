@@ -27,7 +27,7 @@ class RequiredResultsTests(unittest.TestCase):
         script = textwrap.dedent(block.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             env = dict(os.environ, QUICK_GATE="success", WORKFLOW_CHECKS="success", BUILD_REQUIRED=required,
-                       STANDALONE_SUITES="success", PORTABLE="success", LINUX_MATRIX="success", LINUX_CLIPPY="success", SANDBOX_CANCELLATION="success",
+                       STANDALONE_SUITES="success", PORTABLE="success", PORTABLE_RELEASE="success", LINUX_MATRIX="success", LINUX_CLIPPY="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", MACOS_NEXTEST_SOURCE="success", UBUNTU="success",
                        DOCS_AUDIT="success", RUNTIME_USAGE="success", FEDORA_SQLITE="success",
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
@@ -46,13 +46,23 @@ class RequiredResultsTests(unittest.TestCase):
                 self.assertNotEqual(observed.returncode, 0)
                 self.assertIn('Fedora SQLite supply did not succeed', observed.stdout)
 
+    def test_portable_release_cannot_hide_failure_or_skip_behind_portable_success(self):
+        for required in ('true', 'false'):
+            for state in ('failure', 'cancelled', '', None):
+                with self.subTest(required=required, state=state):
+                    result = self.evaluate(required, {'PORTABLE_RELEASE': state})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Portable release did not succeed', result.stdout)
+        self.assertNotEqual(self.evaluate('true', {'PORTABLE_RELEASE': 'skipped'}).returncode, 0)
+        self.assertEqual(self.evaluate('false', {'PORTABLE_RELEASE': 'skipped'}).returncode, 0)
+
     def test_required_job_skips_fail(self):
-        for job in ("STANDALONE_SUITES", "PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE", "FEDORA_SQLITE"):
+        for job in ("STANDALONE_SUITES", "PORTABLE", "PORTABLE_RELEASE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE", "FEDORA_SQLITE"):
             with self.subTest(job=job):
                 self.assertNotEqual(self.evaluate("true", {job: "skipped"}).returncode, 0)
 
     def test_docs_only_skips_pass(self):
-        jobs = ("STANDALONE_SUITES", "PORTABLE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE", "FEDORA_SQLITE")
+        jobs = ("STANDALONE_SUITES", "PORTABLE", "PORTABLE_RELEASE", "LINUX_MATRIX", "SANDBOX_CANCELLATION", "FEATURE_INTERSECTIONS", "MACOS", "MACOS_NEXTEST_SOURCE", "UBUNTU", "RUNTIME_USAGE", "FEDORA_SQLITE")
         self.assertEqual(self.evaluate("false", {job: "skipped" for job in jobs}).returncode, 0)
 
     def test_all_success_passes_and_failure_never_does(self):

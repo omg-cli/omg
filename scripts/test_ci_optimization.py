@@ -12,6 +12,8 @@ import textwrap
 import tomllib
 import unittest
 
+from test_ci_gates import job_block
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / '.github/workflows'
 BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
@@ -229,9 +231,14 @@ class OptimizationContracts(unittest.TestCase):
                 blocks = re.split(r'(?m)^      - ', text)
                 caches = [block for block in blocks
                           if 'uses: Swatinem/rust-cache@' in block and new_prefix in block]
-                self.assertEqual(len(caches), 1, 'registry-only cache must use a fresh prefix')
-                self.assertIn('cache-targets: false', caches[0])
-                self.assertIn('cache-bin: false', caches[0])
+                self.assertEqual(len(caches), 2 if filename == 'ci.yml' else 1,
+                                 'registry-only cache must use a fresh prefix')
+                for cache in caches:
+                    self.assertIn('cache-targets: false', cache)
+                    self.assertIn('cache-bin: false', cache)
+                if filename == 'ci.yml':
+                    for role in ('portable', 'portable-release'):
+                        self.assertEqual(job_block(text, role).count(new_prefix), 1)
                 self.assertNotIn(old_prefix, text)
 
     def test_ci_profiles_do_not_retry_failures(self):
