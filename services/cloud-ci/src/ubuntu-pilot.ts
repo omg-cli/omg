@@ -201,7 +201,7 @@ export async function handleCapabilityProbe(request: Request, token: string, con
   let destroyed = false;
   try {
     await bounded(sandbox.armProbe(), 10_000);
-    const result = await bounded(sandbox.exec(capabilityCommand, { timeout: 45_000, signal: AbortSignal.timeout(120_000) }), 120_000);
+    const result = await bounded(sandbox.exec(capabilityCommand, { timeout: 45_000 }), 120_000);
     if (result.stdout.length > 16_384) throw new Error("Capability report exceeds byte budget");
     probe = reportSchema.parse(JSON.parse(result.stdout));
     if (!result.success || result.exitCode !== 0 || !probe.accepted || !probe.cleanup ||

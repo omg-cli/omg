@@ -17,8 +17,9 @@ function fixture(options: { execReject?: boolean; cleanupReject?: boolean; repor
   const calls: string[] = [];
   const sandbox = {
     async armProbe() { calls.push("arm"); },
-    async exec(command: string) {
+    async exec(command: string, options: object) {
       calls.push("exec");
+      if ("signal" in options) throw new Error("AbortSignal serialization is not enabled.");
       if (options.execReject) throw new Error("execution unavailable");
       return { success: true, exitCode: 0, stdout: JSON.stringify(options.report ?? report), stderr: "",
         command, duration: 1, timestamp: new Date().toISOString() };
