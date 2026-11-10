@@ -1,0 +1,101 @@
+name: Cloudflare native CI
+
+on:
+  push:
+    branches: [main, ci/plain-cloudflare]
+    paths:
+      - services/ci/**
+      - .github/workflows/cloudflare-native-ci.yml
+      - scripts/build-comparison.py
+      - scripts/test-debian-daemon-catalog.py
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - .cargo/config.toml
+      - src/**
+      - vendor/**
+  workflow_dispatch:
+
+concurrency:
+  group: cloudflare-native-ci
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    if: >-
+      github.repository == 'omg-cli/omg' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/plain-cloudflare') &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 75
+    outputs:
+      image_digest: ${{ steps.deploy.outputs.image_digest }}
+      deployment_version: ${{ steps.deploy.outputs.deployment_version }}
+      endpoint: ${{ steps.deploy.outputs.endpoint }}
+      source_sha: ${{ steps.deploy.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.1
+
+      - name: Install pinned deployment package manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 --max-time 120 -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$RUNNER_TEMP/bun.zip"
+          echo "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c  $RUNNER_TEMP/bun.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun"
+          echo "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235  $RUNNER_TEMP/bun/bun-linux-x64/bun" | sha256sum -c -
+          echo "$RUNNER_TEMP/bun/bun-linux-x64" >> "$GITHUB_PATH"
+
+      - name: Install frozen CI control dependencies
+        working-directory: services/ci
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Check native CI controller
+        run: |
+          python3 -B -m unittest discover -s services/ci -p 'test_*.py' -v
+          bun run --cwd services/ci check
+          bun run --cwd services/ci test
+
+      - name: Build, smoke, publish, and deploy immutable image
+        id: deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          OMG_NATIVE_CI_TOKEN: ${{ secrets.OMG_NATIVE_CI_TOKEN }}
+        run: node services/ci/deploy.mjs
+
+      - name: Prove native container capability and teardown
+        env:
+          SOURCE_SHA: ${{ steps.deploy.outputs.source_sha }}
+          IMAGE_DIGEST: ${{ steps.deploy.outputs.image_digest }}
+          OMG_NATIVE_CI_TOKEN: ${{ secrets.OMG_NATIVE_CI_TOKEN }}
+        run: python3 services/ci/courier.py --mode canary --source-sha "$SOURCE_SHA" --image-digest "$IMAGE_DIGEST" --evidence-dir "$RUNNER_TEMP/canary-proof"
+
+      - name: Run real native Rust build and behavior checks
+        env:
+          SOURCE_SHA: ${{ steps.deploy.outputs.source_sha }}
+          IMAGE_DIGEST: ${{ steps.deploy.outputs.image_digest }}
+          OMG_NATIVE_CI_TOKEN: ${{ secrets.OMG_NATIVE_CI_TOKEN }}
+        run: python3 services/ci/courier.py --mode run --source-sha "$SOURCE_SHA" --image-digest "$IMAGE_DIGEST" --evidence-dir "$RUNNER_TEMP/native-proof"
+
+      - name: Preserve deployment and native evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cloudflare-native-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/image-proof/
+            ${{ runner.temp }}/canary-proof/
+            ${{ runner.temp }}/native-proof/
+          if-no-files-found: warn
+          retention-days: 14

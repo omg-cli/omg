@@ -1,5 +1,7 @@
 # Cloudflare CI implementation research and open questions
 
+> Retired for OMG on November 10, 2026. This document describes the former autonomous repair framework. Use [plain Cloudflare CI](plain-cloudflare-ci.md) for the replacement and current activation status.
+
 Updated 2026-10-20 against the current OMG adaptation worktree and frozen CodeLoud `f4371c4ccacbf5fe7ab6e5c776bd9151c9a6850c`. This separates implemented source, operator-reported activation and actual hosted acceptance. Read alongside [adaptation research](cloudflare-ci-adaptation-research.md). Primary documents below were retrieved with Firecrawl. This document update ran no deployment, AI call, native build or capability probe.
 
 ## Ready in source versus still planned
