@@ -295,13 +295,14 @@ jobs:
       arch: x86_64
 
   linux-matrix:
-    name: "Linux (${{ matrix.platform }})"
+    name: "${{ matrix.phase == 'validation' && format('Linux ({0})', matrix.platform) || format('Linux clippy ({0})', matrix.platform) }}"
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Ubuntu's cold validation build also needs room for slow package mirrors.
+    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && matrix.phase == 'validation' && 45 || 30 }}
     env:
-      RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}
+      RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}
       DIAGNOSTIC_IMAGE: ${{ matrix.image }}
       DIAGNOSTIC_PLATFORM: ${{ matrix.platform }}
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
@@ -315,7 +316,10 @@ jobs:
       OMG_CONTRACT_PLATFORM: ${{ matrix.contract_platform || matrix.platform }}
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
+        phase: [validation, clippy]
+        platform: [arch, debian, debian-trixie, ubuntu-2604, fedora]
         include:
           - platform: arch
             image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
@@ -366,7 +370,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish zstd \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
             rust_install: |
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -386,7 +390,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish zstd \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
             rust_install: |
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -413,7 +417,7 @@ jobs:
               test "$(uname -m)" = x86_64
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish jq \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish jq zstd \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               ldconfig -p | grep -F 'libapt-pkg.so.7'
             rust_install: |
@@ -880,7 +884,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}
+          name: rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}
           path: ${{ env.RUSTUP_DIAGNOSTICS_DIR }}/
           retention-days: 14
           if-no-files-found: error
@@ -906,10 +910,12 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         env:
           ZSTD_CLEVEL: "6"
+          # Diagnostic output paths contain run IDs, not compiler settings.
+          RUSTUP_DIAGNOSTICS_DIR: ""
         with:
           prefix-key: v2-platform-dependencies
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.phase == 'validation' }}
           # Never restore across distro ABI or feature contracts. The action
           # additionally keys rustc, Cargo config, lockfiles and compiler flags.
           shared-key: ${{ steps.cache-key.outputs.key }}
@@ -928,10 +934,11 @@ jobs:
         run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
 
       - name: Run unit tests
+        if: matrix.phase == 'validation'
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
 
       - name: Build release
-        if: matrix.platform != 'ubuntu-2604'
+        if: matrix.phase == 'validation' && matrix.platform != 'ubuntu-2604'
         shell: bash
         env:
           DISTRO: ${{ matrix.platform }}
@@ -942,11 +949,11 @@ jobs:
             --image "$BUILD_IMAGE" --features "$BUILD_FEATURES" --destination "$RUNNER_TEMP/native-release"
 
       - name: Build Ubuntu 26.04 validation binary
-        if: matrix.platform == 'ubuntu-2604'
+        if: matrix.phase == 'validation' && matrix.platform == 'ubuntu-2604'
         run: cargo build --release --no-default-features --features debian,pgp,license --locked
 
       - name: Verify complete native APT daemon catalogue
-        if: contains(matrix.features, 'debian')
+        if: matrix.phase == 'validation' && contains(matrix.features, 'debian')
         shell: bash
         run: |
           set -euo pipefail
@@ -958,7 +965,7 @@ jobs:
             --evidence-dir "/tmp/omg-catalog-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
 
       - name: Preserve native APT catalogue proof
-        if: always() && contains(matrix.features, 'debian')
+        if: always() && matrix.phase == 'validation' && contains(matrix.features, 'debian')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: apt-daemon-catalog-${{ matrix.platform }}
@@ -969,7 +976,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload native release pair
-        if: matrix.platform != 'ubuntu-2604'
+        if: matrix.phase == 'validation' && matrix.platform != 'ubuntu-2604'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-release-${{ matrix.platform }}-${{ github.run_attempt }}
@@ -979,12 +986,13 @@ jobs:
           if-no-files-found: error
 
       - name: Platform clippy
+        if: matrix.phase == 'clippy'
         run: |
           cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
             --locked -- -D warnings
 
       - name: Test emitted shell hooks
-        if: matrix.platform == 'fedora'
+        if: matrix.phase == 'validation' && matrix.platform == 'fedora'
         env:
           OMG_HOOK_TEST_BINARY: ${{ github.workspace }}/target/debug/omg
           OMG_HOOK_TEST_REQUIRE_SHELLS: bash,zsh,fish
@@ -994,7 +1002,7 @@ jobs:
           python3 -m unittest discover -s tests -p test_shell_hook_ci.py
 
       - name: Run serial library and binary contracts
-        if: matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'
+        if: matrix.phase == 'validation' && matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'
         # Preserve the former staged-QEMU libtest owner alongside nextest.
         shell: bash
         run: |
@@ -1008,7 +1016,7 @@ jobs:
           fi
 
       - name: Native Fedora ignored integration fixtures
-        if: matrix.platform == 'fedora'
+        if: matrix.phase == 'validation' && matrix.platform == 'fedora'
         timeout-minutes: 4
         shell: bash
         run: |
@@ -1028,7 +1036,7 @@ jobs:
             --evidence-dir target/fedora-ignored/fixture
 
       - name: Upload native Fedora ignored integration evidence
-        if: always() && matrix.platform == 'fedora'
+        if: always() && matrix.phase == 'validation' && matrix.platform == 'fedora'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fedora-ignored-integrations
@@ -1039,7 +1047,7 @@ jobs:
           if-no-files-found: error
 
       - name: Prepare sandbox regression executable
-        if: matrix.platform == 'arch'
+        if: matrix.phase == 'validation' && matrix.platform == 'arch'
         shell: bash
         run: |
           set -euo pipefail
@@ -1050,7 +1058,7 @@ jobs:
           install -Dm755 "$binary" target/sandbox-test/omg-lib-tests
 
       - name: Upload sandbox regression executable
-        if: matrix.platform == 'arch'
+        if: matrix.phase == 'validation' && matrix.platform == 'arch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aur-sandbox-test
@@ -1059,7 +1067,7 @@ jobs:
           if-no-files-found: error
 
       - name: Debian deterministic benchmark regression check
-        if: matrix.platform == 'debian'
+        if: matrix.phase == 'validation' && matrix.platform == 'debian'
         env:
           OMG_BENCH_WRITE_JSON: "1"
           OMG_BENCH_JSON_OUT: target/bench/debian-matrix.json
@@ -1070,7 +1078,7 @@ jobs:
             -- --nocapture
 
       - name: Upload Debian benchmark artifact
-        if: matrix.platform == 'debian'
+        if: matrix.phase == 'validation' && matrix.platform == 'debian'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-debian-matrix
@@ -1079,7 +1087,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish Debian benchmark summary
-        if: matrix.platform == 'debian'
+        if: matrix.phase == 'validation' && matrix.platform == 'debian'
         run: |
           echo "## Debian Deterministic Benchmark" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -1088,11 +1096,13 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Verify binary
+        if: matrix.phase == 'validation'
         run: |
           ./target/release/omg --version
           ./target/release/omg --help | head -20
 
       - name: Upload binary
+        if: matrix.phase == 'validation'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: omg-${{ matrix.platform }}
@@ -1101,7 +1111,7 @@ jobs:
           if-no-files-found: error
 
       - name: Preserve compiled parser surfaces
-        if: always()
+        if: always() && matrix.phase == 'validation'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cli-surfaces-${{ matrix.platform }}

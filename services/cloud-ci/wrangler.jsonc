@@ -35,8 +35,20 @@
   },
   "observability": {
     "enabled": true,
+    "head_sampling_rate": 1,
     "redact_query_string": true,
-    "logs": { "enabled": true, "invocation_logs": false, "persist": true },
-    "traces": { "enabled": false }
+    "logs": {
+      "enabled": true,
+      "destinations": ["latham-openobserve-logs"],
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": false
+    },
+    "traces": {
+      "enabled": true,
+      "destinations": ["latham-openobserve-traces"],
+      "persist": true,
+      "head_sampling_rate": 1
+    }
   },
 }

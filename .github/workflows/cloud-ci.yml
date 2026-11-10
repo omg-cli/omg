@@ -4,10 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: Run portable verification, dependency repair, or a bounded operator rollout lock
+        description: Run portable checks, dependency repair, a rollout lock, or a runtime probe
         type: choice
-        options: [portable, dependencies, rollout-lock]
+        options: [portable, dependencies, rollout-lock, runtime-probe]
         default: portable
+      expected_controller:
+        description: Exact accepted main controller SHA (runtime-probe only)
+        type: string
+        default: ""
+      rollout_lock_run:
+        description: Active dedicated rollout-lock run ID (runtime-probe only)
+        type: string
+        default: ""
   workflow_run:
     workflows: [Security Audit]
     types: [completed]
@@ -16,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ (github.event_name == 'workflow_run' || inputs.task == 'dependencies') && 'omg-cloud-dependencies' || 'omg-ai-review-global' }}
+  group: ${{ inputs.task == 'runtime-probe' && 'omg-ci-operator-probe' || (github.event_name == 'workflow_run' || inputs.task == 'dependencies') && 'omg-cloud-dependencies' || 'omg-ai-review-global' }}
   cancel-in-progress: false
   queue: max
 
@@ -48,17 +56,24 @@ jobs:
           exit 1
 
   portable:
-    name: Cloudflare portable checks
+    name: ${{ inputs.task == 'runtime-probe' && 'Cloudflare operator runtime probe' || 'Cloudflare portable checks' }}
     if: >-
-      github.repository == 'omg-cli/omg' && github.ref_name == 'main' &&
-      github.event_name == 'workflow_dispatch' && inputs.task == 'portable'
+      github.repository == 'omg-cli/omg' && github.event_name == 'workflow_dispatch' &&
+      ((inputs.task == 'portable' && github.ref_name == 'main') ||
+       (inputs.task == 'runtime-probe' && github.ref == 'refs/heads/main'))
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: ${{ inputs.task == 'runtime-probe' && 20 || 75 }}
     env:
       CONTROLLER_SHA: ${{ vars.OMG_CI_CONTROLLER_SHA }}
       CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       TARGET_BRANCH: ${{ github.event.pull_request.base.ref || github.ref_name }}
       SOURCE_BASE_SHA: ${{ github.event.before || github.event.pull_request.base.sha || '' }}
+      PROBE_TASK: ${{ inputs.task }}
+      EXPECTED_CONTROLLER: ${{ inputs.expected_controller || '' }}
+      ROLLOUT_LOCK_RUN_ID: ${{ inputs.rollout_lock_run || '' }}
     steps:
       - name: Validate immutable controller and candidate identities
         shell: bash
@@ -79,6 +94,12 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$CONTROLLER_SHA"
+          if [ "$PROBE_TASK" = runtime-probe ]; then
+            [[ "$EXPECTED_CONTROLLER" =~ ^[a-f0-9]{40}$ ]]
+            test "$CONTROLLER_SHA" = "$EXPECTED_CONTROLLER"
+            test "$CONTROLLER_SHA" = "$GITHUB_SHA"
+            test "$CONTROLLER_SHA" = "$GITHUB_WORKFLOW_SHA"
+          fi
           tools="$RUNNER_TEMP/omg-bun-1.4.4"
           mkdir -m 700 -p "$tools"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 120 \
@@ -88,7 +109,13 @@ jobs:
           printf '%s  %s\n' '10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235' "$directory/bun" | sha256sum -c -
           test "$("$directory/bun" --revision)" = '1.4.4+38afee6c8'
           printf '%s\n' "$directory" >> "$GITHUB_PATH"
+      - name: Verify active operator rollout hold before credentials
+        if: inputs.task == 'runtime-probe'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/cloud-runtime-probe.mjs preflight
       - name: Fetch candidate Git objects without checking out candidate files
+        if: inputs.task == 'portable'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -101,6 +128,18 @@ jobs:
               git fetch --no-tags origin "$CANDIDATE_SHA"
           fi
           git cat-file -e "$CANDIDATE_SHA^{commit}"
+      - name: Install immutable controller dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install frozen operator probe dependencies
+        if: inputs.task == 'runtime-probe'
+        run: |
+          bun install --cwd services/ci-coder --frozen-lockfile --ignore-scripts
+          bun install --cwd services/ci-inspector --frozen-lockfile --ignore-scripts
+      - name: Recheck operator hold before private credentials
+        if: inputs.task == 'runtime-probe'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/cloud-runtime-probe.mjs preflight
       - name: Create private OMG service configuration
         env:
           OMG_CI_API_TOKEN: ${{ secrets.OMG_CI_API_TOKEN }}
@@ -137,15 +176,20 @@ jobs:
             }), { mode: 0o600, flag: "wx" });
           }
           JS
-      - name: Install immutable controller dependencies
-        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Probe deployed runtime without repair or publication
+        if: inputs.task == 'runtime-probe'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/cloud-runtime-probe.mjs run
       - name: Mirror exact candidate Git objects
+        if: inputs.task == 'portable'
         run: bun scripts/cloud-ci-mirror.mjs "$CANDIDATE_SHA"
       - name: Run isolated Cloudflare checks and admit exact-run receipt
+        if: inputs.task == 'portable'
         id: cloud
         run: bun scripts/run-cloud-ci.mjs "$CANDIDATE_SHA" "$TARGET_BRANCH" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$RECEIPT_FILE"
       - name: Report admitted Cloudflare result
-        if: always()
+        if: always() && inputs.task == 'portable'
         env:
           CLOUD_OUTCOME: ${{ steps.cloud.outcome }}
         shell: bash
