@@ -1,6 +1,7 @@
 # pyright: strict
 from __future__ import annotations
 
+import ast
 import json
 import itertools
 import os
@@ -373,12 +374,30 @@ class FedoraSetupSourceTests(unittest.TestCase):
         script = step.split("        run: |\n", 1)[1]
         script = "\n".join(line[10:] for line in script.splitlines())
         # Exercise provisioning, receipt accounting, and the helper gate together.
-        script = "set -euo pipefail\nmkdir -p target/fedora-ignored\n" + script[script.index("started=$(date +%s)"):]
+        script = "set -euo pipefail\n" + script[script.index("mkdir -p"):]
         script = script.replace("${{ matrix.features }}", "fedora,pgp,license")
+        helper_source = (CI_YML.parents[2] / "scripts/run-fedora-ignored-integrations.py").read_text(encoding="utf-8")
+        main = next(node for node in ast.parse(helper_source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "main")
+        allocation = next(index for index, node in enumerate(main.body)
+                          if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "out")
+        # Execute the helper's actual fresh-directory allocation before native RPM work.
+        allocation_source = "\n".join(ast.unparse(node) for node in main.body[allocation:allocation + 2])
+        self.assertIn("exist_ok=False", allocation_source)
+        upload = source.split("      - name: Upload native Fedora ignored integration evidence\n", 1)[1]
+        upload = upload.split("\n      - name:", 1)[0]
+        self.assertIn("${{ runner.temp }}/fedora-ignored/", upload)
+        self.assertIn("target/fedora-serial-libtest.jsonl", upload)
+        self.assertNotIn("target/fedora-ignored", step + upload)
         for exit_code in [0, 42]:
             with self.subTest(dnf_exit=exit_code):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
+                    cached = root / "target/fedora-ignored/fixture"
+                    cached.mkdir(parents=True)
+                    marker = cached / "unrelated-cache-marker"
+                    marker.write_text("preserve cached evidence", encoding="utf-8")
+                    runner_temp = root / "runner temp"
                     (root / "dnf").write_text(
                         f"#!{sys.executable}\n"
                         "import json,os,sys\n"
@@ -389,19 +408,22 @@ class FedoraSetupSourceTests(unittest.TestCase):
                     )
                     (root / "python3").write_text(
                         f"#!{sys.executable}\n"
-                        "import os\nfrom pathlib import Path\n"
-                        "Path(os.environ['HELPER_CALL']).write_text('helper reached')\n",
+                        "import os,sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
+                        "args=SimpleNamespace(evidence_dir=Path(sys.argv[sys.argv.index('--evidence-dir')+1]))\n"
+                        + allocation_source + "\n"
+                        "Path(os.environ['HELPER_CALL']).write_text(str(out))\n",
                         encoding="utf-8",
                     )
                     for name in ["dnf", "python3"]:
                         (root / name).chmod(0o755)
                     receipt = root / "call.json"
                     helper = root / "helper.txt"
+                    environment = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", RUNNER_TEMP=str(runner_temp),
+                                       DNF_CALL=str(receipt), DNF_EXIT=str(exit_code), HELPER_CALL=str(helper))
                     result = subprocess.run(
                         ["bash", "-e", "-c", script],
                         cwd=root,
-                        env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
-                                 DNF_CALL=str(receipt), DNF_EXIT=str(exit_code), HELPER_CALL=str(helper)),
+                        env=environment,
                         capture_output=True, text=True, timeout=10, check=False,
                     )
                     self.assertEqual(result.returncode, exit_code, result.stderr)
@@ -409,13 +431,22 @@ class FedoraSetupSourceTests(unittest.TestCase):
                         "--setopt=*.skip_if_unavailable=False", "--disable-repo=fedora-cisco-openh264", "install", "-y",
                         "--setopt=install_weak_deps=False", "tree", "createrepo_c", "gnupg2",
                     ])
-                    provision = json.loads((root / "target/fedora-ignored/provision.json").read_text(encoding="utf-8"))
+                    provision = json.loads((runner_temp / "fedora-ignored/provision.json").read_text(encoding="utf-8"))
                     self.assertEqual(provision["exit_code"], exit_code)
                     self.assertGreaterEqual(provision["elapsed_seconds"], 0)
                     if exit_code == 0:
-                        self.assertEqual(helper.read_text(encoding="utf-8"), "helper reached")
+                        fresh = runner_temp / "fedora-ignored/fixture"
+                        self.assertEqual(helper.read_text(encoding="utf-8"), str(fresh))
+                        self.assertTrue(fresh.is_dir())
+                        repeated = subprocess.run(
+                            ["bash", "-e", "-c", script], cwd=root, env=environment,
+                            capture_output=True, text=True, timeout=10, check=False,
+                        )
+                        self.assertNotEqual(repeated.returncode, 0)
+                        self.assertIn("FileExistsError", repeated.stderr)
                     else:
                         self.assertFalse(helper.exists(), "failed provisioning must stop before the helper")
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "preserve cached evidence")
 
 
 class QemuConcurrencyTests(unittest.TestCase):

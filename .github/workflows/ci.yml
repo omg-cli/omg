@@ -1033,18 +1033,18 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I -B -m unittest discover -s scripts -p test_fedora_ignored_integrations.py
-          mkdir -p target/fedora-ignored
+          mkdir -p "$RUNNER_TEMP/fedora-ignored"
           started=$(date +%s)
           status=0
           timeout --kill-after=5s 90s dnf --setopt='*.skip_if_unavailable=False' --disable-repo=fedora-cisco-openh264 \
             install -y --setopt=install_weak_deps=False tree createrepo_c gnupg2 \
-            > target/fedora-ignored/provision.stdout 2> target/fedora-ignored/provision.stderr || status=$?
+            > "$RUNNER_TEMP/fedora-ignored/provision.stdout" 2> "$RUNNER_TEMP/fedora-ignored/provision.stderr" || status=$?
           elapsed=$(($(date +%s)-started))
-          printf '{"exit_code":%s,"elapsed_seconds":%s}\n' "$status" "$elapsed" > target/fedora-ignored/provision.json
+          printf '{"exit_code":%s,"elapsed_seconds":%s}\n' "$status" "$elapsed" > "$RUNNER_TEMP/fedora-ignored/provision.json"
           [[ "$status" == 0 ]] || exit "$status"
           timeout --kill-after=5s 140s python3 -I -B scripts/run-fedora-ignored-integrations.py \
             --artifacts target/fedora-serial-libtest.jsonl --features '${{ matrix.features }}' \
-            --evidence-dir target/fedora-ignored/fixture
+            --evidence-dir "$RUNNER_TEMP/fedora-ignored/fixture"
 
       - name: Upload native Fedora ignored integration evidence
         if: always() && matrix.phase == 'validation' && matrix.platform == 'fedora'
@@ -1053,7 +1053,7 @@ jobs:
           name: fedora-ignored-integrations
           path: |
             target/fedora-serial-libtest.jsonl
-            target/fedora-ignored/
+            ${{ runner.temp }}/fedora-ignored/
           retention-days: 7
           if-no-files-found: error
 
