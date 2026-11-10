@@ -31,7 +31,7 @@ The Workflow makes one execution call without automatic command retries. Private
 
 ## Observed evidence and limits
 
-The first cold GitHub R2 compiler-cache run hit its 40-minute cap. The following warm Portable Rust job passed in 21 minutes 32 seconds, with 1,876 Rust hits and 10 misses, three assembler cache errors and zero cache write errors. Their exact cause and cold-run completion remain unresolved. [Cache receipt](../benchmarks/github-portable-r2-warm-2026-11-10.json)
+The first cold GitHub R2 compiler-cache run hit its 40-minute cap after spending 12 minutes 24 seconds on the release guard. The following warm job passed in 21 minutes 32 seconds. The post-merge warm Portable Rust job passed in 17 minutes 23 seconds, with 6,778 hits, 18 misses, and zero storage read or write errors. It still recorded three assembler cache errors. A credential-free release rehearsal reproduced one assembler cache error using a fresh local disk cache, so R2 is not required to trigger that class of error. [Warm cache receipt](../benchmarks/github-portable-r2-warm-2026-11-10.json), [Post-merge warm job](https://github.com/omg-cli/omg/actions/runs/42910260081/job/130158902263), [Local-cache rehearsal](https://github.com/omg-cli/omg/actions/runs/42914388231)
 
 The full release distro override guard now runs in its own required Portable release job. Both portable jobs keep the existing cache trust boundary, 40-minute caps, test commands and build profiles. Production artifacts contain cache counters and source and prefix identity. Compiler traces are collected only in credential-free rehearsals. [sccache configuration](https://github.com/mozilla/sccache/blob/v0.18.0/docs/Configuration.md)
 
