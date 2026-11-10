@@ -41,6 +41,18 @@ export function providerReady(application, rollouts, image) {
         active.target_version === application.version;
 }
 
+export async function readProviderApplication(get) {
+    const listed = await get('?name=omg-native-ci-nativerunner');
+    require(Array.isArray(listed), 'provider application list is invalid');
+    const applications = listed.filter(app => app.name === 'omg-native-ci-nativerunner');
+    require(applications.length <= 1, 'provider application identity ambiguous');
+    if (!applications.length) return undefined;
+    const application = await get(`/${encodeURIComponent(applications[0].id)}`);
+    require(application?.id === applications[0].id && application.name === applications[0].name,
+        'provider application detail identity mismatch');
+    return application;
+}
+
 export async function deploy() {
     require(process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_REPOSITORY === 'omg-cli/omg' &&
         ['refs/heads/main', 'refs/heads/ci/plain-cloudflare'].includes(process.env.GITHUB_REF) &&
@@ -57,6 +69,7 @@ export async function deploy() {
             'https://developers.cloudflare.com/containers/api/durable-object-container/',
             'https://developers.cloudflare.com/containers/configuration/rollouts/',
             'https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/list/',
+            'https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/get/',
             'https://developers.cloudflare.com/api/resources/containers/subresources/applications/subresources/rollouts/',
             'https://rust-lang.github.io/rustup/overrides.html',
             'https://rust-lang.github.io/rustup/concepts/components.html'] };
@@ -170,7 +183,7 @@ print(json.dumps(frozen))`;
         }
         require(healthy, 'deployed configuration health check failed');
         proof.healthConfigurationVerified = true;
-        const deadline = Date.now() + 300000;
+        const deadline = Date.now() + 600000;
         const providerGet = async suffix => {
             const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/containers/applications${suffix}`, {
                 headers: { authorization: 'Bearer ' + process.env.CLOUDFLARE_API_TOKEN }, redirect: 'error',
@@ -178,7 +191,8 @@ print(json.dumps(frozen))`;
             const body = await response.text();
             require(Buffer.byteLength(body) <= 1024 * 1024, 'provider readback exceeds size limit');
             const value = JSON.parse(body);
-            require(response.ok && value.success && Array.isArray(value.result), `provider readback failed: HTTP ${response.status}`);
+            require(response.ok && value.success && value.result !== null && typeof value.result === 'object',
+                `provider readback failed: HTTP ${response.status}`);
             require(!value.result_info?.next_page_token, 'provider readback unexpectedly paginated');
             return value.result;
         };
@@ -186,11 +200,10 @@ print(json.dumps(frozen))`;
         while (Date.now() < deadline) {
             const snapshot = { checkedAt: new Date().toISOString(), attempt: ++proof.providerReadiness.attempts };
             try {
-                const applications = (await providerGet('?name=omg-native-ci-nativerunner')).filter(app => app.name === 'omg-native-ci-nativerunner');
-                require(applications.length <= 1, 'provider application identity ambiguous');
-                const application = applications[0];
+                const application = await readProviderApplication(providerGet);
                 if (application) {
                     const rollouts = await providerGet(`/${encodeURIComponent(application.id)}/rollouts`);
+                    require(Array.isArray(rollouts), 'provider rollout list is invalid');
                     snapshot.application = { id: application.id, name: application.name, version: application.version,
                         image: application.configuration?.image, activeRolloutId: application.active_rollout_id,
                         instances: application.health?.instances };
@@ -205,7 +218,7 @@ print(json.dumps(frozen))`;
             if (snapshot.accepted) { proof.providerReadiness.accepted = true; break; }
             await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(5000, deadline - Date.now()))));
         }
-        require(proof.providerReadiness.accepted, 'provider image rollout or healthy capacity was not ready within five minutes');
+        require(proof.providerReadiness.accepted, 'provider image rollout or healthy capacity was not ready within ten minutes');
         proof.accepted = true;
         for (const [name, value] of Object.entries({ image_digest: proof.imageDigest, endpoint,
             deployment_version: version, source_sha: source })) appendFileSync(process.env.GITHUB_OUTPUT, `${name}=${value}\n`);

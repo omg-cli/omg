@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { imageIdentity, pinnedConfiguration, providerReady } from '../deploy.mjs';
+import { imageIdentity, pinnedConfiguration, providerReady, readProviderApplication } from '../deploy.mjs';
 
 test('published image must match the tested local image and its registry digest', () => {
     const repository = 'registry.cloudflare.com/' + 'a'.repeat(32) + '/omg-native-ci';
@@ -36,4 +36,15 @@ test('provider admission waits for the exact image, completed rollout and idle h
     assert.equal(providerReady(app, [], image), false);
     assert.equal(providerReady({ ...app, configuration: { image: image + '-old' } }, [rollout], image), false);
     assert.equal(providerReady({ ...app, active_rollout_id: null }, [], image), true);
+});
+
+test('readiness uses fresh application detail when the list still contains the previous image', async () => {
+    const image = 'registry.cloudflare.com/' + 'a'.repeat(32) + '/omg-native-ci@sha256:' + 'b'.repeat(64);
+    const stale = { id: 'application', name: 'omg-native-ci-nativerunner', version: 2, configuration: { image: image + '-old' } };
+    const current = { ...stale, version: 3, configuration: { image }, active_rollout_id: 'rollout', health: { instances: { healthy: 1 } } };
+    const rollout = { id: 'rollout', status: 'completed', target_version: 3, target_configuration: { image } };
+    const get = async suffix => suffix.startsWith('?') ? [stale] : current;
+    assert.equal(providerReady(stale, [rollout], image), false);
+    assert.equal(providerReady(await readProviderApplication(get), [rollout], image), true);
+    await assert.rejects(readProviderApplication(async suffix => suffix.startsWith('?') ? [stale] : { ...current, id: 'another' }));
 });
