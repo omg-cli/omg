@@ -10,7 +10,7 @@ const root = fileURLToPath(new URL('../../', import.meta.url));
 const endpoint = 'https://omg-native-ci.latham.workers.dev';
 const require = (condition, message) => { if (!condition) throw new Error(message); };
 const sha256 = value => createHash('sha256').update(value).digest('hex');
-const files = ['services/ci/Dockerfile', 'services/ci/run.py', 'scripts/build-comparison.py', 'scripts/test-debian-daemon-catalog.py'];
+const files = ['services/ci/Dockerfile', 'services/ci/run.py', 'scripts/build-comparison.py', 'scripts/test-debian-daemon-catalog.py', 'rust-toolchain.toml'];
 
 export function imageIdentity(local, published, repository) {
     require(local.Id === published.Id && local.Os === 'linux' && local.Architecture === 'amd64' &&
@@ -57,7 +57,9 @@ export async function deploy() {
             'https://developers.cloudflare.com/containers/api/durable-object-container/',
             'https://developers.cloudflare.com/containers/configuration/rollouts/',
             'https://developers.cloudflare.com/api/resources/containers/subresources/applications/methods/list/',
-            'https://developers.cloudflare.com/api/resources/containers/subresources/applications/subresources/rollouts/'] };
+            'https://developers.cloudflare.com/api/resources/containers/subresources/applications/subresources/rollouts/',
+            'https://rust-lang.github.io/rustup/overrides.html',
+            'https://rust-lang.github.io/rustup/concepts/components.html'] };
     let container;
     const redact = value => {
         let text = value ?? '';
@@ -100,10 +102,10 @@ export async function deploy() {
         const tag = 'omg-native-ci:' + source;
         call('docker', ['build', '--platform', 'linux/amd64', '--file', path.join(context, 'services/ci/Dockerfile'), '--tag', tag, context]);
         const local = JSON.parse(call('docker', ['image', 'inspect', tag]))[0];
-        container = call('docker', ['create', tag]);
+        container = call('docker', ['create', '--network', 'none', tag]);
         call('docker', ['start', container], 30000);
         require(JSON.parse(call('docker', ['inspect', container]))[0].State.Running, 'default image entrypoint did not stay running');
-        const smoke = `import apt_pkg,hashlib,json,os,pathlib,subprocess
+        const smoke = `import apt_pkg,hashlib,json,os,pathlib,shutil,subprocess,tempfile
 assert os.getuid()==0
 release=dict(line.split('=',1) for line in pathlib.Path('/etc/os-release').read_text().splitlines() if '=' in line)
 assert release['ID']=='ubuntu' and release['VERSION_ID'].strip('"')=='24.04'
@@ -111,9 +113,30 @@ assert subprocess.check_output(['rustc','--version'],text=True).startswith('rust
 apt_pkg.init(); cache=apt_pkg.Cache(None); dep=apt_pkg.DepCache(cache)
 assert sum(1 for package in cache.packages if dep.get_candidate_ver(package) or package.current_ver)>=25000
 assert not any(name in os.environ for name in ['CLOUDFLARE_API_TOKEN','OMG_NATIVE_CI_TOKEN','CI_TOKEN'])
-print(json.dumps({name:hashlib.sha256(pathlib.Path('/opt/ci/'+name).read_bytes()).hexdigest() for name in ['run.py','build-comparison.py','test-debian-daemon-catalog.py']}))`;
+frozen={name:hashlib.sha256(pathlib.Path('/opt/ci/'+name).read_bytes()).hexdigest() for name in ['run.py','build-comparison.py','test-debian-daemon-catalog.py','rust-toolchain.toml']}
+workspace=pathlib.Path(tempfile.mkdtemp(prefix='native-ci-toolchain-')); workspace.chmod(0o755)
+try:
+ source=workspace/'source'; source.mkdir(); source.chmod(0o555)
+ toolchain=source/'rust-toolchain.toml'; shutil.copyfile('/opt/ci/rust-toolchain.toml',toolchain); toolchain.chmod(0o444)
+ home=workspace/'home'; home.mkdir(); os.chown(home,10001,10001)
+ candidate='''import hashlib,json,os,pathlib,subprocess
+assert os.getuid()==10001 and os.getgid()==10001
+status=dict(line.split(":",1) for line in pathlib.Path("/proc/self/status").read_text().splitlines() if ":" in line)
+assert int(status["CapEff"].strip(),16)==0 and status["NoNewPrivs"].strip()=="1"
+assert not os.access("rust-toolchain.toml",os.W_OK) and not os.access("/usr/local/rustup",os.W_OK)
+compiler=subprocess.check_output(["rustc","-vV"],text=True)
+cargo=subprocess.check_output(["cargo","--version"],text=True)
+assert "release: 1.95.0" in compiler and cargo.startswith("cargo 1.95.0 ")
+print(json.dumps({"uid":os.getuid(),"gid":os.getgid(),"capEff":0,"noNewPrivs":1,"compiler":compiler,"cargo":cargo,"toolchainSha256":hashlib.sha256(pathlib.Path("rust-toolchain.toml").read_bytes()).hexdigest()}))'''
+ command=['setpriv','--reuid=10001','--regid=10001','--clear-groups','--no-new-privs','--bounding-set=-all','--inh-caps=-all','--ambient-caps=-all','/usr/bin/env','-i','PATH=/usr/local/cargo/bin:/usr/bin:/bin','RUSTUP_HOME=/usr/local/rustup','HOME='+str(home),'CARGO_HOME='+str(home/'cargo'),'/usr/bin/python3','-I','-c',candidate]
+ frozen['candidateToolchain']=json.loads(subprocess.check_output(command,cwd=source,text=True,timeout=30))
+ assert frozen['candidateToolchain']['toolchainSha256']==frozen['rust-toolchain.toml']
+finally:
+ shutil.rmtree(workspace)
+print(json.dumps(frozen))`;
         const frozen = JSON.parse(call('docker', ['exec', container, '/usr/bin/python3', '-I', '-c', smoke], 60000));
         for (const name of files.slice(1)) require(frozen[path.basename(name)] === proof.sourceFiles[name], 'frozen controller image mismatch');
+        proof.candidateToolchain = frozen.candidateToolchain;
         proof.defaultEntrypointSmoke = true;
         proof.localImageId = local.Id;
         call('docker', ['rm', '--force', container], 30000);

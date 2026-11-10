@@ -10,6 +10,7 @@ on:
       - scripts/test-debian-daemon-catalog.py
       - Cargo.toml
       - Cargo.lock
+      - rust-toolchain.toml
       - build.rs
       - .cargo/config.toml
       - src/**
