@@ -44,12 +44,6 @@ class R2CacheTests(unittest.TestCase):
                 with self.subTest(job=job, name=name, value=value), self.assertRaises(ValueError):
                     CACHE.configuration(dict(isolated, **{name: value}))
 
-    def test_diagnostics_do_not_enable_environment_or_storage_logging(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = CACHE.configuration(dict(trusted(), RUNNER_TEMP=directory))
-            self.assertEqual(Path(config['SCCACHE_ERROR_LOG']), Path(directory) / 'omg-r2-cache.log')
-            self.assertEqual(config['SCCACHE_LOG'].partition('/')[0], 'off,sccache::compiler::compiler=debug')
-
     def server(self, root, snapshots=None, failure=None, corrupt_replay=False):
         snapshots = iter(snapshots if snapshots is not None else
                          [statistics(), statistics(1, 1), statistics(1, 1, 1)])

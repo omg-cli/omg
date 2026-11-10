@@ -33,9 +33,9 @@ on:
         default: false
 
 concurrency:
-  group: ci-${{ github.head_ref || github.ref }}
-  # PRs cancel superseded runs; main never cancels so queued main runs
-  # (e.g. #175 behind #172) still complete instead of being dropped.
+  # An isolated experiment must never replace a pending main push.
+  group: ${{ inputs.isolated-cache == true && format('ci-isolated-cache-{0}', github.run_id) || format('ci-{0}', github.head_ref || github.ref) }}
+  # PRs cancel superseded runs; active main pushes keep running.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -297,15 +297,11 @@ jobs:
           printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache-context.txt"
 
       - name: Preserve portable compiler cache diagnostics
-        if: >-
-          always() && vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
-          github.ref == 'refs/heads/main' &&
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/omg-r2-cache.log
             ${{ runner.temp }}/omg-r2-cache-stats.json
             ${{ runner.temp }}/omg-r2-cache-context.txt
           retention-days: 3
@@ -378,15 +374,11 @@ jobs:
           printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache-context.txt"
 
       - name: Preserve portable compiler cache diagnostics
-        if: >-
-          always() && vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
-          github.ref == 'refs/heads/main' &&
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/omg-r2-cache.log
             ${{ runner.temp }}/omg-r2-cache-stats.json
             ${{ runner.temp }}/omg-r2-cache-context.txt
           retention-days: 3

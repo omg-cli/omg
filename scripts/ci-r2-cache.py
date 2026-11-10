@@ -43,9 +43,6 @@ def configuration(env):
         'SCCACHE_S3_RW_MODE': 'READ_WRITE',
         'SCCACHE_IDLE_TIMEOUT': '0',
         'SCCACHE_SERVER_UDS': str(Path(tempfile.gettempdir()) / f'omg-r2-{uuid.uuid4().hex}.sock'),
-        'SCCACHE_ERROR_LOG': str(Path(env.get('RUNNER_TEMP', tempfile.gettempdir())) / 'omg-r2-cache.log'),
-        # This module records compiler args and process errors without tracing request environments.
-        'SCCACHE_LOG': r'off,sccache::compiler::compiler=debug/get_cached_or_compile:.*([.][sS]"|assembler)|process error',
         'RUSTC_WRAPPER': 'sccache',
     }
 
