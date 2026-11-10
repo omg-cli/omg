@@ -1,0 +1,9 @@
+#!/bin/sh
+# OpenSSL asks for assembler help without producing an object to cache.
+if [ "$#" -eq 8 ] && [ "$2" = '-Wa,--help' ] && [ "$3" = '-c' ] &&
+   [ "$4" = '-o' ] && [ "$6" = '-x' ] && [ "$7" = 'assembler' ] && [ "$8" = '/dev/null' ]; then
+    case "$5" in
+        null.*.o) exec "$@" ;;
+    esac
+fi
+exec sccache "$@"

@@ -31,7 +31,8 @@ class QemuProducerDependency(unittest.TestCase):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         script = step_script(job_block(ci, 'ci-success'), 'Evaluate results')
         results = dict(QUICK_GATE='success', WORKFLOW_CHECKS='success', BUILD_REQUIRED='true',
-                       STANDALONE_SUITES='success', PORTABLE='success', LINUX_MATRIX='success',
+                       STANDALONE_SUITES='success', PORTABLE='success', PORTABLE_RELEASE='success',
+                       LINUX_MATRIX='success',
                        FEDORA_SQLITE='success', SANDBOX_CANCELLATION='success',
                        FEATURE_INTERSECTIONS='success', MACOS='success', MACOS_NEXTEST_SOURCE='success',
                        UBUNTU='success', RUNTIME_USAGE='success', QEMU='success',

@@ -522,13 +522,24 @@ class LocalCiGateExecutesTests(unittest.TestCase):
 
 
 class CiDeduplicationTests(unittest.TestCase):
-    def test_portable_has_bounded_room_for_serial_cold_profiles(self) -> None:
+    def test_portable_roles_keep_matching_admission_and_bounds(self) -> None:
         workflow = CI_YML.read_text(encoding="utf-8")
-        portable = job_block(workflow, "portable")
-        self.assertRegex(portable, r"(?m)^    timeout-minutes: 40$")
-        self.assertEqual(portable.count("timeout-minutes:"), 1)
-        self.assertNotIn("continue-on-error:", portable)
-        self.assertIn("runs-on: ubuntu-24.04", portable)
+        admissions = []
+        for role in ("portable", "portable-release"):
+            with self.subTest(role=role):
+                block = job_block(workflow, role)
+                self.assertRegex(block, r"(?m)^    timeout-minutes: 40$")
+                self.assertEqual(block.count("timeout-minutes:"), 1)
+                self.assertNotIn("continue-on-error:", block)
+                self.assertIn("runs-on: ubuntu-24.04", block)
+                self.assertIn("needs: quick-gate", block)
+                self.assertIn('toolchain: "1.95.0"', block)
+                admissions.append(next(line for line in block.splitlines() if line.startswith("    if:")))
+        self.assertEqual(admissions[0], admissions[1])
+        gate = job_block(workflow, "ci-success")
+        needs = next(line for line in gate.splitlines() if line.startswith("    needs:"))
+        self.assertIn("portable-release", needs.split("[", 1)[1].split("]", 1)[0].split(", "))
+        self.assertIn("PORTABLE_RELEASE: ${{ needs.portable-release.result }}", gate)
 
     def test_workflow_checks_execute_shared_checks_only_once(self) -> None:
         gate = job_block(CI_YML.read_text(encoding="utf-8"), "workflow-checks")
@@ -711,54 +722,50 @@ class OwnerInventoryError(AssertionError):
 
 
 class NormalPrOriginalOwners(unittest.TestCase):
-    EXPECTED = [
-        [
-            "cargo", "test", "--test", "distro_override", "--no-default-features",
-            "--features", "pgp,license", "--locked",
+    EXPECTED = {
+        "portable": [
+            ["cargo", "test", "--test", "distro_override", "--no-default-features",
+             "--features", "pgp,license", "--locked"],
+            ["cargo", "test", "--doc", "--no-default-features", "--features",
+             "pgp,license", "--locked"],
         ],
-        [
-            "cargo", "test", "--release", "--test", "distro_override",
-            "--no-default-features", "--features", "pgp,license", "--locked",
+        "portable-release": [
+            ["cargo", "test", "--release", "--test", "distro_override",
+             "--no-default-features", "--features", "pgp,license", "--locked"],
         ],
-        [
-            "cargo", "test", "--doc", "--no-default-features", "--features",
-            "pgp,license", "--locked",
-        ],
-    ]
+    }
 
-    @staticmethod
-    def owners(text: str) -> list[tuple[str, str, list[str]]]:
+    @classmethod
+    def owners(cls, text: str) -> dict[str, list[tuple[str, str, list[str]]]]:
         import shlex
 
-        block = job_block(text, "portable")
-        steps = re.split(r"(?=^      - )", block, flags=re.M)
-        commands: list[tuple[str, str, list[str]]] = []
-        for step in steps:
-            run = re.search(r"^        run: (cargo .+)$", step, re.M)
-            if not run:
-                continue
-            argv = shlex.split(run[1])
-            if "--doc" in argv or (
-                "--test" in argv
-                and argv[argv.index("--test") + 1] == "distro_override"
-            ):
-                if re.search(r"^        (if:|continue-on-error:)", step, re.M):
-                    raise OwnerInventoryError(
-                        "Owner has independent conditional/error suppression"
-                    )
-                commands.append((step, run[1], argv))
-        keys = [
-            "docs" if "--doc" in argv else "release" if "--release" in argv else "debug"
-            for _, _, argv in commands
-        ]
-        if keys != ["debug", "release", "docs"]:
-            raise OwnerInventoryError(
-                "Missing/duplicate/reordered original owner inventory: " + repr(keys)
-            )
-        return commands
+        owners: dict[str, list[tuple[str, str, list[str]]]] = {}
+        for job, expected in cls.EXPECTED.items():
+            try:
+                block = job_block(text, job)
+            except ValueError as error:
+                raise OwnerInventoryError("Missing required owner job: " + job) from error
+            steps = re.split(r"(?=^      - )", block, flags=re.M)
+            commands: list[tuple[str, str, list[str]]] = []
+            for step in steps:
+                run = re.search(r"^        run: (cargo .+)$", step, re.M)
+                if not run:
+                    continue
+                argv = shlex.split(run[1])
+                if "--doc" in argv or (
+                    "--test" in argv
+                    and argv[argv.index("--test") + 1] == "distro_override"
+                ):
+                    if re.search(r"^        (if:|continue-on-error:)", step, re.M):
+                        raise OwnerInventoryError("Owner has independent conditional/error suppression")
+                    commands.append((step, run[1], argv))
+            if [argv for _, _, argv in commands] != expected:
+                raise OwnerInventoryError("Missing/duplicate/changed original owner inventory: " + job)
+            owners[job] = commands
+        return owners
 
     def test_selected_original_owners_execute_literal_argv_and_stop_each_failure(self) -> None:
-        commands = self.owners(CI_YML.read_text(encoding="utf-8"))
+        owners = self.owners(CI_YML.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             record = root / "record.py"
@@ -771,38 +778,31 @@ class NormalPrOriginalOwners(unittest.TestCase):
                 encoding="utf-8",
             )
             cargo = root / "cargo"
-            cargo.write_text(
-                f'#!/bin/sh\nexec "{sys.executable}" "{record}" "$@"\n',
-                encoding="utf-8",
-            )
+            cargo.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{record}" "$@"\n', encoding="utf-8")
             cargo.chmod(0o755)
             log = root / "rows.jsonl"
-            for failed in (0, 1, 2, 3):
-                with self.subTest(failed=failed):
-                    log.unlink(missing_ok=True)
-                    result = subprocess.run(
-                        ["bash", "-e", "-c", "\n".join(x[1] for x in commands)],
-                        env=dict(
-                            os.environ,
-                            PATH=str(root) + os.pathsep + os.environ["PATH"],
-                            OWNER_LOG=str(log),
-                            FAIL_OWNER=str(failed),
-                        ),
-                        capture_output=True,
-                        timeout=10,
-                    )
-                    self.assertEqual(result.returncode, 0 if failed == 0 else 23, result.stderr)
-                    self.assertEqual(
-                        [json.loads(x) for x in log.read_text().splitlines()],
-                        self.EXPECTED[:failed or 3],
-                    )
+            bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
+            for job, commands in owners.items():
+                for failed in range(len(commands) + 1):
+                    with self.subTest(job=job, failed=failed):
+                        log.unlink(missing_ok=True)
+                        result = subprocess.run(
+                            [bash, "-e", "-c", "\n".join(x[1] for x in commands)],
+                            env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                                     OWNER_LOG=str(log), FAIL_OWNER=str(failed)),
+                            capture_output=True, timeout=10,
+                        )
+                        self.assertEqual(result.returncode, 0 if failed == 0 else 23, result.stderr)
+                        self.assertEqual([json.loads(x) for x in log.read_text().splitlines()],
+                                         self.EXPECTED[job][:failed or len(commands)])
 
     def test_missing_each_named_owner_refuses_even_when_other_owners_succeed(self) -> None:
         text = CI_YML.read_text(encoding="utf-8")
-        commands = self.owners(text)
-        for step, _, _ in commands:
-            with self.subTest(omitted=step.splitlines()[0]):
-                with self.assertRaises(OwnerInventoryError):
+        for job, commands in self.owners(text).items():
+            with self.subTest(omitted=job), self.assertRaises(OwnerInventoryError):
+                self.owners(text.replace(job_block(text, job), "", 1))
+            for step, _, _ in commands:
+                with self.subTest(omitted=step.splitlines()[0]), self.assertRaises(OwnerInventoryError):
                     self.owners(text.replace(step, "", 1))
 
     def test_original_source_paths_select_normal_pr_owner_using_real_git_diff(self) -> None:
