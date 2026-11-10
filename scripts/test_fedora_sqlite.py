@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('fedora_sqlite', ROOT/'scripts/fedora-sqlite.py')
@@ -42,6 +43,46 @@ class FedoraSQLiteTests(unittest.TestCase):
 
     def save(self):
         (self.bundle/'manifest.json').write_text(json.dumps(self.manifest))
+
+    def test_failed_dependency_download_preserves_diagnostics_without_admitting_a_bundle(self):
+        destination = self.bundle/'failed'/'fedora-sqlite-x86_64-1'
+        observed = []
+        read_text = Path.read_text
+
+        def native_release(path, *args, **kwargs):
+            if path == Path('/etc/os-release'):
+                return 'ID=fedora\nVERSION_ID=44\n'
+            return read_text(path, *args, **kwargs)
+
+        def failed_dnf(arguments, **kwargs):
+            observed.append((arguments, kwargs))
+            for argument in arguments:
+                if str(argument).startswith('--setopt=logdir='):
+                    logdir = Path(str(argument).split('=', 2)[2])
+                    logdir.mkdir(parents=True, exist_ok=True)
+                    (logdir/'dnf5.log').write_text('fixture: package mirror download failed\n')
+            raise sqlite.subprocess.CalledProcessError(28, arguments)
+
+        with mock.patch.object(sqlite.platform, 'system', return_value='Linux'), \
+                mock.patch.object(sqlite.platform, 'machine', return_value='x86_64'), \
+                mock.patch.object(sqlite.os, 'geteuid', return_value=0, create=True), \
+                mock.patch.object(Path, 'read_text', native_release), \
+                mock.patch.object(sqlite.subprocess, 'check_output', return_value=REVISION+'\n'), \
+                mock.patch.object(sqlite, 'run', side_effect=failed_dnf):
+            with self.assertRaises(sqlite.subprocess.CalledProcessError):
+                sqlite.build_bundle(destination, sqlite.DEFAULT_POLICY, self.policy, REVISION)
+        logs = list((destination.parent/'diagnostics').rglob('dnf5.log'))
+        self.assertEqual(len(logs), 1, 'failed DNF must leave a downloadable native diagnostic')
+        self.assertIn('package mirror download failed', logs[0].read_text())
+        self.assertFalse((destination/'manifest.json').exists())
+        self.assertEqual(list(destination.iterdir()), [])
+        self.assertEqual(len(observed), 1, 'failed dependency install must not reach source download or build')
+        arguments, options = observed[0]
+        self.assertEqual(options['timeout'], 600)
+        for argument in ('--releasever=44', '--disablerepo=*', '--enablerepo=fedora', '--enablerepo=updates',
+                         '--setopt=gpgcheck=1', '--setopt=localpkg_gpgcheck=1', '--setopt=timeout=20',
+                         '--setopt=minrate=100k', '--setopt=log_size=1M', '--setopt=log_rotate=1'):
+            self.assertIn(argument, arguments)
 
     @unittest.skipUnless(__import__('sys').platform.startswith('linux'), 'QEMU driver requires Linux')
     def test_fedora_guest_refuses_missing_supply_before_any_boot(self):
