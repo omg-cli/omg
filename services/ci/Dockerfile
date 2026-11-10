@@ -7,7 +7,6 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
 RUN apt-get update --error-on=any && apt-get install -y --no-install-recommends ca-certificates git build-essential pkg-config libssl-dev libapt-pkg-dev python3 python3-apt clang cmake zlib1g-dev liblzma-dev libbz2-dev util-linux procps
 RUN . /etc/os-release && test "$ID" = ubuntu && test "$VERSION_ID" = 24.04 && test "$(uname -m)" = x86_64 && rustc --version | grep '^rustc 1.95.0 ' && /usr/bin/python3 -I -c 'import apt_pkg,sys; assert sys.version_info[:2] == (3,12); apt_pkg.init(); cache=apt_pkg.Cache(None); dep=apt_pkg.DepCache(cache); assert sum(1 for package in cache.packages if dep.get_candidate_ver(package) or package.current_ver) >= 25000'
-RUN groupadd --gid 10001 ci-candidate && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /work/home --shell /usr/sbin/nologin ci-candidate
 COPY services/ci/run.py /opt/ci/run.py
 COPY scripts/build-comparison.py /opt/ci/build-comparison.py
 COPY scripts/test-debian-daemon-catalog.py /opt/ci/test-debian-daemon-catalog.py
