@@ -885,6 +885,74 @@ class SourceAwareCoverageTests(unittest.TestCase):
                                         "precise_counter_equivalence": "covered/uncovered",
                                         "precise_group_sizes": [4], "pairs": [[6, 7], [8, 9]]}]})
 
+    def serial_wrapper_compare(self, mutate=None):
+        old = ['#[tokio::test]', 'async fn checked() {', '    let callback = || {',
+               '        7', '    };', '    assert_eq!(callback(), 7);', '}', '',
+               'fn untouched() { unseen(); }']
+        new = [old[0], '#[serial_test::serial]', *old[1:]]
+        def row(line, start=1, end=None):
+            return [line, start, line, end or len(old[line - 1]) + 1, 1, 0, 0, 0]
+        brace = old[1].index('{') + 1
+        body = [row(2, brace), row(3, 5), row(6, 5)]
+        closure = [row(3, old[2].index('{') + 1), row(4, 9), row(5, 5)]
+        coarse = [row(2, old[1].index('fn ') + 1, len(old[1][:-1].rstrip()) + 1), row(6, 5), row(7)]
+        def shifted(regions):
+            return [[r[0] + 1, r[1], r[2] + 1, *r[3:]] for r in regions]
+        def owner(name, regions):
+            return dict(name=name, filenames=['/src/example.rs'], count=1, regions=regions)
+        value = dict(old=old, new=new, before={**{n: 1 for n in range(2, 8)}, 9: 0},
+            after={**{n: 1 for n in range(3, 8)}, 10: 0}, base=[owner('outer', coarse),
+                owner('body', body), owner('closure', closure)], head=[
+                owner('renamed_outer', shifted([row(2, brace), row(6, 5)])),
+                owner('renamed_body', shifted(body)), owner('renamed_closure', shifted(closure))],
+            base_summary=[10, 9], head_summary=[7, 6])
+        if mutate:
+            mutate(value)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); reports = []; regions = []
+            for side, counts in [('base', 'before'), ('head', 'after')]:
+                found, hit = value[side + '_summary']
+                path = root / (side + '.info')
+                path.write_text('SF:/src/example.rs\n' + ''.join(
+                    f'DA:{line},{count}\n' for line, count in sorted(value[counts].items())) +
+                    f'LF:{found}\nLH:{hit}\nend_of_record\n')
+                document = dict(type='llvm.coverage.json.export', version='3.1.0', data=[dict(
+                    files=[dict(filename='/src/example.rs', summary=dict(lines=dict(count=found, covered=hit)))],
+                    functions=value[side])])
+                region_path = root / (side + '.json.gz')
+                region_path.write_bytes(gzip.compress(json.dumps(document).encode()))
+                reports.append(coverage.read_coverage(path)); regions.append(region_path)
+            return coverage.require_source_no_regression(*reports, *regions,
+                {'example.rs': ('\n'.join(value['old']) + '\n').encode()},
+                {'example.rs': ('\n'.join(value['new']) + '\n').encode()})
+
+    def test_serial_attribute_accounts_only_the_elided_wrapper_group_and_brace(self):
+        result = self.serial_wrapper_compare()
+        self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                         'deleted_mapped', 'deleted_mapped_hit')], [3, 3, 1, 1])
+        witness = result['serial_wrapper_elision'][0]
+        self.assertEqual(witness['mapped_pairs'], [[7, 8]])
+        self.assertEqual(witness['summary_credit'], [3, 3])
+
+    def test_serial_wrapper_witness_refuses_unexplained_evidence(self):
+        def duplicate(value):
+            extra = copy.deepcopy(value['head'][2]); extra['name'] = 'duplicate'
+            value['head'].append(extra)
+        cases = {
+            'body_hit_lost': lambda v: v['head'][1]['regions'][-1].__setitem__(4, 0),
+            'statement_mapping_lost': lambda v: v['head'][1]['regions'].pop(),
+            'new_zero': lambda v: v['after'].__setitem__(2, 0),
+            'missing_owner': lambda v: v['head'].pop(),
+            'duplicate_owner': duplicate,
+            'different_attribute': lambda v: v['new'].__setitem__(1, '#[serial_test::serial(other)]'),
+            'summary_drift': lambda v: v['head_summary'].__setitem__(0, 8),
+            'head_brace_explicit_zero': lambda v: v['after'].__setitem__(8, 0),
+            'zero_new_wrapper': lambda v: v['head'][0]['regions'][0].__setitem__(4, 0),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.serial_wrapper_compare(mutate)
+
     def test_async_wrapper_paint_accepts_positive_counter_frequency_changes(self):
         expected = self.wrapper_paint_compare()
 

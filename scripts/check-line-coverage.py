@@ -270,11 +270,14 @@ def source_opcodes(old, new, function_scopes, mapped):
                            "\n" + "\n".join(old[x + start - 1:y + start - 1]) + "\n", False)
 
 
-def retained_wrapper_paint(name, old, new, before, after, base, head, base_files, head_files, retained):
+def retained_wrapper_paint(name, old, new, before, after, base, head, base_files, head_files, retained,
+                          base_section, head_section):
     """Prove retained wrapper paint through identical fine-region hit states.
 
     Positive execution frequency may vary across async polls. Fine geometry and
     covered/uncovered states must match; coarse counters and baseline DA stay exact.
+    LLVM groups owners by their first region and max-merges line coverage; adding
+    serial can merge a synthetic wrapper's group into the unchanged body group.
     """
     names = [Counter(owner["name"] for owner in owners) for owners in (base, head)]
 
@@ -314,7 +317,65 @@ def retained_wrapper_paint(name, old, new, before, after, base, head, base_files
             groups[id(owner)] = group
         return groups
 
-    result = []
+    def line_counts(group):
+        counts = {}
+        for region in group:
+            for line in range(region[0], region[2] + (region[3] > 1)):
+                counts[line] = max(counts.get(line, 0), region[4])
+        return counts
+
+    result = []; elisions = []
+    records = {id(owner): owner for owner in base + head}
+    for coarse in base:
+        span = source_owner_span(coarse, name, base_files, old)
+        if span is None or span[2] is None or old.count(span[2]) != 1 or len(coarse['regions']) != 3:
+            continue
+        start, end = span[:2]; count = coarse.get('count')
+        if (type(count) is not int or count <= 0 or
+                new != old[:start - 1] + [re.match(r'\s*', old[start - 1])[0] + '#[serial_test::serial]'] + old[start - 1:] or
+                not async_test(new, start + 1) or retained.get(end) != end + 1 or
+                end + 1 in after or before.get(end) != count):
+            continue
+        header, tail, close = (line.encode('utf-8') for line in (old[start - 1], old[end - 2], old[end - 1]))
+        brace = header.index(b'{') + 1
+        row = lambda line, first, last: (line, first, line, last, count, 0, 0, 0)
+        tail_row = row(end - start - 1, len(tail) - len(tail.lstrip()) + 1, len(tail) + 1)
+        old_shape = (row(0, header.index(b'fn ') + 1, len(header[:-1].rstrip()) + 1), tail_row,
+                     row(end - start, len(close) - len(close.lstrip()) + 1, len(close) + 1))
+        new_shape = (row(0, brace, brace + 1), tail_row)
+        bg = project(base, base_files, old, start, end, 1, len(close) + 1, names[0])
+        hg = project(head, head_files, new, start + 1, end + 1, 1, len(close) + 1, names[1])
+        if bg is None or hg is None or any(
+                (records[key]['regions'][0][0] - origin, records[key]['regions'][0][1]) != group[0][:2]
+                for groups, origin in ((bg, start), (hg, start + 1)) for key, group in groups.items()):
+            continue
+        if bg.pop(id(coarse), None) != old_shape:
+            continue
+        candidates = [key for key, group in hg.items() if group == new_shape and records[key].get('count') == count]
+        if len(candidates) != 1:
+            continue
+        current = candidates[0]; hg.pop(current)
+        old_key, new_key = coarse['regions'][0][:2], records[current]['regions'][0][:2]
+        body = [group for key, group in hg.items() if records[key]['regions'][0][:2] == new_key]
+        fine = Counter(fingerprint(group) for group in bg.values())
+        if (not fine or fine != Counter(fingerprint(group) for group in hg.values()) or
+                any(n != 1 for n in fine.values()) or len(body) != 1 or
+                any(records[key]['regions'][0][:2] == old_key for key in bg)):
+            continue
+        old_lines, new_lines, body_lines = line_counts(old_shape), line_counts(new_shape), line_counts(body[0])
+        exclusive = set(old_lines) - {line for group in bg.values() for line in line_counts(group)}
+        if (exclusive != {end - start} or not set(new_lines) <= body_lines.keys() or
+                any(body_lines[line] <= 0 for line in new_lines) or
+                any(end - start in line_counts(group) for group in hg.values())):
+            continue
+        credit = [len(old_lines), sum(value > 0 for value in old_lines.values())]
+        if ((base_section['LF'] - credit[0], base_section['LH'] - credit[1]) != (head_section['LF'], head_section['LH']) or
+                (len(before) - len(exclusive), sum(value > 0 for value in before.values()) - len(exclusive)) !=
+                (len(after), sum(value > 0 for value in after.values()))):
+            continue
+        elisions.append(dict(file=name, base_range=[start, end], head_range=[start + 1, end + 1],
+            summary_credit=credit, mapped_pairs=[[end, end + 1]], fine_group_sizes=sorted(map(len, bg.values())),
+            old_group_key=old_key, merged_group_key=new_key))
     for coarse in base:
         span = source_owner_span(coarse, name, base_files, old)
         if (span is None or span[3] is None or old.count(span[3]) != 1 or len(coarse["regions"]) != 2
@@ -373,7 +434,7 @@ def retained_wrapper_paint(name, old, new, before, after, base, head, base_files
             result.append(dict(file=name, base_range=[start, end], head_range=[target, target + end - start],
                 precise_counter_equivalence="covered/uncovered",
                 precise_group_sizes=sorted(len(group) for group in before_groups), pairs=pairs))
-    return result
+    return result, elisions
 
 
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
@@ -395,7 +456,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         base_name_counts[function["name"]] = base_name_counts.get(function["name"], 0) + 1
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
-    removed = {}; deleted_mapped = deleted_hit = 0; paint_receipts = []
+    removed = {}; deleted_mapped = deleted_hit = 0; paint_receipts = []; serial_receipts = []; serial_removed = {}
     for name in bs:
         old = base_sources[name].decode("utf-8").splitlines()
         new = head_sources[name].decode("utf-8").splitlines()
@@ -500,7 +561,14 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         paint = []
         final_pairs = {**retained, **anchored}
         if any(before.get(a, 0) > 0 and after.get(b, 0) == 0 for a, b in final_pairs.items()):
-            paint = retained_wrapper_paint(name, old, new, before, after, bf, hf, base_files, head_files, final_pairs)
+            paint, elisions = retained_wrapper_paint(name, old, new, before, after, bf, hf, base_files, head_files,
+                                                     final_pairs, bs[name], hs[name])
+            for witness in elisions:
+                for oldline, newline in witness['mapped_pairs']:
+                    retained.pop(oldline, None); anchored.pop(oldline, None)
+                    serial_removed.setdefault(name, set()).add(oldline)
+                    deleted_mapped += 1; deleted_hit += 1
+            serial_receipts.extend(elisions)
         painted = {(a, b) for witness in paint for a, b in witness["pairs"]}
         paint_receipts.extend(paint)
         for oldline, newline in list(retained.items()):
@@ -544,14 +612,19 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         deleted_mapped += sum(line in gone for line in before)
         deleted_hit += sum(line in gone and count > 0 for line, count in before.items())
     paint_receipt = {"retained_wrapper_paint": paint_receipts} if paint_receipts else {}
-    if (head.hit * base.found >= base.hit * head.found and
+    if serial_receipts:
+        paint_receipt['serial_wrapper_elision'] = serial_receipts
+    if (not serial_receipts and head.hit * base.found >= base.hit * head.found and
             head.mapped_hit * base.mapped >= base.mapped_hit * head.mapped):
         require_no_regression(base, head)
         return {"deleted_summary_found": 0, "deleted_summary_hit": 0,
                 "deleted_mapped": 0, "deleted_mapped_hit": 0, **paint_receipt}
-    deleted_found = deleted_summary_hit = 0
+    deleted_found = sum(row['summary_credit'][0] for row in serial_receipts)
+    deleted_summary_hit = sum(row['summary_credit'][1] for row in serial_receipts)
     accounted = {name: set() for name in bs}
     deleted_summaries = {name: [0, 0] for name in bs}
+    for row in serial_receipts:
+        deleted_summaries[row['file']] = row['summary_credit'].copy()
     deleted_geometries = set()
     for function in bf:
         regions = function["regions"]; filenames = function["filenames"]
@@ -598,7 +671,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 raise ValueError("Deleted attribution exceeds original file counts")
             if (after["LF"], after["LH"]) != (before["LF"] - found, before["LH"] - hit):
                 raise ValueError("Unexplained same-file summary movement during deletion")
-            kept = {line: count for line, count in before["counts"].items() if line not in removed[name]}
+            kept = {line: count for line, count in before["counts"].items()
+                    if line not in removed[name] and line not in serial_removed.get(name, set())}
             if (len(after["counts"]), sum(count > 0 for count in after["counts"].values())) != (len(kept), sum(count > 0 for count in kept.values())):
                 raise ValueError("Unexplained same-file mapped movement during deletion")
     normalized = Coverage(base.files, base.found - deleted_found, base.hit - deleted_summary_hit,
