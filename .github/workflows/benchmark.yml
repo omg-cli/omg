@@ -35,12 +35,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     env:
-      COMPARISON_ROOT: ${{ runner.temp }}/rust-comparison-${{ github.run_id }}-${{ github.run_attempt }}
       COMPARISON_SOURCE_SHA: ${{ inputs.source-sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+
+      - name: Set comparison evidence directory
+        run: echo "COMPARISON_ROOT=$RUNNER_TEMP/rust-comparison-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
       - name: Install comparison dependencies
         run: |
