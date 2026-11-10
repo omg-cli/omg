@@ -121,7 +121,7 @@ test('native execution uses the candidate boundary and rejects a successful zero
 test('Ubuntu image preserves genuine native packages, frozen oracles, and existing toolchain pins', () => {
     const image = readFileSync(new URL('../Dockerfile.ubuntu-pilot', import.meta.url), 'utf8');
     assert.match(image, /FROM ubuntu:24\.04@sha256:[a-f0-9]{64}/);
-    assert.match(image, /COPY --from=sandbox-runtime \/container-server\/sandbox \/sandbox/);
+    assert.match(image, /COPY --from=sandbox-runtime \/container-server\/sandbox \/container-server\/sandbox/);
     assert.match(image, /cloudflare\/sandbox:0\.12\.14@sha256:b8175e89/);
     assert.match(image, /node:24\.22\.1-bookworm-slim@sha256:/);
     assert.match(image, /rust:1\.95\.0-slim-bookworm@sha256:/);
@@ -131,5 +131,21 @@ test('Ubuntu image preserves genuine native packages, frozen oracles, and existi
     assert.doesNotMatch(image, /rm[^\n]*\/var\/lib\/apt\/lists/);
     for (const file of ['build-comparison.py', 'test-debian-daemon-catalog.py'])
         assert.ok(image.includes(`COPY scripts/${file} /scripts/${file}`));
-    assert.match(image, /ENTRYPOINT \["\/sandbox"\]/);
+    assert.match(image, /ENTRYPOINT \["\/container-server\/sandbox"\]/);
+});
+
+test('Ubuntu image includes the pinned SDK server startup and backup runtime', () => {
+    const image = readFileSync(new URL('../Dockerfile.ubuntu-pilot', import.meta.url), 'utf8');
+    assert.match(image, /^EXPOSE 3000$/m);
+    assert.match(image, /^ENV SANDBOX_VERSION=0\.12\.14$/m);
+    for (const [name, count] of [['PYTHON', 0], ['JAVASCRIPT', 3], ['TYPESCRIPT', 3]])
+        assert.ok(image.includes(`ENV ${name}_POOL_MIN_SIZE=${count}`));
+    assert.match(image, /^WORKDIR \/container-server$/m);
+    assert.match(image, /COPY --from=sandbox-runtime \/container-server\/dist\/runtime\/executors\/javascript\/node_executor\.js \/container-server\/dist\/runtime\/executors\/javascript\/node_executor\.js/);
+    assert.match(image, /COPY --from=sandbox-runtime \/container-server\/dist\/index\.js \/container-server\/dist\/index\.js/);
+    assert.match(image, /COPY --from=sandbox-runtime \/usr\/bin\/fuse-overlayfs \/usr\/bin\/fuse-overlayfs/);
+    for (const command of ['s3fs', 'fuse3', 'squashfuse', 'squashfs-tools'])
+        assert.match(image, new RegExp(`apt-get install[^\n]*\\b${command}\\b`));
+    assert.ok(image.includes('ln -sf /proc/mounts /etc/mtab'));
+    assert.ok(image.includes("sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf"));
 });

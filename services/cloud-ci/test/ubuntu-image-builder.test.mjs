@@ -3,13 +3,53 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { buildUbuntuImage, ubuntuFrozenInputs, pinnedDockerfile, candidateIdentityMatches } from '../../../scripts/build-cloud-ubuntu-image.mjs';
+import { buildUbuntuImage, ubuntuFrozenInputs, pinnedDockerfile, candidateIdentityMatches, verifyServerStartup } from '../../../scripts/build-cloud-ubuntu-image.mjs';
 import { frozenAssertion } from './hosted-image-probe.mjs';
 
 const sha = 'a'.repeat(40);
 const environment = { GITHUB_ACTIONS: 'true', GITHUB_REPOSITORY: 'omg-cli/omg',
     GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_SHA: sha, RUNNER_OS: 'Linux',
     CLOUDFLARE_ACCOUNT_ID: 'b'.repeat(32), CLOUDFLARE_API_TOKEN: 'fixture-secret' };
+
+test('default entrypoint must answer the fixed SDK health/version/execute probe before cleanup', () => {
+    const calls = [];
+    const report = verifyServerStartup('image:fixture', { env: environment,
+        run(command, args) {
+            calls.push(args);
+            if (args[0] === 'run') {
+                expect(args).not.toContain('--entrypoint');
+                expect(args).not.toContain('-p');
+                expect(args).not.toContain('--env');
+                expect(args).toContain('none');
+                return { status: 0, stdout: 'owned-container-id' };
+            }
+            if (args[0] === 'exec') {
+                expect(args.at(-1)).toContain('/api/health');
+                expect(args.at(-1)).toContain('/api/version');
+                expect(args.at(-1)).toContain('/api/execute');
+                expect(args.at(-1)).not.toContain(environment.CLOUDFLARE_API_TOKEN);
+                expect(spawnSync('node', ['--input-type=module', '--check'], { input: args.at(-1) }).status).toBe(0);
+                return { status: 0, stdout: JSON.stringify({ accepted: true, sdkVersion: '0.12.14', distro: 'ubuntu', version: '24.04' }) };
+            }
+            return { status: 0, stdout: '' };
+        } });
+    expect(report).toMatchObject({ accepted: true, sdkVersion: '0.12.14', distro: 'ubuntu', version: '24.04' });
+    expect(calls.map(args => args[0])).toEqual(['run', 'exec', 'rm', 'container']);
+});
+
+test('unhealthy server and wrong runtime evidence still retire the owned container and cannot pass', () => {
+    for (const mode of ['failed', 'wrong-version', 'cleanup-failed']) {
+        const calls = [];
+        expect(() => verifyServerStartup('image:fixture', { env: environment, run(command, args) {
+            calls.push(args[0]);
+            if (args[0] === 'run') return { status: 0, stdout: 'owned-container-id' };
+            if (args[0] === 'exec') return mode === 'failed' ? { status: 1, stderr: 'controlled startup failure' } :
+                { status: 0, stdout: JSON.stringify({ accepted: true, sdkVersion: mode === 'wrong-version' ? '1.0' : '0.12.14', distro: 'ubuntu', version: '24.04' }) };
+            return { status: 0, stdout: args[0] === 'container' && mode === 'cleanup-failed' ? 'still-owned' : '' };
+        } })).toThrow();
+        expect(calls).toEqual(['run', 'exec', 'rm', 'container']);
+    }
+});
 
 test('invalid CI identity and stale source fail before any Docker or registry operation', async () => {
     for (const change of [{ GITHUB_ACTIONS: '' }, { GITHUB_REPOSITORY: 'other/repo' },

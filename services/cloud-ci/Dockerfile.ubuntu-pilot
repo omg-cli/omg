@@ -4,15 +4,23 @@ RUN rustup component add rustfmt clippy --toolchain 1.95.0
 FROM docker.io/cloudflare/sandbox:0.12.14@sha256:b8175e89ae5efd83987ffd5056f57c28c390fd5706d42ef70fb669e275248e7b AS sandbox-runtime
 FROM ubuntu:24.04@sha256:78d4744ead1f5b19b04d0df558ab182a5300903900755e515b2ca4d10eb2044d
 USER root
-COPY --from=sandbox-runtime /container-server/sandbox /sandbox
+COPY --from=sandbox-runtime /container-server/sandbox /container-server/sandbox
+COPY --from=sandbox-runtime /container-server/dist/runtime/executors/javascript/node_executor.js /container-server/dist/runtime/executors/javascript/node_executor.js
+COPY --from=sandbox-runtime /container-server/dist/index.js /container-server/dist/index.js
+COPY --from=sandbox-runtime /usr/bin/fuse-overlayfs /usr/bin/fuse-overlayfs
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=rust-runtime /usr/local/cargo /usr/local/cargo
 COPY --from=rust-runtime /usr/local/rustup /usr/local/rustup
 ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-RUN apt-get update --error-on=any && apt-get install -y --no-install-recommends ca-certificates curl git unzip build-essential pkg-config libssl-dev libarchive-dev libapt-pkg-dev python3 python3-apt python3-venv clang cmake zlib1g-dev liblzma-dev libbz2-dev libstdc++6 fish squashfs-tools util-linux sudo iproute2 procps systemd openssh-client zstd
-RUN . /etc/os-release && test "$ID" = ubuntu && test "$VERSION_ID" = 24.04 && test "$(uname -m)" = x86_64 && ldd /sandbox && /usr/bin/python3 -I -c 'import apt_pkg,sys; assert sys.version_info[:2] == (3,12); assert apt_pkg.__file__.startswith("/usr/lib/python3/dist-packages/"); apt_pkg.init(); cache=apt_pkg.Cache(None); dep=apt_pkg.DepCache(cache); assert sum(1 for package in cache.packages if dep.get_candidate_ver(package) or package.current_ver) >= 25000'
+ENV SANDBOX_VERSION=0.12.14
+ENV PYTHON_POOL_MIN_SIZE=0
+ENV JAVASCRIPT_POOL_MIN_SIZE=3
+ENV TYPESCRIPT_POOL_MIN_SIZE=3
+RUN apt-get update --error-on=any && apt-get install -y --no-install-recommends ca-certificates curl git unzip build-essential pkg-config libssl-dev libarchive-dev libapt-pkg-dev python3 python3-apt python3-venv clang cmake zlib1g-dev liblzma-dev libbz2-dev libstdc++6 fish squashfs-tools s3fs fuse3 squashfuse file jq zip inotify-tools wget util-linux sudo iproute2 procps systemd openssh-client zstd
+RUN sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf && ln -sf /proc/mounts /etc/mtab && fuse-overlayfs --version
+RUN . /etc/os-release && test "$ID" = ubuntu && test "$VERSION_ID" = 24.04 && test "$(uname -m)" = x86_64 && ldd /container-server/sandbox && /usr/bin/python3 -I -c 'import apt_pkg,sys; assert sys.version_info[:2] == (3,12); assert apt_pkg.__file__.startswith("/usr/lib/python3/dist-packages/"); apt_pkg.init(); cache=apt_pkg.Cache(None); dep=apt_pkg.DepCache(cache); assert sum(1 for package in cache.packages if dep.get_candidate_ver(package) or package.current_ver) >= 25000'
 RUN curl --proto '=https' --tlsv1.2 -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o /tmp/bun.zip && echo 'bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c  /tmp/bun.zip' | sha256sum -c - && unzip -q /tmp/bun.zip -d /tmp/bun-install && echo '10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235  /tmp/bun-install/bun-linux-x64/bun' | sha256sum -c - && install /tmp/bun-install/bun-linux-x64/bun /usr/local/bin/bun && rm -rf /tmp/bun.zip /tmp/bun-install && test "$(bun --revision)" = '1.4.4+38afee6c8' && test "$(node --version)" = 'v24.22.1' && rustc --version | grep '^rustc 1.95.0 '
 RUN /usr/sbin/groupadd --gid 10001 omg-ci-candidate && /usr/sbin/useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp/omg-portable-home --shell /usr/sbin/nologin omg-ci-candidate && chmod -R a+rX,go-w /usr/local/cargo /usr/local/rustup && setpriv --reuid=10001 --regid=10001 --clear-groups rustc --version | grep '^rustc 1.95.0 '
 COPY services/cloud-ci/runner/package.json services/cloud-ci/runner/bun.lock /opt/omg-ci/
@@ -26,5 +34,7 @@ COPY scripts/build-comparison.py /scripts/build-comparison.py
 COPY scripts/test-debian-daemon-catalog.py /scripts/test-debian-daemon-catalog.py
 RUN /usr/bin/python3 /scripts/prepare-node-test-fixture.py --destination /opt/omg-node-test-fixture && chown -R 10001:10001 /opt/omg-node-test-fixture && setpriv --reuid=10001 --regid=10001 --clear-groups /usr/bin/python3 /scripts/prepare-node-test-fixture.py --destination /opt/omg-node-test-fixture
 RUN chmod -R a+rX,go-w /opt/omg-ci /scripts && node /opt/omg-ci/verification-envelope-smoke.mjs && node --input-type=module -e "await import('/opt/omg-ci/ubuntu-native.mjs'); await import('/opt/omg-ci/runner/audit-verifier.mjs'); await import('/opt/omg-ci/verifier.mjs')"
-WORKDIR /workspace
-ENTRYPOINT ["/sandbox"]
+RUN mkdir -p /workspace
+WORKDIR /container-server
+EXPOSE 3000
+ENTRYPOINT ["/container-server/sandbox"]

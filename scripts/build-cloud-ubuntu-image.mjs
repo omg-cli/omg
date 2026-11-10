@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -28,6 +28,51 @@ export function ubuntuFrozenInputs(root, source) {
         frozen.files.push({ source: 'scripts/' + name, targets: ['/scripts/' + name],
             sha256: hash(readFileSync(path.join(root, 'scripts', name))) });
     return frozen;
+}
+
+export function verifyServerStartup(tag, { run = spawnSync, env = process.env } = {}) {
+    const name = 'omg-ubuntu-startup-' + randomUUID();
+    const fixedCommand = `env -i PATH=/usr/local/bin:/usr/bin:/bin /bin/sh -eu -c '. /etc/os-release; test "$ID" = ubuntu; test "$VERSION_ID" = 24.04; printf "ubuntu-24.04\\n"'`;
+    // SDK 0.12.14 server routes: https://github.com/cloudflare/sandbox-sdk/tree/%40cloudflare%2Fsandbox%400.12.14/packages/sandbox-container/src/handlers
+    const probe = `import assert from 'node:assert/strict';
+const request = async (route, options = {}, milliseconds = 2000) => {
+    const response = await fetch('http://127.0.0.1:3000' + route, { ...options, signal: AbortSignal.timeout(milliseconds) });
+    assert.equal(response.status,200,route);
+    const reader=response.body.getReader(), chunks=[]; let size=0;
+    for (;;) { const next=await reader.read(); if(next.done) break; size+=next.value.byteLength;
+        if(size>16384){await reader.cancel();throw new Error('Startup response too large');} chunks.push(next.value); }
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+};
+const deadline=Date.now()+45000;
+for (;;) {
+    try { const health=await request('/api/health'); assert.equal(health.success,true); assert.equal(health.status,'healthy'); break; }
+    catch(error) { if(Date.now()>=deadline) throw new Error('Sandbox health deadline exceeded: '+String(error).slice(0,256)); }
+    await new Promise(resolve=>setTimeout(resolve,250));
+}
+const version=await request('/api/version'); assert.equal(version.success,true); assert.equal(version.version,'0.12.14');
+const command=${JSON.stringify(fixedCommand)};
+const execution=await request('/api/execute',{method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({command,timeoutMs:5000})},8000);
+assert.equal(execution.success,true); assert.equal(execution.exitCode,0); assert.equal(execution.command,command);
+assert.equal(execution.stdout.trim(),'ubuntu-24.04'); assert.equal(execution.stderr,'');
+console.log(JSON.stringify({accepted:true,sdkVersion:version.version,distro:'ubuntu',version:'24.04'}));`;
+    const execute = (args, timeout = 10_000) => {
+        const result = run('docker', args, { env, encoding: 'utf8', timeout, maxBuffer: 1024 * 1024 });
+        if (result.error || result.status !== 0)
+            throw new Error('Ubuntu default entrypoint ' + args[0] + ' failed: ' + String(result.stderr ?? '').slice(0,4096));
+        return result.stdout?.trim() ?? '';
+    };
+    try {
+        execute(['run', '--rm', '--detach', '--network', 'none', '--name', name, tag]);
+        const report = JSON.parse(execute(['exec', name, 'node', '--input-type=module', '-e', probe], 60_000));
+        if (report.accepted !== true || report.sdkVersion !== '0.12.14' || report.distro !== 'ubuntu' || report.version !== '24.04')
+            throw new Error('Ubuntu default entrypoint returned invalid runtime evidence');
+        return report;
+    } finally {
+        run('docker', ['rm', '--force', name], { env, timeout: 10_000, encoding: 'utf8', maxBuffer: 4096 });
+        if (execute(['container', 'ls', '--all', '--filter', 'name=^/' + name + '$', '--format', '{{.ID}}']))
+            throw new Error('Ubuntu default entrypoint container cleanup was not confirmed');
+    }
 }
 
 function smokeScript(frozen) {
@@ -105,6 +150,7 @@ export async function buildUbuntuImage(output, { root = ROOT, environment = proc
             '--tmpfs', '/tmp:rw,nosuid,nodev,size=16m', '--entrypoint', 'node', tag,
             '--input-type=module', '-e', smokeScript(frozen)], { env: dockerEnv, timeout: 60_000 }).split('\n').at(-1));
         if (smoke.accepted !== true) throw new Error('Ubuntu image smoke did not pass');
+        const entrypointSmoke = verifyServerStartup(tag, { run, env: dockerEnv });
         const wrangler = path.join(root, 'services/cloud-ci/node_modules/wrangler/bin/wrangler.js');
         command(process.execPath, [wrangler, 'containers', 'push', tag],
             { cwd: path.join(root, 'services/cloud-ci'), env: dockerEnv, timeout: 600_000, stdio: 'inherit' });
@@ -117,7 +163,7 @@ export async function buildUbuntuImage(output, { root = ROOT, environment = proc
             registryReference, repoDigests: image.RepoDigests });
         const proof = { schemaVersion: 1, source, ...identity, registryReference, archiveSha256,
             dockerfileSha256: hash(recipe), builtDockerfileSha256: hash(readFileSync(path.join(context, dockerfile))),
-            frozenManifestSha256: hash(JSON.stringify(frozen)), frozen, manifest, image, backend, smoke,
+            frozenManifestSha256: hash(JSON.stringify(frozen)), frozen, manifest, image, backend, smoke, entrypointSmoke,
             runId: environment.GITHUB_RUN_ID, attempt: environment.GITHUB_RUN_ATTEMPT };
         const text = JSON.stringify(proof, null, 2) + '\n';
         if (Buffer.byteLength(text) > 1024 * 1024) throw new Error('Ubuntu image proof exceeds byte budget');
