@@ -236,11 +236,11 @@ class WorkflowBytesTests(unittest.TestCase):
   lanes=re.findall(r'^          - platform: (\S+)$',block,re.M)
   self.assertEqual(len(lanes),5)
   paths=[]
-  for run,attempt,lane in [(run,attempt,lane) for run in ['41','42'] for attempt in ['1','2'] for lane in lanes]:
-   values={'github.run_id':run,'github.run_attempt':attempt,'matrix.platform':lane}
+  for run,attempt,phase,lane in [(run,attempt,phase,lane) for run in ['41','42'] for attempt in ['1','2'] for phase in ['validation','clippy'] for lane in lanes]:
+   values={'github.run_id':run,'github.run_attempt':attempt,'matrix.phase':phase,'matrix.platform':lane}
    rendered=re.sub(r'\$\{\{\s*(.*?)\s*\}\}',lambda match:values[match.group(1)],template)
    path=pathlib.PurePosixPath(rendered)
    self.assertTrue(path.is_absolute());self.assertEqual(path.parent,pathlib.PurePosixPath('/tmp'))
    self.assertNotEqual(path.name,'');paths.append(str(path))
-  self.assertEqual(len(set(paths)),len(paths),'runs, attempts and matrix lanes must not share diagnostic output')
+  self.assertEqual(len(set(paths)),len(paths),'runs, attempts, phases and matrix lanes must not share diagnostic output')
 if __name__=='__main__':unittest.main(verbosity=2)
