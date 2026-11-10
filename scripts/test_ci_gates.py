@@ -189,6 +189,84 @@ class QuickGateOfflineTests(unittest.TestCase):
         )
 
 
+class UbuntuMirrorSetupTests(unittest.TestCase):
+    def test_ca_bootstrap_precedes_exact_https_rewrite_and_stops_failures(self) -> None:
+        workflow = CI_YML.read_text(encoding="utf-8")
+        row = job_block(workflow, "linux-matrix").split("          - platform: ubuntu-2604\n", 1)[1]
+        setup = row.split("            setup: |\n", 1)[1].split("            rust_install:", 1)[0]
+        script = "\n".join(line[14:] for line in setup.splitlines())
+        script = script[script.index("apt-get update"):script.index("ldconfig -p")]
+        expected_packages = [
+            "ca-certificates", "curl", "git", "build-essential", "pkg-config", "sudo",
+            "python3", "python3-apt", "python3-venv", "fish", "jq", "zstd",
+            "libssl-dev", "libapt-pkg-dev", "clang", "cmake", "zlib1g-dev", "liblzma-dev", "libbz2-dev",
+        ]
+        for forbidden in ("Verify-Peer", "Verify-Host", "trusted=yes", "--allow-unauthenticated"):
+            self.assertNotIn(forbidden, script)
+        scenarios = [
+            ("success", "", 0, 4), ("success-slash", "/", 0, 4),
+            ("apt-1", "", 41, 1), ("apt-2", "", 42, 2),
+            ("apt-3", "", 43, 3), ("apt-4", "", 44, 4),
+            ("missing-ca", "", 1, 2), ("unknown-archive", "", 1, 2), ("unknown-security", "", 1, 2),
+        ]
+        for scenario, slash, exit_code, expected_calls in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sources = root / "ubuntu.sources"
+                certificate = root / "ca-certificates.crt"
+                receipt = root / "apt.jsonl"
+                original = (
+                    "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu" + slash + "\n"
+                    "Suites: resolute resolute-updates resolute-backports\nComponents: main universe restricted multiverse\n"
+                    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n"
+                    "Types: deb\nURIs: http://security.ubuntu.com/ubuntu" + slash + "\n"
+                    "Suites: resolute-security\nComponents: main universe restricted multiverse\n"
+                    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+                )
+                if scenario == "unknown-archive":
+                    original = original.replace("archive.ubuntu.com", "unexpected.example")
+                if scenario == "unknown-security":
+                    original = original.replace("security.ubuntu.com", "unexpected.example")
+                sources.write_text(original, encoding="utf-8")
+                apt = root / "apt-get"
+                apt.write_text(
+                    f"#!{sys.executable}\n"
+                    "import json,os,sys\nfrom pathlib import Path\n"
+                    "receipt=Path(os.environ['APT_RECEIPT'])\n"
+                    "prior=receipt.read_text().splitlines() if receipt.exists() else []\n"
+                    "with receipt.open('a') as out:out.write(json.dumps({'args':sys.argv[1:],'sources':Path(os.environ['APT_SOURCES']).read_text()})+'\\n')\n"
+                    "scenario=os.environ['APT_SCENARIO']\n"
+                    "number=len(prior)+1\n"
+                    "if scenario=='apt-'+str(number):sys.exit(40+number)\n"
+                    "if sys.argv[-1]=='ca-certificates' and scenario!='missing-ca':Path(os.environ['APT_CA']).write_text('fixture CA')\n",
+                    encoding="utf-8",
+                )
+                apt.chmod(0o755)
+                fixture_script = script.replace("/etc/apt/sources.list.d/ubuntu.sources", str(sources))
+                fixture_script = fixture_script.replace("/etc/ssl/certs/ca-certificates.crt", str(certificate))
+                result = subprocess.run(
+                    ["bash", "-e", "-c", fixture_script], cwd=root,
+                    env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", APT_RECEIPT=str(receipt),
+                             APT_SOURCES=str(sources), APT_CA=str(certificate), APT_SCENARIO=scenario),
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                calls = [json.loads(line) for line in receipt.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(calls), expected_calls)
+                self.assertEqual(calls[0]["args"], ["update"])
+                if len(calls) >= 2:
+                    self.assertEqual(calls[1]["args"], ["install", "-y", "--no-install-recommends", "ca-certificates"])
+                    self.assertEqual(calls[1]["sources"], original)
+                if len(calls) >= 3:
+                    self.assertEqual(calls[2]["args"], ["update"])
+                    self.assertEqual(calls[2]["sources"], original.replace("URIs: http://", "URIs: https://"))
+                if len(calls) >= 4:
+                    self.assertEqual(calls[3]["args"], ["install", "-y", "--no-install-recommends", *expected_packages])
+                    self.assertEqual(calls[3]["sources"], calls[2]["sources"])
+                if len(calls) < 3:
+                    self.assertEqual(sources.read_text(encoding="utf-8"), original)
+
+
 class FedoraSetupSourceTests(unittest.TestCase):
     def test_fedora_setup_preserves_metalinks_and_fails_missing_repositories(self) -> None:
         commands: list[tuple[str, str]] = []
@@ -386,6 +464,14 @@ class LocalCiGateExecutesTests(unittest.TestCase):
 
 
 class CiDeduplicationTests(unittest.TestCase):
+    def test_portable_has_bounded_room_for_serial_cold_profiles(self) -> None:
+        workflow = CI_YML.read_text(encoding="utf-8")
+        portable = job_block(workflow, "portable")
+        self.assertRegex(portable, r"(?m)^    timeout-minutes: 40$")
+        self.assertEqual(portable.count("timeout-minutes:"), 1)
+        self.assertNotIn("continue-on-error:", portable)
+        self.assertIn("runs-on: ubuntu-24.04", portable)
+
     def test_workflow_checks_execute_shared_checks_only_once(self) -> None:
         gate = job_block(CI_YML.read_text(encoding="utf-8"), "workflow-checks")
         self.assertEqual(gate.count("run: make ci-workflow-quick"), 1)

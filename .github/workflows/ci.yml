@@ -152,7 +152,8 @@ jobs:
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Serial cold debug/release checks reached the previous 30-minute job cap.
+    timeout-minutes: 40
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
@@ -415,6 +416,16 @@ jobs:
               . /etc/os-release
               test "$ID" = ubuntu && test "$VERSION_ID" = 26.04
               test "$(uname -m)" = x86_64
+              apt-get update
+              # The minimal image needs CA trust before using HTTPS mirrors.
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates
+              test -s /etc/ssl/certs/ca-certificates.crt
+              grep -Eq '^URIs: http://archive\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
+              grep -Eq '^URIs: http://security\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
+              sed -Ei 's#^(URIs: )http://((archive|security)\.ubuntu\.com/ubuntu/?)$#\1https://\2#' /etc/apt/sources.list.d/ubuntu.sources
+              grep -Eq '^URIs: https://archive\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
+              grep -Eq '^URIs: https://security\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
+              if grep -Eq '^URIs: http://(archive|security)\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources; then exit 1; fi
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                 ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish jq zstd \
