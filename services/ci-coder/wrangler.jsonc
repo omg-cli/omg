@@ -15,5 +15,22 @@
     "CI_IMAGE_DIGEST": "sha256:768b4ff3432702dbb212ade528445cf8093332593e65657e816c6b0ad85b72a6",
     "CI_VERIFIER_REVISION": "5543893617801998468b71b0e74bf2a18ff93bd3"
   },
-  "observability": { "enabled": false },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "redact_query_string": false,
+    "logs": {
+      "enabled": true,
+      "destinations": ["latham-openobserve-logs"],
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "destinations": ["latham-openobserve-traces"],
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
 }

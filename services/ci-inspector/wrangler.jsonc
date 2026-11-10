@@ -11,5 +11,22 @@
   "durable_objects": { "bindings": [{ "name": "MODEL_PACER", "class_name": "ModelPacer", "script_name": "omg-ci-coder" }] },
   "worker_loaders": [{ "binding": "LOADER" }],
   "limits": { "cpu_ms": 1000 },
-  "observability": { "enabled": false },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "redact_query_string": false,
+    "logs": {
+      "enabled": true,
+      "destinations": ["latham-openobserve-logs"],
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": true,
+      "destinations": ["latham-openobserve-traces"],
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
 }
