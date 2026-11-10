@@ -62,6 +62,30 @@ class LineCoverageTests(unittest.TestCase):
         self.assertEqual((value.files, value.found, value.hit), (2, 4, 1))
         self.assertEqual((value.mapped, value.mapped_hit), (4, 1))
 
+    def test_wrapped_or_saturated_lcov_counter_is_invalid_evidence(self):
+        maximum = 2**63 - 1
+        self.assertEqual(self.read(report(counts=(maximum - 1, 0))).mapped_hit, 1)
+        for count in (maximum, 18446744073709551614, 2**64):
+            with self.subTest(count=count), self.assertRaisesRegex(
+                    ValueError, r"Invalid LCOV coverage counter.*?/src/a\.rs:1"):
+                self.read(report(counts=(count, 0)))
+
+    def test_cli_identifies_the_side_with_invalid_counter_without_comparing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base, head = Path(directory) / 'base.info', Path(directory) / 'head.info'
+            for side in ('base', 'head'):
+                base.write_text(report(), encoding='utf-8')
+                head.write_text(report(), encoding='utf-8')
+                (base if side == 'base' else head).write_text(
+                    report(counts=(18446744073709551614, 0)), encoding='utf-8')
+                result = subprocess.run([sys.executable, str(SCRIPT), '--base', str(base), '--head', str(head)],
+                    capture_output=True, text=True, timeout=10)
+                with self.subTest(side=side):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f'Invalid LCOV coverage counter ({side}) at /src/a.rs:1', result.stderr)
+                    self.assertNotIn('Retained covered line lost', result.stderr)
+                    self.assertNotIn('PASS:', result.stdout)
+
     def test_corrupt_or_missing_records_are_fatal(self):
         valid = report()
         bad = ["", valid.replace("end_of_record\n", ""), valid + valid,
@@ -136,6 +160,16 @@ class SourceAwareCoverageTests(unittest.TestCase):
     def test_proven_covered_helper_deletion_preserves_both_surfaces(self):
         self.assertEqual(self.compare(), {"deleted_summary_found": 2, "deleted_summary_hit": 2,
                                         "deleted_mapped": 2, "deleted_mapped_hit": 2})
+
+    def test_json_saturation_rejects_either_side_before_source_correspondence(self):
+        for side in ('base', 'head'):
+            for count in (9223372036854775807, 18446744073709551614):
+                def saturate(base, head):
+                    document = base if side == 'base' else head
+                    document['data'][0]['functions'][0]['regions'][0][4] = count
+                with self.subTest(side=side, count=count), self.assertRaisesRegex(
+                        ValueError, rf'Invalid JSON region coverage counter \({side}\) at /src/example\.rs:'):
+                    self.compare(mutate=saturate)
 
     def shared_brace_compare(self, mutate=None, after=None):
         old = b"fn unrelated() {\n  unavailable();\n}\nfn obsolete() {\n  exercise();\n}\nfn retained() {\n  keep();\n}\n"

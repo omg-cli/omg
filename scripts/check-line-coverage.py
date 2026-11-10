@@ -11,6 +11,8 @@ import subprocess
 from pathlib import Path
 import re
 
+COUNTER_LIMIT = 2**63 - 1
+
 
 @dataclass(frozen=True)
 class Coverage:
@@ -29,7 +31,7 @@ def unsigned(text):
     return int(text)
 
 
-def read_coverage(path):
+def read_coverage(path, side=None):
     raw = Path(path).read_bytes()
     seen = set()
     source = None
@@ -76,6 +78,9 @@ def read_coverage(path):
             number, count = map(unsigned, fields[:2])
             if number == 0 or number in counts:
                 raise ValueError("Invalid or duplicate LCOV line number")
+            if count >= COUNTER_LIMIT:
+                raise ValueError(f"Invalid LCOV coverage counter ({side or path}) at {source}:{number}: "
+                                 f"{count}; wrapped or saturated count")
             counts[number] = count
         elif line.startswith(("LF:", "LH:")):
             key = line[:2]
@@ -150,7 +155,7 @@ def canonical_source(filename, sources):
     return matches[0]
 
 
-def region_evidence(path, coverage, sources):
+def region_evidence(path, coverage, sources, side=None):
     raw = Path(path).read_bytes()
     if len(raw) > 32 * 1024 * 1024:
         raise ValueError("Region archive exceeds bound")
@@ -174,6 +179,17 @@ def region_evidence(path, coverage, sources):
     for name, item in sections.items():
         if (files[name]["count"], files[name]["covered"]) != (item["LF"], item["LH"]):
             raise ValueError("Region/LCOV summary mismatch")
+    # LLVM's JSON exporter clamps uint64 counts to INT64_MAX. Saturation
+    # cannot establish execution; an unsigned underflow also appears positive.
+    # https://github.com/llvm/llvm-project/blob/main/llvm/tools/llvm-cov/CoverageExporterJson.cpp
+    for function in data["functions"]:
+        for region in function["regions"]:
+            if len(region) > 4 and type(region[4]) is int and region[4] >= COUNTER_LIMIT:
+                file_id = region[5] if len(region) > 5 else None
+                names = function["filenames"]
+                filename = names[file_id] if type(file_id) is int and 0 <= file_id < len(names) else "<unknown>"
+                raise ValueError(f"Invalid JSON region coverage counter ({side or path}) at {filename}:{region[0]}: "
+                                 f"{region[4]}; wrapped or saturated count")
     return data["functions"], sections
 
 
@@ -361,8 +377,8 @@ def retained_wrapper_paint(name, old, new, before, after, base, head, base_files
 
 
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
-    bf, bs = region_evidence(base_regions, base, base_sources)
-    hf, hs = region_evidence(head_regions, head, head_sources)
+    bf, bs = region_evidence(base_regions, base, base_sources, "base")
+    hf, hs = region_evidence(head_regions, head, head_sources, "head")
     if bs.keys() != hs.keys():
         raise ValueError("Added or removed coverage file requires explicit review")
     base_files = {path: canonical_source(path, base_sources) for path in base.sections}
@@ -604,8 +620,8 @@ def main():
     parser.add_argument("--base-sha")
     parser.add_argument("--head-sha")
     args = parser.parse_args()
-    base = read_coverage(args.base)
-    head = read_coverage(args.head)
+    base = read_coverage(args.base, "base")
+    head = read_coverage(args.head, "head")
     print(json.dumps({"base": {k: v for k, v in vars(base).items() if k != "sections"},
                       "head": {k: v for k, v in vars(head).items() if k != "sections"}}, sort_keys=True))
     evidence = (args.base_regions, args.head_regions, args.source_repo, args.base_sha, args.head_sha)
