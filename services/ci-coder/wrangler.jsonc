@@ -1,6 +1,8 @@
 {
   "name": "omg-ci-coder",
   "account_id": "f1e95b3e1b502cf366dfc81a863695fa",
+  "workers_dev": false,
+  "preview_urls": false,
   "main": "src/index.ts",
   "minify": true,
   "compatibility_date": "2026-10-20",

@@ -5,7 +5,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-20",
   "compatibility_flags": ["nodejs_compat"],
-  "workers_dev": true,
+  "workers_dev": false,
   "preview_urls": false,
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "omg-ci" }],
   "containers": [
