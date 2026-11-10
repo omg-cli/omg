@@ -1,6 +1,6 @@
 import type { CiSandbox } from "@cloudflare/ci/worker";
 import type * as Workers from "@cloudflare/workers-types/index.ts";
-import { cloudCiChecks } from "../runner/plan.mjs";
+import { knownCloudChecks } from "../runner/plan.mjs";
 
 type EvidenceSource = Pick<CiSandbox, "listFiles"> & {
   readReport(): Promise<Workers.ReadableStream<Uint8Array>>;
@@ -64,7 +64,7 @@ export async function retainRunnerLog(
 ): Promise<RetentionStatus> {
   if (
     !runIdPattern.test(runId) ||
-    ![...cloudCiChecks, "regression-red-green", "test-audit-four-state", "test-audit-sensitivity"].includes(step) ||
+    ![...knownCloudChecks, "regression-red-green", "test-audit-four-state", "test-audit-sensitivity"].includes(step) ||
     (stream !== "stdout" && stream !== "stderr")
   ) return "invalid-identity";
   return retainFile({

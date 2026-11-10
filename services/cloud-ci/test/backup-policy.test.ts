@@ -4,6 +4,7 @@ import { cloudCiChecks } from "../runner/plan.mjs";
 import { resolveCacheKey } from "../node_modules/@cloudflare/ci/src/ci/cache";
 
 test("only known terminal checks exclude both normal and hidden snapshot entries", () => {
+  expect(leafSnapshotOptions("ubuntu-native-readonly")).toEqual({ excludes: ["*", ".*"] });
   for (const name of cloudCiChecks.slice(1))
     expect(leafSnapshotOptions(name)).toEqual({ excludes: ["*", ".*"] });
 

@@ -11,6 +11,11 @@ const registry = 'registry.cloudflare.com';
 const dockerfile = 'services/cloud-ci/Dockerfile.ubuntu-pilot';
 const hash = value => createHash('sha256').update(value).digest('hex');
 
+export function candidateIdentityMatches(uid, gid, groups) {
+    // Node includes the effective GID: https://nodejs.org/api/process.html#processgetgroups
+    return uid === 10001 && gid === 10001 && groups.length === 1 && groups[0] === gid;
+}
+
 export function pinnedDockerfile(text) {
     const sources = [...text.matchAll(/^[ \t]*FROM[ \t]+(\S+)/gim)];
     if (!sources.length || sources.some(([, image]) => !/^\S+@sha256:[a-f0-9]{64}$/.test(image)))
@@ -26,6 +31,8 @@ export function ubuntuFrozenInputs(root, source) {
 }
 
 function smokeScript(frozen) {
+    const candidateScript = "import assert from 'node:assert/strict';import{writeFileSync}from'node:fs';assert((" +
+        candidateIdentityMatches.toString() + ")(process.getuid(),process.getgid(),process.getgroups()),'candidate UID/GID/groups mismatch');writeFileSync(process.argv[2]+'/owned','candidate');assert.throws(()=>writeFileSync(process.argv[1],'escaped'),{code:'EACCES'});";
     return frozenAssertion(frozen).script + `
 import { mkdtempSync, writeFileSync, chmodSync, mkdirSync, chownSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -38,9 +45,9 @@ try {
     writeFileSync(protectedFile,'frozen'); chmodSync(protectedFile,0o444);
     const home=path.join(work,'candidate'); mkdirSync(home,{mode:0o700}); chownSync(home,10001,10001);
     const child = spawnSync('setpriv',['--reuid=10001','--regid=10001','--clear-groups',process.execPath,'--input-type=module','-e',
-        "import assert from 'node:assert/strict';import{writeFileSync}from'node:fs';assert.equal(process.getuid(),10001);assert.equal(process.getgid(),10001);assert.deepEqual(process.getgroups(),[]);writeFileSync(process.argv[2]+'/owned','candidate');assert.throws(()=>writeFileSync(process.argv[1],'escaped'),{code:'EACCES'});",
+        ${JSON.stringify(candidateScript)},
         protectedFile,home],{encoding:'utf8',timeout:10000,env:{PATH:'/usr/local/bin:/usr/bin:/bin',HOME:home}});
-    assert.equal(child.status,0,'candidate identity/protected-controller smoke failed');
+    assert.equal(child.status,0,child.stderr?.slice(0,2048) || 'candidate identity/protected-controller smoke failed');
     assert.equal(readFileSync(protectedFile,'utf8'),'frozen');
 } finally { rmSync(work,{recursive:true,force:true}); }
 console.log(JSON.stringify({accepted:true,distro:'ubuntu',version:'24.04',architecture:'amd64',candidateUid:10001,frozenFiles:files.length}));`;
@@ -55,7 +62,10 @@ export async function buildUbuntuImage(output, { root = ROOT, environment = proc
     const command = (binary, args, options = {}) => {
         const result = run(binary, args, { cwd: root, encoding: 'utf8', timeout: 60_000,
             maxBuffer: 16 * 1024 * 1024, ...options });
-        if (result.error || result.status !== 0) throw new Error(`Ubuntu image ${binary} ${args[0]} failed`);
+        if (result.error || result.status !== 0) {
+            const detail = binary === 'docker' && args[0] === 'run' ? String(result.stderr ?? '').slice(0,4096) : '';
+            throw new Error(`Ubuntu image ${binary} ${args[0]} failed${detail ? ': ' + detail : ''}`);
+        }
         return result.stdout?.trim() ?? '';
     };
     const source = command('git', ['rev-parse', 'HEAD']);

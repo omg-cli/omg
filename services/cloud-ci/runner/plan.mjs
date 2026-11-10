@@ -63,6 +63,7 @@ export const planIdentity = JSON.stringify({
     applicability: { main: [...cloudCiChecks] },
 });
 const ubuntuChecks = ["frozen-dependencies", "source-format", "ubuntu-native-readonly"];
+export const knownCloudChecks = [...new Set([...cloudCiChecks, ...ubuntuChecks])];
 export const ubuntuPlanIdentity = JSON.stringify({
     version: 1,
     repository: "omg-cli/omg",

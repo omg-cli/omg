@@ -1,4 +1,4 @@
-import { cloudCiChecks } from "../runner/plan.mjs";
+import { knownCloudChecks } from "../runner/plan.mjs";
 
 type BackupCredentials = {
   R2_ACCESS_KEY_ID?: string;
@@ -6,7 +6,7 @@ type BackupCredentials = {
 };
 
 export function leafSnapshotOptions(step?: string) {
-  if (!step || step === "frozen-dependencies" || !cloudCiChecks.includes(step)) return {};
+  if (!step || step === "frozen-dependencies" || !knownCloudChecks.includes(step)) return {};
 
   return { excludes: ["*", ".*"] };
 }

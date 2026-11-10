@@ -260,6 +260,15 @@ function logFixture(type: "file" | "symlink", size = report.length) {
   };
 }
 
+test("Ubuntu failure logs retain their exact owned step identity", async () => {
+  for (const stream of ["stdout", "stderr"]) {
+    const f = logFixture("file");
+    expect(await retainRunnerLog(id, "ubuntu-native-readonly", stream, f.sandbox, f.bucket)).toBe("saved");
+    expect(f.writes).toHaveLength(1);
+    expect(f.writes[0]?.key).toBe(`diagnostics/runner-logs/${id}/ubuntu-native-readonly.${stream}`);
+  }
+});
+
 test("terminal release keeps the container when actual runner-log retention is unsafe", async () => {
   const f = logFixture("symlink");
   const owner = `${id}-ta-${"b".repeat(16)}`;

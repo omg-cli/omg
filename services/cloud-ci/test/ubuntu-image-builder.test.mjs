@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { buildUbuntuImage, ubuntuFrozenInputs, pinnedDockerfile } from '../../../scripts/build-cloud-ubuntu-image.mjs';
+import { buildUbuntuImage, ubuntuFrozenInputs, pinnedDockerfile, candidateIdentityMatches } from '../../../scripts/build-cloud-ubuntu-image.mjs';
 import { frozenAssertion } from './hosted-image-probe.mjs';
 
 const sha = 'a'.repeat(40);
@@ -38,10 +38,18 @@ test('every Dockerfile source stage must be immutable', () => {
         expect(() => pinnedDockerfile(dockerfile)).toThrow('digest');
 });
 
-test('a failed build removes archived context and isolated Docker credentials without publishing', async () => {
+test('Node candidate identity allows its effective group only and refuses privilege leaks', () => {
+    expect(candidateIdentityMatches(10001, 10001, [10001])).toBe(true);
+    for (const [uid, gid, groups] of [[0, 10001, [10001]], [10001, 0, [0]],
+        [10001, 10001, []], [10001, 10001, [0, 10001]], [10001, 10001, [10001, 10002]]])
+        expect(candidateIdentityMatches(uid, gid, groups)).toBe(false);
+});
+
+for (const failedPhase of ['build', 'run']) test(`failed ${failedPhase} removes context and credentials without publishing`, async () => {
     let context, dockerConfig;
     const dockerCalls = [];
-    await expect(buildUbuntuImage('unused.json', { environment,
+    let failure;
+    try { await buildUbuntuImage('unused.json', { environment,
         async login(account, token, host, config) { dockerConfig = config; writeFileSync(path.join(config, 'config.json'), 'private fixture credentials'); },
         run(command, args, options) {
             if (command === 'git' && args[0] === 'rev-parse') return { status: 0, stdout: sha };
@@ -65,12 +73,22 @@ test('a failed build removes archived context and isolated Docker credentials wi
                 dockerCalls.push(args[0]);
                 expect(options.env.DOCKER_CONFIG).toBe(dockerConfig);
                 expect(readFileSync(path.join(context, 'services/cloud-ci/Dockerfile.ubuntu-pilot'), 'utf8')).toContain('RUN --network=none');
-                return { status: 1, stdout: '' };
+                if (args[0] === 'run') {
+                    const syntax = spawnSync('node', ['--input-type=module', '--check'], { input: args.at(-1), encoding: 'utf8' });
+                    expect(syntax.status, syntax.stderr).toBe(0);
+                }
+                if (args[0] !== failedPhase) return { status: 0, stdout: '' };
+                return { status: 1, stdout: '', stderr: 'controlled smoke failure\n' + 'x'.repeat(10_000) };
             }
             throw new Error('unexpected build operation');
         },
-    })).rejects.toThrow('docker build failed');
-    expect(dockerCalls).toEqual(['build']);
+    }); } catch (error) { failure = error; }
+    expect(failure?.message).toContain(`docker ${failedPhase} failed`);
+    if (failedPhase === 'run') expect(failure?.message).toContain('controlled smoke failure');
+    else expect(failure?.message).not.toContain('controlled smoke failure');
+    expect(failure?.message.length).toBeLessThan(5000);
+    expect(failure?.message).not.toContain(environment.CLOUDFLARE_API_TOKEN);
+    expect(dockerCalls).toEqual(failedPhase === 'build' ? ['build'] : ['build', 'run']);
     expect(existsSync(context)).toBe(false);
     expect(existsSync(dockerConfig)).toBe(false);
 });
