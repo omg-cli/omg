@@ -386,18 +386,36 @@ class FedoraSetupSourceTests(unittest.TestCase):
         self.assertIn("exist_ok=False", allocation_source)
         upload = source.split("      - name: Upload native Fedora ignored integration evidence\n", 1)[1]
         upload = upload.split("\n      - name:", 1)[0]
-        self.assertIn("${{ runner.temp }}/fedora-ignored/", upload)
-        self.assertIn("target/fedora-serial-libtest.jsonl", upload)
-        self.assertNotIn("target/fedora-ignored", step + upload)
-        for exit_code in [0, 42]:
-            with self.subTest(dnf_exit=exit_code):
+        serial_upload = source.split("      - name: Upload native Fedora serial libtest diagnostics\n", 1)[1]
+        serial_upload = serial_upload.split("\n      - name:", 1)[0]
+        for uploader, artifact, path in [
+            (upload, "fedora-ignored-integrations", "${{ env.FEDORA_IGNORED_EVIDENCE_DIR }}/"),
+            (serial_upload, "fedora-serial-libtest", "target/fedora-serial-libtest.jsonl"),
+        ]:
+            self.assertIn("        if: always() && matrix.phase == 'validation' && matrix.platform == 'fedora'\n", uploader)
+            self.assertIn("uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", uploader)
+            self.assertIn(f"          name: {artifact}\n", uploader)
+            self.assertEqual(re.findall(r"^          path: (.+)$", uploader, re.M), [path])
+            self.assertIn("          retention-days: 7\n", uploader)
+            self.assertIn("          if-no-files-found: error\n", uploader)
+        self.assertIn(
+            "      FEDORA_IGNORED_EVIDENCE_DIR: /tmp/omg-fedora-ignored-${{ github.run_id }}-${{ github.run_attempt }}\n",
+            job_block(source, "linux-matrix"),
+        )
+        self.assertNotIn("target/fedora-serial-libtest.jsonl", upload)
+        for stale_path in ("target/fedora-ignored", "RUNNER_TEMP", "runner.temp"):
+            self.assertNotIn(stale_path, step + upload)
+        for dnf_exit, missing_receipt, expected_exit in [(0, False, 0), (42, False, 42), (0, True, 1)]:
+            with self.subTest(dnf_exit=dnf_exit, missing_receipt=missing_receipt):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     cached = root / "target/fedora-ignored/fixture"
                     cached.mkdir(parents=True)
                     marker = cached / "unrelated-cache-marker"
                     marker.write_text("preserve cached evidence", encoding="utf-8")
-                    runner_temp = root / "runner temp"
+                    evidence = root / "explicit evidence dir"
+                    container_temp = root / "container default temp"
+                    host_temp = root / "host default temp"
                     (root / "dnf").write_text(
                         f"#!{sys.executable}\n"
                         "import json,os,sys\n"
@@ -411,33 +429,39 @@ class FedoraSetupSourceTests(unittest.TestCase):
                         "import os,sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
                         "args=SimpleNamespace(evidence_dir=Path(sys.argv[sys.argv.index('--evidence-dir')+1]))\n"
                         + allocation_source + "\n"
-                        "Path(os.environ['HELPER_CALL']).write_text(str(out))\n",
+                        "Path(os.environ['HELPER_CALL']).write_text(str(out))\n"
+                        "if os.environ['MISSING_RECEIPT']=='False':(out/'receipt.json').write_text('{\"fixture\":true}\\n')\n",
                         encoding="utf-8",
                     )
                     for name in ["dnf", "python3"]:
                         (root / name).chmod(0o755)
                     receipt = root / "call.json"
                     helper = root / "helper.txt"
-                    environment = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", RUNNER_TEMP=str(runner_temp),
-                                       DNF_CALL=str(receipt), DNF_EXIT=str(exit_code), HELPER_CALL=str(helper))
+                    environment = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", RUNNER_TEMP=str(container_temp),
+                                       RUNNER_CONTEXT_TEMP=str(host_temp), FEDORA_IGNORED_EVIDENCE_DIR=str(evidence),
+                                       DNF_CALL=str(receipt), DNF_EXIT=str(dnf_exit), HELPER_CALL=str(helper),
+                                       MISSING_RECEIPT=str(missing_receipt))
                     result = subprocess.run(
                         ["bash", "-e", "-c", script],
                         cwd=root,
                         env=environment,
                         capture_output=True, text=True, timeout=10, check=False,
                     )
-                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    self.assertEqual(result.returncode, expected_exit, result.stderr)
                     self.assertEqual(json.loads(receipt.read_text(encoding="utf-8")), [
                         "--setopt=*.skip_if_unavailable=False", "--disable-repo=fedora-cisco-openh264", "install", "-y",
                         "--setopt=install_weak_deps=False", "tree", "createrepo_c", "gnupg2",
                     ])
-                    provision = json.loads((runner_temp / "fedora-ignored/provision.json").read_text(encoding="utf-8"))
-                    self.assertEqual(provision["exit_code"], exit_code)
+                    provision = json.loads((evidence / "provision.json").read_text(encoding="utf-8"))
+                    self.assertEqual(provision["exit_code"], dnf_exit)
                     self.assertGreaterEqual(provision["elapsed_seconds"], 0)
-                    if exit_code == 0:
-                        fresh = runner_temp / "fedora-ignored/fixture"
+                    if dnf_exit == 0:
+                        fresh = evidence / "fixture"
                         self.assertEqual(helper.read_text(encoding="utf-8"), str(fresh))
                         self.assertTrue(fresh.is_dir())
+                        self.assertEqual((fresh / "receipt.json").exists(), not missing_receipt)
+                        if not missing_receipt:
+                            self.assertGreater((fresh / "receipt.json").stat().st_size, 0)
                         repeated = subprocess.run(
                             ["bash", "-e", "-c", script], cwd=root, env=environment,
                             capture_output=True, text=True, timeout=10, check=False,
@@ -447,6 +471,8 @@ class FedoraSetupSourceTests(unittest.TestCase):
                     else:
                         self.assertFalse(helper.exists(), "failed provisioning must stop before the helper")
                     self.assertEqual(marker.read_text(encoding="utf-8"), "preserve cached evidence")
+                    self.assertFalse(container_temp.exists())
+                    self.assertFalse(host_temp.exists())
 
 
 class QemuConcurrencyTests(unittest.TestCase):
