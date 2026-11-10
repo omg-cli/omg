@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "omg-cloud-ci-ubuntu-pilot",
+  "account_id": "f1e95b3e1b502cf366dfc81a863695fa",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "omg-ci" }],
+  "containers": [{
+    "class_name": "CiSandbox",
+    "image": "registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci-ubuntu-pilot@sha256:1e1e3805ab6e1b742c19bd8e4a10eb62a1933ba2b7cd6ccdcaa4d2c19abb7a77",
+    "max_instances": 1,
+    "instance_type": "standard-4",
+    "rollout_step_percentage": 100,
+    "observability": { "enabled": true }
+  }],
+  "durable_objects": { "bindings": [{ "name": "SANDBOX", "class_name": "CiSandbox" }] },
+  "exports": { "CiSandbox": { "type": "durable-object", "storage": "sqlite" } },
+  "workflows": [{ "name": "omg-cloud-ci-ubuntu-pilot", "binding": "CI_WORKFLOW", "class_name": "CI" }],
+  "r2_buckets": [{ "binding": "BACKUP_BUCKET", "bucket_name": "omg-ci-ubuntu-pilot" }],
+  "vars": {
+    "SANDBOX_LOG_LEVEL": "error",
+    "CI_WORKLOAD": "ubuntu-native-pilot",
+    "CI_VERIFIER_REVISION": "4864134c690ccf8a9486a04279c3e642fbf0478a",
+    "CI_IMAGE_DIGEST": "sha256:1e1e3805ab6e1b742c19bd8e4a10eb62a1933ba2b7cd6ccdcaa4d2c19abb7a77",
+    "BACKUP_BUCKET_NAME": "omg-ci-ubuntu-pilot",
+    "CLOUDFLARE_ACCOUNT_ID": "f1e95b3e1b502cf366dfc81a863695fa"
+  },
+  "observability": { "enabled": true }
+}

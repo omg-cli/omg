@@ -10,7 +10,7 @@
   "containers": [{
     "name": "omg-cloud-ci-capability-pilot",
     "class_name": "UbuntuPilotSandbox",
-    "image": "registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci@sha256:768b4ff3432702dbb212ade528445cf8093332593e65657e816c6b0ad85b72a6",
+    "image": "registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-cloud-ci-ubuntu-pilot@sha256:1e1e3805ab6e1b742c19bd8e4a10eb62a1933ba2b7cd6ccdcaa4d2c19abb7a77",
     "max_instances": 1,
     "instance_type": "standard-4"
   }],
