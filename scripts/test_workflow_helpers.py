@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,43 @@ class HelperExecutionTests(unittest.TestCase):
             'from scripts.support import VALUE\n' + self.body)
         result = self.run_cli('--output', str(self.root / 'namespace'))
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'real Linux UID permission boundary')
+    def test_module_scratch_allows_explicit_fixture_access_but_keeps_private_content_denied(self):
+        prefix = [] if os.geteuid() == 0 else ['sudo', '-n']
+        if not shutil.which('setpriv') or (prefix and subprocess.run(
+                [*prefix, 'true'], capture_output=True, timeout=5).returncode):
+            self.skipTest('real UID transition requires root or passwordless sudo and setpriv')
+        code = '''import os,subprocess,sys,tempfile
+from pathlib import Path
+scratch=Path(os.environ['TMPDIR'])
+with tempfile.TemporaryDirectory() as directory:
+ root=Path(directory);root.chmod(0o755)
+ public=root/'readable';public.write_text('readable');public.chmod(0o644)
+ private=root/'private';private.write_text('secret');private.chmod(0o600)
+ hidden=root/'hidden';hidden.mkdir(mode=0o700)
+ nested=hidden/'file';nested.write_text('secret');nested.chmod(0o644)
+ probe="""from pathlib import Path
+import sys
+assert Path(sys.argv[1]).read_text()=='readable'
+for path in sys.argv[2:4]:
+ try:Path(path).read_text()
+ except PermissionError:pass
+ else:raise AssertionError('private fixture became readable')
+scratch=Path(sys.argv[4])
+try:list(scratch.iterdir())
+except PermissionError:pass
+else:raise AssertionError('scratch became listable')
+try:(scratch/'unowned').write_text('unowned')
+except PermissionError:pass
+else:raise AssertionError('scratch became writable')
+"""
+ subprocess.run(PREFIX+['setpriv','--reuid=65534','--regid=65534','--clear-groups',sys.executable,'-c',probe,str(public),str(private),str(nested),str(scratch)],check=True)
+ assert scratch.stat().st_mode & 0o777 == 0o711
+'''.replace('PREFIX', repr(prefix))
+        result = subject().child_process(self.root, [], dict(os.environ), time.monotonic() + 10,
+                                         self.root / 'permissions.log', [sys.executable, '-B', '-c', code])
+        self.assertEqual(result, 0, (self.root / 'permissions.log').read_text())
 
     def test_real_failure_preserves_failed_identity_and_nonzero_exit(self):
         (self.root / 'scripts/test_helper_fixture.py').write_text(self.body.replace('True)', 'False)'))

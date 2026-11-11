@@ -303,6 +303,8 @@ def child_process(root, arguments, environment, deadline, log_path, argv=None):
     require(os.name != 'posix' or all(hasattr(os, name) for name in ('waitid', 'WNOWAIT')),
             'POSIX helpers require non-reaping child observation')
     with tempfile.TemporaryDirectory(prefix='omg-helper-') as scratch, log_path.open('wb') as log:
+        if os.name == 'posix':
+            Path(scratch).chmod(0o711)
         child_env = dict(environment, TMPDIR=scratch, TEMP=scratch, TMP=scratch, PYTHONDONTWRITEBYTECODE='1')
         command = [sys.executable, '-B', str(Path(__file__).resolve()), *arguments] if argv is None else argv
         process = subprocess.Popen(command,
