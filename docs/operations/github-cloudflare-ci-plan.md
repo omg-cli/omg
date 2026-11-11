@@ -232,10 +232,20 @@ After the matched pair, collect at least five successful warm samples and repres
 
 ## Current checkpoint and unresolved proof
 
-- PR #1054 is an existing reviewed implementation slice awaiting complete CI and the exact main coverage baseline. Its R2 Benchmark production path still needs hosted cold and warm proof. [PR #1054](https://github.com/omg-cli/omg/pull/1054)
+- PR #1054's cache and scheduling revision `55f8ffb4` passed CI and coverage. The reviewed stage 0 fix and this plan are being added to that PR for one combined hosted verification wave. Its R2 Benchmark production path still needs trusted-main cold and warm proof. [PR #1054](https://github.com/omg-cli/omg/pull/1054)
 - The native producer-extraction patch is sealed privately and remains unapplied. Its expanded job graph needs a capacity experiment.
 - The dependency-reuse prototype is incomplete and remains private. The research replaces assumptions about snapshot scope and identifies which provenance checks the application must still supply.
 - The SDK version, cache semantics and scheduling-generation gaps are source-verified. OMG runtime parity for the proposed replacement is unverified.
 - The existing Ubuntu pilot proves two named libtests and its package-catalogue recipe. Full native suites, ARM and QEMU replacement are pending.
 - Raw LLVM failure inputs were unavailable in the first failed artifact set. The saturated counter is evidence of an inconsistent derived region. Its originating process and collection defect remain unresolved.
 - Containers and Artifacts invoice deductions and the final multi-service credit consumption remain unobserved. Keep the observed award balance, usage receipts and invoice application in the execution record.
+
+## Execution record
+
+| Step | Completed evidence | Remaining acceptance |
+| --- | --- | --- |
+| Research | Published plan, pinned primary sources, independent architecture reviews and repository documentation audit. | Update the plan when measured behavior changes a decision. |
+| Baseline recovery | Main `67678bad` CI and coverage are successful. Attempt 2 reports passed the complete source-aware comparison. Two redundant first-attempt standalone copies were retired after proving byte equality with retained failed comparison artifact `13823091231`. | The original counter defect still needs raw-profile diagnosis. |
+| Stage 0 implementation | Producer-owned report selection, immutable-ID download, digest and size verification, attempt-qualified uploads and failure-only raw diagnostics. The focused Linux suites passed 185 tests. Windows base coverage passed 25. Independent review caught a clock-dependent ZIP fixture, followed by a deterministic failing control and fixed fixture. | Complete combined hosted CI, qualified-upload admission and a report-only rerun. |
+
+The stage 0 code is combined with the existing reviewed cache slice to avoid a second full CI wave for independent changes. Each slice retains its acceptance conditions. The combined head needs its own terminal checks and independent review.
