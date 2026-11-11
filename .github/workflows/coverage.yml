@@ -417,7 +417,8 @@ jobs:
               with export_log.open('rb') as stream:
                   log = stream.read(2 * 1024 * 1024 + 1)
               receipt['export_log_truncated'] = len(log) > 2 * 1024 * 1024
-              for line in log[:2 * 1024 * 1024].decode('utf-8', errors='replace').splitlines():
+              command_log = re.sub(r'\x1b\[[0-9;]*m', '', log[:2 * 1024 * 1024].decode('utf-8', errors='replace'))
+              for line in command_log.splitlines():
                   match = re.search(r'Running `(.*)`$', line)
                   if match:
                       try:

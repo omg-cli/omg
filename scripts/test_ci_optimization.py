@@ -489,6 +489,19 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
             self.assertFalse(any('fixture-object' in name for name in bundle.getnames()))
         self.assertIn('rustc', receipt['tools'])
 
+    def test_diagnostics_read_colored_export_commands(self):
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        executable = target / 'fixture object'
+        executable.write_bytes(b'\x7fELF colored-log fixture')
+        (self.directory / 'coverage-region-export.log').write_text(
+            '\x1b[1;32mRunning\x1b[0m `llvm-cov export -object '
+            + shlex.quote(executable.as_posix()) + '`\n')
+        receipt, _ = self.collect()
+        self.assertEqual(receipt['objects'], [{'path': executable.as_posix(),
+            'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
+            'bytes': executable.stat().st_size, 'changed_during_collection': False}])
+
     def test_diagnostics_bound_input_and_report_missing_and_symlink_profiles(self):
         target = self.directory / 'target/llvm-cov-target'
         target.mkdir(parents=True)
