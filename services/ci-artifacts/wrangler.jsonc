@@ -1,0 +1,14 @@
+{
+  "$schema": "../ci/node_modules/wrangler/config-schema.json",
+  "name": "omg-ci-artifacts",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-11",
+  "workers_dev": true,
+  "preview_urls": false,
+  "durable_objects": {"bindings": [{"name": "CACHE_MINTS", "class_name": "CacheMintBudget"}]},
+  "exports": {"CacheMintBudget": {"type": "durable-object", "storage": "sqlite"}},
+  "r2_buckets": [{"binding": "DEPENDENCIES", "bucket_name": "omg-ci-compiler-cache"}],
+  "vars": {"R2_ACCOUNT_ID": "", "SOURCE_SHA": ""},
+  "limits": {"cpu_ms": 50},
+  "observability": {"enabled": false}
+}

@@ -1,9 +1,25 @@
 name: QEMU preflight
 description: Verify workflow selection, daemon lifecycle, and QEMU harness contracts
+inputs:
+  current-ci-helpers:
+    description: Admit the current CI helper shards instead of repeating their tests
+    default: 'false'
 runs:
   using: composite
   steps:
+    - name: Admit complete current CI helper proof
+      if: inputs.current-ci-helpers == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: python3 -B scripts/workflow-helpers.py admit --current-run --timeout 120 --output "$RUNNER_TEMP/qemu-helper-admission.json"
+
+    - name: Configure signed Ubuntu archive
+      if: inputs.current-ci-helpers != 'true'
+      uses: ./.github/actions/ubuntu-apt
+
     - name: Workflow selection regression checks
+      if: inputs.current-ci-helpers != 'true'
       shell: bash
       run: |
         python3 -m unittest discover -s tests -p test_qemu_workflow.py
@@ -26,14 +42,15 @@ runs:
         python3 -m unittest discover -s scripts -p test_qemu_controller_floor.py
 
     - name: Verify update identity and daemon lifecycle rejection cases
+      if: inputs.current-ci-helpers != 'true'
       shell: bash
       run: |
-        sudo apt-get update
         sudo apt-get install -y jq
         python3 -B -m unittest discover -s scripts -p test_update_identity_runner.py -v
         python3 -B -m unittest discover -s scripts -p test_debian_daemon_catalog_lifecycle.py -v
 
     - name: Verify harness and reporting fixtures before guest builds
+      if: inputs.current-ci-helpers != 'true'
       shell: bash
       run: |
         ./scripts/test-release-smoke.sh

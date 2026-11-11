@@ -1,14 +1,5 @@
-# World-Class CI Pipeline for OMG
-# Optimized for speed, reliability, and comprehensive coverage
-#
-# Key Features:
-# - PR path filtering: Avoid redundant platform builds for documentation
-# - Quick gate: Classify changes before independent checks and builds
-# - Matrix strategy: native Linux distro and ABI checks in parallel
-# - cargo-nextest: 10-35% faster test execution
-# - Artifact caching: Shared caches across jobs
-# - Timeout protection: Prevents runaway jobs
-# - Test reporting: exact nextest selection, JUnit attempts and parser receipts
+# Native, portable and disposable guest checks for the current source.
+# CI Success requires each selected owner and its complete execution proof.
 
 name: CI
 
@@ -85,54 +76,115 @@ jobs:
         id: changes
         run: python3 scripts/ci-change-scope.py
 
-      - name: Validate change classification
-        run: python3 -m unittest discover -s scripts -p test_ci_change_scope.py
-
   workflow-checks:
-    name: "Workflow checks"
+    name: "Workflow helpers (${{ matrix.shard }}/2)"
     needs: quick-gate
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Test debt baseline guards
-        run: python3 -m unittest discover -s scripts -p 'test_debt*.py'
+      - name: Test debt baseline and classification guards on docs-only changes
+        if: matrix.shard == 0 && github.event_name != 'push' && needs.quick-gate.outputs.checks-required != 'true'
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_debt*.py'
+          python3 -m unittest discover -s scripts -p test_ci_change_scope.py
 
       - name: Debt ratchet (gating)
+        if: matrix.shard == 0
         run: python3 scripts/debt-ratchet.py --ci
 
       - name: Install Rust
-        if: needs.quick-gate.outputs.checks-required == 'true'
+        if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.95.0"
           components: rustfmt
 
-      - name: Install Python workflow test dependencies
-        if: needs.quick-gate.outputs.checks-required == 'true'
-        run: |
-          sudo apt-get update --error-on=any
-          sudo apt-get install -y --no-install-recommends python3-venv
+      - name: Configure signed Ubuntu archive
+        if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'
+        uses: ./.github/actions/ubuntu-apt
 
-      - name: Run quick workflow checks
-        if: needs.quick-gate.outputs.checks-required == 'true'
-        run: make ci-workflow-quick
+      - name: Install Python workflow test dependencies
+        if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'
+        run: sudo apt-get install -y --no-install-recommends python3-venv
+
+      - name: Install Worker runtime
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.1
+
+      - name: Install pinned Worker package manager
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        run: |
+          curl --proto '=https' --tlsv1.2 --max-time 120 -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$RUNNER_TEMP/bun.zip"
+          echo "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c  $RUNNER_TEMP/bun.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun"
+          echo "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235  $RUNNER_TEMP/bun/bun-linux-x64/bun" | sha256sum -c -
+          echo "$RUNNER_TEMP/bun/bun-linux-x64" >> "$GITHUB_PATH"
+
+      - name: Install frozen Worker dependencies
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        run: bun install --cwd services/ci --frozen-lockfile --ignore-scripts
+
+      - name: Run shared static checks once
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        run: make ci-workflow-static
+
+      - name: Verify native journal health once
+        if: matrix.shard == 0 && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        run: sudo -n python3 -B scripts/workflow-helpers.py privileged --output "$RUNNER_TEMP/helper-native-health.json"
+
+      - name: Execute complete helper shard
+        if: github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true'
+        run: |
+          extra=()
+          if [[ "${{ matrix.shard }}" == 0 ]]; then
+            extra+=(--static-complete --worker-checks --privileged-receipt "$RUNNER_TEMP/helper-native-health.json")
+          fi
+          python3 -B scripts/workflow-helpers.py run --shard "${{ matrix.shard }}" --shards 2 \
+            --timeout 1800 --output "$RUNNER_TEMP/workflow-helpers" "${extra[@]}"
+
+      - name: Preserve helper execution receipt
+        if: always() && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: workflow-helpers-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}-of-2
+          path: ${{ runner.temp }}/workflow-helpers/receipt.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Preserve helper failure diagnostics
+        if: failure() && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: workflow-helper-logs-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/workflow-helpers/
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Verify installer destination safety
+        if: matrix.shard == 0
         run: bash tests/installer_security.sh
 
       - name: Install cargo-machete
+        if: matrix.shard == 0
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         with:
           tool: cargo-machete
 
       - name: Unused dependencies (gating)
-        # Standalone binary: the machete scan needs no Rust toolchain, so it
-        # still runs on changes that skip compilation.
+        if: matrix.shard == 0
         run: cargo-machete
 
   standalone-suites:
@@ -169,6 +221,10 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
@@ -202,8 +258,11 @@ jobs:
       - name: Install portable compiler cache
         if: >-
           vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
-          github.ref == 'refs/heads/main' &&
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          ((github.ref == 'refs/heads/main' &&
+            (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) ||
+           (github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            vars.OMG_R2_PR_CACHE_ENABLED == 'true'))
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         with:
           tool: sccache@0.18.0
@@ -222,6 +281,21 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
         run: python3 scripts/ci-r2-cache.py
 
+      - name: Configure PR read-only R2 cache
+        id: r2-pr-cache
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          vars.OMG_R2_CACHE_ENABLED == 'true' &&
+          vars.OMG_R2_PR_CACHE_ENABLED == 'true' && inputs.skip-cache != true
+        env:
+          OMG_R2_CACHE_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
+          OMG_R2_PR_CACHE_ENABLED: ${{ vars.OMG_R2_PR_CACHE_ENABLED }}
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          OMG_R2_CACHE_BROKER_URL: ${{ vars.OMG_R2_CACHE_BROKER_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-r2-cache.py --mode pr-read
+
       - name: Clippy
         run: |
           cargo clippy --all-targets --no-default-features --features pgp,license \
@@ -237,12 +311,11 @@ jobs:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked
 
+      - name: Configure signed Ubuntu archive
+        uses: ./.github/actions/ubuntu-apt
+
       - name: Check Bash and Zsh package completion
         run: |
-          for attempt in 1 2 3; do
-            sudo apt-get update --error-on=any -qq && break || sleep 10
-            if [ "$attempt" = 3 ]; then exit 1; fi
-          done
           sudo apt-get install -y --no-install-recommends zsh fish python3-venv
           set +e
           timeout -k 10s 30s zsh tests/shell_completion.zsh > /tmp/shell-completion.log 2>&1
@@ -289,16 +362,19 @@ jobs:
         run: cargo nextest run --test env_portability_cli --no-default-features --features pgp,license --locked --profile ci
 
       - name: Report portable compiler cache
-        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        if: always() && (steps.r2-cache.outputs.enabled == 'true' || steps.r2-pr-cache.outputs.enabled == 'true')
         run: |
           trap 'sccache --stop-server' EXIT
           mkdir -p "$RUNNER_TEMP/omg-r2-cache"
           sccache --show-stats
           sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-stats.json"
-          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-context.txt"
+          printf 'source=%s\nprefix=%s\nmode=%s\nrecipe=%s\npolicy=%s\nexpires=%s\n' \
+            "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" "${OMG_R2_CACHE_MODE:-main}" \
+            "${OMG_R2_CACHE_SEED_RECIPE:-}" "${OMG_R2_CACHE_POLICY:-}" "${OMG_R2_CACHE_EXPIRES_AT:-}" \
+            > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-context.txt"
 
       - name: Preserve portable compiler cache diagnostics
-        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        if: always() && (steps.r2-cache.outputs.enabled == 'true' || steps.r2-pr-cache.outputs.enabled == 'true')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
@@ -312,6 +388,10 @@ jobs:
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -341,8 +421,11 @@ jobs:
       - name: Install portable compiler cache
         if: >-
           vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
-          github.ref == 'refs/heads/main' &&
-          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+          ((github.ref == 'refs/heads/main' &&
+            (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) ||
+           (github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            vars.OMG_R2_PR_CACHE_ENABLED == 'true'))
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         with:
           tool: sccache@0.18.0
@@ -361,20 +444,38 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
         run: python3 scripts/ci-r2-cache.py
 
+      - name: Configure PR read-only R2 cache
+        id: r2-pr-cache
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          vars.OMG_R2_CACHE_ENABLED == 'true' &&
+          vars.OMG_R2_PR_CACHE_ENABLED == 'true' && inputs.skip-cache != true
+        env:
+          OMG_R2_CACHE_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
+          OMG_R2_PR_CACHE_ENABLED: ${{ vars.OMG_R2_PR_CACHE_ENABLED }}
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          OMG_R2_CACHE_BROKER_URL: ${{ vars.OMG_R2_CACHE_BROKER_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-r2-cache.py --mode pr-read
+
       - name: Test release distro override guard
         run: cargo test --release --test distro_override --no-default-features --features pgp,license --locked
 
       - name: Report portable compiler cache
-        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        if: always() && (steps.r2-cache.outputs.enabled == 'true' || steps.r2-pr-cache.outputs.enabled == 'true')
         run: |
           trap 'sccache --stop-server' EXIT
           mkdir -p "$RUNNER_TEMP/omg-r2-cache"
           sccache --show-stats
           sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-stats.json"
-          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-context.txt"
+          printf 'source=%s\nprefix=%s\nmode=%s\nrecipe=%s\npolicy=%s\nexpires=%s\n' \
+            "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" "${OMG_R2_CACHE_MODE:-main}" \
+            "${OMG_R2_CACHE_SEED_RECIPE:-}" "${OMG_R2_CACHE_POLICY:-}" "${OMG_R2_CACHE_EXPIRES_AT:-}" \
+            > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-context.txt"
 
       - name: Preserve portable compiler cache diagnostics
-        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        if: always() && (steps.r2-cache.outputs.enabled == 'true' || steps.r2-pr-cache.outputs.enabled == 'true')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
@@ -396,14 +497,34 @@ jobs:
     with:
       arch: x86_64
 
+  fedora-sqlite-publish:
+    name: Publish existing Fedora SQLite supply
+    needs: fedora-sqlite
+    if: >-
+      github.repository == 'omg-cli/omg' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      needs.fedora-sqlite.result == 'success' && needs.fedora-sqlite.outputs.publishable == 'true'
+    uses: ./.github/workflows/fedora-sqlite-publish.yml
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    with:
+      arch: x86_64
+      artifact-id: ${{ needs.fedora-sqlite.outputs.artifact-id }}
+      artifact-digest: ${{ needs.fedora-sqlite.outputs.artifact-digest }}
+    secrets:
+      OMG_R2_CACHE_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+      OMG_R2_CACHE_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+
   linux-matrix:
-    name: "${{ matrix.phase == 'validation' && format('Linux ({0})', matrix.platform) || format('Linux clippy ({0})', matrix.platform) }}"
+    name: "Linux (${{ matrix.platform }})"
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    # Ubuntu's cold validation build also needs room for slow package mirrors.
-    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && matrix.phase == 'validation' && 45 || 30 }}
-    env: &linux_environment
+    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && 75 || 60 }}
+    env:
       # Shell and upload action must use the same container path.
       FEDORA_IGNORED_EVIDENCE_DIR: /tmp/omg-fedora-ignored-${{ github.run_id }}-${{ github.run_attempt }}
       RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}
@@ -423,8 +544,8 @@ jobs:
       max-parallel: 5
       matrix:
         phase: [validation]
-        platform: &linux_platforms [arch, debian, debian-trixie, ubuntu-2604, fedora]
-        include: &linux_images
+        platform: [arch, debian, debian-trixie, ubuntu-2604, fedora]
+        include:
           - platform: arch
             image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
             features: arch,pgp,license
@@ -519,17 +640,6 @@ jobs:
               . /etc/os-release
               test "$ID" = ubuntu && test "$VERSION_ID" = 26.04
               test "$(uname -m)" = x86_64
-              apt-get update
-              # The minimal image needs CA trust before using HTTPS mirrors.
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates
-              test -s /etc/ssl/certs/ca-certificates.crt
-              grep -Eq '^URIs: http://archive\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
-              grep -Eq '^URIs: http://security\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
-              sed -Ei 's#^(URIs: )http://((archive|security)\.ubuntu\.com/ubuntu/?)$#\1https://\2#' /etc/apt/sources.list.d/ubuntu.sources
-              grep -Eq '^URIs: https://archive\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
-              grep -Eq '^URIs: https://security\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
-              if grep -Eq '^URIs: http://(archive|security)\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources; then exit 1; fi
-              apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
                 ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish jq zstd \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
@@ -568,10 +678,14 @@ jobs:
             rust_components: |
               "$HOME/.cargo/bin/rustup" component add clippy rustfmt
 
-    container: &linux_container
+    container:
       image: ${{ matrix.image }}
 
-    steps: &linux_steps
+    steps:
+      - name: Configure signed Ubuntu archive before checkout
+        if: matrix.platform == 'ubuntu-2604'
+        uses: omg-cli/omg/.github/actions/ubuntu-apt@572076847a70f932757630c0f7d487ca6e8de64f
+
       - name: Setup environment
         run: ${{ matrix.setup }}
 
@@ -1099,11 +1213,6 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-      - name: Platform clippy
-        if: matrix.phase == 'clippy'
-        run: |
-          cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
-            --locked -- -D warnings
 
       - name: Test emitted shell hooks
         if: matrix.phase == 'validation' && matrix.platform == 'fedora'
@@ -1233,6 +1342,33 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Platform clippy
+        id: native-clippy
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
+            --locked -- -D warnings
+
+
+      - name: Record native Clippy execution
+        if: always()
+        shell: bash
+        env:
+          NATIVE_CLIPPY_OUTCOME: ${{ steps.native-clippy.outcome }}
+        run: |
+          python3 scripts/native-build-artifact.py clippy-record --platform '${{ matrix.platform }}' \
+            --image '${{ matrix.image }}' --features '${{ matrix.features }}' \
+            --destination "$RUNNER_TEMP/native-clippy"
+
+      - name: Preserve native Clippy execution
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-clippy-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-clippy/
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Preserve compiled parser surfaces
         if: always() && matrix.phase == 'validation'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1243,23 +1379,31 @@ jobs:
           if-no-files-found: error
 
   linux-clippy:
-    name: "Linux clippy (${{ matrix.platform }})"
+    name: Native Clippy proof
     needs: [quick-gate, linux-matrix]
     if: >-
       !cancelled() && needs.quick-gate.result == 'success' &&
       (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env: *linux_environment
-    strategy:
-      fail-fast: false
-      max-parallel: 5
-      matrix:
-        phase: [clippy]
-        platform: *linux_platforms
-        include: *linux_images
-    container: *linux_container
-    steps: *linux_steps
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Require all five native Clippy executions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/native-build-artifact.py clippy-verify --destination "$RUNNER_TEMP/native-clippy-proof"
+      - name: Preserve verified native Clippy proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-clippy-summary-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-clippy-proof/
+          retention-days: 7
+          if-no-files-found: error
 
   sandbox-cancellation:
     name: "AUR sandbox security regressions"
@@ -1680,9 +1824,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Configure signed Ubuntu archive
+        uses: ./.github/actions/ubuntu-apt
+
       - name: Install Dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libapt-pkg-dev python3-apt python3-venv fish \
             pkg-config \
@@ -1810,40 +1956,67 @@ jobs:
   #############################################################################
   # STAGE 4: Final Status Gate
   #############################################################################
-  # NOTE: no `integration` job exists in this workflow; it was referenced here
-  # but never defined, which made ci-success unresolvable on GitHub and broke
-  # the entire pipeline gate. Local act runs also skip the macos leg, so a
-  # skipped macos result is accepted as passing. A skipped platform job must
-  # not mint a release tag.
+  # Every selected native platform must succeed before release tagging.
   # This job stays read-only: pull_request events execute the merge-ref
   # (PR-controlled) copy of this file, so a PR must never be able to run
   # workflow code holding a write-scoped token. All write-scoped steps live
   # in the push-to-main-only release-tag job below.
   qemu-preflight:
     name: QEMU behavioral verification preflight
-    needs: quick-gate
+    needs: [quick-gate, workflow-checks]
     if: >-
-      (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      !cancelled() && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       needs.quick-gate.result == 'success' &&
       (github.event_name == 'merge_group' || needs.quick-gate.outputs.should-build == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
       - uses: ./.github/actions/qemu-preflight
+        with:
+          current-ci-helpers: 'true'
+
+  native-readiness:
+    name: Native artifact readiness
+    needs: qemu-preflight
+    if: needs.qemu-preflight.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Wait for exact current native artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: timeout --kill-after=5s 1850s python3 scripts/native-build-artifact.py ready --timeout 1800 --destination "$RUNNER_TEMP/native-readiness"
+      - name: Preserve native readiness
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: native-readiness-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-readiness/
+          retention-days: 7
+          if-no-files-found: error
 
   qemu:
     name: QEMU behavioral verification (non-Fedora)
-    needs: [qemu-preflight, linux-matrix, ubuntu]
+    needs: [qemu-preflight, native-readiness]
     if: >-
       !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
     with:
       partition: non-fedora
       preflight-result: ${{ needs.qemu-preflight.result }}
+      native-readiness-result: ${{ needs.native-readiness.result }}
     permissions:
       contents: read
       actions: read
@@ -1852,13 +2025,14 @@ jobs:
 
   qemu-fedora:
     name: QEMU behavioral verification (Fedora)
-    needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]
+    needs: [qemu-preflight, native-readiness, fedora-sqlite]
     if: >-
       !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
     with:
       partition: fedora
       preflight-result: ${{ needs.qemu-preflight.result }}
+      native-readiness-result: ${{ needs.native-readiness.result }}
     permissions:
       contents: read
       actions: read
@@ -1923,13 +2097,24 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, workflow-checks, standalone-suites, portable, portable-release, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, qemu-fedora, docs-audit, runtime-usage]
+    needs: [quick-gate, workflow-checks, standalone-suites, portable, portable-release, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, native-readiness, qemu, qemu-fedora, docs-audit, runtime-usage]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
+      actions: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Admit complete helper identity union
+        if: needs.workflow-checks.result == 'success' && (github.event_name == 'push' || needs.quick-gate.outputs.checks-required == 'true')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/workflow-helpers.py admit --current-run --timeout 120 --output "$RUNNER_TEMP/workflow-helper-admission.json"
+
       - name: Evaluate results
         env:
           BUILD_REQUIRED: ${{ needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group' }}
@@ -1947,6 +2132,7 @@ jobs:
           MACOS_NEXTEST_SOURCE: ${{ needs.macos-nextest-source.result }}
           UBUNTU: ${{ needs.ubuntu.result }}
           RUNTIME_USAGE: ${{ needs.runtime-usage.result }}
+          NATIVE_READINESS: ${{ needs.native-readiness.result }}
           QEMU: ${{ needs.qemu.result }}
           QEMU_FEDORA: ${{ needs.qemu-fedora.result }}
           QEMU_REQUIRED: ${{ github.event_name == 'merge_group' || ((github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true') }}
@@ -1970,6 +2156,7 @@ jobs:
           echo "| macOS nextest source contract | $MACOS_NEXTEST_SOURCE |" >> $GITHUB_STEP_SUMMARY
           echo "| Ubuntu | $UBUNTU |" >> $GITHUB_STEP_SUMMARY
           echo "| Runtime usage accounting | $RUNTIME_USAGE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Native artifact readiness | $NATIVE_READINESS |" >> $GITHUB_STEP_SUMMARY
           echo "| QEMU non-Fedora | $QEMU |" >> $GITHUB_STEP_SUMMARY
           echo "| QEMU Fedora | $QEMU_FEDORA |" >> $GITHUB_STEP_SUMMARY
           echo "| Docs audit | $DOCS_AUDIT |" >> $GITHUB_STEP_SUMMARY
@@ -1979,6 +2166,10 @@ jobs:
             exit 1
           fi
 
+          if [[ "$QEMU_REQUIRED" == "true" && "${NATIVE_READINESS:-}" != "success" ]]; then
+            echo "::error::Native artifact readiness did not succeed: ${NATIVE_READINESS:-missing}"
+            exit 1
+          fi
           if [[ "$QEMU_REQUIRED" == "true" && ( "$QEMU" != "success" || "$QEMU_FEDORA" != "success" ) ]]; then
             echo "::error::Required QEMU verification did not succeed: non-Fedora=$QEMU Fedora=$QEMU_FEDORA"
             exit 1

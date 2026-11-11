@@ -30,6 +30,9 @@ on:
       preflight-result:
         type: string
         default: ''
+      native-readiness-result:
+        type: string
+        default: ''
     secrets:
       OMG_SMOKE_SENTRY_DSN:
         required: false
@@ -102,6 +105,11 @@ jobs:
         if: inputs.preflight-result != '' && inputs.preflight-result != 'success'
         run: |
           echo '::error::Required QEMU preflight did not pass'
+          exit 1
+      - name: Require native artifact readiness
+        if: inputs.native-readiness-result != '' && inputs.native-readiness-result != 'success'
+        run: |
+          echo '::error::Required current native artifacts did not become ready'
           exit 1
       - name: Verify QEMU preflight
         if: inputs.preflight-result == ''
@@ -446,6 +454,9 @@ jobs:
       (needs.build-staged-ubuntu-arm.result == 'success' || needs.build-staged-ubuntu-arm.result == 'skipped')
     runs-on: ${{ vars.OMG_QEMU_ARM_RUNNER || 'ubuntu-24.04-arm' }}
     timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -512,8 +523,9 @@ jobs:
         if: matrix.distro == 'fedora'
         env:
           SOURCE_REVISION: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          bundle=$(python3 scripts/fedora-sqlite.py select "$RUNNER_TEMP/fedora-sqlite-inputs" \
+          bundle=$(timeout --kill-after=5s 360s python3 scripts/fedora-sqlite.py select "$RUNNER_TEMP/fedora-sqlite-inputs" \
             --arch aarch64 --attempt "$GITHUB_RUN_ATTEMPT" --revision "$SOURCE_REVISION")
           printf 'FEDORA_SQLITE_BUNDLE=%s\n' "$bundle" >> "$GITHUB_ENV"
 

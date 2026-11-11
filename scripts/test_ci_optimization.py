@@ -244,9 +244,12 @@ class OptimizationContracts(unittest.TestCase):
                 self.assertNotIn(old_prefix, text)
 
     def test_compiler_cache_upload_contains_both_diagnostics_in_one_directory(self):
-        for filename, job in (('ci.yml', 'portable'), ('ci.yml', 'portable-release'),
-                              ('benchmark.yml', 'benchmark')):
-            with self.subTest(workflow=filename, job=job), tempfile.TemporaryDirectory() as directory:
+        cases = [(filename, job, mode)
+                 for filename, job in (('ci.yml', 'portable'), ('ci.yml', 'portable-release'),
+                                       ('benchmark.yml', 'benchmark'))
+                 for mode in (('main', 'READ_ONLY') if filename == 'ci.yml' else ('main',))]
+        for filename, job, mode in cases:
+            with self.subTest(workflow=filename, job=job, mode=mode), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 tools = root / 'bin'
                 tools.mkdir()
@@ -258,10 +261,18 @@ class OptimizationContracts(unittest.TestCase):
                 report = re.search(r'(?m)^      - name: Report .* compiler cache\n', block)
                 report_step = block[report.end():].split('\n      - ', 1)[0]
                 script = textwrap.dedent(report_step.split('        run: |\n', 1)[1])
+                metadata = dict(OMG_R2_CACHE_MODE='READ_ONLY', OMG_R2_CACHE_SEED_RECIPE='b' * 64,
+                                OMG_R2_CACHE_POLICY='portable-read-v1', OMG_R2_CACHE_EXPIRES_AT='1794424500')
+                environment = {name: value for name, value in os.environ.items() if name not in metadata}
+                if mode == 'READ_ONLY' or filename == 'benchmark.yml':
+                    environment.update(metadata)
+                prefix = 'portable-v1/' if filename == 'ci.yml' else 'benchmark-v1/'
+                credentials = dict(AWS_ACCESS_KEY_ID='fixture-access-key', AWS_SECRET_ACCESS_KEY='fixture-secret-key',
+                                   AWS_SESSION_TOKEN='fixture-session-token', ACTIONS_ID_TOKEN_REQUEST_TOKEN='fixture-oidc-token')
                 result = subprocess.run([BASH, '-eu', '-c', script], capture_output=True, text=True,
-                    env=dict(os.environ, PATH=tools.as_posix() + os.pathsep + os.environ['PATH'],
+                    env=dict(environment, **credentials, PATH=tools.as_posix() + os.pathsep + os.environ['PATH'],
                              RUNNER_TEMP=root.as_posix(), GITHUB_SHA='a' * 40,
-                             SCCACHE_S3_KEY_PREFIX='benchmark-v1/'), timeout=10)
+                             SCCACHE_S3_KEY_PREFIX=prefix), timeout=10)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 upload = re.split(r'      - name: Preserve .* compiler cache diagnostics\n', block)[1]
                 path = re.search(r'(?m)^          path: (.+)$', upload).group(1)
@@ -271,8 +282,15 @@ class OptimizationContracts(unittest.TestCase):
                                  ['omg-r2-cache-context.txt', 'omg-r2-cache-stats.json'])
                 self.assertEqual(json.loads((uploaded / 'omg-r2-cache-stats.json').read_text()),
                                  {'stats': {'cache_read_errors': 0}})
-                self.assertEqual((uploaded / 'omg-r2-cache-context.txt').read_text(),
-                                 'source=' + 'a' * 40 + '\nprefix=benchmark-v1/\n')
+                context = (uploaded / 'omg-r2-cache-context.txt').read_text()
+                expected = 'source=' + 'a' * 40 + f'\nprefix={prefix}\n'
+                if filename == 'ci.yml':
+                    expected += ('mode=READ_ONLY\nrecipe=' + 'b' * 64 + '\npolicy=portable-read-v1\nexpires=1794424500\n'
+                                 if mode == 'READ_ONLY' else 'mode=main\nrecipe=\npolicy=\nexpires=\n')
+                self.assertEqual(context, expected)
+                for name, value in credentials.items():
+                    self.assertNotIn(name, context)
+                    self.assertNotIn(value, context + result.stdout + result.stderr)
 
     def test_ci_profiles_do_not_retry_failures(self):
         config = tomllib.loads((ROOT / '.config/nextest.toml').read_text())

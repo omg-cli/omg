@@ -44,6 +44,66 @@ class FedoraSQLiteTests(unittest.TestCase):
     def save(self):
         (self.bundle/'manifest.json').write_text(json.dumps(self.manifest))
 
+    def test_cached_source_keeps_manifest_and_requires_current_admission_digest(self):
+        import subprocess
+        import sys
+        import time
+        original = (self.bundle/'manifest.json').read_bytes()
+        now = int(time.time())
+        (self.bundle/'baseline.tar').write_bytes(b'fixture archive')
+        (self.bundle/'baseline.sigstore.json').write_bytes(b'fixture proof')
+        admission = dict(schema_version=1, consumer_sha='b'*40, consumer_run_id='91',
+            consumer_run_attempt=2, build_source_sha=REVISION, build_run_id='41', build_run_attempt=1,
+            disposition='cache-hit',
+            manifest_sha256=sqlite.digest(self.bundle/'manifest.json'),
+            packages_sha256=self.manifest['files']['packages.tsv'], built_at=now-30,
+            verified_tlog_at=now-15,
+            recipe_sha256='c'*64, inventory_sha256='d'*64,
+            archive_sha256=sqlite.digest(self.bundle/'baseline.tar'),
+            proof_sha256=sqlite.digest(self.bundle/'baseline.sigstore.json'))
+        (self.bundle/'admission.json').write_text(json.dumps(admission))
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = Path(tmp)/'policy.json'
+            policy.write_text(json.dumps(self.policy))
+            command = [sys.executable, '-B', str(ROOT/'scripts/fedora-sqlite.py'), 'verify',
+                str(self.bundle), '--policy', str(policy), '--arch', 'x86_64', '--revision', 'b'*40,
+                '--run-id', '91', '--run-attempt', '2', '--admission-sha256',
+                sqlite.digest(self.bundle/'admission.json')]
+            accepted = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual((self.bundle/'manifest.json').read_bytes(), original)
+            command[-1] = '0'*64
+            rejected = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('admission digest', rejected.stderr)
+
+    def test_malformed_cached_tar_falls_back_to_the_original_cold_source_path(self):
+        import tarfile
+        destination = self.bundle/'cold'/'fedora-sqlite-x86_64-1'
+        original_read = Path.read_text
+        def release(path, *args, **kwargs):
+            if path == Path('/etc/os-release'):
+                return 'ID=fedora\nVERSION_ID=44\n'
+            return original_read(path, *args, **kwargs)
+        def command(arguments, **options):
+            if str(arguments[0]) == 'curl':
+                raise ValueError('complete cold source path reached')
+        with mock.patch.object(sqlite.platform, 'system', return_value='Linux'), \
+                mock.patch.object(sqlite.platform, 'machine', return_value='x86_64'), \
+                mock.patch.object(sqlite.os, 'geteuid', return_value=0, create=True), \
+                mock.patch.object(Path, 'read_text', release), \
+                mock.patch.object(sqlite.subprocess, 'check_output', return_value=REVISION+'\n'), \
+                mock.patch.object(sqlite, 'run', side_effect=command), \
+                mock.patch.object(sqlite.runpy, 'run_path', return_value={
+                    'inventory': lambda diagnostics: [], 'canonical': lambda value: b'[]\n',
+                    'restore': mock.Mock(side_effect=tarfile.ReadError('bad cached tar'))}), \
+                mock.patch.dict(os.environ, GITHUB_EVENT_NAME='push'):
+            with self.assertRaisesRegex(ValueError, 'complete cold source path reached'):
+                sqlite.build_bundle(destination, sqlite.DEFAULT_POLICY, self.policy, REVISION, reuse=True)
+        refusal = destination.parent/'diagnostics'/destination.name/'cache-refusal.json'
+        self.assertEqual(json.loads(refusal.read_text())['error'], 'ReadError')
+        self.assertFalse((destination/'manifest.json').exists())
+
     def test_failed_dependency_download_preserves_diagnostics_without_admitting_a_bundle(self):
         destination = self.bundle/'failed'/'fedora-sqlite-x86_64-1'
         observed = []
@@ -125,7 +185,7 @@ class FedoraSQLiteTests(unittest.TestCase):
                 result = subprocess.run(['bash', '-euo', 'pipefail', '-c', script],
                     env=dict(os.environ, PATH=str(tools)+os.pathsep+os.environ['PATH'],
                              RUNNER_TEMP=str(root), NATIVE_ARCH='x86_64', SOURCE_REVISION=REVISION,
-                             GITHUB_RUN_ATTEMPT=str(attempt), FIXTURE_SUPPLY=str(self.bundle)),
+                             GITHUB_RUN_ATTEMPT=str(attempt), FIXTURE_SUPPLY=str(self.bundle), REUSE_SQLITE='true'),
                     capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 upload = root/'fedora-sqlite'

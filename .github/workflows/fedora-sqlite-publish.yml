@@ -1,0 +1,124 @@
+name: Publish existing checked SQLite supply
+on:
+  workflow_call:
+    inputs:
+      arch:
+        required: true
+        type: string
+      artifact-id:
+        required: true
+        type: string
+      artifact-digest:
+        required: true
+        type: string
+    secrets:
+      OMG_R2_CACHE_ACCESS_KEY_ID:
+        required: true
+      OMG_R2_CACHE_SECRET_ACCESS_KEY:
+        required: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  publish:
+    name: "Optional checked SQLite baseline publication (${{ inputs.arch }})"
+    continue-on-error: true
+    if: >-
+      github.repository_id == '1133413326' && github.repository_owner_id == '329545359' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - id: download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ inputs.artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/fedora-sqlite
+      - name: Package the existing successful full build
+        id: package
+        continue-on-error: true
+        env:
+          NATIVE_ARCH: ${{ inputs.arch }}
+          SUPPLY_ARTIFACT_ID: ${{ inputs.artifact-id }}
+          SUPPLY_ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/fedora-sqlite-baseline.py pack \
+            "$RUNNER_TEMP/fedora-sqlite/fedora-sqlite-$NATIVE_ARCH-$GITHUB_RUN_ATTEMPT" \
+            --arch "$NATIVE_ARCH" --output "$RUNNER_TEMP/sqlite-publication" \
+            --artifact-id "$SUPPLY_ARTIFACT_ID" --artifact-digest "$SUPPLY_ARTIFACT_DIGEST"
+      - name: Attest the original checked archive
+        id: attest
+        if: steps.package.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/sqlite-publication/sqlite-baseline.tar
+      - name: Publish immutable bytes then conditional pointer
+        id: publish
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        env:
+          NATIVE_ARCH: ${{ inputs.arch }}
+          GH_TOKEN: ${{ github.token }}
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp -- "$ATTESTATION_BUNDLE" "$RUNNER_TEMP/sqlite-publication/attestation.sigstore.json"
+          python3 scripts/fedora-sqlite-baseline.py publish "$RUNNER_TEMP/sqlite-publication" \
+            --arch "$NATIVE_ARCH" --proof "$RUNNER_TEMP/sqlite-publication/attestation.sigstore.json"
+      - name: Record cache publication disposition
+        if: always()
+        env:
+          PUBLICATION: ${{ steps.publish.outcome }}
+          CHECKOUT_RESULT: ${{ steps.checkout.outcome }}
+          DOWNLOAD_RESULT: ${{ steps.download.outcome }}
+          PACKAGE_RESULT: ${{ steps.package.outcome }}
+          ATTEST_RESULT: ${{ steps.attest.outcome }}
+          SUPPLY_ARTIFACT_ID: ${{ inputs.artifact-id }}
+          SUPPLY_ARTIFACT_DIGEST: ${{ inputs.artifact-digest }}
+        run: |
+          if [[ "$PUBLICATION" != success ]]; then
+            echo '::warning::Optional SQLite baseline publication did not complete; full current RPM proof remains authoritative'
+          fi
+          printf 'SQLite cache publication: %s. Original full RPM checks were not rerun.\n' "$PUBLICATION" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          stages = {name.lower(): os.environ.get(name+'_RESULT') or 'unavailable'
+                    for name in ('CHECKOUT', 'DOWNLOAD', 'PACKAGE', 'ATTEST')}
+          stages['publish'] = os.environ.get('PUBLICATION') or 'unavailable'
+          receipt = dict(schema_version=1, source_sha=os.environ['GITHUB_SHA'],
+              run_id=os.environ['GITHUB_RUN_ID'], run_attempt=int(os.environ['GITHUB_RUN_ATTEMPT']),
+              supply_artifact_id=os.environ['SUPPLY_ARTIFACT_ID'],
+              supply_artifact_digest=os.environ['SUPPLY_ARTIFACT_DIGEST'], stages=stages,
+              disposition='published' if stages['publish'] == 'success' else 'degraded',
+              tests_executed_by_publisher=False)
+          directory = Path(os.environ['RUNNER_TEMP'])/'sqlite-publication'
+          directory.mkdir(parents=True, exist_ok=True)
+          (directory/'publication-status.json').write_text(json.dumps(receipt, indent=2)+'\n')
+          PY
+      - name: Preserve publication and failed-attempt evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora-sqlite-publication-${{ inputs.arch }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sqlite-publication/
+          retention-days: 30
+          if-no-files-found: warn

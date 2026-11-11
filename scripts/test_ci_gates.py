@@ -46,48 +46,35 @@ class NativePhaseMatrixTests(unittest.TestCase):
             self.job, re.MULTILINE | re.DOTALL,
         ))
 
-    def test_all_platforms_have_required_validation_and_clippy_with_five_runner_limit(self) -> None:
-        clippy = job_block(self.workflow, "linux-clippy")
-        self.assertIn("        phase: [validation]\n", self.job)
-        self.assertIn("        phase: [clippy]\n", clippy)
-        self.assertIn("    needs: [quick-gate, linux-matrix]\n", clippy)
+    def test_all_five_platforms_reuse_native_targets_for_required_clippy(self) -> None:
+        proof = job_block(self.workflow, "linux-clippy")
+        self.assertIn("    needs: [quick-gate, linux-matrix]\n", proof)
         platforms = ["arch", "debian", "debian-trixie", "ubuntu-2604", "fedora"]
-        match = re.search(r"^        platform: &linux_platforms \[([^\]]+)\]$", self.job, re.MULTILINE)
+        match = re.search(r"^        platform: \[([^\]]+)\]$", self.job, re.MULTILINE)
         self.assertIsNotNone(match)
         assert match is not None
         self.assertEqual(match.group(1).split(", "), platforms)
-        for field, anchor in (("platform", "linux_platforms"), ("include", "linux_images"),
-                              ("env", "linux_environment"), ("container", "linux_container"),
-                              ("steps", "linux_steps")):
-            self.assertRegex(self.job, rf"(?m)^\s+{field}: &{anchor}\b")
-            self.assertRegex(clippy, rf"(?m)^\s+{field}: \*{anchor}$")
-        rows = re.findall(
-            r"^          - platform: (\S+)\n(.*?)(?=^          - platform:|^    container:)",
-            self.job, re.MULTILINE | re.DOTALL,
-        )
-        self.assertEqual([platform for platform, _ in rows], platforms)
-        for platform, metadata in rows:
-            for field in ("image", "features", "setup", "rust_install", "rust_components"):
-                self.assertRegex(metadata, rf"(?m)^            {field}: .+")
-            self.assertNotRegex(metadata, r"(?m)^            phase:")
-        self.assertIn(
-            "    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && "
-            "matrix.phase == 'validation' && 45 || 30 }}\n", self.job,
-        )
-        for job in (self.job, clippy):
-            self.assertIn("      max-parallel: 5\n", job)
-            self.assertIn("      fail-fast: false\n", job)
-            self.assertNotIn("continue-on-error", job)
-            self.assertNotIn("exclude:", job)
-        self.assertIn("matrix.phase == 'validation' && format('Linux ({0})', matrix.platform)", self.job)
-        self.assertIn("format('Linux clippy ({0})', matrix.platform)", self.job)
-        self.assertIn("linux-matrix", job_block(self.workflow, "ci-success").split("    steps:", 1)[0])
-        self.assertIn("linux-clippy", job_block(self.workflow, "ci-success").split("    steps:", 1)[0])
-        self.assertIn("needs: [quick-gate, linux-matrix]", job_block(self.workflow, "sandbox-cancellation"))
-        self.assertIn("needs: [qemu-preflight, linux-matrix, ubuntu]", job_block(self.workflow, "qemu"))
-        self.assertIn("needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]", job_block(self.workflow, "qemu-fedora"))
+        self.assertIn("      max-parallel: 5\n", self.job)
+        self.assertIn("      fail-fast: false\n", self.job)
+        self.assertNotIn("continue-on-error", self.job)
+        self.assertNotIn("exclude:", self.job)
+        self.assertIn("    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && 75 || 60 }}", self.job)
+        self.assertNotIn("container:", proof)
+        self.assertNotIn("strategy:", proof)
+        self.assertIn("native-build-artifact.py clippy-verify", proof)
+        self.assertLess(self.job.index("- name: Upload native release pair"), self.job.index("- name: Platform clippy"))
+        self.assertLess(self.job.index("- name: Run serial library and binary contracts"), self.job.index("- name: Platform clippy"))
+        self.assertIn("id: native-clippy", self.steps["Platform clippy"])
+        self.assertIn("native-build-artifact.py clippy-record", self.job)
+        self.assertIn("NATIVE_CLIPPY_OUTCOME: ${{ steps.native-clippy.outcome }}", self.job)
+        self.assertIn("name: native-clippy-${{ matrix.platform }}-${{ github.run_attempt }}", self.job)
+        final = job_block(self.workflow, "ci-success").split("    steps:", 1)[0]
+        self.assertIn("linux-matrix", final)
+        self.assertIn("linux-clippy", final)
+        self.assertIn("needs: [qemu-preflight, native-readiness]", job_block(self.workflow, "qemu"))
+        self.assertIn("needs: [qemu-preflight, native-readiness, fedora-sqlite]", job_block(self.workflow, "qemu-fedora"))
 
-    def test_validation_outputs_and_commands_never_run_in_clippy_phase(self) -> None:
+    def test_native_validation_and_clippy_keep_all_existing_commands(self) -> None:
         validation = "matrix.phase == 'validation'"
         conditions = {
             "Run unit tests": validation,
@@ -108,7 +95,7 @@ class NativePhaseMatrixTests(unittest.TestCase):
             "Verify binary": validation,
             "Upload binary": validation,
             "Preserve compiled parser surfaces": "always() && " + validation,
-            "Platform clippy": "matrix.phase == 'clippy'",
+            "Platform clippy": "${{ !cancelled() }}",
         }
         for name, condition in conditions.items():
             with self.subTest(step=name):
@@ -180,11 +167,9 @@ class QuickGateOfflineTests(unittest.TestCase):
             portable,
             "portable job must own the relocated shell-completion check",
         )
-        self.assertIn(
-            "--error-on=any",
-            portable,
-            "portable apt update must fail closed with --error-on=any + retry",
-        )
+        self.assertIn("uses: ./.github/actions/ubuntu-apt", portable)
+        archive_setup = (CI_YML.parents[2] / ".github/actions/ubuntu-apt/setup.sh").read_text()
+        self.assertIn("APT::Update::Error-Mode=any", archive_setup)
         self.assertIn(
             "timeout -k 10s 30s zsh tests/shell_completion.zsh",
             portable,
@@ -194,80 +179,80 @@ class QuickGateOfflineTests(unittest.TestCase):
 
 class UbuntuMirrorSetupTests(unittest.TestCase):
     def test_ca_bootstrap_precedes_exact_https_rewrite_and_stops_failures(self) -> None:
+        from test_ubuntu_apt_setup import UbuntuAptSetup
+
         workflow = CI_YML.read_text(encoding="utf-8")
-        row = job_block(workflow, "linux-matrix").split("          - platform: ubuntu-2604\n", 1)[1]
+        matrix = job_block(workflow, "linux-matrix")
+        self.assertLess(matrix.index("Configure signed Ubuntu archive before checkout"),
+                        matrix.index("name: Setup environment"))
+        self.assertRegex(matrix, r"uses: omg-cli/omg/\.github/actions/ubuntu-apt@[a-f0-9]{40}")
+        row = matrix.split("          - platform: ubuntu-2604\n", 1)[1]
         setup = row.split("            setup: |\n", 1)[1].split("            rust_install:", 1)[0]
-        script = "\n".join(line[14:] for line in setup.splitlines())
-        script = script[script.index("apt-get update"):script.index("ldconfig -p")]
+        install = "\n".join(line[14:] for line in setup.splitlines())
+        install = install[install.index("DEBIAN_FRONTEND=noninteractive"):install.index("ldconfig -p")]
         expected_packages = [
             "ca-certificates", "curl", "git", "build-essential", "pkg-config", "sudo",
             "python3", "python3-apt", "python3-venv", "fish", "jq", "zstd",
             "libssl-dev", "libapt-pkg-dev", "clang", "cmake", "zlib1g-dev", "liblzma-dev", "libbz2-dev",
         ]
-        for forbidden in ("Verify-Peer", "Verify-Host", "trusted=yes", "--allow-unauthenticated"):
-            self.assertNotIn(forbidden, script)
         scenarios = [
-            ("success", "", 0, 4), ("success-slash", "/", 0, 4),
+            ("success", "", 0, 4), ("success-slash", "/", 0, 4), ("canonical-dns", "", 0, 4),
             ("apt-1", "", 41, 1), ("apt-2", "", 42, 2),
             ("apt-3", "", 43, 3), ("apt-4", "", 44, 4),
-            ("missing-ca", "", 1, 2), ("unknown-archive", "", 1, 2), ("unknown-security", "", 1, 2),
+            ("missing-ca", "", 1, 2), ("unknown-archive", "", 1, 0), ("unknown-security", "", 1, 0),
         ]
-        for scenario, slash, exit_code, expected_calls in scenarios:
+        helper = UbuntuAptSetup("test_dns_failure_uses_independent_mirror")
+        for scenario, slash, status, expected_calls in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                sources = root / "ubuntu.sources"
-                certificate = root / "ca-certificates.crt"
-                receipt = root / "apt.jsonl"
-                original = (
-                    "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu" + slash + "\n"
-                    "Suites: resolute resolute-updates resolute-backports\nComponents: main universe restricted multiverse\n"
-                    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n"
-                    "Types: deb\nURIs: http://security.ubuntu.com/ubuntu" + slash + "\n"
-                    "Suites: resolute-security\nComponents: main universe restricted multiverse\n"
-                    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
-                )
+                fixture = helper.fixture(root, ca=False, codename="resolute")
+                original = fixture["source"].read_text().replace("/ubuntu/\n", "/ubuntu" + slash + "\n")
                 if scenario == "unknown-archive":
                     original = original.replace("archive.ubuntu.com", "unexpected.example")
                 if scenario == "unknown-security":
                     original = original.replace("security.ubuntu.com", "unexpected.example")
-                sources.write_text(original, encoding="utf-8")
-                apt = root / "apt-get"
+                fixture["source"].write_text(original)
+                receipt = root / "apt.jsonl"
+                apt = root / "bin/apt-get"
                 apt.write_text(
                     f"#!{sys.executable}\n"
                     "import json,os,sys\nfrom pathlib import Path\n"
                     "receipt=Path(os.environ['APT_RECEIPT'])\n"
                     "prior=receipt.read_text().splitlines() if receipt.exists() else []\n"
-                    "with receipt.open('a') as out:out.write(json.dumps({'args':sys.argv[1:],'sources':Path(os.environ['APT_SOURCES']).read_text()})+'\\n')\n"
+                    "sources=Path(os.environ['SOURCE_PATH']).read_text()\n"
+                    "with receipt.open('a') as out:out.write(json.dumps({'args':sys.argv[1:],'sources':sources})+'\\n')\n"
                     "scenario=os.environ['APT_SCENARIO']\n"
-                    "number=len(prior)+1\n"
-                    "if scenario=='apt-'+str(number):sys.exit(40+number)\n"
-                    "if sys.argv[-1]=='ca-certificates' and scenario!='missing-ca':Path(os.environ['APT_CA']).write_text('fixture CA')\n",
+                    "if scenario=='canonical-dns' and any(host in sources for host in ('archive.ubuntu.com','security.ubuntu.com')):sys.exit(100)\n"
+                    "if scenario=='apt-'+str(len(prior)+1):sys.exit(41+len(prior))\n"
+                    "if sys.argv[-1]=='ca-certificates' and scenario!='missing-ca':Path(os.environ['CA_PATH']).write_text('fixture CA')\n",
                     encoding="utf-8",
                 )
                 apt.chmod(0o755)
-                fixture_script = script.replace("/etc/apt/sources.list.d/ubuntu.sources", str(sources))
-                fixture_script = fixture_script.replace("/etc/ssl/certs/ca-certificates.crt", str(certificate))
-                result = subprocess.run(
-                    ["bash", "-e", "-c", fixture_script], cwd=root,
-                    env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", APT_RECEIPT=str(receipt),
-                             APT_SOURCES=str(sources), APT_CA=str(certificate), APT_SCENARIO=scenario),
-                    capture_output=True, text=True, timeout=10, check=False,
-                )
-                self.assertEqual(result.returncode, exit_code, result.stderr)
-                calls = [json.loads(line) for line in receipt.read_text(encoding="utf-8").splitlines()]
+                fixture["script"] += "\n" + install
+                for forbidden in ("Verify-Peer", "Verify-Host", "trusted=yes", "--allow-unauthenticated"):
+                    self.assertNotIn(forbidden, fixture["script"])
+                result = helper.execute(fixture, APT_RECEIPT=str(receipt), APT_SCENARIO=scenario)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in receipt.read_text().splitlines()] if receipt.exists() else []
                 self.assertEqual(len(calls), expected_calls)
-                self.assertEqual(calls[0]["args"], ["update"])
+                http_source = re.sub(r"(?m)^URIs: http://(?:archive|security)\.ubuntu\.com/ubuntu/?$",
+                                     "URIs: http://mirrors.edge.kernel.org/ubuntu/", original)
+                https_source = http_source.replace("URIs: http://", "URIs: https://")
+                if calls:
+                    self.assertEqual(calls[0]["args"][-1], "update")
+                    self.assertIn("APT::Update::Error-Mode=any", calls[0]["args"])
+                    self.assertEqual(calls[0]["sources"], http_source)
                 if len(calls) >= 2:
-                    self.assertEqual(calls[1]["args"], ["install", "-y", "--no-install-recommends", "ca-certificates"])
-                    self.assertEqual(calls[1]["sources"], original)
+                    self.assertEqual(calls[1]["args"][-4:], ["install", "-y", "--no-install-recommends", "ca-certificates"])
+                    self.assertEqual(calls[1]["sources"], http_source)
                 if len(calls) >= 3:
-                    self.assertEqual(calls[2]["args"], ["update"])
-                    self.assertEqual(calls[2]["sources"], original.replace("URIs: http://", "URIs: https://"))
+                    self.assertEqual(calls[2]["args"][-1], "update")
+                    self.assertEqual(calls[2]["sources"], https_source)
                 if len(calls) >= 4:
                     self.assertEqual(calls[3]["args"], ["install", "-y", "--no-install-recommends", *expected_packages])
-                    self.assertEqual(calls[3]["sources"], calls[2]["sources"])
-                if len(calls) < 3:
-                    self.assertEqual(sources.read_text(encoding="utf-8"), original)
+                    self.assertEqual(calls[3]["sources"], https_source)
+                if not calls:
+                    self.assertEqual(fixture["source"].read_text(), original)
 
 
 class FedoraSetupSourceTests(unittest.TestCase):
@@ -517,9 +502,12 @@ class LocalCiGateExecutesTests(unittest.TestCase):
         )
         self.assertRegex(
             gate,
-            r"run:\s*make ci-workflow-quick",
-            "workflow checks must really execute `make ci-workflow-quick`",
+            r"run:\s*make ci-workflow-static",
+            "the first helper owner must execute static recipes",
         )
+        self.assertIn('python3 -B scripts/workflow-helpers.py run --shard', gate)
+        self.assertIn('--shards 2', gate)
+        self.assertIn('shard: [0, 1]', gate)
 
 
 class CiDeduplicationTests(unittest.TestCase):
@@ -544,7 +532,9 @@ class CiDeduplicationTests(unittest.TestCase):
 
     def test_workflow_checks_execute_shared_checks_only_once(self) -> None:
         gate = job_block(CI_YML.read_text(encoding="utf-8"), "workflow-checks")
-        self.assertEqual(gate.count("run: make ci-workflow-quick"), 1)
+        self.assertEqual(gate.count("run: make ci-workflow-static"), 1)
+        self.assertEqual(gate.count('python3 -B scripts/workflow-helpers.py run --shard'), 1)
+        self.assertIn('--static-complete --worker-checks --privileged-receipt', gate)
         result = subprocess.run(
             ["make", "--no-print-directory", "--dry-run", "ci-workflow-quick"],
             cwd=CI_YML.parents[2],
@@ -555,8 +545,11 @@ class CiDeduplicationTests(unittest.TestCase):
         )
         for command in [
             "cargo fmt --all -- --check",
-            "python3 -m unittest discover -s scripts -p 'test_*.py'",
-            "python3 tests/test_benchmark_records.py",
+            "python3 -B scripts/workflow-helpers.py run --static-complete",
+            "./scripts/test-release-smoke.sh",
+            "./scripts/test-qa-file-issue.sh",
+            "./scripts/test-qa-audit.sh",
+            "./scripts/test-qa-open-pr.sh",
         ]:
             with self.subTest(command=command):
                 self.assertNotIn(command, gate)
@@ -565,6 +558,31 @@ class CiDeduplicationTests(unittest.TestCase):
         self.assertEqual(result.stdout.count("bash -n"), 1)
         self.assertNotIn("cargo check", result.stdout)
         self.assertNotIn("cargo clippy", result.stdout)
+
+    def test_helper_manifest_keeps_every_former_python_selection(self) -> None:
+        import importlib.util
+
+        driver = CI_YML.parents[2] / 'scripts/workflow-helpers.py'
+        spec = importlib.util.spec_from_file_location('gate_helper_driver', driver)
+        helpers = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helpers)
+        explicit = (
+            'test_benchmark_records.py', 'test_terminal_update_notice.py', 'test_audit_repair_shell.py',
+            'test_changelog_workflow_security.py', 'test_ci_config_path_security.py',
+            'test_container_path_security.py', 'test_daemon_path_security.py', 'test_shell_backup_safety.py',
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'scripts').mkdir(); (root / 'tests').mkdir()
+            paths = ['scripts/test_gate_owned.py', 'tests/test_qemu_gate_owned.py'] + ['tests/' + name for name in explicit]
+            for path in paths:
+                (root / path).write_text('import unittest\nclass Owned(unittest.TestCase):\n def test_owned(self): pass\n')
+            manifest = helpers.discover(root)
+            self.assertEqual({row['path'] for row in manifest}, set(paths))
+            selected = [identity for shard in range(2) for row in helpers.selection(manifest, shard, 2)
+                        for identity in row['identities']]
+            self.assertEqual(len(selected), len(set(selected)))
+            self.assertEqual(set(selected), {identity for row in manifest for identity in row['identities']})
 
     def test_portable_keeps_tests_and_lints_without_repeating_gate_compilation(
         self,
@@ -593,33 +611,18 @@ class CiDeduplicationTests(unittest.TestCase):
             "cargo fmt --all -- --check",
             "cargo check --all-targets --no-default-features --features pgp,license --locked",
             "cargo check --manifest-path fuzz/Cargo.toml --all-targets --locked",
-            "python3 -m unittest discover -s scripts -p 'test_*.py'",
-            "python3 tests/test_terminal_update_notice.py",
+            "python3 -B scripts/workflow-helpers.py run --static-complete",
         ):
             self.assertEqual(result.stdout.count(command), 1, command)
 
     def test_workflow_recipe_executes_checks_and_propagates_failure(self) -> None:
         commands = [
             ["cargo", "fmt", "--all", "--", "--check"],
-            ["python3", "-m", "unittest", "discover", "-s", "tests", "-p", "test_qemu_*.py", "-v"],
             ["./scripts/test-release-smoke.sh"],
             ["./scripts/test-qa-file-issue.sh"],
             ["./scripts/test-qa-audit.sh"],
             ["./scripts/test-qa-open-pr.sh"],
-            ["python3", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_*.py", "-v"],
-            ["python3", "tests/test_benchmark_records.py"],
-            ["python3", "tests/test_terminal_update_notice.py"],
-            ["python3", "tests/test_audit_repair_shell.py"],
-            ["python3", "-B", "-m", "unittest", "discover", "-s", "tests",
-             "-p", "test_changelog_workflow_security.py", "-v"],
-            ["python3", "-B", "-m", "unittest", "discover", "-s", "tests",
-             "-p", "test_ci_config_path_security.py", "-v"],
-            ["python3", "-B", "-m", "unittest", "discover", "-s", "tests",
-             "-p", "test_container_path_security.py", "-v"],
-            ["python3", "-B", "-m", "unittest", "discover", "-s", "tests",
-             "-p", "test_daemon_path_security.py", "-v"],
-            ["python3", "-B", "-m", "unittest", "discover", "-s", "tests",
-             "-p", "test_shell_backup_safety.py", "-v"],
+            ["python3", "-B", "scripts/workflow-helpers.py", "run", "--static-complete"],
         ]
         for failed in range(len(commands) + 1):
             with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:

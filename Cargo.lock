@@ -81,8 +81,8 @@ dependencies = [
 
 [[package]]
 name = "alpm-common"
-version = "0.2.1"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=d8967aa5101aaacb6e92b3d3f8e706987246a2ab#bd241fb0b869212d0ee24e7b1f6fd7ed2e4c9d6f"
+version = "0.3.0"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
 dependencies = [
  "alpm-types",
  "fluent-i18n",
@@ -91,34 +91,59 @@ dependencies = [
 
 [[package]]
 name = "alpm-db"
-version = "0.2.2"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=d8967aa5101aaacb6e92b3d3f8e706987246a2ab#bd241fb0b869212d0ee24e7b1f6fd7ed2e4c9d6f"
+version = "0.3.0"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+dependencies = [
+ "alpm-common",
+ "alpm-mtree",
+ "alpm-parsers",
+ "alpm-types",
+ "fluent-i18n",
+ "log",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "strum",
+ "thiserror 2.0.20",
+ "uuid",
+ "winnow",
+]
+
+[[package]]
+name = "alpm-mtree"
+version = "0.4.0"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
 dependencies = [
  "alpm-common",
  "alpm-parsers",
  "alpm-types",
+ "flate2",
  "fluent-i18n",
+ "log",
  "serde",
- "serde_with",
  "strum",
  "thiserror 2.0.20",
- "winnow 0.7.14",
+ "which",
+ "winnow",
 ]
 
 [[package]]
 name = "alpm-parsers"
-version = "0.4.1"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=d8967aa5101aaacb6e92b3d3f8e706987246a2ab#bd241fb0b869212d0ee24e7b1f6fd7ed2e4c9d6f"
+version = "0.4.3"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
 dependencies = [
+ "colored",
  "serde",
  "testresult",
- "winnow 0.7.14",
+ "unicode-width",
+ "winnow",
 ]
 
 [[package]]
 name = "alpm-pkgbuild"
-version = "0.2.4"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=d8967aa5101aaacb6e92b3d3f8e706987246a2ab#bd241fb0b869212d0ee24e7b1f6fd7ed2e4c9d6f"
+version = "0.2.6"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
 dependencies = [
  "alpm-parsers",
  "alpm-types",
@@ -128,13 +153,13 @@ dependencies = [
  "strum",
  "thiserror 2.0.20",
  "which",
- "winnow 0.7.14",
+ "winnow",
 ]
 
 [[package]]
 name = "alpm-repo-db"
-version = "0.1.2"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=d8967aa5101aaacb6e92b3d3f8e706987246a2ab#bd241fb0b869212d0ee24e7b1f6fd7ed2e4c9d6f"
+version = "0.2.0"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
 dependencies = [
  "alpm-common",
  "alpm-parsers",
@@ -143,13 +168,13 @@ dependencies = [
  "serde",
  "strum",
  "thiserror 2.0.20",
- "winnow 0.7.14",
+ "winnow",
 ]
 
 [[package]]
 name = "alpm-srcinfo"
-version = "0.6.3"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=d8967aa5101aaacb6e92b3d3f8e706987246a2ab#bd241fb0b869212d0ee24e7b1f6fd7ed2e4c9d6f"
+version = "0.7.0"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
 dependencies = [
  "alpm-common",
  "alpm-parsers",
@@ -159,7 +184,7 @@ dependencies = [
  "serde",
  "strum",
  "thiserror 2.0.20",
- "winnow 0.7.14",
+ "winnow",
 ]
 
 [[package]]
@@ -173,30 +198,29 @@ dependencies = [
 
 [[package]]
 name = "alpm-types"
-version = "0.11.2"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=d8967aa5101aaacb6e92b3d3f8e706987246a2ab#bd241fb0b869212d0ee24e7b1f6fd7ed2e4c9d6f"
+version = "0.14.0"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
 dependencies = [
  "alpm-parsers",
- "base64 0.22.1",
- "blake2",
- "crc-fast",
- "digest 0.10.7",
+ "base64 0.23.1",
+ "blake2 0.11.0",
+ "crc",
+ "digest 0.11.3",
  "email_address",
  "fluent-i18n",
  "log",
  "md-5",
  "semver",
  "serde",
- "serde_json",
  "serde_with",
  "sha1",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "spdx",
  "strum",
  "thiserror 2.0.20",
  "time",
  "url",
- "winnow 0.7.14",
+ "winnow",
 ]
 
 [[package]]
@@ -302,7 +326,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
 dependencies = [
  "base64ct",
- "blake2",
+ "blake2 0.10.6",
  "cpufeatures 0.2.17",
  "password-hash",
 ]
@@ -542,6 +566,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "blake2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -884,6 +917,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
+name = "colored"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
+dependencies = [
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "colorgrad"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1045,16 +1087,6 @@ name = "crc-catalog"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
-
-[[package]]
-name = "crc-fast"
-version = "1.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
-dependencies = [
- "digest 0.10.7",
- "spin 0.10.1",
-]
 
 [[package]]
 name = "crc32fast"
@@ -1680,7 +1712,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1836,7 +1868,7 @@ version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
 dependencies = [
- "spin 0.9.9",
+ "spin",
 ]
 
 [[package]]
@@ -2842,7 +2874,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin 0.9.9",
+ "spin",
 ]
 
 [[package]]
@@ -3023,12 +3055,12 @@ dependencies = [
 
 [[package]]
 name = "md-5"
-version = "0.10.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
 dependencies = [
  "cfg-if",
- "digest 0.10.7",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -4706,15 +4738,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.1",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4773,7 +4805,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5200,13 +5232,13 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -5380,12 +5412,6 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
-
-[[package]]
-name = "spin"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spinning_top"
@@ -5608,7 +5634,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5834,7 +5860,7 @@ dependencies = [
  "toml_datetime",
  "toml_parser",
  "toml_writer",
- "winnow 1.0.4",
+ "winnow",
 ]
 
 [[package]]
@@ -5856,7 +5882,7 @@ dependencies = [
  "toml_datetime",
  "toml_parser",
  "toml_writer",
- "winnow 1.0.4",
+ "winnow",
 ]
 
 [[package]]
@@ -5865,7 +5891,7 @@ version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
- "winnow 1.0.4",
+ "winnow",
 ]
 
 [[package]]
@@ -6218,9 +6244,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.25.0"
+version = "1.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
+checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
 dependencies = [
  "getrandom 0.4.1",
  "js-sys",
@@ -6504,7 +6530,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6804,15 +6830,6 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
-
-[[package]]
-name = "winnow"
-version = "0.7.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winnow"

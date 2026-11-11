@@ -1,7 +1,7 @@
 //! AUR (Arch User Repository) client with build support
 
 use ahash::AHashSet;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -463,10 +463,8 @@ fn encode_symlink_manifest(target: &Path) -> Vec<u8> {
     bytes
 }
 
-/// Lexically resolve `target` from `link_path` and require the result stay
-/// inside `root`. Absolute links and `..` escapes are attacks. Relative
-/// links that stay in the checkout (license files, vendor aliases) are
-/// hashed by target string, never followed.
+/// Require both lexical and resolved containment; intermediate symlinks can
+/// otherwise change the meaning of parent components.
 fn contained_aur_symlink_target(root: &Path, link_path: &Path, target: &Path) -> Result<()> {
     anyhow::ensure!(
         target.is_relative(),
@@ -500,6 +498,16 @@ fn contained_aur_symlink_target(root: &Path, link_path: &Path, target: &Path) ->
     }
     anyhow::ensure!(
         resolved.starts_with(root) && resolved != root,
+        "AUR source symlink escapes the checkout: {} -> {}",
+        link_path.display(),
+        target.display()
+    );
+    let canonical_root = root.canonicalize()?;
+    let canonical_target = link_path
+        .canonicalize()
+        .context("AUR source symlink must resolve to a reviewed checkout entry")?;
+    anyhow::ensure!(
+        canonical_target.starts_with(&canonical_root) && canonical_target != canonical_root,
         "AUR source symlink escapes the checkout: {} -> {}",
         link_path.display(),
         target.display()
@@ -588,6 +596,7 @@ fn sandbox_command_with(
         "--clearenv",
         "--share-net",
         "--unshare-pid",
+        "--unshare-ipc",
         "--new-session",
         "--die-with-parent",
     ]);
@@ -853,11 +862,13 @@ fn pkgbuild_review_panel(
     }
 
     let mut file_names = vec!["PKGBUILD".to_string()];
-    file_names.extend(
-        extra_files
-            .iter()
-            .map(|file| file.relative.display().to_string()),
-    );
+    file_names.extend(extra_files.iter().map(|file| {
+        file.relative
+            .display()
+            .to_string()
+            .escape_debug()
+            .to_string()
+    }));
     lines.push(chrome::kv("files", &file_names.join("  ")));
     lines.push(chrome::kv("sha-256", digest));
     lines.push(chrome::kv(
@@ -876,7 +887,7 @@ fn pkgbuild_review_panel(
                 "file",
                 &format!(
                     "{}  {} B  {}",
-                    file.relative.display(),
+                    file.relative.display().to_string().escape_debug(),
                     file.bytes,
                     file.digest
                 ),
@@ -1598,16 +1609,24 @@ impl AurClient {
     #[instrument(skip(self))]
     pub async fn get_update_list(&self) -> Result<Vec<(String, Version, Version)>> {
         // 1. Get all packages not in official repos
-        let foreign_packages = tokio::task::spawn_blocking(|| -> Result<Vec<String>> {
+        let (foreign_packages, installed) = tokio::task::spawn_blocking(|| -> Result<_> {
             let mut packages = get_potential_aur_packages()?;
-            if packages.is_empty() {
-                return Ok(packages);
+            if !packages.is_empty() {
+                let config =
+                    crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
+                        .context("Failed to load AUR update filters from pacman.conf")?;
+                let ignored = pacman_db::compile_ignore_patterns(&config.ignore_pkg, "IgnorePkg")?;
+                packages.retain(|name| !ignored.is_match(name));
             }
-            let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
-                .context("Failed to load AUR update filters from pacman.conf")?;
-            let ignored = pacman_db::compile_ignore_patterns(&config.ignore_pkg, "IgnorePkg")?;
-            packages.retain(|name| !ignored.is_match(name));
-            Ok(packages)
+            let installed = if packages.is_empty() {
+                HashMap::new()
+            } else {
+                pacman_db::list_local_cached()?
+                    .into_iter()
+                    .map(|package| (package.name, package.version))
+                    .collect()
+            };
+            Ok((packages, Arc::new(installed)))
         })
         .await
         .context("AUR foreign-package scan task failed")??;
@@ -1622,12 +1641,13 @@ impl AurClient {
         // through to the AUR RPC instead.
         if let Some(index_path) = self.fresh_metadata_index_path().await {
             let local_names = foreign_packages.clone();
+            let local_installed = Arc::clone(&installed);
             let result = tokio::task::spawn_blocking(
                 move || -> Result<Option<(Vec<(String, Version, Version)>, Vec<String>)>> {
                     let mut local_pkgs = Vec::with_capacity(local_names.len());
                     for name in local_names {
-                        if let Some(package) = pacman_db::get_local_package(&name)? {
-                            local_pkgs.push((name, package.version));
+                        if let Some(version) = local_installed.get(&name) {
+                            local_pkgs.push((name, version.clone()));
                         }
                     }
                     let index = match AurIndex::open(&index_path) {
@@ -1654,14 +1674,17 @@ impl AurClient {
                     "Binary index missing {} package(s); querying RPC for those",
                     missing.len()
                 );
-                let rpc_updates = self.query_aur_updates(&missing).await?;
+                let rpc_updates = self
+                    .query_aur_updates_at(AUR_RPC_URL, &missing, installed)
+                    .await?;
                 updates.extend(rpc_updates);
                 return Ok(updates);
             }
         }
 
         // 3. Fallback: Query AUR RPC directly for all foreign packages.
-        self.query_aur_updates(&foreign_packages).await
+        self.query_aur_updates_at(AUR_RPC_URL, &foreign_packages, installed)
+            .await
     }
 
     /// Query AUR RPC for package updates (parallel chunked requests)
@@ -1728,17 +1751,11 @@ impl AurClient {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("AUR request failed after retries")))
     }
 
-    async fn query_aur_updates(
-        &self,
-        packages: &[String],
-    ) -> Result<Vec<(String, Version, Version)>> {
-        self.query_aur_updates_at(AUR_RPC_URL, packages).await
-    }
-
     async fn query_aur_updates_at(
         &self,
         endpoint: &str,
         packages: &[String],
+        installed: Arc<HashMap<String, Version>>,
     ) -> Result<Vec<(String, Version, Version)>> {
         let mut updates = Vec::with_capacity(packages.len() / 10 + 1);
         let chunked_names = Self::chunk_aur_names(packages);
@@ -1761,6 +1778,7 @@ impl AurClient {
                 tracing::warn!("AUR update check failed: {}", error);
                 error.context("Failed to check AUR updates")
             })?;
+            let installed = Arc::clone(&installed);
             let chunk_updates = tokio::task::spawn_blocking(move || -> Result<Vec<_>> {
                 let mut updates = Vec::new();
                 for package in response.results {
@@ -1774,7 +1792,7 @@ impl AurClient {
                         continue;
                     }
 
-                    if let Some(local_package) = pacman_db::get_local_package(&package.name)? {
+                    if let Some(local_version) = installed.get(&package.name) {
                         let Some(remote_version) =
                             crate::package_managers::parse_version(&package.version)
                         else {
@@ -1787,10 +1805,10 @@ impl AurClient {
                         };
                         if crate::package_managers::types::compare_versions(
                             &remote_version,
-                            &local_package.version,
+                            local_version,
                         ) == std::cmp::Ordering::Greater
                         {
-                            updates.push((package.name, local_package.version, remote_version));
+                            updates.push((package.name, local_version.clone(), remote_version));
                         }
                     }
                 }
@@ -4518,7 +4536,7 @@ impl AurClient {
                     "rejected_unattended",
                 )?;
                 anyhow::bail!(
-                    "AUR archive requests an install hook, setuid/setgid mode, or file capability; attended approval is required"
+                    "AUR archive requests privileged system integration, an install hook, setuid/setgid mode, or file capability; attended approval is required"
                 );
             }
             if !confirm_prompt(prompt, false).await? {
@@ -5016,6 +5034,65 @@ mod tests {
     }
 
     #[test]
+    fn aur_rpc_updates_use_one_installed_snapshot() -> Result<()> {
+        let test =
+            "package_managers::aur::client::tests::aur_rpc_updates_use_one_installed_snapshot";
+        if crate::core::testing::run_isolated_test(test) || Settings::rerun_test_unprivileged(test)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["aur-demo"])?;
+        fixture.with_environment(async {
+            let installed = Arc::new(
+                pacman_db::list_local_cached()?
+                    .into_iter()
+                    .map(|package| (package.name, package.version))
+                    .collect(),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("http://{}/rpc", listener.local_addr()?);
+            let desc = fixture.db.join("local/aur-demo-1.0-1/desc");
+            let server =
+                tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await?;
+                    let mut request = [0; 4096];
+                    anyhow::ensure!(stream.read(&mut request).await? > 0, "empty request");
+                    let updated = std::fs::read_to_string(&desc)?.replace("1.0-1", "9.0-1");
+                    std::fs::write(desc, updated)?;
+                    let body = s72_rpc_json(&[("aur-demo", "2.0-1")]);
+                    stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                ).as_bytes()).await?;
+                    stream.write_all(&body).await?;
+                    anyhow::Ok(())
+                });
+            let updates = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.client().query_aur_updates_at(
+                    &endpoint,
+                    &["aur-demo".to_owned()],
+                    installed,
+                ),
+            )
+            .await??;
+            tokio::time::timeout(Duration::from_secs(5), server).await???;
+            assert_eq!(
+                updates
+                    .into_iter()
+                    .map(|(name, old, new)| (name, old.to_string(), new.to_string()))
+                    .collect::<Vec<_>>(),
+                [(
+                    "aur-demo".to_owned(),
+                    "1.0-1".to_owned(),
+                    "2.0-1".to_owned()
+                )],
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn aur_rpc_updates_rejects_unsolicited_installed_official_package() -> Result<()> {
         if crate::core::testing::run_isolated_test(
             "package_managers::aur::client::tests::aur_rpc_updates_rejects_unsolicited_installed_official_package",
@@ -5055,9 +5132,17 @@ mod tests {
             let sync_before = std::fs::read(&sync_path)?;
             let (endpoint, server) =
                 rpc_body_server(s72_rpc_json(&[("core-demo", "3.0-1")]), false).await?;
+            let installed = Arc::new(
+                pacman_db::list_local_cached()?
+                    .into_iter()
+                    .map(|package| (package.name, package.version))
+                    .collect(),
+            );
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
-                fixture.client().query_aur_updates_at(&endpoint, &foreign),
+                fixture
+                    .client()
+                    .query_aur_updates_at(&endpoint, &foreign, installed),
             )
             .await?;
             tokio::time::timeout(Duration::from_secs(5), server).await???;
@@ -6218,6 +6303,81 @@ mod tests {
         let error = pkgbuild_review_text(&oversized)
             .expect_err("oversized PKGBUILD must fail before terminal rendering");
         assert!(error.to_string().contains("review limit"));
+    }
+
+    #[test]
+    fn reviewed_source_rejects_symlink_chain_escaping_checkout() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("source");
+        std::fs::create_dir_all(root.join("a"))?;
+        std::fs::create_dir(root.join("c"))?;
+        std::fs::write(root.join("PKGBUILD"), "pkgname=fixture\n")?;
+        std::fs::write(root.join(".SRCINFO"), "pkgbase = fixture\n")?;
+        std::fs::write(directory.path().join("outside"), "unreviewed")?;
+        std::os::unix::fs::symlink("../c", root.join("a/b"))?;
+        std::os::unix::fs::symlink("a/b/../../outside", root.join("escape"))?;
+        assert_eq!(std::fs::read(root.join("escape"))?, b"unreviewed");
+        assert!(ReviewedSource::capture(&root).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pkgbuild_review_panel_escapes_repository_filenames() {
+        let filename = Path::new("patch\x1b[2J\r\u{202e}.diff");
+        let files = [AurReviewFiles {
+            relative: filename,
+            bytes: 1,
+            digest: "abc".to_string(),
+        }];
+        for verbose in [false, true] {
+            let panel = pkgbuild_review_panel(
+                "fixture",
+                "abc",
+                "pkgname=fixture\n",
+                Path::new("PKGBUILD"),
+                &files,
+                &[],
+                verbose,
+            );
+            assert!(!panel.contains("\x1b[2J"));
+            assert!(!panel.contains('\r'));
+            assert!(!panel.contains('\u{202e}'));
+            assert!(panel.contains("patch\\u{1b}[2J\\r\\u{202e}.diff"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires bubblewrap and permission to create namespaces"]
+    async fn sandbox_launcher_isolates_host_ipc_namespace() -> Result<()> {
+        let host_namespace = std::fs::read_link("/proc/self/ns/ipc")?;
+        let mut command = sandbox_command_with(Path::new("/tmp"), "builder", |_| {
+            Ok(PathBuf::from("/usr/bin/bwrap"))
+        })?;
+        let output = command
+            .args([
+                "--unshare-user",
+                "--ro-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--",
+                "/usr/bin/readlink",
+                "/proc/self/ns/ipc",
+            ])
+            .output()
+            .await?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ne!(
+            String::from_utf8(output.stdout)?.trim(),
+            host_namespace.to_string_lossy()
+        );
+        Ok(())
     }
 
     #[test]
@@ -9112,7 +9272,11 @@ mod update_error_tests {
         };
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            client.query_aur_updates_at(&endpoint, &["private-package-query".to_owned()]),
+            client.query_aur_updates_at(
+                &endpoint,
+                &["private-package-query".to_owned()],
+                Arc::new(HashMap::new()),
+            ),
         )
         .await?;
         tokio::time::timeout(Duration::from_secs(5), server).await???;
