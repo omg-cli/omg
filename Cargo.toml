@@ -98,7 +98,7 @@ harness = false
 #   diffs (unexpected duplicates, new proc macros, new build scripts).
 # - The archlinux/alpm git family is pinned by exact version (`=`) AND full
 #   commit rev for supply-chain integrity. Updates require a deliberate rev
-#   bump applied to ALL five alpm-* entries together (same repo commit).
+#   bump applied to all four direct alpm-* entries together (same repo commit).
 # - sequoia-openpgp tracks the stable 2.x line; Cargo.lock pins the exact release.
 # ----------------------------------------------------------------------------
 [dependencies]
@@ -227,15 +227,13 @@ jiff = { version = "0.2.21", features = ["serde"] }
 alpm = { version = "5.0.2", optional = true }
 
 # Official Arch Linux pure Rust ALPM ecosystem (archlinux/alpm)
-# Pinned to a single monorepo snapshot (alpm-srcinfo/0.6.3 tag) which carries
-# types 0.11.2, db 0.2.2, repo-db 0.1.2 and srcinfo 0.6.3 for supply-chain security.
-# Revs correspond to: types 0.11.2 (2026-03-15, adds PackageOption::PEStrip),
-# srcinfo 0.6.3, db 0.2.2 + repo-db 0.1.2 (canonicalized error variants).
-# Reviewed 2026-08-31 against upstream tags; refresh quarterly.
-alpm-types = { version = "=0.11.2", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-types", rev = "d8967aa5101aaacb6e92b3d3f8e706987246a2ab", optional = true }
-alpm-srcinfo = { version = "=0.6.3", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-srcinfo", rev = "d8967aa5101aaacb6e92b3d3f8e706987246a2ab", optional = true }
-alpm-db = { version = "=0.2.2", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-db", rev = "d8967aa5101aaacb6e92b3d3f8e706987246a2ab", optional = true }
-alpm-repo-db = { version = "=0.1.2", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-repo-db", rev = "d8967aa5101aaacb6e92b3d3f8e706987246a2ab", optional = true }
+# One immutable monorepo commit at the alpm-types/0.14.0 release.
+# Reviewed 2026-11-11; compatibility evidence is in docs/arch-audit-2026-11-11.md.
+# C libalpm remains for live queries, dependency solving and transactions.
+alpm-types = { version = "=0.14.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-types", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", optional = true }
+alpm-srcinfo = { version = "=0.7.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-srcinfo", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", optional = true }
+alpm-db = { version = "=0.3.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-db", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", optional = true }
+alpm-repo-db = { version = "=0.2.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-repo-db", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", optional = true }
 
 # Process execution
 which = "8.0"

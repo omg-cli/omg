@@ -102,6 +102,11 @@ jobs:
       - name: Test debt baseline guards
         run: python3 -m unittest discover -s scripts -p 'test_debt*.py'
 
+      - name: Check Rust ALPM snapshot consistency
+        run: |
+          python3 scripts/check-alpm-pins.py
+          python3 scripts/test_alpm_pins.py
+
       - name: Debt ratchet (gating)
         run: python3 scripts/debt-ratchet.py --ci
 

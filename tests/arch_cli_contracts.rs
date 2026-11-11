@@ -21,6 +21,8 @@ fn run(root: &Path, args: &[&str]) -> CommandResult {
             ("OMG_TEST_DISTRO", "arch"),
             ("NO_COLOR", "1"),
             ("OMG_DISABLE_TELEMETRY", "1"),
+            // Contract output must not depend on the developer's log filter.
+            ("RUST_LOG", "error"),
         ],
     )
 }
@@ -75,6 +77,41 @@ fn unknown_config_keys_fail() -> Result<()> {
     let output = run(root.path(), &["config", "get", "not.a.real.key"]);
     assert!(!output.success, "{}", output_text(&output));
     assert!(output_text(&output).contains("Unknown config key"));
+    Ok(())
+}
+
+#[test]
+fn hardened_aur_profile_round_trips_and_refuses_weakening() -> Result<()> {
+    let root = TempDir::new()?;
+    let config = root.path().join("config");
+    std::fs::create_dir(&config)?;
+    let config_text = config.to_string_lossy().into_owned();
+    let invoke = |args: &[&str]| {
+        common::run_omg_with_options(
+            args,
+            Some(root.path()),
+            &[("OMG_CONFIG_DIR", config_text.as_str()), ("NO_COLOR", "1")],
+        )
+    };
+    let initial = invoke(&["config", "get", "aur.security_profile"]);
+    assert!(initial.success, "{}", output_text(&initial));
+    assert_eq!(initial.stdout.trim(), "standard");
+    let enabled = invoke(&["config", "set", "aur.security_profile", "hardened"]);
+    assert!(enabled.success, "{}", output_text(&enabled));
+    let selected = invoke(&["config", "get", "aur.security_profile"]);
+    assert!(selected.success, "{}", output_text(&selected));
+    assert_eq!(selected.stdout.trim(), "hardened");
+    let before = std::fs::read(config.join("config.toml"))?;
+    for args in [
+        ["config", "set", "aur.security_profile", "hardned"],
+        ["config", "set", "aur.secure_makepkg", "false"],
+    ] {
+        let rejected = invoke(&args);
+        assert!(!rejected.success, "{}", output_text(&rejected));
+        assert_eq!(std::fs::read(config.join("config.toml"))?, before);
+    }
+    let restored = invoke(&["config", "set", "aur.security_profile", "standard"]);
+    assert!(restored.success, "{}", output_text(&restored));
     Ok(())
 }
 

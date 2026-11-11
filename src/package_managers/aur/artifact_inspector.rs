@@ -9,14 +9,14 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read};
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::runtimes::common::{BudgetedReader, BudgetedWriter, decode_xz_to};
+use super::archive_metadata;
 
 const MAX_DECLARED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_MEMBERS: u64 = 100_000;
@@ -26,7 +26,7 @@ const MAX_PATH_BYTES: usize = 4_096;
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PRIVILEGED_FILES: usize = 256;
 
-pub(crate) const INSPECTION_POLICY_VERSION: u32 = 2;
+pub(crate) const INSPECTION_POLICY_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrivilegedFile {
@@ -51,6 +51,24 @@ pub(crate) struct ArtifactInspection {
 }
 
 impl ArtifactInspection {
+    pub(crate) fn enforce_profile(&self, profile: crate::config::AurSecurityProfile) -> Result<()> {
+        if profile == crate::config::AurSecurityProfile::Hardened {
+            anyhow::ensure!(
+                !self.requires_paired_build(),
+                "Hardened AUR profile rejects install hooks, set-ID files, capabilities, system configuration and privileged system integration in {}",
+                crate::cli::style::sanitize_terminal_text(&self.package_name)
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn requires_paired_build_for(
+        &self,
+        profile: crate::config::AurSecurityProfile,
+    ) -> bool {
+        profile == crate::config::AurSecurityProfile::Hardened || self.requires_paired_build()
+    }
+
     pub(crate) fn requires_exception(&self) -> bool {
         self.install_hook.is_some() || !self.privileged_files.is_empty()
     }
@@ -122,31 +140,7 @@ fn archive_reader(path: &Path) -> Result<Box<dyn Read>> {
 }
 
 fn archive_reader_with_limit(path: &Path, limit: u64) -> Result<Box<dyn Read>> {
-    let mut file = File::open(path)?;
-    let mut magic = [0_u8; 6];
-    let magic_len = file.read(&mut magic)?;
-    file.rewind()?;
-    let magic = &magic[..magic_len];
-    if magic.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        let decoder = ruzstd::decoding::StreamingDecoder::new(file)
-            .map_err(|error| anyhow::anyhow!("invalid zstd AUR archive: {error}"))?;
-        Ok(Box::new(BudgetedReader::new(decoder, limit)))
-    } else if magic.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
-        let temporary = tempfile::tempfile()?;
-        let mut output = BudgetedWriter::new(std::io::BufWriter::new(temporary), limit);
-        decode_xz_to(BufReader::new(file), &mut output)
-            .map_err(|error| anyhow::anyhow!("invalid or oversized xz AUR archive: {error}"))?;
-        let mut output = output.into_inner().into_inner()?;
-        output.rewind()?;
-        Ok(Box::new(output))
-    } else if magic.starts_with(&[0x1f, 0x8b]) {
-        Ok(Box::new(BudgetedReader::new(
-            flate2::read::GzDecoder::new(file),
-            limit,
-        )))
-    } else {
-        Ok(Box::new(BudgetedReader::new(file, limit)))
-    }
+    super::archive_reader::decode(File::open(path)?, limit)
 }
 
 fn validate_relative_link(member: &str, target: &Path, hard_link: bool) -> Result<()> {
@@ -218,6 +212,7 @@ fn parse_buildinfo(content: &str) -> Result<(String, String, String, String)> {
 
 pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
     let archive_sha256 = archive_sha256(path)?;
+    archive_metadata::validate(archive_reader(path)?)?;
     let mut archive = tar::Archive::new(archive_reader(path)?);
     let mut seen = HashSet::new();
     let mut member_count = 0_u64;
@@ -308,10 +303,9 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
         if let Some(extensions) = entry.pax_extensions()? {
             for extension in extensions {
                 let extension = extension?;
-                if matches!(
-                    extension.key_bytes(),
-                    b"SCHILY.xattr.security.capability" | b"LIBARCHIVE.xattr.security.capability"
-                ) {
+                if archive_metadata::attribute_name(extension.key_bytes()).as_deref()
+                    == Some(b"security.capability".as_slice())
+                {
                     capability = Some(hex::encode(extension.value_bytes()));
                 }
             }
@@ -319,7 +313,7 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
         if kind.is_file() && mode & 0o111 != 0 {
             executable_files.push(member.clone());
         }
-        if kind.is_file() && (mode & 0o6000 != 0 || capability.is_some()) {
+        if (kind.is_file() || kind.is_hard_link()) && mode & 0o6000 != 0 || capability.is_some() {
             // Linux documents set-ID and file capabilities as privilege-bearing
             // mechanisms: https://man7.org/linux/man-pages/man7/capabilities.7.html
             anyhow::ensure!(
@@ -539,6 +533,204 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_pax_metadata_is_rejected_before_native_installation() -> Result<()> {
+        for attributes in [
+            vec![
+                ("path", b"usr/share/marker".as_slice()),
+                ("path", b".INSTALL".as_slice()),
+            ],
+            vec![("path", b".INSTALL\0suffix".as_slice())],
+            vec![("size", b"4".as_slice()), ("size", b"4".as_slice())],
+            vec![("GNU.sparse.name", b".INSTALL".as_slice())],
+        ] {
+            let file = fixture_archive(|builder| {
+                builder.append_pax_extensions(attributes.iter().copied())?;
+                append_file(builder, "usr/share/marker", b"test", 0o644)
+            })?;
+            assert!(
+                inspect_archive(file.path()).is_err(),
+                "ambiguous attributes: {attributes:?}"
+            );
+        }
+        let file = fixture_archive(|builder| {
+            builder.append_pax_extensions([
+                ("linkpath", b"usr/share/marker".as_slice()),
+                ("linkpath", b"../../outside".as_slice()),
+            ])?;
+            let mut header = tar::Header::new_gnu();
+            header.set_path("usr/share/alias")?;
+            header.set_link_name("usr/share/marker")?;
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, std::io::empty())?;
+            Ok(())
+        })?;
+        assert!(inspect_archive(file.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_gnu_and_pax_paths_cannot_hide_an_install_hook() -> Result<()> {
+        let file = fixture_archive(|builder| {
+            let bytes = b"usr/share/marker\0";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("././@LongLink")?;
+            header.set_entry_type(tar::EntryType::GNULongName);
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, bytes.as_slice())?;
+            builder.append_pax_extensions([("path", b".INSTALL".as_slice())])?;
+            append_file(builder, "usr/share/marker", b"test", 0o644)
+        })?;
+        assert!(inspect_archive(file.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn hardlinks_cannot_carry_data_or_unclassified_privilege_metadata() -> Result<()> {
+        for data in [b"".as_slice(), b"harmless marker data".as_slice()] {
+            let file = fixture_archive(|builder| {
+                append_file(builder, "usr/share/marker", b"test", 0o644)?;
+                builder.append_pax_extensions([("comment", b"inert".as_slice())])?;
+                let mut header = tar::Header::new_gnu();
+                header.set_path("usr/share/alias")?;
+                header.set_link_name("usr/share/marker")?;
+                header.set_entry_type(tar::EntryType::Link);
+                header.set_size(data.len() as u64);
+                header.set_mode(0o4755);
+                header.set_cksum();
+                builder.append(&header, data)?;
+                Ok(())
+            })?;
+            if data.is_empty() {
+                assert!(
+                    inspect_archive(file.path())?.requires_exception(),
+                    "link privilege metadata must be classified"
+                );
+            } else {
+                assert!(
+                    inspect_archive(file.path()).is_err(),
+                    "hardlink data must be refused"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_capability_attribute_encodings_cannot_bypass_classification() -> Result<()> {
+        for key in [
+            "SCHILY.xattr.security.capability",
+            "LIBARCHIVE.xattr.security.capability",
+            "LIBARCHIVE.xattr.security%2Ecapability",
+            "LIBARCHIVE.xattr.security.%63apability",
+        ] {
+            let file = fixture_archive(|builder| {
+                builder.append_pax_extensions([(key, b"AQAAAA==".as_slice())])?;
+                append_file(builder, "usr/bin/marker", b"inert", 0o755)
+            })?;
+            assert!(inspect_archive(file.path())?.requires_exception(), "{key}");
+        }
+        for key in [
+            "SCHILY.xattr.security.capability\0suffix",
+            "LIBARCHIVE.xattr.security.capability%00suffix",
+        ] {
+            let file = fixture_archive(|builder| {
+                builder.append_pax_extensions([(key, b"AQAAAA==".as_slice())])?;
+                append_file(builder, "usr/bin/marker", b"inert", 0o755)
+            })?;
+            assert!(inspect_archive(file.path()).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_pax_metadata_and_literal_attributes_remain_accepted() -> Result<()> {
+        let file = fixture_archive(|builder| {
+            builder.append_pax_extensions([
+                ("path", b"usr/share/marker".as_slice()),
+                ("size", b"5".as_slice()),
+                ("SCHILY.xattr.user.note", b"inert".as_slice()),
+            ])?;
+            append_file(builder, "marker", b"inert", 0o644)
+        })?;
+        let inspection = inspect_archive(file.path())?;
+        assert!(!inspection.requires_exception());
+        assert_eq!(inspection.member_count, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn attribute_aliases_and_inconsistent_sizes_are_rejected() -> Result<()> {
+        for attributes in [
+            vec![
+                ("SCHILY.xattr.user.note", b"inert".as_slice()),
+                ("LIBARCHIVE.xattr.user.note", b"inert".as_slice()),
+            ],
+            vec![("size", b"4".as_slice())],
+        ] {
+            let file = fixture_archive(|builder| {
+                builder.append_pax_extensions(attributes.iter().copied())?;
+                append_file(builder, "usr/share/marker", b"inert", 0o644)
+            })?;
+            assert!(inspect_archive(file.path()).is_err());
+        }
+        Ok(())
+    }
+
+    fn inspect_concatenated_compression_frames(kind: &str) -> Result<()> {
+        let prefix = fixture_archive(|builder| {
+            append_file(builder, "usr/share/first-marker", b"inert", 0o644)
+        })?;
+        let mut raw = Vec::new();
+        flate2::read::MultiGzDecoder::new(prefix.reopen()?).read_to_end(&mut raw)?;
+        while raw.ends_with(&[0; 512]) {
+            raw.truncate(raw.len() - 512);
+        }
+        let mut suffix = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("usr/share/second-marker")?;
+        header.set_mode(0o644);
+        header.set_size(5);
+        header.set_cksum();
+        suffix.append(&header, b"inert".as_slice())?;
+        let suffix = suffix.into_inner()?;
+        let mut compressed = Vec::new();
+        for frame in [raw.as_slice(), suffix.as_slice()] {
+            if kind == "zstd" {
+                compressed.extend(zstd::stream::encode_all(frame, 1)?);
+            } else {
+                use std::io::Write as _;
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                encoder.write_all(frame)?;
+                compressed.extend(encoder.finish()?);
+            }
+        }
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), compressed)?;
+        assert_eq!(
+            inspect_archive(file.path())?.member_count,
+            5,
+            "{kind}: every frame must be inspected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_zstd_frame_is_inspected() -> Result<()> {
+        inspect_concatenated_compression_frames("zstd")
+    }
+
+    #[test]
+    fn every_gzip_member_is_inspected() -> Result<()> {
+        inspect_concatenated_compression_frames("gzip")
+    }
+
+    #[test]
     fn buildinfo_requires_one_complete_identity() {
         let valid =
             "format = 2\npkgname = demo\npkgbase = demo\npkgver = 1.0-1\npkgarch = x86_64\n";
@@ -567,6 +759,30 @@ mod tests {
                 format!("AUR archive .BUILDINFO must contain one {field}")
             );
         }
+    }
+
+    #[test]
+    fn hardened_profile_refuses_privileged_integration_and_pairs_ordinary_outputs() -> Result<()> {
+        use crate::config::AurSecurityProfile::{Hardened, Standard};
+        for path in [
+            "usr/bin/demo",
+            "etc/demo.conf",
+            "usr/lib/systemd/system/demo.service",
+            "usr/share/libalpm/hooks/demo.hook",
+            "usr/share/polkit-1/actions/demo.policy",
+            ".INSTALL",
+        ] {
+            let file = fixture_archive(|builder| append_file(builder, path, b"inert", 0o644))?;
+            let inspection = inspect_archive(file.path())?;
+            assert!(inspection.enforce_profile(Standard).is_ok());
+            assert_eq!(
+                inspection.enforce_profile(Hardened).is_ok(),
+                path == "usr/bin/demo",
+                "{path}"
+            );
+            assert!(inspection.requires_paired_build_for(Hardened));
+        }
+        Ok(())
     }
 
     #[test]

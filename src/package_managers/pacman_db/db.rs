@@ -1818,20 +1818,6 @@ pub fn get_potential_aur_packages() -> Result<Vec<String>> {
     Ok(potential)
 }
 
-/// Reduce an alpm relation or optdepend string to the bare name that participates in
-/// dependency resolution: `"curl>=7.0"` → `"curl"`,
-/// `"libfoo.so=1-64"` → `"libfoo.so"`,
-/// `"lib:libfoo.so.1"` → `"lib:libfoo.so.1"`,
-/// `"python-pillow: for image support"` → `"python-pillow"`.
-fn dependency_base_name(relation: &str) -> &str {
-    let relation = relation.split_once(": ").map_or(relation, |(name, _)| name);
-    relation
-        .split(['<', '>', '='])
-        .next()
-        .unwrap_or(relation)
-        .trim()
-}
-
 /// Names of installed packages that at least one other installed package
 /// requires or optionally requires, derived from the cached `%DEPENDS%`/`%OPTDEPENDS%`/`%PROVIDES%` sets.
 ///
@@ -1841,59 +1827,53 @@ fn dependency_base_name(relation: &str) -> &str {
 /// instead of trusting `%REQUIREDBY%` sections, which modern pacman no longer writes.
 fn compute_required_names(
     packages: &HashMap<String, LocalDbPackage>,
-) -> std::collections::HashSet<String> {
+) -> Result<std::collections::HashSet<String>> {
     // Virtual dependencies ("app depends on virtual-svc") are satisfied by
     // the installed packages whose `%PROVIDES%` name that capability.
-    let mut providers: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut providers: HashMap<&str, Vec<(&str, HealthRelation<'_>)>> = HashMap::new();
     for (name, pkg) in packages {
         for provide in &pkg.provides {
+            let relation = health_relation(provide)?;
+            anyhow::ensure!(
+                matches!(relation.operator, "" | "="),
+                "Unsupported provision {provide} declared by {name}"
+            );
             providers
-                .entry(dependency_base_name(provide))
+                .entry(relation.name)
                 .or_default()
-                .push(name);
+                .push((name, relation));
         }
     }
 
     let mut required: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(packages.len());
     for pkg in packages.values() {
-        for depend in &pkg.depends {
-            let target = dependency_base_name(depend);
-            if target == pkg.name {
-                continue;
+        for raw in pkg.depends.iter().chain(&pkg.optdepends) {
+            let raw = raw
+                .split_once(": ")
+                .map_or(raw.as_str(), |(relation, _)| relation);
+            let relation = health_relation(raw)
+                .with_context(|| format!("Invalid dependency declared by {}", pkg.name))?;
+            if let Some(installed) = packages.get(relation.name)
+                && installed.name != pkg.name
+                && relation.accepts(Some(&installed.version.to_string()))
+            {
+                required.insert(installed.name.clone());
             }
-            if packages.contains_key(target) {
-                required.insert(target.to_owned());
-            }
-            if let Some(provider_names) = providers.get(target) {
+            if let Some(candidates) = providers.get(relation.name) {
                 required.extend(
-                    provider_names
+                    candidates
                         .iter()
-                        .filter(|provider| **provider != pkg.name)
-                        .map(|provider| (*provider).to_owned()),
-                );
-            }
-        }
-        for optdepend in &pkg.optdepends {
-            let target = dependency_base_name(optdepend);
-            if target == pkg.name {
-                continue;
-            }
-            if packages.contains_key(target) {
-                required.insert(target.to_owned());
-            }
-            if let Some(provider_names) = providers.get(target) {
-                required.extend(
-                    provider_names
-                        .iter()
-                        .filter(|provider| **provider != pkg.name)
-                        .map(|provider| (*provider).to_owned()),
+                        .filter(|(owner, provided)| {
+                            *owner != pkg.name && relation.accepts(provided.version)
+                        })
+                        .map(|(owner, _)| (*owner).to_owned()),
                 );
             }
         }
     }
 
-    required
+    Ok(required)
 }
 
 /// Get total package counts - INSTANT (<1ms with cache)
@@ -1911,7 +1891,7 @@ pub fn get_counts_fast() -> Result<(usize, usize, usize)> {
 
     let cache = read_lock(&LOCAL_DB_CACHE);
     let total = cache.packages.len();
-    let required = compute_required_names(&cache.packages);
+    let required = compute_required_names(&cache.packages)?;
     let mut explicit = 0;
     let mut orphans = 0;
     for (name, pkg) in &cache.packages {
@@ -3231,7 +3211,7 @@ mod tests {
     /// reverse dependencies derived from `%DEPENDS%`/`%PROVIDES%`.
     fn fixture_orphans(temp: &tempfile::TempDir) -> Vec<String> {
         let packages = parse_local_db(temp.path()).unwrap();
-        let required = compute_required_names(&packages);
+        let required = compute_required_names(&packages).unwrap();
         let mut orphans: Vec<String> = packages
             .iter()
             .filter(|(name, pkg)| {
@@ -3247,10 +3227,65 @@ mod tests {
     }
 
     #[test]
-    fn dependency_base_name_strips_version_constraints_and_sonames() {
-        assert_eq!(dependency_base_name("curl"), "curl");
-        assert_eq!(dependency_base_name("curl>=7.0"), "curl");
-        assert_eq!(dependency_base_name("libfoo.so=1-64"), "libfoo.so");
+    fn dependency_relations_preserve_version_constraints_and_sonames() {
+        assert_eq!(health_relation("curl").unwrap().name, "curl");
+        let versioned = health_relation("curl>=7.0").unwrap();
+        assert_eq!(versioned.name, "curl");
+        assert_eq!(versioned.version, Some("7.0"));
+        assert_eq!(health_relation("libfoo.so=1-64").unwrap().name, "libfoo.so");
+    }
+
+    #[test]
+    fn orphan_versions_match_libalpm_for_direct_and_virtual_dependencies() {
+        for section in ["DEPENDS", "OPTDEPENDS"] {
+            for (requirement, provision) in [
+                ("provider>=2", None),
+                ("virtual>=2", Some("virtual")),
+                ("virtual>=2", Some("virtual=1")),
+                ("virtual>=2", Some("virtual=3")),
+                ("virtual=1-64", Some("virtual=1-32")),
+                ("virtual", Some("virtual=1")),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let local = directory.path().join("local");
+                let root = directory.path().join("root");
+                std::fs::create_dir_all(&local).unwrap();
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+                for (name, reason, extra) in [
+                    ("app", "0", format!("%{section}%\n{requirement}\n\n")),
+                    (
+                        "provider",
+                        "1",
+                        provision
+                            .map_or_else(String::new, |value| format!("%PROVIDES%\n{value}\n\n")),
+                    ),
+                ] {
+                    let entry = local.join(format!("{name}-1.0-1"));
+                    std::fs::create_dir(&entry).unwrap();
+                    std::fs::write(
+                        entry.join("desc"),
+                        format!(
+                            "%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n{reason}\n\n{extra}"
+                        ),
+                    )
+                    .unwrap();
+                }
+                let packages = parse_local_db(&local).unwrap();
+                let required = compute_required_names(&packages).unwrap();
+                let alpm =
+                    alpm::Alpm::new(root.to_str().unwrap(), directory.path().to_str().unwrap())
+                        .unwrap();
+                let provider = alpm.localdb().pkg("provider").unwrap();
+                let native_required =
+                    !provider.required_by().is_empty() || !provider.optional_for().is_empty();
+                assert_eq!(
+                    required.contains("provider"),
+                    native_required,
+                    "{section}: {requirement} / {provision:?}"
+                );
+            }
+        }
     }
 
     /// #687: a local database that parses cleanly can still declare a
@@ -3394,7 +3429,7 @@ mod tests {
 
         let packages = parse_local_db(temp.path()).unwrap();
         assert_eq!(packages.len(), 7);
-        let required = compute_required_names(&packages);
+        let required = compute_required_names(&packages).unwrap();
         assert_eq!(
             required.len(),
             3,

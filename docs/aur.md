@@ -37,6 +37,9 @@ OMG asks before the package transaction. `--yes` skips that normal confirmation 
 1. OMG fetches recipe sources without executing the PKGBUILD, then presents the source tree for review when `aur.review_pkgbuild` is enabled.
 2. It hashes and rechecks the reviewed tree before the build. The default Bubblewrap path isolates the build home and environment and denies build network access unless configured otherwise.
 3. It inspects output archives before installation. The inspector rejects unsafe paths, escaping links, special entries, and inconsistent or undeclared metadata.
+   It also rejects ambiguous PAX/GNU metadata and data-bearing nonregular
+   entries before passing archives to native libalpm. Capability classification
+   uses the attribute name decoded by libarchive.
 4. Outputs with privileged integration, such as install hooks, capabilities, systemd units, kernel modules, package-manager hooks, or `/etc` content, receive a second private build. The outputs must match byte for byte.
 5. Accepted archive bytes move through a sealed in-memory handoff to the privileged transaction, which reinspects the staged bytes.
 
@@ -65,7 +68,53 @@ allow_network = false
 allow_unsafe_builds = false
 ```
 
-`build_method` also accepts `chroot` and `native`. Native builds require the explicit `allow_unsafe_builds` opt-in. Chroot devtools can execute recipe code on the host before isolation and need the unsafe opt-in; they cannot enforce an offline build. Keep the default unless you understand those limits. `makeflags`, `cache_builds`, `enable_ccache`, `enable_sccache`, `pkgdest`, and `srcdest` are optional settings. A higher `build_concurrency` uses more CPU and memory and is not a guarantee of a faster build.
+`build_method` also accepts `chroot` and `native`. Native builds require the explicit `allow_unsafe_builds` opt-in. Chroot devtools can execute recipe code on the host before isolation and require both unsafe and network opt-ins. They cannot enforce an offline build. Keep the default unless you understand those limits.
+
+Build outputs, downloaded sources and compiler caches use private invocation
+directories. Legacy `cache_builds`, `pkgdest`, `srcdest`, `ccache_dir` and
+`sccache_dir` values remain accepted for compatibility, but shared storage and
+persistent artifact reuse are disabled. `enable_ccache` and `enable_sccache`
+enable invocation-local compiler caches. A higher `build_concurrency` uses more
+CPU and memory and is not a guarantee of a faster build.
+
+## Optional hardened profile
+
+Enable the profile before installing AUR packages:
+
+```bash
+omg config set aur.security_profile hardened
+omg config get aur.security_profile
+```
+
+The equivalent configuration is:
+
+```toml
+[aur]
+security_profile = "hardened"
+build_method = "bubblewrap"
+review_pkgbuild = true
+secure_makepkg = true
+allow_network = false
+allow_unsafe_builds = false
+```
+
+Conflicting settings fail instead of weakening the profile. Missing Bubblewrap
+also fails. Source review still requires an attended terminal, and `--yes`
+cannot skip its confirmation in hardened mode.
+
+This profile rejects install hooks, setuid/setgid files, file capabilities,
+`/etc` content and the privileged integration paths classified by OMG, such as
+systemd units, kernel modules, ALPM hooks and polkit policies. It requires two
+builds with separate output, source and compiler-cache directories to produce
+identical archive hashes for every accepted output. Some legitimate AUR recipes
+will fail these requirements. Use `standard` to restore the default profile.
+
+Both builds use the same host toolchain and reviewed checkout. A deterministic
+malicious program can pass. These checks do not authenticate the maintainer or
+vet arbitrary code, and the profile only governs OMG operations. It does not
+govern packages installed through yay, Aura or direct pacman commands. To refuse
+AUR entirely, set `allow_aur = false` in your OMG `policy.toml`; see
+[security](./security.md).
 
 ## Update or remove
 

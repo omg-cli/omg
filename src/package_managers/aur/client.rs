@@ -3,7 +3,7 @@
 use ahash::AHashSet;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -43,9 +43,7 @@ use crate::config::{AurBuildMethod, Settings};
 use crate::core::http::shared_client;
 use crate::core::{Package, PackageSource, paths};
 use crate::package_managers::{get_potential_aur_packages, pacman_db};
-use crate::runtimes::common::{
-    BudgetedReader, BudgetedWriter, MAX_DECOMPRESSED_BYTES, decode_xz_to,
-};
+use crate::runtimes::common::MAX_DECOMPRESSED_BYTES;
 
 use crate::core::security::artifact::ArchiveSnapshot;
 const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
@@ -375,7 +373,7 @@ impl ReviewedSource {
                         relative.as_path() != Path::new("PKGBUILD")
                             && relative.as_path() != Path::new(".SRCINFO"),
                         "AUR {} must be a regular file, not a symlink",
-                        relative.display()
+                        review_path(&relative)
                     );
                     let target = std::fs::read_link(&path)?;
                     contained_aur_symlink_target(root, &path, &target)?;
@@ -451,7 +449,7 @@ impl ReviewedSource {
         let bytes = self
             .files
             .get(path)
-            .with_context(|| format!("Unreviewed AUR input: {}", path.display()))?;
+            .with_context(|| format!("Unreviewed AUR input: {}", review_path(path)))?;
         Ok(std::str::from_utf8(bytes)?)
     }
 }
@@ -468,11 +466,11 @@ fn encode_symlink_manifest(target: &Path) -> Vec<u8> {
 /// links that stay in the checkout (license files, vendor aliases) are
 /// hashed by target string, never followed.
 fn contained_aur_symlink_target(root: &Path, link_path: &Path, target: &Path) -> Result<()> {
+    let link_display = review_path(link_path);
+    let target_display = review_path(target);
     anyhow::ensure!(
         target.is_relative(),
-        "AUR source symlink must be relative: {} -> {}",
-        link_path.display(),
-        target.display()
+        "AUR source symlink must be relative: {link_display} -> {target_display}"
     );
     let mut resolved = link_path
         .parent()
@@ -484,25 +482,19 @@ fn contained_aur_symlink_target(root: &Path, link_path: &Path, target: &Path) ->
             std::path::Component::ParentDir => {
                 anyhow::ensure!(
                     resolved.starts_with(root) && resolved != root && resolved.pop(),
-                    "AUR source symlink escapes the checkout: {} -> {}",
-                    link_path.display(),
-                    target.display()
+                    "AUR source symlink escapes the checkout: {link_display} -> {target_display}"
                 );
             }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 anyhow::bail!(
-                    "AUR source symlink must be relative: {} -> {}",
-                    link_path.display(),
-                    target.display()
+                    "AUR source symlink must be relative: {link_display} -> {target_display}"
                 );
             }
         }
     }
     anyhow::ensure!(
         resolved.starts_with(root) && resolved != root,
-        "AUR source symlink escapes the checkout: {} -> {}",
-        link_path.display(),
-        target.display()
+        "AUR source symlink escapes the checkout: {link_display} -> {target_display}"
     );
     Ok(())
 }
@@ -789,6 +781,13 @@ struct AurReviewFiles<'a> {
     digest: String,
 }
 
+/// Keep untrusted source names visible as single-line data, including literal
+/// backslashes, controls and invisible Unicode. Filesystem and hash inputs
+/// retain their original bytes.
+fn review_path(path: &Path) -> String {
+    path.to_string_lossy().escape_debug().to_string()
+}
+
 fn pkgbuild_review_panel(
     package: &str,
     digest: &str,
@@ -853,16 +852,12 @@ fn pkgbuild_review_panel(
     }
 
     let mut file_names = vec!["PKGBUILD".to_string()];
-    file_names.extend(
-        extra_files
-            .iter()
-            .map(|file| file.relative.display().to_string()),
-    );
+    file_names.extend(extra_files.iter().map(|file| review_path(file.relative)));
     lines.push(chrome::kv("files", &file_names.join("  ")));
     lines.push(chrome::kv("sha-256", digest));
     lines.push(chrome::kv(
         "open",
-        &chrome::osc8_file(pkgbuild_path, &pkgbuild_path.display().to_string()),
+        &chrome::osc8_file(pkgbuild_path, &review_path(pkgbuild_path)),
     ));
     lines.push(chrome::rail_line(""));
 
@@ -876,7 +871,7 @@ fn pkgbuild_review_panel(
                 "file",
                 &format!(
                     "{}  {} B  {}",
-                    file.relative.display(),
+                    review_path(file.relative),
                     file.bytes,
                     file.digest
                 ),
@@ -907,10 +902,7 @@ fn pkgbuild_review_panel(
     // these reviewed bytes before any root installation.
     for (name, contents) in install_hooks {
         lines.push(chrome::rail_line(""));
-        lines.push(chrome::kv(
-            "hook",
-            &crate::cli::style::sanitize_terminal_text(name),
-        ));
+        lines.push(chrome::kv("hook", &review_path(Path::new(name))));
         for (number, line) in contents.lines().enumerate() {
             lines.push(chrome::snippet_line(number + 1, line));
         }
@@ -949,16 +941,17 @@ fn declared_install_hook_previews(source: &ReviewedSource) -> Result<Vec<(String
     names
         .into_iter()
         .map(|name| {
+            let display_name = review_path(Path::new(&name));
             let bytes = source
                 .files
                 .get(Path::new(&name))
-                .with_context(|| format!("Declared install hook is absent: {name}"))?;
+                .with_context(|| format!("Declared install hook is absent: {display_name}"))?;
             anyhow::ensure!(
                 bytes.len() <= MAX_PKGBUILD_REVIEW_BYTES,
-                "Install hook {name} exceeds the review limit"
+                "Install hook {display_name} exceeds the review limit"
             );
             let text = std::str::from_utf8(bytes)
-                .with_context(|| format!("Install hook {name} is not UTF-8"))?;
+                .with_context(|| format!("Install hook {display_name} is not UTF-8"))?;
             // Make control/bidi bytes visible instead of silently removing them.
             let contents = text
                 .chars()
@@ -2084,7 +2077,9 @@ impl AurClient {
         // ALWAYS show the review prompt during rollback rebuilds,
         // independent of the user's day-to-day review preference.
         let pkgbuild_path = pkg_dir.join("PKGBUILD");
-        let reviewed_digest = Self::review_pkgbuild(package, &pkgbuild_path).await?;
+        let reviewed_digest =
+            Self::review_pkgbuild(package, &pkgbuild_path, self.settings.aur.security_profile)
+                .await?;
         set_reproducible_source_epoch(&mut env, &reviewed_digest)?;
         env.pgp_home = Self::fetch_missing_pgp_keys(&pkgbuild_path).await?;
         println!(
@@ -2292,7 +2287,8 @@ impl AurClient {
             return Err(AurError::PkgbuildNotFound(package.to_string()).into());
         }
         let reviewed_digest = if self.settings.aur.review_pkgbuild {
-            Self::review_pkgbuild(package, &pkgbuild_path).await?
+            Self::review_pkgbuild(package, &pkgbuild_path, self.settings.aur.security_profile)
+                .await?
         } else {
             ReviewedSource::capture(&pkg_dir)?
         };
@@ -2420,52 +2416,30 @@ impl AurClient {
             }
         }
 
-        let cache_key = self.cache_key(&pkg_dir, &env.makeflags)?;
-
-        let cached = Self::cached_artifacts(
-            &package,
-            &requested_outputs,
-            &pkg_dir,
-            &env.pkgdest,
-            &cache_key,
-        );
-        let mut pkg_files = match cached {
-            Some(archives) => {
-                crate::cli::modern_ui::print_info(&format!("Using cached build for {package}"));
-                archives
+        reviewed_digest.verify(&pkg_dir)?;
+        let log_path = self.build_log_path(&package);
+        let status = self
+            .run_build(&pkg_dir, &env, &package)
+            .await
+            .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
+        if !status.success() {
+            return Err(AurError::BuildFailed {
+                package: package.clone(),
+                log_path: log_path.display().to_string(),
             }
-            None => Vec::new(),
-        };
-
-        let fresh = pkg_files.is_empty();
-        if fresh {
-            reviewed_digest.verify(&pkg_dir)?;
-            let log_path = self.build_log_path(&package);
-
-            let status = self
-                .run_build(&pkg_dir, &env, &package)
-                .await
-                .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
-
-            if !status.success() {
-                return Err(AurError::BuildFailed {
-                    package: package.clone(),
-                    log_path: log_path.display().to_string(),
-                }
-                .into());
-            }
-
-            pkg_files = Self::find_built_packages(&pkg_dir, &env.pkgdest, &requested_outputs)
-                .await
-                .map_err(|_| AurError::PackageArchiveNotFound(package.clone()))?;
+            .into());
         }
+
+        let pkg_files = Self::find_built_packages(&pkg_dir, &env.pkgdest, &requested_outputs)
+            .await
+            .map_err(|_| AurError::PackageArchiveNotFound(package.clone()))?;
 
         self.authorize_with_paired_build(
             &pkg_files,
             &reviewed_digest,
             &package,
             &requested_outputs,
-            fresh,
+            true,
             &pkg_dir,
             &env,
         )
@@ -2587,7 +2561,12 @@ impl AurClient {
         // Same hash seal as install_package_outputs: re-verify the reviewed
         // PKGBUILD right before this dependency build runs.
         let reviewed_digest = if self.settings.aur.review_pkgbuild {
-            Self::review_pkgbuild(package_base, &pkgbuild_path).await?
+            Self::review_pkgbuild(
+                package_base,
+                &pkgbuild_path,
+                self.settings.aur.security_profile,
+            )
+            .await?
         } else {
             ReviewedSource::capture(&pkg_dir)?
         };
@@ -2616,27 +2595,6 @@ impl AurClient {
         let mut env = self.makepkg_env(&pkg_dir).await?;
         set_reproducible_source_epoch(&mut env, &reviewed_digest)?;
         env.pgp_home = pgp_home;
-        let cache_key = self.cache_key(&pkg_dir, &env.makeflags)?;
-        if let Some(archives) = Self::cached_artifacts(
-            package_base,
-            &package_outputs,
-            &pkg_dir,
-            &env.pkgdest,
-            &cache_key,
-        ) {
-            return self
-                .authorize_with_paired_build(
-                    &archives,
-                    &reviewed_digest,
-                    package_base,
-                    &package_outputs,
-                    false,
-                    &pkg_dir,
-                    &env,
-                )
-                .await;
-        }
-
         reviewed_digest.verify(&pkg_dir)?;
         let log_path = self.build_log_path(package);
         let status = self
@@ -2944,6 +2902,7 @@ impl AurClient {
             source.digest.as_str(),
             env.makeflags.as_str(),
             method.as_str(),
+            self.settings.aur.security_profile.as_str(),
             makepkg_args.as_str(),
             if self.settings.aur.secure_makepkg {
                 "secure-makepkg"
@@ -3019,9 +2978,14 @@ impl AurClient {
             .iter()
             .map(|archive| artifact_inspector::inspect_archive(&archive.path()))
             .collect::<Result<Vec<_>>>()?;
+        let profile = self.settings.aur.security_profile;
+        self.settings.aur.validate_security_profile()?;
+        for inspection in &primary_inspections {
+            inspection.enforce_profile(profile)?;
+        }
         if !primary_inspections
             .iter()
-            .any(artifact_inspector::ArtifactInspection::requires_paired_build)
+            .any(|inspection| inspection.requires_paired_build_for(profile))
         {
             return Ok(primary);
         }
@@ -3045,7 +3009,7 @@ impl AurClient {
         }
 
         crate::cli::modern_ui::print_info(&format!(
-            "Rebuilding high-risk AUR package {base} independently for exact comparison"
+            "Rebuilding AUR package {base} with separate output storage for exact comparison"
         ));
         source.verify(pkg_dir)?;
         let mut secondary_env = self.makepkg_env(pkg_dir).await?;
@@ -3371,25 +3335,7 @@ impl AurClient {
             Some(snapshot) => snapshot.reader()?,
             None => File::open(path)?,
         };
-        if path.extension().is_some_and(|ext| ext == "zst") {
-            let decoder = ruzstd::decoding::StreamingDecoder::new(file)
-                .map_err(|error| anyhow::anyhow!("zstd: {error}"))?;
-            Ok(Box::new(BudgetedReader::new(decoder, budget)))
-        } else if path.extension().is_some_and(|ext| ext == "xz") {
-            let temporary = tempfile::NamedTempFile::new()
-                .context("Failed to create temporary AUR package metadata spool")?;
-            let mut output = BudgetedWriter::new(temporary, budget);
-            decode_xz_to(BufReader::new(file), &mut output)
-                .map_err(|error| anyhow::anyhow!("xz: {error}"))?;
-            let mut output = output.into_inner().into_file();
-            output.rewind()?;
-            Ok(Box::new(output))
-        } else {
-            Ok(Box::new(BudgetedReader::new(
-                flate2::read::GzDecoder::new(file),
-                budget,
-            )))
-        }
+        super::archive_reader::decode(file, budget)
     }
 
     fn pkg_name_and_version_from_archive_result(path: &Path) -> Result<Option<(String, String)>> {
@@ -3631,6 +3577,7 @@ impl AurClient {
         env: &MakepkgEnv,
         package: &str,
     ) -> Result<std::process::ExitStatus> {
+        self.settings.aur.validate_security_profile()?;
         if !self.settings.aur.allow_network {
             let sources = parse_sources(pkg_dir)?;
             let summary = download_sources(sources, &env.srcdest).await;
@@ -4168,7 +4115,11 @@ impl AurClient {
     /// Captures all local build inputs and their manifest digest so the caller
     /// can reject additions, removals, permission changes and modified content
     /// immediately before building.
-    async fn review_pkgbuild(package: &str, pkgbuild_path: &Path) -> Result<ReviewedSource> {
+    async fn review_pkgbuild(
+        package: &str,
+        pkgbuild_path: &Path,
+        profile: crate::config::AurSecurityProfile,
+    ) -> Result<ReviewedSource> {
         // Quiesce before joining the review queue: a queued review should
         // hold one continuous quiesce across the wait and confirm, so
         // concurrent spinners neither flicker nor overwrite review output.
@@ -4215,7 +4166,9 @@ impl AurClient {
             )
         );
 
-        if !crate::core::privilege::get_yes_flag() {
+        if profile == crate::config::AurSecurityProfile::Hardened
+            || !crate::core::privilege::get_yes_flag()
+        {
             let proceed = confirm_prompt(pkgbuild_review_prompt(package), true).await?;
             if !proceed {
                 anyhow::bail!("Build aborted by user after PKGBUILD review.");
@@ -4450,6 +4403,7 @@ impl AurClient {
         })
     }
 
+    #[cfg(test)]
     fn cache_key(&self, pkg_dir: &Path, makeflags: &str) -> Result<String> {
         let source = ReviewedSource::capture(pkg_dir)?;
         let makepkg_args = self.makepkg_args().join(" ");
@@ -4483,6 +4437,7 @@ impl AurClient {
     /// Legacy hash markers bind source text only, not the complete archive.
     /// Do not promote recipe-writable payloads into trusted cache entries.
     /// Reuse stays disabled until controller-owned archive provenance exists.
+    #[cfg(test)]
     fn cached_artifacts(
         _cache_name: &str,
         _artifacts: &[String],
@@ -4506,6 +4461,10 @@ impl AurClient {
             .iter()
             .map(|snapshot| artifact_inspector::inspect_archive(&snapshot.path()))
             .collect::<Result<Vec<_>>>()?;
+        let profile = Settings::load()?.aur.security_profile;
+        for inspection in &inspections {
+            inspection.enforce_profile(profile)?;
+        }
         if let Some(prompt) = approval::exception_prompt(&inspections)? {
             let evidence = inspections
                 .iter()
@@ -6245,6 +6204,62 @@ mod tests {
             pkgbuild_review_prompt("google-chrome"),
             "Build google-chrome from this PKGBUILD?"
         );
+    }
+
+    #[test]
+    fn source_filename_review_escapes_controls_without_hiding_identity() {
+        let raw = "patch\n\r\u{1b}[2J\u{202e}\u{200b}\u{2028}\\n.diff";
+        let file = AurReviewFiles {
+            relative: Path::new(raw),
+            bytes: 12,
+            digest: "a".repeat(64),
+        };
+        for verbose in [false, true] {
+            let panel = pkgbuild_review_panel(
+                "demo",
+                &"b".repeat(64),
+                "pkgname=demo",
+                Path::new("/tmp/PKGBUILD"),
+                std::slice::from_ref(&file),
+                &[],
+                verbose,
+            );
+            assert!(!panel.contains(raw));
+            assert!(!panel.contains('\r'));
+            for control in ['\u{202e}', '\u{200b}', '\u{2028}'] {
+                assert!(!panel.contains(control));
+            }
+            assert!(panel.contains("patch\\n\\r\\u{1b}[2J\\u{202e}\\u{200b}\\u{2028}\\\\n.diff"));
+        }
+    }
+
+    #[test]
+    fn source_filename_review_errors_escape_hook_and_symlink_names() -> Result<()> {
+        let hook = "hook\u{1b}[2J\u{202e}.install";
+        let source = ReviewedSource {
+            files: std::collections::BTreeMap::from([(
+                PathBuf::from(".SRCINFO"),
+                format!("install = {hook}\n").into_bytes(),
+            )]),
+            digest: "a".repeat(64),
+        };
+        let error = declared_install_hook_previews(&source)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains('\u{1b}'));
+        assert!(!error.contains('\u{202e}'));
+        assert!(error.contains("hook\\u{1b}[2J\\u{202e}.install"));
+        let root = tempfile::tempdir()?;
+        let error = contained_aur_symlink_target(
+            root.path(),
+            &root.path().join("file\n\u{1b}[2J"),
+            Path::new("/outside\r\u{202e}"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains(['\n', '\r', '\u{1b}', '\u{202e}']));
+        assert!(error.contains("file\\n\\u{1b}[2J"));
+        Ok(())
     }
 
     #[test]

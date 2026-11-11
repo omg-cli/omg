@@ -1429,9 +1429,8 @@ mod tests {
             .collect()
     }
 
-    /// Builds a backend version from raw metadata text. The strict parser
-    /// rejects poisoned strings, so this goes through the domain type's serde
-    /// path the way cached/remote metadata does.
+    /// Builds a backend version through the same validated serde boundary as
+    /// cached metadata. Arch ALPM 0.14 rejects non-ASCII version characters.
     fn poisoned_version(raw: &str) -> crate::package_managers::types::Version {
         #[cfg(feature = "arch")]
         {
@@ -1439,13 +1438,24 @@ mod tests {
                 r#"{{"pkgver":{},"epoch":null,"pkgrel":{{"major":1,"minor":null}}}}"#,
                 serde_json::to_string(raw).expect("json version string")
             ))
-            .expect("serde constructs versions without strict validation")
+            .expect("version fixture must satisfy the backend's serde validation")
         }
         #[cfg(not(feature = "arch"))]
         {
             let _ = raw;
             crate::package_managers::types::DebVersion::new(raw)
         }
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn cached_arch_versions_reject_bidi_before_rendering() {
+        let value = serde_json::json!({
+            "pkgver": "1.0\u{202e}evil",
+            "epoch": null,
+            "pkgrel": { "major": 1, "minor": null }
+        });
+        assert!(serde_json::from_value::<crate::package_managers::types::Version>(value).is_err());
     }
 
     fn package_app() -> App {
@@ -1607,7 +1617,11 @@ mod tests {
         let mut app = app_on(Tab::Packages);
         app.search_results = vec![crate::package_managers::SyncPackage {
             name: "evil".to_string(),
-            version: poisoned_version("1.0\u{1b}[31m\u{202e}evil"),
+            version: poisoned_version(if cfg!(feature = "arch") {
+                "1.0\u{1b}[31mevil"
+            } else {
+                "1.0\u{1b}[31m\u{202e}evil"
+            }),
             description: "browser".to_string(),
             repo: "AUR".to_string(),
             download_size: 0,

@@ -4,6 +4,8 @@
 //! packages from the Arch User Repository.
 
 mod approval;
+mod archive_metadata;
+mod archive_reader;
 pub(crate) mod artifact_inspector;
 mod client;
 mod error;
