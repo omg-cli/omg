@@ -243,6 +243,37 @@ class OptimizationContracts(unittest.TestCase):
                         self.assertEqual(job_block(text, role).count(new_prefix), 1)
                 self.assertNotIn(old_prefix, text)
 
+    def test_compiler_cache_upload_contains_both_diagnostics_in_one_directory(self):
+        for filename, job in (('ci.yml', 'portable'), ('ci.yml', 'portable-release'),
+                              ('benchmark.yml', 'benchmark')):
+            with self.subTest(workflow=filename, job=job), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tools = root / 'bin'
+                tools.mkdir()
+                cache = tools / 'sccache'
+                cache.write_text('#!/bin/sh\nif [ "$*" = "--show-stats --stats-format=json" ]; then\n'
+                                 '  printf \'{"stats":{"cache_read_errors":0}}\\n\'\nfi\n')
+                cache.chmod(0o755)
+                block = job_block((WORKFLOWS / filename).read_text(), job)
+                report = re.search(r'(?m)^      - name: Report .* compiler cache\n', block)
+                report_step = block[report.end():].split('\n      - ', 1)[0]
+                script = textwrap.dedent(report_step.split('        run: |\n', 1)[1])
+                result = subprocess.run([BASH, '-eu', '-c', script], capture_output=True, text=True,
+                    env=dict(os.environ, PATH=tools.as_posix() + os.pathsep + os.environ['PATH'],
+                             RUNNER_TEMP=root.as_posix(), GITHUB_SHA='a' * 40,
+                             SCCACHE_S3_KEY_PREFIX='benchmark-v1/'), timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                upload = re.split(r'      - name: Preserve .* compiler cache diagnostics\n', block)[1]
+                path = re.search(r'(?m)^          path: (.+)$', upload).group(1)
+                self.assertNotEqual(path, '|', 'Container uploads need one scalar directory path')
+                uploaded = Path(path.replace('${{ runner.temp }}', root.as_posix()))
+                self.assertEqual(sorted(item.name for item in uploaded.iterdir()),
+                                 ['omg-r2-cache-context.txt', 'omg-r2-cache-stats.json'])
+                self.assertEqual(json.loads((uploaded / 'omg-r2-cache-stats.json').read_text()),
+                                 {'stats': {'cache_read_errors': 0}})
+                self.assertEqual((uploaded / 'omg-r2-cache-context.txt').read_text(),
+                                 'source=' + 'a' * 40 + '\nprefix=benchmark-v1/\n')
+
     def test_ci_profiles_do_not_retry_failures(self):
         config = tomllib.loads((ROOT / '.config/nextest.toml').read_text())
         for name in ('ci', 'ci-junit'):

@@ -292,18 +292,17 @@ jobs:
         if: always() && steps.r2-cache.outputs.enabled == 'true'
         run: |
           trap 'sccache --stop-server' EXIT
+          mkdir -p "$RUNNER_TEMP/omg-r2-cache"
           sccache --show-stats
-          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache-stats.json"
-          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache-context.txt"
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-stats.json"
+          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-context.txt"
 
       - name: Preserve portable compiler cache diagnostics
         if: always() && steps.r2-cache.outputs.enabled == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/omg-r2-cache-stats.json
-            ${{ runner.temp }}/omg-r2-cache-context.txt
+          path: ${{ runner.temp }}/omg-r2-cache/
           retention-days: 3
           if-no-files-found: warn
 
@@ -369,18 +368,17 @@ jobs:
         if: always() && steps.r2-cache.outputs.enabled == 'true'
         run: |
           trap 'sccache --stop-server' EXIT
+          mkdir -p "$RUNNER_TEMP/omg-r2-cache"
           sccache --show-stats
-          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache-stats.json"
-          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache-context.txt"
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-stats.json"
+          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-context.txt"
 
       - name: Preserve portable compiler cache diagnostics
         if: always() && steps.r2-cache.outputs.enabled == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/omg-r2-cache-stats.json
-            ${{ runner.temp }}/omg-r2-cache-context.txt
+          path: ${{ runner.temp }}/omg-r2-cache/
           retention-days: 3
           if-no-files-found: warn
 
