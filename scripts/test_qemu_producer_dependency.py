@@ -82,20 +82,41 @@ class QemuProducerDependency(unittest.TestCase):
         final = job_block(ci, 'ci-success')
         self.assertRegex(final, r'needs: \[[^\]]*\bqemu\b')
 
+    def test_preflight_runs_alongside_producers_and_guests_require_its_success(self):
+        ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        preflight = job_block(ci, 'qemu-preflight')
+        guests = job_block(ci, 'qemu')
+        self.assertRegex(preflight, r'(?m)^    needs: quick-gate$')
+        self.assertIn('uses: ./.github/actions/qemu-preflight', preflight)
+        self.assertIn('ref: ${{ github.sha }}', preflight)
+        self.assertIn('persist-credentials: false', preflight)
+        self.assertIn('qemu-preflight', re.search(r'(?m)^    needs: \[([^]]+)\]$', guests)[1].split(', '))
+        self.assertIn('preflight-complete: true', guests)
+        condition = re.search(r'^    if: >-\n((?:      .*\n)+)', guests, re.MULTILINE)[1]
+        expression = ' '.join(condition.split())
+        for result, cancelled in (('success', False), ('failure', False), ('cancelled', False),
+                                  ('skipped', False), ('success', True)):
+            with self.subTest(preflight=result, cancelled=cancelled):
+                check = expression.replace('needs.qemu-preflight.result', repr(result)).replace(
+                    '!cancelled()', '0 == 1' if cancelled else '0 == 0')
+                result_code = subprocess.run([BASH, '-c', '[[ ' + check + ' ]]'], timeout=10).returncode
+                self.assertEqual(result_code, 0 if result == 'success' and not cancelled else 1)
+
     def test_native_failure_still_schedules_guests_after_a_successful_quick_gate(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         qemu = job_block(ci, 'qemu')
-        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]', qemu)
-        condition = re.search(r'^    if: >-\n((?:      .*\n)+)', qemu, re.MULTILINE)
+        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]', qemu)
+        self.assertIn('!cancelled()', qemu)
+        self.assertNotIn('needs.linux-matrix.result', qemu)
+        self.assertNotIn('needs.ubuntu.result', qemu)
+        preflight = job_block(ci, 'qemu-preflight')
+        condition = re.search(r'^    if: >-\n((?:      .*\n)+)', preflight, re.MULTILINE)
         self.assertIsNotNone(condition)
         expression = condition.group(1)
-        self.assertIn('!cancelled()', expression)
         self.assertIn("needs.quick-gate.result == 'success'", expression)
         self.assertIn("needs.quick-gate.outputs.should-build == 'true'", expression)
         self.assertIn("github.event_name == 'push'", expression)
         self.assertIn("github.event_name == 'pull_request'", expression)
-        self.assertNotIn('needs.linux-matrix.result', expression)
-        self.assertNotIn('needs.ubuntu.result', expression)
 
     def test_reusable_guests_do_not_start_a_second_automatic_workflow(self):
         matrix = (ROOT / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')

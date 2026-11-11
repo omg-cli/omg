@@ -15,6 +15,7 @@ import unittest
 WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/qemu-matrix.yml'
 PARENT = WORKFLOW.read_text(encoding='utf-8')
 LANE = WORKFLOW.with_name('qemu-lane.yml').read_text(encoding='utf-8')
+PREFLIGHT = (WORKFLOW.parent.parent / 'actions/qemu-preflight/action.yml').read_text(encoding='utf-8')
 TEXT = PARENT.replace('\n  guest:\n', '\n  lane-caller:\n') + LANE
 
 
@@ -25,16 +26,17 @@ def literal(text, key, indent):
     return textwrap.dedent(match[1])
 
 
-def step(name):
-    start = TEXT.index('      - name: ' + name + '\n')
-    remaining = TEXT[start + 1:]
-    end = re.search(r'^      - |^  [a-z][\w-]*:', remaining, re.M)
-    return TEXT[start:start + 1 + end.start()] if end else TEXT[start:]
+def step(name, source=TEXT, indent=6):
+    prefix = ' ' * indent + '- '
+    start = source.index(prefix + 'name: ' + name + '\n')
+    remaining = source[start + 1:]
+    end = re.search(r'^' + prefix + r'|^  [a-z][\w-]*:', remaining, re.M)
+    return source[start:start + 1 + end.start()] if end else source[start:]
 
 
 class QemuWorkflowTests(unittest.TestCase):
     def _required_companion_prepare_control(self, mode):
-        script = literal(step('Workflow selection regression checks'), 'run', 8)
+        script = literal(step('Workflow selection regression checks', PREFLIGHT, 4), 'run', 6)
         fixture_base = WORKFLOW.parents[2] / 'tests' / 'fixtures' / 'qemu-companion-completeness'
         expected = sorted(json.loads((fixture_base / 'expected-identities.json').read_text())["identities"])
         with tempfile.TemporaryDirectory() as directory:
@@ -99,9 +101,10 @@ class QemuWorkflowTests(unittest.TestCase):
     def test_prepare_executes_boot_observer_and_budget_regressions_before_selection(self):
         # Execute the real prepare step. The private executables record the
         # discovery payload and fail on demand; they do not run guests or sudo.
-        regression = step('Workflow selection regression checks')
-        self.assertLess(PARENT.index(regression), PARENT.index('      - name: Resolve selection\n'))
-        script = literal(regression, 'run', 8)
+        regression = step('Workflow selection regression checks', PREFLIGHT, 4)
+        self.assertLess(PARENT.index('      - name: Verify QEMU preflight\n'),
+                        PARENT.index('      - name: Resolve selection\n'))
+        script = literal(regression, 'run', 6)
         observer = ['-m', 'unittest', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_diagnostics.py']
         budget = ['scripts/run_qemu_boot_timeout_budget.py', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_timeout_budget.py']
         for failed, expected in (('', 0), ('test_qemu_boot_diagnostics.py', 37),
@@ -136,7 +139,7 @@ class QemuWorkflowTests(unittest.TestCase):
                     if failed:
                         self.assertEqual(calls[-1], budget)
 
-        script = literal(step('Workflow selection regression checks'), 'run', 8)
+        script = literal(step('Workflow selection regression checks', PREFLIGHT, 4), 'run', 6)
         dispatch = ['-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_qemu_companion_completeness.py']
         control_root = WORKFLOW.parents[2]
         wanted = [
@@ -419,7 +422,7 @@ exit "$rc"
 
     def test_merge_group_requires_current_candidate_guests_and_native_reuse(self):
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
-        automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  docs-audit:', 1)[0]
+        automatic = ci.split('\n  qemu-preflight:\n', 1)[1].split('\n  qemu:', 1)[0]
         expressions = {
             'producer': ' '.join(line.strip() for line in re.search(
                 r'^    if: >-\n((?:      [^\n]+\n)+)', automatic, re.M)[1].splitlines()),
@@ -431,18 +434,15 @@ exit "$rc"
             with self.subTest(boundary=name):
                 expression = expression.replace('github.event_name', "'merge_group'").replace(
                     'needs.quick-gate.outputs.should-build', "'false'").replace('inputs.staged', '0 == 1').replace(
-                    'needs.quick-gate.result', "'success'").replace('!cancelled()', '0 == 0')
+                    'needs.quick-gate.result', "'success'")
                 result = subprocess.run([self.bash, '-c', '[[ ' + expression + ' ]]'],
                                         text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
         producer = expressions['producer'].replace('github.event_name', "'merge_group'").replace(
             'needs.quick-gate.outputs.should-build', "'false'")
-        for quick_gate, cancelled, expected in (('success', False, 0),
-                                               ('failure', False, 1),
-                                               ('success', True, 1)):
-            with self.subTest(quick_gate=quick_gate, cancelled=cancelled):
-                expression = producer.replace('needs.quick-gate.result', repr(quick_gate)).replace(
-                    '!cancelled()', '0 == 1' if cancelled else '0 == 0')
+        for quick_gate, expected in (('success', 0), ('failure', 1), ('skipped', 1)):
+            with self.subTest(quick_gate=quick_gate):
+                expression = producer.replace('needs.quick-gate.result', repr(quick_gate))
                 result = subprocess.run([self.bash, '-c', '[[ ' + expression + ' ]]'],
                                         text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, expected, result.stderr)
@@ -474,13 +474,16 @@ exit "$rc"
         self.assertNotIn('launched', result.stdout)
 
     def test_all_qa_reporting_harnesses_gate_guest_builds(self):
-        reporting = step('Verify harness and reporting fixtures before guest builds')
+        reporting = step('Verify harness and reporting fixtures before guest builds', PREFLIGHT, 4)
         for name in ('qa-file-issue', 'qa-audit', 'qa-open-pr'):
             self.assertIn(f'./scripts/test-{name}.sh', reporting)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         self.assertIn('  pull_request:\n  merge_group:', ci)
         self.assertIn('uses: ./.github/workflows/qemu-matrix.yml', ci)
-        self.assertLess(PARENT.index(reporting), PARENT.index('      - name: Resolve selection'))
+        gate = step('Verify QEMU preflight')
+        self.assertIn('if: inputs.preflight-complete != true', gate)
+        self.assertIn('uses: ./.github/actions/qemu-preflight', gate)
+        self.assertLess(PARENT.index(gate), PARENT.index('      - name: Resolve selection'))
 
     @classmethod
     def setUpClass(cls):
@@ -712,7 +715,7 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotIn('native-build-artifact.py ready', PARENT)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  ci-success:', 1)[0]
-        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]', automatic)
+        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]', automatic)
         self.assertIn('inputs.staged && inputs.reuse-ci', LANE)
         self.assertIn('needs: [build-staged, build-staged-ubuntu, fedora-sqlite]', LANE)
         self.assertIn("inputs.distro != 'ubuntu' && needs.build-staged.result == 'success'", LANE)
