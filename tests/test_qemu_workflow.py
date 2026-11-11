@@ -503,13 +503,55 @@ exit "$rc"
         values = dict(line.split('=', 1) for line in output.read_text().splitlines()) if output.exists() else {}
         return result, values
 
-    def selection(self, directory, staged, distro, arch, tag='', event_name='workflow_dispatch'):
+    def selection(self, directory, staged, distro, arch, tag='', event_name='workflow_dispatch', partition='all'):
         block = step('Resolve selection')
         env = dict(STAGED=str(staged).lower(), REQUESTED_DISTRO=distro,
-                   REQUESTED_ARCH=arch, REQUESTED_RELEASE_TAG=tag, EVENT_NAME=event_name,
+                   REQUESTED_ARCH=arch, REQUESTED_RELEASE_TAG=tag, EVENT_NAME=event_name, PARTITION=partition,
                    BUILD_X64=literal(block, 'BUILD_X64', 10), BUILD_ARM64=literal(block, 'BUILD_ARM64', 10))
         # A local shell function replaces the only release API call.
         return self.run_script('gh() { printf "v9.8.7\\n"; }\n' + literal(block, 'run', 8), env, directory)
+
+
+    def test_automatic_partitions_are_disjoint_and_complete(self):
+        for event in ('push', 'pull_request', 'merge_group'):
+            selected = {}
+            for partition in ('all', 'non-fedora', 'fedora'):
+                with self.subTest(event=event, partition=partition), tempfile.TemporaryDirectory() as tmp:
+                    result, values = self.selection(Path(tmp), True, 'all', 'all',
+                                                    event_name=event, partition=partition)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    distros = json.loads(values['distros'])
+                    lanes = [row['distro'] for row in json.loads(values['lanes'])]
+                    self.assertEqual(len(distros), len(set(distros)))
+                    self.assertEqual(len(lanes), len(set(lanes)))
+                    self.assertEqual(set(lanes), set(distros))
+                    self.assertEqual((values['x64'], values['arm64']), ('true', 'false'))
+                    self.assertEqual({row['distro'] for row in json.loads(values['build-x64'])},
+                                     set(distros) - {'ubuntu'})
+                    selected[partition] = set(distros)
+            self.assertEqual(selected['fedora'], {'fedora'})
+            self.assertEqual(selected['non-fedora'], {'arch', 'debian', 'debian-trixie', 'ubuntu'})
+            self.assertFalse(selected['fedora'] & selected['non-fedora'])
+            self.assertEqual(selected['fedora'] | selected['non-fedora'], selected['all'])
+
+    def test_partition_boundary_rejects_unknown_and_standalone_splits(self):
+        cases = [('pull_request', partition) for partition in ('', 'unknown', 'Fedora', 'fedora,arch')]
+        cases += [(event, partition) for event in ('schedule', 'workflow_dispatch')
+                  for partition in ('non-fedora', 'fedora')]
+        for event, partition in cases:
+            with self.subTest(event=event, partition=partition), tempfile.TemporaryDirectory() as tmp:
+                result, values = self.selection(Path(tmp), True, 'all', 'all',
+                                                event_name=event, partition=partition)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {}, 'invalid partition published guest selection')
+
+    def test_default_all_nightly_keeps_all_five_x64_guests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, values = self.selection(Path(tmp), True, 'all', 'all', event_name='schedule')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(values['distros']),
+                             ['arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'])
+            self.assertEqual((values['x64'], values['arm64']), ('true', 'false'))
 
     def test_dispatch_cross_product(self):
         for staged, distro, arch in itertools.product([False, True], ['all', 'arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'], ['all', 'x64', 'arm64']):
@@ -715,7 +757,9 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotIn('native-build-artifact.py ready', PARENT)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  ci-success:', 1)[0]
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]', automatic)
+        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu]', automatic)
+        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]',
+                      ci.split('\n  qemu-fedora:\n', 1)[1].split('\n  docs-audit:', 1)[0])
         self.assertIn('inputs.staged && inputs.reuse-ci', LANE)
         self.assertIn('needs: [build-staged, build-staged-ubuntu, fedora-sqlite]', LANE)
         self.assertIn("inputs.distro != 'ubuntu' && needs.build-staged.result == 'success'", LANE)

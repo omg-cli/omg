@@ -24,6 +24,9 @@ name: QEMU Matrix
 on:
   workflow_call:
     inputs:
+      partition:
+        type: string
+        default: all
       preflight-result:
         type: string
         default: ''
@@ -57,7 +60,7 @@ on:
 concurrency:
   # Matrix values belong to job-level groups. Separate interactive runs
   # from nightly evidence at both workflow and job scope.
-  group: qemu-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'interactive' }}
+  group: qemu-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'interactive' }}-${{ inputs.partition || 'all' }}
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 permissions:
@@ -154,8 +157,19 @@ jobs:
           REQUESTED_ARCH: ${{ inputs.arch || 'all' }}
           STAGED: ${{ github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'merge_group' || github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.staged) }}
           EVENT_NAME: ${{ github.event_name }}
+          PARTITION: ${{ inputs.partition || 'all' }}
           GH_TOKEN: ${{ github.event_name != 'pull_request' && secrets.GITHUB_TOKEN || '' }}
         run: |
+          case "$PARTITION" in
+            all) ;;
+            non-fedora|fedora)
+              if [[ "$EVENT_NAME" != push && "$EVENT_NAME" != pull_request && "$EVENT_NAME" != merge_group ]]; then
+                echo '::error::QEMU partitions require an automatic source run'
+                exit 1
+              fi
+              ;;
+            *) echo '::error::Invalid QEMU partition'; exit 1 ;;
+          esac
           if [[ "$STAGED" == true && -n "$REQUESTED_RELEASE_TAG" ]]; then
             echo "::error::staged builds use the workflow revision; tag is only for published releases"
             exit 1
@@ -175,9 +189,13 @@ jobs:
             distros=$(jq -cn --arg distro "$REQUESTED_DISTRO" '[$distro]')
             arm_distros="$distros"
           fi
-          printf 'build-x64=%s\n' "$(jq -c --arg distro "$REQUESTED_DISTRO" 'map(select($distro == "all" or .distro == $distro))' <<< "$BUILD_X64")" >> "$GITHUB_OUTPUT"
-          printf 'build-arm64=%s\n' "$(jq -c --arg distro "$REQUESTED_DISTRO" 'map(select($distro == "all" or .distro == $distro))' <<< "$BUILD_ARM64")" >> "$GITHUB_OUTPUT"
-          printf 'lanes=%s\n' "$(jq -c --arg distro "$REQUESTED_DISTRO" '. + [{distro:"ubuntu",image:"unused",features:"debian,pgp,license",setup:"true"}] | map(select($distro == "all" or .distro == $distro))' <<< "$BUILD_X64")" >> "$GITHUB_OUTPUT"
+          if [[ "$PARTITION" != all ]]; then
+            distros=$(jq -c --arg partition "$PARTITION" 'map(select(if $partition == "fedora" then . == "fedora" else . != "fedora" end))' <<< "$distros")
+            arm_distros='[]'
+          fi
+          printf 'build-x64=%s\n' "$(jq -c --argjson distros "$distros" 'map(select(.distro as $distro | $distros | index($distro)))' <<< "$BUILD_X64")" >> "$GITHUB_OUTPUT"
+          printf 'build-arm64=%s\n' "$(jq -c --argjson distros "$arm_distros" 'map(select(.distro as $distro | $distros | index($distro)))' <<< "$BUILD_ARM64")" >> "$GITHUB_OUTPUT"
+          printf 'lanes=%s\n' "$(jq -c --argjson distros "$distros" '. + [{distro:"ubuntu",image:"unused",features:"debian,pgp,license",setup:"true"}] | map(select(.distro as $distro | $distros | index($distro)))' <<< "$BUILD_X64")" >> "$GITHUB_OUTPUT"
           if [[ "$STAGED" == true ]]; then
             VERSION=$(awk -F'"' '/^version =/ {print $2; exit}' Cargo.toml)
             tag="v$VERSION"
@@ -614,7 +632,7 @@ jobs:
         if: always() && failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: qemu-workflow-report
+          name: qemu-workflow-report${{ inputs.partition == 'non-fedora' && '-non-fedora' || inputs.partition == 'fedora' && '-fedora' || '' }}
           path: ${{ runner.temp }}/qemu-workflow-report/
           retention-days: 30
           if-no-files-found: warn

@@ -1,5 +1,6 @@
 """Require scheduler dependencies instead of racing native producer runners."""
 from pathlib import Path
+import itertools
 import os
 import re
 import subprocess
@@ -35,7 +36,7 @@ class QemuProducerDependency(unittest.TestCase):
                        LINUX_MATRIX='success',
                        FEDORA_SQLITE='success', SANDBOX_CANCELLATION='success',
                        FEATURE_INTERSECTIONS='success', MACOS='success', MACOS_NEXTEST_SOURCE='success',
-                       UBUNTU='success', RUNTIME_USAGE='success', QEMU='success',
+                       UBUNTU='success', RUNTIME_USAGE='success', QEMU='success', QEMU_FEDORA='success',
                        QEMU_REQUIRED='true', DOCS_AUDIT='success')
         for state in ('success', 'failure', 'cancelled', 'skipped', ''):
             with self.subTest(clippy=state), tempfile.TemporaryDirectory() as directory:
@@ -60,52 +61,70 @@ class QemuProducerDependency(unittest.TestCase):
         end = re.search(r'\n\s*fi\b', script[start:])
         self.assertIsNotNone(end)
         guard = script[start:start + end.end()]
-        for required in ('true', 'false'):
-            for outcome in ('success', 'failure', 'cancelled', 'skipped', ''):
-                with self.subTest(required=required, outcome=outcome):
-                    result = subprocess.run([BASH, '-eu', '-c', guard],
-                        env=dict(os.environ, QEMU_REQUIRED=required, QEMU=outcome),
-                        capture_output=True, text=True, timeout=10)
-                    self.assertEqual(result.returncode == 0,
-                                     required == 'false' or outcome == 'success')
+        outcomes = ('success', 'failure', 'cancelled', 'skipped', '')
+        for required, outcome, fedora in itertools.product(('true', 'false'), outcomes, outcomes):
+            with self.subTest(required=required, non_fedora=outcome, fedora=fedora):
+                result = subprocess.run([BASH, '-eu', '-c', guard],
+                    env=dict(os.environ, QEMU_REQUIRED=required, QEMU=outcome, QEMU_FEDORA=fedora),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode == 0,
+                                 required == 'false' or outcome == fedora == 'success')
 
     def test_automatic_guests_wait_for_both_native_producer_jobs(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
-        self.assertTrue('\n  qemu:\n' in ci,
-                      'automatic QEMU must be scheduled by its native producer workflow')
-        qemu = job_block(ci, 'qemu')
-        needs = re.search(r'^    needs: \[([^]]+)\]', qemu, re.MULTILINE)
-        self.assertIsNotNone(needs)
-        self.assertTrue({'linux-matrix', 'ubuntu'} <=
-                        {item.strip() for item in needs.group(1).split(',')})
-        self.assertIn('uses: ./.github/workflows/qemu-matrix.yml', qemu)
         final = job_block(ci, 'ci-success')
-        self.assertRegex(final, r'needs: \[[^\]]*\bqemu\b')
+        self.assertIn('QEMU_FEDORA: ${{ needs.qemu-fedora.result }}', final)
+        for name, partition, expected_needs in (
+                ('qemu', 'non-fedora', {'qemu-preflight', 'linux-matrix', 'ubuntu'}),
+                ('qemu-fedora', 'fedora', {'qemu-preflight', 'linux-matrix', 'ubuntu', 'fedora-sqlite'})):
+            with self.subTest(caller=name):
+                qemu = job_block(ci, name)
+                needs = re.search(r'^    needs: \[([^]]+)\]', qemu, re.MULTILINE)
+                self.assertIsNotNone(needs)
+                self.assertEqual({item.strip() for item in needs.group(1).split(',')}, expected_needs)
+                self.assertIn('uses: ./.github/workflows/qemu-matrix.yml', qemu)
+                self.assertIn('partition: ' + partition, qemu)
+                self.assertRegex(final, r'needs: \[[^\]]*\b' + name + r'\b')
 
     def test_preflight_runs_alongside_producers(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         preflight = job_block(ci, 'qemu-preflight')
-        guests = job_block(ci, 'qemu')
         self.assertRegex(preflight, r'(?m)^    needs: quick-gate$')
         self.assertIn('uses: ./.github/actions/qemu-preflight', preflight)
         self.assertIn('ref: ${{ github.sha }}', preflight)
         self.assertIn('persist-credentials: false', preflight)
-        self.assertIn('qemu-preflight', re.search(r'(?m)^    needs: \[([^]]+)\]$', guests)[1].split(', '))
-        self.assertIn('preflight-result: ${{ needs.qemu-preflight.result }}', guests)
+        for name in ('qemu', 'qemu-fedora'):
+            with self.subTest(caller=name):
+                guests = job_block(ci, name)
+                self.assertIn('qemu-preflight', re.search(r'(?m)^    needs: \[([^]]+)\]$', guests)[1].split(', '))
+                self.assertIn('preflight-result: ${{ needs.qemu-preflight.result }}', guests)
 
-    def test_preflight_failure_still_runs_the_qemu_failure_coordinator(self):
+    def test_preflight_failure_still_runs_both_qemu_failure_coordinators(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
-        guests = job_block(ci, 'qemu')
         self.assertIn('name: QEMU behavioral verification preflight', job_block(ci, 'qemu-preflight'))
-        condition = re.search(r'^    if: >-\n((?:      .*\n)+)', guests, re.MULTILINE)[1]
-        expression = ' '.join(condition.split())
-        for result, cancelled in (('success', False), ('failure', False), ('cancelled', False),
-                                  ('skipped', False), ('success', True)):
-            with self.subTest(preflight=result, cancelled=cancelled):
-                check = expression.replace('needs.qemu-preflight.result', repr(result)).replace(
-                    '!cancelled()', '0 == 1' if cancelled else '0 == 0')
-                result_code = subprocess.run([BASH, '-c', '[[ ' + check + ' ]]'], timeout=10).returncode
-                self.assertEqual(result_code, 0 if result != 'skipped' and not cancelled else 1)
+        for name in ('qemu', 'qemu-fedora'):
+            guests = job_block(ci, name)
+            self.assertIn('name: QEMU behavioral verification', guests)
+            condition = re.search(r'^    if: >-\n((?:      .*\n)+)', guests, re.MULTILINE)[1]
+            expression = ' '.join(condition.split())
+            for result, cancelled in (('success', False), ('failure', False), ('cancelled', False),
+                                      ('skipped', False), ('success', True)):
+                with self.subTest(caller=name, preflight=result, cancelled=cancelled):
+                    check = expression.replace('needs.qemu-preflight.result', repr(result)).replace(
+                        '!cancelled()', '0 == 1' if cancelled else '0 == 0')
+                    result_code = subprocess.run([BASH, '-c', '[[ ' + check + ' ]]'], timeout=10).returncode
+                    self.assertEqual(result_code, 0 if result != 'skipped' and not cancelled else 1)
+
+    def test_partition_names_do_not_depend_on_successful_preparation(self):
+        matrix = (ROOT / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
+        self.assertIn('      partition:\n        type: string\n        default: all\n', matrix)
+        workflow_group = re.search(r'^  group: (.+)$', matrix, re.MULTILINE)[1]
+        self.assertIn("${{ inputs.partition || 'all' }}", workflow_group)
+        self.assertIn("PARTITION: ${{ inputs.partition || 'all' }}", matrix)
+        report = job_block(matrix, 'summary').split('      - name: Preserve workflow reporting evidence\n', 1)[1]
+        self.assertIn("inputs.partition == 'non-fedora' && '-non-fedora'", report)
+        self.assertIn("inputs.partition == 'fedora' && '-fedora'", report)
+        self.assertNotIn('needs.prepare.outputs', report)
 
     def test_failed_early_preflight_blocks_guest_selection(self):
         matrix = (ROOT / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
@@ -124,11 +143,11 @@ class QemuProducerDependency(unittest.TestCase):
 
     def test_native_failure_still_schedules_guests_after_a_successful_quick_gate(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
-        qemu = job_block(ci, 'qemu')
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]', qemu)
-        self.assertIn('!cancelled()', qemu)
-        self.assertNotIn('needs.linux-matrix.result', qemu)
-        self.assertNotIn('needs.ubuntu.result', qemu)
+        for name in ('qemu', 'qemu-fedora'):
+            qemu = job_block(ci, name)
+            self.assertIn('!cancelled()', qemu)
+            self.assertNotIn('needs.linux-matrix.result', qemu)
+            self.assertNotIn('needs.ubuntu.result', qemu)
         preflight = job_block(ci, 'qemu-preflight')
         condition = re.search(r'^    if: >-\n((?:      .*\n)+)', preflight, re.MULTILINE)
         self.assertIsNotNone(condition)

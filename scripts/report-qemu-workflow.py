@@ -804,7 +804,8 @@ def main():
         published_artifacts = {}
         for artifact in artifacts:
             stage = "artifact-metadata"
-            if artifact_guest_identity(artifact["name"]) is None and artifact["name"] != "qemu-workflow-report":
+            if artifact_guest_identity(artifact["name"]) is None and artifact["name"] not in (
+                    "qemu-workflow-report", "qemu-workflow-report-non-fedora", "qemu-workflow-report-fedora"):
                 continue
             # Re-run failed jobs retains successful jobs and their artifacts.
             # Carry those guests forward only when the latest job receipt still
