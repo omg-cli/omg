@@ -1,5 +1,9 @@
 # CI latency and Cloudflare
 
+The [November GitHub and Cloudflare CI plan](operations/github-cloudflare-ci-plan.md)
+contains the current architecture research, implementation sequence and promotion checks.
+The sections below record the earlier scheduling and compiler-cache integration.
+
 This change lets native builds start after change classification while the full
 workflow checks run independently. CI Success requires both jobs. It does not
 remove tests, relax result handling, move QEMU to another runner, or change a
