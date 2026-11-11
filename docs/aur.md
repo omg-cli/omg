@@ -37,7 +37,7 @@ OMG asks before the package transaction. `--yes` skips that normal confirmation 
 1. OMG fetches recipe sources without executing the PKGBUILD, then presents the source tree for review when `aur.review_pkgbuild` is enabled.
 2. It hashes and rechecks the reviewed tree before the build. The default Bubblewrap path isolates the build home and environment and denies build network access unless configured otherwise.
 3. It inspects output archives before installation. The inspector rejects unsafe paths, escaping links, special entries, and inconsistent or undeclared metadata.
-4. Outputs with privileged integration, such as install hooks, capabilities, systemd units, kernel modules, package-manager hooks, or `/etc` content, receive a second private build. The outputs must match byte for byte.
+4. Outputs with privileged integration, such as install hooks, capabilities, systemd units, kernel modules, package-manager hooks, or `/etc` content, receive a second private build. The outputs must match byte for byte and require separate attended approval of their inspected paths and archive digests.
 5. Accepted archive bytes move through a sealed in-memory handoff to the privileged transaction, which reinspects the staged bytes.
 
 These checks reduce specific build and handoff risks. A reproducible malicious recipe remains malicious. A package hash is not a publisher signature. Check the recipe's source verification, including `validpgpkeys`, and the upstream project before trusting it. Read [security](./security.md) for the limits of grades and audit evidence.
@@ -51,6 +51,11 @@ Build and test dependencies are required before packaging. If a recipe names one
 PKGBUILD review defaults to on. With review enabled, a session without an interactive terminal fails before building. `omg install --review PACKAGE` or `omg update --review` forces review even when configuration has disabled it. Turning review off does not disable archive inspection or the separate exceptional privilege approval.
 
 Do not assume `--yes` makes every AUR package suitable for CI. An archive that requires attended approval fails without a terminal. Use reviewed, pinned artifacts and test the exact recipe in your CI environment.
+
+Review previews the PKGBUILD and lists supporting files with their hashes. Inspect
+those files yourself; their hashes do not establish that they are safe. Source
+symlinks must resolve inside the checkout. Source prefetch stops after fifteen
+minutes, including servers that continue sending small amounts of data.
 
 ## Configure builds
 

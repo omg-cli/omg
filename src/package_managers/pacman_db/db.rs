@@ -32,6 +32,7 @@ use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter, deco
 /// TTL for cache eviction safety net (30 minutes)
 const CACHE_TTL_SECS: u64 = 30 * 60;
 const MAX_DESC_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PACKAGE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SYNC_ENTRIES: usize = 100_000;
 
 /// Sync database cache, validated against its source identity on reuse.
@@ -1098,7 +1099,23 @@ fn load_cache_from_disk_in<T: for<'de> Deserialize<'de>>(
     name: &str,
 ) -> Result<T> {
     let path = cache_dir.join(format!("{name}.bin"));
-    let data = fs::read(&path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(&path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "Package cache must be a regular file");
+    anyhow::ensure!(
+        metadata.len() <= MAX_PACKAGE_CACHE_BYTES,
+        "Package cache exceeds size limit"
+    );
+    let mut data = Vec::new();
+    file.take(MAX_PACKAGE_CACHE_BYTES + 1)
+        .read_to_end(&mut data)?;
+    anyhow::ensure!(
+        data.len() as u64 <= MAX_PACKAGE_CACHE_BYTES,
+        "Package cache exceeds size limit"
+    );
     let cache: T = bitcode::deserialize(&data)?;
     Ok(cache)
 }
@@ -1293,8 +1310,18 @@ fn ensure_local_cache_loaded(local_dir: &Path) -> Result<()> {
     let current_epoch = LocalDbEpoch::from_local_dir(local_dir)?;
     // The previous local_db_rdeps layout stores only a directory timestamp.
     ensure_cache_loaded(&LOCAL_DB_CACHE, "local_db_source_v1", current_epoch, || {
-        parse_local_db(local_dir)
-    })
+        let packages = parse_local_db(local_dir)?;
+        anyhow::ensure!(
+            current_epoch == LocalDbEpoch::from_local_dir(local_dir)?,
+            "Installed packages changed while loading; retry the operation"
+        );
+        Ok(packages)
+    })?;
+    anyhow::ensure!(
+        current_epoch == LocalDbEpoch::from_local_dir(local_dir)?,
+        "Installed packages changed while loading; retry the operation"
+    );
+    Ok(())
 }
 
 /// Metadata identity of the complete sync directory. Ordering is meaningless:
@@ -2600,6 +2627,30 @@ mod tests {
     }
 
     #[test]
+    fn persisted_package_cache_rejects_symlink_and_oversized_file() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("valid");
+        fs::write(&target, bitcode::serialize(&DbCache::default())?)?;
+        let path = directory.path().join("fixture.bin");
+        std::os::unix::fs::symlink(&target, &path)?;
+        assert!(load_cache_from_disk_in::<DbCache>(directory.path(), "fixture").is_err());
+        fs::remove_file(&path)?;
+        let file = fs::File::create(&path)?;
+        file.set_len(512 * 1024 * 1024 + 1)?;
+        let error = load_cache_from_disk_in::<DbCache>(directory.path(), "fixture")
+            .err()
+            .context("oversized cache must fail before decoding")?;
+        assert!(error.to_string().contains("size limit"), "{error:#}");
+        fs::remove_file(&path)?;
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        assert!(load_cache_from_disk_in::<DbCache>(directory.path(), "fixture").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn sync_identity_cache_uses_versioned_namespace() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let cache = DbCache {
@@ -3502,8 +3553,11 @@ mod tests {
                 let fast = get_counts_fast().expect("fast-path counts must succeed");
                 let ffi = crate::package_managers::alpm_direct::get_counts()
                     .expect("libalpm counts must succeed");
+                let public = crate::package_managers::get_counts()
+                    .expect("public package counts must succeed");
                 assert_eq!(fast, expected, "fast path diverged on fixture");
                 assert_eq!(ffi, expected, "libalpm path diverged on fixture");
+                assert_eq!(public, expected, "public count routing diverged on fixture");
                 assert_eq!(fast, ffi, "fast path and libalpm path must agree");
             },
         );

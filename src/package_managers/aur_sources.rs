@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 const MAX_AUR_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_AUR_SOURCE_DURATION: Duration = Duration::from_mins(15);
 const MAX_GIT_MIRROR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_GIT_MIRROR_ENTRIES: usize = 200_000;
 const MAX_GIT_STDERR_BYTES: u64 = 1024 * 1024;
@@ -729,6 +730,7 @@ fn public_source_client(host: &str, addresses: &[std::net::SocketAddr]) -> Resul
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_mins(1))
+        .timeout(MAX_AUR_SOURCE_DURATION)
         .resolve_to_addrs(host, addresses)
         .build()?)
 }
@@ -761,10 +763,8 @@ async fn fetch_public_source(value: &str) -> Result<reqwest::Response> {
         );
         // Redirects stay manual (Policy::none): each hop must re-resolve and
         // re-validate as public-only for SSRF protection, which reqwest's
-        // automatic redirect policy cannot do. Total `.timeout()` is avoided
-        // here because it covers the whole body download and aborts large
-        // files; `.read_timeout()` only fires on stalled reads, matching
-        // core::http::download_client.
+        // automatic redirect policy cannot do. A total timeout also bounds
+        // servers that keep sending data just before the read timeout.
         let client = public_source_client(&host, &addresses)?;
         let response = client.get(url.clone()).send().await?;
         if !response.status().is_redirection() {
@@ -782,46 +782,50 @@ async fn fetch_public_source(value: &str) -> Result<reqwest::Response> {
 
 /// Download a single file with progress tracking
 async fn download_file(url: &str, dest_path: &Path, task: ProgressTask) -> Result<()> {
-    let response = fetch_public_source(url).await?;
+    tokio::time::timeout(MAX_AUR_SOURCE_DURATION, async {
+        let response = fetch_public_source(url).await?;
 
-    if !response.status().is_success() {
-        task.set_message(&format!("HTTP {}", response.status()));
-        task.finish(Outcome::Failed);
-        return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
-    }
+        if !response.status().is_success() {
+            task.set_message(&format!("HTTP {}", response.status()));
+            task.finish(Outcome::Failed);
+            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+        }
 
-    // Get content length for progress bar and reject an oversized response
-    // before creating a large temporary file.
-    let expected_length = response.content_length();
-    if let Some(total) = expected_length {
-        anyhow::ensure!(
-            total <= MAX_AUR_SOURCE_BYTES,
-            "AUR source declares {total} bytes, exceeding the {MAX_AUR_SOURCE_BYTES}-byte limit"
-        );
-        task.set_total(Some(total));
-    }
+        // Get content length for progress bar and reject an oversized response
+        // before creating a large temporary file.
+        let expected_length = response.content_length();
+        if let Some(total) = expected_length {
+            anyhow::ensure!(
+                total <= MAX_AUR_SOURCE_BYTES,
+                "AUR source declares {total} bytes, exceeding the {MAX_AUR_SOURCE_BYTES}-byte limit"
+            );
+            task.set_total(Some(total));
+        }
 
-    let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
-    let temporary = tempfile::Builder::new()
-        .prefix(".src-")
-        .tempfile_in(parent)
-        .with_context(|| {
-            format!(
-                "Failed to create temporary AUR source in {}",
-                parent.display()
-            )
-        })?;
-    let (std_file, temporary_path) = temporary.into_parts();
+        let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+        let temporary = tempfile::Builder::new()
+            .prefix(".src-")
+            .tempfile_in(parent)
+            .with_context(|| {
+                format!(
+                    "Failed to create temporary AUR source in {}",
+                    parent.display()
+                )
+            })?;
+        let (std_file, temporary_path) = temporary.into_parts();
 
-    download_to_file(
-        std_file,
-        temporary_path,
-        dest_path,
-        &task,
-        expected_length,
-        response,
-    )
+        download_to_file(
+            std_file,
+            temporary_path,
+            dest_path,
+            &task,
+            expected_length,
+            response,
+        )
+        .await
+    })
     .await
+    .context("AUR source download deadline exceeded")?
 }
 
 /// Stream the response into a same-directory temp file, then persist it.
@@ -838,8 +842,12 @@ async fn download_to_file(
     // Stream download with progress updates
     let mut downloaded = 0u64;
     let mut stream = response.bytes_stream();
+    let deadline = tokio::time::Instant::now() + MAX_AUR_SOURCE_DURATION;
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .context("AUR source body deadline exceeded")?
+    {
         let chunk = chunk.context("Failed to read download chunk")?;
 
         tokio::io::copy(&mut chunk.as_ref(), &mut file)
@@ -884,6 +892,61 @@ async fn download_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn source_body_deadline_removes_partial_download() -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (release, hold) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = [0; 4096];
+            anyhow::ensure!(socket.read(&mut request).await? > 0, "empty source request");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx")
+                .await?;
+            let _ = hold.await;
+            anyhow::Ok(())
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()?
+            .get(format!("http://{address}"))
+            .send()
+            .await?;
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("source");
+        let temporary = tempfile::NamedTempFile::new_in(directory.path())?;
+        let (file, temporary_path) = temporary.into_parts();
+        let task = ProgressTask::start(&TaskSpec {
+            label: "deadline fixture".into(),
+            kind: TaskKind::Bytes { total: None },
+            accent: Accent::Network,
+        });
+        tokio::time::pause();
+        let result = tokio::time::timeout(
+            Duration::from_mins(16),
+            download_to_file(
+                file,
+                temporary_path,
+                &destination,
+                &task,
+                Some(100),
+                response,
+            ),
+        )
+        .await;
+        let _ = release.send(());
+        server.await??;
+        let error = result
+            .expect("source body must have its own deadline")
+            .expect_err("incomplete source must fail");
+        assert!(format!("{error:#}").contains("deadline"), "{error:#}");
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
 
     #[test]
     fn conflicting_source_destinations_are_rejected() {
