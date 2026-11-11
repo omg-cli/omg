@@ -1,6 +1,6 @@
 # OMG Makefile - Development and Testing Targets
 
-.PHONY: help build release test test-lib check fmt fmt-check clippy clippy-strict clean bench bench-fast bench-hyperfine bench-hyperfine-fast bench-charts docker-debian docker-ubuntu docker-test docker-debian-shell docker-ubuntu-shell install audit dev dev-stop dev-check test-property test-fuzz test-fuzz-quick test-advanced test-security qa coverage tdd ci-workflow-quick ci-local-quick ci-local-full check-shell-syntax debt-check debt-refresh
+.PHONY: help build release test test-lib check fmt fmt-check clippy clippy-strict clean bench bench-fast bench-hyperfine bench-hyperfine-fast bench-charts docker-debian docker-ubuntu docker-test docker-debian-shell docker-ubuntu-shell install audit dev dev-stop dev-check test-property test-fuzz test-fuzz-quick test-advanced test-security qa coverage tdd ci-workflow-static ci-workflow-quick ci-local-quick ci-local-full check-shell-syntax debt-check debt-refresh
 
 # Default target - show help
 .DEFAULT_GOAL := help
@@ -284,23 +284,16 @@ debt-check:
 debt-refresh:
 	python3 scripts/debt-ratchet.py --refresh
 
-# Required hosted checks run alongside independent platform jobs.
-ci-workflow-quick: check-shell-syntax
+# Static work has one hosted owner; local quick checks still run every check once.
+ci-workflow-static: check-shell-syntax
 	cargo fmt --all -- --check
-	python3 -m unittest discover -s tests -p 'test_qemu_*.py' -v
 	./scripts/test-release-smoke.sh
 	./scripts/test-qa-file-issue.sh
 	./scripts/test-qa-audit.sh
 	./scripts/test-qa-open-pr.sh
-	python3 -m unittest discover -s scripts -p 'test_*.py' -v
-	python3 tests/test_benchmark_records.py
-	python3 tests/test_terminal_update_notice.py
-	python3 tests/test_audit_repair_shell.py
-	python3 -B -m unittest discover -s tests -p 'test_changelog_workflow_security.py' -v
-	python3 -B -m unittest discover -s tests -p 'test_ci_config_path_security.py' -v
-	python3 -B -m unittest discover -s tests -p 'test_container_path_security.py' -v
-	python3 -B -m unittest discover -s tests -p 'test_daemon_path_security.py' -v
-	python3 -B -m unittest discover -s tests -p 'test_shell_backup_safety.py' -v
+
+ci-workflow-quick: ci-workflow-static
+	python3 -B scripts/workflow-helpers.py run --static-complete
 
 ci-local-quick: ci-workflow-quick
 	cargo check --all-targets --no-default-features --features pgp,license --locked

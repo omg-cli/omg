@@ -217,7 +217,7 @@ class ArtifactUnavailable(ValueError):
     """Scheduling absence; each guest must still enforce full admission."""
 
 
-def prior_successful_artifact(repository, run, expected_run, distro, artifacts):
+def prior_successful_artifact(repository, run, expected_run, distro, artifacts, family='native-release'):
     """Admit a carried build only when this attempt did not rerun its owner."""
     current_attempt = run['run_attempt']
     owner = f'Linux ({distro})'
@@ -232,7 +232,9 @@ def prior_successful_artifact(repository, run, expected_run, distro, artifacts):
             'native owner start time is unavailable')
     if any(job['started_at'] >= run['run_started_at'] for job in current_owners):
         return None
-    prefix = f'native-release-{distro}-'
+    if len(current_owners) != 1:
+        return None
+    prefix = f'{family}-{distro}-'
     candidates = []
     for artifact in artifacts:
         name = artifact.get('name')
@@ -244,6 +246,7 @@ def prior_successful_artifact(repository, run, expected_run, distro, artifacts):
     require(len({attempt for attempt, _ in candidates}) == len(candidates),
             'ambiguous prior native artifact')
     for attempt, artifact in sorted(candidates, reverse=True):
+        carried = [(current_attempt, current_owners[0])]
         for later in range(current_attempt - 1, attempt, -1):
             later_run = api_json(f'repos/{repository}/actions/runs/{run["id"]}/attempts/{later}')
             validate_producer_run(later_run, expected_run)
@@ -261,6 +264,8 @@ def prior_successful_artifact(repository, run, expected_run, distro, artifacts):
                     'intermediate native owner start time is unavailable')
             require(not any(job['started_at'] >= later_run['run_started_at'] for job in later_owners),
                     'newer native owner reran without an admissible artifact')
+            require(len(later_owners) == 1, 'missing or ambiguous intermediate native owner')
+            carried.append((later, later_owners[0]))
         prior_run = api_json(f'repos/{repository}/actions/runs/{run["id"]}/attempts/{attempt}')
         validate_producer_run(prior_run, expected_run)
         require(prior_run['id'] == run['id'] and prior_run['run_attempt'] == attempt
@@ -283,6 +288,13 @@ def prior_successful_artifact(repository, run, expected_run, distro, artifacts):
                 and prior_run['run_started_at'] <= job['started_at'] <= artifact['created_at']
                 <= job['completed_at'] < run['run_started_at'],
                 'prior native artifact lacks a successful exact-attempt owner')
+        require(all(type(row.get('id')) is int and row['id'] > 0
+                    and row.get('run_id') == run['id'] and row.get('run_attempt') == owner_attempt
+                    and row.get('head_sha') == expected_run['head_sha']
+                    and row.get('status') == 'completed' and row.get('conclusion') == 'success'
+                    and (row.get('started_at'), row.get('completed_at'))
+                        == (job['started_at'], job['completed_at'])
+                    for owner_attempt, row in carried), 'carried native owner differs from successful origin')
         require(type(artifact.get('id')) is int and artifact['id'] > 0
                 and type(artifact.get('size_in_bytes')) is int
                 and 0 < artifact['size_in_bytes'] <= MAX_DOWNLOAD
@@ -291,15 +303,15 @@ def prior_successful_artifact(repository, run, expected_run, distro, artifacts):
     return None
 
 
-def find_native_artifact(root, distro, context, event, timeout=1500):
-    require(distro in FEATURES, 'unsupported native owner')
+def native_lookup_context(root, context, event, *, allow_manual=False):
     repository = context['GITHUB_REPOSITORY']
     require(re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository), 'invalid repository')
     source = context['GITHUB_SHA']
     require(re.fullmatch('[a-f0-9]{40}', source), 'invalid checkout SHA')
     require(command_output(['git', '-C', str(root), 'rev-parse', 'HEAD']) == source, 'checkout identity mismatch')
     event_name = context['GITHUB_EVENT_NAME']
-    require(event_name in ('push', 'pull_request', 'merge_group'), 'reuse only applies to automatic source runs')
+    require(event_name in ('push', 'pull_request', 'merge_group')
+            or (allow_manual and event_name == 'workflow_dispatch'), 'reuse only applies to automatic source runs')
     head = event['pull_request']['head']['sha'] if event_name == 'pull_request' else source
     require(re.fullmatch('[a-f0-9]{40}', head), 'invalid API head SHA')
     workflow = api_json('repos/' + repository + '/actions/workflows/ci.yml')
@@ -307,6 +319,44 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
             'invalid CI workflow identity')
     expected_run = dict(repository=repository, workflow_id=workflow['id'], event=event_name,
                         head_sha=head, pr_number=event.get('number'))
+    return repository, head, event_name, expected_run
+
+
+def select_native_artifact(repository, run, expected_run, distro, listing, family='native-release'):
+    current_attempt = run['run_attempt']
+    require(type(listing.get('total_count')) is int and 0 <= listing['total_count'] <= 100
+            and isinstance(listing.get('artifacts'), list)
+            and len(listing['artifacts']) == listing['total_count'],
+            'excessive producer artifact list')
+    artifacts = [row for row in listing['artifacts']
+                 if row.get('name') == f'{family}-{distro}-{current_attempt}']
+    print(f'Native artifact lookup: run={run["id"]} attempt={current_attempt} '
+          f'status={run.get("status")} distro={distro} matches={len(artifacts)}', flush=True)
+    require(len(artifacts) <= 1, 'ambiguous native artifact')
+    if artifacts:
+        artifact = artifacts[0]
+        require(type(artifact.get('id')) is int and artifact['id'] > 0
+                and type(artifact.get('size_in_bytes')) is int
+                and 0 < artifact['size_in_bytes'] <= MAX_DOWNLOAD
+                and artifact.get('expired') is False
+                and isinstance(artifact.get('created_at'), str)
+                and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', artifact['created_at'])
+                and artifact['created_at'] >= run['run_started_at'], 'stale or invalid native artifact')
+        return artifact, current_attempt
+    if current_attempt > 1:
+        prior = prior_successful_artifact(repository, run, expected_run, distro,
+                                          listing['artifacts'], family=family)
+        if prior is not None:
+            artifact, producer_attempt = prior
+            print(f'Using successful native owner from attempt {producer_attempt}; '
+                  f'current attempt {current_attempt} did not rerun {distro}', flush=True)
+            return artifact, producer_attempt
+    return None
+
+
+def find_native_artifact(root, distro, context, event, timeout=1500):
+    require(distro in FEATURES, 'unsupported native owner')
+    repository, head, event_name, expected_run = native_lookup_context(root, context, event)
     started, delay, selected_id = time.monotonic(), 5, None
     while time.monotonic() - started < timeout:
         run = None
@@ -331,36 +381,150 @@ def find_native_artifact(root, distro, context, event, timeout=1500):
         if run and run.get('run_started_at') is not None:
             current_attempt = run['run_attempt']
             listing = api_json(f'repos/{repository}/actions/runs/{selected_id}/artifacts?per_page=100')
-            require(type(listing.get('total_count')) is int and listing['total_count'] <= 100,
-                    'excessive producer artifact list')
-            artifacts = [row for row in listing['artifacts']
-                         if row.get('name') == f'native-release-{distro}-{current_attempt}']
-            print(f'Native artifact lookup: run={selected_id} attempt={current_attempt} '
-                  f'status={run.get("status")} distro={distro} matches={len(artifacts)}', flush=True)
-            require(len(artifacts) <= 1, 'ambiguous native artifact')
-            if artifacts:
-                artifact = artifacts[0]
-                require(type(artifact.get('id')) is int and artifact['id'] > 0
-                        and type(artifact.get('size_in_bytes')) is int
-                        and 0 < artifact['size_in_bytes'] <= MAX_DOWNLOAD
-                        and artifact.get('expired') is False
-                        and isinstance(artifact.get('created_at'), str)
-                        and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', artifact['created_at'])
-                        and artifact['created_at'] >= run['run_started_at'], 'stale or invalid native artifact')
-                return artifact, run, expected_run, current_attempt
-            if current_attempt > 1:
-                prior = prior_successful_artifact(repository, run, expected_run, distro,
-                                                  listing['artifacts'])
-                if prior is not None:
-                    artifact, producer_attempt = prior
-                    print(f'Using successful native owner from attempt {producer_attempt}; '
-                          f'current attempt {current_attempt} did not rerun {distro}', flush=True)
-                    return artifact, run, expected_run, producer_attempt
+            selected = select_native_artifact(repository, run, expected_run, distro, listing)
+            if selected is not None:
+                artifact, producer_attempt = selected
+                return artifact, run, expected_run, producer_attempt
             if run.get('status') == 'completed':
                 raise ArtifactUnavailable('CI finished without the required native artifact')
         time.sleep(delay)
         delay = min(30, delay * 1.5)
     raise ArtifactUnavailable('CI native artifact did not become available before the deadline')
+
+
+def native_readiness(root, destination, context, event, timeout):
+    repository, _, _, expected_run = native_lookup_context(root, context, event)
+    run_id = context['GITHUB_RUN_ID']
+    require(re.fullmatch(r'[1-9][0-9]*', run_id), 'invalid readiness run')
+    attempt = context['GITHUB_RUN_ATTEMPT']
+    require(re.fullmatch(r'[1-9][0-9]*', attempt), 'invalid readiness attempt')
+    deadline = time.monotonic() + timeout
+    delay = 5
+    while time.monotonic() < deadline:
+        run = api_json(f'repos/{repository}/actions/runs/{run_id}')
+        validate_producer_run(run, expected_run)
+        require(run['id'] == int(run_id) and run['run_attempt'] == int(attempt),
+                'readiness run or attempt changed')
+        selected = {}
+        if run.get('run_started_at') is not None:
+            listing = api_json(f'repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+            for distro in FEATURES:
+                found = select_native_artifact(repository, run, expected_run, distro, listing)
+                if found is not None:
+                    artifact, producer_attempt = found
+                    selected[distro] = dict(artifact, producer_attempt=producer_attempt)
+        if len(selected) == len(FEATURES):
+            if time.monotonic() >= deadline:
+                raise ArtifactUnavailable('native readiness exceeded its common deadline')
+            receipt = dict(schema_version=1, repository=repository, source_sha=context['GITHUB_SHA'],
+                           run_id=run_id, run_attempt=int(attempt), artifacts=selected)
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination/'native-ready.json').write_text(json.dumps(receipt, indent=2)+'\n')
+            print('All five native artifacts are available; consumers retain full byte admission')
+            return receipt
+        jobs = api_json(f'repos/{repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100')
+        require(type(jobs.get('total_count')) is int and 0 <= jobs['total_count'] <= 100
+                and isinstance(jobs.get('jobs'), list)
+                and len(jobs['jobs']) == jobs['total_count'], 'incomplete readiness owner listing')
+        for distro in FEATURES.keys() - selected.keys():
+            owners = [job for job in jobs['jobs'] if job.get('name') == f'Linux ({distro})']
+            for job in owners:
+                require(job.get('run_id') == int(run_id) and job.get('head_sha') == expected_run['head_sha'],
+                        'foreign readiness owner')
+            if owners and all(job.get('status') == 'completed' for job in owners) \
+                    and all(job.get('conclusion') != 'success' for job in owners):
+                raise ArtifactUnavailable(f'Native owner {distro} failed before publishing its artifact')
+        if run.get('status') == 'completed':
+            raise ArtifactUnavailable('CI completed without every required native artifact')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(delay, remaining))
+        delay = min(30, delay * 1.5)
+    raise ArtifactUnavailable('native artifacts did not become available before the common deadline')
+
+
+CLIPPY_PLATFORMS = ('arch', 'debian', 'debian-trixie', 'fedora', 'ubuntu-2604')
+
+
+def record_clippy(root, destination, platform, image, features, context):
+    require(platform in CLIPPY_PLATFORMS, 'unknown Clippy platform')
+    expected_features = FEATURES.get(platform, FEATURES['ubuntu'])
+    require(features == expected_features, 'Clippy feature mismatch')
+    require(isinstance(image, str) and re.fullmatch(r'[^\s]+@sha256:[a-f0-9]{64}', image),
+            'unpinned Clippy image')
+    require(context['GITHUB_REPOSITORY'] == 'omg-cli/omg'
+            and re.fullmatch('[a-f0-9]{40}', context['GITHUB_SHA'])
+            and re.fullmatch('[1-9][0-9]*', context['GITHUB_RUN_ID'])
+            and re.fullmatch('[1-9][0-9]*', context['GITHUB_RUN_ATTEMPT']), 'invalid Clippy context')
+    require(command_output(['git', '-C', str(root), 'rev-parse', 'HEAD']) == context['GITHUB_SHA'],
+            'Clippy source mismatch')
+    outcome = context['NATIVE_CLIPPY_OUTCOME']
+    require(outcome in ('success', 'failure', 'cancelled', 'skipped'), 'invalid Clippy outcome')
+    receipt = dict(schema_version=1, repository=context['GITHUB_REPOSITORY'],
+                   source_sha=context['GITHUB_SHA'], run_id=context['GITHUB_RUN_ID'],
+                   run_attempt=int(context['GITHUB_RUN_ATTEMPT']), platform=platform,
+                   workflow_sha256=sha256((root/'.github/workflows/ci.yml').read_bytes()),
+                   image=image, features=features, outcome=outcome,
+                   argv=['cargo', 'clippy', '--all-targets', '--no-default-features',
+                         '--features', features, '--locked', '--', '-D', 'warnings'])
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination/'native-clippy.json').write_text(json.dumps(receipt, indent=2)+'\n')
+    return receipt
+
+
+def verify_clippy(root, destination, context, event):
+    repository, _, _, expected_run = native_lookup_context(root, context, event, allow_manual=True)
+    run_id, attempt = context['GITHUB_RUN_ID'], context['GITHUB_RUN_ATTEMPT']
+    require(re.fullmatch('[1-9][0-9]*', run_id) and re.fullmatch('[1-9][0-9]*', attempt),
+            'invalid Clippy admission context')
+    run = api_json(f'repos/{repository}/actions/runs/{run_id}')
+    validate_producer_run(run, expected_run)
+    require(run['id'] == int(run_id) and run['run_attempt'] == int(attempt),
+            'Clippy run or attempt changed')
+    listing = api_json(f'repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100')
+    proofs = {}
+    for platform in CLIPPY_PLATFORMS:
+        selected = select_native_artifact(repository, run, expected_run, platform, listing,
+                                          family='native-clippy')
+        if selected is None:
+            raise ArtifactUnavailable(f'Missing native Clippy proof for {platform}')
+        artifact, producer_attempt = selected
+        require(0 < artifact['size_in_bytes'] <= 65536, 'Clippy proof archive exceeds limit')
+        data = api(f'repos/{repository}/actions/artifacts/{artifact["id"]}/zip', 65536)
+        require(len(data) == artifact['size_in_bytes']
+                and artifact.get('digest') == 'sha256:'+sha256(data), 'Clippy proof digest mismatch')
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = archive.infolist()
+            require(len(entries) == 1 and entries[0].filename == 'native-clippy.json'
+                    and 0 < entries[0].file_size <= 65536, 'invalid Clippy archive members')
+            require(stat.S_IFMT(entries[0].external_attr >> 16) in (0, stat.S_IFREG),
+                    'nonregular Clippy receipt')
+            receipt = json.loads(archive.read(entries[0]), object_pairs_hook=unique_object,
+                                 parse_constant=reject_constant)
+        features = FEATURES.get(platform, FEATURES['ubuntu'])
+        expected = dict(schema_version=1, repository=repository, source_sha=context['GITHUB_SHA'],
+                        run_id=run_id, run_attempt=producer_attempt, platform=platform,
+                        workflow_sha256=sha256((root/'.github/workflows/ci.yml').read_bytes()),
+                        features=features, outcome='success',
+                        argv=['cargo', 'clippy', '--all-targets', '--no-default-features',
+                              '--features', features, '--locked', '--', '-D', 'warnings'])
+        require(isinstance(receipt, dict) and set(receipt) == set(expected) | {'image'}
+                and all(type(receipt[key]) is type(value) and receipt[key] == value
+                        for key, value in expected.items()), 'invalid or failed Clippy execution proof')
+        require(isinstance(receipt['image'], str)
+                and re.fullmatch(r'[^\s]+@sha256:[a-f0-9]{64}', receipt['image']), 'unpinned Clippy proof image')
+        proofs[platform] = dict(artifact_id=artifact['id'], producer_attempt=producer_attempt, receipt=receipt)
+    refreshed = api_json(f'repos/{repository}/actions/runs/{run_id}')
+    validate_producer_run(refreshed, expected_run)
+    require(refreshed['id'] == int(run_id) and refreshed['run_attempt'] == int(attempt),
+            'Clippy attempt changed during admission')
+    result = dict(schema_version=1, source_sha=context['GITHUB_SHA'], run_id=run_id,
+                  run_attempt=int(attempt), platforms=proofs)
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination/'native-clippy-summary.json').write_text(json.dumps(result, indent=2)+'\n')
+    print('Verified all five exact native Clippy execution receipts')
+    return result
 
 
 def reuse(root, distro, image, features, destination, context, event, timeout=1500):
@@ -477,13 +641,25 @@ def validate_bundle(content, server_digest, expected):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('build', 'reuse'))
+    parser.add_argument('mode', choices=('build', 'reuse', 'ready', 'clippy-record', 'clippy-verify'))
     parser.add_argument('--distro', choices=tuple(FEATURES))
+    parser.add_argument('--platform', choices=CLIPPY_PLATFORMS)
     parser.add_argument('--image')
     parser.add_argument('--features')
     parser.add_argument('--destination', type=Path)
     parser.add_argument('--timeout', type=int, default=1500)
     args = parser.parse_args(argv)
+    if args.mode in ('clippy-record', 'clippy-verify'):
+        require(args.destination is not None, 'Clippy proof destination is required')
+        if args.mode == 'clippy-record':
+            return record_clippy(Path.cwd(), args.destination, args.platform, args.image, args.features,
+                                 dict(os.environ))
+        event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+        return verify_clippy(Path.cwd(), args.destination, dict(os.environ), event)
+    if args.mode == 'ready':
+        require(1 <= args.timeout <= 1800 and args.destination is not None, 'invalid readiness deadline or output')
+        event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text(encoding='utf-8'))
+        return native_readiness(Path.cwd(), args.destination, dict(os.environ), event, args.timeout)
     require(1 <= args.timeout <= 1500, 'invalid native wait deadline')
     if not all((args.distro, args.image, args.features, args.destination)):
         parser.error('build/reuse require --distro, --image, --features and --destination')
@@ -499,6 +675,6 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
+    except (ValueError, OSError, KeyError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
         print('Native build admission failed: ' + str(error), file=sys.stderr)
         sys.exit(1)

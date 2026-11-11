@@ -432,13 +432,13 @@ exit "$rc"
         }
         for name, expression in expressions.items():
             with self.subTest(boundary=name):
-                expression = expression.replace('github.event_name', "'merge_group'").replace(
+                expression = expression.replace('!cancelled()', '0 == 0').replace('github.event_name', "'merge_group'").replace(
                     'needs.quick-gate.outputs.should-build', "'false'").replace('inputs.staged', '0 == 1').replace(
                     'needs.quick-gate.result', "'success'")
                 result = subprocess.run([self.bash, '-c', '[[ ' + expression + ' ]]'],
                                         text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
-        producer = expressions['producer'].replace('github.event_name', "'merge_group'").replace(
+        producer = expressions['producer'].replace('!cancelled()', '0 == 0').replace('github.event_name', "'merge_group'").replace(
             'needs.quick-gate.outputs.should-build', "'false'")
         for quick_gate, expected in (('success', 0), ('failure', 1), ('skipped', 1)):
             with self.subTest(quick_gate=quick_gate):
@@ -757,8 +757,8 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotIn('native-build-artifact.py ready', PARENT)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  ci-success:', 1)[0]
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu]', automatic)
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]',
+        self.assertIn('needs: [qemu-preflight, native-readiness]', automatic)
+        self.assertIn('needs: [qemu-preflight, native-readiness, fedora-sqlite]',
                       ci.split('\n  qemu-fedora:\n', 1)[1].split('\n  docs-audit:', 1)[0])
         self.assertIn('inputs.staged && inputs.reuse-ci', LANE)
         self.assertIn('needs: [build-staged, build-staged-ubuntu, fedora-sqlite]', LANE)
@@ -925,6 +925,12 @@ elif args[:2] == ['nextest', 'run']:
                     self.assertIn('scripts/native-build-artifact.py', block)
                     # PR artifact reads are intentional. The guest/coordinator
                     # must not acquire the trusted reporter's write privileges.
+                    self.assertNotRegex(TEXT, r'(?m)^\s+(?:actions|contents|issues): write\s*$')
+                    continue
+                if any(name in block for name in ('- name: Admit latest same-revision ARM Fedora SQLite supply',
+                                                  '- name: Admit latest same-revision Fedora SQLite supply')):
+                    self.assertIn('GH_TOKEN: ${{ github.token }}', block)
+                    self.assertIn('scripts/fedora-sqlite.py select', block)
                     self.assertNotRegex(TEXT, r'(?m)^\s+(?:actions|contents|issues): write\s*$')
                     continue
                 self.assertTrue(any(name in block for name in (

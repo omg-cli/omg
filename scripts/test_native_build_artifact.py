@@ -297,8 +297,8 @@ class NativeBuildAdmission(unittest.TestCase):
         lane = (root / '.github/workflows/qemu-lane.yml').read_text(encoding='utf-8')
         matrix = (root / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
         self.assertNotIn('native-build-artifact.py ready', job_block(matrix, 'prepare'))
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu]', job_block(ci, 'qemu'))
-        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]', job_block(ci, 'qemu-fedora'))
+        self.assertIn('needs: [qemu-preflight, native-readiness]', job_block(ci, 'qemu'))
+        self.assertIn('needs: [qemu-preflight, native-readiness, fedora-sqlite]', job_block(ci, 'qemu-fedora'))
         for owner in ('linux-matrix', 'ubuntu'):
             block = job_block(ci, owner)
             self.assertIn('native-build-artifact.py build', block)
@@ -476,7 +476,8 @@ class NativeBuildAdmission(unittest.TestCase):
                         expired=False, created_at='2026-09-20T09:01:00Z',
                         digest='sha256:' + hashlib.sha256(data).hexdigest())
         for mode in ('valid', 'reran-owner', 'failed-owner', 'wrong-head',
-                     'late-artifact', 'intermediate-reran-owner'):
+                     'late-artifact', 'intermediate-reran-owner', 'latest-failed', 'latest-pending',
+                     'latest-wrong-head', 'latest-wrong-interval', 'latest-zero-id'):
             selected_run = dict(run, run_attempt=3,
                                 run_started_at='2026-09-20T11:00:00Z') \
                 if mode == 'intermediate-reran-owner' else run
@@ -484,7 +485,12 @@ class NativeBuildAdmission(unittest.TestCase):
             candidate_artifact = dict(artifact)
             # GitHub includes the carried job in attempt 2 and rewrites its
             # run_attempt field, but its start time remains in attempt 1.
-            current_jobs = [dict(job, run_attempt=2)]
+            current_jobs = [dict(job, id=117, run_attempt=2)]
+            if mode == 'latest-failed': current_jobs[0]['conclusion'] = 'failure'
+            if mode == 'latest-pending': current_jobs[0]['status'] = 'in_progress'
+            if mode == 'latest-wrong-head': current_jobs[0]['head_sha'] = 'd'*40
+            if mode == 'latest-wrong-interval': current_jobs[0]['completed_at'] = '2026-09-20T09:03:00Z'
+            if mode == 'latest-zero-id': current_jobs[0]['id'] = 0
             if mode == 'reran-owner':
                 current_jobs.append(dict(job, id=18, run_attempt=2,
                                          started_at='2026-09-20T10:00:30Z'))

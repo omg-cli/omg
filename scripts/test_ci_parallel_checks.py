@@ -10,19 +10,27 @@ class ParallelChecksTests(unittest.TestCase):
         source = CI_YML.read_text(encoding='utf-8')
         gate = job_block(source, 'quick-gate')
         self.assertIn('python3 scripts/ci-change-scope.py', gate)
-        self.assertIn('test_ci_change_scope.py', gate)
+        self.assertNotIn('test_ci_change_scope.py', gate)
         self.assertNotIn('make ci-workflow-quick', gate)
         self.assertNotIn('rust-toolchain@', gate)
         checks = job_block(source, 'workflow-checks')
-        for command in ('make ci-workflow-quick', 'scripts/debt-ratchet.py --ci',
+        for command in ('make ci-workflow-static', 'scripts/workflow-helpers.py run --shard', 'scripts/debt-ratchet.py --ci',
                         'bash tests/installer_security.sh', 'run: cargo-machete'):
             self.assertIn(command, checks)
+        docs_steps = [step for step in checks.split('\n      - name:') if 'test_ci_change_scope.py' in step]
+        self.assertEqual(len(docs_steps), 1)
+        docs = docs_steps[0]
+        self.assertIn("matrix.shard == 0", docs)
+        self.assertIn("github.event_name != 'push'", docs)
+        self.assertIn("checks-required != 'true'", docs)
+        self.assertIn('test_ci_change_scope.py', docs)
         for job in ('portable', 'linux-matrix', 'ubuntu', 'macos', 'standalone-suites'):
             header = job_block(source, job).split('    steps:', 1)[0]
             self.assertNotIn('workflow-checks', header)
         final = job_block(source, 'ci-success')
         self.assertIn('workflow-checks', final.split('    steps:', 1)[0])
         self.assertIn('WORKFLOW_CHECKS: ${{ needs.workflow-checks.result }}', final)
+        self.assertIn('workflow-helpers.py admit --current-run', final)
 
     def test_workflow_checks_cannot_be_skipped_or_failed_even_on_docs(self):
         evaluator = test_ci_required_results.RequiredResultsTests()

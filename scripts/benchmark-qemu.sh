@@ -386,8 +386,17 @@ for tool in docker timeout sha256sum; do command -v "$tool" >/dev/null || exit 3
 fedora_sqlite_revision=
 if [[ "$distro" == fedora ]]; then
   fedora_sqlite_revision=$(git -C "$repo_root" rev-parse HEAD)
+  fedora_sqlite_binding=()
+  fedora_sqlite_remote_binding=
+  if [[ -f "$fedora_sqlite_bundle/admission.json" ]]; then
+    admission_sha=$(sha256sum "$fedora_sqlite_bundle/admission.json")
+    admission_sha=${admission_sha%% *}
+    fedora_sqlite_binding=(--run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --admission-sha256 "$admission_sha")
+    fedora_sqlite_remote_binding="--run-id '$GITHUB_RUN_ID' --run-attempt '$GITHUB_RUN_ATTEMPT' --admission-sha256 '$admission_sha'"
+    cp "$fedora_sqlite_bundle/admission.json" "$work/fedora-sqlite-admission.json"
+  fi
   python3 "$here/fedora-sqlite.py" verify "$fedora_sqlite_bundle" --arch "$arch" \
-    --revision "$fedora_sqlite_revision" > "$work/fedora-sqlite-admission.log" 2>&1 || exit 3
+    --revision "$fedora_sqlite_revision" "${fedora_sqlite_binding[@]}" > "$work/fedora-sqlite-admission.log" 2>&1 || exit 3
   cp -a "$fedora_sqlite_bundle" "$work/fedora-sqlite-bundle"
   cp "$here/fedora-sqlite.py" "$work/fedora-sqlite.py"
   cp "$here/../tests/qemu-image-provenance/fedora-sqlite.json" "$work/fedora-sqlite-policy.json"
@@ -978,6 +987,9 @@ fi
 cp "$here/qemu-daemon-check.sh" "$work/qemu-daemon-check.sh"
 cp "$here/provision-qemu-crash-channel.py" "$here/check-qemu-health.py" "$work/"
 cp "$here/qemu-apt-abi.py" "$work/qemu-apt-abi.py"
+if [[ "$distro" == ubuntu ]]; then
+  cp "$here/../.github/actions/ubuntu-apt/setup.sh" "$work/setup-ubuntu-apt.sh"
+fi
 cp "$here/qemu-aur-check.sh" "$here/qemu-aur-fixture.py" "$work/"
 cp "$here/qemu-doctor-connectivity-check.sh" "$here/qemu-doctor-connectivity-fixture.py" "$work/"
 cp "$here/../tests/daemon_advisory_shutdown.sh" "$work/daemon-advisory-shutdown.sh"
@@ -1067,11 +1079,12 @@ case "$distro" in
   arch) sudo -n pacman -Syu --noconfirm >evidence/arch-system-upgrade.txt 2>&1 || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
   debian|debian-trixie|ubuntu)
     sudo -n systemctl stop apt-daily.timer apt-daily-upgrade.timer
-    if [[ "$distro" == ubuntu ]]; then
-      sudo -n sed -i 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
-    fi
     printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Languages "none";\nAcquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";\nAcquire::IndexTargets::deb::CNF::DefaultEnabled "false";\n' | sudo -n tee /etc/apt/apt.conf.d/99omg-qa-network > evidence/apt-network.conf
-    sudo -n apt-get update > evidence/index-update.txt 2>&1 || exit 120
+    if [[ "$distro" == ubuntu ]]; then
+      sudo -n bash "$HOME/setup-ubuntu-apt.sh" > evidence/index-update.txt 2>&1 || exit 120
+    else
+      sudo -n apt-get update > evidence/index-update.txt 2>&1 || exit 120
+    fi
     native=(apt-cache --no-all-versions show tree)
     version_cmd=(dpkg-query -W '-f=${Version}\n' tree) ;;
   fedora)
@@ -1236,11 +1249,14 @@ if [[ "$distro" == fedora ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp -r "${opts[@]}" -P 2222 \
     /work/fedora-sqlite-bundle /work/fedora-sqlite.py /work/fedora-sqlite-policy.json bench@127.0.0.1:
   timeout --kill-after=5s 90s docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 \
-    "mkdir -p evidence && sudo -n python3 fedora-sqlite.py install fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' --output evidence/fedora-sqlite-before.json" \
+    "mkdir -p evidence && sudo -n python3 fedora-sqlite.py install fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' $fedora_sqlite_remote_binding --output evidence/fedora-sqlite-before.json" \
     > "$work/fedora-sqlite-install.log" 2>&1 || exit 3
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
+if [[ "$distro" == ubuntu ]]; then
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/setup-ubuntu-apt.sh bench@127.0.0.1:setup-ubuntu-apt.sh
+fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
   /work/provision-qemu-crash-channel.py /work/check-qemu-health.py bench@127.0.0.1:
@@ -1285,7 +1301,7 @@ rc=0
 timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel'" > "$work/guest-check.log" 2>&1 || rc=$?
 if [[ "$distro" == fedora && "$rc" == 0 ]]; then
   timeout --kill-after=5s 30s docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 \
-    "sudo -n python3 fedora-sqlite.py installed fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' --output evidence/fedora-sqlite-after.json" \
+    "sudo -n python3 fedora-sqlite.py installed fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' $fedora_sqlite_remote_binding --output evidence/fedora-sqlite-after.json" \
     >> "$work/fedora-sqlite-install.log" 2>&1 || rc=3
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp -r "${opts[@]}" -P 2222 bench@127.0.0.1:evidence /work/guest/ > "$work/evidence-copy.log" 2>&1
@@ -1655,7 +1671,7 @@ fi
 if [[ "$distro" == fedora && "$rc" == 0 ]]; then
   sqlite_final_rc=0
   timeout --kill-after=5s 30s docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 \
-    "sudo -n python3 fedora-sqlite.py installed fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' --output evidence/fedora-sqlite-final.json" \
+    "sudo -n python3 fedora-sqlite.py installed fedora-sqlite-bundle --policy fedora-sqlite-policy.json --arch '$arch' --revision '$fedora_sqlite_revision' $fedora_sqlite_remote_binding --output evidence/fedora-sqlite-final.json" \
     >> "$work/fedora-sqlite-install.log" 2>&1 || sqlite_final_rc=$?
   if [[ "$sqlite_final_rc" == 0 ]]; then
     timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
@@ -1664,7 +1680,7 @@ if [[ "$distro" == fedora && "$rc" == 0 ]]; then
   fi
   if [[ "$sqlite_final_rc" == 0 ]]; then
     python3 "$here/fedora-sqlite.py" verify "$work/fedora-sqlite-bundle" --arch "$arch" \
-      --revision "$fedora_sqlite_revision" --evidence-dir "$work/guest/evidence" \
+      --revision "$fedora_sqlite_revision" "${fedora_sqlite_binding[@]}" --evidence-dir "$work/guest/evidence" \
       >> "$work/fedora-sqlite-admission.log" 2>&1 || sqlite_final_rc=$?
   fi
   if [[ "$sqlite_final_rc" != 0 ]]; then

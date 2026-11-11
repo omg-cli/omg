@@ -1,0 +1,92 @@
+name: Cloudflare CI artifacts
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: cloudflare-ci-artifacts-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.repository == 'omg-cli/omg' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.1
+
+      - name: Install pinned deployment package manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 --max-time 120 -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$RUNNER_TEMP/bun.zip"
+          echo "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c  $RUNNER_TEMP/bun.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun"
+          echo "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235  $RUNNER_TEMP/bun/bun-linux-x64/bun" | sha256sum -c -
+          echo "$RUNNER_TEMP/bun/bun-linux-x64" >> "$GITHUB_PATH"
+
+      - name: Install frozen control dependencies
+        working-directory: services/ci
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Check artifact transport
+        run: |
+          bun test services/ci-artifacts/test/worker.test.ts
+          bun run --cwd services/ci tsc --project ../ci-artifacts/tsconfig.json --noEmit
+          node --test services/ci-artifacts/test/deploy.test.mjs
+          python3 -B -m unittest discover -s scripts -p 'test_ci_r2_cache.py' -v
+
+      - name: Install seed compiler
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install seed cache client
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b
+        with:
+          tool: sccache@0.18.0
+
+      - name: Prove original Rust bytes and seed remote cache
+        env:
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+        run: python3 scripts/ci-r2-cache.py --mode seed --receipt "$RUNNER_TEMP/omg-r2-seed.json"
+
+      - name: Deploy separate artifact Worker with existing credentials
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          OMG_R2_CACHE_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+          OMG_R2_CACHE_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+          OMG_R2_CACHE_SEED_RECEIPT: ${{ runner.temp }}/omg-r2-seed.json
+        run: node services/ci-artifacts/deploy.mjs
+
+      - name: Preserve nonsecret producer and final deployment receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cloudflare-ci-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/omg-r2-seed.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Preserve nonsecret deployment identity
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cloudflare-ci-artifacts-deployment-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/omg-ci-artifacts-deployment.json
+          if-no-files-found: warn
+          retention-days: 14
