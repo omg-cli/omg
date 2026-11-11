@@ -5,6 +5,9 @@ on:
       arch:
         required: true
         type: string
+      cpu-quota:
+        default: 2
+        type: number
 permissions:
   contents: read
 defaults:
@@ -12,12 +15,12 @@ defaults:
     shell: bash
 jobs:
   build:
-    name: "SQLite full RPM check (${{ inputs.arch }})"
+    name: "SQLite full RPM check (${{ inputs.arch }}, ${{ inputs.cpu-quota }} CPU)"
     runs-on: ${{ inputs.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     container:
       image: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
-      options: --cpus 2 --memory 4g --memory-swap 4g --pids-limit 512
+      options: --cpus ${{ inputs.cpu-quota }} --memory 4g --memory-swap 4g --pids-limit 512
     steps:
       - name: Prepare authenticated Fedora 44 checkout tools
         run: |
@@ -42,23 +45,61 @@ jobs:
         env:
           SOURCE_REVISION: ${{ github.sha }}
           NATIVE_ARCH: ${{ inputs.arch }}
+          CPU_QUOTA: ${{ inputs.cpu-quota }}
         run: |
           set -euo pipefail
           [[ "$(uname -m)" == "$NATIVE_ARCH" ]]
-          python3 scripts/fedora-sqlite.py build "$RUNNER_TEMP/fedora-sqlite/fedora-sqlite-$NATIVE_ARCH-$GITHUB_RUN_ATTEMPT" --revision "$SOURCE_REVISION"
+          [[ "$CPU_QUOTA" == 2 || "$CPU_QUOTA" == 4 ]]
+          read -r quota period < /sys/fs/cgroup/cpu.max
+          [[ "$quota" == "$((CPU_QUOTA * period))" ]]
+          profile="$RUNNER_TEMP/fedora-sqlite/diagnostics/cpu-rehearsal"
+          bundle="$RUNNER_TEMP/fedora-sqlite/fedora-sqlite-$NATIVE_ARCH-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$profile"
+          capture_resources() {
+            for counter in cpu.max cpu.stat memory.max memory.peak memory.events memory.swap.max pids.max pids.peak pids.events; do
+              if [[ -r /sys/fs/cgroup/$counter ]]; then
+                printf '\n[%s]\n' "$counter"
+                cat "/sys/fs/cgroup/$counter"
+              fi
+            done
+          }
+          capture_resources > "$profile/before.txt"
+          printf 'start\t%s\n' "$(date +%s)" > "$profile/wall.tsv"
+          python3 scripts/fedora-sqlite.py build "$bundle" --revision "$SOURCE_REVISION" &
+          builder=$!
+          (
+            tail --pid="$builder" --sleep-interval=.25 --retry --follow=name -n +1 "$bundle/rpmbuild.log" 2>/dev/null |
+              python3 -u -c '
+          import sys, time
+          markers = ("Executing(%", "+ make test", "./testfixture ", "0 errors out of ", "Wrote: ")
+          for line in sys.stdin:
+              if line.startswith(markers):
+                  print(int(time.time()), line.rstrip(), sep="\t")'
+          ) > "$profile/phases.tsv" &
+          observer=$!
+          status=0
+          wait "$builder" || status=$?
+          capture_resources > "$profile/after.txt"
+          printf 'end\t%s\n' "$(date +%s)" >> "$profile/wall.tsv"
+          wait "$observer" || { [[ "$status" != 0 ]] || exit 1; }
+          if [[ "$status" == 0 ]]; then
+            grep -F 'Executing(%check)' "$profile/phases.tsv" >/dev/null
+            grep -F '0 errors out of ' "$profile/phases.tsv" >/dev/null
+          fi
+          exit "$status"
       - name: Preserve complete admitted package supply
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fedora-sqlite-${{ inputs.arch }}-${{ github.run_attempt }}
+          name: fedora-sqlite-cpu-${{ inputs.cpu-quota }}-${{ inputs.arch }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fedora-sqlite/
           compression-level: 0
-          retention-days: 30
+          retention-days: 3
           if-no-files-found: error
       - name: Preserve failed build diagnostics
         if: failure() || cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fedora-sqlite-failure-${{ inputs.arch }}-${{ github.run_attempt }}
+          name: fedora-sqlite-cpu-${{ inputs.cpu-quota }}-failure-${{ inputs.arch }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/fedora-sqlite/
-          retention-days: 30
+          retention-days: 3
           if-no-files-found: warn

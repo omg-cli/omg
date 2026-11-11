@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       rust-comparison:
-        description: Run only the matched Ubuntu Rust build comparison
+        description: Run only the Fedora RPM CPU rehearsal
         type: boolean
         default: false
       source-sha:
@@ -30,70 +30,16 @@ env:
 
 jobs:
   rust-comparison:
-    name: Matched Ubuntu Rust build comparison
+    name: Fedora RPM CPU rehearsal (${{ matrix.cpu }})
     if: github.event_name == 'workflow_dispatch' && inputs.rust-comparison == true
-    runs-on: ubuntu-24.04
-    timeout-minutes: 300
-    env:
-      COMPARISON_SOURCE_SHA: ${{ inputs.source-sha || github.sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-
-      - name: Set comparison evidence directory
-        run: echo "COMPARISON_ROOT=$RUNNER_TEMP/rust-comparison-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
-
-      - name: Install comparison dependencies
-        run: |
-          sudo apt-get update --error-on=any
-          sudo apt-get install -y --no-install-recommends \
-            ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv \
-            fish zstd libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev tar gzip xz-utils
-
-      - name: Install pinned Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: "1.95.0"
-
-      - name: Check comparison runner
-        run: python3 -B -m unittest discover -s scripts -p test_build_comparison.py -v
-
-      - name: Export immutable application source
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$COMPARISON_SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
-          mkdir -p "$COMPARISON_ROOT"
-          git fetch --no-tags --depth=1 origin "$COMPARISON_SOURCE_SHA"
-          git archive --format=tar --output="$COMPARISON_ROOT/source.tar" "$COMPARISON_SOURCE_SHA"
-          python3 scripts/build-comparison.py prepare --archive "$COMPARISON_ROOT/source.tar" \
-            --source "$COMPARISON_ROOT/source" --evidence "$COMPARISON_ROOT/evidence" \
-            --source-sha "$COMPARISON_SOURCE_SHA"
-          printf '%s\n' "$GITHUB_SHA" > "$COMPARISON_ROOT/evidence/driver-sha.txt"
-
-      - name: Prefetch locked source dependencies outside measurement
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$COMPARISON_ROOT/source"
-          timeout --kill-after=15s 20m cargo +1.95.0 fetch --locked --target x86_64-unknown-linux-gnu \
-            > "$COMPARISON_ROOT/evidence/fetch.stdout" 2> "$COMPARISON_ROOT/evidence/fetch.stderr"
-          test ! -e target
-
-      - name: Measure real release builds and named native tests
-        run: |
-          python3 scripts/build-comparison.py run --source "$COMPARISON_ROOT/source" \
-            --evidence "$COMPARISON_ROOT/evidence" --source-sha "$COMPARISON_SOURCE_SHA"
-
-      - name: Preserve comparison evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: rust-comparison-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.COMPARISON_ROOT }}/evidence/
-          if-no-files-found: error
-          retention-days: 14
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [2, 4]
+    uses: ./.github/workflows/fedora-sqlite.yml
+    with:
+      arch: x86_64
+      cpu-quota: ${{ matrix.cpu }}
 
   workflow-helpers:
     name: Test workflow helpers on Linux host
