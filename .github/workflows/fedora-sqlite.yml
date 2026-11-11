@@ -68,7 +68,9 @@ jobs:
           python3 scripts/fedora-sqlite.py build "$bundle" --revision "$SOURCE_REVISION" &
           builder=$!
           (
-            tail --pid="$builder" --sleep-interval=.25 --retry --follow=name -n +1 "$bundle/rpmbuild.log" 2>/dev/null |
+            while [[ ! -f "$bundle/rpmbuild.log" ]] && kill -0 "$builder" 2>/dev/null; do sleep .25; done
+            [[ -f "$bundle/rpmbuild.log" ]] || exit 0
+            tail --pid="$builder" --sleep-interval=.25 --follow=descriptor -n +1 "$bundle/rpmbuild.log" |
               python3 -u -c '
           import sys, time
           markers = ("Executing(%", "+ make test", "./testfixture ", "0 errors out of ", "Wrote: ")
