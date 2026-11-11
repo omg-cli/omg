@@ -481,7 +481,7 @@ exit "$rc"
         self.assertIn('  pull_request:\n  merge_group:', ci)
         self.assertIn('uses: ./.github/workflows/qemu-matrix.yml', ci)
         gate = step('Verify QEMU preflight')
-        self.assertIn('if: inputs.preflight-complete != true', gate)
+        self.assertIn("if: inputs.preflight-result == ''", gate)
         self.assertIn('uses: ./.github/actions/qemu-preflight', gate)
         self.assertLess(PARENT.index(gate), PARENT.index('      - name: Resolve selection'))
 

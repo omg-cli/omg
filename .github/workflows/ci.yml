@@ -1822,7 +1822,7 @@ jobs:
   # workflow code holding a write-scoped token. All write-scoped steps live
   # in the push-to-main-only release-tag job below.
   qemu-preflight:
-    name: QEMU preflight
+    name: QEMU behavioral verification preflight
     needs: quick-gate
     if: >-
       (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
@@ -1841,10 +1841,10 @@ jobs:
     name: QEMU behavioral verification
     needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]
     if: >-
-      !cancelled() && needs.qemu-preflight.result == 'success'
+      !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
     with:
-      preflight-complete: true
+      preflight-result: ${{ needs.qemu-preflight.result }}
     permissions:
       contents: read
       actions: read

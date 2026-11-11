@@ -24,9 +24,9 @@ name: QEMU Matrix
 on:
   workflow_call:
     inputs:
-      preflight-complete:
-        type: boolean
-        default: false
+      preflight-result:
+        type: string
+        default: ''
     secrets:
       OMG_SMOKE_SENTRY_DSN:
         required: false
@@ -95,8 +95,13 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+      - name: Require early QEMU preflight
+        if: inputs.preflight-result != '' && inputs.preflight-result != 'success'
+        run: |
+          echo '::error::Required QEMU preflight did not pass'
+          exit 1
       - name: Verify QEMU preflight
-        if: inputs.preflight-complete != true
+        if: inputs.preflight-result == ''
         uses: ./.github/actions/qemu-preflight
 
       - name: Resolve selection

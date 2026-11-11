@@ -82,7 +82,7 @@ class QemuProducerDependency(unittest.TestCase):
         final = job_block(ci, 'ci-success')
         self.assertRegex(final, r'needs: \[[^\]]*\bqemu\b')
 
-    def test_preflight_runs_alongside_producers_and_guests_require_its_success(self):
+    def test_preflight_runs_alongside_producers(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
         preflight = job_block(ci, 'qemu-preflight')
         guests = job_block(ci, 'qemu')
@@ -91,7 +91,12 @@ class QemuProducerDependency(unittest.TestCase):
         self.assertIn('ref: ${{ github.sha }}', preflight)
         self.assertIn('persist-credentials: false', preflight)
         self.assertIn('qemu-preflight', re.search(r'(?m)^    needs: \[([^]]+)\]$', guests)[1].split(', '))
-        self.assertIn('preflight-complete: true', guests)
+        self.assertIn('preflight-result: ${{ needs.qemu-preflight.result }}', guests)
+
+    def test_preflight_failure_still_runs_the_qemu_failure_coordinator(self):
+        ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+        guests = job_block(ci, 'qemu')
+        self.assertIn('name: QEMU behavioral verification preflight', job_block(ci, 'qemu-preflight'))
         condition = re.search(r'^    if: >-\n((?:      .*\n)+)', guests, re.MULTILINE)[1]
         expression = ' '.join(condition.split())
         for result, cancelled in (('success', False), ('failure', False), ('cancelled', False),
@@ -100,7 +105,22 @@ class QemuProducerDependency(unittest.TestCase):
                 check = expression.replace('needs.qemu-preflight.result', repr(result)).replace(
                     '!cancelled()', '0 == 1' if cancelled else '0 == 0')
                 result_code = subprocess.run([BASH, '-c', '[[ ' + check + ' ]]'], timeout=10).returncode
-                self.assertEqual(result_code, 0 if result == 'success' and not cancelled else 1)
+                self.assertEqual(result_code, 0 if result != 'skipped' and not cancelled else 1)
+
+    def test_failed_early_preflight_blocks_guest_selection(self):
+        matrix = (ROOT / '.github/workflows/qemu-matrix.yml').read_text(encoding='utf-8')
+        prepare = job_block(matrix, 'prepare')
+        self.assertLess(prepare.index('name: Require early QEMU preflight'), prepare.index('name: Resolve selection'))
+        gate = prepare.split('      - name: Require early QEMU preflight\n', 1)[1].split('      - name: ', 1)[0]
+        expression = re.search(r'^        if: (.+)$', gate, re.MULTILINE)[1]
+        guard = step_script(prepare, 'Require early QEMU preflight')
+        for status in ('', 'success', 'failure', 'cancelled', 'skipped', 'invalid'):
+            with self.subTest(preflight=status):
+                check = expression.replace('inputs.preflight-result', repr(status))
+                command = 'if [[ ' + check + ' ]]; then\n' + guard + '\nfi\nprintf selected'
+                result = subprocess.run([BASH, '-c', command], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0 if status in ('', 'success') else 1, result.stderr)
+                self.assertEqual(result.stdout.endswith('selected'), status in ('', 'success'))
 
     def test_native_failure_still_schedules_guests_after_a_successful_quick_gate(self):
         ci = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
