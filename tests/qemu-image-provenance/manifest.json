@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "reviewed_on": "2026-10-15",
-  "review_expires": "2026-11-14",
+  "reviewed_on": "2026-11-11",
+  "review_expires": "2026-12-11",
   "images": {
     "arch-x86_64": {
       "publisher": "arch",
-      "url": "https://geo.mirror.pkgbuild.com/images/v20261001.604814/Arch-Linux-x86_64-cloudimg-20261001.604814.qcow2",
-      "digest": "360f0fa49db6813bdc8e35bed230a2dc2ae3567b7b5ab74719c0a706e4e34e87",
+      "url": "https://geo.mirror.pkgbuild.com/images/v20261101.620452/Arch-Linux-x86_64-cloudimg-20261101.620452.qcow2",
+      "digest": "794eb4889b39e1f0ed7d5ae998b2a1ed2137db8cf8c3476cf2962c7437ecb003",
       "algorithm": "sha256",
       "keyring": "arch.gpg",
       "keyring_sha256": "f21550af3ff9c63fee0f109127c1e61a54f0e382285eb3c557576770b7fb79c1",
@@ -17,8 +17,8 @@
     },
     "debian-x86_64": {
       "publisher": "debian",
-      "url": "https://cloud.debian.org/images/cloud/bookworm/20261006-2623/debian-12-generic-amd64-20261006-2623.qcow2",
-      "digest": "f631afb1d8123a29779f720f7f08a97e9f2ce5f5c705b8d9f753df8ed0c3afddeb34e4f254dfa41a6330e9a637387c80a8fe453d789446f9d8be7d7714d0ce7e",
+      "url": "https://cloud.debian.org/images/cloud/bookworm/20261026-2643/debian-12-generic-amd64-20261026-2643.qcow2",
+      "digest": "ba6073af9f789c0f7d6b73ec1b23bb207f07f06f2d31bfd3ce5e550fe43eb9415ef983dc0e039014cd59797e0cbea5c32592e6900fa8f974f2e4466b88ff0d80",
       "algorithm": "sha512",
       "signature_policy": "publisher-unsigned-cloud-checksums",
       "rationale": "Debian documents TLS-distributed checksums for current cloud images; its CD signature policy does not cover these images.",
@@ -26,17 +26,17 @@
     },
     "debian-trixie-x86_64": {
       "publisher": "debian",
-      "url": "https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2",
-      "digest": "f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d",
+      "url": "https://cloud.debian.org/images/cloud/trixie/20261103-2651/debian-13-genericcloud-amd64-20261103-2651.qcow2",
+      "digest": "d25999de0770d4cde1be72c299ba3ad94eac7ea8fd4d18f8cc86c69df69337e2e8a91d64465a9bfd8f2a78c566fcbcb0842eacc91c09efdef72d719d9f13b535",
       "algorithm": "sha512",
       "signature_policy": "publisher-unsigned-cloud-checksums",
       "rationale": "Debian publishes this versioned cloud image with TLS-distributed SHA512SUMS and no detached checksum signature; do not claim OpenPGP authentication.",
-      "source": "https://cloud.debian.org/images/cloud/trixie/20261001-2618/SHA512SUMS"
+      "source": "https://cloud.debian.org/images/cloud/trixie/20261103-2651/SHA512SUMS"
     },
     "debian-aarch64": {
       "publisher": "debian",
-      "url": "https://cloud.debian.org/images/cloud/bookworm/20261006-2623/debian-12-generic-arm64-20261006-2623.qcow2",
-      "digest": "991f0dd77ee442eb2406568fc27c537190af0c78ab211b0e2adcf568cd203aebf696b94a05e64c7e00d3e05e0e532fdd941311e34ef862ad06bc1bc69a92a3fb",
+      "url": "https://cloud.debian.org/images/cloud/bookworm/20261026-2643/debian-12-generic-arm64-20261026-2643.qcow2",
+      "digest": "45d5918f1d6272931f87a0a3af8a9fcd4373947369c4d1d2cbad463882d0c3a24acbd6a27cf8b6cd422c23af05d5deaf3cc2d968313649da4d896b707974ad42",
       "algorithm": "sha512",
       "signature_policy": "publisher-unsigned-cloud-checksums",
       "rationale": "Debian documents TLS-distributed checksums for current cloud images; its CD signature policy does not cover these images.",
@@ -44,8 +44,8 @@
     },
     "ubuntu-x86_64": {
       "publisher": "ubuntu",
-      "url": "https://cloud-images.ubuntu.com/noble/20260926/noble-server-cloudimg-amd64.img",
-      "digest": "6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2",
+      "url": "https://cloud-images.ubuntu.com/noble/20261017/noble-server-cloudimg-amd64.img",
+      "digest": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
       "algorithm": "sha256",
       "keyring": "ubuntu.gpg",
       "keyring_sha256": "7d3205c5554f6690006751edae92f147c0c26d4e0bc33ce04709f3f94ca3679d",
@@ -57,8 +57,8 @@
     },
     "ubuntu-aarch64": {
       "publisher": "ubuntu",
-      "url": "https://cloud-images.ubuntu.com/noble/20260926/noble-server-cloudimg-arm64.img",
-      "digest": "1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55",
+      "url": "https://cloud-images.ubuntu.com/noble/20261017/noble-server-cloudimg-arm64.img",
+      "digest": "50e24e1fb79e89116e939d90aa7738f7af48c442fa1bc2510131e0b39c50348e",
       "algorithm": "sha256",
       "keyring": "ubuntu.gpg",
       "keyring_sha256": "7d3205c5554f6690006751edae92f147c0c26d4e0bc33ce04709f3f94ca3679d",
