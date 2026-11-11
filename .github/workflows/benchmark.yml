@@ -184,7 +184,8 @@ jobs:
           chmod +x benchmark-hyperfine.sh
 
           # Use hyperfine for statistical rigor and JSON export
-          ./benchmark-hyperfine.sh --fast 2>&1 | tee benchmark_output.txt
+          OMG_BENCH_BINARY="$GITHUB_WORKSPACE/target/release/omg" \
+            ./benchmark-hyperfine.sh --fast 2>&1 | tee benchmark_output.txt
 
           # Extract metrics from the hyperfine search JSON. Current runs emit
           # "OMG"; older records used "OMG (Daemon)".

@@ -292,6 +292,36 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         self.assertEqual(set(dependencies.group(1).split(', ')), {'benchmark', 'workflow-helpers'})
         self.assertNotRegex(history, r'\balways\(')
 
+    def test_benchmark_uses_the_job_release_pair_without_rebuilding(self):
+        workflow = (WORKFLOWS / 'benchmark.yml').read_text(encoding='utf-8')
+        launcher = step_script(job_block(workflow, 'benchmark'), 'Run Benchmarks (Hyperfine)')
+        launcher = launcher.split('# Extract metrics', 1)[0]
+        benchmark = (ROOT / 'benchmark-hyperfine.sh').read_text(encoding='utf-8')
+        selection = benchmark[benchmark.index('\nTARGET_DIR='):]
+        selection = selection.split('\nif [[ "$GUEST_MODE" == true ]]; then', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / 'target/release'
+            release.mkdir(parents=True)
+            for name in ('omg', 'omgd'):
+                binary = release / name
+                binary.write_bytes(b'#!/bin/sh\nexit 0\n')
+                binary.chmod(0o700)
+            (root / 'benchmark-hyperfine.sh').write_bytes((
+                '#!/usr/bin/env bash\nset -euo pipefail\n'
+                'GUEST_MODE=false UPDATE_MODE=false BLUE= RED= NC=\n'
+                'cargo() { echo unexpected-rebuild >&2; return 47; }\n'
+                + selection + '\n'
+                '[[ "$OMG" -ef "$GITHUB_WORKSPACE/target/release/omg" ]]\n'
+                '[[ "$OMGD" -ef "$GITHUB_WORKSPACE/target/release/omgd" ]]\n'
+                '[[ "$*" == --fast ]]\n'
+            ).encode())
+            environment = dict(os.environ, GITHUB_WORKSPACE=root.as_posix(), OMG_BENCH_BINARY='')
+            result = subprocess.run([BASH, '-ec', launcher], cwd=root, env=environment,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn('unexpected-rebuild', result.stdout + result.stderr)
+
     def test_publication_requires_tag_but_branch_dry_run_remains_valid(self):
         text = (WORKFLOWS / 'release.yml').read_text(encoding='utf-8')
         script = step_script(job_block(text, 'gate-on-ci'), 'Require successful CI and benchmark runs for this commit')
