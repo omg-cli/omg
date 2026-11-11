@@ -28,6 +28,29 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_native_coverage_passes_one_complete_guest_script_to_docker(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        start = script.index('container=$(docker create')
+        end = script.index("\ntrap 'docker rm", start)
+        command = script[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / 'docker-arguments'
+            driver = (
+                'docker() { printf \'%s\\0\' "$@" > "$ARGV_CAPTURE"; '
+                'printf \'%s\' fixture-container; }\n' + command
+            )
+            result = subprocess.run(
+                [BASH, '-eu', '-c', driver],
+                env=dict(os.environ, ARGV_CAPTURE=capture.as_posix()),
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            arguments = capture.read_bytes().split(b'\0')[:-1]
+            guest = arguments[arguments.index(b'-c') + 1:]
+            self.assertEqual(len(guest), 1, 'Docker must receive the entire guest program as one argument')
+            syntax = subprocess.run([BASH, '-n'], input=guest[0], capture_output=True)
+            self.assertEqual(syntax.returncode, 0, syntax.stderr.decode())
+
     def test_privileged_coverage_case_requires_real_execution_and_profiles(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
         self.assertIn('run_case() {', script)
@@ -86,11 +109,20 @@ class OptimizationContracts(unittest.TestCase):
         self.assertIsNotNone(cases, 'coverage must select its required fixture cases explicitly')
         selected = [line.strip() for line in cases.group(1).splitlines() if line.strip()]
         self.assertEqual(len(selected), len(set(selected)))
-        self.assertEqual(len(selected), 14)
+        self.assertEqual(len(selected), 19)
+        self.assertIn('package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes', selected)
+        self.assertIn('package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing', selected)
+        self.assertIn('package_managers::aur::client::tests::native_isolated_history_requires_hardened_review', selected)
+        self.assertIn('runner=(runuser -u nobody -- env HOME=/home/omg-fixture', script)
+        self.assertIn('NOPASSWD: /usr/bin/true', script)
+        self.assertNotIn('NOPASSWD: ALL', script)
+        self.assertIn('config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options', selected)
+        self.assertIn('grep -F "parent_uid=0"', script)
+        self.assertIn('grep -F "uid=65534 "', script)
         self.assertEqual(selected[0], 'package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman')
         self.assertEqual(selected[-1], 'core::usage::tests::elevated_state_roundtrip_preserves_caller_files')
         self.assertIn('mkdir -m 1777 /profiles', script)
-        self.assertIn('--network none --pids-limit 128 --memory 1g --cpus 2', script)
+        self.assertIn('--network none --add-host aur.archlinux.org:127.0.0.1 --pids-limit 128 --memory 1g --cpus 2', script)
         self.assertIn('mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib', script)
         self.assertNotIn('--env GH_TOKEN', script)
         self.assertNotIn('--env GITHUB_TOKEN', script)

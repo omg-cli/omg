@@ -590,6 +590,49 @@ mod tests {
     }
 
     #[test]
+    fn gnu_longlinks_are_inspected_and_cannot_mix_with_pax() -> Result<()> {
+        for mixed in [false, true] {
+            let file = fixture_archive(|builder| {
+                append_file(builder, "usr/share/marker", b"inert marker", 0o644)?;
+                let target = b"usr/share/marker\0";
+                let mut extension = tar::Header::new_gnu();
+                extension.set_path("././@LongLink")?;
+                extension.set_entry_type(tar::EntryType::GNULongLink);
+                extension.set_size(target.len() as u64);
+                extension.set_mode(0o644);
+                extension.set_cksum();
+                builder.append(&extension, target.as_slice())?;
+                if mixed {
+                    builder
+                        .append_pax_extensions([("linkpath", b"usr/share/marker".as_slice())])?;
+                }
+                let mut link = tar::Header::new_gnu();
+                link.set_path("usr/share/alias")?;
+                link.set_link_name("placeholder")?;
+                link.set_entry_type(tar::EntryType::Link);
+                link.set_size(0);
+                link.set_mode(0o644);
+                link.set_cksum();
+                builder.append(&link, std::io::empty())?;
+                Ok(())
+            })?;
+            let inspection = inspect_archive(file.path());
+            if mixed {
+                let error = inspection.expect_err("mixed GNU/PAX link metadata must be refused");
+                assert!(
+                    error.to_string().contains("Duplicate or mixed GNU/PAX"),
+                    "{error}"
+                );
+            } else {
+                let inspection = inspection?;
+                assert_eq!(inspection.member_count, 5);
+                assert!(!inspection.requires_exception());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn hardlinks_cannot_carry_data_or_unclassified_privilege_metadata() -> Result<()> {
         for data in [b"".as_slice(), b"harmless marker data".as_slice()] {
             let file = fixture_archive(|builder| {

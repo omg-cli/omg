@@ -8,6 +8,7 @@ import json
 import difflib
 import gzip
 import subprocess
+import tempfile
 from pathlib import Path
 import re
 
@@ -220,6 +221,220 @@ def source_owner_span(owner, name, files, source):
 def owner_covers_lines(regions, start, end):
     return all(any(region[0] <= line < region[2] or line == region[2] and region[3] > 1
                    for region in regions) for line in range(start, end + 1))
+
+
+def require_rustfmt_syntax(excerpts):
+    if any(len(source) > 64 * 1024 for source in excerpts):
+        raise ValueError("Positive source correspondence exceeds 64 KiB syntax parser bound")
+    with tempfile.TemporaryDirectory(prefix="omg-coverage-rustfmt-") as directory:
+        root = Path(directory); work = root / "work"; work.mkdir()
+        config = root / "rustfmt.toml"
+        config.write_text('edition = "2024"\n', encoding="utf-8")
+        try:
+            resolved = subprocess.run(["rustup", "which", "--toolchain", "1.95.0", "rustfmt"],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, cwd=work, timeout=10)
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("Positive source correspondence rustfmt 1.95.0 lookup timed out") from error
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ValueError("Positive source correspondence requires installed rustfmt 1.95.0") from error
+        binary = Path(resolved.stdout.strip())
+        if not binary.is_absolute() or not binary.is_file():
+            raise ValueError("Positive source correspondence requires an absolute installed rustfmt 1.95.0 binary")
+        for source in dict.fromkeys(excerpts):
+            try:
+                parsed = subprocess.run([str(binary), "--edition", "2024", "--emit", "stdout",
+                    "--config-path", str(config)], input=source, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, cwd=work, timeout=10)
+            except subprocess.TimeoutExpired as error:
+                raise ValueError("Positive source correspondence rustfmt 1.95.0 syntax check timed out") from error
+            except OSError as error:
+                raise ValueError("Positive source correspondence could not execute rustfmt 1.95.0") from error
+            if parsed.returncode != 0:
+                raise ValueError("Ambiguous unchanged source correspondence: rustfmt 1.95.0 did not validate source syntax")
+
+
+def source_function_prefixes(source, spans):
+    """Recognize bounded signatures and their actual lexical body boundaries."""
+    text = "\n".join(source)
+    raw_literal = re.compile(r'(?:br|cr|r)(#*)"')
+    character = re.compile(r"'(?:[^\\'\n]|\\(?:[\\'\"nrt0]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}))'")
+    lifetime_name = re.compile(r"'[A-Za-z_]\w*")
+    identifier = re.compile(r"(?:r#)?([A-Za-z_]\w*)")
+    braces = {}; stack = []; names = Counter(); modules = []; previous = None; at = 0
+    while at < len(text):
+        if text[at].isspace():
+            at += 1
+            continue
+        if text.startswith("//", at):
+            end = text.find("\n", at)
+            at = len(text) if end < 0 else end + 1
+            continue
+        if text.startswith("/*", at):
+            depth = 1; at += 2
+            while depth and at < len(text):
+                if text.startswith("/*", at):
+                    depth += 1; at += 2
+                elif text.startswith("*/", at):
+                    depth -= 1; at += 2
+                else:
+                    at += 1
+            if depth:
+                return {}
+            continue
+        raw = raw_literal.match(text, at)
+        if raw:
+            ending = '"' + raw[1]
+            end = text.find(ending, at + len(raw[0]))
+            if end < 0:
+                return {}
+            at = end + len(ending); previous = None
+            continue
+        if text[at] == '"':
+            at += 1
+            while at < len(text) and text[at] != '"':
+                at += 2 if text[at] == "\\" else 1
+            if at >= len(text):
+                return {}
+            at += 1; previous = None
+            continue
+        if text[at] == "'":
+            char = character.match(text, at)
+            lifetime = lifetime_name.match(text, at)
+            token = char or lifetime
+            if token is None:
+                return {}
+            at += len(token[0]); previous = None
+            continue
+        word = identifier.match(text, at)
+        if word:
+            if previous == "fn":
+                names[word[1]] += 1
+            if word[1] == "mod":
+                modules.append(at)
+            previous = word[1]; at += len(word[0])
+            continue
+        if text[at] in "([{":
+            stack.append((text[at], at))
+        elif text[at] in ")]}":
+            if not stack or stack[-1][0] != {")": "(", "]": "[", "}": "{"}[text[at]]:
+                return {}
+            _, opening = stack.pop()
+            if text[at] == "}":
+                braces[opening] = at
+        previous = text[at]; at += 1
+    if stack:
+        return {}
+    offsets = [0]
+    for line in source:
+        offsets.append(offsets[-1] + len(line) + 1)
+    result = {}
+    for start, end in spans:
+        body = "\n".join(source[start - 1:end])
+        header = re.match(
+            r"([ \t]*(?:(?:pub(?:\([^()]*\))?|async|unsafe|const)\s+)*fn\s+([A-Za-z_]\w*)\s*"
+            r"\([^(){}]*\))\s*(?:->\s*[^{}]+?)?\{", body[:4097])
+        if (header is None or len(header[0]) > 4096 or names[header[2]] != 1
+                or any(offsets[start - 1] <= position < offsets[end] for position in modules)
+                or re.search(r"\bwhere\b", header[0])
+                or source[end - 1].strip() != "}"
+                or braces.get(offsets[start - 1] + len(header[0]) - 1) !=
+                offsets[start - 1] + len(body.rstrip()) - 1):
+            continue
+        result[start, end] = header[1]
+    return result
+
+
+def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files, fragments):
+    """Prove only positive pairs, retaining every compiled copy and candidate."""
+    if not fragments:
+        return {}, []
+    def refuse():
+        a, b, c, d, _ = fragments[0]
+        raise ValueError(f"Ambiguous unchanged source correspondence: {name}:{a + 1}-{b} -> {c + 1}-{d}")
+    inventories = []; groups = []
+    for owners, files, source in ((base, base_files, old), (head, head_files, new)):
+        names = Counter(owner["name"] for owner in owners)
+        inventory = [owner for owner in owners if any(
+            files.get(path) == name or path.endswith("/" + name) for path in owner["filenames"])]
+        by_span = {}
+        for owner in inventory:
+            span = source_owner_span(owner, name, files, source)
+            if span is None:
+                refuse()
+            by_span.setdefault(span[:2], []).append(owner)
+        prefixes = source_function_prefixes(source, by_span)
+        valid = {}
+        for span, prefix in prefixes.items():
+            members = by_span[span]
+            shapes = {tuple(sorted(tuple(r[:4] + r[5:]) for r in owner["regions"])) for owner in members}
+            if (len(shapes) == 1 and all(names[owner["name"]] == 1 for owner in members)
+                    and all(any(r[2] == span[1] and r[3] > len(source[span[1] - 1].rstrip().encode())
+                                for r in owner["regions"]) for owner in members)):
+                valid[prefix] = (*span, members)
+        inventories.append(inventory); groups.append(valid)
+    claimed = {}; pairs = {}; excerpts = {}
+    for a, b, c, d, pending in fragments:
+        candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
+                      if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
+                      and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
+        if (len(candidates) != 1 or old[a:b] != new[c:d]
+                or any(before.get(line, 0) <= 0 for line in pending)):
+            refuse()
+        prefix, bg, hg = candidates[0]
+        if len(bg[2]) != len(hg[2]):
+            refuse()
+        for side, source, group in ((0, old, bg), (1, new, hg)):
+            excerpts[side, group[0], group[1]] = ("\n".join(source[group[0] - 1:group[1]]) + "\n").encode()
+        entry = claimed.setdefault(prefix, {"states": [[[] for _ in group[2]] for group in (bg, hg)],
+            "file": name, "base_range": list(bg[:2]), "head_range": list(hg[:2]),
+            "instances": len(bg[2]), "pairs": [], "candidates": [],
+            "source_prefix_sha256": hashlib.sha256(prefix.encode()).hexdigest()})
+        occurrences = []
+        for side, source, counts, group, proposed in ((0, old, before, bg, a), (1, new, after, hg, c)):
+            start, end, members = group
+            starts = [offset for offset in range(start - 1, end - (b - a) + 1)
+                      if source[offset:offset + b - a] == old[a:b]]
+            if proposed not in starts:
+                refuse()
+            observed = None
+            for offset in starts:
+                lines = [offset + line - a for line in pending]
+                if (any(counts.get(line, 0) <= 0 for line in lines)
+                        or any(not owner_covers_lines(owner["regions"], offset + 1, offset + b - a)
+                               for owner in members)):
+                    refuse()
+                touched = {id(owner) for owner in inventories[side] if any(
+                    owner_covers_lines([region], line, line) for region in owner["regions"]
+                    for line in range(offset + 1, offset + b - a + 1))}
+                if touched != {id(owner) for owner in members}:
+                    refuse()
+                states = tuple(tuple(int(any(region[4] > 0 and owner_covers_lines([region], line, line)
+                                             for region in owner["regions"])) for line in lines)
+                               for owner in members)
+                if (any(not any(row[column] for row in states) for column in range(len(lines)))
+                        or observed is not None and observed != states):
+                    refuse()
+                observed = states
+            for row, states in zip(entry["states"][side], observed):
+                row.extend(states)
+            occurrences.append([[offset + 1, offset + b - a] for offset in starts])
+        entry["candidates"].append({"base": occurrences[0], "head": occurrences[1]})
+        for line in pending:
+            target = c + line - a
+            if line in pairs and pairs[line] != target:
+                refuse()
+            pairs[line] = target
+            entry["pairs"].append([line, target])
+    receipts = []
+    for entry in claimed.values():
+        states = entry.pop("states")
+        if Counter(map(tuple, states[0])) != Counter(map(tuple, states[1])):
+            refuse()
+        entry["instance_states"] = sorted(states[0])
+        receipts.append(entry)
+    require_rustfmt_syntax(excerpts.values())
+    return pairs, receipts
 
 
 def source_opcodes(old, new, function_scopes, mapped):
@@ -440,8 +655,34 @@ def retained_wrapper_paint(name, old, new, before, after, base, head, base_files
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
     bf, bs = region_evidence(base_regions, base, base_sources, "base")
     hf, hs = region_evidence(head_regions, head, head_sources, "head")
-    if bs.keys() != hs.keys():
-        raise ValueError("Added or removed coverage file requires explicit review")
+    if bs.keys() - hs.keys():
+        raise ValueError("Removed coverage file requires explicit review")
+    added_receipt = []
+    for name in sorted(hs.keys() - bs.keys()):
+        if name in base_sources:
+            raise ValueError(f"Added coverage file already exists in base source: {name}")
+        section = hs[name]
+        counts = section["counts"]
+        source = head_sources[name].decode("utf-8").splitlines()
+        if any(line > len(source) for line in counts):
+            raise ValueError(f"Coverage line exceeds exact source blob: {name}")
+        if section["LF"] == 0 or not counts:
+            raise ValueError(f"Empty added coverage evidence: {name}")
+        if section["LH"] != section["LF"]:
+            raise ValueError(f"Added file summary is not fully covered: {name}")
+        for line, count in sorted(counts.items()):
+            if count == 0:
+                raise ValueError(f"Added file has uncovered mapped line: {name}:{line}")
+        added_receipt.append({"file": name, "summary_found": section["LF"],
+                              "summary_hit": section["LH"], "mapped": len(counts),
+                              "mapped_hit": sum(count > 0 for count in counts.values())})
+    common_head = Coverage(len(bs), sum(hs[name]["LF"] for name in bs),
+                           sum(hs[name]["LH"] for name in bs),
+                           sum(len(hs[name]["counts"]) for name in bs),
+                           sum(sum(count > 0 for count in hs[name]["counts"].values()) for name in bs),
+                           head.sha256)
+    if min(common_head.found, common_head.mapped) <= 0:
+        raise ValueError("No comparable common head coverage")
     base_files = {path: canonical_source(path, base_sources) for path in base.sections}
     head_files = {path: canonical_source(path, head_sources) for path in head.sections}
     head_owners = {}; head_owners_by_file = {}
@@ -457,6 +698,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     removed = {}; deleted_mapped = deleted_hit = 0; paint_receipts = []; serial_receipts = []; serial_removed = {}
+    positive_receipts = []
     for name in bs:
         old = base_sources[name].decode("utf-8").splitlines()
         new = head_sources[name].decode("utf-8").splitlines()
@@ -526,7 +768,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             scope != other and (max(scope[0], other[0]) <= min(scope[1], other[1])
                                 or max(scope[2], other[2]) <= min(scope[3], other[3]))
             for other in function_scopes)]
-        retained = {}; gone = set()
+        retained = {}; gone = set(); unresolved_fragments = []
         for tag, a, b, c, d, block, anchored_suffix in source_opcodes(old, new, function_scopes, before):
             if tag == "equal":
                 if old != new and any(before.get(line, 0) > 0 for line in range(a + 1, b + 1)):
@@ -546,8 +788,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                                      for offset in starts)
                                     or any(after.get(offset + line - a, 0) <= 0
                                            for offset in starts for line in pending)):
-                                raise ValueError(
-                                    f"Ambiguous unchanged source correspondence: {name}:{a + 1}-{b} -> {c + 1}-{d}")
+                                unresolved_fragments.append((a, b, c, d, pending))
+                                continue
                             retained.update((line, c + line - a) for line in pending)
                         # Repeated text is retained only through its proven function owner.
                         continue
@@ -556,6 +798,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 gone.update(range(a + 1, b + 1))
             # Replacement is not proven deletion. Its old counts stay in the
             # strict base ratios, and its new uncovered mappings are refused.
+        positive, receipts = positive_source_fragments(
+            name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments)
+        retained.update(positive)
+        positive_receipts.extend(receipts)
         gone.difference_update(anchored)
         anchored_new = set(anchored.values())
         paint = []
@@ -612,11 +858,15 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         deleted_mapped += sum(line in gone for line in before)
         deleted_hit += sum(line in gone and count > 0 for line, count in before.items())
     paint_receipt = {"retained_wrapper_paint": paint_receipts} if paint_receipts else {}
+    if positive_receipts:
+        paint_receipt["positive_source_fragments"] = positive_receipts
+    if added_receipt:
+        paint_receipt["added_files"] = added_receipt
     if serial_receipts:
         paint_receipt['serial_wrapper_elision'] = serial_receipts
-    if (not serial_receipts and head.hit * base.found >= base.hit * head.found and
-            head.mapped_hit * base.mapped >= base.mapped_hit * head.mapped):
-        require_no_regression(base, head)
+    if (not serial_receipts and common_head.hit * base.found >= base.hit * common_head.found and
+            common_head.mapped_hit * base.mapped >= base.mapped_hit * common_head.mapped):
+        require_no_regression(base, common_head)
         return {"deleted_summary_found": 0, "deleted_summary_hit": 0,
                 "deleted_mapped": 0, "deleted_mapped_hit": 0, **paint_receipt}
     deleted_found = sum(row['summary_credit'][0] for row in serial_receipts)
@@ -679,7 +929,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                           base.mapped - deleted_mapped, base.mapped_hit - deleted_hit, base.sha256)
     if min(normalized.found, normalized.mapped) <= 0:
         raise ValueError("Deletion leaves no comparable coverage")
-    require_no_regression(normalized, head)
+    require_no_regression(normalized, common_head)
     return {"deleted_summary_found": deleted_found, "deleted_summary_hit": deleted_summary_hit,
             "deleted_mapped": deleted_mapped, "deleted_mapped_hit": deleted_hit, **paint_receipt}
 

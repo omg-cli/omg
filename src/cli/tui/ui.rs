@@ -1615,13 +1615,13 @@ mod tests {
     fn packages_rows_render_sanitized_version_strings() {
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
         let mut app = app_on(Tab::Packages);
+        #[cfg(feature = "arch")]
+        let raw_version = "1.0\u{1b}[31mevil";
+        #[cfg(not(feature = "arch"))]
+        let raw_version = "1.0\u{1b}[31m\u{202e}evil";
         app.search_results = vec![crate::package_managers::SyncPackage {
             name: "evil".to_string(),
-            version: poisoned_version(if cfg!(feature = "arch") {
-                "1.0\u{1b}[31mevil"
-            } else {
-                "1.0\u{1b}[31m\u{202e}evil"
-            }),
+            version: poisoned_version(raw_version),
             description: "browser".to_string(),
             repo: "AUR".to_string(),
             download_size: 0,

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("check-line-coverage.py")
 SPEC = importlib.util.spec_from_file_location("line_coverage", SCRIPT)
@@ -156,6 +157,142 @@ class SourceAwareCoverageTests(unittest.TestCase):
             hg.write_bytes(gzip.compress(json.dumps(hr).encode()))
             old, new = sources or ({"example.rs": self.old_source}, {"example.rs": self.new_source})
             return coverage.require_source_no_regression(coverage.read_coverage(bp), coverage.read_coverage(hp), bg, hg, old, new)
+
+    def compare_additions(self, before=None, after=None, summaries=None, additions=None,
+                          old=None, new=None, mutate=None):
+        before = self.fixture()[0] if before is None else before
+        after = self.fixture()[1] if after is None else after
+        summaries = summaries or ((len(before), sum(c > 0 for _, c in before)),
+                                  (len(after), sum(c > 0 for _, c in after)))
+        additions = additions if additions is not None else {"new.rs": ([(1, 1)], (1, 1), b"new();\n")}
+        old = {"example.rs": self.old_source} if old is None else old.copy()
+        new = {"example.rs": self.new_source} if new is None else new.copy()
+        def section(name, rows, summary):
+            found, hit = summary
+            return (f"SF:/src/{name}\n" + "".join(f"DA:{line},{count}\n" for line, count in rows)
+                    + f"LF:{found}\nLH:{hit}\nend_of_record\n")
+        br, hr = self.regions(before, True), self.regions(after, False)
+        for doc, summary in ((br, summaries[0]), (hr, summaries[1])):
+            doc["data"][0]["files"][0]["summary"]["lines"] = dict(zip(("count", "covered"), summary))
+        head_lcov = section("example.rs", after, summaries[1])
+        for name, (rows, summary, source) in additions.items():
+            head_lcov += section(name, rows, summary)
+            new[name] = source
+            hr["data"][0]["files"].append({"filename": f"/src/{name}", "summary": {
+                "lines": dict(zip(("count", "covered"), summary))}})
+            hr["data"][0]["functions"].append({"name": f"owner_{name}", "filenames": [f"/src/{name}"],
+                "regions": [[line, 1, line, 2, count, 0, 0, 0] for line, count in rows]})
+        if mutate:
+            br, hr, old, new, head_lcov = mutate(br, hr, old, new, head_lcov)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bp, hp, bg, hg = (root / name for name in ("b.info", "h.info", "b.gz", "h.gz"))
+            bp.write_text(section("example.rs", before, summaries[0]))
+            hp.write_text(head_lcov)
+            bg.write_bytes(gzip.compress(json.dumps(br).encode()))
+            hg.write_bytes(gzip.compress(json.dumps(hr).encode()))
+            return coverage.require_source_no_regression(coverage.read_coverage(bp), coverage.read_coverage(hp),
+                                                         bg, hg, old, new)
+
+    def test_added_files_are_covered_and_sorted_with_deletion_credit(self):
+        added = {"z.rs": ([(1, 1), (2, 4)], (2, 2), b"a();\nb();\n"),
+                 "a.rs": ([(1, 2)], (1, 1), b"a();\n")}
+        self.assertEqual(self.compare_additions(additions=added), {
+            "deleted_summary_found": 2, "deleted_summary_hit": 2,
+            "deleted_mapped": 2, "deleted_mapped_hit": 2,
+            "added_files": [{"file": "a.rs", "summary_found": 1, "summary_hit": 1, "mapped": 1, "mapped_hit": 1},
+                            {"file": "z.rs", "summary_found": 2, "summary_hit": 2, "mapped": 2, "mapped_hit": 2}]})
+
+    def test_addition_with_unchanged_common_file_uses_fast_path(self):
+        rows = [(1, 1), (2, 0)]
+        source = b"covered();\nuncovered();\n"
+        result = self.compare_additions(before=rows, after=rows,
+            old={"example.rs": source}, new={"example.rs": source})
+        self.assertEqual(result, {"deleted_summary_found": 0, "deleted_summary_hit": 0,
+            "deleted_mapped": 0, "deleted_mapped_hit": 0,
+            "added_files": [{"file": "new.rs", "summary_found": 1, "summary_hit": 1,
+                             "mapped": 1, "mapped_hit": 1}]})
+
+    def test_empty_common_head_cannot_be_rescued_by_addition(self):
+        for after in ([], [(1, 1)]):
+            with self.subTest(after=after), self.assertRaisesRegex(ValueError, "No comparable common head"):
+                self.compare_additions(after=after, summaries=((6, 4), (0, 0)))
+
+    def test_added_file_requires_complete_independent_surfaces(self):
+        for rows, summary, source, message in [
+                ([(1, 1)], (2, 1), b"a();\n", "summary"),
+                ([(1, 0)], (1, 1), b"a();\n", r"new.rs:1"),
+                ([(2, 1)], (1, 1), b"a();\n", "source blob"),
+                ([], (0, 0), b"", "Empty")]:
+            with self.subTest(rows=rows, summary=summary), self.assertRaisesRegex(ValueError, message):
+                self.compare_additions(additions={"new.rs": (rows, summary, source)})
+
+    def test_added_file_must_not_exist_in_base_sources(self):
+        old = {"example.rs": self.old_source, "new.rs": b"existing();\n"}
+        with self.assertRaisesRegex(ValueError, "base source"):
+            self.compare_additions(old=old)
+
+    def test_added_owner_cannot_disguise_deletion(self):
+        def reuse(br, hr, old, new, lcov):
+            hr["data"][0]["functions"][-1]["name"] = "obsolete"
+            return br, hr, old, new, lcov
+        with self.assertRaisesRegex(ValueError, "retained or ambiguous"):
+            self.compare_additions(mutate=reuse)
+
+    def test_duplicate_added_owners_cannot_disguise_deletion(self):
+        def reuse(br, hr, old, new, lcov):
+            owner = hr["data"][0]["functions"][-1]
+            owner["name"] = "obsolete"
+            hr["data"][0]["functions"].append(copy.deepcopy(owner))
+            return br, hr, old, new, lcov
+        with self.assertRaisesRegex(ValueError, "retained or ambiguous"):
+            self.compare_additions(mutate=reuse)
+
+    def test_large_addition_cannot_mask_common_summary_or_mapping_regression(self):
+        old = b"fn retained() {\n  obsolete_step();\n  keep();\n  untested();\n}\n"
+        new = b"fn retained() {\n  replacement();\n  keep();\n  untested();\n}\n"
+        additions = {"new.rs": ([(i, 1) for i in range(1, 101)], (100, 100), b"x();\n" * 100)}
+        before = [(1, 1), (2, 1), (3, 1), (4, 0), (5, 0)]
+        for summary, after, expected in [
+                ((6, 3), before, "Line coverage decreased"),
+                ((6, 4), [(1, 1), (3, 1), (4, 0), (5, 0)], "Mapped line coverage decreased")]:
+            with self.subTest(summary=summary), self.assertRaisesRegex(ValueError, expected):
+                self.compare_additions(before=before, after=after,
+                    summaries=((6, 4), summary), additions=additions,
+                    old={"example.rs": old}, new={"example.rs": new})
+
+    def test_removed_coverage_file_is_refused_despite_addition(self):
+        def remove(br, hr, old, new, lcov):
+            hr["data"][0]["files"].pop(0)
+            hr["data"][0]["functions"] = hr["data"][0]["functions"][1:]
+            return br, hr, old, new, lcov[lcov.index("SF:/src/new.rs"):]
+        with self.assertRaisesRegex(ValueError, "[Rr]emoved"):
+            self.compare_additions(mutate=remove)
+
+    def test_added_file_does_not_excuse_retained_loss_or_new_zero(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.compare_additions(after=[(1, 0), (2, 1), (3, 1), (4, 1)])
+        with self.assertRaisesRegex(ValueError, "New uncovered"):
+            self.compare_additions(after=[(1, 1), (2, 1), (3, 1), (4, 1), (5, 0)],
+                                   new={"example.rs": self.new_source + b"untested_new();\n"})
+
+    def test_added_evidence_still_validates_metadata_and_counters(self):
+        def change(kind):
+            def mutate(br, hr, old, new, lcov):
+                file = hr["data"][0]["files"][-1]
+                if kind == "schema": hr["version"] = "0"
+                if kind == "summary": file["summary"]["lines"]["covered"] = 0
+                if kind == "missing": del new["new.rs"]
+                if kind == "ambiguous": new["src/new.rs"] = b"x();\n"
+                if kind == "section": hr["data"][0]["files"].pop()
+                if kind == "json saturation": hr["data"][0]["functions"][-1]["regions"][0][4] = coverage.COUNTER_LIMIT
+                if kind == "lcov saturation": lcov = lcov.replace("DA:1,1\nLF:1", f"DA:1,{coverage.COUNTER_LIMIT}\nLF:1")
+                if kind == "malformed": lcov = lcov.replace("DA:1,1\nLF:1", "DA:1,-1\nLF:1")
+                return br, hr, old, new, lcov
+            return mutate
+        for kind in ("schema", "summary", "missing", "ambiguous", "section", "json saturation", "lcov saturation", "malformed"):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self.compare_additions(mutate=change(kind))
 
     def test_proven_covered_helper_deletion_preserves_both_surfaces(self):
         self.assertEqual(self.compare(), {"deleted_summary_found": 2, "deleted_summary_hit": 2,
@@ -607,6 +744,341 @@ class SourceAwareCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "New uncovered"):
             self.duplicated_owned_calls_compare(after=rows, head_source=new)
 
+    def multiline_copies_compare(self, mutate=None, fragments=False, copies=2):
+        old = ["fn retained(", "    value: Input,", ") -> Value {",
+               "    if old_first {", "        old_one();", "    }", "    old_middle();",
+               "    if old_second {", "        old_two();", "    }", "    old_end();", "}"]
+        new = ["fn retained(", "    value: Input,", ") -> Result<Value> {",
+               "    if new_first {", "        new_one();", "        checked();", "    }",
+               "    new_middle();", "    if new_second {", "        new_two();", "    }",
+               "    new_end();", "}"]
+        if fragments:
+            for source, version in ((old, "old"), (new, "new")):
+                source[3:-1] = [line for n, token in enumerate(("a", "b", "a", "b"))
+                               for line in (f"    {version}_{n}();", f"    shared_{token}();")]
+        value = {}
+        for side, source in (("base", old), ("head", new)):
+            end = len(source)
+            source += ["fn tail() {", "    keep();", "}"]
+            value[side] = {"source": source, "counts": {n: 1 for n in range(1, len(source) + 1)},
+                          "owners": [{"name": f"{side}_crate_{instance}", "filenames": ["/src/example.rs"],
+                                      "regions": [[n, 1, n, len(source[n - 1].encode()) + 1,
+                                                   int(instance == copies - 1), 0, 0, 0]
+                                                  for n in range(1, end + 1)]}
+                                     for instance in range(copies)]}
+            value[side]["owners"].append({"name": "tail", "filenames": ["/src/example.rs"],
+                "regions": [[n, 1, n, len(source[n - 1].encode()) + 1, 1, 0, 0, 0]
+                            for n in range(end + 1, len(source) + 1)]})
+        if mutate:
+            mutate(value)
+        def owners(base, head):
+            for document, side in ((base, "base"), (head, "head")):
+                document["data"][0]["functions"] = value[side]["owners"]
+        return self.compare(before=sorted(value["base"]["counts"].items()),
+                            after=sorted(value["head"]["counts"].items()), mutate=owners,
+                            sources=tuple({"example.rs": ("\n".join(value[side]["source"]) + "\n").encode()}
+                                          for side in ("base", "head")))
+
+    def test_multiline_return_change_preserves_covered_fragments_in_every_compiled_copy(self):
+        result = self.multiline_copies_compare()
+        self.assertEqual([result[key] for key in ("deleted_summary_found", "deleted_summary_hit",
+                         "deleted_mapped", "deleted_mapped_hit")], [0, 0, 0, 0])
+        self.assertEqual(result["positive_source_fragments"][0]["pairs"], [[6, 7], [10, 11]])
+
+    def test_multiline_fragment_proof_preserves_instances_and_all_candidate_copies(self):
+        def lose_instance(value):
+            value["head"]["owners"][1]["regions"][10][4] = 0
+        def foreign(value):
+            value["head"]["owners"].append({"name": "foreign", "filenames": ["/src/example.rs"],
+                "regions": [[7, 1, 7, 6, 1, 0, 0, 0]]})
+        def foreign_path(value):
+            foreign(value)
+            value["head"]["owners"][-1]["filenames"] = ["/other-root/example.rs"]
+        mutations = {
+            "lost_instance": lose_instance,
+            "zero_candidate": lambda v: v["head"]["counts"].__setitem__(11, 0),
+            "missing_candidate": lambda v: v["head"]["counts"].pop(11),
+            "missing_copy": lambda v: v["head"]["owners"].pop(0),
+            "duplicate_symbol": lambda v: v["head"]["owners"].append(copy.deepcopy(v["head"]["owners"][0])),
+            "different_geometry": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(3, 5),
+            "different_parameter": lambda v: v["head"]["source"].__setitem__(1, "    value: OtherInput,"),
+            "foreign_owner": foreign,
+            "foreign_path_alias": foreign_path,
+            "multifile_owner": lambda v: v["head"]["owners"][0]["filenames"].append("/src/other.rs"),
+            "uninstrumented_duplicate": lambda v: v["head"]["source"].extend(
+                ["mod nested {", "fn retained(value: Input) {}", "}"]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=mutate)
+
+    def test_multiline_fragment_receipts_do_not_depend_on_instance_order_or_frequency(self):
+        expected = self.multiline_copies_compare()
+        def reordered(value):
+            value["head"]["owners"].reverse()
+            for owner in value["head"]["owners"]:
+                for region in owner["regions"]:
+                    region[4] *= 19
+        self.assertEqual(self.multiline_copies_compare(mutate=reordered), expected)
+        self.multiline_copies_compare(copies=1)
+        def same_return(value):
+            value["head"]["source"][2] = ") -> Value {"
+            for owner in value["head"]["owners"][:2]:
+                owner["regions"][2][3] = len(value["head"]["source"][2]) + 1
+        self.multiline_copies_compare(mutate=same_return)
+
+    def test_multiline_fragment_proof_rejects_incomplete_or_unsupported_evidence(self):
+        def extra_copy(value):
+            extra = copy.deepcopy(value["head"]["owners"][0]); extra["name"] = "extra"
+            value["head"]["owners"].append(extra)
+        def global_duplicate(value):
+            extra = copy.deepcopy(value["head"]["owners"][0]); extra["filenames"] = ["/src/excluded.rs"]
+            value["head"]["owners"].append(extra)
+        mutations = {
+            "extra_copy": extra_copy,
+            "global_duplicate": global_duplicate,
+            "missing_region": lambda v: v["head"]["owners"][0]["regions"].pop(10),
+            "exclusive_endpoint": lambda v: v["head"]["owners"][0]["regions"][-1].__setitem__(3, 1),
+            "negative_count": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(4, -1),
+            "boolean_count": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(4, True),
+            "expansion": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(7, 1),
+            "invalid_column": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(3, 999),
+            "where_clause": lambda v: v["head"]["source"].__setitem__(2, ") -> Value where Value: Copy {"),
+            "function_pointer": lambda v: v["head"]["source"].__setitem__(1, "    value: fn(Input) -> Value,"),
+            "unclosed_literal": lambda v: v["head"]["source"].__setitem__(4, '        call(r##"unclosed);'),
+            "hidden_duplicate_name": lambda v: v["head"]["source"].extend(
+                ["fn /* comment /* nested */ */ r#retained(other: Input) {}"]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=mutate)
+
+    def test_multiline_fragment_proof_compares_complete_instance_vectors(self):
+        def profiles(value, redistributed):
+            for side in ("base", "head"):
+                for instance, owner in enumerate(value[side]["owners"][:2]):
+                    for region in owner["regions"]:
+                        text = value[side]["source"][region[0] - 1]
+                        if "shared_" in text:
+                            region[4] = int(instance == (0 if "shared_a" in text else 1))
+                            if redistributed and side == "head":
+                                region[4] = int(instance == 0)
+        self.multiline_copies_compare(mutate=lambda v: profiles(v, False), fragments=True)
+        with self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+            self.multiline_copies_compare(mutate=lambda v: profiles(v, True), fragments=True)
+
+    def test_multiline_fragment_refuses_foreign_owners_on_unmapped_candidate_lines(self):
+        old = b"fn retained(\n    x: Input,\n) -> Value {\n    shared();\n    second();\n    old();\n    shared();\n    second();\n}\n"
+        new = old.replace(b"-> Value", b"-> Result<Value>").replace(b"    old();", b"    new();")
+        def compare(foreign_side=None, foreign_line=5):
+            def owners(base, head):
+                for side, document in (("base", base), ("head", head)):
+                    document["data"][0]["functions"] = [
+                        {"name": f"{side}_{instance}", "filenames": ["/src/example.rs"],
+                         "regions": [[1, 1, 9, 2, instance, 0, 0, 0]]} for instance in (0, 1)]
+                    if side == foreign_side:
+                        document["data"][0]["functions"].append({
+                            "name": "foreign_partial", "filenames": ["/src/example.rs"],
+                            "regions": [[foreign_line, 5, foreign_line, 14, 1, 0, 0, 0]]})
+            return self.compare(before=[(4, 1), (7, 1)], after=[(4, 1), (7, 1)], mutate=owners,
+                                sources=({"example.rs": old}, {"example.rs": new}))
+        result = compare()
+        witness = result["positive_source_fragments"][0]
+        self.assertEqual(witness["pairs"], [[4, 4]])
+        self.assertEqual(witness["candidates"], [{"base": [[4, 5], [7, 8]], "head": [[4, 5], [7, 8]]}])
+        for side in ("base", "head"):
+            for line in (5, 8):
+                with self.subTest(side=side, line=line), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                    compare(side, line)
+
+    def test_multiline_fragment_proof_cannot_grant_gray_mappings(self):
+        def new_zero(value):
+            value["head"]["source"].extend(["fn missed() {", "    never();", "}"])
+            value["head"]["counts"][18] = 0
+        with self.assertRaisesRegex(ValueError, "New uncovered instrumented line: example.rs:18"):
+            self.multiline_copies_compare(mutate=new_zero)
+        with self.assertRaisesRegex(ValueError, "New uncovered instrumented line: example.rs:6"):
+            self.multiline_copies_compare(mutate=lambda v: v["head"]["counts"].__setitem__(6, 0))
+        with self.assertRaisesRegex(ValueError, "Retained covered line lost coverage"):
+            self.multiline_copies_compare(mutate=lambda v: v["head"]["counts"].__setitem__(15, 0))
+
+    def test_multiline_fragment_proof_requires_the_actual_body_boundary(self):
+        def partial(value):
+            for side, end in (("base", 10), ("head", 11)):
+                for owner in value[side]["owners"][:2]:
+                    owner["regions"] = owner["regions"][:end]
+        with self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+            self.multiline_copies_compare(mutate=partial)
+
+    def test_multiline_fragment_proof_requires_a_parseable_bounded_header(self):
+        parameters = (
+            "value: Input,,", "value: Input Input,", "value: Vec<Input,,>,", "value: Vec<Input],",
+            "value: (Input, Input),", "value: fn(Input) -> Input,", "value: if,",
+            "value:" + " " * 4096 + "Input,",
+        )
+        for parameter in parameters:
+            def malformed(value):
+                for side in ("base", "head"):
+                    source = value[side]["source"]
+                    source[1] = "    " + parameter
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][1][3] = len(source[1].encode()) + 1
+            with self.subTest(parameter=parameter[:80]), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=malformed)
+
+    def test_multiline_parser_accepts_type_syntax_without_resolving_types(self):
+        for parameter in ("value: Vec<>,", "value: &'static Input,", "value: &[Input],",
+                          "value: " + "Vec<" * 33 + "Input" + ">" * 33 + ","):
+            def header(value):
+                for side in ("base", "head"):
+                    value[side]["source"][1] = "    " + parameter
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][1][3] = len(value[side]["source"][1].encode()) + 1
+            with self.subTest(parameter=parameter[:80]):
+                self.multiline_copies_compare(mutate=header)
+
+    def test_multiline_fragment_proof_requires_balanced_body_delimiters(self):
+        for statement in ("call(;", "let x = [;", "call(];"):
+            def malformed(value):
+                for side in ("base", "head"):
+                    source = value[side]["source"]
+                    source[4] = "        " + statement
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][4][3] = len(source[4].encode()) + 1
+            with self.subTest(statement=statement), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=malformed)
+
+    def test_multiline_fragment_proof_requires_parseable_modifiers_and_body(self):
+        cases = [(0, modifier + " fn retained(") for modifier in
+                 ("pub(foo)", "pub(in garbage::)", "async async", "unsafe const pub pub")]
+        cases.append((4, "        let x = ;"))
+        for line, text in cases:
+            def malformed(value):
+                for side in ("base", "head"):
+                    value[side]["source"][line] = text
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][line][3] = len(text.encode()) + 1
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=malformed)
+
+    def test_multiline_fragment_proof_blocks_module_tokens_before_running_a_parser(self):
+        for statement in ("mod external;", '#[path = "/do-not-read.rs"] mod external;',
+                          "consume!(mod external;);", "r#mod();"):
+            def module(value):
+                for side in ("base", "head"):
+                    value[side]["source"][4] = "        " + statement
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][4][3] = len(value[side]["source"][4].encode()) + 1
+            with self.subTest(statement=statement), mock.patch.object(
+                    coverage.subprocess, "run", side_effect=AssertionError("module reached parser")), \
+                    self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=module)
+
+    def test_source_comparison_without_fallback_needs_no_rustfmt(self):
+        with mock.patch.object(coverage.subprocess, "run", side_effect=AssertionError("unexpected parser dependency")):
+            self.compare()
+
+    def test_multiline_parser_uses_exact_stdin_and_private_configuration(self):
+        expected = []; parsed = []; temporary = []; real_run = subprocess.run
+        def capture(value):
+            for side in ("base", "head"):
+                source = value[side]["source"]
+                expected.append(("\n".join(source[:source.index("}") + 1]) + "\n").encode())
+        def run(command, **kwargs):
+            work = Path(kwargs["cwd"])
+            self.assertEqual(list(work.iterdir()), [])
+            self.assertNotEqual(work, Path.cwd())
+            self.assertEqual(work.parent.stat().st_mode & 0o777, 0o700)
+            temporary.append(work.parent)
+            if command[0] == "rustup":
+                self.assertEqual(command, ["rustup", "which", "--toolchain", "1.95.0", "rustfmt"])
+            else:
+                self.assertTrue(Path(command[0]).is_absolute())
+                config = Path(command[-1])
+                self.assertEqual(config.parent, work.parent)
+                self.assertEqual(config.read_text(), 'edition = "2024"\n')
+                self.assertEqual(command[1:], ["--edition", "2024", "--emit", "stdout", "--config-path", str(config)])
+                self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["timeout"], 10)
+                parsed.append(kwargs["input"])
+            return real_run(command, **kwargs)
+        with mock.patch.object(coverage.subprocess, "run", side_effect=run):
+            self.multiline_copies_compare(mutate=capture)
+        self.assertEqual(parsed, expected)
+        self.assertTrue(all(not path.exists() for path in temporary))
+
+    def test_multiline_parser_dependency_failures_are_explicit(self):
+        failures = (
+            (FileNotFoundError("rustup"), "requires installed rustfmt 1.95.0"),
+            (subprocess.CalledProcessError(1, ["rustup"]), "requires installed rustfmt 1.95.0"),
+            (subprocess.TimeoutExpired(["rustup"], 10), "lookup timed out"),
+        )
+        for error, message in failures:
+            with self.subTest(error=type(error).__name__), mock.patch.object(
+                    coverage.subprocess, "run", side_effect=error), self.assertRaisesRegex(ValueError, message):
+                self.multiline_copies_compare()
+        for path in ("rustfmt", "/nonexistent-omg-toolchain/rustfmt"):
+            with self.subTest(path=path), mock.patch.object(coverage.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, stdout=path)), \
+                    self.assertRaisesRegex(ValueError, "requires an absolute installed rustfmt 1.95.0 binary"):
+                self.multiline_copies_compare()
+
+    def test_multiline_parser_timeout_cannot_authorize_a_fragment(self):
+        real_run = subprocess.run
+        def run(command, **kwargs):
+            if command[0] == "rustup":
+                return real_run(command, **kwargs)
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        with mock.patch.object(coverage.subprocess, "run", side_effect=run), \
+                self.assertRaisesRegex(ValueError, "syntax check timed out"):
+            self.multiline_copies_compare()
+
+    def test_multiline_parser_refuses_oversized_input_before_tool_execution(self):
+        def oversized(value):
+            for side in ("base", "head"):
+                value[side]["source"][4] = '        consume("' + 'x' * (64 * 1024) + '");'
+                for owner in value[side]["owners"][:2]:
+                    owner["regions"][4][3] = len(value[side]["source"][4].encode()) + 1
+        with mock.patch.object(coverage.subprocess, "run", side_effect=AssertionError("oversized parser input")), \
+                self.assertRaisesRegex(ValueError, "exceeds 64 KiB syntax parser bound"):
+            self.multiline_copies_compare(mutate=oversized)
+
+    def test_multiline_parser_ignores_module_words_in_literals_and_does_not_expand_macros(self):
+        for statement in ('consume("mod external;", r#"mod external;"#); // mod external;',
+                          'include!("/nonexistent-omg-coverage-include.rs");'):
+            def body(value):
+                for side in ("base", "head"):
+                    value[side]["source"][4] = "        " + statement
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][4][3] = len(value[side]["source"][4].encode()) + 1
+            with self.subTest(statement=statement):
+                self.multiline_copies_compare(mutate=body)
+
+    def test_multiline_fragment_proof_recognizes_the_real_hashmap_parameter(self):
+        def header(value):
+            for side in ("base", "head"):
+                source = value[side]["source"]
+                source[1] = "    packages: &HashMap<String, LocalDbPackage>,"
+                result = "std::collections::HashSet<String>"
+                source[2] = ") -> " + (result if side == "base" else f"Result<{result}>") + " {"
+                for owner in value[side]["owners"][:2]:
+                    for line in (2, 3):
+                        owner["regions"][line - 1][3] = len(source[line - 1].encode()) + 1
+        result = self.multiline_copies_compare(mutate=header)
+        self.assertEqual(result["positive_source_fragments"][0]["pairs"], [[6, 7], [10, 11]])
+
+    def test_multiline_body_scan_ignores_supported_literals_and_comments(self):
+        def literals(value):
+            for side in ("base", "head"):
+                value[side]["source"][4] = ('        ' + side +
+                    '_call("} {", \'{\', /* { /* nested } */ } */ value); // }')
+        self.multiline_copies_compare(mutate=literals)
+        def raw(value):
+            for side in ("base", "head"):
+                value[side]["source"][4] = '        ' + side + '_call(r###"} { fn retained(fake) {"###);'
+        self.multiline_copies_compare(mutate=raw)
+
     def changed_profile_role_compare(self, after=None, mutate=None, head_source=None, duplicate_declaration=None, partial_base=False):
         old = b"fn checked() {\n  if isolated(old) {\n    return;\n  }\n  first(old);\n  probe();\n  finish();\n  second(old);\n  probe();\n  finish();\n}\nfn other() {\n  if unrelated() {\n    return;\n  }\n}\n"
         new = head_source or b"fn checked() {\n  if isolated(new) {\n    return;\n  }\n  with_env(|| {\n  first(new);\n  probe();\n  finish();\n  second(new);\n  probe();\n  finish();\n  });\n}\nfn other() {\n  if unrelated() {\n    return;\n  }\n}\n"
@@ -837,7 +1309,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
                         "deleted_summary_found": 0, "deleted_summary_hit": 0,
                         "deleted_mapped": 0, "deleted_mapped_hit": 0})
 
-    def wrapper_paint_compare(self, mutate=None):
+    def wrapper_paint_compare(self, mutate=None, addition=False):
         body = ["    work();", "    check()?;", "    (", "        value", "    )", "}"]
         untouched = ["fn unrelated() {", "    unavailable();", "}"]
         old = ["#[tokio::test]", "#[serial_test::serial]", "async fn checked() {", "    old_setup();", *body, *untouched]
@@ -873,9 +1345,17 @@ class SourceAwareCoverageTests(unittest.TestCase):
         def owners(base, head):
             base["data"][0]["functions"], head["data"][0]["functions"] = value["base"], value["head"]
 
-        return self.compare(before=sorted(before.items()), after=sorted(after.items()), mutate=owners,
-            sources=({"example.rs": ("\n".join(old) + "\n").encode()},
-                     {"example.rs": ("\n".join(new) + "\n").encode()}))
+        sources = ({"example.rs": ("\n".join(old) + "\n").encode()},
+                   {"example.rs": ("\n".join(new) + "\n").encode()})
+        if addition:
+            def with_addition(br, hr, old_sources, new_sources, lcov):
+                extra = hr["data"][0]["functions"][-1]
+                owners(br, hr)
+                hr["data"][0]["functions"].append(extra)
+                return br, hr, old_sources, new_sources, lcov
+            return self.compare_additions(before=sorted(before.items()), after=sorted(after.items()),
+                                          old=sources[0], new=sources[1], mutate=with_addition)
+        return self.compare(before=sorted(before.items()), after=sorted(after.items()), mutate=owners, sources=sources)
 
     def test_identical_precise_regions_resolve_only_retained_async_wrapper_paint(self):
         self.assertEqual(self.wrapper_paint_compare(), {
@@ -884,6 +1364,16 @@ class SourceAwareCoverageTests(unittest.TestCase):
             "retained_wrapper_paint": [{"file": "example.rs", "base_range": [5, 9], "head_range": [6, 10],
                                         "precise_counter_equivalence": "covered/uncovered",
                                         "precise_group_sizes": [4], "pairs": [[6, 7], [8, 9]]}]})
+
+    def test_wrapper_proof_and_failure_with_added_file(self):
+        expected = self.wrapper_paint_compare()
+        expected["added_files"] = [{"file": "new.rs", "summary_found": 1, "summary_hit": 1,
+                                    "mapped": 1, "mapped_hit": 1}]
+        self.assertEqual(self.wrapper_paint_compare(addition=True), expected)
+        def lose_precise(value):
+            value["head"][1]["regions"][1][4] = 0
+        with self.assertRaises(ValueError):
+            self.wrapper_paint_compare(mutate=lose_precise, addition=True)
 
     def serial_wrapper_compare(self, mutate=None):
         old = ['#[tokio::test]', 'async fn checked() {', '    let callback = || {',

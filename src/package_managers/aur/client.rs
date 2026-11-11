@@ -47,6 +47,25 @@ use crate::runtimes::common::MAX_DECOMPRESSED_BYTES;
 
 use crate::core::security::artifact::ArchiveSnapshot;
 const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
+// makepkg records BUILDDIR in .BUILDINFO; physical invocation storage stays private.
+const SANDBOX_BUILD_ROOT: &str = "/omg-build";
+
+fn sandbox_build_root(mount_destinations: &[&Path]) -> Result<PathBuf> {
+    (0..=mount_destinations.len())
+        .map(|index| {
+            if index == 0 {
+                PathBuf::from(SANDBOX_BUILD_ROOT)
+            } else {
+                PathBuf::from(format!("{SANDBOX_BUILD_ROOT}-{index}"))
+            }
+        })
+        .find(|candidate| {
+            mount_destinations.iter().all(|destination| {
+                !destination.starts_with(candidate) && !candidate.starts_with(destination)
+            })
+        })
+        .context("Sandbox build root overlaps an existing mount")
+}
 
 const AUR_GIT_URL: &str = "https://aur.archlinux.org";
 const AUR_RPC_MAX_URI: usize = 4400;
@@ -3725,6 +3744,17 @@ impl AurClient {
             let pacman_cache_root = paths::pacman_cache_root_dir_result()?;
             let pacman_cache_root_str = pacman_cache_root.to_string_lossy();
             let home_str = home.to_string_lossy();
+            let mut mount_destinations = vec![
+                home.as_path(),
+                pkg_dir_canonical.as_path(),
+                pkgdest_canonical.as_path(),
+                srcdest_canonical.as_path(),
+                pacman_db_dir.as_path(),
+                pacman_cache_root.as_path(),
+            ];
+            mount_destinations.extend(compiler_cache_mounts.iter().map(PathBuf::as_path));
+            mount_destinations.extend(pgp_home.as_deref());
+            let build_root = sandbox_build_root(&mount_destinations)?;
 
             // Keep bwrap as omg's direct child for parent-death handling.
             // Its PID namespace makes cancellation kill compiler descendants
@@ -3773,7 +3803,7 @@ impl AurClient {
             cmd.arg(&*srcdest_str);
             cmd.args(["--bind"]);
             cmd.arg(&*builddir_str);
-            cmd.arg(&*builddir_str);
+            cmd.arg(&build_root);
             for cache_dir in &compiler_cache_mounts {
                 cmd.args(["--bind"]);
                 cmd.arg(cache_dir);
@@ -3819,7 +3849,7 @@ impl AurClient {
             cmd.args(["--setenv", "SRCDEST"]);
             cmd.arg(&*srcdest_str);
             cmd.args(["--setenv", "BUILDDIR"]);
-            cmd.arg(&*builddir_str);
+            cmd.arg(&build_root);
             if let Some(path) = &pgp_home {
                 cmd.args(["--setenv", "GNUPGHOME"]);
                 cmd.arg(path);
@@ -9013,6 +9043,486 @@ mod tests {
             install_hook: None,
             paired_build_reasons: vec!["system-configuration".to_owned()],
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires native Arch build tools and explicitly isolated fixture state"]
+    async fn native_isolated_fixture_builds_reviewed_source_without_installing() -> Result<()> {
+        anyhow::ensure!(
+            matches!(
+                std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref(),
+                Ok("isolated-container" | "private-build")
+            ),
+            "native fixture requires explicitly isolated build state"
+        );
+        for variable in ["OMG_CACHE_DIR", "OMG_DATA_DIR", "OMG_CONFIG_DIR"] {
+            anyhow::ensure!(
+                std::env::var_os(variable).is_some_and(|path| Path::new(&path).is_absolute()),
+                "native fixture requires an absolute private {variable}"
+            );
+        }
+        anyhow::ensure!(
+            !crate::core::is_root(),
+            "native fixture must run unprivileged"
+        );
+        let cache = paths::cache_dir();
+        std::fs::create_dir_all(&cache)?;
+        let directory = tempfile::tempdir_in(&cache)?;
+        let build_dir = directory.path().join("aur");
+        let checkout = build_dir.join("omg-coverage-fixture");
+        std::fs::create_dir_all(&checkout)?;
+        std::fs::write(
+            checkout.join("PKGBUILD"),
+            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG coverage fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-fixture/empty\"; }\n",
+        )?;
+        std::fs::write(
+            checkout.join(".SRCINFO"),
+            "pkgbase = omg-coverage-fixture\n\tpkgdesc = Inert OMG coverage fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-fixture\n",
+        )?;
+        let outputs = vec!["omg-coverage-fixture".to_owned()];
+        let dependencies = check_dependencies_for_outputs(&checkout, &outputs)?;
+        anyhow::ensure!(
+            dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
+            "fixture must never require dependency installation"
+        );
+        let mut settings = Settings::default();
+        settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
+        let client = AurClient {
+            build_dir,
+            settings,
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut hashes = Vec::new();
+        for _ in 0..2 {
+            let authorized = AuthorizedBuild {
+                lifecycle_guard: client.acquire_build_lifecycle().await?,
+                package: "omg-coverage-fixture".to_owned(),
+                requested_outputs: outputs.clone(),
+                reviewed_digest: ReviewedSource::capture(&checkout)?,
+            };
+            let archives = client
+                .install_authorized_package_outputs(authorized, None)
+                .await?;
+            assert_eq!(archives.len(), 1);
+            let inspected = artifact_inspector::inspect_archive(&archives[0].path())?;
+            assert_eq!(inspected.package_name, "omg-coverage-fixture");
+            assert!(inspected.install_hook.is_none());
+            hashes.push(inspected.archive_sha256);
+        }
+        assert_eq!(
+            hashes[0], hashes[1],
+            "repeated admission preserves archive identity"
+        );
+        std::fs::write(
+            checkout.join("PKGBUILD"),
+            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { printf 'intentional-fixture-failure\\n' >&2; return 1; }\n",
+        )?;
+        let authorized = AuthorizedBuild {
+            lifecycle_guard: client.acquire_build_lifecycle().await?,
+            package: "omg-coverage-fixture".to_owned(),
+            requested_outputs: outputs,
+            reviewed_digest: ReviewedSource::capture(&checkout)?,
+        };
+        let error = client
+            .install_authorized_package_outputs(authorized, None)
+            .await
+            .expect_err("a failed recipe must not reuse previously accepted archives");
+        assert!(
+            matches!(
+                error.downcast_ref::<AurError>(),
+                Some(AurError::BuildFailed { .. })
+            ),
+            "{error:#}"
+        );
+        let log = std::fs::read_to_string(client.build_log_path("omg-coverage-fixture"))?;
+        assert!(log.contains("intentional-fixture-failure"), "{log}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the disposable, network-isolated Arch coverage container"]
+    fn native_isolated_history_requires_hardened_review() -> Result<()> {
+        anyhow::ensure!(
+            std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container")
+                && !crate::core::is_root(),
+            "history fixture requires the unprivileged isolated container"
+        );
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes",
+                "--nocapture",
+            ])
+            .env("OMG_AUR_HISTORY_FIXTURE", "1")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "history fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attended_review_requires_hardened_confirmation_even_with_yes() -> Result<()> {
+        if Settings::rerun_test_unprivileged(
+            "package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes",
+        ) {
+            return Ok(());
+        }
+        const MODE: &str = "OMG_AUR_REVIEW_PTY_MODE";
+        if let Ok(mode) = std::env::var(MODE) {
+            let directory = tempfile::tempdir()?;
+            let pkgbuild = directory.path().join("PKGBUILD");
+            std::fs::write(&pkgbuild, "pkgname=demo\n")?;
+            std::fs::write(directory.path().join(".SRCINFO"), "pkgbase = demo\n")?;
+            crate::core::privilege::set_yes_flag(true);
+            let profile = match mode.as_str() {
+                "standard" | "authorize" => crate::config::AurSecurityProfile::Standard,
+                "hardened" | "history" => crate::config::AurSecurityProfile::Hardened,
+                _ => anyhow::bail!("unknown review fixture mode"),
+            };
+            if mode == "history" {
+                anyhow::ensure!(
+                    std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container"),
+                    "historical fixture requires the isolated container"
+                );
+                let mut settings = Settings::default();
+                settings.aur.security_profile = profile;
+                let client = AurClient {
+                    build_dir: directory.path().join("build"),
+                    settings,
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let error = client
+                    .downgrade_from_history("demo", "1-1")
+                    .await
+                    .expect_err("declining historical review must abort before building");
+                assert!(
+                    error.to_string().contains("Build aborted by user"),
+                    "{error:#}"
+                );
+                println!("REVIEW_DECLINED");
+            } else if mode == "authorize" {
+                let client = AurClient {
+                    build_dir: directory.path().join("build"),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let authorized = client
+                    .authorize_package_outputs("demo", &["demo".to_owned()])
+                    .await?;
+                authorized
+                    .reviewed_digest
+                    .verify(&client.build_dir.join("demo"))?;
+                println!("REVIEW_ACCEPTED");
+            } else {
+                let result = AurClient::review_pkgbuild("demo", &pkgbuild, profile).await;
+                if mode == "standard" {
+                    result?.verify(directory.path())?;
+                    println!("REVIEW_ACCEPTED");
+                } else {
+                    let error = result.expect_err("declining hardened review must abort");
+                    assert!(
+                        error.to_string().contains("Build aborted by user"),
+                        "{error:#}"
+                    );
+                    println!("REVIEW_DECLINED");
+                }
+            }
+            return Ok(());
+        }
+
+        // The child owns its terminal and global --yes flag. Input is sent only
+        // after the prompt appears, so an unexpected skipped prompt fails.
+        let driver = r#"
+import errno, os, pty, select, shutil, signal, sys, tempfile, time
+mode, executable, test_name = sys.argv[1:]
+fixture = tempfile.mkdtemp(prefix='omg-review-pty-')
+with open(os.path.join(fixture, 'git'), 'w') as script:
+    script.write('''#!/bin/sh
+set -eu
+if [ "$1" = clone ] && [ "$#" -eq 5 ] && [ "$2" = --filter=blob:none ] && [ "$3" = -- ] && [ "$4" = https://aur.archlinux.org/demo.git ]; then
+    case "$5" in */_rollback/demo-*) exit 0;; *) exit 1;; esac
+fi
+if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
+    case "$2" in */_rollback/demo-*) ;; *) exit 1;; esac
+    if [ "$#" -eq 4 ] && [ "$3" = log ] && [ "$4" = --format=%H ]; then
+        printf 'fixture-commit\\n'
+        exit 0
+    fi
+    if [ "$#" -eq 4 ] && [ "$3" = show ] && [ "$4" = fixture-commit:.SRCINFO ]; then
+        printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n'
+        exit 0
+    fi
+    if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = fixture-commit ]; then
+        printf 'pkgname=demo\\n' > "$2/PKGBUILD"
+        printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n' > "$2/.SRCINFO"
+        exit 0
+    fi
+    exit 1
+fi
+[ "$#" -eq 6 ] && [ "$1" = clone ] && [ "$2" = --depth=1 ] && [ "$3" = --filter=blob:none ] && [ "$4" = -- ] && [ "$5" = https://aur.archlinux.org/demo.git ]
+mkdir "$6"
+printf 'pkgname=demo\\n' > "$6/PKGBUILD"
+printf 'pkgbase = demo\\n' > "$6/.SRCINFO"
+''')
+os.chmod(os.path.join(fixture, 'git'), 0o700)
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ['OMG_AUR_REVIEW_PTY_MODE'] = mode
+    os.environ['PATH'] = fixture + ':/usr/bin:/bin'
+    os.execv(executable, [executable, '--exact', test_name, '--nocapture'])
+output = bytearray()
+sent = False
+deadline = time.monotonic() + 45
+status = None
+try:
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if readable:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                chunk = b''
+            output.extend(chunk)
+            if len(output) > 1024 * 1024:
+                raise RuntimeError('review output exceeded limit')
+            if mode in ('hardened', 'history') and not sent and b'Build demo from this PKGBUILD?' in output:
+                os.write(fd, b'n\n')
+                sent = True
+        done, child_status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            status = child_status
+            while True:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > 1024 * 1024:
+                    raise RuntimeError('review output exceeded limit')
+            break
+    else:
+        raise RuntimeError('review child timed out')
+    expected = b'REVIEW_DECLINED' if mode in ('hardened', 'history') else b'REVIEW_ACCEPTED'
+    if not os.waitstatus_to_exitcode(status) == 0 or expected not in output or (mode in ('hardened', 'history') and not sent):
+        raise RuntimeError('review child failed or did not show the expected prompt')
+finally:
+    if status is None:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)
+    shutil.rmtree(fixture)
+    sys.stdout.buffer.write(output)
+"#;
+        let mut modes = vec!["standard", "hardened", "authorize"];
+        if std::env::var("OMG_AUR_HISTORY_FIXTURE").as_deref() == Ok("1") {
+            modes.push("history");
+        }
+        for mode in modes {
+            let output = std::process::Command::new("python3")
+                .args(["-c", driver, mode])
+                .arg(std::env::current_exe()?)
+                .arg("package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{mode} review fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn archive_admission_enforces_profile_and_binds_paired_cache_to_it() -> Result<()> {
+        let checkout = tempfile::tempdir()?;
+        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        std::fs::write(
+            checkout.path().join(".SRCINFO"),
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\ninstall = demo.install\npkgname = demo\n",
+        )?;
+        let hook = "post_install() { :; }\n";
+        std::fs::write(checkout.path().join("demo.install"), hook)?;
+        let source = ReviewedSource::capture(checkout.path())?;
+        let archives = tempfile::tempdir()?;
+        let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+        let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
+        write_pkg_archive(&archive, info, Some(hook));
+        let invocation = tempfile::tempdir()?;
+        let env = MakepkgEnv {
+            pkgdest: invocation.path().join("pkg"),
+            srcdest: invocation.path().join("src"),
+            builddir: invocation.path().join("build"),
+            _invocation: invocation,
+            makeflags: String::new(),
+            compiler_cache_dirs: Vec::new(),
+            extra_env: Vec::new(),
+            pgp_home: None,
+        };
+        let mut client = AurClient {
+            build_dir: checkout.path().to_path_buf(),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let inspection = artifact_inspector::inspect_archive(&archive)?;
+        let standard_key =
+            client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+        client.settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
+        let hardened_key =
+            client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+        assert_ne!(
+            standard_key, hardened_key,
+            "a proof under one profile must not authorize another"
+        );
+        let error = client
+            .authorize_with_paired_build(
+                std::slice::from_ref(&archive),
+                &source,
+                "demo",
+                &["demo".to_owned()],
+                true,
+                checkout.path(),
+                &env,
+            )
+            .await
+            .expect_err("hardened admission must reject an install hook before rebuilding");
+        assert!(
+            error.to_string().contains("Hardened AUR profile rejects"),
+            "{error:#}"
+        );
+        client.settings.aur.review_pkgbuild = false;
+        let error = client
+            .run_build(checkout.path(), &env, "demo")
+            .await
+            .expect_err("an invalid hardened configuration must fail before running a build");
+        assert!(
+            error.to_string().contains("requires build_method"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn standard_admission_accepts_an_ordinary_archive_without_rebuild() -> Result<()> {
+        let checkout = tempfile::tempdir()?;
+        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        std::fs::write(
+            checkout.path().join(".SRCINFO"),
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
+        )?;
+        let source = ReviewedSource::capture(checkout.path())?;
+        let archives = tempfile::tempdir()?;
+        let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+        write_pkg_archive(
+            &archive,
+            "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
+            None,
+        );
+        let invocation = tempfile::tempdir()?;
+        let env = MakepkgEnv {
+            pkgdest: invocation.path().join("pkg"),
+            srcdest: invocation.path().join("src"),
+            builddir: invocation.path().join("build"),
+            _invocation: invocation,
+            makeflags: String::new(),
+            compiler_cache_dirs: Vec::new(),
+            extra_env: Vec::new(),
+            pgp_home: None,
+        };
+        let client = AurClient {
+            build_dir: checkout.path().to_path_buf(),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let accepted = client
+            .authorize_with_paired_build(
+                std::slice::from_ref(&archive),
+                &source,
+                "demo",
+                &["demo".to_owned()],
+                true,
+                checkout.path(),
+                &env,
+            )
+            .await?;
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(
+            artifact_inspector::inspect_archive(&accepted[0].path())?.package_name,
+            "demo"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn final_install_rechecks_current_hardened_profile_before_elevation() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation";
+        if Settings::rerun_test_unprivileged(TEST) || crate::core::testing::run_isolated_test(TEST)
+        {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let archive = directory.path().join("demo-1-1-any.pkg.tar.gz");
+        write_pkg_archive(
+            &archive,
+            "pkgname = demo\npkgbase = demo\npkgver = 1-1\narch = any\n",
+            Some("post_install() { :; }\n"),
+        );
+        let snapshot = ArchiveSnapshot::capture(&archive)?;
+        std::fs::write(
+            directory.path().join("config.toml"),
+            "[aur]\nsecurity_profile = 'hardened'\n",
+        )?;
+        temp_env::with_var("OMG_CONFIG_DIR", Some(directory.path()), || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let error = runtime
+                .block_on(AurClient::install_built_packages(&[snapshot], None))
+                .expect_err("the current hardened profile must reject hooks before elevation");
+            assert!(
+                error.to_string().contains("Hardened AUR profile rejects"),
+                "{error:#}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn sandbox_build_root_keeps_existing_mounts_visible_and_identity_stable() -> Result<()> {
+        let first = [
+            Path::new("/omg-build/checkout"),
+            Path::new("/cache/first/packages"),
+        ];
+        let second = [
+            Path::new("/omg-build/checkout"),
+            Path::new("/cache/second/packages"),
+        ];
+        let root = sandbox_build_root(&first)?;
+        for destination in first {
+            assert!(
+                !destination.starts_with(&root) && !root.starts_with(destination),
+                "build root {} must not obscure mount {}",
+                root.display(),
+                destination.display()
+            );
+        }
+        assert_eq!(root, sandbox_build_root(&second)?);
+        assert_eq!(
+            sandbox_build_root(&[Path::new("/omg-builder/cache")])?,
+            Path::new(SANDBOX_BUILD_ROOT)
+        );
+        assert!(sandbox_build_root(&[Path::new("/")]).is_err());
+        Ok(())
     }
 
     #[test]

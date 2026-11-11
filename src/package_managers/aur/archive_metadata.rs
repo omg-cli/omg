@@ -135,11 +135,12 @@ pub(super) fn validate(reader: impl Read) -> Result<()> {
                 "AUR archive PAX metadata exceeds limit"
             );
             pending.headers += 1;
-            if let Some(fields) = entry.pax_extensions()? {
-                for field in fields {
-                    let field = field?;
-                    pending.field(field.key_bytes(), field.value_bytes())?;
-                }
+            let fields = entry
+                .pax_extensions()?
+                .context("AUR archive PAX header has no extension fields")?;
+            for field in fields {
+                let field = field?;
+                pending.field(field.key_bytes(), field.value_bytes())?;
             }
         } else if kind.is_gnu_longname() || kind.is_gnu_longlink() {
             ensure!(

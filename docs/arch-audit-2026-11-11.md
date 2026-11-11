@@ -158,6 +158,55 @@ Independent Rust reviews found no blockers in the API migration, lockfile
 changes or root-fixture correction. They treated internal CLI code as
 application code and checked correctness before style.
 
+## Followup coverage and native builds
+
+The next hosted run passed the platform, guest, security and instrumented-test
+jobs. Coverage comparison refused the two added source modules before examining
+their lines. The comparator now admits genuinely new files only when both
+summary and mapped lines are fully covered. It compares the common files
+separately so additions cannot conceal a regression. Removed files and
+previously uninstrumented existing files still require review.
+
+A separate source-correspondence check handles repeated covered fragments
+inside a unique function with multiple compiled copies. It checks every
+candidate line and complete owner inventory, then compares the combined
+covered-state vectors. It grants no deletion credit or uncovered mappings.
+Pinned Rustfmt validates the bounded function excerpt in an empty temporary
+directory. Module declarations are refused before parsing. Formatter output
+does not supply coverage or replace source bytes. This uses the
+[Rustfmt parsing contract](https://github.com/rust-lang/rustfmt#running).
+
+These checks have 128 passing Python tests, including failing-before controls
+for hidden regressions, ambiguous ownership and malformed source. Independent
+reviews found and corrected a partial-owner gap and syntax-recognition gaps
+before publication. Fresh producer evidence remains necessary for acceptance.
+
+The added native build test exposed a hardened-mode usability defect.
+Two source-free, inert Bubblewrap builds completed but produced different
+archives because makepkg records `BUILDDIR` in `.BUILDINFO`. Random private
+host paths therefore defeated exact comparison. Builds now retain distinct
+physical directories while exposing a stable, collision-free guest build root.
+The regression failed before the fix and passed afterward without changing
+archive comparison or metadata. A second failing-before test covers custom
+cache paths that could otherwise be hidden by that mount.
+
+The native fixture also repeats admission using the verified pairing cache and
+then checks that a deliberately failed recipe cannot reuse accepted archives.
+It never calls the installation stage. Every local build drive preserved its
+own before/after pacman database fingerprint. The final-install fixture checks
+that the current hardened profile rejects an install hook before elevation.
+Genuine PTY tests verify that hardened review still prompts under `--yes` and
+honors refusal; their namespace-root runs verify the ordinary-user boundary.
+
+The latest ordinary checks passed 2,120 library tests, 15 Arch CLI contracts,
+18 version tests, all-target Clippy with warnings denied, and 25 coverage-workflow
+tests. Six library tests were ignored by default: four existing cases and two
+explicit native fixtures. The inert paired-build fixture passed separately on
+this Arch host. Historical rollback review remains selected in the existing
+network-isolated CI container, where only `/usr/bin/true` receives passwordless
+sudo authorization. That container has separate fixture home, cache, data and
+configuration directories. No host package installation or removal was used.
+
 ## Remaining work
 
 - Live searches and several inventory operations still use C libalpm. Move

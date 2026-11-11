@@ -196,7 +196,7 @@ jobs:
 
           docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
-          RUN pacman -Syu --noconfirm --needed bubblewrap fakeroot && pacman -Scc --noconfirm
+          RUN pacman -Syu --noconfirm --needed bubblewrap fakeroot python sudo debugedit && pacman -Scc --noconfirm
           DOCKERFILE
           curl -fsS https://raw.githubusercontent.com/moby/profiles/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json -o /tmp/coverage-seccomp.json
           echo '536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74  /tmp/coverage-seccomp.json' | sha256sum --check
@@ -206,10 +206,15 @@ jobs:
           # Namespace permissions apply only to this credential-free fixture.
           container=$(docker create --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
             --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json \
-            --network none --pids-limit 128 --memory 1g --cpus 2 \
+            --network none --add-host aur.archlinux.org:127.0.0.1 --pids-limit 128 --memory 1g --cpus 2 \
             omg-coverage-sandbox /bin/bash -euo pipefail -c '
               mkdir -m 1777 /profiles
               mkdir /evidence
+              install -d -m 700 -o nobody -g nobody /home/omg-fixture /var/tmp/omg-fixture-cache /var/tmp/omg-fixture-state /var/tmp/omg-fixture-config
+              mkdir -p /var/cache/pacman/pkg /var/lib/pacman/local /var/lib/pacman/sync
+              printf "nobody ALL=(root) NOPASSWD: /usr/bin/true\n" > /etc/sudoers.d/omg-fixture
+              chmod 440 /etc/sudoers.d/omg-fixture
+              visudo -cf /etc/sudoers.d/omg-fixture
               fixture_binary=/fixture
               fixture_profiles=/profiles
               fixture_evidence=/evidence
@@ -222,13 +227,23 @@ jobs:
                 local test_name=$1
                 local case_id=${test_name//::/_}
                 local log="$fixture_evidence/$case_id.log"
+                local runner=()
+                if [[ "$test_name" == package_managers::aur::client::tests::native_isolated_* ]]; then
+                  runner=(runuser -u nobody -- env HOME=/home/omg-fixture
+                    OMG_CACHE_DIR=/var/tmp/omg-fixture-cache OMG_DATA_DIR=/var/tmp/omg-fixture-state
+                    OMG_CONFIG_DIR=/var/tmp/omg-fixture-config OMG_AUR_NATIVE_FIXTURE=isolated-container)
+                fi
                 grep -Fx "$test_name: test" "$fixture_evidence/registry.txt"
                 LLVM_PROFILE_FILE="$fixture_profiles/omg-fixture-$case_id-%p-%m%c.profraw" \
-                  timeout --kill-after=2s 35s "$fixture_binary" --exact "$test_name" \
+                  timeout --kill-after=2s 35s "${runner[@]}" "$fixture_binary" --exact "$test_name" \
                   --include-ignored --nocapture --test-threads=1 2>&1 | tee "$log"
                 grep -Eq "^test result: ok\. 1 passed; 0 failed; 0 ignored;" "$log"
                 if grep -Eq "\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)" "$log"; then
                   return 1
+                fi
+                if [ "$test_name" = config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options ]; then
+                  grep -F "[omg-unprivileged-fixture]" "$log" | grep -F "parent_uid=0"
+                  grep -F "[omg-unprivileged-fixture-child]" "$log" | grep -F "uid=65534 "
                 fi
                 local profiles=("$fixture_profiles/omg-fixture-$case_id-"*.profraw)
                 for profile in "${profiles[@]}"; do test -s "$profile"; done
@@ -248,6 +263,11 @@ jobs:
                 package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller
                 package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db
                 package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_preserve_distinct_soname_dependencies
+                package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes
+                package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing
+                package_managers::aur::client::tests::native_isolated_history_requires_hardened_review
+                config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options
+                package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation
                 core::usage::tests::elevated_state_roundtrip_preserves_caller_files
               )
               printf "%s\n" "${cases[@]}" > /evidence/expected-tests.txt
@@ -582,6 +602,13 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
+
+      - name: Install pinned Rust syntax validator
+        if: needs.changes.outputs.coverage_required == 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
 
       - name: Require coverage to meet the exact base commit
         if: needs.changes.outputs.coverage_required == 'true'
