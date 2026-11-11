@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """Download and compare coverage evidence for the exact current/base commits."""
+from datetime import datetime, timezone
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
+import tempfile
+import zipfile
 
 REPOSITORY = "omg-cli/omg"
 WORKFLOW = ".github/workflows/coverage.yml"
+MAX_REPORT = 128 * 1024 * 1024
 
 
-def api(endpoint):
-    result = subprocess.run(["gh", "api", endpoint], check=True,
-                            capture_output=True, text=True, timeout=60)
-    return json.loads(result.stdout)
+def api(endpoint, *, binary=False):
+    limit = MAX_REPORT if binary else 1024 * 1024
+    with tempfile.TemporaryFile() as output:
+        subprocess.run(["gh", "api", endpoint], check=True, stdout=output, timeout=180 if binary else 60)
+        if output.tell() > limit:
+            raise ValueError("Coverage GitHub response exceeds limit")
+        output.seek(0)
+        content = output.read(limit + 1)
+    return content if binary else json.loads(content)
 
 
 def sha(value):
@@ -61,19 +73,134 @@ def validate_artifact(artifacts, run_id, commit, name="coverage-lcov"):
     return artifact
 
 
-def download(run, commit, destination, name="coverage-lcov"):
-    artifacts = api(f"repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts?per_page=100")
-    if artifacts["total_count"] != len(artifacts["artifacts"]):
-        raise ValueError("Coverage artifact listing is incomplete")
-    artifact = validate_artifact(artifacts["artifacts"], run["id"], commit, name)
+def timestamp(value):
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z", value):
+        raise ValueError("Missing or invalid coverage ownership timestamp")
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def complete_listing(endpoint, field):
+    rows, seen, total, page = [], set(), None, 1
+    while True:
+        listing = api(endpoint if page == 1 else f"{endpoint}&page={page}")
+        batch, count = listing.get(field), listing.get("total_count")
+        if (not isinstance(batch, list) or type(count) is not int or count < 0
+                or (total is not None and count != total) or len(batch) > 100
+                or (not batch and len(rows) != count)):
+            raise ValueError(f"Coverage {field} listing is incomplete or changed")
+        total = count
+        for row in batch:
+            identity = row.get("id")
+            if type(identity) is not int or identity <= 0 or identity in seen:
+                raise ValueError(f"Coverage {field} listing has invalid or duplicate IDs")
+            seen.add(identity)
+        rows.extend(batch)
+        if len(rows) == total:
+            return rows
+        if len(rows) > total:
+            raise ValueError(f"Coverage {field} listing is incomplete or changed")
+        page += 1
+
+
+def coverage_producer(run, commit):
+    attempt = run.get("run_attempt")
+    if type(attempt) is not int or attempt <= 0:
+        raise ValueError("Missing or invalid coverage run attempt")
+
+    def owner(number):
+        jobs = complete_listing(
+            f"repos/{REPOSITORY}/actions/runs/{run['id']}/attempts/{number}/jobs?per_page=100", "jobs")
+        selected = [job for job in jobs if job.get("name") == "Instrumented coverage tests"]
+        if len(selected) != 1:
+            raise ValueError("Expected exactly one instrumented coverage producer")
+        job = selected[0]
+        if (job.get("run_id") != run["id"] or job.get("head_sha") != commit
+                or type(job.get("id")) is not int):
+            raise ValueError("Coverage producer identity mismatch")
+        return job
+
+    producer = owner(attempt)
+    if producer.get("status") != "completed" or producer.get("conclusion") != "success":
+        raise ValueError("Latest coverage producer did not complete successfully")
+    start, finish = timestamp(producer.get("started_at")), timestamp(producer.get("completed_at"))
+    if start >= finish:
+        raise ValueError("Invalid coverage producer interval")
+    # Carried jobs retain their execution interval even when GitHub relabels
+    # their attempt and ID. A new execution starts within its attempt's window.
+    snapshot = run
+    while start < timestamp(snapshot.get("run_started_at")):
+        if attempt == 1:
+            raise ValueError("Coverage producer predates its workflow run")
+        attempt -= 1
+        snapshot = api(f"repos/{REPOSITORY}/actions/runs/{run['id']}/attempts/{attempt}")
+        if (snapshot.get("id") != run["id"] or snapshot.get("head_sha") != commit
+                or snapshot.get("run_attempt") != attempt):
+            raise ValueError("Coverage producer attempt identity mismatch")
+        previous = owner(attempt)
+        if (previous.get("started_at"), previous.get("completed_at")) != (
+                producer["started_at"], producer["completed_at"]):
+            raise ValueError("Carried coverage producer execution changed")
+        if previous.get("status") != "completed" or previous.get("conclusion") != "success":
+            raise ValueError("Carried coverage producer was not successful")
+        producer = previous
+    return attempt, producer
+
+
+def coverage_artifacts(run, commit):
+    attempt, producer = coverage_producer(run, commit)
+    start, finish = timestamp(producer["started_at"]), timestamp(producer["completed_at"])
+    artifacts = complete_listing(
+        f"repos/{REPOSITORY}/actions/runs/{run['id']}/artifacts?per_page=100", "artifacts")
+    pair = {}
+    for kind in ("coverage-lcov", "coverage-regions"):
+        selected = [artifact for artifact in artifacts
+                    if re.fullmatch(kind + r"(?:-\d+-\d+)?", artifact.get("name", ""))
+                    and start <= timestamp(artifact.get("created_at")) <= finish]
+        expected = f"{kind}-{run['id']}-{attempt}"
+        if len(selected) != 1 or selected[0]["name"] not in (kind, expected):
+            raise ValueError(f"Expected exactly one {kind} artifact from the effective producer")
+        artifact = validate_artifact(selected, run["id"], commit, selected[0]["name"])
+        if (type(artifact.get("id")) is not int or artifact["id"] <= 0
+                or type(artifact.get("size_in_bytes")) is not int
+                or not 0 < artifact["size_in_bytes"] <= MAX_REPORT):
+            raise ValueError("Invalid coverage artifact ID or size")
+        pair[kind] = artifact
+    if pair["coverage-lcov"]["id"] == pair["coverage-regions"]["id"]:
+        raise ValueError("Coverage evidence pair has duplicate IDs")
+    if (pair["coverage-lcov"]["name"] == "coverage-lcov") != (
+            pair["coverage-regions"]["name"] == "coverage-regions"):
+        raise ValueError("Coverage evidence pair mixes legacy and qualified names")
+    return pair, attempt, producer["id"]
+
+
+def download(run, commit, destination, name="coverage-lcov", *, artifact=None):
+    if name not in ("coverage-lcov", "coverage-regions"):
+        raise ValueError("Unsupported coverage artifact kind")
+    if artifact is None:
+        pair, _, _ = coverage_artifacts(run, commit)
+        artifact = pair[name]
+    content = api(f"repos/{REPOSITORY}/actions/artifacts/{artifact['id']}/zip", binary=True)
+    if len(content) != artifact["size_in_bytes"]:
+        raise ValueError("GitHub coverage artifact size mismatch")
+    if artifact.get("digest") != "sha256:" + hashlib.sha256(content).hexdigest():
+        raise ValueError("GitHub coverage artifact digest missing or mismatched")
+    leaf = "lcov.info" if name == "coverage-lcov" else "coverage-regions.json.gz"
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            if (len(members) != 1 or members[0].filename != leaf
+                    or members[0].is_dir() or not 0 < members[0].file_size <= MAX_REPORT
+                    or stat.S_IFMT(members[0].external_attr >> 16) not in (0, stat.S_IFREG)):
+                raise ValueError("Coverage artifact must contain one bounded lcov.info report")
+            payload = archive.read(members[0])
+    except (zipfile.BadZipFile, RuntimeError) as error:
+        raise ValueError("Invalid coverage artifact archive") from error
+    refreshed = api(f"repos/{REPOSITORY}/actions/runs/{run['id']}")
+    if any(refreshed.get(key) != run.get(key) for key in ("id", "head_sha", "run_attempt")):
+        raise ValueError("Coverage producer attempt changed during download")
     destination.mkdir(parents=True, exist_ok=False)
-    subprocess.run(["gh", "run", "download", str(run["id"]), "--repo", REPOSITORY,
-                    "--name", name, "--dir", str(destination)],
-                   check=True, timeout=180)
-    report = destination / ("lcov.info" if name == "coverage-lcov" else "coverage-regions.json.gz")
-    if (not report.is_file() or report.is_symlink()
-            or list(destination.iterdir()) != [report] or report.stat().st_size > 128 * 1024 * 1024):
-        raise ValueError("Coverage artifact must contain one bounded lcov.info report")
+    report = destination / leaf
+    report.write_bytes(payload)
     return artifact, report
 
 
@@ -102,6 +229,9 @@ def main():
     ensure_source_commit(Path.cwd(), head_sha)
     current_id = int(os.environ["GITHUB_RUN_ID"])
     current = api(f"repos/{REPOSITORY}/actions/runs/{current_id}")
+    if (current.get("id") != current_id
+            or current.get("run_attempt") != int(os.environ["GITHUB_RUN_ATTEMPT"])):
+        raise ValueError("Current coverage run attempt no longer matches this job")
     workflow_id = api(f"repos/{REPOSITORY}/actions/workflows/coverage.yml")["id"]
     validate_run(current, head_sha, event_name, workflow_id)
     runs = api(f"repos/{REPOSITORY}/actions/workflows/coverage.yml/runs"
@@ -112,11 +242,17 @@ def main():
     validate_run(base, base_sha, "push", workflow_id, base=True)
     root = Path("coverage-comparison")
     root.mkdir(exist_ok=False)
-    base_artifact, base_report = download(base, base_sha, root / "base")
-    head_artifact, head_report = download(current, head_sha, root / "head")
-    base_regions_artifact, base_regions = download(base, base_sha, root / "base-regions", "coverage-regions")
-    head_regions_artifact, head_regions = download(current, head_sha, root / "head-regions", "coverage-regions")
-    receipt = {"base_regions_artifact": base_regions_artifact["id"],
+    base_pair, base_attempt, base_job = coverage_artifacts(base, base_sha)
+    head_pair, head_attempt, head_job = coverage_artifacts(current, head_sha)
+    base_artifact, base_report = download(base, base_sha, root / "base", artifact=base_pair["coverage-lcov"])
+    head_artifact, head_report = download(current, head_sha, root / "head", artifact=head_pair["coverage-lcov"])
+    base_regions_artifact, base_regions = download(base, base_sha, root / "base-regions", "coverage-regions",
+                                                  artifact=base_pair["coverage-regions"])
+    head_regions_artifact, head_regions = download(current, head_sha, root / "head-regions", "coverage-regions",
+                                                  artifact=head_pair["coverage-regions"])
+    receipt = {"base_producer_attempt": base_attempt, "head_producer_attempt": head_attempt,
+               "base_producer_job": base_job, "head_producer_job": head_job,
+               "base_regions_artifact": base_regions_artifact["id"],
                "head_regions_artifact": head_regions_artifact["id"],
                "base_sha": base_sha, "head_sha": head_sha,
                "base_run": base["id"], "head_run": current_id,

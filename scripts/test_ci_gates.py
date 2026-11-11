@@ -84,7 +84,8 @@ class NativePhaseMatrixTests(unittest.TestCase):
         self.assertIn("linux-matrix", job_block(self.workflow, "ci-success").split("    steps:", 1)[0])
         self.assertIn("linux-clippy", job_block(self.workflow, "ci-success").split("    steps:", 1)[0])
         self.assertIn("needs: [quick-gate, linux-matrix]", job_block(self.workflow, "sandbox-cancellation"))
-        self.assertIn("needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]", job_block(self.workflow, "qemu"))
+        self.assertIn("needs: [qemu-preflight, linux-matrix, ubuntu]", job_block(self.workflow, "qemu"))
+        self.assertIn("needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]", job_block(self.workflow, "qemu-fedora"))
 
     def test_validation_outputs_and_commands_never_run_in_clippy_phase(self) -> None:
         validation = "matrix.phase == 'validation'"

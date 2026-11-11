@@ -69,6 +69,22 @@ class R2CacheTests(unittest.TestCase):
                 with self.subTest(job=job, name=name, value=value), self.assertRaises(ValueError):
                     CACHE.configuration(dict(isolated, **{name: value}))
 
+    def test_benchmark_uses_r2_with_its_own_prefix_for_trusted_events(self):
+        for event in ('push', 'workflow_dispatch', 'schedule'):
+            with self.subTest(event=event):
+                config = CACHE.configuration(dict(trusted(), GITHUB_JOB='benchmark', GITHUB_EVENT_NAME=event))
+                self.assertEqual(config['SCCACHE_S3_KEY_PREFIX'], 'benchmark-v1/')
+                self.assertEqual(config['SCCACHE_S3_RW_MODE'], 'READ_WRITE')
+        for job in ('portable', 'portable-release'):
+            with self.subTest(job=job), self.assertRaises(ValueError):
+                CACHE.configuration(dict(trusted(), GITHUB_JOB=job, GITHUB_EVENT_NAME='schedule'))
+        for name, value in [('GITHUB_EVENT_NAME', 'pull_request'),
+                            ('GITHUB_EVENT_NAME', 'pull_request_target'),
+                            ('GITHUB_REF', 'refs/heads/topic'),
+                            ('GITHUB_REPOSITORY', 'someone/omg')]:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                CACHE.configuration(dict(trusted(), GITHUB_JOB='benchmark', **{name: value}))
+
     def server(self, root, snapshots=None, failure=None, corrupt_replay=False):
         snapshots = iter(snapshots if snapshots is not None else
                          [statistics(), statistics(1, 1), statistics(1, 1, 1)])
@@ -120,7 +136,7 @@ class R2CacheTests(unittest.TestCase):
     def test_outputs_follow_write_and_replay_without_client_credentials(self):
         names = []
         sockets = []
-        for job in ('portable', 'portable-release'):
+        for job in ('portable', 'portable-release', 'benchmark'):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 env = dict(trusted(), GITHUB_JOB=job, GITHUB_ENV=str(root / 'env'), GITHUB_OUTPUT=str(root / 'output'))
@@ -195,7 +211,7 @@ class R2CacheTests(unittest.TestCase):
             self.assertFalse((root / 'env').exists())
             self.assertFalse((root / 'output').exists())
 
-    def test_workflow_cache_is_portable_only_and_no_pr_credentials(self):
+    def test_native_producers_keep_their_cache_and_no_pr_credentials(self):
         source = CI_YML.read_text()
         for job in ('portable', 'portable-release'):
             portable = job_block(source, job)
@@ -209,6 +225,22 @@ class R2CacheTests(unittest.TestCase):
             block = job_block(source, job)
             self.assertNotIn('ci-r2-cache.py', block)
             self.assertNotIn('OMG_R2_CACHE_SECRET_ACCESS_KEY', block)
+
+    def test_benchmark_workflow_verifies_cache_before_compiling_and_keeps_diagnostics(self):
+        source = (CI_YML.parent / 'benchmark.yml').read_text()
+        block = job_block(source, 'benchmark')
+        self.assertIn('sccache@0.18.0', block)
+        self.assertIn('python3 scripts/ci-r2-cache.py', block)
+        self.assertLess(block.index('python3 scripts/ci-r2-cache.py'), block.index('run: cargo build'))
+        self.assertNotIn('SCCACHE_GHA_ENABLED', block)
+        for name in ('Install benchmark compiler cache', 'Configure benchmark R2 cache'):
+            step = block.split(f'      - name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("github.ref == 'refs/heads/main'", step)
+            self.assertIn("vars.OMG_R2_CACHE_ENABLED == 'true'", step)
+        self.assertIn("if: always() && steps.r2-cache.outputs.enabled == 'true'", block)
+        self.assertIn('sccache --stop-server', block)
+        self.assertIn('sccache --show-stats --stats-format=json', block)
+        self.assertIn('compiler-cache-${{ github.job }}-${{ github.run_attempt }}', block)
 
 
 if __name__ == '__main__':

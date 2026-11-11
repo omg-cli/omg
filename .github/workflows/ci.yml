@@ -1838,12 +1838,28 @@ jobs:
       - uses: ./.github/actions/qemu-preflight
 
   qemu:
-    name: QEMU behavioral verification
+    name: QEMU behavioral verification (non-Fedora)
+    needs: [qemu-preflight, linux-matrix, ubuntu]
+    if: >-
+      !cancelled() && needs.qemu-preflight.result != 'skipped'
+    uses: ./.github/workflows/qemu-matrix.yml
+    with:
+      partition: non-fedora
+      preflight-result: ${{ needs.qemu-preflight.result }}
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      OMG_SMOKE_SENTRY_DSN: ${{ github.event_name != 'pull_request' && secrets.OMG_SMOKE_SENTRY_DSN || '' }}
+
+  qemu-fedora:
+    name: QEMU behavioral verification (Fedora)
     needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]
     if: >-
       !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
     with:
+      partition: fedora
       preflight-result: ${{ needs.qemu-preflight.result }}
     permissions:
       contents: read
@@ -1909,7 +1925,7 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, workflow-checks, standalone-suites, portable, portable-release, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
+    needs: [quick-gate, workflow-checks, standalone-suites, portable, portable-release, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, qemu-fedora, docs-audit, runtime-usage]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1934,6 +1950,7 @@ jobs:
           UBUNTU: ${{ needs.ubuntu.result }}
           RUNTIME_USAGE: ${{ needs.runtime-usage.result }}
           QEMU: ${{ needs.qemu.result }}
+          QEMU_FEDORA: ${{ needs.qemu-fedora.result }}
           QEMU_REQUIRED: ${{ github.event_name == 'merge_group' || ((github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true') }}
           DOCS_AUDIT: ${{ needs.docs-audit.result }}
         run: |
@@ -1955,7 +1972,8 @@ jobs:
           echo "| macOS nextest source contract | $MACOS_NEXTEST_SOURCE |" >> $GITHUB_STEP_SUMMARY
           echo "| Ubuntu | $UBUNTU |" >> $GITHUB_STEP_SUMMARY
           echo "| Runtime usage accounting | $RUNTIME_USAGE |" >> $GITHUB_STEP_SUMMARY
-          echo "| QEMU | $QEMU |" >> $GITHUB_STEP_SUMMARY
+          echo "| QEMU non-Fedora | $QEMU |" >> $GITHUB_STEP_SUMMARY
+          echo "| QEMU Fedora | $QEMU_FEDORA |" >> $GITHUB_STEP_SUMMARY
           echo "| Docs audit | $DOCS_AUDIT |" >> $GITHUB_STEP_SUMMARY
 
           if [[ "$DOCS_AUDIT" != "success" ]]; then
@@ -1963,8 +1981,8 @@ jobs:
             exit 1
           fi
 
-          if [[ "$QEMU_REQUIRED" == "true" && "$QEMU" != "success" ]]; then
-            echo "::error::Required QEMU verification did not succeed: $QEMU"
+          if [[ "$QEMU_REQUIRED" == "true" && ( "$QEMU" != "success" || "$QEMU_FEDORA" != "success" ) ]]; then
+            echo "::error::Required QEMU verification did not succeed: non-Fedora=$QEMU Fedora=$QEMU_FEDORA"
             exit 1
           fi
 

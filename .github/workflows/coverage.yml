@@ -342,7 +342,7 @@ jobs:
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-lcov
+          name: coverage-lcov-${{ github.run_id }}-${{ github.run_attempt }}
           path: lcov.info
           retention-days: 14
           if-no-files-found: warn
@@ -350,14 +350,174 @@ jobs:
       - name: Generate region evidence
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         run: |
-          cargo llvm-cov report --json --output-path coverage-regions.json
+          if cargo llvm-cov report --json --output-path coverage-regions.json --verbose 2> coverage-region-export.log; then
+            :
+          else
+            status=$?
+            tail -c 28000 coverage-region-export.log >&2
+            exit "$status"
+          fi
           gzip -9 coverage-regions.json
+
+      - name: Validate local coverage evidence
+        id: coverage_sanity
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util, os, sys
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('coverage_check', 'scripts/check-line-coverage.py')
+          checker = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = checker
+          spec.loader.exec_module(checker)
+          report = checker.read_coverage(Path('lcov.info'), 'producer')
+          sources = checker.source_blobs(Path.cwd(), os.environ['GITHUB_SHA'])
+          checker.region_evidence(Path('coverage-regions.json.gz'), report, sources, 'producer')
+          print('PASS: current producer coverage evidence is valid')
+          PY
+
+      - name: Collect invalid coverage diagnostics
+        if: ${{ !cancelled() && steps.coverage_sanity.outcome == 'failure' }}
+        timeout-minutes: 3
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, shlex, stat, subprocess, tarfile
+          from pathlib import Path
+          root = Path.cwd()
+          profiles = root / 'target/llvm-cov-target'
+          output = Path(os.environ['RUNNER_TEMP']) / 'coverage-diagnostics'
+          output.mkdir(exist_ok=False)
+          budget = 128 * 1024 * 1024
+          receipt = {'schema_version': 1, 'source_commit': os.environ['GITHUB_SHA'],
+              'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'], 'input_budget_bytes': budget,
+              'flags': {key: os.environ.get(key) for key in ('RUSTFLAGS', 'LLVM_PROFILE_FILE_NAME')},
+              'files': [], 'objects': [], 'tools': {}}
+          workflow = (root / '.github/workflows/coverage.yml').read_bytes()
+          receipt['workflow_sha256'] = hashlib.sha256(workflow).hexdigest()
+          job = workflow.decode().split('\n  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
+          receipt['image'] = re.search(r'(?m)^      image: (.+)$', job)[1]
+          def command(argv):
+              try:
+                  result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+                  return {'exit_code': result.returncode, 'output': (result.stdout + result.stderr)[:8192]}
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  return {'error': str(error)}
+          receipt['tools']['rustc'] = command(['rustc', '-vV'])
+          receipt['tools']['cargo-llvm-cov'] = command(['cargo', 'llvm-cov', '--version'])
+          receipt['tools']['nextest'] = command(['cargo', 'nextest', '--version'])
+          libdir = command(['rustc', '--print', 'target-libdir'])
+          if libdir.get('exit_code') == 0:
+              tools = Path(libdir['output'].strip()).parent / 'bin'
+              for name in ('llvm-cov', 'llvm-profdata'):
+                  receipt['tools'][name] = command([str(tools / name), '--version'])
+          export_log = root / 'coverage-region-export.log'
+          object_paths = set()
+          if export_log.is_file() and not export_log.is_symlink():
+              with export_log.open('rb') as stream:
+                  log = stream.read(2 * 1024 * 1024 + 1)
+              receipt['export_log_truncated'] = len(log) > 2 * 1024 * 1024
+              command_log = re.sub(r'\x1b\[[0-9;]*m', '', log[:2 * 1024 * 1024].decode('utf-8', errors='replace'))
+              for line in command_log.splitlines():
+                  match = re.search(r'Running `(.*)`$', line)
+                  if match:
+                      try:
+                          argv = shlex.split(match[1])
+                      except ValueError:
+                          receipt['export_log_unparsed'] = True
+                          continue
+                      object_paths.update(argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == '-object')
+          for name in sorted(object_paths):
+              path = Path(name)
+              entry = {'path': name}
+              try:
+                  if (path.is_symlink() or not path.resolve().is_relative_to(root)
+                          or not path.resolve().is_relative_to(profiles.resolve())):
+                      raise ValueError('object is a symlink or outside the profile target')
+                  descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                  with os.fdopen(descriptor, 'rb') as stream:
+                      before = os.fstat(stream.fileno())
+                      if not stat.S_ISREG(before.st_mode):
+                          raise ValueError('object is not a regular file')
+                      entry['bytes'] = remaining = before.st_size
+                      digest = hashlib.sha256()
+                      while remaining:
+                          data = stream.read(min(remaining, 1024 * 1024))
+                          if not data:
+                              raise ValueError('object shrank during hashing')
+                          digest.update(data)
+                          remaining -= len(data)
+                      entry['sha256'] = digest.hexdigest()
+                      after = os.fstat(stream.fileno())
+                      entry['changed_during_collection'] = (
+                          after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns)
+              except (OSError, ValueError) as error:
+                  entry['omitted'] = str(error)
+              receipt['objects'].append(entry)
+          expected = [profiles / (root.name + '.profdata'), profiles / (root.name + '-profraw-list')]
+          candidates = expected + sorted(profiles.glob('*.profraw')) + [export_log]
+          used = 0
+          archive = output / 'profiles.tar.gz'
+          with tarfile.open(archive, 'w:gz', compresslevel=1) as bundle:
+              for path in candidates:
+                  entry = {'path': path.relative_to(root).as_posix()}
+                  receipt['files'].append(entry)
+                  try:
+                      info = path.lstat()
+                      entry['bytes'] = info.st_size
+                      if not stat.S_ISREG(info.st_mode) or not path.resolve().is_relative_to(root):
+                          raise ValueError('not a regular contained file; symlinks are not followed')
+                      if used + info.st_size > budget:
+                          raise ValueError('input byte budget exceeded')
+                      descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                      with os.fdopen(descriptor, 'rb') as stream:
+                          digest = hashlib.sha256()
+                          class ProfileReader:
+                              def read(self, size):
+                                  data = stream.read(size)
+                                  digest.update(data)
+                                  entry['captured_bytes'] = entry.get('captured_bytes', 0) + len(data)
+                                  return data
+                          member = tarfile.TarInfo(entry['path'])
+                          member.size = info.st_size
+                          used += info.st_size
+                          bundle.addfile(member, ProfileReader())
+                          entry['sha256'] = digest.hexdigest()
+                          changed = os.fstat(stream.fileno())
+                          entry['changed_during_collection'] = (
+                              changed.st_size != info.st_size or changed.st_mtime_ns != info.st_mtime_ns)
+                  except (OSError, ValueError) as error:
+                      entry['omitted'] = str(error)
+          receipt['raw_profiles_missing'] = not any(
+              entry['path'].endswith('.profraw') and 'omitted' not in entry for entry in receipt['files'])
+          receipt['admitted_input_bytes'] = used
+          receipt['captured_input_bytes'] = sum(entry.get('captured_bytes', 0) for entry in receipt['files'])
+          receipt['complete'] = bool(object_paths) and not receipt['raw_profiles_missing'] and not any(
+              entry.get('omitted') or entry.get('changed_during_collection')
+              for entry in receipt['files'] + receipt['objects']) and not receipt.get('export_log_truncated') and not receipt.get('export_log_unparsed') and all(
+              receipt['tools'].get(name, {}).get('exit_code') == 0
+              for name in ('rustc', 'cargo-llvm-cov', 'nextest', 'llvm-cov', 'llvm-profdata'))
+          with archive.open('rb') as stream:
+              receipt['archive_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
+          receipt['archive_bytes'] = archive.stat().st_size
+          (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps({'diagnostics': str(output), 'complete': receipt['complete'], 'captured_input_bytes': receipt['captured_input_bytes']}))
+          PY
+
+      - name: Preserve invalid coverage diagnostics
+        if: ${{ !cancelled() && steps.coverage_sanity.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/coverage-diagnostics/
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Preserve region evidence
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-regions
+          name: coverage-regions-${{ github.run_id }}-${{ github.run_attempt }}
           path: coverage-regions.json.gz
           retention-days: 14
           if-no-files-found: error
@@ -433,7 +593,7 @@ jobs:
         if: ${{ always() && needs.changes.outputs.coverage_required == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-comparison
+          name: coverage-comparison-${{ github.run_id }}-${{ github.run_attempt }}
           path: coverage-comparison/
           if-no-files-found: error
           retention-days: 30
