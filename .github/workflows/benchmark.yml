@@ -129,7 +129,7 @@ jobs:
       - name: Install Dependencies
         run: |
           pacman -Syu --noconfirm
-          pacman -S --noconfirm base-devel git curl pkgconf openssl libarchive clang bc python sccache hyperfine jq
+          pacman -S --noconfirm base-devel git curl pkgconf openssl libarchive clang bc python hyperfine jq
           curl --proto '=https' --tlsv1.2 -fsSL \
             https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init \
             -o /tmp/rustup-init
@@ -146,19 +146,21 @@ jobs:
       - name: Git safe directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        continue-on-error: true
+      - name: Install benchmark compiler cache
+        if: vars.OMG_R2_CACHE_ENABLED == 'true' && github.ref == 'refs/heads/main'
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: sccache@0.18.0
 
-      - name: Configure sccache
-        run: |
-          if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
-            echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
-            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo "::notice::sccache enabled"
-          else
-            echo "::warning::sccache unavailable, building without cache"
-          fi
+      - name: Configure benchmark R2 cache
+        id: r2-cache
+        if: vars.OMG_R2_CACHE_ENABLED == 'true' && github.ref == 'refs/heads/main'
+        env:
+          OMG_R2_CACHE_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+        run: python3 scripts/ci-r2-cache.py
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -172,9 +174,6 @@ jobs:
 
       - name: Build Release
         run: cargo build --release --features arch --locked
-
-      - name: Show sccache stats
-        run: sccache --show-stats
 
       - name: Run Benchmarks (Hyperfine)
         id: bench
@@ -238,6 +237,25 @@ jobs:
         run: |
           chmod +x scripts/check-perf-regression.py
           python3 scripts/check-perf-regression.py
+
+      - name: Report benchmark compiler cache
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        run: |
+          trap 'sccache --stop-server' EXIT
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache-stats.json"
+          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache-context.txt"
+
+      - name: Preserve benchmark compiler cache diagnostics
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/omg-r2-cache-stats.json
+            ${{ runner.temp }}/omg-r2-cache-context.txt
+          retention-days: 3
+          if-no-files-found: error
 
 
   commit-results:

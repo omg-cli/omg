@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configure the opt-in R2 compiler cache for the two trusted portable jobs."""
+"""Configure the opt-in R2 compiler cache for trusted main builds."""
 import json
 import os
 from pathlib import Path
@@ -18,9 +18,10 @@ def configuration(env):
         return {}
     if (env.get('GITHUB_REPOSITORY') != 'omg-cli/omg'
             or env.get('GITHUB_REF') != 'refs/heads/main'
-            or env.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch')
-            or env.get('GITHUB_JOB') not in ('portable', 'portable-release')):
-        raise ValueError('R2 compiler cache is restricted to the trusted main portable jobs')
+            or env.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch', 'schedule')
+            or (env.get('GITHUB_EVENT_NAME') == 'schedule' and env.get('GITHUB_JOB') != 'benchmark')
+            or env.get('GITHUB_JOB') not in ('portable', 'portable-release', 'benchmark')):
+        raise ValueError('R2 compiler cache is restricted to trusted main build jobs')
     account = env.get('OMG_R2_CACHE_ACCOUNT_ID', '')
     if not re.fullmatch(r'[a-f0-9]{32}', account):
         raise ValueError('a valid R2 account ID is required')
@@ -30,7 +31,7 @@ def configuration(env):
     if env.get('RUSTC_WRAPPER') or env.get('RUSTC_WORKSPACE_WRAPPER'):
         raise ValueError('refusing to replace an existing compiler wrapper')
     isolated = env.get('OMG_R2_CACHE_ISOLATED', 'false')
-    prefix = 'portable-v1/'
+    prefix = 'benchmark-v1/' if env['GITHUB_JOB'] == 'benchmark' else 'portable-v1/'
     if isolated == 'true':
         run_id = env.get('GITHUB_RUN_ID', '')
         if env['GITHUB_EVENT_NAME'] != 'workflow_dispatch' or not re.fullmatch(r'[1-9][0-9]{0,19}', run_id):
