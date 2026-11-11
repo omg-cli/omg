@@ -151,13 +151,10 @@ jobs:
         continue-on-error: true
 
       - name: Configure sccache
-        id: compiler-cache
         run: |
-          export SCCACHE_GHA_ENABLED=true
           if command -v sccache &> /dev/null && sccache --start-server 2>/dev/null; then
             echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
-            echo 'enabled=true' >> "$GITHUB_OUTPUT"
             echo "::notice::sccache enabled"
           else
             echo "::warning::sccache unavailable, building without cache"
@@ -177,7 +174,6 @@ jobs:
         run: cargo build --release --features arch --locked
 
       - name: Show sccache stats
-        if: steps.compiler-cache.outputs.enabled == 'true'
         run: sccache --show-stats
 
       - name: Run Benchmarks (Hyperfine)

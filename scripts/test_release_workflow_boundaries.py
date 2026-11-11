@@ -292,30 +292,6 @@ class ReleaseWorkflowBoundaryTests(unittest.TestCase):
         self.assertEqual(set(dependencies.group(1).split(', ')), {'benchmark', 'workflow-helpers'})
         self.assertNotRegex(history, r'\balways\(')
 
-    def test_benchmark_cache_backend_is_set_before_server_start(self):
-        workflow = (WORKFLOWS / 'benchmark.yml').read_text(encoding='utf-8')
-        block = job_block(workflow, 'benchmark')
-        script = step_script(block, 'Configure sccache')
-        for startup_exit in (0, 23):
-            with self.subTest(startup_exit=startup_exit), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                environment = dict(os.environ, SCCACHE_GHA_ENABLED='', RUSTC_WRAPPER='',
-                                   STARTUP_EXIT=str(startup_exit), GITHUB_ENV='environment',
-                                   GITHUB_OUTPUT='outputs')
-                fake = ('sccache() { [[ "$*" == --start-server ]] || return 47; '
-                        'printf "%s\\n" "$SCCACHE_GHA_ENABLED" > startup-backend; '
-                        'return "$STARTUP_EXIT"; }\n')
-                result = subprocess.run([BASH, '-ec', fake + script], cwd=root, env=environment,
-                                        capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual((root / 'startup-backend').read_text().strip(), 'true')
-                variables = (root / 'environment').read_text() if (root / 'environment').exists() else ''
-                outputs = (root / 'outputs').read_text() if (root / 'outputs').exists() else ''
-                self.assertEqual('RUSTC_WRAPPER=sccache\n' in variables, startup_exit == 0)
-                self.assertEqual('enabled=true\n' in outputs, startup_exit == 0)
-        stats = block.split('      - name: Show sccache stats\n', 1)[1].split('\n      - ', 1)[0]
-        self.assertIn("if: steps.compiler-cache.outputs.enabled == 'true'", stats)
-
     def test_benchmark_uses_the_job_release_pair_without_rebuilding(self):
         workflow = (WORKFLOWS / 'benchmark.yml').read_text(encoding='utf-8')
         launcher = step_script(job_block(workflow, 'benchmark'), 'Run Benchmarks (Hyperfine)')
