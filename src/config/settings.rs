@@ -791,6 +791,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn hardened_aur_settings_refuse_incompatible_build_options() -> Result<()> {
+        if Settings::rerun_test_unprivileged(
+            "config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options",
+        ) {
+            return Ok(());
+        }
         if crate::core::testing::run_isolated_test(
             "config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options",
         ) {

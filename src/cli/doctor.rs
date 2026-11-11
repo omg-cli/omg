@@ -1361,10 +1361,8 @@ fn check_shell_hook() -> bool {
 /// Inspect the actual file capability attribute, including an empty set.
 #[cfg(target_os = "linux")]
 fn file_has_capability_xattr(exe: &std::path::Path) -> Result<bool> {
-    // A zero-length buffer asks for the attribute length without reading it.
     // Even a zero-length attribute is present and needs explicit cleanup.
-    let mut empty = [0_u8; 0];
-    match rustix::fs::getxattr(exe, "security.capability", &mut empty) {
+    match rustix::fs::getxattr_query(exe, "security.capability") {
         Ok(_) => Ok(true),
         Err(error)
             if error == rustix::io::Errno::NODATA || error == rustix::io::Errno::OPNOTSUPP =>

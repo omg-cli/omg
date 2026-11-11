@@ -80,6 +80,7 @@ of every Arch transaction operation or every supported system configuration.
 | Single-frame decompression hid later archive members | Shared bounded decompression now consumes concatenated zstd frames and gzip members in both inspection and identity reads. Regression fixtures contain inert marker data. |
 | Existing settings could not express restrictive AUR admission | Added the typed `standard`/`hardened` profile, config CLI support, conflicting-setting rejection and per-output admission checks. Hardened source confirmation remains attended even with `--yes`. |
 | Disabled build-cache branches still hashed inputs and described reusable output | Removed unreachable production cache-hit branches and redundant cache hashing. Legacy cache helpers remain test-only. Default cache requests are off, and examples describe invocation-local storage. |
+| RustSec published an xattr buffer soundness advisory during CI | Raised rustix to 1.1.6 in the manifest and both lockfiles. Doctor now uses the explicit attribute-length query API. |
 
 The native archive checks used libarchive 3.8.11 and harmless temporary marker
 files under an unprivileged account. They performed no package installation or
@@ -113,6 +114,11 @@ the target was remeasured below budget before resuming. A compact retirement
 receipt records old binary hashes. The original loader-failure binary and its
 referenced debug companions remain available; current proofs were preserved.
 
+The CI followup raised this task's native target budget to 20 GiB before
+all-target linting and the final CLI rebuild. The host had 793 GiB free.
+Superseded passing library-test artifacts were retired with hashes recorded.
+The original unresolved linker evidence remains intact.
+
 Final checks passed:
 
 - `cargo test --locked --lib --test arch_cli_contracts --test version_tests -- --test-threads=1`:
@@ -122,11 +128,18 @@ Final checks passed:
 - `python3 scripts/check-alpm-pins.py` and its four negative/positive guard tests.
 - The 21 CI gate tests and six change-classification tests passed after wiring
   the snapshot guard into the existing workflow.
+- The documentation checker recognizes `aur.security_profile`; its 11 tests
+  pass. The hardened-settings fixture uses the existing unprivileged runner
+  when launched as root, preserving production root environment protection.
+  A namespace-root run verified the child UID was 65534 and all assertions ran.
 - The checkout-built default-feature CLI passed doctor, official search,
   installed glibc information, fast/full status and `outdated --json` checks.
   Doctor verified 1,009 installed packages and reported only the expected
   disposable-state daemon/hook warnings. The update result was an empty JSON
   array. Each drive preserved the host pacman database fingerprint.
+  After the dependency followup, the rebuilt CLI's doctor verified 1,027
+  packages with the same two expected warnings. Fast status reported the same
+  installed count and preserved its own before/after database fingerprint.
 
 The native proof's metadata/extraction comparisons used 31 bounded cases with
 inert data. The retained initial static scan reported terminal rendering and
@@ -134,6 +147,16 @@ left native-parser hypotheses open; the later defensive fixtures and regression
 tests resolved those hypotheses for the inspected native library version.
 The scan is historical evidence for the initial source, not a certification of
 the patched program or the entire repository.
+
+The first PR run found [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486),
+published on November 11. The lockfiles contained affected rustix 1.1.4.
+The followup uses patched 1.1.6 and `getxattr_query` for doctor's capability
+presence check. The existing absent-attribute and missing-file test passed
+before and after the API migration. The dependency-policy check now passes
+advisories, licenses, bans and sources without changing exemptions.
+Independent Rust reviews found no blockers in the API migration, lockfile
+changes or root-fixture correction. They treated internal CLI code as
+application code and checked correctness before style.
 
 ## Remaining work
 
