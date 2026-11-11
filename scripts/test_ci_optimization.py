@@ -5,8 +5,10 @@ import gzip
 import json
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import tomllib
@@ -182,7 +184,7 @@ class OptimizationContracts(unittest.TestCase):
             with self.subTest(export_status=export_status), tempfile.TemporaryDirectory() as directory:
                 exporter = """
                 cargo() {
-                    test "$*" = 'llvm-cov report --json --output-path coverage-regions.json' || return 99
+                    test "$*" = 'llvm-cov report --json --output-path coverage-regions.json --verbose' || return 99
                     test "$EXPORT_STATUS" = 0 || return "$EXPORT_STATUS"
                     printf '%s' '{"data":[{"functions":[{"regions":[[16,29,16,86,10,0,0,0]]}]}]}' > coverage-regions.json
                 }
@@ -383,6 +385,145 @@ class OptimizationContracts(unittest.TestCase):
             self.assertNotEqual(cron.split()[0], '0')
             schedules.append(cron)
         self.assertEqual(len(schedules), len(set(schedules)))
+
+
+class CoverageProducerDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        (self.directory / 'scripts').mkdir()
+        (self.directory / 'scripts/check-line-coverage.py').write_bytes(
+            (ROOT / 'scripts/check-line-coverage.py').read_bytes())
+        (self.directory / '.github/workflows').mkdir(parents=True)
+        (self.directory / '.github/workflows/coverage.yml').write_bytes(
+            (WORKFLOWS / 'coverage.yml').read_bytes())
+        (self.directory / 'src').mkdir()
+        (self.directory / 'src/a.rs').write_text('fn a() {}\n')
+        for command in (['git', 'init', '-q'], ['git', 'add', 'src/a.rs'],
+                        ['git', '-c', 'user.name=Coverage fixture', '-c',
+                         'user.email=coverage@example.invalid', 'commit', '-qm', 'fixture']):
+            subprocess.run(command, cwd=self.directory, check=True, capture_output=True)
+        self.revision = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=self.directory, text=True).strip()
+        self.environment = dict(os.environ, GITHUB_SHA=self.revision, GITHUB_RUN_ID='123',
+                                GITHUB_RUN_ATTEMPT='2', GITHUB_JOB='coverage',
+                                RUNNER_TEMP=self.directory.as_posix(), TEST_PYTHON=sys.executable)
+
+    def reports(self, count=1, schema='3.1.0'):
+        (self.directory / 'lcov.info').write_text(
+            'SF:/fixture/src/a.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n')
+        document = {'type': 'llvm.coverage.json.export', 'version': schema, 'data': [{
+            'files': [{'filename': '/fixture/src/a.rs', 'summary': {'lines': {'count': 1, 'covered': 1}}}],
+            'functions': [{'name': 'a', 'filenames': ['/fixture/src/a.rs'],
+                           'regions': [[1, 1, 1, 10, count, 0, 0, 0]]}]}]}
+        (self.directory / 'export.json').write_text(json.dumps(document))
+
+    def run_shell(self, script, environment=None):
+        launcher = 'python3() { "$TEST_PYTHON" "$@"; };\n'
+        return subprocess.run([BASH, '-e', '-c', launcher + script], cwd=self.directory,
+                              env=environment or self.environment, text=True,
+                              capture_output=True, timeout=30)
+
+    def export_and_validate(self):
+        exporter = '''cargo() {
+          test "$EXPORT_STATUS" = 0 || return "$EXPORT_STATUS"
+          cp export.json coverage-regions.json
+        };\n'''
+        script = step_script('coverage.yml', 'Generate region evidence')
+        text = (WORKFLOWS / 'coverage.yml').read_text()
+        if '      - name: Validate local coverage evidence\n' in text:
+            script += step_script('coverage.yml', 'Validate local coverage evidence')
+        return self.run_shell(exporter + script, dict(self.environment, EXPORT_STATUS='0'))
+
+    def test_producer_rejects_saturation_before_runner_disappears(self):
+        self.reports(2**63 - 1)
+        result = self.export_and_validate()
+        self.assertNotEqual(result.returncode, 0, 'producer accepted a saturated region')
+        self.assertIn('wrapped or saturated count', result.stderr)
+        self.assertTrue((self.directory / 'coverage-regions.json.gz').is_file())
+
+    def test_producer_preserves_healthy_report_and_rejects_bad_schema(self):
+        self.reports()
+        result = self.export_and_validate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.directory / 'coverage-diagnostics').exists())
+        self.reports(schema='unsupported')
+        (self.directory / 'coverage-regions.json.gz').unlink()
+        result = self.export_and_validate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Unsupported region schema', result.stderr)
+
+    def collect(self):
+        result = self.run_shell(step_script('coverage.yml', 'Collect invalid coverage diagnostics'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = self.directory / 'coverage-diagnostics'
+        return json.loads((output / 'receipt.json').read_text()), output / 'profiles.tar.gz'
+
+    def test_failure_diagnostics_capture_profiles_and_object_identity_without_executable(self):
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        (target / (self.directory.name + '.profdata')).write_bytes(b'merged')
+        (target / (self.directory.name + '-profraw-list')).write_text('one.profraw\n')
+        (target / 'one.profraw').write_bytes(b'raw profile')
+        executable = target / 'fixture-object'
+        executable.write_bytes(b'\x7fELF executable remains outside archive')
+        self.environment['GITHUB_TOKEN'] = 'diagnostic-secret-must-not-be-recorded'
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(executable.as_posix()) + '`\n')
+        receipt, archive = self.collect()
+        self.assertEqual((receipt['source_commit'], receipt['run_id'], receipt['run_attempt']),
+                         (self.revision, '123', '2'))
+        self.assertEqual(receipt['objects'], [{'path': executable.as_posix(),
+            'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(), 'bytes': executable.stat().st_size,
+            'changed_during_collection': False}])
+        self.assertEqual(receipt['workflow_sha256'], hashlib.sha256((WORKFLOWS / 'coverage.yml').read_bytes()).hexdigest())
+        self.assertIn('@sha256:', receipt['image'])
+        self.assertEqual(receipt['archive_sha256'], hashlib.sha256(archive.read_bytes()).hexdigest())
+        self.assertNotIn(self.environment['GITHUB_TOKEN'], json.dumps(receipt))
+        with tarfile.open(archive) as bundle:
+            raw = bundle.extractfile('target/llvm-cov-target/one.profraw').read()
+            self.assertEqual(raw, b'raw profile')
+            files = {item['path']: item for item in receipt['files']}
+            self.assertEqual(files['target/llvm-cov-target/one.profraw']['sha256'], hashlib.sha256(raw).hexdigest())
+            self.assertFalse(any('fixture-object' in name for name in bundle.getnames()))
+        self.assertIn('rustc', receipt['tools'])
+
+    def test_diagnostics_bound_input_and_report_missing_and_symlink_profiles(self):
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        (target / 'one.profraw').write_bytes(b'raw')
+        with (target / 'oversize.profraw').open('wb') as stream:
+            stream.truncate(128 * 1024 * 1024 + 1)
+        outside = self.directory / 'private.txt'
+        outside.write_text('must not be archived')
+        try:
+            (target / 'linked.profraw').symlink_to(outside)
+        except OSError as error:
+            self.skipTest(f'symlink fixture unavailable: {error}')
+        receipt, archive = self.collect()
+        self.assertFalse(receipt['complete'])
+        self.assertLessEqual(receipt['captured_input_bytes'], 128 * 1024 * 1024)
+        self.assertLessEqual(receipt['admitted_input_bytes'], 128 * 1024 * 1024)
+        files = {Path(item['path']).name: item for item in receipt['files']}
+        self.assertIn('budget', files['oversize.profraw']['omitted'])
+        self.assertIn('symlinks', files['linked.profraw']['omitted'])
+        self.assertIn('omitted', files[self.directory.name + '.profdata'])
+        with tarfile.open(archive) as bundle:
+            self.assertEqual(bundle.getnames(), ['target/llvm-cov-target/one.profraw'])
+
+    def test_missing_profiles_are_explicit_and_uploads_do_not_mask_validation(self):
+        receipt, _ = self.collect()
+        self.assertTrue(receipt['raw_profiles_missing'])
+        self.assertFalse(receipt['complete'])
+        text = (WORKFLOWS / 'coverage.yml').read_text()
+        for name in ('Collect invalid coverage diagnostics', 'Preserve invalid coverage diagnostics'):
+            block = text.split(f'      - name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("!cancelled() && steps.coverage_sanity.outcome == 'failure'", block)
+        validator = text.split('      - name: Validate local coverage evidence\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertNotIn('continue-on-error', validator)
+        for name in ('lcov', 'regions', 'comparison', 'diagnostics'):
+            self.assertIn('name: coverage-' + name + '-${{ github.run_id }}-${{ github.run_attempt }}', text)
 
 
 if __name__ == '__main__':
