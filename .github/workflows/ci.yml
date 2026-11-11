@@ -1821,15 +1821,30 @@ jobs:
   # (PR-controlled) copy of this file, so a PR must never be able to run
   # workflow code holding a write-scoped token. All write-scoped steps live
   # in the push-to-main-only release-tag job below.
-  qemu:
-    name: QEMU behavioral verification
-    needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]
+  qemu-preflight:
+    name: QEMU behavioral verification preflight
+    needs: quick-gate
     if: >-
-      !cancelled() &&
       (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       needs.quick-gate.result == 'success' &&
       (github.event_name == 'merge_group' || needs.quick-gate.outputs.should-build == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/qemu-preflight
+
+  qemu:
+    name: QEMU behavioral verification
+    needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]
+    if: >-
+      !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
+    with:
+      preflight-result: ${{ needs.qemu-preflight.result }}
     permissions:
       contents: read
       actions: read
