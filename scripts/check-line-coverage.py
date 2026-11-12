@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Require complete LCOV line coverage to meet the exact base report."""
 import argparse
+import ast
 from collections import Counter
 from dataclasses import dataclass
 import hashlib
@@ -254,14 +255,15 @@ def require_rustfmt_syntax(excerpts):
                 raise ValueError("Ambiguous unchanged source correspondence: rustfmt 1.95.0 did not validate source syntax")
 
 
-def source_function_prefixes(source, spans):
-    """Recognize bounded signatures and their actual lexical body boundaries."""
+def _source_structural_map(source):
+    """Find lexical brace pairs and names while ignoring comments and literals."""
     text = "\n".join(source)
     raw_literal = re.compile(r'(?:br|cr|r)(#*)"')
     character = re.compile(r"'(?:[^\\'\n]|\\(?:[\\'\"nrt0]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}))'")
     lifetime_name = re.compile(r"'[A-Za-z_]\w*")
     identifier = re.compile(r"(?:r#)?([A-Za-z_]\w*)")
     braces = {}; stack = []; names = Counter(); modules = []; previous = None; at = 0
+    code = bytearray(len(text))
     while at < len(text):
         if text[at].isspace():
             at += 1
@@ -314,6 +316,7 @@ def source_function_prefixes(source, spans):
                 modules.append(at)
             previous = word[1]; at += len(word[0])
             continue
+        code[at] = 1
         if text[at] in "([{":
             stack.append((text[at], at))
         elif text[at] in ")]}":
@@ -328,6 +331,15 @@ def source_function_prefixes(source, spans):
     offsets = [0]
     for line in source:
         offsets.append(offsets[-1] + len(line) + 1)
+    return braces, names, modules, offsets, code
+
+
+def source_function_prefixes(source, spans):
+    """Recognize bounded signatures and their actual lexical body boundaries."""
+    structure = _source_structural_map(source)
+    if not structure:
+        return {}
+    braces, names, modules, offsets, _ = structure
     result = {}
     for start, end in spans:
         body = "\n".join(source[start - 1:end])
@@ -652,6 +664,203 @@ def retained_wrapper_paint(name, old, new, before, after, base, head, base_files
     return result, elisions
 
 
+def _data_argument_shape(expression):
+    """Recognize identifiers, fields, immutable borrows and tuples only.
+
+    Unary plus gives Python's AST parser the shape of a Rust borrow. The
+    allowlist rejects calls and operators; rustfmt checks the actual Rust.
+    """
+    if (not expression.strip() or len(expression.encode()) > 4096
+            or not re.fullmatch(r'[A-Za-z_0-9\s.,()&]+', expression)):
+        return False
+    try:
+        tree = ast.parse(expression.strip().replace('&', '+'), mode='eval')
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    allowed = (ast.Expression, ast.Name, ast.Attribute, ast.Tuple, ast.UnaryOp, ast.UAdd, ast.Load)
+    return all(type(node) in allowed for node in ast.walk(tree))
+
+
+def retained_block_endpoint_paint(name, old, new, before, after, base, head, base_files, head_files, retained):
+    """Prove LLVM paint equivalence for a retained, unmapped loop endpoint."""
+    ident = r'[A-Za-z_][A-Za-z_0-9]*'
+    loop_header = (r'\s*for\s+' + ident + r'\s+in\s+&?\s*' + ident
+                   + r'(?:\s*\.\s*' + ident + r')*\s*\{\s*')
+    if not any(before.get(a, 0) > 0 and b not in after and old[a - 1].strip() == '}'
+               and new[b - 1].strip() == '}' for a, b in retained.items()):
+        return []
+    sides = ((old, base, base_files), (new, head, head_files))
+    inventories = []
+    for source, owners, files in sides:
+        counts = Counter(owner['name'] for owner in owners)
+        relevant = [owner for owner in owners if any(files.get(path) == name or path.endswith('/' + name)
+                                                       for path in owner['filenames'])]
+        if any(counts[owner['name']] != 1 or source_owner_span(owner, name, files, source) is None
+               for owner in relevant):
+            return []
+        spans = {id(owner): source_owner_span(owner, name, files, source)[:2] for owner in relevant}
+        prefixes = source_function_prefixes(source, set(spans.values()))
+        structure = _source_structural_map(source)
+        if not structure:
+            return []
+        inventories.append((relevant, spans, prefixes, structure))
+
+    def touch(region, start, end):
+        return (region[0], region[1]) < end and (region[2], region[3]) > start
+
+    results = []
+    for oldline, newline in retained.items():
+        if (before.get(oldline, 0) <= 0 or newline in after or old[oldline - 1].strip() != '}'
+                or new[newline - 1].strip() != '}'):
+            continue
+        old_info, new_info = inventories
+        candidates = [owner for owner in old_info[0] if any(touch(r, (oldline, 1), (oldline + 1, 1))
+                                                               for r in owner['regions'])]
+        if not candidates:
+            continue
+        span = old_info[1][id(candidates[0])]
+        prefix = old_info[2].get(span)
+        if not prefix or any(old_info[1][id(owner)] != span for owner in candidates):
+            continue
+        groups = [[owner for owner in info[0] if info[1][id(owner)] == target]
+                  for info, target in ((old_info, span), (new_info, None))]
+        matching_spans = [key for key, value in new_info[2].items() if value == prefix]
+        if len(matching_spans) != 1:
+            continue
+        target = matching_spans[0]
+        groups[1] = [owner for owner in new_info[0] if new_info[1][id(owner)] == target]
+        if len(groups[0]) != len(groups[1]) or not groups[1]:
+            continue
+        if any(len({tuple(tuple(r[:4] + r[5:]) for r in owner['regions']) for owner in group}) != 1
+               for group in groups):
+            continue
+        positions = []
+        valid = True
+        for source, line, info, bounds in ((old, oldline, old_info, span), (new, newline, new_info, target)):
+            braces, _, _, offsets, _ = info[3]
+            closing = offsets[line - 1] + source[line - 1].index('}')
+            openings = [opening for opening, end in braces.items() if end == closing]
+            if len(openings) != 1:
+                valid = False; break
+            opening = openings[0]
+            start_line = next((i + 1 for i in range(len(source)) if offsets[i] <= opening < offsets[i + 1]), None)
+            if start_line is None or not bounds[0] < start_line < line < bounds[1]:
+                valid = False; break
+            header = source[start_line - 1]
+            if len(header.encode()) > 4096 or not re.fullmatch(loop_header, header):
+                valid = False; break
+            if sum(text == header for text in source[bounds[0] - 1:bounds[1]]) != 1:
+                valid = False; break
+            ancestors = sorted((a, b) for a, b in braces.items() if a < opening < closing < b)
+            path = []
+            for a, b in ancestors:
+                line_index = next(i for i in range(len(source)) if offsets[i] <= a < offsets[i + 1])
+                if bounds[0] - 1 <= line_index < start_line - 1 and b < offsets[bounds[1] - 1]:
+                    path.append(source[line_index].strip())
+            positions.append((opening, closing, start_line, header, path, offsets))
+        if not valid or positions[0][3:5] != positions[1][3:5]:
+            continue
+        opening, closing, start_line, _, _, offsets = positions[0]
+        open_col = len(old[start_line - 1][:opening - offsets[start_line - 1]].encode()) + 1
+        end_col = len(old[oldline - 1].encode()) + 1
+        expected = (start_line, open_col, oldline, end_col)
+        if any([tuple(r[:4]) for r in owner['regions'] if touch(r, (oldline, 1), (oldline + 1, 1))] != [expected]
+               for owner in groups[0]) or set(map(id, candidates)) != set(map(id, groups[0])):
+            continue
+        if any(touch(r, (newline, 1), (newline + 1, 1)) for owner in new_info[0] for r in owner['regions']):
+            continue
+        opening, closing, _, _, _, offsets = positions[1]
+        text = "\n".join(new)
+        braces, _, _, _, code = new_info[3]
+        semicolons = [i for i in range(opening + 1, closing) if text[i] == ';' and code[i]]
+        tail_end = semicolons[-1] if semicolons else -1
+        if tail_end < 0 or text[tail_end + 1:closing].strip():
+            continue
+        cursor = opening + 1; boundary = cursor; depth = 0
+        while cursor < tail_end:
+            if cursor in braces:
+                cursor = braces[cursor] + 1
+                if depth == 0:
+                    boundary = cursor
+                continue
+            if code[cursor]:
+                if text[cursor] in '([':
+                    depth += 1
+                elif text[cursor] in ')]':
+                    depth -= 1
+                elif text[cursor] == ';' and depth == 0:
+                    boundary = cursor + 1
+            cursor += 1
+        if depth:
+            continue
+        raw_statement = text[boundary:tail_end + 1]
+        statement = raw_statement.strip()
+        if (not re.fullmatch(r'[A-Za-z_0-9\s.,()&;]+', statement)
+                or re.search(r'\b(?:return|break|continue|yield|await|for|while|if|else|match|loop|let|async|move|unsafe)\b', statement)):
+            continue
+        root = re.match(ident, statement)
+        if root is None:
+            continue
+        cursor = root.end(); methods = 0; last_args = ''; arguments_valid = True
+        while cursor < len(statement):
+            method_match = re.match(r'\s*\.\s*' + ident + r'\s*\(', statement[cursor:])
+            if method_match is None:
+                break
+            cursor += method_match.end(); arg_start = cursor; depth = 1
+            while cursor < len(statement) and depth:
+                depth += (statement[cursor] == '(') - (statement[cursor] == ')')
+                cursor += 1
+            if depth:
+                break
+            last_args = statement[arg_start:cursor - 1]
+            if last_args.strip() and not _data_argument_shape(last_args):
+                arguments_valid = False
+                break
+            methods += 1
+        if not arguments_valid or not methods or not last_args.strip() or statement[cursor:].strip() != ';':
+            continue
+        terminal = re.fullmatch(r'\s*\.(' + ident + r')\((.+)\);\s*', new[newline - 2])
+        if not terminal or not _data_argument_shape(terminal[2]):
+            continue
+        row = new[newline - 2]
+        method = (newline - 1, len(row[:terminal.start(1)].encode()) + 1,
+                  newline - 1, len(row[:terminal.end(1)].encode()) + 1)
+        argument = (newline - 1, len(row[:terminal.start(2)].encode()) + 1,
+                    newline - 1, len(row[:terminal.end(2)].encode()) + 1)
+        statement_start = boundary + len(raw_statement) - len(raw_statement.lstrip())
+        witness_line = next(i + 1 for i in range(len(new)) if offsets[i] <= statement_start < offsets[i + 1])
+        witness_column = len(new[witness_line - 1][:statement_start - offsets[witness_line - 1]].encode()) + 1
+        witness_start, witness_end = (witness_line, witness_column), (newline, 1)
+        if any(id(owner) not in {id(o) for o in groups[1]} and any(touch(r, witness_start, witness_end)
+               for r in owner['regions']) for owner in new_info[0]):
+            continue
+        base_counts = [next(r[4] for r in owner['regions'] if tuple(r[:4]) == expected) for owner in groups[0]]
+        if before[oldline] != max(base_counts):
+            continue
+        base_states, head_states = [], []
+        for owner in groups[0]:
+            base_states.append(next(r[4] > 0 for r in owner['regions'] if tuple(r[:4]) == expected))
+        for owner in groups[1]:
+            method_rows = [r for r in owner['regions'] if tuple(r[:4]) == method]
+            arg_rows = [r for r in owner['regions'] if tuple(r[:4]) == argument]
+            if len(method_rows) != 1 or len(arg_rows) != 1 or (method_rows[0][4] > 0) != (arg_rows[0][4] > 0):
+                break
+            head_states.append(method_rows[0][4] > 0)
+        if len(head_states) != len(groups[1]) or Counter(base_states) != Counter(head_states):
+            continue
+        require_rustfmt_syntax(['\n'.join(source[bounds[0] - 1:bounds[1]]).encode()
+                                for source, bounds in ((old, span), (new, target))])
+        results.append(dict(file=name, pairs=[[oldline, newline]], equivalence='LLVM paint-equivalence',
+                            limitation='Block-entry paint; no independent brace counter. The final method may panic or diverge.',
+                            base_range=list(span), head_range=list(target), instances=len(groups[0]),
+                            source_prefix_sha256=hashlib.sha256(prefix.encode()).hexdigest(),
+                            loop_header_sha256=hashlib.sha256(positions[0][3].encode()).hexdigest(),
+                            base_body_region=list(expected), head_terminal_regions=[list(method), list(argument)],
+                            base_copy_states=sorted(map(int, base_states)),
+                            head_copy_states=sorted(map(int, head_states))))
+    return results
+
+
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
     bf, bs = region_evidence(base_regions, base, base_sources, "base")
     hf, hs = region_evidence(head_regions, head, head_sources, "head")
@@ -698,7 +907,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     removed = {}; deleted_mapped = deleted_hit = 0; paint_receipts = []; serial_receipts = []; serial_removed = {}
-    positive_receipts = []
+    positive_receipts = []; endpoint_receipts = []
     for name in bs:
         old = base_sources[name].decode("utf-8").splitlines()
         new = head_sources[name].decode("utf-8").splitlines()
@@ -815,7 +1024,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     serial_removed.setdefault(name, set()).add(oldline)
                     deleted_mapped += 1; deleted_hit += 1
             serial_receipts.extend(elisions)
-        painted = {(a, b) for witness in paint for a, b in witness["pairs"]}
+        endpoint = retained_block_endpoint_paint(name, old, new, before, after, bf, hf, base_files, head_files, final_pairs)
+        endpoint_receipts.extend(endpoint)
+        painted = {(a, b) for witness in paint + endpoint for a, b in witness["pairs"]}
         paint_receipts.extend(paint)
         for oldline, newline in list(retained.items()):
             if oldline in anchored:
@@ -858,6 +1069,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         deleted_mapped += sum(line in gone for line in before)
         deleted_hit += sum(line in gone and count > 0 for line, count in before.items())
     paint_receipt = {"retained_wrapper_paint": paint_receipts} if paint_receipts else {}
+    if endpoint_receipts:
+        paint_receipt["retained_block_endpoint_paint"] = endpoint_receipts
     if positive_receipts:
         paint_receipt["positive_source_fragments"] = positive_receipts
     if added_receipt:

@@ -3,6 +3,7 @@ import importlib.util
 import copy
 import gzip
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -1308,6 +1309,140 @@ class SourceAwareCoverageTests(unittest.TestCase):
                     sources=({"example.rs": old}, {"example.rs": new})), {
                         "deleted_summary_found": 0, "deleted_summary_hit": 0,
                         "deleted_mapped": 0, "deleted_mapped_hit": 0})
+
+    def endpoint_paint_fixture(self):
+        old = ["fn example(items: Items) -> Old {", "    for item in items {",
+               "        value.push(item);", "    }", "}"]
+        new = ["fn example(items: Items) -> New {", "    for item in items {",
+               "        values", "            .push((item, value));", "    }", "}"]
+        def owner(name, regions):
+            return {"name": name, "filenames": ["/src/example.rs"], "regions": regions}
+        base, head = [], []
+        for i, count in enumerate((0, 5)):
+            base.append(owner(f"base{i}", [[1, 1, 1, len(old[0]) + 1, 1, 0, 0, 0],
+                [2, 23, 4, 6, count, 0, 0, 0], [5, 1, 5, 2, 1, 0, 0, 0]]))
+            head.append(owner(f"head{i}", [[1, 1, 1, len(new[0]) + 1, 1, 0, 0, 0],
+                [4, 14, 4, 18, count, 0, 0, 0], [4, 19, 4, 32, count, 0, 0, 0],
+                [6, 1, 6, 2, 1, 0, 0, 0]]))
+        return dict(name="example.rs", old=old, new=new, before={4: 5}, after={},
+                    base=base, head=head, base_files={"/src/example.rs": "example.rs"},
+                    head_files={"/src/example.rs": "example.rs"}, retained={4: 5})
+
+    def test_endpoint_paint_integration_accepts_for_brace(self):
+        value = self.endpoint_paint_fixture()
+        def owners(base, head):
+            base["data"][0]["functions"] = value["base"]
+            head["data"][0]["functions"] = value["head"]
+        sources = tuple({"example.rs": ("\n".join(value[side]) + "\n").encode()}
+                        for side in ("old", "new"))
+        result = self.compare(before=[(1, 1), (2, 1), (3, 5), (4, 5), (5, 1)],
+                              after=[(1, 1), (2, 1), (3, 5), (4, 5), (6, 1)],
+                              mutate=owners, sources=sources)
+        self.assertEqual(result["retained_block_endpoint_paint"][0]["pairs"], [[4, 5]])
+
+    def test_endpoint_paint_accepts_unmapped_retained_for_brace(self):
+        witnesses = coverage.retained_block_endpoint_paint(**self.endpoint_paint_fixture())
+        self.assertEqual([pair for witness in witnesses for pair in witness["pairs"]], [[4, 5]])
+
+    def test_endpoint_paint_refuses_incomplete_or_conflicting_evidence(self):
+        def foreign(value, side, region):
+            value[side].append({"name": "foreign", "filenames": ["/src/example.rs"], "regions": [region]})
+        cases = {
+            "explicit_zero": lambda v: v["after"].update({5: 0}),
+            "missing_copy": lambda v: v["head"].pop(),
+            "duplicate_name": lambda v: v["head"][1].__setitem__("name", "head0"),
+            "brace_touch": lambda v: v["head"][0]["regions"].append([5, 5, 5, 6, 1, 0, 0, 0]),
+            "foreign_brace": lambda v: foreign(v, "base", [4, 5, 4, 6, 1, 0, 0, 0]),
+            "foreign_witness": lambda v: foreign(v, "head", [4, 14, 4, 18, 1, 0, 0, 0]),
+            "zero_terminal": lambda v: v["head"][1]["regions"][1].__setitem__(4, 0),
+            "zero_argument": lambda v: v["head"][1]["regions"][2].__setitem__(4, 0),
+            "state_change": lambda v: [r.__setitem__(4, 0) for r in v["head"][1]["regions"][1:3]],
+            "changed_header": lambda v: v["new"].__setitem__(1, "    for item in other {"),
+            "endpoint_start": lambda v: [o["regions"][1].__setitem__(1, 22) for o in v["base"]],
+            "endpoint_end": lambda v: [o["regions"][1].__setitem__(3, 5) for o in v["base"]],
+            "tail_return": lambda v: v["new"].__setitem__(2, "        return values"),
+            "tail_macro": lambda v: v["new"].__setitem__(2, "        values!"),
+            "tail_closure": lambda v: v["new"].__setitem__(2, "        |x| values"),
+            "nested_call": lambda v: v["new"].__setitem__(3, "            .push(foo(item));"),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                value = self.endpoint_paint_fixture()
+                mutate(value)
+                self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_paint_rejects_repeated_matching_loop_header(self):
+        value = self.endpoint_paint_fixture()
+        value["new"][5:5] = [value["new"][1], "    }"]
+        for owner in value["head"]:
+            owner["regions"][-1][0] = owner["regions"][-1][2] = 8
+        self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_paint_refuses_iterator_expression_block(self):
+        value = self.endpoint_paint_fixture()
+        for side, owners in (("old", "base"), ("new", "head")):
+            value[side][1] = "    for item in {"
+            value[side][-1:-1] = ["    {", "        break;", "    }"]
+            for owner in value[owners]:
+                owner["regions"][-1][0] = owner["regions"][-1][2] = len(value[side])
+        for owner in value["base"]:
+            owner["regions"][1][1] = len(value["old"][1])
+        self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_paint_refuses_argument_calls_with_exact_geometry(self):
+        for argument in ("foo(item)", "(foo)(item)", "(foo.0)(item)",
+                         "((foo))(item)", "foo.0(item)"):
+            with self.subTest(argument=argument):
+                value = self.endpoint_paint_fixture()
+                row = value["new"][3] = f"            .push({argument});"
+                match = re.fullmatch(r"\s*\.push\((.+)\);", row)
+                for owner in value["head"]:
+                    owner["regions"][2][1] = match.start(1) + 1
+                    owner["regions"][2][3] = match.end(1) + 1
+                self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_argument_shape_accepts_only_data_expressions(self):
+        for expression in ("item", "item.field", "&item", "&&item", "(item, &value.field)",
+                           "(item, (first, second))", "first, second", " (item, &value.field) "):
+            with self.subTest(expression=expression):
+                self.assertTrue(coverage._data_argument_shape(expression))
+        for expression in ("foo(item)", "(foo)(item)", "foo.0(item)", "(foo.0)(item)",
+                           "((foo))(item)", "first & second", "value as Kind", "0", "[item]",
+                           "item + other", "" , "&" * 4097 + "item"):
+            with self.subTest(expression=expression):
+                self.assertFalse(coverage._data_argument_shape(expression))
+
+    def test_endpoint_paint_does_not_hide_other_coverage_losses(self):
+        value = self.endpoint_paint_fixture()
+        def owners(base, head):
+            base["data"][0]["functions"] = value["base"]
+            head["data"][0]["functions"] = value["head"]
+        sources = tuple({"example.rs": ("\n".join(value[side]) + "\n").encode()}
+                        for side in ("old", "new"))
+        before = [(1, 1), (2, 1), (3, 5), (4, 5), (5, 1)]
+        for after in ([(1, 1), (2, 1), (3, 5), (4, 5), (5, 0), (6, 1)],
+                      [(1, 1), (2, 1), (3, 0), (4, 5), (6, 1)],
+                      [(1, 1), (2, 0), (3, 5), (4, 5), (6, 1)]):
+            with self.subTest(after=after), self.assertRaises(ValueError):
+                self.compare(before=before, after=after, mutate=owners, sources=sources)
+
+    def test_endpoint_paint_does_not_mistake_comment_semicolon_for_statement_end(self):
+        value = self.endpoint_paint_fixture()
+        value["new"].insert(2, "        return //;")
+        for owner in value["head"]:
+            for region in owner["regions"][1:]:
+                region[0] += 1
+                region[2] += 1
+        value["retained"] = {4: 6}
+        self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_paint_requires_valid_full_function_syntax(self):
+        value = self.endpoint_paint_fixture()
+        value["new"].insert(5, "    let = ;")
+        for owner in value["head"]:
+            owner["regions"][-1][0] = owner["regions"][-1][2] = 7
+        with self.assertRaisesRegex(ValueError, "rustfmt.*did not validate"):
+            coverage.retained_block_endpoint_paint(**value)
 
     def wrapper_paint_compare(self, mutate=None, addition=False):
         body = ["    work();", "    check()?;", "    (", "        value", "    )", "}"]

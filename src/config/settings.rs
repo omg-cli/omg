@@ -815,7 +815,8 @@ mod tests {
             std::fs::write(
                 &config,
                 format!("[aur]\nsecurity_profile = 'hardened'\n{option}\n"),
-            )?;
+            )
+            .expect("write hardened settings fixture");
             let result =
                 temp_env::with_var("OMG_CONFIG_DIR", Some(directory.path()), Settings::load);
             assert_eq!(result.is_ok(), option.is_empty(), "{option}: {result:?}");

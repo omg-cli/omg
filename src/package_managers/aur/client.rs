@@ -9074,11 +9074,11 @@ mod tests {
         std::fs::write(
             checkout.join("PKGBUILD"),
             "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG coverage fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-fixture/empty\"; }\n",
-        )?;
+        ).expect("write fixture file");
         std::fs::write(
             checkout.join(".SRCINFO"),
             "pkgbase = omg-coverage-fixture\n\tpkgdesc = Inert OMG coverage fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-fixture\n",
-        )?;
+        ).expect("write fixture file");
         let outputs = vec!["omg-coverage-fixture".to_owned()];
         let dependencies = check_dependencies_for_outputs(&checkout, &outputs)?;
         anyhow::ensure!(
@@ -9105,10 +9105,11 @@ mod tests {
                 .await;
             let log_path = client.build_log_path("omg-coverage-fixture");
             let log = std::fs::read_to_string(&log_path);
-            let archives = result.context(format!(
+            let diagnostic = format!(
                 "Native fixture build log ({}):\n{log:?}",
                 log_path.display()
-            ))?;
+            );
+            let archives = result.context(diagnostic)?;
             assert_eq!(archives.len(), 1);
             let inspected = artifact_inspector::inspect_archive(&archives[0].path())?;
             assert_eq!(inspected.package_name, "omg-coverage-fixture");
@@ -9122,7 +9123,7 @@ mod tests {
         std::fs::write(
             checkout.join("PKGBUILD"),
             "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { printf 'intentional-fixture-failure\\n' >&2; return 1; }\n",
-        )?;
+        ).expect("write fixture file");
         let authorized = AuthorizedBuild {
             lifecycle_guard: client.acquire_build_lifecycle().await?,
             package: "omg-coverage-fixture".to_owned(),
@@ -9133,13 +9134,10 @@ mod tests {
             .install_authorized_package_outputs(authorized, None)
             .await
             .expect_err("a failed recipe must not reuse previously accepted archives");
-        assert!(
-            matches!(
-                error.downcast_ref::<AurError>(),
-                Some(AurError::BuildFailed { .. })
-            ),
-            "{error:#}"
-        );
+        let diagnostic = format!("{error:#}");
+        let error_kind = error.downcast_ref::<AurError>();
+        let build_failed = matches!(error_kind, Some(AurError::BuildFailed { .. }));
+        assert!(build_failed, "{diagnostic}");
         let log = std::fs::read_to_string(client.build_log_path("omg-coverage-fixture"))?;
         assert!(log.contains("intentional-fixture-failure"), "{log}");
         Ok(())
@@ -9161,12 +9159,12 @@ mod tests {
             ])
             .env("OMG_AUR_HISTORY_FIXTURE", "1")
             .output()?;
-        anyhow::ensure!(
-            output.status.success(),
+        let diagnostic = format!(
             "history fixture failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        anyhow::ensure!(output.status.success(), "{diagnostic}");
         Ok(())
     }
 
@@ -9179,21 +9177,33 @@ mod tests {
         }
         const MODE: &str = "OMG_AUR_REVIEW_PTY_MODE";
         if let Ok(mode) = std::env::var(MODE) {
-            let directory = tempfile::tempdir()?;
-            let pkgbuild = directory.path().join("PKGBUILD");
-            std::fs::write(&pkgbuild, "pkgname=demo\n")?;
-            std::fs::write(directory.path().join(".SRCINFO"), "pkgbase = demo\n")?;
-            crate::core::privilege::set_yes_flag(true);
-            let profile = match mode.as_str() {
-                "standard" | "authorize" => crate::config::AurSecurityProfile::Standard,
-                "hardened" | "history" => crate::config::AurSecurityProfile::Hardened,
-                _ => anyhow::bail!("unknown review fixture mode"),
-            };
-            if mode == "history" {
+            let history = matches!(mode.as_str(), "history" | "history-accept-failing-build");
+            let directory = if history {
                 anyhow::ensure!(
                     std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container"),
                     "historical fixture requires the isolated container"
                 );
+                anyhow::ensure!(
+                    std::env::var_os("OMG_CACHE_DIR")
+                        .is_some_and(|path| Path::new(&path).is_absolute()),
+                    "historical fixture requires an absolute private cache"
+                );
+                let cache = paths::cache_dir();
+                std::fs::create_dir_all(&cache).expect("create private fixture cache");
+                tempfile::tempdir_in(cache)?
+            } else {
+                tempfile::tempdir()?
+            };
+            let pkgbuild = directory.path().join("PKGBUILD");
+            std::fs::write(&pkgbuild, "pkgname=demo\n").expect("write fixture file");
+            std::fs::write(directory.path().join(".SRCINFO"), "pkgbase = demo\n")
+                .expect("write fixture file");
+            crate::core::privilege::set_yes_flag(true);
+            let profile = match mode.as_str() {
+                "standard" | "authorize" => crate::config::AurSecurityProfile::Standard,
+                _ => crate::config::AurSecurityProfile::Hardened,
+            };
+            if history {
                 let mut settings = Settings::default();
                 settings.aur.security_profile = profile;
                 let client = AurClient {
@@ -9204,12 +9214,24 @@ mod tests {
                 let error = client
                     .downgrade_from_history("demo", "1-1")
                     .await
-                    .expect_err("declining historical review must abort before building");
-                assert!(
-                    error.to_string().contains("Build aborted by user"),
-                    "{error:#}"
-                );
-                println!("REVIEW_DECLINED");
+                    .expect_err("historical fixture must not install a package");
+                if mode == "history" {
+                    assert!(
+                        error.to_string().contains("Build aborted by user"),
+                        "{error:#}"
+                    );
+                    println!("REVIEW_DECLINED");
+                } else {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Historical build of demo 1-1 failed"),
+                        "{error:#}"
+                    );
+                    let log = std::fs::read_to_string(client.build_log_path("demo"))?;
+                    assert!(log.contains("intentional-history-fixture-failure"), "{log}");
+                    println!("HISTORY_BUILD_FAILED");
+                }
             } else if mode == "authorize" {
                 let client = AurClient {
                     build_dir: directory.path().join("build"),
@@ -9263,7 +9285,7 @@ if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
         exit 0
     fi
     if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = fixture-commit ]; then
-        printf 'pkgname=demo\\n' > "$2/PKGBUILD"
+        printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\npackage() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' > "$2/PKGBUILD"
         printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n' > "$2/.SRCINFO"
         exit 0
     fi
@@ -9297,8 +9319,8 @@ try:
             output.extend(chunk)
             if len(output) > 1024 * 1024:
                 raise RuntimeError('review output exceeded limit')
-            if mode in ('hardened', 'history') and not sent and b'Build demo from this PKGBUILD?' in output:
-                os.write(fd, b'n\n')
+            if mode in ('hardened', 'history', 'history-accept-failing-build') and not sent and b'Build demo from this PKGBUILD?' in output:
+                os.write(fd, b'y\n' if mode == 'history-accept-failing-build' else b'n\n')
                 sent = True
         done, child_status = os.waitpid(pid, os.WNOHANG)
         if done:
@@ -9318,8 +9340,12 @@ try:
             break
     else:
         raise RuntimeError('review child timed out')
-    expected = b'REVIEW_DECLINED' if mode in ('hardened', 'history') else b'REVIEW_ACCEPTED'
-    if not os.waitstatus_to_exitcode(status) == 0 or expected not in output or (mode in ('hardened', 'history') and not sent):
+    expected = (b'REVIEW_DECLINED' if mode in ('hardened', 'history') else
+                b'HISTORY_BUILD_FAILED' if mode == 'history-accept-failing-build' else b'REVIEW_ACCEPTED')
+    prompt_required = mode in ('hardened', 'history', 'history-accept-failing-build')
+    if (os.waitstatus_to_exitcode(status) != 0 or expected not in output or
+            (prompt_required and not sent) or
+            (mode == 'history-accept-failing-build' and b'REVIEW_DECLINED' in output)):
         raise RuntimeError('review child failed or did not show the expected prompt')
 finally:
     if status is None:
@@ -9331,7 +9357,7 @@ finally:
 "#;
         let mut modes = vec!["standard", "hardened", "authorize"];
         if std::env::var("OMG_AUR_HISTORY_FIXTURE").as_deref() == Ok("1") {
-            modes.push("history");
+            modes.extend(["history", "history-accept-failing-build"]);
         }
         for mode in modes {
             let output = std::process::Command::new("python3")
@@ -9339,12 +9365,12 @@ finally:
                 .arg(std::env::current_exe()?)
                 .arg("package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes")
                 .output()?;
-            assert!(
-                output.status.success(),
+            let diagnostic = format!(
                 "{mode} review fixture failed:\n{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            assert!(output.status.success(), "{diagnostic}");
         }
         Ok(())
     }
@@ -9352,13 +9378,14 @@ finally:
     #[tokio::test]
     async fn archive_admission_enforces_profile_and_binds_paired_cache_to_it() -> Result<()> {
         let checkout = tempfile::tempdir()?;
-        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
+            .expect("write fixture file");
         std::fs::write(
             checkout.path().join(".SRCINFO"),
             "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\ninstall = demo.install\npkgname = demo\n",
-        )?;
+        ).expect("write fixture file");
         let hook = "post_install() { :; }\n";
-        std::fs::write(checkout.path().join("demo.install"), hook)?;
+        std::fs::write(checkout.path().join("demo.install"), hook).expect("write fixture file");
         let source = ReviewedSource::capture(checkout.path())?;
         let archives = tempfile::tempdir()?;
         let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
@@ -9421,11 +9448,13 @@ finally:
     #[tokio::test]
     async fn standard_admission_accepts_an_ordinary_archive_without_rebuild() -> Result<()> {
         let checkout = tempfile::tempdir()?;
-        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
+            .expect("write fixture file");
         std::fs::write(
             checkout.path().join(".SRCINFO"),
             "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
-        )?;
+        )
+        .expect("write fixture file");
         let source = ReviewedSource::capture(checkout.path())?;
         let archives = tempfile::tempdir()?;
         let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
@@ -9487,7 +9516,8 @@ finally:
         std::fs::write(
             directory.path().join("config.toml"),
             "[aur]\nsecurity_profile = 'hardened'\n",
-        )?;
+        )
+        .expect("write fixture file");
         temp_env::with_var("OMG_CONFIG_DIR", Some(directory.path()), || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

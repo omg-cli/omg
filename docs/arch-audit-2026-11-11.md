@@ -176,7 +176,15 @@ directory. Module declarations are refused before parsing. Formatter output
 does not supply coverage or replace source bytes. This uses the
 [Rustfmt parsing contract](https://github.com/rust-lang/rustfmt#running).
 
-These checks have 128 passing Python tests, including failing-before controls
+A retained provider-loop brace lost its LLVM mapping after fallible validation
+was added. Its old count came only from the enclosing block-entry region.
+A separate endpoint witness checks the exact loop scope, every compiled copy
+and the terminal method and argument regions. It refuses explicit zero counts,
+foreign owners and control-flow or call expressions in the data arguments.
+The receipt records inherited LLVM paint, not normal arrival at the brace.
+It changes no raw counts, ratios or deletion credit.
+
+These checks have 138 passing Python tests, including failing-before controls
 for hidden regressions, ambiguous ownership and malformed source. Independent
 reviews found and corrected a partial-owner gap and syntax-recognition gaps
 before publication. Fresh producer evidence remains necessary for acceptance.
@@ -198,14 +206,17 @@ that the current hardened profile rejects an install hook before elevation.
 Genuine PTY tests verify that hardened review still prompts under `--yes` and
 honors refusal; their namespace-root runs verify the ordinary-user boundary.
 
-The latest ordinary checks passed 2,120 library tests, 15 Arch CLI contracts,
-18 version tests, all-target Clippy with warnings denied, and 25 coverage-workflow
+The full local run passed 2,120 library tests, 15 Arch CLI contracts,
+18 version tests, all-target Clippy with warnings denied, and 26 coverage-workflow
 tests. Six library tests were ignored by default: four existing cases and two
 explicit native fixtures. The inert paired-build fixture passed separately on
-this Arch host. Historical rollback review remains selected in the existing
+this Arch host. Later scoped checks passed 241 AUR and 19 settings tests.
+Historical rollback review remains selected in the existing
 network-isolated CI container, where only `/usr/bin/true` receives passwordless
 sudo authorization. That container has separate fixture home, cache, data and
 configuration directories. No host package installation or removal was used.
+Its historical review scenarios decline once and separately accept an authored,
+source-free recipe that must fail with its log marker before installation.
 
 A subsequent reader regression reproduced loss of the decoder after a
 recoverable I/O error between zstd frames. The reader now models active,
