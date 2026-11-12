@@ -623,7 +623,22 @@ documented privileged prefixes and exact configuration files in explicit tables.
 Focused tests now refuse those paths while retaining ordinary local application
 paths and adjacent names. No generator payload was installed or executed.
 
-This is a source checkpoint. The complete policy-6 verification, review and fresh
-hosted source-bound coverage remain required. The strict coverage criteria are
-unchanged. Current CI results are recorded on PR #1057. The local checkout stays
-on `main`; the approved remote PR branch is the only publication target.
+At published head `9426e52c`, Main CI, Security Audit, Secret Scanning, CodeQL,
+Docker E2E and the complete hosted coverage producer passed. All seven added-file
+coverage requirements passed. The exact-base comparison still rejects ambiguous
+source correspondence in the ALPM transaction refactor. This remains an open
+gate, and the PR is not merge-ready. Coverage criteria are unchanged.
+
+The next local batch also corrected two transaction failure fixtures. Their
+release-less versions made libalpm index a dashed package name incorrectly.
+Stronger assertions reproduced “package not found” instead of the intended
+conflict and missing-dependency paths. Release-bearing fixture versions now reach
+native conflict preparation and the fail-closed refusal to drop an unresolved
+package. The latter test also checks that no package was installed and no lock
+remains. All six failure tests passed against private databases and offline
+file mirrors. All 37 artifact-inspector tests and all-target Clippy with warnings
+denied passed. Independent review approved the two-file test diff. These local
+checks do not establish a fresh hosted coverage verdict.
+
+The local checkout stays on `main`; the approved remote PR branch is the only
+publication target.

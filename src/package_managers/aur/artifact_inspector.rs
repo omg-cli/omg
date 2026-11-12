@@ -1040,28 +1040,14 @@ mod tests {
             Ok(())
         })
         .expect("bounded inert privilege metadata fixture is writable");
-        match inspect_archive(file.path()) {
-            Err(error) => {
-                let diagnostic = format!("{error:#}");
-                assert!(
-                    diagnostic.contains("privilege")
-                        && (diagnostic.contains("limit") || diagnostic.contains("budget")),
-                    "refusal must reach the privilege metadata budget: {diagnostic}"
-                );
-            }
-            Ok(admission) => {
-                let retained = admission
-                    .inspection()
-                    .privileged_files
-                    .iter()
-                    .filter_map(|file| file.capability.as_ref())
-                    .map(String::len)
-                    .sum::<usize>();
-                panic!(
-                    "accepted {retained} encoded capability bytes across {file_count} privileged files"
-                );
-            }
-        }
+        let error = inspect_archive(file.path())
+            .expect_err("privilege metadata budget must refuse the archive");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("privilege")
+                && (diagnostic.contains("limit") || diagnostic.contains("budget")),
+            "refusal must reach the privilege metadata budget: {diagnostic}"
+        );
     }
 
     #[test]
@@ -1219,7 +1205,6 @@ mod tests {
     #[test]
     fn hardened_profile_refuses_every_system_generator_search_root() -> Result<()> {
         use crate::config::AurSecurityProfile::{Hardened, Standard};
-        let mut admitted = Vec::new();
         for root in ["usr/lib", "usr/local/lib", "run", "etc"] {
             let path = format!("{root}/systemd/system-generators/omg-inert-marker");
             let mtree = fixture_file_mtree(&[(&path, 0o755, 5)]);
@@ -1229,21 +1214,17 @@ mod tests {
             let inspection = inspect_archive(file.path())?.into_inspection();
             assert!(inspection.executable_files.contains(&path));
             assert!(inspection.enforce_profile(Standard).is_ok());
-            if inspection.enforce_profile(Hardened).is_ok() {
-                admitted.push(path);
-            }
+            assert!(
+                inspection.enforce_profile(Hardened).is_err(),
+                "Hardened accepted system generator path: {path}"
+            );
         }
-        assert!(
-            admitted.is_empty(),
-            "Hardened accepted system generator paths: {admitted:?}"
-        );
         Ok(())
     }
 
     #[test]
     fn hardened_profile_refuses_local_and_runtime_privileged_loader_aliases() -> Result<()> {
         use crate::config::AurSecurityProfile::{Hardened, Standard};
-        let mut admitted = Vec::new();
         for path in [
             "usr/local/lib/udev/rules.d/marker.rules",
             "run/udev/rules.d/marker.rules",
@@ -1271,14 +1252,11 @@ mod tests {
             })?;
             let inspection = inspect_archive(file.path())?.into_inspection();
             assert!(inspection.enforce_profile(Standard).is_ok());
-            if inspection.enforce_profile(Hardened).is_ok() {
-                admitted.push(path);
-            }
+            assert!(
+                inspection.enforce_profile(Hardened).is_err(),
+                "Hardened accepted privileged loader alias: {path}"
+            );
         }
-        assert!(
-            admitted.is_empty(),
-            "Hardened accepted privileged loader aliases: {admitted:?}"
-        );
         Ok(())
     }
 

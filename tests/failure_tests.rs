@@ -20,10 +20,10 @@ fn test_conflicting_packages_fails_gracefully() -> Result<()> {
     let harness = AlpmHarness::new()?;
 
     // Create two conflicting packages
-    let mut pkg_a = HarnessPkg::new("pkg-a", "1.0.0");
+    let mut pkg_a = HarnessPkg::new("pkg-a", "1.0.0-1");
     pkg_a.desc.push_str("%CONFLICTS%\npkg-b\n\n");
 
-    let mut pkg_b = HarnessPkg::new("pkg-b", "1.0.0");
+    let mut pkg_b = HarnessPkg::new("pkg-b", "1.0.0-1");
     pkg_b.desc.push_str("%CONFLICTS%\npkg-a\n\n");
 
     harness.add_sync_pkg("core", &pkg_a)?;
@@ -51,14 +51,16 @@ fn test_conflicting_packages_fails_gracefully() -> Result<()> {
         Some(&mut alpm),
     );
 
-    assert!(result.is_err(), "Transaction should fail due to conflicts");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("conflicting packages")
-            || err.contains("Transaction failed")
-            || err.contains("pkg-a"),
-        "Error message should mention conflicts or transaction failure, got: {}",
-        err
+    let err = result.expect_err("conflicting packages must refuse preparation");
+    assert_eq!(
+        err.to_string().lines().next(),
+        Some(
+            format!(
+                "✗ Transaction preparation failed: {}",
+                alpm::Error::ConflictingDeps
+            )
+            .as_str()
+        )
     );
 
     Ok(())
@@ -132,7 +134,7 @@ fn test_missing_dependency_fails_gracefully() -> Result<()> {
     let harness = AlpmHarness::new()?;
 
     // Create a package with a missing dependency
-    let mut pkg_a = HarnessPkg::new("pkg-a", "1.0.0");
+    let mut pkg_a = HarnessPkg::new("pkg-a", "1.0.0-1");
     pkg_a.desc.push_str("%DEPENDS%\nnon-existent-dep\n\n");
 
     harness.add_sync_pkg("core", &pkg_a)?;
@@ -155,18 +157,18 @@ fn test_missing_dependency_fails_gracefully() -> Result<()> {
         Some(&mut alpm),
     );
 
-    assert!(
-        result.is_err(),
-        "Transaction should fail due to missing dependency"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("could not satisfy dependencies")
-            || err.contains("Preparation Error")
-            || err.contains("not found"),
-        "Error message should mention dependency failure, got: {}",
-        err
-    );
+    let err = result.expect_err("missing dependencies must refuse an unconfirmed package drop");
+    let diagnostic = err.to_string();
+    for required in [
+        "ALPM transaction aborted",
+        "unconfirmed package mutation",
+        "drop unresolvable package(s) from the transaction: pkg-a",
+        "resolve the conflict explicitly and retry",
+    ] {
+        assert!(diagnostic.contains(required), "{diagnostic}");
+    }
+    assert!(alpm.localdb().pkg("pkg-a").is_err());
+    assert!(!harness.db_path().join("db.lck").exists());
 
     Ok(())
 }
