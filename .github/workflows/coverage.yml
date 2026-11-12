@@ -231,8 +231,15 @@ jobs:
           cleanup() {
             local status=$? cleanup_status=0
             trap - EXIT
-            if [ -n "$container" ]; then docker rm --force "$container" || cleanup_status=$?; fi
-            if [ "$profile_loaded" -eq 1 ]; then
+            if [ -n "$container" ]; then
+              if docker rm --force "$container"; then
+                container=
+              else
+                cleanup_status=$?
+                printf 'Container removal failed; retaining AppArmor profile %s\n' "$profile_name" >&2
+              fi
+            fi
+            if [ "$profile_loaded" -eq 1 ] && [ -z "$container" ]; then
               printf '%s\n' "$profile_text" | docker run --rm --interactive --network=none \
                 --pids-limit=32 --memory=256m --cpus=1 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=16m \
                 --cap-drop=ALL --cap-add=MAC_ADMIN --security-opt=apparmor=unconfined \

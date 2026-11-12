@@ -96,7 +96,7 @@ jq() { :; }
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]
                 loaders = [(args, data) for args, data in calls if '--entrypoint' in args]
-                self.assertEqual(len(loaders), 2)
+                self.assertEqual(len(loaders), 1 if remove else 2)
                 name = f'omg-coverage-{run_id}-{attempt}'
                 for (args, data), operation in zip(loaders, ('--replace', '--remove')):
                     self.assertIn(operation, args)
@@ -117,8 +117,13 @@ jq() { :; }
                 self.assertIn('apparmor=' + name, create)
                 self.assertIn('--network', create)
                 removal = next(i for i, (args, _) in enumerate(calls) if args[:2] == ['rm', '--force'])
-                unload = next(i for i, (args, _) in enumerate(calls) if '--remove' in args)
-                self.assertLess(removal, unload)
+                unloads = [i for i, (args, _) in enumerate(calls) if '--remove' in args]
+                if remove:
+                    self.assertEqual(unloads, [])
+                    self.assertIn('retaining AppArmor profile', result.stderr)
+                else:
+                    self.assertEqual(len(unloads), 1)
+                    self.assertLess(removal, unloads[0])
 
     def test_privileged_coverage_case_requires_real_execution_and_profiles(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
