@@ -784,3 +784,15 @@ remains open. Fresh evidence identifies a real lost hit in mirror configuration,
 additional uncovered branches and several incorrect source correspondences.
 Those findings require explicit tests or mapping proof; passing the lock batch
 does not close that gate.
+
+
+A follow-up behavior batch covers a configured repository absent from a supplied
+native handle without registering an extra database. It uses only private
+`file://` mirror configuration and checks the registered repository's expanded
+server. Additional sync-archive cases refuse invalid names inside an otherwise
+flat entry and require the repository and entry in the error. The owned-child
+fixture now reads its proc identity before writing the observation file.
+All 578 package-manager tests passed with 11 ignored, as did all-target Clippy
+with warnings denied. Independent review approved these test changes. These are
+passing behavior cases for expected production behavior, not reproduced runtime
+bugs or a fresh complete coverage verdict.

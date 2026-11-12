@@ -3182,6 +3182,69 @@ mod tests {
     }
 
     #[test]
+    fn mirror_configuration_preserves_the_registered_repository_set() -> anyhow::Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        const TEST: &str = "package_managers::alpm_ops::tests::mirror_configuration_preserves_the_registered_repository_set";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        assert!(
+            !crate::core::is_root(),
+            "mirror configuration overrides require an ordinary UID"
+        );
+        let owner = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let root = owner.path().join("root");
+        let database = owner.path().join("db");
+        for directory in [&root, &database] {
+            std::fs::DirBuilder::new().mode(0o700).create(directory)?;
+        }
+        let mirror = owner.path().join("mirror");
+        let configuration = owner.path().join("pacman.conf");
+        std::fs::write(
+            &configuration,
+            format!(
+                "[options]\n[core]\nServer = file://{}/$repo/os/$arch\n\n[configured-only]\nServer = file://{}/$repo/os/$arch\n",
+                mirror.display(),
+                mirror.display()
+            ),
+        )?;
+        let mut alpm = alpm::Alpm::new(
+            root.to_str().expect("private root path"),
+            database.to_str().expect("private database path"),
+        )?;
+        alpm.register_syncdb_mut("core", alpm::SigLevel::NONE)?;
+        assert!(ensure_mirror_servers(&alpm).is_err());
+        temp_env::with_var("OMG_PACMAN_CONF", Some(&configuration), || {
+            super::configure_mirrors(&mut alpm)
+        })?;
+
+        let databases: Vec<_> = alpm.syncdbs().into_iter().collect();
+        assert_eq!(
+            databases.len(),
+            1,
+            "configuring mirrors must not register an additional database"
+        );
+        let core = databases.first().expect("registered core database");
+        assert_eq!(core.name(), "core");
+        let expected = format!(
+            "file://{}/core/os/{}",
+            mirror.display(),
+            std::env::consts::ARCH
+        );
+        assert_eq!(
+            core.servers().into_iter().collect::<Vec<_>>(),
+            vec![expected.as_str()]
+        );
+        ensure_mirror_servers(&alpm)?;
+        Ok(())
+    }
+
+    #[test]
     fn pacman_signature_policy_is_applied_to_handle_and_repositories() {
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
             "[options]\nSigLevel = Required DatabaseOptional\nLocalFileSigLevel = PackageOptional\nRemoteFileSigLevel = PackageNever\n\n[core]\nSigLevel = PackageOptional DatabaseNever\n",

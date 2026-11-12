@@ -1351,10 +1351,8 @@ mod public_source_tests {
         let helper = OwnedGitHelper {
             identity_file: staging.path().join("helper.stat"),
         };
-        std::fs::write(
-            &helper.identity_file,
-            std::fs::read(format!("/proc/{pid}/stat"))?,
-        )?;
+        let identity = std::fs::read(format!("/proc/{pid}/stat"))?;
+        std::fs::write(&helper.identity_file, identity)?;
         assert_eq!(helper.running_pid(), i32::try_from(pid).ok());
         let stopped_without_cleanup = helper.stopped_before_cleanup().await;
         let status = tokio::time::timeout(Duration::from_secs(1), child.wait()).await??;

@@ -2589,6 +2589,29 @@ mod tests {
     }
 
     #[test]
+    fn sync_archive_identity_reports_invalid_package_names_at_the_flat_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private sync archive owner");
+        let path = owner.path().join("audit-repo.db");
+        let entry = "actual-1-1/desc";
+        for name in ["bad/name", "bad name"] {
+            let description = format!("%NAME%\n{name}\n\n%VERSION%\n1-1\n");
+            write_sync_identity_fixture(&path, &[(entry, &description)]);
+            let error = parse_sync_db(&path, "audit-repo")
+                .expect_err("an invalid package name must refuse the flat sync entry");
+            assert_eq!(
+                error.to_string(),
+                "Invalid package name in actual-1-1/desc from repository audit-repo",
+                "invalid name {name:?} must identify its archive entry and repository"
+            );
+        }
+    }
+
+    #[test]
     #[serial_test::serial]
     fn sync_archive_identity_does_not_reuse_unvalidated_legacy_cache() {
         batch2_catalog_fixture(
