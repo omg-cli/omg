@@ -2,6 +2,7 @@
 """Require complete LCOV line coverage to meet the exact base report."""
 import argparse
 import ast
+import bisect
 from collections import Counter
 from dataclasses import dataclass
 import hashlib
@@ -169,18 +170,21 @@ def region_evidence(path, coverage, sources, side=None):
     value = json.loads(decoded)
     if value.get("type") != "llvm.coverage.json.export" or value.get("version") != "3.1.0" or len(value.get("data", [])) != 1:
         raise ValueError("Unsupported region schema")
-    data = value["data"][0]; files = {}
+    data = value["data"][0]; files = {}; mappings = {}
     for item in data["files"]:
         name = canonical_source(item["filename"], sources)
         if name in files:
             raise ValueError("Duplicate region source")
         files[name] = item["summary"]["lines"]
-    sections = {canonical_source(name, sources): item for name, item in coverage.sections.items()}
+        mappings[name] = item
+    sections = {canonical_source(name, sources): dict(item) for name, item in coverage.sections.items()}
     if len(sections) != len(coverage.sections) or files.keys() != sections.keys():
         raise ValueError("Region/LCOV source set mismatch")
     for name, item in sections.items():
         if (files[name]["count"], files[name]["covered"]) != (item["LF"], item["LH"]):
             raise ValueError("Region/LCOV summary mismatch")
+        item["segments"] = mappings[name].get("segments")
+        item["expansions"] = mappings[name].get("expansions")
     # LLVM's JSON exporter clamps uint64 counts to INT64_MAX. Saturation
     # cannot establish execution; an unsigned underflow also appears positive.
     # https://github.com/llvm/llvm-project/blob/main/llvm/tools/llvm-cov/CoverageExporterJson.cpp
@@ -861,6 +865,438 @@ def retained_block_endpoint_paint(name, old, new, before, after, base, head, bas
     return results
 
 
+@dataclass(frozen=True)
+class _BooleanSource:
+    text: str
+    words: list
+    starts: list
+    ends: list
+    parents: list
+    pairs: dict
+    offsets: list
+
+    def position(self, offset):
+        line = bisect.bisect_right(self.offsets, offset) - 1
+        return line + 1, len(self.text[self.offsets[line]:offset].encode()) + 1
+
+    def region(self, first, last):
+        return (*self.position(self.starts[first]), *self.position(self.ends[last]))
+
+    def ancestors(self, index):
+        result = []
+        parent = self.parents[index]
+        while parent is not None:
+            result.append(parent)
+            parent = self.parents[parent]
+        return result
+
+
+def _boolean_source(source):
+    """Bounded Rust token boundaries, retaining every delimiter and source byte."""
+    text = '\n'.join(source)
+    if len(text.encode()) > 1024 * 1024:
+        return None
+    words = []; starts = []; ends = []; parents = []; pairs = {}; stack = []; at = 0
+    raw_literal = re.compile(r'(?:br|cr|r)(#*)"')
+    token = re.compile(r'''(?:[bc]?"(?:\\[\s\S]|[^"\\])*"|'(?:[^'\\\n]|\\(?:[\\'"nrt0]|x[\da-fA-F]{2}|u\{[\da-fA-F_]+\}))'|'[A-Za-z_]\w*|(?:r\#)?[A-Za-z_]\w*|[0-9][A-Za-z_0-9.]*|::|->|=>|&&|\|\||[^\s])''')
+    while at < len(text):
+        if text[at].isspace():
+            at += 1; continue
+        if text.startswith('//', at):
+            end = text.find('\n', at)
+            at = len(text) if end < 0 else end + 1
+            continue
+        if text.startswith('/*', at):
+            depth = 1; at += 2
+            while depth and at < len(text):
+                if text.startswith('/*', at):
+                    depth += 1; at += 2
+                    if depth > 32:
+                        return None
+                elif text.startswith('*/', at):
+                    depth -= 1; at += 2
+                else:
+                    at += 1
+            if depth:
+                return None
+            continue
+        raw = raw_literal.match(text, at)
+        if raw:
+            end = text.find('"' + raw[1], at + len(raw[0]))
+            if end < 0:
+                return None
+            end += len(raw[1]) + 1
+        else:
+            match = token.match(text, at)
+            if match is None:
+                return None
+            end = match.end()
+        word = text[at:end]
+        if word in ('"', "'"):
+            return None
+        if re.fullmatch(r'r#[A-Za-z_]\w*', word):
+            word = word[2:]
+        index = len(words)
+        words.append(word); starts.append(at); ends.append(end)
+        parents.append(stack[-1] if stack else None)
+        if word in ('(', '[', '{'):
+            stack.append(index)
+            if len(stack) > 32:
+                return None
+        elif word in (')', ']', '}'):
+            if not stack or words[stack[-1]] != {')': '(', ']': '[', '}': '{'}[word]:
+                return None
+            opening = stack.pop(); pairs[opening] = index; pairs[index] = opening
+        if len(words) > 131072:
+            return None
+        at = end
+    if stack:
+        return None
+    offsets = [0]
+    for line in source[:-1]:
+        offsets.append(offsets[-1] + len(line) + 1)
+    return _BooleanSource(text, words, starts, ends, parents, pairs, offsets)
+
+
+def _boolean_attributes(code, index):
+    attributes = []
+    cursor = index - 1
+    while cursor >= 0 and code.words[cursor] == ']':
+        opening = code.pairs[cursor]
+        if opening == 0 or code.words[opening - 1] != '#':
+            return None
+        attributes.append(code.words[opening + 1:cursor])
+        cursor = opening - 2
+    if cursor >= 0 and code.words[cursor] not in (';', '}', '{'):
+        return None
+    return attributes
+
+
+def _boolean_items(code):
+    items = []
+    for index, word in enumerate(code.words[:-2]):
+        if word != 'fn' or not re.fullmatch(r'[A-Za-z_]\w*', code.words[index + 1]) or code.words[index + 2] != '(':
+            continue
+        args_end = code.pairs[index + 2]
+        cursor = args_end + 1
+        while cursor < len(code.words) and code.words[cursor] not in ('{', ';', '}'):
+            cursor += 1
+        if (cursor == len(code.words) or code.words[cursor] != '{'
+                or len(code.text[code.starts[index]:code.ends[cursor]].encode()) > 4096):
+            continue
+        end = code.pairs[cursor]
+        if len(code.text[code.starts[index]:code.ends[end]].encode()) > 64 * 1024:
+            continue
+        items.append(dict(name=code.words[index + 1], start=index, body=cursor, end=end,
+                          arguments=(index + 2, args_end), parent=code.parents[index],
+                          span=(code.position(code.starts[index])[0], code.position(code.ends[end])[0])))
+    return items
+
+
+def _boolean_module(code, item):
+    path = []; gates = []; scopes = []
+    for opening in reversed(code.ancestors(item['start'])):
+        if opening < 2 or code.words[opening - 2] != 'mod' or not re.fullmatch(r'[A-Za-z_]\w*', code.words[opening - 1]):
+            return None
+        attributes = _boolean_attributes(code, opening - 2)
+        if attributes is None or any(attribute != ['cfg', '(', 'test', ')'] for attribute in attributes):
+            return None
+        path.append(code.words[opening - 1]); scopes.append(opening)
+        if attributes:
+            gates.append('::'.join(path))
+    return path, gates, scopes
+
+
+def _boolean_arguments(code, opening):
+    end = code.pairs[opening]; cursor = opening + 1; start = cursor; result = []
+    while cursor < end:
+        if code.words[cursor] == ',' and code.parents[cursor] == opening:
+            if cursor == start:
+                return None
+            result.append((start, cursor)); start = cursor + 1
+        if code.words[cursor] in ('(', '[', '{'):
+            cursor = code.pairs[cursor]
+        cursor += 1
+    if start < end:
+        result.append((start, end))
+    return result if result and len(result) <= 32 else None
+
+
+def _boolean_leaf(words):
+    keywords = {'as', 'async', 'await', 'break', 'const', 'continue', 'else', 'enum', 'extern', 'fn',
+                'for', 'if', 'impl', 'in', 'let', 'loop', 'match', 'mod', 'move', 'mut', 'pub',
+                'ref', 'return', 'static', 'struct', 'trait', 'type', 'unsafe', 'use', 'where', 'yield'}
+    if len(words) == 1:
+        return words[0] not in keywords and bool(re.fullmatch(
+            r'(?:[A-Za-z_]\w*|[0-9]+|"(?:\\.|[^"\\])*")', words[0]))
+    return (len(words) % 2 == 1 and words[1::2] == ['::'] * (len(words) // 2)
+            and all(word not in keywords and re.fullmatch(r'[A-Za-z_]\w*', word) for word in words[::2]))
+
+
+def _boolean_call_context(code, line, head):
+    literal = re.fullmatch(r'\s*(true|false)\s*,?\s*', code.text.splitlines()[line - 1])
+    if literal is None:
+        return None
+    tokens = [i for i, word in enumerate(code.words) if word == literal[1] and code.position(code.starts[i])[0] == line]
+    items = _boolean_items(code)
+    callers = [item for item in items if tokens and item['body'] < tokens[0] < item['end']]
+    if len(tokens) != 1 or len(callers) != 1:
+        return None
+    caller = callers[0]; token = tokens[0]; opening = code.parents[token]
+    if opening is None or code.words[opening] != '(' or opening == 0:
+        return None
+    call = opening - 1; name = code.words[call]
+    definitions = [item for item in items if item['name'] == name]
+    if len(definitions) != 1 or not re.fullmatch(r'[A-Za-z_]\w*', name):
+        return None
+    callee = definitions[0]
+    module = _boolean_module(code, caller)
+    if (module is None or _boolean_module(code, callee) != module or callee['parent'] != caller['parent']
+            or _boolean_attributes(code, callee['start']) != []
+            or _boolean_attributes(code, caller['start']) not in ([], [['test']])):
+        return None
+    parameters = _boolean_arguments(code, callee['arguments'][0])
+    arguments = _boolean_arguments(code, opening)
+    if parameters is None or arguments is None or len(parameters) != len(arguments):
+        return None
+    ordinals = [i for i, (start, end) in enumerate(arguments) if (start, end) == (token, token + 1)]
+    if len(ordinals) != 1:
+        return None
+    ordinal = ordinals[0]
+    # Local items shadow module globs. Explicit imports/declarations of this
+    # name, and generators at the module boundary, still make proof impossible.
+    module_parent = caller['parent']
+    item_bodies = {item['body'] for item in items}
+    for index, word in enumerate(code.words):
+        enclosing = code.ancestors(index)
+        at_module = code.parents[index] == module_parent
+        inside_item = any(opening in item_bodies for opening in enclosing)
+        in_module = (module_parent is None or module_parent in enclosing)
+        if in_module and not inside_item and word == name and index != callee['start'] + 1:
+            return None
+        if at_module and word == '!':
+            return None
+        if at_module and word == '#' and index + 1 < len(code.words) and code.words[index + 1] == '[':
+            attr = code.words[index + 2:code.pairs[index + 1]]
+            if not attr or attr[0] not in ('cfg', 'test'):
+                return None
+    occurrences = []; selected = None
+    enclosing_blocks = {i for i in code.ancestors(call) if code.words[i] == '{'}
+    for ancestor in code.ancestors(call):
+        if ancestor > 0 and code.words[ancestor - 1] == '!':
+            if head or ancestor < 2 or code.words[ancestor - 2] not in ('assert', 'assert_eq', 'assert_ne'):
+                return None
+    for index in range(caller['start'], caller['end']):
+        word = code.words[index]
+        if (index != caller['start'] and code.parents[index] in enclosing_blocks
+                and word in ('use', 'extern', 'mod', 'struct', 'enum', 'union', 'type', 'static', 'const', 'fn', '#')):
+            return None
+        if word in ('|', '||', 'async', 'await'):
+            return None
+        if word == '!' and code.parents[index] in enclosing_blocks:
+            # Only the base's assertion macro is supported; its execution is
+            # established separately by the literal's ordinary region.
+            if head or index == 0 or code.words[index - 1] not in ('assert', 'assert_eq', 'assert_ne'):
+                return None
+        if word != name:
+            continue
+        if (index + 1 >= len(code.words) or code.words[index + 1] != '('
+                or index > 0 and code.words[index - 1] in ('.', '::', 'fn')):
+            return None
+        args = _boolean_arguments(code, index + 1)
+        if args is None or len(code.text[code.starts[index]:code.ends[code.pairs[index + 1]]].encode()) > 4096:
+            return None
+        leaves = all(_boolean_leaf(code.words[a:b]) for a, b in args)
+        eligible = (leaves and len(args) == len(arguments)
+                    and code.words[args[ordinal][0]:args[ordinal][1]] == [literal[1]])
+        occurrences.append(dict(region=list(code.region(index, code.pairs[index + 1])), eligible=eligible,
+                                reason='safe leaves' if leaves else 'non-leaf argument'))
+        if eligible:
+            selected = index
+        if len(occurrences) > 256:
+            return None
+    if sum(row['eligible'] for row in occurrences) != 1 or selected != call:
+        return None
+    continuation = None
+    if head:
+        # The call is the first statement of the function or of each enclosing
+        # ordinary for body. This excludes labels, joins, lazy scopes and bypasses.
+        blocks = list(reversed([i for i in code.ancestors(call) if code.words[i] == '{']))
+        if caller['body'] not in blocks:
+            return None
+        blocks = blocks[blocks.index(caller['body']):]
+        boundary = caller['body'] + 1
+        for block in blocks[1:]:
+            if (code.words[boundary] != 'for' or not re.fullmatch(r'[A-Za-z_]\w*', code.words[boundary + 1])
+                    or code.words[boundary + 2] != 'in' or code.words[boundary + 3] != '['
+                    or code.pairs[boundary + 3] != block - 1):
+                return None
+            boundary = block + 1
+        prefix = code.words[boundary:call]
+        if not (len(prefix) in (3, 4) and prefix[0] == 'let' and prefix[-1] == '='
+                and re.fullmatch(r'[A-Za-z_]\w*', prefix[-2])
+                and (len(prefix) == 3 or prefix[1] == 'mut')):
+            return None
+        end = code.pairs[opening]
+        tail = code.words[end + 1:]
+        if (len(tail) < 6 or tail[0:2] != [';', 'for']
+                or not re.fullmatch(r'[A-Za-z_]\w*', tail[2]) or tail[3:5] != ['in', '[']):
+            return None
+        iterator = end + 5; iterator_end = code.pairs[iterator]
+        if code.words[iterator_end + 1] != '{' or code.parents[iterator] != code.parents[call]:
+            return None
+        if any(word in ('!', '|', '||', 'async', 'await', 'return', 'break', 'continue', 'if', 'match', '?')
+               for word in code.words[iterator:iterator_end + 1]):
+            return None
+        continuation = code.region(iterator, iterator_end)
+    return dict(caller=caller, callee=callee, module=module, ordinal=ordinal, arity=len(arguments),
+                occurrences=occurrences, literal=code.region(token, token),
+                call=code.region(call, call), continuation=continuation)
+
+
+def _boolean_segments(segments, source):
+    if not isinstance(segments, list) or not segments or len(segments) > 131072:
+        return False
+    previous = (0, 0); encoded = [line.encode() for line in source]
+    for row in segments:
+        if (not isinstance(row, list) or len(row) != 6 or any(type(v) is not int for v in row[:3])
+                or any(type(v) is not bool for v in row[3:]) or not 1 <= row[0] <= len(source)
+                or not 1 <= row[1] <= len(encoded[row[0] - 1]) + 1
+                or not 0 <= row[2] < COUNTER_LIMIT or tuple(row[:2]) <= previous
+                or not row[3] and (row[2] != 0 or row[4] or row[5])):
+            return False
+        if row[1] <= len(encoded[row[0] - 1]) and encoded[row[0] - 1][row[1] - 1] & 0xC0 == 0x80:
+            return False
+        previous = tuple(row[:2])
+    return not segments[-1][3]
+
+
+def retained_boolean_argument_paint(name, old, new, before, after, base, head, base_files, head_files,
+                                    retained, base_segments=None, head_segments=None):
+    """Prove only an existing, unmapped eager boolean argument; grant no credit."""
+    candidates = [(a, b) for a, b in retained.items() if before.get(a, 0) > 0 and b not in after
+                  and re.fullmatch(r'\s*(?:true|false)\s*,?\s*', old[a - 1])
+                  and old[a - 1].strip() == new[b - 1].strip()]
+    if not candidates or len(candidates) > 256:
+        return []
+    codes = [_boolean_source(source) for source in (old, new)]
+    if not all(codes) or not all(_boolean_segments(segments, source)
+                                for segments, source in ((base_segments, old), (head_segments, new))):
+        return []
+    if sum(len(code.words) for code in codes) * len(candidates) > 262144:
+        return []
+    inventories = []
+    for source, owners, files in ((old, base, base_files), (new, head, head_files)):
+        names = Counter(owner['name'] for owner in owners)
+        relevant = [owner for owner in owners if any(files.get(path) == name or path.endswith('/' + name)
+                                                    for path in owner['filenames'])]
+        boundaries = []
+        for line in source:
+            column = 1; columns = {1}
+            for character in line:
+                column += len(character.encode()); columns.add(column)
+            boundaries.append(columns)
+        if len(relevant) > 4096 or any(names[owner['name']] != 1 or source_owner_span(owner, name, files, source) is None
+                                    for owner in relevant):
+            return []
+        if any(row[4] >= COUNTER_LIMIT or row[1] not in boundaries[row[0] - 1]
+               or row[3] not in boundaries[row[2] - 1] for owner in relevant for row in owner['regions']):
+            return []
+        inventories.append(relevant)
+
+    def touches(row, start, end):
+        return tuple(row[:2]) < end and tuple(row[2:4]) > start
+
+    def segment_rows(segments, start, end):
+        return [row for index, row in enumerate(segments)
+                if tuple(row[:2]) < end and (index + 1 == len(segments) or tuple(segments[index + 1][:2]) > start)]
+
+    results = []
+    for oldline, newline in candidates:
+        contexts = [_boolean_call_context(code, line, is_head) for code, line, is_head in
+                    ((codes[0], oldline, False), (codes[1], newline, True))]
+        if not all(contexts):
+            continue
+        bc, hc = contexts
+        if (bc['module'][:2] != hc['module'][:2] or (bc['ordinal'], bc['arity']) != (hc['ordinal'], hc['arity'])):
+            continue
+        callee_sources = [code.text[code.starts[context['callee']['start']]:code.ends[context['callee']['end']]]
+                          for code, context in zip(codes, contexts)]
+        if callee_sources[0] != callee_sources[1]:
+            continue
+        groups = []
+        for source, owners, files, context in zip((old, new), inventories, (base_files, head_files), contexts):
+            groups.append([[owner for owner in owners if source_owner_span(owner, name, files, source)[:2] == context[kind]['span']]
+                           for kind in ('caller', 'callee')])
+        if any(len(group) != 1 for side in groups for group in side):
+            continue
+        if any(not any(row[4] > 0 and touches(row, code.region(context['callee']['start'] + 1,
+                       context['callee']['start'] + 1)[:2], code.region(context['callee']['start'] + 1,
+                       context['callee']['start'] + 1)[2:]) for row in side[1][0]['regions'])
+               for code, context, side in zip(codes, contexts, groups)):
+            continue
+        if any(any(owner is not group[0] and any(touches(row, (context[kind]['span'][0], 1),
+                        (context[kind]['span'][1] + 1, 1)) for row in owner['regions']) for owner in owners)
+               for context, owners, side in zip(contexts, inventories, groups)
+               for kind, group in zip(('caller', 'callee'), side)):
+            continue
+        bo, ho = groups[0][0][0], groups[1][0][0]
+        base_line_rows = [(owner, row) for owner in inventories[0] for row in owner['regions']
+                          if touches(row, (oldline, 1), (oldline + 1, 1))]
+        if len(base_line_rows) != 1 or base_line_rows[0][0] is not bo:
+            continue
+        region = base_line_rows[0][1]
+        if (tuple(region[:2]) > bc['literal'][:2] or tuple(region[2:4]) < bc['literal'][2:]
+                or region[4] != before[oldline]):
+            continue
+        if any(touches(row, (newline, 1), (newline + 1, 1)) for owner in inventories[1] for row in owner['regions']):
+            continue
+        base_segment_rows = segment_rows(base_segments, (oldline, 1), (oldline + 1, 1))
+        base_token_rows = segment_rows(base_segments, bc['literal'][:2], bc['literal'][2:])
+        head_segment_rows = segment_rows(head_segments, (newline, 1), (newline + 1, 1))
+        if (not base_segment_rows or max((row[2] for row in base_segment_rows if row[3] and not row[5]), default=0) != before[oldline]
+                or not base_token_rows or any(not row[3] or row[5] or row[2] != before[oldline] for row in base_token_rows)
+                or any(row[5] for row in base_segment_rows) or not head_segment_rows
+                or any(row[3] or row[4] or row[5] for row in head_segment_rows)):
+            continue
+        witnesses = []
+        for owners, owner, shape in ((inventories[0], bo, bc['call']), (inventories[1], ho, hc['call']),
+                                    (inventories[1], ho, hc['continuation'])):
+            rows = [row for row in owner['regions'] if tuple(row[:4]) == shape]
+            if (len(rows) != 1 or rows[0][4] <= 0 or any(
+                    touches(row, shape[:2], shape[2:]) and row[4] != rows[0][4] for row in owner['regions'])
+                    or any(other is not owner and any(
+                    touches(row, shape[:2], shape[2:]) for row in other['regions']) for other in owners)):
+                break
+            witnesses.append(rows[0])
+        if len(witnesses) != 3 or witnesses[1][4] != witnesses[2][4]:
+            continue
+        witness_segments = [segment_rows(segments, shape[:2], shape[2:])
+                            for segments, shape in ((base_segments, bc['call']), (head_segments, hc['call']),
+                                                     (head_segments, hc['continuation']))]
+        if any(not rows or tuple(rows[0][:2]) != shape[:2] or not rows[0][4]
+               or any(not row[3] or row[5] or row[2] != witness[4] for row in rows)
+               for rows, shape, witness in zip(witness_segments, (bc['call'], hc['call'], hc['continuation']), witnesses)):
+            continue
+        excerpts = [code.text[code.starts[context['caller']['start']]:code.ends[context['caller']['end']]].encode()
+                    for code, context in zip(codes, contexts)]
+        require_rustfmt_syntax(excerpts + [callee_sources[0].encode()])
+        results.append(dict(file=name, pairs=[[oldline, newline]], argument_ordinal=bc['ordinal'] + 1, arity=bc['arity'],
+            claim='eager boolean evaluation only; no caller ancestry or independent literal counter',
+            module_path=bc['module'][0], test_gates=bc['module'][1],
+            source_lines_sha256=[hashlib.sha256(code.text.encode()).hexdigest() for code in codes],
+            callee_source_sha256=hashlib.sha256(callee_sources[0].encode()).hexdigest(),
+            base_occurrences=bc['occurrences'], head_occurrences=hc['occurrences'],
+            owner_inventories=[[dict(role=role, name=group[0]['name'], regions=group[0]['regions'])
+                                for role, group in zip(('caller', 'callee'), side)] for side in groups],
+            base_literal_region=region, base_call_region=witnesses[0], head_call_region=witnesses[1],
+            head_continuation_region=witnesses[2], base_literal_segments=base_segment_rows,
+            base_literal_token_segments=base_token_rows,
+            head_literal_segments=head_segment_rows,
+            base_call_segments=witness_segments[0], head_witness_segments=witness_segments[1:]))
+    return results
+
+
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
     bf, bs = region_evidence(base_regions, base, base_sources, "base")
     hf, hs = region_evidence(head_regions, head, head_sources, "head")
@@ -907,7 +1343,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     removed = {}; deleted_mapped = deleted_hit = 0; paint_receipts = []; serial_receipts = []; serial_removed = {}
-    positive_receipts = []; endpoint_receipts = []
+    positive_receipts = []; endpoint_receipts = []; boolean_receipts = []
     for name in bs:
         old = base_sources[name].decode("utf-8").splitlines()
         new = head_sources[name].decode("utf-8").splitlines()
@@ -1026,7 +1462,16 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             serial_receipts.extend(elisions)
         endpoint = retained_block_endpoint_paint(name, old, new, before, after, bf, hf, base_files, head_files, final_pairs)
         endpoint_receipts.extend(endpoint)
-        painted = {(a, b) for witness in paint + endpoint for a, b in witness["pairs"]}
+        raw_sources = (base_sources[name], head_sources[name])
+        line_sources = tuple('\n'.join(source).encode() for source in (old, new))
+        boolean = (retained_boolean_argument_paint(name, old, new, before, after, bf, hf, base_files, head_files,
+                                                   final_pairs, bs[name]['segments'], hs[name]['segments'])
+                   if bs[name]['expansions'] == hs[name]['expansions'] == []
+                   and all(raw in (lines, lines + b'\n') for raw, lines in zip(raw_sources, line_sources)) else [])
+        for witness in boolean:
+            witness['source_blob_sha256'] = [hashlib.sha256(raw).hexdigest() for raw in raw_sources]
+        boolean_receipts.extend(boolean)
+        painted = {(a, b) for witness in paint + endpoint + boolean for a, b in witness["pairs"]}
         paint_receipts.extend(paint)
         for oldline, newline in list(retained.items()):
             if oldline in anchored:
@@ -1071,6 +1516,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     paint_receipt = {"retained_wrapper_paint": paint_receipts} if paint_receipts else {}
     if endpoint_receipts:
         paint_receipt["retained_block_endpoint_paint"] = endpoint_receipts
+    if boolean_receipts:
+        paint_receipt['retained_boolean_argument_paint'] = boolean_receipts
     if positive_receipts:
         paint_receipt["positive_source_fragments"] = positive_receipts
     if added_receipt:

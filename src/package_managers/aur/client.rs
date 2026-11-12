@@ -5089,6 +5089,29 @@ mod tests {
     }
 
     #[test]
+    fn aur_updates_empty_local_catalog_does_not_require_index_or_rpc() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::aur_updates_empty_local_catalog_does_not_require_index_or_rpc";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&[])?;
+        std::fs::create_dir(fixture.db.join("local"))?;
+        fixture.with_environment(async {
+            assert!(get_potential_aur_packages()?.is_empty());
+            assert!(!metadata_path().exists() && !index_path().exists());
+            let updates =
+                tokio::time::timeout(Duration::from_secs(2), fixture.client().get_update_list())
+                    .await
+                    .context("an empty installed catalog must complete without AUR RPC")??;
+            assert!(updates.is_empty());
+            assert!(!metadata_path().exists() && !index_path().exists());
+            assert!(fixture.local_bytes()?.is_empty());
+            Ok(())
+        })
+    }
+
+    #[test]
     fn aur_updates_all_ignored_do_not_require_index_or_rpc() -> Result<()> {
         if crate::core::testing::run_isolated_test(
             "package_managers::aur::client::tests::aur_updates_all_ignored_do_not_require_index_or_rpc",
@@ -9156,9 +9179,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test]
     #[ignore = "requires native Arch build tools and explicitly isolated fixture state"]
-    async fn native_isolated_fixture_builds_reviewed_source_without_installing() -> Result<()> {
+    fn native_isolated_fixture_builds_reviewed_source_without_installing() -> Result<()> {
+        use std::collections::HashMap;
+
+        use super::super::parallel_build::ParallelBuilder;
+
         anyhow::ensure!(
             matches!(
                 std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref(),
@@ -9179,79 +9206,187 @@ mod tests {
         let cache = paths::cache_dir();
         std::fs::create_dir_all(&cache)?;
         let directory = tempfile::tempdir_in(&cache)?;
-        let build_dir = directory.path().join("aur");
-        let checkout = build_dir.join("omg-coverage-fixture");
-        std::fs::create_dir_all(&checkout)?;
-        std::fs::write(
-            checkout.join("PKGBUILD"),
-            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG coverage fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-fixture/empty\"; }\n",
-        ).expect("write fixture file");
-        std::fs::write(
-            checkout.join(".SRCINFO"),
-            "pkgbase = omg-coverage-fixture\n\tpkgdesc = Inert OMG coverage fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-fixture\n",
-        ).expect("write fixture file");
-        let outputs = vec!["omg-coverage-fixture".to_owned()];
-        let dependencies = check_dependencies_for_outputs(&checkout, &outputs)?;
-        anyhow::ensure!(
-            dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
-            "fixture must never require dependency installation"
-        );
-        let mut settings = Settings::default();
-        settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
-        let client = AurClient {
-            build_dir,
-            settings,
-            package_base_locks: Arc::new(dashmap::DashMap::new()),
-        };
-        let mut hashes = Vec::new();
-        for _ in 0..2 {
-            let authorized = AuthorizedBuild {
-                lifecycle_guard: client.acquire_build_lifecycle().await?,
-                package: "omg-coverage-fixture".to_owned(),
-                requested_outputs: outputs.clone(),
-                reviewed_digest: ReviewedSource::capture(&checkout)?,
-            };
-            let result = client
-                .install_authorized_package_outputs(authorized, None)
-                .await;
-            let log_path = client.build_log_path("omg-coverage-fixture");
-            let log = std::fs::read_to_string(&log_path);
-            let diagnostic = format!(
-                "Native fixture build log ({}):\n{log:?}",
-                log_path.display()
-            );
-            let archives = result.context(diagnostic)?;
-            assert_eq!(archives.len(), 1);
-            let inspected = artifact_inspector::inspect_archive(&archives.archives[0].path())?;
-            assert_eq!(inspected.package_name, "omg-coverage-fixture");
-            assert!(inspected.install_hook.is_none());
-            hashes.push(inspected.archive_sha256);
-        }
-        assert_eq!(
-            hashes[0], hashes[1],
-            "repeated admission preserves archive identity"
-        );
-        std::fs::write(
-            checkout.join("PKGBUILD"),
-            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { printf 'intentional-fixture-failure\\n' >&2; return 1; }\n",
-        ).expect("write fixture file");
-        let authorized = AuthorizedBuild {
-            lifecycle_guard: client.acquire_build_lifecycle().await?,
-            package: "omg-coverage-fixture".to_owned(),
-            requested_outputs: outputs,
-            reviewed_digest: ReviewedSource::capture(&checkout)?,
-        };
-        let error = client
-            .install_authorized_package_outputs(authorized, None)
-            .await
-            .expect_err("a failed recipe must not reuse previously accepted archives");
-        let diagnostic = format!("{error:#}");
-        let error_kind = error.downcast_ref::<AurError>();
-        let build_failed = matches!(error_kind, Some(AurError::BuildFailed { .. }));
-        assert!(build_failed, "{diagnostic}");
-        let log = std::fs::read_to_string(client.build_log_path("omg-coverage-fixture"))?;
-        assert!(log.contains("intentional-fixture-failure"), "{log}");
-        Ok(())
+        let socket = directory.path().join("absent.sock");
+        temp_env::with_vars(
+            [
+                ("CARGO_PRIMARY_PACKAGE", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let build_dir = directory.path().join("aur");
+                        let checkout = build_dir.join("omg-coverage-fixture");
+                        std::fs::create_dir_all(&checkout)?;
+                        std::fs::write(
+                            checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG coverage fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-fixture/empty\"; }\n",
+                        ).expect("write fixture file");
+                        std::fs::write(
+                            checkout.join(".SRCINFO"),
+                            "pkgbase = omg-coverage-fixture\n\tpkgdesc = Inert OMG coverage fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-fixture\n",
+                        ).expect("write fixture file");
+                        let outputs = vec!["omg-coverage-fixture".to_owned()];
+                        let dependencies = check_dependencies_for_outputs(&checkout, &outputs)?;
+                        anyhow::ensure!(
+                            dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
+                            "fixture must never require dependency installation"
+                        );
+                        let mut settings = Settings::default();
+                        settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
+                        let client = AurClient {
+                            build_dir,
+                            settings,
+                            package_base_locks: Arc::new(dashmap::DashMap::new()),
+                        };
+                        let mut hashes = Vec::new();
+                        for _ in 0..2 {
+                            let authorized = AuthorizedBuild {
+                                lifecycle_guard: client.acquire_build_lifecycle().await?,
+                                package: "omg-coverage-fixture".to_owned(),
+                                requested_outputs: outputs.clone(),
+                                reviewed_digest: ReviewedSource::capture(&checkout)?,
+                            };
+                            let result = client
+                                .install_authorized_package_outputs(authorized, None)
+                                .await;
+                            let log_path = client.build_log_path("omg-coverage-fixture");
+                            let log = std::fs::read_to_string(&log_path);
+                            let diagnostic = format!(
+                                "Native fixture build log ({}):\n{log:?}",
+                                log_path.display()
+                            );
+                            let archives = result.context(diagnostic)?;
+                            assert_eq!(archives.len(), 1);
+                            let inspected = artifact_inspector::inspect_archive(&archives.archives[0].path())?;
+                            assert_eq!(inspected.package_name, "omg-coverage-fixture");
+                            assert!(inspected.install_hook.is_none());
+                            hashes.push(inspected.archive_sha256);
+                        }
+                        assert_eq!(
+                            hashes[0], hashes[1],
+                            "repeated admission preserves archive identity"
+                        );
+                        std::fs::write(
+                            checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { printf 'intentional-fixture-failure\\n' >&2; return 1; }\n",
+                        ).expect("write fixture file");
+                        let authorized = AuthorizedBuild {
+                            lifecycle_guard: client.acquire_build_lifecycle().await?,
+                            package: "omg-coverage-fixture".to_owned(),
+                            requested_outputs: outputs,
+                            reviewed_digest: ReviewedSource::capture(&checkout)?,
+                        };
+                        let error = client
+                            .install_authorized_package_outputs(authorized, None)
+                            .await
+                            .expect_err("a failed recipe must not reuse previously accepted archives");
+                        let diagnostic = format!("{error:#}");
+                        let error_kind = error.downcast_ref::<AurError>();
+                        let build_failed = matches!(error_kind, Some(AurError::BuildFailed { .. }));
+                        assert!(build_failed, "{diagnostic}");
+                        let log = std::fs::read_to_string(client.build_log_path("omg-coverage-fixture"))?;
+                        assert!(log.contains("intentional-fixture-failure"), "{log}");
+
+                        let success = "omg-coverage-wave-fixture";
+                        let failure = "omg-coverage-fixture";
+                        let success_checkout = client.build_dir.join(success);
+                        std::fs::create_dir_all(&success_checkout)?;
+                        std::fs::write(
+                            success_checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-wave-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG parallel wave fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-wave-fixture/empty\"; printf 'wave-success-complete\\n' >&2; }\n",
+                        )?;
+                        std::fs::write(
+                            success_checkout.join(".SRCINFO"),
+                            "pkgbase = omg-coverage-wave-fixture\n\tpkgdesc = Inert OMG parallel wave fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-wave-fixture\n",
+                        )?;
+                        let client = Arc::new(client);
+                        let builder = ParallelBuilder::new(Arc::clone(&client), 2);
+                        let empty = builder
+                            .build_level(1, 1, &[], &HashMap::new(), &mut HashMap::new())
+                            .await?;
+                        assert_eq!(empty.succeeded_output_count(), 0);
+                        assert_eq!(empty.failed_output_count(), 0);
+                        assert_eq!(empty.skipped_output_count(), 0);
+                        assert!(empty.failures().next().is_none());
+                        assert!(empty.skipped_outputs().is_empty());
+
+                        let packages = vec![failure.to_owned(), success.to_owned()];
+                        let mut jobs = HashMap::new();
+                        let mut authorizations = HashMap::new();
+                        let success_source = ReviewedSource::capture(&success_checkout)?.digest;
+                        for package in &packages {
+                            let checkout = client.build_dir.join(package);
+                            let outputs = vec![package.clone()];
+                            let dependencies = check_dependencies_for_outputs(&checkout, &outputs)?;
+                            anyhow::ensure!(
+                                dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
+                                "parallel fixture must never require dependency installation"
+                            );
+                            jobs.insert(package.clone(), BuildJob::new(package.clone(), Vec::new()));
+                            authorizations.insert(
+                                package.clone(),
+                                AuthorizedBuild {
+                                    lifecycle_guard: client.acquire_build_lifecycle().await?,
+                                    package: package.clone(),
+                                    requested_outputs: outputs,
+                                    reviewed_digest: ReviewedSource::capture(&checkout)?,
+                                },
+                            );
+                        }
+                        std::fs::remove_file(client.build_log_path(failure))?;
+                        let audit_path = paths::data_dir().join("audit/audit.jsonl");
+                        let before = std::fs::read_to_string(&audit_path)?;
+                        let error = builder
+                            .build_level(1, 1, &packages, &jobs, &mut authorizations)
+                            .await
+                            .expect_err("a collected native archive must reach inert installation refusal");
+                        assert!(authorizations.is_empty(), "both native jobs must be consumed");
+                        assert!(
+                            error.chain().any(|cause| {
+                                cause.to_string().lines().next()
+                                    == Some("Privilege elevation not supported in development mode.")
+                            }),
+                            "{error:#}"
+                        );
+                        let success_log = std::fs::read_to_string(client.build_log_path(success))?;
+                        assert!(success_log.contains("wave-success-complete"), "{success_log}");
+                        let failure_log = std::fs::read_to_string(client.build_log_path(failure))?;
+                        assert!(
+                            failure_log.contains("intentional-fixture-failure"),
+                            "{failure_log}"
+                        );
+                        let after = std::fs::read_to_string(audit_path)?;
+                        let entries = after
+                            .strip_prefix(&before)
+                            .context("native fixture audit must retain the pre-wave prefix")?
+                            .lines()
+                            .map(serde_json::from_str::<crate::core::security::audit::AuditEntry>)
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        assert_eq!(
+                            entries.iter().filter(|entry| {
+                                entry.description.starts_with("Package operation aur_inspection: succeeded;")
+                                    && entry.resource.contains(&format!("source_manifest_sha256={success_source}"))
+                                    && entry.resource.contains(&format!("{success} 1-1 archive_sha256="))
+                            }).count(),
+                            2,
+                            "both native archives must be inspected for the new wave source: {entries:?}"
+                        );
+                        assert!(
+                            entries.iter().any(|entry| {
+                                entry.description.starts_with("Package operation aur_paired_build: succeeded;")
+                                    && entry.resource.contains(&format!("source_manifest_sha256={success_source}"))
+                                    && entry.resource.contains(&format!("outputs={success}"))
+                                    && entry.resource.contains("result=exact-match")
+                            }),
+                            "successful wave fixture must complete independent exact-match verification: {entries:?}"
+                        );
+                        Ok(())
+                    })
+            },
+        )
     }
 
     #[test]
@@ -10117,6 +10252,59 @@ finally:
             alpm::PackageReason::Explicit,
             "an automatic build dependency request must preserve an existing explicit reason"
         );
+        drop(promoted);
+        let mut archives = Vec::new();
+        for name in ["omg-fixture-app", "omg-fixture-libs"] {
+            let archive = directory.path().join(format!("{name}-1-1-any.pkg.tar.gz"));
+            write_pkg_archive(
+                &archive,
+                &format!("pkgname = {name}\npkgbase = omg-fixture-split\npkgver = 1-1\n"),
+                None,
+            );
+            archives.push(ArchiveSnapshot::capture(&archive)?);
+        }
+        let mut batch = BuiltPackages {
+            archives,
+            profile: AurSecurityProfile::Hardened,
+            requested_outputs: BTreeSet::from(["omg-fixture-app".to_owned()]),
+        };
+        AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
+        let installed = || -> Result<Vec<(String, alpm::PackageReason)>> {
+            let alpm = alpm::Alpm::new(
+                root.to_str().context("fixture root")?,
+                database.to_str().context("fixture database")?,
+            )?;
+            let mut packages = alpm
+                .localdb()
+                .pkgs()
+                .iter()
+                .map(|package| (package.name().to_owned(), package.reason()))
+                .collect::<Vec<_>>();
+            packages.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok(packages)
+        };
+        use alpm::PackageReason::{Depend, Explicit};
+        assert_eq!(
+            installed()?,
+            vec![
+                ("helper".to_owned(), Explicit),
+                ("omg-fixture-app".to_owned(), Explicit),
+                ("omg-fixture-libs".to_owned(), Depend),
+            ],
+            "only requested outputs from an admitted build batch become explicit"
+        );
+        batch.requested_outputs.clear();
+        AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
+        assert_eq!(
+            installed()?[1].1,
+            Explicit,
+            "an automatic rebuild must not demote an existing explicit split output"
+        );
+        batch
+            .requested_outputs
+            .insert("omg-fixture-libs".to_owned());
+        AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
+        assert!(installed()?.iter().all(|(_, reason)| *reason == Explicit));
         Ok(())
     }
 

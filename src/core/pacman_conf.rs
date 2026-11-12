@@ -186,9 +186,22 @@ impl PacmanConfig {
     }
 
     pub fn parse_str(content: &str) -> Result<Self> {
+        enum Section {
+            Preamble,
+            Options,
+            Repository(RepoConfig),
+        }
+
+        let finish = |section: Section, repos: &mut Vec<RepoConfig>| {
+            if let Section::Repository(mut repo) = section {
+                if repo.usage.is_empty() {
+                    repo.usage = RepoUsage::ALL;
+                }
+                repos.push(repo);
+            }
+        };
         let mut config = PacmanConfig::default();
-        let mut current_section: Option<String> = None;
-        let mut current_repo: Option<RepoConfig> = None;
+        let mut current_section = Section::Preamble;
         let mut repository_names = HashSet::new();
 
         for line in content.lines() {
@@ -199,28 +212,26 @@ impl PacmanConfig {
             }
 
             if line.starts_with('[') && line.ends_with(']') {
-                if let Some(mut repo) = current_repo.take() {
-                    if repo.usage.is_empty() {
-                        repo.usage = RepoUsage::ALL;
-                    }
-                    config.repos.push(repo);
-                }
+                finish(
+                    std::mem::replace(&mut current_section, Section::Preamble),
+                    &mut config.repos,
+                );
 
                 let section = &line[1..line.len() - 1];
-                current_section = Some(section.to_string());
-
-                if section != "options" {
+                current_section = if section == "options" {
+                    Section::Options
+                } else {
                     validate_repository_name(section)?;
                     anyhow::ensure!(
                         repository_names.insert(section.to_string()),
                         "Duplicate pacman repository section: {section}"
                     );
-                    current_repo = Some(RepoConfig {
+                    Section::Repository(RepoConfig {
                         name: section.to_string(),
                         usage: RepoUsage::empty(),
                         ..Default::default()
-                    });
-                }
+                    })
+                };
                 continue;
             }
 
@@ -232,25 +243,18 @@ impl PacmanConfig {
                 (line, None)
             };
 
-            match current_section.as_deref() {
-                Some("options") => {
+            match &mut current_section {
+                Section::Options => {
                     Self::parse_option(&mut config, key, value)?;
                 }
-                Some(_) => {
-                    if let Some(ref mut repo) = current_repo {
-                        Self::parse_repo_option(repo, key, value)?;
-                    }
+                Section::Repository(repo) => {
+                    Self::parse_repo_option(repo, key, value)?;
                 }
-                None => {}
+                Section::Preamble => {}
             }
         }
 
-        if let Some(mut repo) = current_repo {
-            if repo.usage.is_empty() {
-                repo.usage = RepoUsage::ALL;
-            }
-            config.repos.push(repo);
-        }
+        finish(current_section, &mut config.repos);
 
         Ok(config)
     }
@@ -443,6 +447,30 @@ mod tests {
         assert_eq!(config.repos[0].name, "core");
         assert_eq!(config.repos[0].usage, RepoUsage::SEARCH);
         assert!(config.repos[0].servers.is_empty());
+    }
+
+    #[test]
+    fn section_transitions_keep_repository_and_option_state_separate() {
+        let config = PacmanConfig::parse_str(
+            "Usage = Invalid\nServer = ignored\n\
+             [first]\nServer = https://first.invalid\nUsage = Search\n\
+             [options]\nIgnorePkg = first-held\nServer = ignored\n\
+             [second]\nServer = https://second.invalid\nIgnorePkg = ignored\n\
+             [options]\nIgnorePkg = second-held\n\
+             [options]\nIgnorePkg = final-held\n",
+        )
+        .expect("mixed sections retain their own directives");
+        assert_eq!(
+            config.ignore_pkg,
+            ["first-held", "second-held", "final-held"]
+        );
+        assert_eq!(config.repos.len(), 2);
+        assert_eq!(config.repos[0].name, "first");
+        assert_eq!(config.repos[0].servers, ["https://first.invalid"]);
+        assert_eq!(config.repos[0].usage, RepoUsage::SEARCH);
+        assert_eq!(config.repos[1].name, "second");
+        assert_eq!(config.repos[1].servers, ["https://second.invalid"]);
+        assert_eq!(config.repos[1].usage, RepoUsage::ALL);
     }
 
     #[test]

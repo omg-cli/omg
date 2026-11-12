@@ -230,6 +230,110 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn list_updates_refreshes_sync_config_and_local_catalogs() -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_worker::tests::list_updates_refreshes_sync_config_and_local_catalogs";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
+            return Ok(());
+        }
+        assert!(!crate::core::is_root(), "fixture must run as ordinary user");
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = root.join("var/lib/pacman");
+        let local = database.join("local");
+        let sync = database.join("sync");
+        std::fs::create_dir_all(local.join("widget-1-1"))?;
+        std::fs::create_dir(&sync)?;
+        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n")?;
+        let local_desc =
+            |version: &str| format!("%NAME%\nwidget\n\n%VERSION%\n{version}\n\n%REASON%\n0\n\n");
+        std::fs::write(local.join("widget-1-1/desc"), local_desc("1-1"))?;
+        let write_sync = |version: &str| -> anyhow::Result<()> {
+            let content = format!("%NAME%\nwidget\n\n%VERSION%\n{version}\n\n%ARCH%\nx86_64\n\n");
+            let encoder = flate2::write::GzEncoder::new(
+                std::fs::File::create(sync.join("core.db.next"))?,
+                flate2::Compression::fast(),
+            );
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(
+                &mut header,
+                format!("widget-{version}/desc"),
+                content.as_bytes(),
+            )?;
+            archive.into_inner()?.finish()?;
+            std::fs::rename(sync.join("core.db.next"), sync.join("core.db"))?;
+            Ok(())
+        };
+        write_sync("2-1")?;
+        let config = directory.path().join("pacman.conf");
+        let configuration = "[options]\nSigLevel = Never\nArchitecture = x86_64\n[core]\n";
+        std::fs::write(&config, configuration)?;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+            }
+        }
+        let _restore = Restore;
+        crate::core::paths::set_test_overrides(Some(root), Some(database));
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None),
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+            ],
+            || -> anyhow::Result<()> {
+                let worker = AlpmWorker::new()?;
+                let assert_update = |old_version: &str, new_version: &str| -> anyhow::Result<()> {
+                    let updates = futures::executor::block_on(worker.list_updates())?;
+                    assert_eq!(updates.len(), 1, "expected the private widget update");
+                    let update = &updates[0];
+                    assert_eq!(
+                        (
+                            update.name.as_str(),
+                            update.old_version.as_str(),
+                            update.new_version.as_str(),
+                            update.repo.as_str(),
+                        ),
+                        ("widget", old_version, new_version, "core")
+                    );
+                    Ok(())
+                };
+                assert_update("1-1", "2-1")?;
+                assert_update("1-1", "2-1")?;
+
+                write_sync("3-1")?;
+                assert_update("1-1", "3-1")?;
+
+                std::fs::write(
+                    &config,
+                    "[options]\nSigLevel = Never\nArchitecture = x86_64\nIgnorePkg = widget\n[core]\n",
+                )?;
+                assert!(futures::executor::block_on(worker.list_updates())?.is_empty());
+                std::fs::write(&config, configuration)?;
+                assert_update("1-1", "3-1")?;
+
+                std::fs::rename(local.join("widget-1-1"), local.join("widget-2-1"))?;
+                std::fs::write(local.join("widget-2-1/desc"), local_desc("2-1"))?;
+                assert_update("2-1", "3-1")?;
+
+                std::fs::rename(local.join("widget-2-1"), local.join("widget-3-1"))?;
+                std::fs::write(local.join("widget-3-1/desc"), local_desc("3-1"))?;
+                assert!(futures::executor::block_on(worker.list_updates())?.is_empty());
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn initialization_errors_are_returned_to_the_caller() {
         const NAME: &str = "package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller";
         if crate::config::Settings::rerun_test_unprivileged(NAME) {

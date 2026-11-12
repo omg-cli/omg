@@ -1817,5 +1817,583 @@ class SourceAwareCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Mapped line coverage decreased|retained or ambiguous"):
             self.raw_ratio_retained_owner_compare((6, 4), (1, 1, 0, 0))
 
+
+class BooleanArgumentPaintTests(unittest.TestCase):
+    # Exact complete source items and LLVM rows from the frozen f2413f80/b22afa9b
+    # pair, translated together into a compact module retaining its cfg and glob.
+    base_source = '#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn transaction(\n        transaction_type: crate::core::history::TransactionType,\n        source: &str,\n        old_version: Option<&str>,\n        success: bool,\n    ) -> crate::core::history::Transaction {\n        crate::core::history::Transaction {\n            id: "test".to_string(),\n            timestamp: jiff::Timestamp::now(),\n            transaction_type,\n            changes: vec![crate::core::history::PackageChange {\n                name: "example".to_string(),\n                old_version: old_version.map(str::to_string),\n                new_version: Some("2.0-1".to_string()),\n                source: source.to_string(),\n            }],\n            success,\n        }\n    }\n\n    #[test]\n    fn rollback_plan_reverses_installs_and_restores_official_updates() -> Result<()> {\n        assert_eq!(\n            rollback_action(&transaction(\n                crate::core::history::TransactionType::Install,\n                "aur",\n                None,\n                true,\n            ))?,\n            RollbackAction::Remove(vec!["example".to_string()])\n        );\n        assert_eq!(\n            rollback_action(&transaction(\n                crate::core::history::TransactionType::Update,\n                "core",\n                Some("1.0-1"),\n                true,\n            ))?,\n            RollbackAction::Restore {\n                official: vec![("example".to_string(), "1.0-1".to_string())],\n                rebuild_from_aur: vec![],\n            }\n        );\n        Ok(())\n    }\n}\n'
+    base_owners = [{'branches': [],
+      'count': 6,
+      'filenames': ['/src/example.rs'],
+      'mcdc_records': [],
+      'name': '_RNvNtNtNtCs40j12eeWnis_7omg_lib3cli8commands5tests11transaction',
+      'regions': [[5, 5, 10, 43, 6, 0, 0, 0],
+                  [11, 9, 22, 10, 6, 0, 0, 0],
+                  [12, 17, 12, 23, 6, 0, 0, 0],
+                  [12, 24, 12, 33, 6, 0, 0, 0],
+                  [13, 24, 13, 44, 6, 0, 0, 0],
+                  [14, 13, 14, 29, 6, 0, 0, 0],
+                  [15, 22, 15, 26, 6, 0, 0, 0],
+                  [16, 23, 16, 32, 6, 0, 0, 0],
+                  [16, 33, 16, 42, 6, 0, 0, 0],
+                  [17, 30, 17, 41, 6, 0, 0, 0],
+                  [17, 42, 17, 45, 6, 0, 0, 0],
+                  [18, 30, 18, 55, 6, 0, 0, 0],
+                  [23, 5, 23, 6, 6, 0, 0, 0]]},
+     {'branches': [],
+      'count': 1,
+      'filenames': ['/src/example.rs'],
+      'mcdc_records': [],
+      'name': '_RNvNtNtNtCs40j12eeWnis_7omg_lib3cli8commands5testss_61rollback_plan_reverses_installs_and_restores_official_updates',
+      'regions': [[26, 5, 26, 85, 1, 0, 0, 0],
+                  [27, 9, 27, 19, 1, 0, 0, 0],
+                  [28, 13, 28, 28, 1, 0, 0, 0],
+                  [28, 29, 33, 14, 1, 0, 0, 0],
+                  [28, 30, 28, 41, 1, 0, 0, 0],
+                  [29, 17, 29, 63, 1, 0, 0, 0],
+                  [33, 15, 33, 16, 0, 0, 0, 0],
+                  [34, 13, 34, 64, 1, 0, 0, 0],
+                  [34, 36, 34, 40, 1, 0, 0, 0],
+                  [36, 9, 36, 19, 1, 0, 0, 0],
+                  [37, 13, 37, 28, 1, 0, 0, 0],
+                  [37, 29, 42, 14, 1, 0, 0, 0],
+                  [37, 30, 37, 41, 1, 0, 0, 0],
+                  [38, 17, 38, 62, 1, 0, 0, 0],
+                  [42, 15, 42, 16, 0, 0, 0, 0],
+                  [43, 13, 46, 14, 1, 0, 0, 0],
+                  [44, 27, 44, 31, 1, 0, 0, 0],
+                  [44, 33, 44, 42, 1, 0, 0, 0],
+                  [44, 43, 44, 52, 1, 0, 0, 0],
+                  [48, 9, 48, 15, 1, 0, 0, 0],
+                  [49, 5, 49, 6, 1, 0, 0, 0]]}]
+    base_segments = [[5, 5, 6, True, True, False],
+     [10, 43, 0, False, False, False],
+     [11, 9, 6, True, True, False],
+     [12, 17, 6, True, True, False],
+     [12, 23, 6, True, False, False],
+     [12, 24, 6, True, True, False],
+     [12, 33, 6, True, False, False],
+     [13, 24, 6, True, True, False],
+     [13, 44, 6, True, False, False],
+     [14, 13, 6, True, True, False],
+     [14, 29, 6, True, False, False],
+     [15, 22, 6, True, True, False],
+     [15, 26, 6, True, False, False],
+     [16, 23, 6, True, True, False],
+     [16, 32, 6, True, False, False],
+     [16, 33, 6, True, True, False],
+     [16, 42, 6, True, False, False],
+     [17, 30, 6, True, True, False],
+     [17, 41, 6, True, False, False],
+     [17, 42, 6, True, True, False],
+     [17, 45, 6, True, False, False],
+     [18, 30, 6, True, True, False],
+     [18, 55, 6, True, False, False],
+     [22, 10, 0, False, False, False],
+     [23, 5, 6, True, True, False],
+     [23, 6, 0, False, False, False],
+     [26, 5, 1, True, True, False],
+     [26, 85, 0, False, False, False],
+     [27, 9, 1, True, True, False],
+     [27, 19, 0, False, False, False],
+     [28, 13, 1, True, True, False],
+     [28, 28, 0, False, False, False],
+     [28, 29, 1, True, True, False],
+     [28, 30, 1, True, True, False],
+     [28, 41, 1, True, False, False],
+     [29, 17, 1, True, True, False],
+     [29, 63, 1, True, False, False],
+     [33, 14, 0, False, False, False],
+     [33, 15, 0, True, True, False],
+     [33, 16, 0, False, False, False],
+     [34, 13, 1, True, True, False],
+     [34, 36, 1, True, True, False],
+     [34, 40, 1, True, False, False],
+     [34, 64, 0, False, False, False],
+     [36, 9, 1, True, True, False],
+     [36, 19, 0, False, False, False],
+     [37, 13, 1, True, True, False],
+     [37, 28, 0, False, False, False],
+     [37, 29, 1, True, True, False],
+     [37, 30, 1, True, True, False],
+     [37, 41, 1, True, False, False],
+     [38, 17, 1, True, True, False],
+     [38, 62, 1, True, False, False],
+     [42, 14, 0, False, False, False],
+     [42, 15, 0, True, True, False],
+     [42, 16, 0, False, False, False],
+     [43, 13, 1, True, True, False],
+     [44, 27, 1, True, True, False],
+     [44, 31, 1, True, False, False],
+     [44, 33, 1, True, True, False],
+     [44, 42, 1, True, False, False],
+     [44, 43, 1, True, True, False],
+     [44, 52, 1, True, False, False],
+     [46, 14, 0, False, False, False],
+     [48, 9, 1, True, True, False],
+     [48, 15, 0, False, False, False],
+     [49, 5, 1, True, True, False],
+     [49, 6, 0, False, False, False]]
+    head_source = '#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn transaction(\n        transaction_type: crate::core::history::TransactionType,\n        source: &str,\n        old_version: Option<&str>,\n        success: bool,\n    ) -> crate::core::history::Transaction {\n        crate::core::history::Transaction {\n            id: "test".to_string(),\n            timestamp: jiff::Timestamp::now(),\n            transaction_type,\n            changes: vec![crate::core::history::PackageChange {\n                name: "example".to_string(),\n                old_version: old_version.map(str::to_string),\n                new_version: Some("2.0-1".to_string()),\n                source: source.to_string(),\n            }],\n            success,\n        }\n    }\n\n    #[test]\n    fn install_rollback_refuses_unproven_package_removal() {\n        for source in ["pacman", "local", "aur"] {\n            let mut recorded = transaction(\n                crate::core::history::TransactionType::Install,\n                source,\n                None,\n                true,\n            );\n            for version in [None, Some("1-1".to_owned())] {\n                recorded.changes[0].new_version = version;\n                let error = rollback_action(&recorded)\n                    .expect_err("install history does not prove this package was newly installed");\n                assert!(error.to_string().contains("newly installed"), "{error:#}");\n            }\n        }\n    }\n}\n'
+    head_owners = [{'branches': [],
+      'count': 8,
+      'filenames': ['/src/example.rs'],
+      'mcdc_records': [],
+      'name': '_RNvNtNtNtCskPrOzUXTdLt_7omg_lib3cli8commands5tests11transaction',
+      'regions': [[5, 5, 10, 43, 8, 0, 0, 0],
+                  [11, 9, 22, 10, 8, 0, 0, 0],
+                  [12, 17, 12, 23, 8, 0, 0, 0],
+                  [12, 24, 12, 33, 8, 0, 0, 0],
+                  [13, 24, 13, 44, 8, 0, 0, 0],
+                  [14, 13, 14, 29, 8, 0, 0, 0],
+                  [15, 22, 15, 26, 8, 0, 0, 0],
+                  [16, 23, 16, 32, 8, 0, 0, 0],
+                  [16, 33, 16, 42, 8, 0, 0, 0],
+                  [17, 30, 17, 41, 8, 0, 0, 0],
+                  [17, 42, 17, 45, 8, 0, 0, 0],
+                  [18, 30, 18, 55, 8, 0, 0, 0],
+                  [23, 5, 23, 6, 8, 0, 0, 0]]},
+     {'branches': [],
+      'count': 1,
+      'filenames': ['/src/example.rs'],
+      'mcdc_records': [],
+      'name': '_RNvNtNtNtCskPrOzUXTdLt_7omg_lib3cli8commands5testss_49install_rollback_refuses_unproven_package_removal',
+      'regions': [[26, 5, 26, 59, 1, 0, 0, 0],
+                  [27, 13, 27, 19, 3, 0, 0, 0],
+                  [27, 23, 27, 49, 1, 0, 0, 0],
+                  [28, 17, 28, 29, 3, 0, 0, 0],
+                  [28, 32, 28, 43, 3, 0, 0, 0],
+                  [29, 17, 29, 63, 3, 0, 0, 0],
+                  [30, 17, 30, 23, 3, 0, 0, 0],
+                  [31, 17, 31, 21, 3, 0, 0, 0],
+                  [34, 17, 34, 24, 6, 0, 0, 0],
+                  [34, 28, 34, 58, 3, 0, 0, 0],
+                  [34, 29, 34, 33, 3, 0, 0, 0],
+                  [35, 17, 35, 48, 6, 0, 0, 0],
+                  [35, 51, 35, 58, 6, 0, 0, 0],
+                  [36, 21, 36, 26, 6, 0, 0, 0],
+                  [36, 29, 36, 44, 6, 0, 0, 0],
+                  [36, 45, 36, 54, 6, 0, 0, 0],
+                  [37, 22, 37, 32, 6, 0, 0, 0],
+                  [37, 33, 37, 98, 6, 0, 0, 0],
+                  [38, 17, 38, 24, 6, 0, 0, 0],
+                  [38, 25, 38, 70, 6, 0, 0, 0],
+                  [41, 5, 41, 6, 1, 0, 0, 0]]}]
+    head_segments = [[5, 5, 8, True, True, False],
+     [10, 43, 0, False, False, False],
+     [11, 9, 8, True, True, False],
+     [12, 17, 8, True, True, False],
+     [12, 23, 8, True, False, False],
+     [12, 24, 8, True, True, False],
+     [12, 33, 8, True, False, False],
+     [13, 24, 8, True, True, False],
+     [13, 44, 8, True, False, False],
+     [14, 13, 8, True, True, False],
+     [14, 29, 8, True, False, False],
+     [15, 22, 8, True, True, False],
+     [15, 26, 8, True, False, False],
+     [16, 23, 8, True, True, False],
+     [16, 32, 8, True, False, False],
+     [16, 33, 8, True, True, False],
+     [16, 42, 8, True, False, False],
+     [17, 30, 8, True, True, False],
+     [17, 41, 8, True, False, False],
+     [17, 42, 8, True, True, False],
+     [17, 45, 8, True, False, False],
+     [18, 30, 8, True, True, False],
+     [18, 55, 8, True, False, False],
+     [22, 10, 0, False, False, False],
+     [23, 5, 8, True, True, False],
+     [23, 6, 0, False, False, False],
+     [26, 5, 1, True, True, False],
+     [26, 59, 0, False, False, False],
+     [27, 13, 3, True, True, False],
+     [27, 19, 0, False, False, False],
+     [27, 23, 1, True, True, False],
+     [27, 49, 0, False, False, False],
+     [28, 17, 3, True, True, False],
+     [28, 29, 0, False, False, False],
+     [28, 32, 3, True, True, False],
+     [28, 43, 0, False, False, False],
+     [29, 17, 3, True, True, False],
+     [29, 63, 0, False, False, False],
+     [30, 17, 3, True, True, False],
+     [30, 23, 0, False, False, False],
+     [31, 17, 3, True, True, False],
+     [31, 21, 0, False, False, False],
+     [34, 17, 6, True, True, False],
+     [34, 24, 0, False, False, False],
+     [34, 28, 3, True, True, False],
+     [34, 29, 3, True, True, False],
+     [34, 33, 3, True, False, False],
+     [34, 58, 0, False, False, False],
+     [35, 17, 6, True, True, False],
+     [35, 48, 0, False, False, False],
+     [35, 51, 6, True, True, False],
+     [35, 58, 0, False, False, False],
+     [36, 21, 6, True, True, False],
+     [36, 26, 0, False, False, False],
+     [36, 29, 6, True, True, False],
+     [36, 44, 0, False, False, False],
+     [36, 45, 6, True, True, False],
+     [36, 54, 0, False, False, False],
+     [37, 22, 6, True, True, False],
+     [37, 32, 0, False, False, False],
+     [37, 33, 6, True, True, False],
+     [37, 98, 0, False, False, False],
+     [38, 17, 6, True, True, False],
+     [38, 24, 0, False, False, False],
+     [38, 25, 6, True, True, False],
+     [38, 70, 0, False, False, False],
+     [41, 5, 1, True, True, False],
+     [41, 6, 0, False, False, False]]
+
+    def fixture(self):
+        return dict(name='example.rs', old=self.base_source.splitlines(),
+                    new=self.head_source.splitlines(), before={32: 1}, after={},
+                    base=copy.deepcopy(self.base_owners), head=copy.deepcopy(self.head_owners),
+                    base_files={'/src/example.rs': 'example.rs'},
+                    head_files={'/src/example.rs': 'example.rs'}, retained={32: 32},
+                    base_segments=copy.deepcopy(self.base_segments),
+                    head_segments=copy.deepcopy(self.head_segments))
+
+    def proof(self, value=None):
+        return coverage.retained_boolean_argument_paint(**(value or self.fixture()))
+
+    def compare(self, mutate=None):
+        value = self.fixture()
+        value['old'] = value['new'].copy()
+        value['base'] = copy.deepcopy(value['head'])
+        value['base_segments'] = copy.deepcopy(value['head_segments'])
+        value['base'][-1]['regions'].append([32, 17, 32, 21, 3, 0, 0, 0])
+        value['base_segments'].extend([[32, 17, 3, True, True, False],
+                                      [32, 21, 0, False, False, False]])
+        value['base_segments'].sort()
+        value['before'] = {row[0]: row[4] for owner in value['base'] for row in owner['regions']}
+        value['after'] = {row[0]: row[4] for owner in value['head'] for row in owner['regions']}
+        if mutate:
+            mutate(value)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            reports = []
+            for side, rows, segments, owners in (
+                    ('base', value['before'], value['base_segments'], value['base']),
+                    ('head', value['after'], value['head_segments'], value['head'])):
+                found, hit = value.get(side + '_summary', (len(rows), sum(count > 0 for count in rows.values())))
+                path = Path(directory) / (side + '.info')
+                path.write_text('SF:/src/example.rs\n' + ''.join(
+                    f'DA:{line},{count}\n' for line, count in sorted(rows.items())) +
+                    f'LF:{found}\nLH:{hit}\nend_of_record\n')
+                reports.append(coverage.read_coverage(path))
+                data = {'type': 'llvm.coverage.json.export', 'version': '3.1.0', 'data': [{
+                    'files': [{'filename': '/src/example.rs', 'segments': segments, 'expansions': [],
+                               'summary': {'lines': {'count': found, 'covered': hit}}}],
+                    'functions': owners}]}
+                region_path = Path(directory) / (side + '.gz')
+                region_path.write_bytes(gzip.compress(json.dumps(data).encode()))
+                paths.append(region_path)
+            return coverage.require_source_no_regression(
+                *reports, *paths, {'example.rs': value.get('old_raw', '\n'.join(value['old']).encode())},
+                {'example.rs': value.get('new_raw', '\n'.join(value['new']).encode())})
+
+    def test_boolean_paint_integration_proves_only_existing_pair_without_credit(self):
+        try:
+            receipt = self.compare()
+        except ValueError as error:
+            self.fail(f'proven eager boolean remains refused: {error}')
+        self.assertEqual(receipt['retained_boolean_argument_paint'][0]['pairs'], [[32, 32]])
+        for key in ('deleted_summary_found', 'deleted_summary_hit', 'deleted_mapped', 'deleted_mapped_hit'):
+            self.assertEqual(receipt[key], 0)
+
+    def test_boolean_actual_source_owner_fixture_records_both_base_occurrences(self):
+        receipts = self.proof()
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertEqual(receipt['pairs'], [[32, 32]])
+        self.assertEqual((receipt['argument_ordinal'], receipt['arity']), (4, 4))
+        self.assertEqual([entry['eligible'] for entry in receipt['base_occurrences']], [True, False])
+        self.assertIn('non-leaf', receipt['base_occurrences'][1]['reason'])
+        self.assertEqual(receipt['module_path'], ['tests'])
+        self.assertEqual(receipt['test_gates'], ['tests'])
+        self.assertEqual(receipt['head_call_region'], [28, 32, 28, 43, 3, 0, 0, 0])
+        self.assertEqual(receipt['head_continuation_region'], [34, 28, 34, 58, 3, 0, 0, 0])
+        self.assertFalse(any('credit' in key or 'deleted' in key for key in receipt))
+
+    def test_boolean_explicit_zero_or_any_head_line_mapping_is_refused(self):
+        for mode in ('da', 'positive_region', 'zero_region', 'positive_segment', 'zero_segment', 'gap_segment'):
+            value = self.fixture()
+            if mode == 'da':
+                value['after'][32] = 0
+            elif mode.endswith('region'):
+                value['head'][-1]['regions'].append([32, 17, 32, 21, int(mode == 'positive_region'), 0, 0, 0])
+            else:
+                value['head_segments'].extend([[32, 17, int(mode == 'positive_segment'), True, True,
+                                                mode == 'gap_segment'], [32, 21, 0, False, False, False]])
+                value['head_segments'].sort()
+            with self.subTest(mode=mode):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_exact_witnesses_are_required_and_counts_must_agree(self):
+        for line in (28, 34):
+            for mode in ('missing', 'zero', 'unequal', 'short_endpoint', 'foreign'):
+                value = self.fixture()
+                rows = value['head'][-1]['regions']
+                row = next(row for row in rows if row[:4] == ([28, 32, 28, 43] if line == 28 else [34, 28, 34, 58]))
+                if mode == 'missing':
+                    rows.remove(row)
+                elif mode == 'zero':
+                    row[4] = 0
+                elif mode == 'unequal':
+                    row[4] += 1
+                elif mode == 'short_endpoint':
+                    row[3] -= 1
+                else:
+                    value['head'].append(dict(name='foreign', filenames=['/src/example.rs'], regions=[row.copy()]))
+                with self.subTest(line=line, mode=mode):
+                    self.assertEqual(self.proof(value), [])
+
+    def test_boolean_complete_singleton_inventory_includes_unhit_owners(self):
+        for side in ('base', 'head'):
+            for index in (0, 1):
+                for duplicate_name in (True, False):
+                    value = self.fixture()
+                    extra = copy.deepcopy(value[side][index])
+                    if not duplicate_name:
+                        extra['name'] += '_other_copy'
+                    extra['count'] = 0
+                    for row in extra['regions']:
+                        row[4] = 0
+                    value[side].append(extra)
+                    with self.subTest(side=side, index=index, duplicate_name=duplicate_name):
+                        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_unsafe_arguments_and_lazy_or_bypass_shapes_are_refused(self):
+        for original, replacement in (
+                ('let mut recorded = transaction(', 'let mut recorded = || transaction('),
+                ('let mut recorded = transaction(', 'let mut recorded = async { transaction('),
+                ('let mut recorded = transaction(', 'let mut recorded = object.transaction('),
+                ('let mut recorded = transaction(', 'let mut recorded = transaction!('),
+                ('let mut recorded = transaction(', 'if false { let mut recorded = transaction('),
+                ('                source,', '                source(),'),
+                ('                source,', '                source[0],'),
+                ('                source,', '                source.field,'),
+                ('                source,', '                source?, '),
+                ('                true,', '                true && false,'),
+                ('                true,', '                false,'),
+                ('                true,', '                true, other(),'),
+                ('            for version in', '            if false {} for version in'),
+                ('            for version in', '        } for version in'),
+                ('            for version in', '            let lazy = || for version in')):
+            value = self.fixture()
+            value['new'] = '\n'.join(value['new']).replace(original, replacement).splitlines()
+            with self.subTest(replacement=replacement):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_binding_and_configuration_ambiguity_are_refused(self):
+        for original, replacement in (
+                ('use super::*;', 'use other::transaction;'),
+                ('#[cfg(test)]', '#[cfg(feature = "other")]'),
+                ('    fn transaction(', '    #[cfg(test)] fn transaction('),
+                ('    fn transaction(', '    async fn transaction('),
+                ('    fn transaction(', '    fn another_helper('),
+                ('    #[test]', '    #[unknown_generator]'),
+                ('fn install_rollback_refuses_unproven_package_removal()',
+                 'fn install_rollback_refuses_unproven_package_removal(transaction: fn())'),
+                ('let mut recorded = transaction(', 'let transaction = transaction('),
+                ('            for version in', '            let transaction = alias; for version in'),
+                ('            for version in', '            use other::transaction; for version in'),
+                ('            for version in', '            create_binding!(); for version in'),
+                ('use super::*;', 'use super::*; create_binding!();')):
+            value = self.fixture()
+            value['new'] = '\n'.join(value['new']).replace(original, replacement).splitlines()
+            with self.subTest(replacement=replacement):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_second_safe_occurrence_is_ambiguous_independent_of_values(self):
+        value = self.fixture()
+        value['old'] = '\n'.join(value['old']).replace('Some("1.0-1"),', 'None         ,').splitlines()
+        for row in value['base'][-1]['regions']:
+            if row[0] >= 36:
+                row[4] = 0
+        # Matching byte widths and a second unhit call isolate occurrence uniqueness.
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_caller_rename_and_different_positive_frequency_are_supported(self):
+        value = self.fixture()
+        original = 'install_rollback_refuses_unproven_package_removal'
+        value['new'] = '\n'.join(value['new']).replace(original, 'x' * len(original)).splitlines()
+        for row in value['head'][-1]['regions']:
+            if row[4] == 3:
+                row[4] = 4
+        for row in value['head_segments']:
+            if row[2] == 3:
+                row[2] = 4
+        self.assertEqual(self.proof(value)[0]['pairs'], [[32, 32]])
+
+    def test_boolean_unhit_header_only_copy_is_not_omitted_from_inventory(self):
+        value = self.fixture()
+        row = value['head'][-1]['regions'][0].copy()
+        row[4] = 0
+        value['head'].append(dict(name='unhit_sparse_copy', filenames=['/src/example.rs'], regions=[row]))
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_segment_counts_must_support_each_exact_witness(self):
+        for line, column in ((28, 32), (34, 28)):
+            for mode in ('missing', 'count', 'entry', 'gap'):
+                value = self.fixture()
+                row = next(row for row in value['head_segments'] if row[:2] == [line, column])
+                if mode == 'missing':
+                    value['head_segments'].remove(row)
+                elif mode == 'count':
+                    row[2] = 0
+                elif mode == 'entry':
+                    row[4] = False
+                else:
+                    row[5] = True
+                with self.subTest(line=line, mode=mode):
+                    self.assertEqual(self.proof(value), [])
+
+    def test_boolean_same_owner_overlaps_must_agree_with_the_exact_witness(self):
+        for shape in ([28, 33, 28, 42], [34, 30, 34, 32]):
+            for count in (0, 4):
+                value = self.fixture()
+                value['head'][-1]['regions'].append(shape + [count, 0, 0, 0])
+                with self.subTest(shape=shape, count=count):
+                    self.assertEqual(self.proof(value), [])
+
+    def test_boolean_inactive_segment_cannot_claim_a_region_entry(self):
+        value = self.fixture()
+        next(row for row in value['head_segments'] if not row[3])[4] = True
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_base_token_segments_cannot_contradict_positive_line_paint(self):
+        value = self.fixture()
+        value['base_segments'].extend([[32, 17, 0, True, True, False], [32, 21, 1, True, False, False]])
+        value['base_segments'].sort()
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_exact_source_guard_refuses_normalized_callee_byte_changes(self):
+        for separator in ('\r\n', '\v', '\u0085'):
+            def different_raw_source(value):
+                value['new_raw'] = separator.join(value['new']).encode()
+            with self.subTest(separator=repr(separator)), self.assertRaisesRegex(ValueError, 'Retained covered line'):
+                self.compare(different_raw_source)
+
+    def test_boolean_exact_source_guard_allows_optional_final_lf_and_records_raw_hash(self):
+        def trailing_lf(value):
+            value['old_raw'] = ('\n'.join(value['old']) + '\n').encode()
+        receipt = self.compare(trailing_lf)['retained_boolean_argument_paint'][0]
+        self.assertEqual(len(receipt['source_blob_sha256']), 2)
+        self.assertNotEqual(*receipt['source_blob_sha256'])
+        self.assertEqual(*receipt['source_lines_sha256'])
+
+    def test_boolean_call_signature_and_item_bounds_count_utf8_bytes(self):
+        for mode in ('call', 'signature', 'item'):
+            value = self.fixture()
+            if mode == 'call':
+                value['new'][29] += ' /*' + 'é' * 2100 + '*/'
+            else:
+                line, repetitions = (8, 2100) if mode == 'signature' else (11, 33000)
+                for side in ('old', 'new'):
+                    value[side][line] += ' /*' + 'é' * repetitions + '*/'
+            with self.subTest(mode=mode), mock.patch.object(
+                    coverage, 'require_rustfmt_syntax', side_effect=AssertionError('over-bound syntax invocation')):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_raw_identifier_and_late_block_glob_shadow_are_refused(self):
+        for original, replacement in (
+                ('fn install_rollback_refuses_unproven_package_removal()',
+                 'fn install_rollback_refuses_unproven_package_removal(r#transaction: fn())'),
+                ('        }\n    }', '        } use other::*;\n    }')):
+            value = self.fixture()
+            value['new'] = '\n'.join(value['new']).replace(original, replacement).splitlines()
+            self.assertEqual(self.proof(value), [])
+
+    def test_boolean_string_and_comment_tokens_do_not_create_occurrences(self):
+        value = self.fixture()
+        value['new'][-1] += ' // transaction(true), fn transaction() {}'
+        value['new'].append('const WORDS: &str = "transaction(true), fn transaction() {}";')
+        self.assertEqual(self.proof(value)[0]['pairs'], [[32, 32]])
+
+    def test_boolean_adjacent_tokens_cannot_be_joined_into_a_pure_leaf(self):
+        value = self.fixture()
+        value['new'] = '\n'.join(value['new']).replace('                source,', '                source as Text,').splitlines()
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_zero_callee_entry_and_nested_base_macro_are_refused(self):
+        for mode in ('callee', 'macro'):
+            value = self.fixture()
+            if mode == 'callee':
+                for row in value['head'][0]['regions']:
+                    row[4] = 0
+            else:
+                value['old'] = '\n'.join(value['old']).replace('rollback_action(&transaction(', 'rollback_actio!(&transaction(').splitlines()
+            self.assertEqual(self.proof(value), [])
+
+    def test_boolean_proof_preserves_all_supplied_evidence(self):
+        value = self.fixture()
+        original = copy.deepcopy(value)
+        self.assertEqual(len(self.proof(value)), 1)
+        self.assertEqual(value, original)
+
+    def test_boolean_changed_callee_or_base_attribution_is_refused(self):
+        value = self.fixture()
+        value['new'] = '\n'.join(value['new']).replace('"2.0-1"', '"3.0-1"').splitlines()
+        self.assertEqual(self.proof(value), [])
+        value = self.fixture()
+        value['before'][32] = 2
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_malformed_region_segment_and_parser_bounds_are_refused(self):
+        for mode in ('region_column', 'region_expansion', 'region_schema', 'foreign_file',
+                     'segment_schema', 'segment_column', 'segment_counter', 'missing_segments',
+                     'source_bound', 'nesting_bound', 'syntax'):
+            value = self.fixture()
+            if mode.startswith('region_'):
+                row = value['head'][-1]['regions'][0]
+                if mode == 'region_column': row[3] = 10000
+                elif mode == 'region_expansion': row[7] = 1
+                else: row.append(0)
+            elif mode == 'foreign_file':
+                value['head'][-1]['filenames'].append('/src/other.rs')
+            elif mode == 'segment_schema':
+                value['head_segments'][0].append(False)
+            elif mode == 'segment_column':
+                value['head_segments'][0][1] = 10000
+            elif mode == 'segment_counter':
+                value['head_segments'][0][2] = coverage.COUNTER_LIMIT
+            elif mode == 'missing_segments':
+                value['head_segments'] = None
+            elif mode == 'source_bound':
+                value['new'].append(' ' * (1024 * 1024 + 1))
+            elif mode == 'nesting_bound':
+                value['new'][0] = '(' * 33 + ')' * 33
+            else:
+                value['new'][27] = value['new'][27].replace('let mut', 'let mut mut')
+            with self.subTest(mode=mode):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_paint_does_not_hide_another_retained_zero(self):
+        with self.assertRaisesRegex(ValueError, 'Retained covered line'):
+            self.compare(lambda value: value['after'].__setitem__(36, 0))
+
+    def test_boolean_paint_preserves_new_zero_raw_counter_and_ratio_failures(self):
+        def new_zero(value):
+            value['new'].append('fn uncovered() { untested(); }')
+            value['after'][len(value['new'])] = 0
+        def summary_loss(value):
+            value['head_summary'] = (len(value['after']) + 1, len(value['after']))
+        for mutate, error in ((new_zero, 'New uncovered'), (summary_loss, 'Line coverage decreased'),
+                              (lambda value: value['after'].__setitem__(36, coverage.COUNTER_LIMIT),
+                               'Invalid LCOV coverage counter')):
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                self.compare(mutate)
+
+    def test_boolean_paint_requires_the_pinned_syntax_validator(self):
+        with mock.patch.object(coverage, 'require_rustfmt_syntax', side_effect=ValueError('parser unavailable')):
+            with self.assertRaisesRegex(ValueError, 'parser unavailable'):
+                self.proof()
+
+
 if __name__ == "__main__":
     unittest.main()

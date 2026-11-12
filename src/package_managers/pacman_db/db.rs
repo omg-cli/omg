@@ -858,7 +858,12 @@ impl LocalHealthSnapshot {
 pub fn parse_local_db(path: &Path) -> Result<HashMap<String, LocalDbPackage>> {
     let mut packages = HashMap::with_capacity(2000); // Pre-allocate for typical system
 
-    if !path.exists() {
+    if !path.try_exists().with_context(|| {
+        format!(
+            "Failed to inspect pacman local directory {}",
+            path.display()
+        )
+    })? {
         return Ok(packages);
     }
 
@@ -877,11 +882,6 @@ pub fn parse_local_db(path: &Path) -> Result<HashMap<String, LocalDbPackage>> {
         let desc_path = pkg_path.join("desc");
         let pkg = parse_local_desc(&desc_path)
             .with_context(|| format!("Incomplete local package entry {}", desc_path.display()))?;
-        anyhow::ensure!(
-            !pkg.name.is_empty(),
-            "Missing package name in {}",
-            desc_path.display()
-        );
         packages.insert(pkg.name.clone(), pkg);
     }
 
@@ -2426,6 +2426,60 @@ mod tests {
     }
 
     #[test]
+    fn malformed_sync_desc_rejects_repository_with_healthy_package() {
+        let cases: [(&str, &[u8], &str); 3] = [
+            (
+                "invalid-utf8",
+                b"%NAME%\nbroken\n\n%VERSION%\n1-1\n\n%DESC%\n\xff\n",
+                "Invalid UTF-8",
+            ),
+            (
+                "absent-name",
+                b"%VERSION%\n1-1\n\n%DESC%\nNameless package\n",
+                "Missing package name",
+            ),
+            (
+                "empty-name",
+                b"%NAME%\n\n%VERSION%\n1-1\n\n",
+                "Missing package name",
+            ),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let healthy = b"%NAME%\nhealthy\n\n%VERSION%\n1-1\n\n";
+        for (case, malformed, diagnostic) in cases {
+            let path = temp.path().join(format!("{case}.db"));
+            let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::fast(),
+            ));
+            for (entry, content) in [
+                ("healthy-1-1/desc", healthy.as_slice()),
+                ("broken-1-1/desc", malformed),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, entry, content).unwrap();
+            }
+            fs::write(&path, archive.into_inner().unwrap().finish().unwrap()).unwrap();
+
+            let error = parse_sync_db(&path, "custom")
+                .expect_err("a healthy package must not conceal malformed repository metadata");
+            let message = format!("{error:#}");
+            assert!(message.contains(diagnostic), "{case}: {message}");
+            assert!(message.contains("broken-1-1/desc"), "{case}: {message}");
+            assert!(message.contains("repository custom"), "{case}: {message}");
+            if case == "invalid-utf8" {
+                assert!(
+                    error.downcast_ref::<std::string::FromUtf8Error>().is_some(),
+                    "invalid UTF-8 must retain its decoding cause: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn truncated_sync_desc_payload_retains_entry_and_repository_context() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("custom.db");
@@ -2798,6 +2852,47 @@ mod tests {
                 )
             );
             assert_eq!(fs::read(&healthy_desc).unwrap(), healthy_bytes);
+        }
+    }
+
+    #[test]
+    fn malformed_local_desc_rejects_snapshot_with_healthy_package() {
+        let temp = tempfile::tempdir().unwrap();
+        write_local_desc(&temp, "healthy", "0", "");
+        let healthy_desc = temp.path().join("healthy/desc");
+        let healthy_bytes = fs::read(&healthy_desc).unwrap();
+        assert_eq!(parse_local_db(temp.path()).unwrap().len(), 1);
+        let broken = temp.path().join("broken-1-1");
+        fs::create_dir(&broken).unwrap();
+        let cases: [(&str, &[u8]); 3] = [
+            ("absent-name", b"%VERSION%\n1-1\n\n%REASON%\n0\n"),
+            ("empty-name", b"%NAME%\n\n%VERSION%\n1-1\n\n%REASON%\n0\n"),
+            (
+                "invalid-utf8",
+                b"%NAME%\nbroken\n\n%VERSION%\n1-1\n\n%DESC%\n\xff\n",
+            ),
+        ];
+        for (case, content) in cases {
+            fs::write(broken.join("desc"), content).unwrap();
+            let error = parse_local_db(temp.path())
+                .expect_err("a healthy package must not conceal malformed local metadata");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("Incomplete local package entry"),
+                "{case}: {message}"
+            );
+            assert!(message.contains("broken-1-1/desc"), "{case}: {message}");
+            if case == "invalid-utf8" {
+                assert!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|cause| { cause.kind() == std::io::ErrorKind::InvalidData }),
+                    "invalid UTF-8 must retain its decoding cause: {message}"
+                );
+            } else {
+                assert!(message.contains("no NAME found"), "{case}: {message}");
+            }
+            assert_eq!(fs::read(&healthy_desc).unwrap(), healthy_bytes, "{case}");
         }
     }
 

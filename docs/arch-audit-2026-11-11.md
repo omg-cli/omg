@@ -383,3 +383,49 @@ since their explicit Arch prerequisite excludes this Omarchy host.
 - Hardened admission rejects classified integration paths. It does not vet
   arbitrary program behavior or provide independent builder provenance. Use
   `allow_aur = false` when official repositories are the required trust boundary.
+
+## Arch execution and verification follow-up
+
+The follow-up consolidates the owned and supplied-handle ALPM transaction paths
+without changing the exported API. Both use the same preparation, question
+refusal, intent, commit and audit body. Supplied handles retain caller-owned
+repository registration. The pacman configuration parser now owns its current
+repository in one section enum, removing inconsistent optional states while
+preserving repository order, repeated Usage unions and default All behavior.
+
+A new unprivileged regression reproduced a local-database error being reported
+as a successful empty catalog. `Path::exists()` hid a permission error in an
+inaccessible ancestor. `try_exists()` now retains the underlying I/O error and
+path context; genuinely missing directories keep their existing behavior. The
+failing test was committed before the fix. Malformed UTF-8 and missing-name
+fixtures reject complete local and sync snapshots even beside healthy entries.
+The redundant outer empty-name check was removed after verifying that every
+successful typed and manual parser route already requires a name.
+
+The updated local run passed 2,190 library tests, with 11 native-only tests
+ignored. All-target Clippy with warnings denied, formatting, 42 CI workflow
+tests and the four ALPM pin tests passed. The rebuilt default-feature CLI passed
+seven read-only checks against the native host catalogs and preserved their
+package database fingerprint. Local test tools remain in the owned task cache.
+No host package installation, removal or policy changes were performed.
+
+Expanded disposable native fixtures cover supplied-handle installation,
+NEEDED retry, removal, public asynchronous removal, and sealed split-output
+admission with requested versus automatic installation reasons. The parallel
+AUR fixture retains paired-build and failed-rebuild checks and adds a successful
+independent sibling alongside a failed build. Final installation is deliberately
+refused through the existing development-mode boundary; it does not claim a
+successful parallel-wave installation. Runtime verification of these expanded
+native cases is pending at this source checkpoint.
+
+The strict coverage comparison exposed both missing domain execution and a
+compiler mapping omission for an eagerly evaluated boolean argument. The new
+bounded proof applies only to an already retained pair, requires exact local
+callee source, complete singleton owner inventories, matching positive call and
+continuation evidence, and absent literal mappings in both regions and segments.
+It grants no counter or deletion credit. Raw source line-ending admission keeps
+the callee comparison tied to exact Git bytes. Adversarial controls reject zero
+or overlapping evidence, ambiguous calls or bindings, oversized UTF-8 input and
+contradictory segments. The frozen prior-source replay proves that one pair and
+then fails on a separate retained line. A fresh combined-source coverage report
+and required hosted CI remain pending; no passing final coverage is claimed.

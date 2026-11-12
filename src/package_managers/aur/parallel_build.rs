@@ -283,7 +283,7 @@ impl ParallelBuilder {
         max_concurrent.max(1).min(level_len)
     }
 
-    async fn build_level(
+    pub(super) async fn build_level(
         &self,
         level_num: usize,
         total_levels: usize,

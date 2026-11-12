@@ -309,6 +309,69 @@ fn native_installation_preserves_mixed_intents() -> Result<()> {
         reason_promotion_was_audited && public_request_is_explicit,
         "reason-only promotion audited={reason_promotion_was_audited}; public request promoted to explicit={public_request_is_explicit}"
     );
+    let borrowed_archive = archive(&dir, "omg-fixture-borrowed", "1-1")?;
+    let configuration =
+        crate::core::pacman_conf::PacmanConfig::parse(crate::core::paths::pacman_conf_path())?;
+    {
+        let mut alpm = alpm::Alpm::new(
+            root.to_str().context("fixture root")?,
+            db.to_str().context("fixture database")?,
+        )?;
+        crate::package_managers::alpm_ops::register_configured_syncdbs(&alpm, &configuration)?;
+        for attempt in 0..2 {
+            let audit_before = fs::read_to_string(audit_path)?.lines().count();
+            crate::package_managers::execute_transaction(
+                vec![borrowed_archive.handoff()],
+                crate::package_managers::TransactionKind::Install,
+                Some(&mut alpm),
+            )?;
+            assert_eq!(
+                alpm.localdb().pkg("omg-fixture-borrowed")?.reason(),
+                Explicit,
+                "the borrowed handle must observe its committed requested installation"
+            );
+            assert_eq!(
+                fs::read(root.join("usr/share/omg-fixture/omg-fixture-borrowed"))?,
+                b"fixture\n"
+            );
+            assert_eq!(
+                fs::read_to_string(audit_path)?.lines().count(),
+                audit_before + if attempt == 0 { 2 } else { 0 },
+                "the NEEDED retry must not add a second committed installation or audit pair"
+            );
+            assert!(
+                !db.join("db.lck").exists(),
+                "each transaction must release the supplied handle's database lock"
+            );
+        }
+        crate::package_managers::execute_transaction(
+            vec!["omg-fixture-borrowed".to_owned()],
+            crate::package_managers::TransactionKind::Remove { recursive: false },
+            Some(&mut alpm),
+        )?;
+        assert!(alpm.localdb().pkg("omg-fixture-borrowed").is_err());
+    }
+    assert_eq!(
+        installed(&root, &db)?,
+        final_state,
+        "borrowed installation, NEEDED retry and removal preserve unrelated packages"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(
+        crate::package_managers::ArchPackageManager::new()
+            .remove(&["omg-fixture-requested".to_owned()]),
+    )?;
+    let mut expected = final_state;
+    expected.retain(|(name, _, _)| name != "omg-fixture-requested");
+    assert_eq!(installed(&root, &db)?, expected);
+    assert!(
+        !root
+            .join("usr/share/omg-fixture/omg-fixture-requested")
+            .exists(),
+        "the public asynchronous removal must remove the owned fixture payload"
+    );
     for test in [
         "package_managers::aur::client::tests::batch2_native_automatic_dependency_reason",
         CREATION_DENIAL_TEST,

@@ -846,6 +846,17 @@ mod tests {
             0o777,
             "configuration validation must not silently chmod a user directory"
         );
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        validate_config_path(directory.path(), "pkgdest").expect("accept a private directory");
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "private build directories must retain their existing permissions"
+        );
     }
 
     #[test]

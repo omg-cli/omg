@@ -491,12 +491,8 @@ pub enum TransactionKind {
 
 /// Execute a libalpm transaction.
 ///
-/// The `handle` parameter exists for callers that already own a configured
-/// ALPM handle (e.g. an elevated fast path); every current caller passes
-/// [`None`], which creates and configures a fresh handle. NOTE(wave2): the
-/// `Some(handle)` branch skips repository registration that the `None`
-/// branch performs — if you ever pass a handle, it must already have sync
-/// databases registered.
+/// A supplied handle must already have its sync databases registered. Passing
+/// [`None`] opens a fresh handle and registers the configured repositories.
 pub fn execute_transaction(
     packages: Vec<String>,
     kind: TransactionKind,
@@ -562,47 +558,30 @@ fn execute_transaction_with_intents(
     let pacman_config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load transaction options from pacman.conf")?;
 
-    if let Some(alpm) = handle {
+    let mut owned;
+    let alpm = if let Some(alpm) = handle {
         configure_transaction_options(alpm, &pacman_config)?;
-        configure_mirrors(alpm)?;
-        let refusals = Arc::new(Mutex::new(AlpmQuestionRefusals::default()));
-        let main_task = setup_alpm_callbacks(alpm, &refusals);
-        let tx_guard = prepare_alpm_transaction(alpm, packages.clone(), kind, &pacman_config)
-            .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
-        let reasons = installation_reasons(tx_guard.0, &packages, intents)?;
-        // Declined replacement questions make libalpm skip the replacement
-        // silently, so a successful prepare can still hide a refused mutation.
-        if let Some(error) = question_refusal_error(&refusals) {
-            return Err(error);
-        }
-        commit_alpm_transaction(
-            tx_guard.0,
-            &main_task,
-            kind,
-            &pacman_config.hold_pkg,
-            &reasons,
-            selections,
-        )
-        .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
-        return Ok(());
-    }
+        alpm
+    } else {
+        owned = open_default_alpm()?;
+        configure_transaction_options(&mut owned, &pacman_config)?;
+        anyhow::ensure!(
+            !pacman_config.repos.is_empty(),
+            "pacman configuration contains no repositories"
+        );
+        register_configured_syncdbs(&owned, &pacman_config)?;
+        &mut owned
+    };
 
-    let mut alpm = open_default_alpm()?;
-    configure_transaction_options(&mut alpm, &pacman_config)?;
-
-    if pacman_config.repos.is_empty() {
-        anyhow::bail!("pacman configuration contains no repositories");
-    }
-
-    register_configured_syncdbs(&alpm, &pacman_config)?;
-
-    configure_mirrors(&mut alpm)?;
+    configure_mirrors(alpm)?;
 
     let refusals = Arc::new(Mutex::new(AlpmQuestionRefusals::default()));
-    let main_task = setup_alpm_callbacks(&alpm, &refusals);
-    let tx_guard = prepare_alpm_transaction(&mut alpm, packages.clone(), kind, &pacman_config)
+    let main_task = setup_alpm_callbacks(alpm, &refusals);
+    let tx_guard = prepare_alpm_transaction(alpm, packages.clone(), kind, &pacman_config)
         .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
     let reasons = installation_reasons(tx_guard.0, &packages, intents)?;
+    // Declined replacement questions make libalpm skip the replacement
+    // silently, so a successful prepare can still hide a refused mutation.
     if let Some(error) = question_refusal_error(&refusals) {
         return Err(error);
     }
