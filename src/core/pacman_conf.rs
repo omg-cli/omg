@@ -434,6 +434,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directives_before_a_section_do_not_configure_a_later_repository() {
+        let config = PacmanConfig::parse_str(
+            "Server = https://ignored.invalid\nUsage = Unknown\n[core]\nUsage = Search\n",
+        )
+        .expect("pre-section directives are ignored");
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].name, "core");
+        assert_eq!(config.repos[0].usage, RepoUsage::SEARCH);
+        assert!(config.repos[0].servers.is_empty());
+    }
+
+    #[test]
     fn repository_usage_defaults_and_repeated_directives() {
         let config = PacmanConfig::parse_str(
             "[default]\n[restricted]\nUsage = Sync Search\nUsage = Upgrade\n[all]\nUsage = All\n",

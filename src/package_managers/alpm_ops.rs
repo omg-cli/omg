@@ -112,6 +112,9 @@ pub(crate) fn validate_sync_database(alpm: &alpm::Alpm, database: &alpm::Db) -> 
         "Repository '{}' is not a regular database",
         database.name()
     );
+    // libalpm loads catalogs lazily. A parse failure invalidates the database,
+    // while pkgs() alone represents both failure and a valid empty catalog as [].
+    let _ = database.pkgs();
     database
         .is_valid()
         .with_context(|| format!("Repository '{}' failed native validation", database.name()))
@@ -2015,37 +2018,347 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn prepared_dependency_keeps_selected_repository_and_constraints() -> anyhow::Result<()> {
-        use crate::package_managers::arch_install::OfficialTarget;
-        let directory = tempfile::tempdir()?;
-        let root = directory.path().join("root");
-        let database = directory.path().join("db");
-        std::fs::create_dir_all(&root)?;
-        std::fs::create_dir_all(database.join("local"))?;
-        std::fs::create_dir_all(database.join("sync"))?;
-        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
-        for (repository, version) in [("high", "1-1"), ("low", "2-1")] {
-            let content = format!(
-                "%NAME%\nhelper\n\n%VERSION%\n{version}\n\n%FILENAME%\nhelper-{version}-any.pkg.tar.zst\n\n%ARCH%\nany\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n"
-            );
-            let file = std::fs::File::create(database.join(format!("sync/{repository}.db")))?;
+    struct RepositoryFixture {
+        directory: tempfile::TempDir,
+    }
+
+    impl RepositoryFixture {
+        fn new() -> anyhow::Result<Self> {
+            let directory = tempfile::tempdir()?;
+            std::fs::create_dir(directory.path().join("root"))?;
+            std::fs::create_dir_all(directory.path().join("db/local"))?;
+            std::fs::create_dir(directory.path().join("db/sync"))?;
+            std::fs::write(directory.path().join("db/local/ALPM_DB_VERSION"), "9\n")?;
+            Ok(Self { directory })
+        }
+
+        fn database(&self) -> std::path::PathBuf {
+            self.directory.path().join("db")
+        }
+
+        fn write_sync(
+            &self,
+            repository: &str,
+            packages: &[(&str, &str, &str)],
+        ) -> anyhow::Result<()> {
+            let file =
+                std::fs::File::create(self.database().join(format!("sync/{repository}.db")))?;
             let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
                 file,
                 flate2::Compression::fast(),
             ));
-            let mut header = tar::Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            archive.append_data(
-                &mut header,
-                format!("helper-{version}/desc"),
-                content.as_bytes(),
-            )?;
+            for (name, version, extra) in packages {
+                let content = format!(
+                    "%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%FILENAME%\n{name}-{version}-any.pkg.tar.zst\n\n%ARCH%\nany\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n{extra}"
+                );
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(
+                    &mut header,
+                    format!("{name}-{version}/desc"),
+                    content.as_bytes(),
+                )?;
+            }
             archive.into_inner()?.finish()?;
+            Ok(())
         }
-        let mut alpm = alpm::Alpm::new(root.to_str().unwrap(), database.to_str().unwrap())?;
+
+        fn write_local(&self, name: &str, version: &str) -> anyhow::Result<()> {
+            let package = self.database().join(format!("local/{name}-{version}"));
+            std::fs::create_dir(&package)?;
+            std::fs::write(
+                package.join("desc"),
+                format!("%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%ARCH%\nany\n\n%REASON%\n0\n\n"),
+            )?;
+            Ok(())
+        }
+
+        fn open(&self) -> anyhow::Result<alpm::Alpm> {
+            Ok(alpm::Alpm::new(
+                self.directory
+                    .path()
+                    .join("root")
+                    .to_str()
+                    .expect("UTF-8 root"),
+                self.database().to_str().expect("UTF-8 database"),
+            )?)
+        }
+    }
+
+    #[test]
+    fn repository_usage_controls_info_and_update_candidates() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_local("helper", "1-1")?;
+        fixture.write_sync("excluded", &[("helper", "9-1", "")])?;
+        fixture.write_sync("eligible", &[("helper", "2-1", "")])?;
+        let alpm = fixture.open()?;
+        let excluded = alpm.register_syncdb("excluded", alpm::SigLevel::NONE)?;
+        excluded.set_usage(alpm::Usage::UPGRADE)?;
+        alpm.register_syncdb("eligible", alpm::SigLevel::NONE)?
+            .set_usage(alpm::Usage::SEARCH | alpm::Usage::UPGRADE)?;
+
+        let info = super::get_pkg_info_from_db(&alpm, "helper")?.expect("eligible package");
+        assert_eq!(info.repo, "eligible");
+        assert_eq!(info.version.to_string(), "2-1");
+        assert!(
+            info.installed,
+            "the selected package is installed at version 1"
+        );
+
+        excluded.set_usage(alpm::Usage::SEARCH)?;
+        let updates = super::collect_updates(&alpm)?;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].name, "helper");
+        assert_eq!(updates[0].old_version, "1-1");
+        assert_eq!(updates[0].new_version, "2-1");
+        assert_eq!(updates[0].repo, "eligible");
+        Ok(())
+    }
+
+    #[test]
+    fn info_refuses_unavailable_eligible_repositories() -> anyhow::Result<()> {
+        for corrupt in [false, true] {
+            let fixture = RepositoryFixture::new()?;
+            fixture.write_sync("healthy", &[("helper", "2-1", "")])?;
+            if corrupt {
+                std::fs::write(
+                    fixture.database().join("sync/unavailable.db"),
+                    b"invalid database",
+                )?;
+            }
+            let alpm = fixture.open()?;
+            alpm.register_syncdb("healthy", alpm::SigLevel::NONE)?;
+            alpm.register_syncdb("unavailable", alpm::SigLevel::NONE)?
+                .set_usage(alpm::Usage::SEARCH)?;
+            let error = super::get_pkg_info_from_db(&alpm, "absent").expect_err(if corrupt {
+                "a corrupt eligible catalog cannot establish absence"
+            } else {
+                "a missing eligible catalog cannot establish absence"
+            });
+            let message = error.to_string();
+            assert!(message.contains("Repository 'unavailable'"), "{error:#}");
+            assert!(
+                message.contains(if corrupt {
+                    "failed native validation"
+                } else {
+                    "is unavailable"
+                }),
+                "{error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_database_validation_refuses_a_directory() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        let path = fixture.database().join("sync/nonregular.db");
+        std::fs::create_dir(&path)?;
+        let alpm = fixture.open()?;
+        let database = alpm.register_syncdb("nonregular", alpm::SigLevel::NONE)?;
+        let error = super::validate_sync_database(&alpm, database)
+            .expect_err("a database path must be a regular file");
+        assert!(
+            error
+                .to_string()
+                .contains("Repository 'nonregular' is not a regular database"),
+            "{error:#}"
+        );
+        assert!(
+            path.is_dir(),
+            "validation must preserve the rejected object"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_dependency_refuses_a_missing_repository_or_package() -> anyhow::Result<()> {
+        use crate::package_managers::arch_install::OfficialTarget;
+        let original = RepositoryFixture::new()?;
+        original.write_sync("selected", &[("helper", "2-1", "")])?;
+        let selected = {
+            let alpm = original.open()?;
+            let database = alpm.register_syncdb("selected", alpm::SigLevel::NONE)?;
+            let package = database.pkg("helper")?;
+            OfficialTarget {
+                repository: database.name().to_owned(),
+                name: package.name().to_owned(),
+                relations: vec!["helper>=2".to_owned()],
+            }
+        };
+        let changed = RepositoryFixture::new()?;
+        changed.write_sync("selected", &[("other", "2-1", "")])?;
+        let alpm = changed.open()?;
+        let error = super::validate_prepared_selections(&alpm, std::slice::from_ref(&selected))
+            .expect_err("a removed selected repository cannot be substituted");
+        assert!(
+            error
+                .to_string()
+                .contains("Selected repository 'selected' is no longer configured"),
+            "{error:#}"
+        );
+        alpm.register_syncdb("selected", alpm::SigLevel::NONE)?;
+        let error = super::validate_prepared_selections(&alpm, &[selected])
+            .expect_err("a removed selected package cannot be substituted");
+        assert!(
+            error
+                .to_string()
+                .contains("Selected package 'selected/helper' is no longer available"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_dependency_uses_installed_state_only_when_present() -> anyhow::Result<()> {
+        use crate::package_managers::arch_install::OfficialTarget;
+        for installed in [false, true] {
+            let fixture = RepositoryFixture::new()?;
+            fixture.write_sync("selected", &[("helper", "2-1", "")])?;
+            if installed {
+                fixture.write_local("helper", "2-1")?;
+            }
+            let mut alpm = fixture.open()?;
+            alpm.register_syncdb("selected", alpm::SigLevel::NONE)?;
+            let targets = if installed {
+                vec!["selected/helper".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let prepared = super::prepare_alpm_transaction(
+                &mut alpm,
+                targets,
+                super::TransactionKind::Install,
+                &crate::core::pacman_conf::PacmanConfig::default(),
+            )?;
+            prepared
+                .0
+                .trans_prepare()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            assert!(
+                prepared.0.trans_add().is_empty(),
+                "the fixture must prepare no package changes"
+            );
+            let selection = OfficialTarget {
+                repository: "selected".to_owned(),
+                name: "helper".to_owned(),
+                relations: vec!["helper>=2".to_owned(), "helper<3".to_owned()],
+            };
+            let result = super::validate_prepared_selections(prepared.0, &[selection]);
+            if installed {
+                result?;
+                assert_eq!(
+                    prepared.0.localdb().pkg("helper")?.reason(),
+                    alpm::PackageReason::Explicit
+                );
+            } else {
+                let error =
+                    result.expect_err("a selected dependency must be prepared or installed");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("neither prepared nor already installed"),
+                    "{error:#}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_virtual_dependency_preserves_provision_constraints() -> anyhow::Result<()> {
+        use crate::package_managers::arch_install::OfficialTarget;
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync(
+            "selected",
+            &[("provider", "7-1", "%PROVIDES%\nvirtual-helper=2\n\n")],
+        )?;
+        let mut alpm = fixture.open()?;
+        alpm.register_syncdb("selected", alpm::SigLevel::NONE)?;
+        let prepared = super::prepare_alpm_transaction(
+            &mut alpm,
+            vec!["selected/provider".to_owned()],
+            super::TransactionKind::Install,
+            &crate::core::pacman_conf::PacmanConfig::default(),
+        )?;
+        prepared
+            .0
+            .trans_prepare()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        assert_eq!(
+            prepared
+                .0
+                .trans_add()
+                .first()
+                .expect("prepared provider")
+                .name(),
+            "provider"
+        );
+        let selection = OfficialTarget {
+            repository: "selected".to_owned(),
+            name: "provider".to_owned(),
+            relations: vec![
+                "virtual-helper>=2".to_owned(),
+                "virtual-helper<3".to_owned(),
+            ],
+        };
+        super::validate_prepared_selections(prepared.0, std::slice::from_ref(&selection))?;
+        let stale = OfficialTarget {
+            relations: vec!["virtual-helper>=3".to_owned()],
+            ..selection
+        };
+        let error = super::validate_prepared_selections(prepared.0, &[stale])
+            .expect_err("the provider package version must not replace its provision version");
+        assert!(
+            error
+                .to_string()
+                .contains("no longer satisfies 'virtual-helper>=3'"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reason_persistence_reports_a_missing_installed_package() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_local("unrelated", "1-1")?;
+        let description = fixture.database().join("local/unrelated-1-1/desc");
+        let before = std::fs::read(&description)?;
+        let alpm = fixture.open()?;
+        let error = super::persist_installation_reasons(
+            &alpm,
+            &[("absent".to_owned(), alpm::PackageReason::Depend)],
+        )
+        .expect_err("missing postcommit state must require inspection before retry");
+        assert!(
+            error
+                .to_string()
+                .contains("installed package 'absent' could not be found"),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("inspect installed state before retrying"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(description)?, before);
+        assert_eq!(
+            alpm.localdb().pkg("unrelated")?.reason(),
+            alpm::PackageReason::Explicit
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_dependency_keeps_selected_repository_and_constraints() -> anyhow::Result<()> {
+        use crate::package_managers::arch_install::OfficialTarget;
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync("high", &[("helper", "1-1", "")])?;
+        fixture.write_sync("low", &[("helper", "2-1", "")])?;
+        let mut alpm = fixture.open()?;
         alpm.register_syncdb("high", alpm::SigLevel::NONE)?;
         alpm.register_syncdb("low", alpm::SigLevel::NONE)?;
         let selected = OfficialTarget {

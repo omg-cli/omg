@@ -9812,9 +9812,11 @@ finally:
         std::fs::write(fixture.db.join("local/ALPM_DB_VERSION"), "9\n")?;
         write_review_repository(&fixture.db, "high", "1-1", "virtual-helper=5")?;
         write_review_repository(&fixture.db, "low", "2-1", "virtual-helper=10")?;
+        write_review_repository(&fixture.db, "search-only", "99-1", "virtual-helper=99")?;
+        write_tar_gz(&fixture.db.join("sync/empty.db"), &[]);
         std::fs::write(
             &fixture.conf,
-            "[options]\nSigLevel = Never\n[high]\n[low]\n",
+            "[options]\nSigLevel = Never\n[search-only]\nUsage = Search\n[empty]\n[high]\n[low]\n",
         )?;
         fixture.with_environment(async {
             let client = fixture.client();
@@ -9832,6 +9834,11 @@ finally:
                     intent: InstallIntent::Automatic,
                 }).collect())?;
             }
+            S72Fixture::index(&["aur-helper"])?;
+            std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
+            let plan = client.aur_dependency_plan(fixture.directory.path(), "demo", &["demo".to_owned()]).await?;
+            assert!(plan.official_dependencies.is_empty());
+            assert_eq!(plan.aur_dependencies, ["aur-helper"]);
             std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = helper<2\ndepends = helper>=2\n")?;
             client.aur_dependency_plan(fixture.directory.path(), "demo", &["demo".to_owned()]).await
                 .expect_err("contradictory constraints must fail closed before installation");
@@ -9961,36 +9968,103 @@ finally:
     }
 
     #[tokio::test]
-    #[ignore = "mutates only the explicitly provisioned disposable Arch guest"]
+    #[ignore = "requires an explicitly provisioned disposable native Arch fixture"]
     async fn batch2_native_automatic_dependency_reason() -> Result<()> {
         anyhow::ensure!(
-            std::env::var("OMG_ARCH_BATCH2_NATIVE").as_deref() == Ok("1"),
-            "guest fixture prerequisite: OMG_ARCH_BATCH2_NATIVE=1 is required"
+            std::env::var("OMG_ARCH_INSTALL_FIXTURE").as_deref() == Ok("isolated-container"),
+            "OMG_ARCH_INSTALL_FIXTURE=isolated-container is required"
         );
         anyhow::ensure!(crate::core::is_root(), "guest fixture requires root");
-        let product = std::fs::read_to_string("/sys/class/dmi/id/product_name")?;
-        let vendor = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")?;
-        anyhow::ensure!(
-            product.contains("QEMU") || product.contains("KVM") || vendor.trim() == "QEMU",
-            "fixture requires the disposable QEMU guest"
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = directory.path().join("db");
+        let cache = root.join("var/cache/pacman/pkg");
+        for path in [
+            root.join("etc/pacman.d/gnupg"),
+            database.join("local"),
+            database.join("sync"),
+            cache.clone(),
+        ] {
+            std::fs::create_dir_all(path)?;
+        }
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
+        let filename = "helper-2-1-any.pkg.tar.gz";
+        let package = cache.join(filename);
+        write_pkg_archive(
+            &package,
+            "pkgname = helper\npkgbase = helper\npkgver = 2-1\n",
+            None,
         );
-        const HELPER: &str = "omg-batch2-helper";
-        let before = alpm::Alpm::new("/", "/var/lib/pacman")?;
-        anyhow::ensure!(
-            before.localdb().pkg(HELPER).is_err(),
-            "fixture helper must be absent before the transaction"
+        let bytes = std::fs::read(&package)?;
+        let desc = format!(
+            "%NAME%\nhelper\n\n%VERSION%\n2-1\n\n%DESC%\ninert automatic dependency fixture\n\n%ARCH%\nany\n\n%FILENAME%\n{filename}\n\n%CSIZE%\n{}\n\n%ISIZE%\n0\n\n%SHA256SUM%\n{}\n\n",
+            bytes.len(),
+            hex::encode(Sha256::digest(&bytes))
         );
+        write_tar_gz(
+            &database.join("sync/omg-fixture.db"),
+            &[("helper-2-1/desc", desc.as_bytes())],
+        );
+        let configuration = directory.path().join("pacman.conf");
+        std::fs::write(
+            &configuration,
+            format!(
+                "[options]\nArchitecture = auto\nSigLevel = Never\n[omg-fixture]\nSigLevel = Never\nServer = file://{}\n",
+                cache.display()
+            ),
+        )?;
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
+        assert!(
+            std::process::Command::new("mount")
+                .args(["--make-rprivate", "/"])
+                .status()?
+                .success()
+        );
+        assert!(
+            std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(&configuration)
+                .arg("/etc/pacman.conf")
+                .status()?
+                .success()
+        );
+        crate::core::paths::set_test_overrides(Some(root.clone()), Some(database.clone()));
+        let before = alpm::Alpm::new(
+            root.to_str().context("fixture root")?,
+            database.to_str().context("fixture database")?,
+        )?;
+        assert_eq!(before.localdb().pkgs().len(), 0);
         drop(before);
         let selected = crate::package_managers::alpm_direct::with_handle(|alpm| {
-            resolve_official_dependency(alpm, HELPER)?
+            resolve_official_dependency(alpm, "helper>=2")?
                 .context("fixture helper is absent from sync repositories")
         })?;
-        AurClient::install_official_dependencies(&[selected]).await?;
-        let after = alpm::Alpm::new("/", "/var/lib/pacman")?;
+        assert_eq!(selected.repository, "omg-fixture");
+        AurClient::install_official_dependencies(std::slice::from_ref(&selected)).await?;
+        let after = alpm::Alpm::new(
+            root.to_str().context("fixture root")?,
+            database.to_str().context("fixture database")?,
+        )?;
+        assert_eq!(after.localdb().pkgs().len(), 1);
         assert_eq!(
-            after.localdb().pkg(HELPER)?.reason(),
+            after.localdb().pkg("helper")?.reason(),
             alpm::PackageReason::Depend,
             "new official AUR build dependencies must remain eligible for orphan cleanup"
+        );
+        drop(after);
+        use crate::package_managers::traits::PackageManager;
+        crate::package_managers::ArchPackageManager::new()
+            .install(&["omg-fixture/helper".to_owned()])
+            .await?;
+        AurClient::install_official_dependencies(&[selected]).await?;
+        let promoted = alpm::Alpm::new(
+            root.to_str().context("fixture root")?,
+            database.to_str().context("fixture database")?,
+        )?;
+        assert_eq!(
+            promoted.localdb().pkg("helper")?.reason(),
+            alpm::PackageReason::Explicit,
+            "an automatic build dependency request must preserve an existing explicit reason"
         );
         Ok(())
     }

@@ -10,6 +10,125 @@ use crate::core::security::artifact::ArchiveSnapshot;
 const TEST: &str =
     "package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents";
 
+fn assert_descriptor_denial(test: &str, syscall: nix::libc::c_long, argument: u32) {
+    use nix::libc;
+
+    assert_eq!(
+        std::env::var("OMG_ARCH_INSTALL_FIXTURE").as_deref(),
+        Ok("isolated-container"),
+        "kernel-policy fault injection requires the disposable native fixture"
+    );
+    assert!(crate::core::is_root(), "native fixture requires root");
+    if std::env::var("OMG_DESCRIPTOR_DENIAL_TEST").as_deref() == Ok(test) {
+        let request = InstallRequest::new(vec![InstallItem {
+            target: InstallTarget::Named("omg-fixture-denied".to_owned()),
+            intent: InstallIntent::Requested,
+        }])
+        .expect("valid requested installation");
+        let error = request
+            .seal()
+            .err()
+            .expect("kernel denial must refuse the installation handoff");
+        assert_eq!(
+            error.downcast_ref::<rustix::io::Errno>(),
+            Some(&rustix::io::Errno::PERM)
+        );
+        return;
+    }
+    let instruction = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
+    let filters = [
+        instruction((libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16, 0, 0, 0),
+        instruction(
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            0,
+            3,
+            syscall as u32,
+        ),
+        instruction(
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            0,
+            0,
+            (std::mem::offset_of!(libc::seccomp_data, args) + std::mem::size_of::<u64>()) as u32,
+        ),
+        instruction(
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            0,
+            1,
+            argument,
+        ),
+        instruction(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            0,
+            0,
+            libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        ),
+        instruction(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            0,
+            0,
+            libc::SECCOMP_RET_ALLOW,
+        ),
+    ];
+    let mut bytes = Vec::new();
+    for filter in filters {
+        bytes.extend_from_slice(&filter.code.to_ne_bytes());
+        bytes.extend_from_slice(&[filter.jt, filter.jf]);
+        bytes.extend_from_slice(&filter.k.to_ne_bytes());
+    }
+    let directory = tempfile::tempdir().expect("private seccomp fixture");
+    let path = directory.path().join("descriptor-denial.bpf");
+    fs::write(&path, bytes).expect("write raw native BPF instructions");
+    let output = std::process::Command::new("setpriv")
+        .args(["--no-new-privs", "--seccomp-filter"])
+        .arg(&path)
+        .arg(std::env::current_exe().expect("fixture executable"))
+        .args([
+            "--exact",
+            test,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("OMG_DESCRIPTOR_DENIAL_TEST", test)
+        .output()
+        .expect("run confined descriptor fixture");
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "descriptor denial fixture failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "restricts only an explicitly provisioned disposable native fixture child"]
+fn descriptor_creation_denial_refuses_installation_handoff() {
+    use rustix::fs::MemfdFlags;
+    assert_descriptor_denial(
+        concat!(
+            module_path!(),
+            "::descriptor_creation_denial_refuses_installation_handoff"
+        ),
+        nix::libc::SYS_memfd_create,
+        (MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).bits(),
+    );
+}
+
+#[test]
+#[ignore = "restricts only an explicitly provisioned disposable native fixture child"]
+fn descriptor_sealing_denial_refuses_installation_handoff() {
+    assert_descriptor_denial(
+        concat!(
+            module_path!(),
+            "::descriptor_sealing_denial_refuses_installation_handoff"
+        ),
+        nix::libc::SYS_fcntl,
+        nix::libc::F_ADD_SEALS as u32,
+    );
+}
+
 fn archive(dir: &Path, name: &str, version: &str) -> Result<ArchiveSnapshot> {
     let path = dir.join(format!("{name}-{version}-any.pkg.tar.gz"));
     let file = File::create(&path)?;
@@ -194,5 +313,15 @@ fn native_installation_preserves_mixed_intents() -> Result<()> {
         reason_promotion_was_audited && public_request_is_explicit,
         "reason-only promotion audited={reason_promotion_was_audited}; public request promoted to explicit={public_request_is_explicit}"
     );
+    for test in [
+        "package_managers::aur::client::tests::batch2_native_automatic_dependency_reason",
+        "package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff",
+        "package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff",
+    ] {
+        assert!(crate::core::testing::run_isolated_test_with_timeout(
+            test,
+            std::time::Duration::from_secs(5),
+        ));
+    }
     Ok(())
 }

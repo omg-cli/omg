@@ -590,6 +590,34 @@ mod tests {
         );
     }
 
+    fn write_sync_fixture(
+        database: &std::path::Path,
+        repository: &str,
+        packages: &[(&str, &str)],
+    ) -> Result<()> {
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(database.join("sync").join(format!("{repository}.db")))?,
+            flate2::Compression::fast(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        for (name, version) in packages {
+            let content = format!(
+                "%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nfixture {name}\n\n%ARCH%\nx86_64\n"
+            );
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(
+                &mut header,
+                format!("{name}-{version}/desc"),
+                content.as_bytes(),
+            )?;
+        }
+        archive.into_inner()?.finish()?;
+        Ok(())
+    }
+
     fn with_private_alpm(name: &str, run: impl FnOnce()) {
         if crate::config::Settings::rerun_test_unprivileged(name) {
             return;
@@ -612,21 +640,7 @@ mod tests {
             "%NAME%\npacman\n\n%VERSION%\n1.0-1\n\n%DESC%\nfixture package manager\n\n%ARCH%\nx86_64\n\n%REASON%\n0\n",
         )
         .unwrap();
-        let content =
-            "%NAME%\nlinux\n\n%VERSION%\n6.1.0-1\n\n%DESC%\nfixture kernel\n\n%ARCH%\nx86_64\n";
-        let encoder = flate2::write::GzEncoder::new(
-            std::fs::File::create(sync.join("core.db")).unwrap(),
-            flate2::Compression::fast(),
-        );
-        let mut archive = tar::Builder::new(encoder);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(content.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "linux-6.1.0-1/desc", content.as_bytes())
-            .unwrap();
-        archive.into_inner().unwrap().finish().unwrap();
+        write_sync_fixture(&database, "core", &[("linux", "6.1.0-1")]).unwrap();
         let config = directory.path().join("pacman.conf");
         std::fs::write(&config, "[options]\nSigLevel = Never\n[core]\nServer = https://example.invalid/$repo/os/$arch\n").unwrap();
         struct Restore;
@@ -648,6 +662,45 @@ mod tests {
                 ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
             ],
             run,
+        );
+    }
+
+    #[test]
+    fn search_usage_excludes_repository_from_info_search_and_completion() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(search_usage_excludes_repository_from_info_search_and_completion)
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().expect("private database");
+                write_sync_fixture(
+                    &database,
+                    "upgrade-only",
+                    &[("linux", "99.0-1"), ("hidden-only", "1.0-1")],
+                )
+                .unwrap();
+                std::fs::write(
+                    paths::pacman_conf_path(),
+                    "[options]\nSigLevel = Never\n[upgrade-only]\nUsage = Upgrade\nServer = https://example.invalid/$repo/$arch\n[core]\nUsage = Search\nServer = https://example.invalid/$repo/$arch\n",
+                )
+                .unwrap();
+                clear_alpm_cache();
+
+                let info = get_package_info("linux")
+                    .unwrap()
+                    .expect("searchable kernel");
+                assert_eq!(info.repo, "core");
+                assert_eq!(info.version.to_string(), "6.1.0-1");
+                assert!(!info.installed);
+                assert!(get_package_info("hidden-only").unwrap().is_none());
+                let search = search_sync("linux").unwrap();
+                assert_eq!(search.len(), 1);
+                assert_eq!(search[0].repo, "core");
+                assert_eq!(search[0].version.to_string(), "6.1.0-1");
+                assert!(search_sync("hidden-only").unwrap().is_empty());
+                assert_eq!(list_all_package_names().unwrap(), ["linux", "pacman"]);
+            },
         );
     }
 

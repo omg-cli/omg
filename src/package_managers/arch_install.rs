@@ -276,6 +276,8 @@ mod tests {
             InstallTarget::Named("requested".to_owned())
         );
         assert_eq!(decoded.items()[0].intent, InstallIntent::Requested);
+        assert_eq!(decoded.items()[0].target.argument(), "requested");
+        assert_eq!(decoded.kind(), super::super::TransactionKind::Install);
         assert_eq!(
             decoded.items()[1].target,
             InstallTarget::Named("helper".to_owned())

@@ -2417,8 +2417,75 @@ mod tests {
         std::fs::write(&path, compressed).unwrap();
 
         let error = parse_sync_db(&path, "custom").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Malformed desc broken-1/desc from repository custom"
+        );
         assert!(format!("{error:#}").contains("broken-1/desc"));
         assert!(format!("{error:#}").contains("Invalid package version"));
+    }
+
+    #[test]
+    fn truncated_sync_desc_payload_retains_entry_and_repository_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("custom.db");
+        let desc = b"%NAME%\nwidget\n\n%VERSION%\n1-1\n\n";
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "widget-1/desc", desc.as_slice())
+            .unwrap();
+        let raw = tar.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let partial_desc_end = header.as_bytes().len() + desc.len() / 2;
+        encoder.write_all(&raw[..partial_desc_end]).unwrap();
+        encoder.flush().unwrap();
+        let truncated_len = encoder.get_ref().len();
+        encoder.write_all(&raw[partial_desc_end..]).unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.truncate(truncated_len);
+        fs::write(&path, compressed).unwrap();
+
+        let error = parse_sync_db(&path, "custom")
+            .expect_err("an interrupted desc payload must reject the repository snapshot");
+        assert_eq!(
+            error.to_string(),
+            "Failed to read desc widget-1/desc from repo custom"
+        );
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::UnexpectedEof)),
+            "the truncated compressed payload must retain its I/O cause: {error:#}"
+        );
+    }
+
+    #[test]
+    fn utf8_sync_desc_missing_required_version_retains_repository_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("custom.db");
+        let desc = "%NAME%\nwidget\n\n%DESC%\nValid UTF-8 description\n\n";
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "widget-1/desc", desc.as_bytes())
+            .unwrap();
+        let raw = tar.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        fs::write(&path, encoder.finish().unwrap()).unwrap();
+
+        let error = parse_sync_db(&path, "custom")
+            .expect_err("valid UTF-8 cannot make a desc without a package version complete");
+        assert_eq!(
+            error.to_string(),
+            "Malformed desc widget-1/desc from repository custom"
+        );
+        assert!(format!("{error:#}").contains("Missing package version in repository custom"));
     }
 
     #[test]
@@ -2678,6 +2745,36 @@ mod tests {
         std::fs::create_dir(temp_dir.path().join("vim-9.1.0-1")).unwrap();
         let error = parse_local_db(temp_dir.path()).unwrap_err();
         assert!(format!("{error:#}").contains("vim-9.1.0-1/desc"));
+    }
+
+    #[test]
+    fn incomplete_local_entry_rejects_snapshot_with_healthy_package() {
+        let temp = tempfile::tempdir().unwrap();
+        write_local_desc(&temp, "healthy", "0", "");
+        let healthy_desc = temp.path().join("healthy/desc");
+        let healthy_bytes = fs::read(&healthy_desc).unwrap();
+        assert_eq!(parse_local_db(temp.path()).unwrap().len(), 1);
+
+        let incomplete = temp.path().join("incomplete-1");
+        fs::create_dir(&incomplete).unwrap();
+        for desc in [
+            None,
+            Some("%NAME%\nincomplete\n\n%VERSION%\ninvalid version\n"),
+        ] {
+            if let Some(desc) = desc {
+                fs::write(incomplete.join("desc"), desc).unwrap();
+            }
+            let error = parse_local_db(temp.path())
+                .expect_err("a healthy package cannot conceal an incomplete local entry");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Incomplete local package entry {}",
+                    incomplete.join("desc").display()
+                )
+            );
+            assert_eq!(fs::read(&healthy_desc).unwrap(), healthy_bytes);
+        }
     }
 
     #[test]

@@ -372,17 +372,14 @@ pub(crate) fn provision_satisfies(dependency: &str, provision: &str) -> bool {
 #[cfg(feature = "arch")]
 pub(crate) fn dependency_version_satisfies(dependency: &str, candidate: &str) -> bool {
     let dependency = alpm::Depend::new(dependency);
-    let Some(required) = dependency.version() else {
-        return true;
-    };
-    let comparison = alpm::vercmp(candidate, required.to_string().as_str());
-    match dependency.depmod() {
-        alpm::DepMod::Any => true,
-        alpm::DepMod::Eq => comparison.is_eq(),
-        alpm::DepMod::Ge => !comparison.is_lt(),
-        alpm::DepMod::Le => !comparison.is_gt(),
-        alpm::DepMod::Gt => comparison.is_gt(),
-        alpm::DepMod::Lt => comparison.is_lt(),
+    let compare = |required: &alpm::Ver| alpm::vercmp(candidate, required.to_string().as_str());
+    match dependency.depmodver() {
+        alpm::DepModVer::Any => true,
+        alpm::DepModVer::Eq(required) => compare(required).is_eq(),
+        alpm::DepModVer::Ge(required) => !compare(required).is_lt(),
+        alpm::DepModVer::Le(required) => !compare(required).is_gt(),
+        alpm::DepModVer::Gt(required) => compare(required).is_gt(),
+        alpm::DepModVer::Lt(required) => compare(required).is_lt(),
     }
 }
 
@@ -394,6 +391,51 @@ mod tests {
     fn version_display_is_borrowed_and_backend_independent() {
         let version = parse_version("1:2.3.4-5").expect("valid version must parse");
         assert_eq!(version.version_string(), "1:2.3.4-5");
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn versionless_virtual_requirements_accept_only_same_name_provisions() {
+        for provision in ["virtual-api", "virtual-api=2"] {
+            assert!(provision_satisfies("virtual-api", provision), "{provision}");
+            assert!(
+                !provision_satisfies("other-api", provision),
+                "a different virtual name must reject {provision}"
+            );
+            assert!(
+                !provision_satisfies("virtual-api>=3", provision),
+                "a versioned requirement must reject {provision}"
+            );
+        }
+        assert!(provision_satisfies("virtual-api>=2", "virtual-api=2"));
+        assert!(!provision_satisfies("virtual-api>=2", "virtual-api>=2"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn dependency_versions_preserve_unconstrained_and_ordered_relations() {
+        for candidate in ["0", "1:2.0-1", "999-9"] {
+            assert!(
+                dependency_version_satisfies("widget", candidate),
+                "{candidate}"
+            );
+        }
+        for (relation, accepted, rejected) in [
+            ("widget=2", "2", "3"),
+            ("widget>=2", "2", "1"),
+            ("widget<=2", "2", "3"),
+            ("widget>2", "3", "2"),
+            ("widget<2", "1", "2"),
+        ] {
+            assert!(
+                dependency_version_satisfies(relation, accepted),
+                "{relation} with {accepted}"
+            );
+            assert!(
+                !dependency_version_satisfies(relation, rejected),
+                "{relation} with {rejected}"
+            );
+        }
     }
 
     /// ARCH-R14 regression: a version string that fails the strict parser

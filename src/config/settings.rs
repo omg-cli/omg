@@ -830,6 +830,24 @@ mod tests {
         assert!(validate_config_path(Path::new("cache/../escape"), "pkgdest").is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn standard_config_path_validation_preserves_shared_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        validate_config_path(directory.path(), "pkgdest").expect("warn about the shared directory");
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o777,
+            "configuration validation must not silently chmod a user directory"
+        );
+    }
+
     #[test]
     fn config_paths_accept_the_current_home_and_reject_unrelated_roots() {
         if let Some(home) = dirs::home_dir() {

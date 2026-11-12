@@ -346,6 +346,22 @@ changing that package or history. Five read-only checkout CLI checks passed with
 an unchanged host pacman fingerprint. Local coverage comparison and fresh hosted
 CI are still pending for this batch.
 
+The next verification batch adds repository eligibility, stale-selection,
+virtual-provider, incomplete-database and metadata synchronization cases.
+The metadata cases exercise real loopback HTTP responses and generation
+publication through a private endpoint boundary; the public caller retains the
+official AUR URL. A readable corrupt native catalog reproduced a false absent
+package result. Loading its lazy package cache before checking native validity
+now rejects that catalog, while the native probe preserves valid empty and
+nonempty catalogs. The regression and all 40 transaction tests pass.
+
+The consolidated library run passes 2,183 tests with 11 ignored native-only
+cases. Independent review approved the source batch. Native descriptor-denial
+and self-contained official dependency cases are included in the existing
+isolated selection; revised-source guest execution and source-bound coverage
+remain pending. Existing native CLI contracts will also run in the Arch guest,
+since their explicit Arch prerequisite excludes this Omarchy host.
+
 ## Remaining work
 
 - Require fresh producer and exact-base comparison evidence for the retention

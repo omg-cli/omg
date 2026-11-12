@@ -141,10 +141,11 @@ pub(crate) fn open_fresh_metadata_index(ttl: Duration) -> Result<Option<AurIndex
 
 fn metadata_request(
     client: &reqwest::Client,
+    endpoint: &str,
     meta_cache: &AurMetaCache,
     cache_exists: bool,
 ) -> reqwest::RequestBuilder {
-    let mut request = client.get(AUR_META_URL);
+    let mut request = client.get(endpoint);
     if cache_exists {
         if let Some(etag) = &meta_cache.etag {
             request = request.header(IF_NONE_MATCH, etag);
@@ -163,11 +164,20 @@ pub async fn sync_aur_metadata(
     settings: &Settings,
     force: bool,
 ) -> Result<()> {
+    sync_aur_metadata_at(client, settings, force, metadata_root(), AUR_META_URL).await
+}
+
+async fn sync_aur_metadata_at(
+    client: &reqwest::Client,
+    settings: &Settings,
+    force: bool,
+    root: PathBuf,
+    endpoint: &str,
+) -> Result<()> {
     if !settings.aur.use_metadata_archive {
         return Ok(());
     }
 
-    let root = metadata_root();
     let lock_root = root.clone();
     let publication_lock =
         tokio::task::spawn_blocking(move || lock_metadata(&lock_root, true)).await??;
@@ -189,7 +199,7 @@ pub async fn sync_aur_metadata(
         }
     }
     if current.is_none() && !force {
-        let legacy = metadata_path();
+        let legacy = root.join("packages-meta-ext-v1.json.gz");
         let fresh = std::fs::metadata(&legacy)
             .and_then(|m| m.modified())
             .is_ok_and(|modified| {
@@ -215,9 +225,14 @@ pub async fn sync_aur_metadata(
     }
     let validators = current.as_ref().map(|(manifest, _)| &manifest.validators);
     let empty = AurMetaCache::default();
-    let response = metadata_request(client, validators.unwrap_or(&empty), current.is_some())
-        .send()
-        .await?;
+    let response = metadata_request(
+        client,
+        endpoint,
+        validators.unwrap_or(&empty),
+        current.is_some(),
+    )
+    .send()
+    .await?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         let (manifest, _) =
             current.context("AUR metadata server returned 304 without a complete generation")?;
@@ -368,6 +383,72 @@ fn persist_file_atomically(dest: &Path, data: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn metadata_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    async fn metadata_server(
+        status: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use std::fmt::Write as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/metadata.gz", listener.local_addr().unwrap());
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            write!(response, "{name}: {value}\r\n").unwrap();
+        }
+        response.push_str("\r\n");
+        let mut response = response.into_bytes();
+        response.extend_from_slice(body);
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0_u8; 1024];
+                    let count = stream.read(&mut bytes).await.unwrap();
+                    assert_ne!(count, 0, "request ended before its headers");
+                    request.extend_from_slice(&bytes[..count]);
+                    assert!(request.len() <= 16 * 1024, "request headers are too large");
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                stream.write_all(&response).await.unwrap();
+                String::from_utf8(request).unwrap()
+            })
+            .await
+            .expect("metadata request and response must finish within five seconds")
+        });
+        (endpoint, server)
+    }
+
+    fn unused_metadata_endpoint() -> (String, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/metadata.gz", listener.local_addr().unwrap());
+        (endpoint, listener)
+    }
+
+    fn assert_no_metadata_request(listener: &std::net::TcpListener) {
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "metadata reuse must not connect to the endpoint"
+        );
+    }
+
     fn catalogue(name: &str) -> Vec<u8> {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         serde_json::to_writer(
@@ -376,6 +457,319 @@ mod tests {
         )
         .unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_disabled_metadata_does_not_create_cache_or_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("unused-cache");
+        let mut settings = Settings::default();
+        settings.aur.use_metadata_archive = false;
+        let (endpoint, listener) = unused_metadata_endpoint();
+
+        sync_aur_metadata_at(&metadata_client(), &settings, true, root.clone(), &endpoint)
+            .await
+            .unwrap();
+
+        assert!(!root.exists());
+        assert_no_metadata_request(&listener);
+    }
+
+    #[tokio::test]
+    async fn sync_fresh_complete_generation_does_not_request_or_republish() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        publish_generation(root, &catalogue("cached"), AurMetaCache::default()).unwrap();
+        let manifest_before = std::fs::read(root.join("manifest.json")).unwrap();
+        let (endpoint, listener) = unused_metadata_endpoint();
+
+        sync_aur_metadata_at(
+            &metadata_client(),
+            &Settings::default(),
+            false,
+            root.to_owned(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+
+        assert_no_metadata_request(&listener);
+        assert_eq!(
+            std::fs::read(root.join("manifest.json")).unwrap(),
+            manifest_before
+        );
+        let (_, index) = current_generation(root).unwrap().unwrap();
+        assert!(index.get("cached").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_fresh_legacy_archive_migrates_without_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let archive = catalogue("legacy");
+        let legacy = root.join("packages-meta-ext-v1.json.gz");
+        std::fs::write(&legacy, &archive).unwrap();
+        let (endpoint, listener) = unused_metadata_endpoint();
+
+        sync_aur_metadata_at(
+            &metadata_client(),
+            &Settings::default(),
+            false,
+            root.to_owned(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+
+        assert_no_metadata_request(&listener);
+        let (manifest, index) = current_generation(root).unwrap().unwrap();
+        let (published_archive, _) = generation_paths(root, &manifest).unwrap();
+        assert_eq!(std::fs::read(published_archive).unwrap(), archive);
+        assert_eq!(std::fs::read(legacy).unwrap(), archive);
+        assert!(index.get("legacy").unwrap().is_some());
+        assert!(manifest.validators.etag.is_none());
+        assert!(manifest.validators.last_modified.is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_200_publishes_archive_index_and_validators_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        publish_generation(root, &catalogue("old"), AurMetaCache::default()).unwrap();
+        let (old_manifest, snapshot) = current_generation(root).unwrap().unwrap();
+        let archive = catalogue("new");
+        let modified = "Wed, 11 Nov 2026 12:00:00 GMT";
+        let (endpoint, server) = metadata_server(
+            "200 OK",
+            &[("ETag", "\"new-etag\""), ("Last-Modified", modified)],
+            &archive,
+        )
+        .await;
+
+        sync_aur_metadata_at(
+            &metadata_client(),
+            &Settings::default(),
+            true,
+            root.to_owned(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /metadata.gz HTTP/1.1\r\n"));
+        let (manifest, index) = current_generation(root).unwrap().unwrap();
+        assert_ne!(manifest.generation, old_manifest.generation);
+        assert_eq!(manifest.validators.etag.as_deref(), Some("\"new-etag\""));
+        assert_eq!(manifest.validators.last_modified.as_deref(), Some(modified));
+        let (published_archive, _) = generation_paths(root, &manifest).unwrap();
+        assert_eq!(std::fs::read(&published_archive).unwrap(), archive);
+        assert_eq!(
+            read_metadata_archive(&published_archive).unwrap()[0].name,
+            "new"
+        );
+        assert!(index.get("new").unwrap().is_some());
+        assert!(index.get("old").unwrap().is_none());
+        assert!(snapshot.get("old").unwrap().is_some());
+        assert!(snapshot.get("new").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_304_reuses_complete_generation_and_refreshes_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let modified = "Wed, 11 Nov 2026 12:00:00 GMT";
+        publish_generation(
+            root,
+            &catalogue("cached"),
+            AurMetaCache {
+                etag: Some("\"cached-etag\"".into()),
+                last_modified: Some(modified.into()),
+            },
+        )
+        .unwrap();
+        let manifest_path = root.join("manifest.json");
+        File::options()
+            .write(true)
+            .open(&manifest_path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_hours(24))
+            .unwrap();
+        let manifest_before = std::fs::read(&manifest_path).unwrap();
+        let (manifest, _) = current_generation(root).unwrap().unwrap();
+        let (archive, index) = generation_paths(root, &manifest).unwrap();
+        let archive_before = std::fs::read(&archive).unwrap();
+        let index_before = std::fs::read(&index).unwrap();
+        let (endpoint, server) = metadata_server("304 Not Modified", &[], &[]).await;
+
+        sync_aur_metadata_at(
+            &metadata_client(),
+            &Settings::default(),
+            false,
+            root.to_owned(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("\r\nif-none-match: \"cached-etag\"\r\n"));
+        assert!(request.contains(&format!(
+            "\r\nif-modified-since: {}\r\n",
+            modified.to_ascii_lowercase()
+        )));
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(std::fs::read(archive).unwrap(), archive_before);
+        assert_eq!(std::fs::read(index).unwrap(), index_before);
+        assert!(
+            open_fresh_metadata_index_at(root, Duration::from_mins(1))
+                .unwrap()
+                .unwrap()
+                .get("cached")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_incomplete_or_corrupt_generation_recovers_without_validators() {
+        #[derive(Debug)]
+        enum Damage {
+            MissingArchive,
+            CorruptIndex,
+            CorruptManifest,
+        }
+
+        for damage in [
+            Damage::MissingArchive,
+            Damage::CorruptIndex,
+            Damage::CorruptManifest,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            publish_generation(
+                root,
+                &catalogue("old"),
+                AurMetaCache {
+                    etag: Some("\"unusable\"".into()),
+                    last_modified: Some("Wed, 11 Nov 2026 12:00:00 GMT".into()),
+                },
+            )
+            .unwrap();
+            let (manifest, _) = current_generation(root).unwrap().unwrap();
+            let (archive, index) = generation_paths(root, &manifest).unwrap();
+            match damage {
+                Damage::MissingArchive => std::fs::remove_file(archive).unwrap(),
+                Damage::CorruptIndex => std::fs::write(index, b"invalid index").unwrap(),
+                Damage::CorruptManifest => {
+                    std::fs::write(root.join("manifest.json"), b"{").unwrap();
+                }
+            }
+            assert!(current_generation(root).is_err(), "{damage:?}");
+            let recovered = catalogue("recovered");
+            let (endpoint, server) = metadata_server("200 OK", &[], &recovered).await;
+
+            sync_aur_metadata_at(
+                &metadata_client(),
+                &Settings::default(),
+                false,
+                root.to_owned(),
+                &endpoint,
+            )
+            .await
+            .unwrap();
+
+            let request = server.await.unwrap().to_ascii_lowercase();
+            assert!(!request.contains("\r\nif-none-match:"), "{damage:?}");
+            assert!(!request.contains("\r\nif-modified-since:"), "{damage:?}");
+            let (manifest, index) = current_generation(root).unwrap().unwrap();
+            assert!(index.get("recovered").unwrap().is_some(), "{damage:?}");
+            assert!(index.get("old").unwrap().is_none(), "{damage:?}");
+            assert_eq!(
+                std::fs::read(generation_paths(root, &manifest).unwrap().0).unwrap(),
+                recovered,
+                "{damage:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_304_without_complete_generation_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let (endpoint, server) = metadata_server("304 Not Modified", &[], &[]).await;
+
+        let error = sync_aur_metadata_at(
+            &metadata_client(),
+            &Settings::default(),
+            true,
+            root.to_owned(),
+            &endpoint,
+        )
+        .await
+        .unwrap_err();
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(!request.contains("\r\nif-none-match:"));
+        assert!(!request.contains("\r\nif-modified-since:"));
+        assert!(
+            error
+                .to_string()
+                .contains("304 without a complete generation")
+        );
+        assert!(current_generation(root).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_invalid_200_preserves_published_generation_and_validators() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        publish_generation(
+            root,
+            &catalogue("cached"),
+            AurMetaCache {
+                etag: Some("\"cached-etag\"".into()),
+                last_modified: None,
+            },
+        )
+        .unwrap();
+        let manifest_before = std::fs::read(root.join("manifest.json")).unwrap();
+        let (endpoint, server) =
+            metadata_server("200 OK", &[("ETag", "\"invalid-etag\"")], b"invalid gzip").await;
+
+        assert!(
+            sync_aur_metadata_at(
+                &metadata_client(),
+                &Settings::default(),
+                true,
+                root.to_owned(),
+                &endpoint,
+            )
+            .await
+            .is_err()
+        );
+
+        server.await.unwrap();
+        assert_eq!(
+            std::fs::read(root.join("manifest.json")).unwrap(),
+            manifest_before
+        );
+        let (manifest, index) = current_generation(root).unwrap().unwrap();
+        assert_eq!(manifest.validators.etag.as_deref(), Some("\"cached-etag\""));
+        assert!(index.get("cached").unwrap().is_some());
+    }
+
+    #[test]
+    fn current_generation_distinguishes_absent_manifest_from_read_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(current_generation(directory.path()).unwrap().is_none());
+        std::fs::create_dir(directory.path().join("manifest.json")).unwrap();
+
+        let error = current_generation(directory.path()).err().unwrap();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::IsADirectory
+        );
     }
 
     #[test]
@@ -450,26 +844,22 @@ mod tests {
     #[test]
     fn metadata_request_requires_complete_generation_for_validators() {
         let client = reqwest::Client::new();
+        let modified = "Wed, 11 Nov 2026 12:00:00 GMT";
         let validators = AurMetaCache {
             etag: Some("etag".into()),
-            last_modified: None,
+            last_modified: Some(modified.into()),
         };
-        assert!(
-            metadata_request(&client, &validators, false)
-                .build()
-                .unwrap()
-                .headers()
-                .get(IF_NONE_MATCH)
-                .is_none()
-        );
-        assert!(
-            metadata_request(&client, &validators, true)
-                .build()
-                .unwrap()
-                .headers()
-                .get(IF_NONE_MATCH)
-                .is_some()
-        );
+        let incomplete = metadata_request(&client, AUR_META_URL, &validators, false)
+            .build()
+            .unwrap();
+        assert!(incomplete.headers().get(IF_NONE_MATCH).is_none());
+        assert!(incomplete.headers().get(IF_MODIFIED_SINCE).is_none());
+        let complete = metadata_request(&client, AUR_META_URL, &validators, true)
+            .build()
+            .unwrap();
+        assert_eq!(complete.url().as_str(), AUR_META_URL);
+        assert_eq!(complete.headers().get(IF_NONE_MATCH).unwrap(), "etag");
+        assert_eq!(complete.headers().get(IF_MODIFIED_SINCE).unwrap(), modified);
     }
     #[test]
     fn future_cache_timestamp_is_not_fresh() {

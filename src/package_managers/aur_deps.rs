@@ -269,20 +269,9 @@ mod tests {
 
     #[test]
     fn runtime_virtual_sibling_refuses_ineligible_architecture() {
-        let other_arch = if super::super::aur::utils::current_arch()
-            .expect("host arch")
-            .to_string()
-            == "aarch64"
-        {
-            "x86_64"
-        } else {
-            "aarch64"
-        };
         let srcinfo = split_fixture(
             "",
-            &format!(
-                "pkgname = example-cli\n\tdepends = example-api>=2\npkgname = example-lib\n\tarch = {other_arch}\n\tprovides = example-api=2\n"
-            ),
+            "pkgname = example-cli\n\tdepends = example-api>=2\npkgname = example-lib\n\tarch = riscv64\n\tprovides = example-api=2\n",
         );
         let error = dependency_plan(&srcinfo, &["example-cli".into()])
             .expect_err("a foreign-architecture provider cannot enter the runtime closure");

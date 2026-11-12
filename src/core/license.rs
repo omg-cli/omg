@@ -1014,6 +1014,62 @@ pub fn features_for_tier(tier: Tier) -> Vec<&'static Feature> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fallback_machine_identity_is_private_stable_and_recovers_empty_state() {
+        const TEST: &str = "core::license::tests::fallback_machine_identity_is_private_stable_and_recovers_empty_state";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("state");
+        temp_env::with_var("OMG_DATA_DIR", Some(&data), || {
+            let identity = persisted_machine_id_fallback();
+            uuid::Uuid::parse_str(&identity).expect("new identity is a UUID");
+            assert_eq!(persisted_machine_id_fallback(), identity);
+            let path = data.join("machine-id");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), identity);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            std::fs::write(&path, " \n").unwrap();
+            let replacement = persisted_machine_id_fallback();
+            uuid::Uuid::parse_str(&replacement).expect("empty state is replaced with a UUID");
+            assert_ne!(replacement, identity);
+            assert_eq!(persisted_machine_id_fallback(), replacement);
+        });
+    }
+
+    #[test]
+    fn fallback_machine_identity_preserves_unusable_state_paths() {
+        const TEST: &str =
+            "core::license::tests::fallback_machine_identity_preserves_unusable_state_paths";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let blocker = directory.path().join("file");
+        std::fs::write(&blocker, b"preserve user data").unwrap();
+        temp_env::with_var("OMG_DATA_DIR", Some(&blocker), || {
+            uuid::Uuid::parse_str(&persisted_machine_id_fallback()).expect("ephemeral fallback");
+            assert_eq!(std::fs::read(&blocker).unwrap(), b"preserve user data");
+        });
+        let data = directory.path().join("state");
+        std::fs::create_dir_all(data.join("machine-id")).unwrap();
+        temp_env::with_var("OMG_DATA_DIR", Some(&data), || {
+            uuid::Uuid::parse_str(&persisted_machine_id_fallback()).expect("ephemeral fallback");
+            assert!(data.join("machine-id").is_dir());
+        });
+    }
+
     // gitleaks:allow -- deterministic test-only Ed25519 fixture
     const TEST_PRIVATE_KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIIx/ifT0yOyJ/SykVkxxVR4zdDCep94lm3xLOyNn83kM\n-----END PRIVATE KEY-----\n";
     const TEST_PUBLIC_KEY: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAniF8d18mTVtOAi1msyk1sPU6smSFhAiiTRpLgzcFEEs=\n-----END PUBLIC KEY-----\n";
