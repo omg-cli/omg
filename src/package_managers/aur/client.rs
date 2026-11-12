@@ -9100,9 +9100,15 @@ mod tests {
                 requested_outputs: outputs.clone(),
                 reviewed_digest: ReviewedSource::capture(&checkout)?,
             };
-            let archives = client
+            let result = client
                 .install_authorized_package_outputs(authorized, None)
-                .await?;
+                .await;
+            let log_path = client.build_log_path("omg-coverage-fixture");
+            let log = std::fs::read_to_string(&log_path);
+            let archives = result.context(format!(
+                "Native fixture build log ({}):\n{log:?}",
+                log_path.display()
+            ))?;
             assert_eq!(archives.len(), 1);
             let inspected = artifact_inspector::inspect_archive(&archives[0].path())?;
             assert_eq!(inspected.package_name, "omg-coverage-fixture");

@@ -207,6 +207,15 @@ network-isolated CI container, where only `/usr/bin/true` receives passwordless
 sudo authorization. That container has separate fixture home, cache, data and
 configuration directories. No host package installation or removal was used.
 
+A subsequent reader regression reproduced loss of the decoder after a
+recoverable I/O error between zstd frames. The reader now models active,
+finished and failed states explicitly. Retrying `Interrupted` or `WouldBlock`
+at a frame boundary preserves the remaining data; malformed subsequent frames
+and the frame budget remain terminal errors. The four reader tests passed
+after the boundary retry failed against the old implementation. The isolated
+CI build fixture also captures its private build log before removing temporary
+state, so unexpected build failures retain their diagnostic evidence.
+
 ## Remaining work
 
 - Live searches and several inventory operations still use C libalpm. Move
