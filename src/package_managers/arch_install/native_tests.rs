@@ -9,6 +9,8 @@ use crate::core::security::artifact::ArchiveSnapshot;
 
 const TEST: &str =
     "package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents";
+const CREATION_DENIAL_TEST: &str = "package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff";
+const SEALING_DENIAL_TEST: &str = "package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff";
 
 fn assert_descriptor_denial(test: &str, syscall: nix::libc::c_long, argument: u32) {
     use nix::libc;
@@ -107,10 +109,7 @@ fn assert_descriptor_denial(test: &str, syscall: nix::libc::c_long, argument: u3
 fn descriptor_creation_denial_refuses_installation_handoff() {
     use rustix::fs::MemfdFlags;
     assert_descriptor_denial(
-        concat!(
-            module_path!(),
-            "::descriptor_creation_denial_refuses_installation_handoff"
-        ),
+        CREATION_DENIAL_TEST,
         nix::libc::SYS_memfd_create,
         (MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).bits(),
     );
@@ -120,10 +119,7 @@ fn descriptor_creation_denial_refuses_installation_handoff() {
 #[ignore = "restricts only an explicitly provisioned disposable native fixture child"]
 fn descriptor_sealing_denial_refuses_installation_handoff() {
     assert_descriptor_denial(
-        concat!(
-            module_path!(),
-            "::descriptor_sealing_denial_refuses_installation_handoff"
-        ),
+        SEALING_DENIAL_TEST,
         nix::libc::SYS_fcntl,
         nix::libc::F_ADD_SEALS as u32,
     );
@@ -315,8 +311,8 @@ fn native_installation_preserves_mixed_intents() -> Result<()> {
     );
     for test in [
         "package_managers::aur::client::tests::batch2_native_automatic_dependency_reason",
-        "package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff",
-        "package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff",
+        CREATION_DENIAL_TEST,
+        SEALING_DENIAL_TEST,
     ] {
         assert!(crate::core::testing::run_isolated_test_with_timeout(
             test,

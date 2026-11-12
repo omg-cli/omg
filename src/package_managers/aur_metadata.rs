@@ -459,6 +459,34 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    #[test]
+    fn public_disabled_sync_does_not_create_cache_or_connect() -> Result<()> {
+        const TEST: &str = "package_managers::aur_metadata::tests::public_disabled_sync_does_not_create_cache_or_connect";
+        if Settings::rerun_test_unprivileged(TEST) || crate::core::testing::run_isolated_test(TEST)
+        {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let cache = directory.path().join("unused-cache");
+        let (endpoint, listener) = unused_metadata_endpoint();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(endpoint)?)
+            .timeout(Duration::from_millis(250))
+            .build()?;
+        let mut settings = Settings::default();
+        settings.aur.use_metadata_archive = false;
+        temp_env::with_var("OMG_CACHE_DIR", Some(&cache), || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(sync_aur_metadata(&client, &settings, true))
+        })?;
+        assert!(!cache.exists());
+        assert_no_metadata_request(&listener);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn sync_disabled_metadata_does_not_create_cache_or_request() {
         let directory = tempfile::tempdir().unwrap();

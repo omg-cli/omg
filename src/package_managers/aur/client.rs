@@ -9486,233 +9486,284 @@ finally:
         Ok(())
     }
 
-    #[tokio::test]
-    async fn archive_admission_enforces_profile_and_binds_paired_cache_to_it() -> Result<()> {
-        let checkout = tempfile::tempdir()?;
-        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
-            .expect("write fixture file");
-        std::fs::write(
-            checkout.path().join(".SRCINFO"),
-            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\ninstall = demo.install\npkgname = demo\n",
-        ).expect("write fixture file");
-        let hook = "post_install() { :; }\n";
-        std::fs::write(checkout.path().join("demo.install"), hook).expect("write fixture file");
-        let source = ReviewedSource::capture(checkout.path())?;
-        let archives = tempfile::tempdir()?;
-        let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
-        let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
-        write_pkg_archive(&archive, info, Some(hook));
-        let invocation = tempfile::tempdir()?;
-        let env = MakepkgEnv {
-            pkgdest: invocation.path().join("pkg"),
-            srcdest: invocation.path().join("src"),
-            builddir: invocation.path().join("build"),
-            _invocation: invocation,
-            makeflags: String::new(),
-            compiler_cache_dirs: Vec::new(),
-            extra_env: Vec::new(),
-            pgp_home: None,
-        };
-        let mut client = AurClient {
-            build_dir: checkout.path().to_path_buf(),
-            settings: Settings::default(),
-            package_base_locks: Arc::new(dashmap::DashMap::new()),
-        };
-        let inspection = artifact_inspector::inspect_archive(&archive)?;
-        let standard_key =
-            client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
-        client.settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
-        let hardened_key =
-            client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
-        assert_ne!(
-            standard_key, hardened_key,
-            "a proof under one profile must not authorize another"
-        );
-        let error = client
-            .authorize_with_paired_build(
-                std::slice::from_ref(&archive),
-                &source,
-                "demo",
-                &["demo".to_owned()],
-                &["demo".to_owned()],
-                true,
-                checkout.path(),
-                &env,
-            )
-            .await
-            .expect_err("hardened admission must reject an install hook before rebuilding");
-        assert!(
-            error.to_string().contains("Hardened AUR profile rejects"),
-            "{error:#}"
-        );
-        client.settings.aur.review_pkgbuild = false;
-        let error = client
-            .run_build(checkout.path(), &env, "demo")
-            .await
-            .expect_err("an invalid hardened configuration must fail before running a build");
-        assert!(
-            error.to_string().contains("requires build_method"),
-            "{error:#}"
-        );
-        Ok(())
+    fn with_private_admission_fixture(
+        test: &str,
+        body: impl FnOnce(&tokio::runtime::Runtime, &Path) -> Result<()>,
+    ) -> Result<()> {
+        if Settings::rerun_test_unprivileged(test) || crate::core::testing::run_isolated_test(test)
+        {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let configuration = fixture.path().join("config");
+        let data = fixture.path().join("data");
+        let cache = fixture.path().join("cache");
+        let socket = fixture.path().join("absent.sock");
+        for directory in [&configuration, &data, &cache] {
+            std::fs::create_dir(directory)?;
+        }
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(configuration.as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+                ("CARGO_PRIMARY_PACKAGE", Some(std::ffi::OsStr::new("1"))),
+            ],
+            || {
+                std::fs::write(
+                    configuration.join("config.toml"),
+                    "[aur]\nsecurity_profile = 'standard'\n",
+                )?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                body(&runtime, fixture.path())
+            },
+        )
     }
 
-    #[tokio::test]
-    async fn standard_admission_accepts_an_ordinary_archive_without_rebuild() -> Result<()> {
-        let checkout = tempfile::tempdir()?;
-        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
-            .expect("write fixture file");
-        std::fs::write(
-            checkout.path().join(".SRCINFO"),
-            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
-        )
-        .expect("write fixture file");
-        let source = ReviewedSource::capture(checkout.path())?;
-        let archives = tempfile::tempdir()?;
-        let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
-        write_pkg_archive(
-            &archive,
-            "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
-            None,
-        );
-        let invocation = tempfile::tempdir()?;
-        let env = MakepkgEnv {
-            pkgdest: invocation.path().join("pkg"),
-            srcdest: invocation.path().join("src"),
-            builddir: invocation.path().join("build"),
-            _invocation: invocation,
-            makeflags: String::new(),
-            compiler_cache_dirs: Vec::new(),
-            extra_env: Vec::new(),
-            pgp_home: None,
-        };
-        let client = AurClient {
-            build_dir: checkout.path().to_path_buf(),
-            settings: Settings::default(),
-            package_base_locks: Arc::new(dashmap::DashMap::new()),
-        };
-        let accepted = client
-            .authorize_with_paired_build(
-                std::slice::from_ref(&archive),
-                &source,
-                "demo",
-                &["demo".to_owned()],
-                &["demo".to_owned()],
-                true,
-                checkout.path(),
-                &env,
-            )
-            .await?;
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(
-            artifact_inspector::inspect_archive(&accepted.archives[0].path())?.package_name,
-            "demo"
-        );
-        Ok(())
+    #[test]
+    fn archive_admission_enforces_profile_and_binds_paired_cache_to_it() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::archive_admission_enforces_profile_and_binds_paired_cache_to_it";
+        with_private_admission_fixture(TEST, |runtime, fixture| {
+            runtime.block_on(async {
+                let checkout = tempfile::tempdir_in(fixture)?;
+                std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
+                    .expect("write fixture file");
+                std::fs::write(
+                    checkout.path().join(".SRCINFO"),
+                    "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\ninstall = demo.install\npkgname = demo\n",
+                )
+                .expect("write fixture file");
+                let hook = "post_install() { :; }\n";
+                std::fs::write(checkout.path().join("demo.install"), hook).expect("write fixture file");
+                let source = ReviewedSource::capture(checkout.path())?;
+                let archives = tempfile::tempdir_in(fixture)?;
+                let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+                let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
+                write_pkg_archive(&archive, info, Some(hook));
+                let invocation = tempfile::tempdir_in(fixture)?;
+                let env = MakepkgEnv {
+                    pkgdest: invocation.path().join("pkg"),
+                    srcdest: invocation.path().join("src"),
+                    builddir: invocation.path().join("build"),
+                    _invocation: invocation,
+                    makeflags: String::new(),
+                    compiler_cache_dirs: Vec::new(),
+                    extra_env: Vec::new(),
+                    pgp_home: None,
+                };
+                let mut client = AurClient {
+                    build_dir: checkout.path().to_path_buf(),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let inspection = artifact_inspector::inspect_archive(&archive)?;
+                let standard_key =
+                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+                client.settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
+                let hardened_key =
+                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+                assert_ne!(
+                    standard_key, hardened_key,
+                    "a proof under one profile must not authorize another"
+                );
+                let error = client
+                    .authorize_with_paired_build(
+                        std::slice::from_ref(&archive),
+                        &source,
+                        "demo",
+                        &["demo".to_owned()],
+                        &["demo".to_owned()],
+                        true,
+                        checkout.path(),
+                        &env,
+                    )
+                    .await
+                    .expect_err("hardened admission must reject an install hook before rebuilding");
+                assert!(
+                    error.to_string().contains("Hardened AUR profile rejects"),
+                    "{error:#}"
+                );
+                client.settings.aur.review_pkgbuild = false;
+                let error = client
+                    .run_build(checkout.path(), &env, "demo")
+                    .await
+                    .expect_err("an invalid hardened configuration must fail before running a build");
+                assert!(
+                    error.to_string().contains("requires build_method"),
+                    "{error:#}"
+                );
+                Ok(())
+            })
+        })
+    }
+
+    #[test]
+    fn standard_admission_accepts_an_ordinary_archive_without_rebuild() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::standard_admission_accepts_an_ordinary_archive_without_rebuild";
+        with_private_admission_fixture(TEST, |runtime, fixture| {
+            runtime.block_on(async {
+                let checkout = tempfile::tempdir_in(fixture)?;
+                std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
+                    .expect("write fixture file");
+                std::fs::write(
+                    checkout.path().join(".SRCINFO"),
+                    "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
+                )
+                .expect("write fixture file");
+                let source = ReviewedSource::capture(checkout.path())?;
+                let archives = tempfile::tempdir_in(fixture)?;
+                let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+                write_pkg_archive(
+                    &archive,
+                    "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
+                    None,
+                );
+                let invocation = tempfile::tempdir_in(fixture)?;
+                let env = MakepkgEnv {
+                    pkgdest: invocation.path().join("pkg"),
+                    srcdest: invocation.path().join("src"),
+                    builddir: invocation.path().join("build"),
+                    _invocation: invocation,
+                    makeflags: String::new(),
+                    compiler_cache_dirs: Vec::new(),
+                    extra_env: Vec::new(),
+                    pgp_home: None,
+                };
+                let client = AurClient {
+                    build_dir: checkout.path().to_path_buf(),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let accepted = client
+                    .authorize_with_paired_build(
+                        std::slice::from_ref(&archive),
+                        &source,
+                        "demo",
+                        &["demo".to_owned()],
+                        &["demo".to_owned()],
+                        true,
+                        checkout.path(),
+                        &env,
+                    )
+                    .await?;
+                assert_eq!(accepted.len(), 1);
+                assert_eq!(
+                    artifact_inspector::inspect_archive(&accepted.archives[0].path())?.package_name,
+                    "demo"
+                );
+                let journal = fixture.join("data/audit/audit.jsonl");
+                assert!(
+                    journal.is_file(),
+                    "inspection audit journal: {}",
+                    journal.display()
+                );
+                let audit = std::fs::read_to_string(&journal)?;
+                assert!(audit.contains("aur_inspection"), "{audit}");
+                assert!(audit.contains("succeeded"), "{audit}");
+                Ok(())
+            })
+        })
     }
 
     #[test]
     fn standard_build_is_rejected_after_current_profile_becomes_hardened() -> Result<()> {
         const TEST: &str = "package_managers::aur::client::tests::standard_build_is_rejected_after_current_profile_becomes_hardened";
-        if Settings::rerun_test_unprivileged(TEST) || crate::core::testing::run_isolated_test(TEST)
-        {
-            return Ok(());
-        }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-
-        let checkout = tempfile::tempdir()?;
-        std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
-            .expect("write fixture file");
-        std::fs::write(
-            checkout.path().join(".SRCINFO"),
-            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
-        )
-        .expect("write fixture file");
-        let source = ReviewedSource::capture(checkout.path())?;
-        let archives = tempfile::tempdir()?;
-        let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
-        write_pkg_archive(
-            &archive,
-            "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
-            None,
-        );
-        let invocation = tempfile::tempdir()?;
-        let env = MakepkgEnv {
-            pkgdest: invocation.path().join("pkg"),
-            srcdest: invocation.path().join("src"),
-            builddir: invocation.path().join("build"),
-            _invocation: invocation,
-            makeflags: String::new(),
-            compiler_cache_dirs: Vec::new(),
-            extra_env: Vec::new(),
-            pgp_home: None,
-        };
-        let client = AurClient {
-            build_dir: checkout.path().to_path_buf(),
-            settings: Settings::default(),
-            package_base_locks: Arc::new(dashmap::DashMap::new()),
-        };
-        let accepted = runtime.block_on(client.authorize_with_paired_build(
-            std::slice::from_ref(&archive),
-            &source,
-            "demo",
-            &["demo".to_owned()],
-            &["demo".to_owned()],
-            true,
-            checkout.path(),
-            &env,
-        ))?;
-        let configuration = tempfile::tempdir()?;
-        std::fs::write(
-            configuration.path().join("config.toml"),
-            "[aur]\nsecurity_profile = 'hardened'\n",
-        )?;
-        temp_env::with_vars(
-            [
-                ("OMG_CONFIG_DIR", Some(configuration.path().as_os_str())),
-                ("CARGO_PRIMARY_PACKAGE", Some(std::ffi::OsStr::new("1"))),
-            ],
-            || {
-                runtime.block_on(async {
-                    let error = AurClient::install_built_packages(
-                        std::slice::from_ref(&accepted),
-                        None,
+        with_private_admission_fixture(TEST, |runtime, fixture| {
+            runtime.block_on(async {
+                let checkout = tempfile::tempdir_in(fixture)?;
+                std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
+                    .expect("write fixture file");
+                std::fs::write(
+                    checkout.path().join(".SRCINFO"),
+                    "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
+                )
+                .expect("write fixture file");
+                let source = ReviewedSource::capture(checkout.path())?;
+                let archives = tempfile::tempdir_in(fixture)?;
+                let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+                write_pkg_archive(
+                    &archive,
+                    "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
+                    None,
+                );
+                let invocation = tempfile::tempdir_in(fixture)?;
+                let env = MakepkgEnv {
+                    pkgdest: invocation.path().join("pkg"),
+                    srcdest: invocation.path().join("src"),
+                    builddir: invocation.path().join("build"),
+                    _invocation: invocation,
+                    makeflags: String::new(),
+                    compiler_cache_dirs: Vec::new(),
+                    extra_env: Vec::new(),
+                    pgp_home: None,
+                };
+                let client = AurClient {
+                    build_dir: checkout.path().to_path_buf(),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let accepted = client
+                    .authorize_with_paired_build(
+                        std::slice::from_ref(&archive),
+                        &source,
+                        "demo",
+                        &["demo".to_owned()],
+                        &["demo".to_owned()],
+                        true,
+                        checkout.path(),
+                        &env,
                     )
-                    .await
-                    .expect_err(
-                        "standard build evidence must not satisfy the newly hardened profile",
-                    );
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("built under the Standard AUR profile"),
-                        "{error:#}"
-                    );
-                    let wave = [
-                        BuiltPackages {
-                            archives: vec![ArchiveSnapshot::capture(&archive)?],
-                            profile: AurSecurityProfile::Hardened,
-                            requested_outputs: BTreeSet::from(["demo".to_owned()]),
-                        },
-                        accepted,
-                    ];
-                    let error = AurClient::install_built_packages(&wave, None)
+                    .await?;
+                let journal = fixture.join("data/audit/audit.jsonl");
+                assert!(
+                    journal.is_file(),
+                    "inspection audit journal: {}",
+                    journal.display()
+                );
+                let audit = std::fs::read_to_string(&journal)?;
+                assert!(audit.contains("aur_inspection"), "{audit}");
+                assert!(audit.contains("succeeded"), "{audit}");
+                std::fs::write(
+                    fixture.join("config/config.toml"),
+                    "[aur]\nsecurity_profile = 'hardened'\n",
+                )?;
+                let error =
+                    AurClient::install_built_packages(std::slice::from_ref(&accepted), None)
                         .await
                         .expect_err(
-                            "a hardened first batch must not authorize a standard second batch",
+                            "standard build evidence must not satisfy the newly hardened profile",
                         );
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("built under the Standard AUR profile"),
-                        "{error:#}"
+                assert!(
+                    error
+                        .to_string()
+                        .contains("built under the Standard AUR profile"),
+                    "{error:#}"
+                );
+                let wave = [
+                    BuiltPackages {
+                        archives: vec![ArchiveSnapshot::capture(&archive)?],
+                        profile: AurSecurityProfile::Hardened,
+                        requested_outputs: BTreeSet::from(["demo".to_owned()]),
+                    },
+                    accepted,
+                ];
+                let error = AurClient::install_built_packages(&wave, None)
+                    .await
+                    .expect_err(
+                        "a hardened first batch must not authorize a standard second batch",
                     );
-                    Ok(())
-                })
-            },
-        )
+                assert!(
+                    error
+                        .to_string()
+                        .contains("built under the Standard AUR profile"),
+                    "{error:#}"
+                );
+                Ok(())
+            })
+        })
     }
 
     fn write_review_repository(
