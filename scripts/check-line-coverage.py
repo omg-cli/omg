@@ -4,17 +4,19 @@ import argparse
 import ast
 import bisect
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 import hashlib
 import json
 import difflib
 import gzip
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 import re
 
 COUNTER_LIMIT = 2**63 - 1
+MAX_DIAGNOSTIC_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -158,7 +160,7 @@ def canonical_source(filename, sources):
     return matches[0]
 
 
-def region_evidence(path, coverage, sources, side=None):
+def _read_region_document(path):
     raw = Path(path).read_bytes()
     if len(raw) > 32 * 1024 * 1024:
         raise ValueError("Region archive exceeds bound")
@@ -170,7 +172,11 @@ def region_evidence(path, coverage, sources, side=None):
     value = json.loads(decoded)
     if value.get("type") != "llvm.coverage.json.export" or value.get("version") != "3.1.0" or len(value.get("data", [])) != 1:
         raise ValueError("Unsupported region schema")
-    data = value["data"][0]; files = {}; mappings = {}
+    return value["data"][0]
+
+
+def region_evidence(path, coverage, sources, side=None):
+    data = _read_region_document(path); files = {}; mappings = {}
     for item in data["files"]:
         name = canonical_source(item["filename"], sources)
         if name in files:
@@ -197,6 +203,265 @@ def region_evidence(path, coverage, sources, side=None):
                 raise ValueError(f"Invalid JSON region coverage counter ({side or path}) at {filename}:{region[0]}: "
                                  f"{region[4]}; wrapped or saturated count")
     return data["functions"], sections
+
+
+@dataclass(frozen=True)
+class ObservedOwner:
+    name: str
+    count: int
+    regions: tuple
+    rows: tuple
+
+
+@dataclass(frozen=True)
+class ObservedFile:
+    filename: str
+    source_sha256: str
+    inventory_sha256: str
+    owners: tuple
+    groups: tuple
+    segments: tuple
+    rows: tuple
+    summary: tuple
+
+
+class _ObserverWork:
+    def __init__(self):
+        self.remaining = 20_000_000
+
+    def spend(self, units=1):
+        self.remaining -= units
+        if self.remaining < 0:
+            raise ValueError('LLVM observer work bound exceeded')
+
+
+def _llvm22_segments(regions, work):
+    ordered = sorted((tuple(r[:2]), tuple(r[2:4]), r[4]) for r in regions)
+    ordered.sort(key=lambda r: (r[0], -r[1][0], -r[1][1]))
+    combined = []
+    for region in ordered:
+        work.spend()
+        if combined and combined[-1][:2] == region[:2]:
+            count = combined[-1][2] + region[2]
+            if count >= COUNTER_LIMIT:
+                raise ValueError('LLVM observer merged counter is saturated')
+            combined[-1] = (region[0], region[1], count)
+        else:
+            combined.append(region)
+    result = []; active = []
+
+    def start(region, location, entry, skip=False):
+        count, has_count = (0, False) if skip else (region[2], True)
+        if (result and not entry and not skip and result[-1][3] == has_count
+                and result[-1][2] == count and not result[-1][4]):
+            return
+        work.spend()
+        result.append((location[0], location[1], count, has_count, entry, False))
+
+    def complete(location, first):
+        nonlocal active
+        active[first:] = sorted(active[first:], key=lambda r: r[1])
+        size = len(active)
+        for index in range(first + 1, size):
+            work.spend()
+            previous, current = active[index - 1], active[index]
+            at = previous[1]
+            if location is not None and at == location:
+                break
+            if at == current[1]:
+                continue
+            for other in range(index + 1, size):
+                work.spend()
+                if current[1] == active[other][1]:
+                    current = active[other]
+            start(current, at, False)
+        last = active[-1]
+        if first and last[1] != location:
+            start(active[first - 1], last[1], False)
+        elif not first and (location is None or location != last[1]):
+            start(last, last[1], False, True)
+        active = active[:first]
+
+    for index, region in enumerate(combined):
+        work.spend(len(active) + 1)
+        kept = [r for r in active if r[1] > region[0]]
+        done = [r for r in active if r[1] <= region[0]]
+        active = kept + done
+        if done:
+            complete(region[0], len(kept))
+        if region[0] == region[1]:
+            skipped = index + 1 == len(combined)
+            start(active[-1] if active else region, region[0], True, skipped)
+            if skipped and active:
+                start(active[-1], region[0], False)
+            continue
+        if index + 1 == len(combined) or region[0] != combined[index + 1][0]:
+            start(region, region[0], True)
+        active.append(region)
+    if active:
+        complete(None, 0)
+    return tuple(result)
+
+
+def _llvm22_rows(segments, work):
+    by_line = {}
+    for segment in segments:
+        by_line.setdefault(segment[0], []).append(segment)
+    result = []; wrapped = None
+    for line in range(1, max(by_line, default=0) + 1):
+        current = by_line.get(line, ())
+        work.spend(len(current) + 1)
+        entries = [s for s in current if s[3] and s[4] and not s[5]]
+        skipped = bool(current and not current[0][3] and current[0][4])
+        mapped = ((not skipped and ((wrapped is not None and wrapped[3]) or entries))
+                  or any(s[3] and s[4] for s in current))
+        if mapped:
+            result.append((line, max([wrapped[2] if wrapped else 0] + [s[2] for s in entries])))
+        if current:
+            wrapped = current[-1]
+    return tuple(result)
+
+
+def observe_llvm22_file(filename, source, functions, record, lcov):
+    """Reconcile the bounded LLVM 22 kind-0 observer model, without source credit.
+
+    The model follows rust-lang/llvm-project at
+    1cb4e3833c1919c2e6fb579a23ac0e2b22587b7e. Its immutable result preserves
+    every compiled copy. It does not establish retention, folding or deletion.
+    """
+    def require(condition, message):
+        if not condition:
+            raise ValueError('LLVM observer ' + message)
+
+    require(type(source) is bytes and len(source) <= 1024 * 1024, 'source exceeds byte bound')
+    try:
+        text = source.decode('utf-8')
+    except UnicodeDecodeError as error:
+        raise ValueError('LLVM observer source is not UTF-8') from error
+    require('\r' not in text, 'source must retain raw LF identity')
+    lines = text.split('\n')
+    require(len(lines) <= 65_536, 'source exceeds line bound')
+    boundaries = []
+    for line in lines:
+        offset = 1; positions = {1}
+        for character in line:
+            offset += len(character.encode('utf-8')); positions.add(offset)
+        boundaries.append(positions)
+
+    def position(line, column):
+        return (type(line) is int and type(column) is int and 1 <= line <= len(lines)
+                and column in boundaries[line - 1])
+
+    def counter(value):
+        return type(value) is int and 0 <= value < COUNTER_LIMIT
+
+    require(type(filename) is str and filename.startswith('/') and '\\' not in filename
+            and '..' not in filename.split('/'), 'raw filename is invalid')
+    require(type(record) is dict and record.get('filename') == filename, 'file identity mismatch')
+    require(all(record.get(key) == [] for key in ('branches', 'mcdc_records', 'expansions')),
+            'unsupported file schema')
+    require(type(functions) is list and len(functions) <= 100_000, 'function inventory exceeds bound')
+    selected = []; names = set(); region_total = 0
+    for owner in functions:
+        require(type(owner) is dict and type(owner.get('filenames')) is list
+                and owner['filenames'] and all(type(path) is str for path in owner['filenames']),
+                'invalid function filename inventory')
+        if filename not in owner['filenames']:
+            continue
+        require(owner['filenames'] == [filename], 'unsupported cross-file owner')
+        require(type(owner.get('name')) is str and owner['name'] and owner['name'] not in names,
+                'duplicate or missing owner inventory identity')
+        names.add(owner['name'])
+        require(counter(owner.get('count')), 'invalid owner inventory counter')
+        require(owner.get('branches') == [] and owner.get('mcdc_records') == [],
+                'unsupported owner schema')
+        regions = owner.get('regions')
+        require(type(regions) is list and regions, 'empty owner inventory')
+        region_total += len(regions)
+        require(region_total <= 50_000, 'region inventory exceeds bound')
+        for region in regions:
+            require(type(region) is list and len(region) == 8
+                    and all(type(value) is int for value in region), 'invalid region schema')
+            require(position(region[0], region[1]) and position(region[2], region[3]),
+                    'region source byte boundary mismatch')
+            require(tuple(region[:2]) <= tuple(region[2:4]), 'reversed region geometry')
+            require(counter(region[4]), 'invalid or saturated region counter')
+            require(region[5:] == [0, 0, 0], 'unsupported region kind or filename relationship')
+        selected.append(owner)
+    require(selected, 'missing selected owner inventory')
+    raw_segments = record.get('segments')
+    require(type(raw_segments) is list and len(raw_segments) <= 100_000, 'segment inventory exceeds bound')
+    for segment in raw_segments:
+        require(type(segment) is list and len(segment) == 6
+                and position(segment[0], segment[1]) and counter(segment[2])
+                and all(type(flag) is bool for flag in segment[3:]), 'invalid segment schema')
+    require(type(lcov) is dict and type(lcov.get('counts')) is dict, 'missing LCOV inventory')
+    require(all(type(line) is int and 1 <= line <= len(lines) and counter(count)
+                for line, count in lcov['counts'].items()), 'invalid LCOV row inventory')
+    work = _ObserverWork(); owners = []; grouped = {}
+    for owner in selected:
+        rows = _llvm22_rows(_llvm22_segments(owner['regions'], work), work)
+        owners.append(ObservedOwner(owner['name'], owner['count'],
+                                    tuple(tuple(row) for row in owner['regions']), rows))
+        grouped.setdefault(tuple(owner['regions'][0][:2]), []).append(len(owners) - 1)
+    groups = tuple((key, tuple(indices)) for key, indices in sorted(grouped.items()))
+    summaries = {
+        'lines': tuple(sum(max((len(owners[i].rows), sum(count > 0 for _, count in owners[i].rows))[metric]
+                                  for i in indices) for _, indices in groups) for metric in (0, 1)),
+        'regions': tuple(sum(max((len(owners[i].regions), sum(row[4] > 0 for row in owners[i].regions))[metric]
+                                    for i in indices) for _, indices in groups) for metric in (0, 1)),
+        'functions': (len(groups), sum(any(owners[i].count > 0 for i in indices) for _, indices in groups)),
+        'instantiations': (len(owners), sum(owner.count > 0 for owner in owners)),
+    }
+    require(type(record.get('summary')) is dict, 'missing summary inventory')
+    for kind, expected in summaries.items():
+        summary = record['summary'].get(kind, {})
+        require(type(summary) is dict, f'invalid {kind} summary inventory')
+        pair = (summary.get('count'), summary.get('covered'))
+        require(all(counter(value) for value in pair) and pair == expected,
+                f'{kind} summary reconciliation failed')
+    require(counter(lcov.get('LF')) and counter(lcov.get('LH'))
+            and (lcov['LF'], lcov['LH']) == summaries['lines'], 'LCOV summary reconciliation failed')
+    segments = _llvm22_segments([row for owner in selected for row in owner['regions']], work)
+    require(tuple(tuple(row) for row in raw_segments) == segments, 'complete segment reconciliation failed')
+    rows = _llvm22_rows(segments, work)
+    require(tuple(sorted(lcov['counts'].items())) == rows, 'every DA count reconciliation failed')
+    digest = hashlib.sha256(json.dumps(selected, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return ObservedFile(filename, hashlib.sha256(source).hexdigest(), digest, tuple(owners), groups,
+                        segments, rows, summaries['lines'])
+
+
+@dataclass(frozen=True)
+class ObserverProjection:
+    removed_groups: tuple
+    removed_owners: tuple
+    summary: tuple
+    rows: tuple
+
+
+def project_observer_groups(observed, removed_groups, *, _work=None):
+    """Reconstruct a whole-group omission; this is not a source deletion proof."""
+    if (not isinstance(observed, ObservedFile) or type(removed_groups) not in (tuple, list)
+            or any(type(key) is not tuple or len(key) != 2
+                   or any(type(value) is not int for value in key) for key in removed_groups)):
+        raise ValueError('Projection requires exact whole observer group keys')
+    selected = set(removed_groups)
+    inventory = {key for key, _ in observed.groups}
+    if len(selected) != len(removed_groups) or selected - inventory:
+        raise ValueError('Projection requires unique existing whole observer group keys')
+    removed = {index for key, indices in observed.groups if key in selected for index in indices}
+    kept = [(key, indices) for key, indices in observed.groups if key not in selected]
+    summary = tuple(sum(max((len(observed.owners[i].rows),
+                             sum(count > 0 for _, count in observed.owners[i].rows))[metric]
+                            for i in indices) for _, indices in kept) for metric in (0, 1))
+    work = _ObserverWork() if _work is None else _work
+    if not isinstance(work, _ObserverWork):
+        raise ValueError('Projection requires a bounded observer work owner')
+    segments = _llvm22_segments([row for index, owner in enumerate(observed.owners)
+                                if index not in removed for row in owner.regions], work)
+    return ObserverProjection(tuple(sorted(selected)),
+                              tuple(owner.name for index, owner in enumerate(observed.owners)
+                                    if index in removed), summary, _llvm22_rows(segments, work))
 
 
 def source_owner_span(owner, name, files, source):
@@ -958,6 +1223,378 @@ def _boolean_source(source):
     return _BooleanSource(text, words, starts, ends, parents, pairs, offsets)
 
 
+@dataclass(frozen=True)
+class SourceAtom:
+    line: int
+    text: str
+    count: int
+    endpoint: tuple | None
+
+
+@dataclass(frozen=True)
+class SourceObligation:
+    old_line: int
+    role: str
+    head_line: int | None
+    head_candidates: tuple
+    reason: str
+
+
+@dataclass(frozen=True)
+class SourceLedger:
+    base_atoms: tuple
+    head_atoms: tuple
+    obligations: tuple
+    additions: tuple
+
+    def require_resolved(self):
+        """Check source classification only, without a coverage or deletion verdict."""
+        pending = [item.old_line for item in self.obligations
+                   if item.role not in ('Retained', 'Moved')]
+        if pending:
+            raise ValueError(f'Ledger has unresolved source obligations: {pending}')
+
+
+def _ledger_lexical_inventory(source):
+    code = _boolean_source(source)
+    if code is None:
+        raise ValueError('Unsupported bounded source ledger syntax')
+    frames = {}; functions = []; remaining = 20_000_000
+    for opening in sorted(index for index, word in enumerate(code.words) if word == '{'):
+        parent = code.parents[opening]
+        first = parent + 1 if parent is not None else 0
+        for index in range(opening - 1, first - 1, -1):
+            remaining -= 1
+            if remaining < 0:
+                raise ValueError('Source ledger lexical work bound exceeded')
+            if (code.words[index] == ';' and code.parents[index] == parent
+                    or code.words[index] == '}' and code.parents[code.pairs[index]] == parent):
+                first = index + 1
+                break
+        prefix = code.words[first:opening]
+        remaining -= 8 * (opening - first) + (code.pairs[opening] - opening)
+        if remaining < 0:
+            raise ValueError('Source ledger lexical work bound exceeded')
+        direct = [index for index in range(first, opening) if code.parents[index] == parent]
+        fn = [index for index in direct if code.words[index] == 'fn']
+        ancestors = tuple(frames[index]['local_identity'] for index in reversed(code.ancestors(opening))
+                          if index in frames)
+        supported = all(frames[index]['supported'] for index in code.ancestors(opening) if index in frames)
+        for index in range(first, opening):
+            if code.words[index] != '#':
+                continue
+            if index + 1 >= opening or code.words[index + 1] != '[':
+                supported = False
+                continue
+            end_attribute = code.pairs[index + 1]
+            attribute = code.words[index + 2:end_attribute]
+            if attribute not in (['cfg', '(', 'test', ')'], ['test']):
+                supported = False
+        kind = 'block'; identity = ('block', ancestors, tuple(prefix)); declaration = first
+        if len(fn) == 1:
+            declaration = fn[0]
+            args = declaration + 2
+            if (args < opening and code.words[args] == '('
+                    and re.fullmatch(r'[A-Za-z_]\w*', code.words[declaration + 1])):
+                kind = 'function'
+                identity = ('function', ancestors, code.words[declaration + 1],
+                            tuple(code.words[args:code.pairs[args] + 1]))
+            else:
+                kind = 'unsupported'; identity = ('unsupported', ancestors, tuple(prefix))
+        elif prefix and prefix[-1] == '!':
+            kind = 'macro'; identity = ('macro', ancestors, tuple(prefix))
+        else:
+            for keyword in ('struct', 'enum', 'union', 'impl', 'mod', 'trait'):
+                selected = [index for index in direct if code.words[index] == keyword]
+                if len(selected) == 1:
+                    kind = keyword
+                    identity = (kind, ancestors, tuple(code.words[selected[0]:opening]))
+                    break
+        end = code.pairs[opening]
+        frames[opening] = dict(kind=kind, identity=identity,
+                               local_identity=(identity[0], *identity[2:]), opening=opening, end=end,
+                               supported=supported and kind not in ('macro', 'unsupported'),
+                               first_line=code.position(code.starts[declaration])[0],
+                               last_line=code.position(code.starts[end])[0],
+                               body=tuple(code.words[opening:end + 1]))
+        if kind == 'function':
+            functions.append(frames[opening])
+    endpoints = {}; by_line = {}
+    for index, word in enumerate(code.words):
+        by_line.setdefault(code.position(code.starts[index])[0], []).append(index)
+    for line, indices in by_line.items():
+        if [code.words[index] for index in indices] not in (['}'], ['}', ';']):
+            continue
+        opening = code.pairs[indices[0]]
+        if opening in frames:
+            endpoints[line] = frames[opening]
+    if len(source) * len(functions) > 20_000_000:
+        raise ValueError('Source ledger context inventory work bound exceeded')
+    contexts = {}
+    for line in range(1, len(source) + 1):
+        matches = [frame for frame in functions if frame['first_line'] <= line <= frame['last_line']]
+        if matches:
+            narrowest = min(frame['last_line'] - frame['first_line'] for frame in matches)
+            matches = [frame for frame in matches if frame['last_line'] - frame['first_line'] == narrowest]
+            if len(matches) == 1:
+                contexts[line] = matches[0]['identity']
+    if len(source) * len(frames) > 20_000_000:
+        raise ValueError('Source ledger scope inventory work bound exceeded')
+    eligible = {line for line in range(1, len(source) + 1)
+                if all(frame['supported'] for frame in frames.values()
+                       if frame['first_line'] <= line <= frame['last_line'])}
+    return endpoints, contexts, functions, eligible
+
+
+def source_obligation_ledger(old_blob, new_blob, before, after):
+    """Inventory line obligations without granting execution or deletion credit.
+
+    Source candidates are selected before counts. Replacements and rejected
+    endpoints remain old obligations. This operation is not a coverage verdict.
+    """
+    sources = []
+    for blob, counts in ((old_blob, before), (new_blob, after)):
+        if type(blob) is not bytes or len(blob) > 1024 * 1024 or b'\r' in blob:
+            raise ValueError('Unsupported exact source ledger blob')
+        try:
+            text = blob.decode('utf-8')
+            lines = text.split('\n')
+            if lines[-1] == '':
+                lines.pop()
+        except UnicodeDecodeError as error:
+            raise ValueError('Source ledger blob is not UTF-8') from error
+        if (type(counts) is not dict or len(lines) > 65_536
+                or any(type(line) is not int or not 1 <= line <= len(lines)
+                       or type(count) is not int or not 0 <= count < COUNTER_LIMIT
+                       for line, count in counts.items())):
+            raise ValueError('Invalid mapped source ledger inventory')
+        sources.append(lines)
+    old, new = sources
+    if len(old) * len(new) > 32_000_000:
+        raise ValueError('Source ledger alignment work bound exceeded')
+    be, bc, bfunctions, beligible = _ledger_lexical_inventory(old)
+    he, hc, hfunctions, heligible = _ledger_lexical_inventory(new)
+    atoms = tuple(SourceAtom(line, old[line - 1], count,
+                             be[line]['identity'] if line in be else None)
+                  for line, count in sorted(before.items()))
+    head_atoms = tuple(SourceAtom(line, new[line - 1], count,
+                                  he[line]['identity'] if line in he else None)
+                       for line, count in sorted(after.items()))
+    proposals = {}
+    for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+        for line in range(a + 1, b + 1):
+            proposals[line] = (tag, c + line - a if tag == 'equal' else None)
+    rows = []
+    for atom in atoms:
+        line = atom.line; endpoint = be.get(line)
+        role = 'Retained'; reason = 'exact unchanged source'; candidates = ()
+        if old_blob == new_blob:
+            candidates = (line,)
+        elif endpoint is not None:
+            candidates = tuple(number for number, frame in sorted(he.items())
+                               if frame['identity'] == endpoint['identity']
+                               and frame['kind'] != 'unsupported')
+            reason = 'complete compatible lexical endpoint inventory'
+            if not candidates and endpoint['kind'] == 'function':
+                old_matches = [frame for frame in bfunctions if frame['supported'] and frame['body'] == endpoint['body']
+                               and frame['identity'][3] == endpoint['identity'][3]]
+                new_matches = [frame for frame in hfunctions if frame['supported'] and frame['body'] == endpoint['body']
+                               and frame['identity'][3] == endpoint['identity'][3]]
+                if len(old_matches) == len(new_matches) == 1:
+                    candidates = (new_matches[0]['last_line'],)
+                    role = 'Moved'; reason = 'unique complete function body extraction'
+        else:
+            context = bc.get(line)
+            candidates = tuple(number for number, text in enumerate(new, 1)
+                               if text == atom.text and context is not None and hc.get(number) == context)
+            old_candidates = [number for number, text in enumerate(old, 1)
+                              if text == atom.text and context is not None and bc.get(number) == context]
+            if len(old_candidates) != 1:
+                candidates = ()
+            reason = 'complete lexical expression inventory'
+            if not candidates:
+                tag, target = proposals[line]
+                text = '\n' + '\n'.join(old) + '\n'
+                other = '\n' + '\n'.join(new) + '\n'
+                block = '\n' + atom.text + '\n'
+                if (tag == 'equal' and re.search(r'\w', atom.text)
+                        and text.count(block) == other.count(block) == 1):
+                    candidates = (target,)
+                    reason = 'unique global source line candidate'
+        if len(candidates) == 1 and line in beligible and candidates[0] in heligible:
+            rows.append(SourceObligation(line, role, candidates[0], candidates, reason))
+        else:
+            tag, _ = proposals[line]
+            role = 'Replaced' if tag == 'replace' and endpoint is None else 'Unresolved'
+            rows.append(SourceObligation(line, role, None, candidates,
+                        reason + '; source attribution remains unresolved'))
+    usage = Counter(item.head_line for item in rows if item.head_line is not None)
+    rows = tuple(SourceObligation(item.old_line, 'Unresolved', None, item.head_candidates,
+                                 'non-injective source correspondence remains unresolved')
+                 if item.head_line is not None and usage[item.head_line] != 1 else item for item in rows)
+    retained = {item.head_line for item in rows if item.head_line is not None}
+    return SourceLedger(atoms, head_atoms, rows,
+                        tuple(atom.line for atom in head_atoms if atom.line not in retained))
+
+
+def _diagnostic_size(value):
+    """Bound expanded JSON before copying a shared diagnostic object graph."""
+    memo = {}; active = set(); remaining = 20_000_000
+
+    def size(item, depth):
+        nonlocal remaining
+        remaining -= 1
+        if remaining < 0:
+            raise ValueError('Diagnostic serialization work bound exceeded')
+        if depth > 64:
+            raise ValueError('Diagnostic serialization nesting bound exceeded')
+        identity = id(item)
+        if identity in memo:
+            count, height = memo[identity]
+            if depth + height > 64:
+                raise ValueError('Diagnostic serialization nesting bound exceeded')
+            return count, height
+        if identity in active:
+            raise ValueError('Diagnostic serialization contains a cycle')
+        active.add(identity)
+        height = 0
+        if type(item) is str:
+            remaining -= len(item)
+            if remaining < 0:
+                raise ValueError('Diagnostic serialization work bound exceeded')
+            count = 2 + sum(2 if char in '\\"\b\f\n\r\t' else
+                            1 if 0x20 <= ord(char) <= 0x7e else
+                            6 if ord(char) <= 0xffff else 12 for char in item)
+        elif item is None:
+            count = 4
+        elif type(item) is bool:
+            count = 4 if item else 5
+        elif type(item) is int:
+            count = len(str(item))
+        elif is_dataclass(item) or type(item) is dict:
+            pairs = ((field.name, getattr(item, field.name)) for field in fields(item)) \
+                if is_dataclass(item) else item.items()
+            count = 2
+            for index, (key, child) in enumerate(pairs):
+                if type(key) is not str:
+                    raise ValueError('Diagnostic serialization requires string keys')
+                key_size, key_height = size(key, depth + 1)
+                child_size, child_height = size(child, depth + 1)
+                count += key_size + child_size + 2 + (2 if index else 0)
+                height = max(height, key_height + 1, child_height + 1)
+                if count > MAX_DIAGNOSTIC_BYTES:
+                    raise ValueError('Diagnostic output exceeds 64 MiB bound')
+        elif type(item) in (tuple, list):
+            count = 2
+            for index, child in enumerate(item):
+                child_size, child_height = size(child, depth + 1)
+                count += child_size + (2 if index else 0)
+                height = max(height, child_height + 1)
+                if count > MAX_DIAGNOSTIC_BYTES:
+                    raise ValueError('Diagnostic output exceeds 64 MiB bound')
+        else:
+            raise ValueError('Unsupported diagnostic serialization value')
+        if count > MAX_DIAGNOSTIC_BYTES:
+            raise ValueError('Diagnostic output exceeds 64 MiB bound')
+        active.remove(identity)
+        memo[identity] = count, height
+        return count, height
+
+    return size(value, 0)[0]
+
+
+def _diagnostic_plain_value(value):
+    _diagnostic_size(value)
+
+    def plain(item):
+        if is_dataclass(item):
+            return asdict(item)
+        if type(item) is dict:
+            return {key: plain(child) for key, child in item.items()}
+        if type(item) is tuple:
+            return tuple(plain(child) for child in item)
+        if type(item) is list:
+            return [plain(child) for child in item]
+        return item
+
+    return plain(value)
+
+
+def source_pair_diagnostics(base, head, base_regions, head_regions, base_sources, head_sources, names):
+    """Report bounded observer and source inventories without changing comparison."""
+    if (not names or len(names) > 8 or len(set(names)) != len(names)
+            or any(type(name) is not str or name not in base_sources or name not in head_sources
+                   for name in names)):
+        raise ValueError('Diagnostic requires one to eight distinct common source files')
+    result = {'schema': 'omg.coverage.source-diagnostic.v1', 'acceptance': False,
+              'deletion_credit': None, 'folded_credit': None, 'files': []}
+    snapshots = []
+    for side, coverage, archive, sources in [('base', base, base_regions, base_sources),
+                                              ('head', head, head_regions, head_sources)]:
+        data = _read_region_document(archive)
+        sections = {canonical_source(path, sources): (path, section)
+                    for path, section in coverage.sections.items()}
+        if len(sections) != len(coverage.sections):
+            raise ValueError('Diagnostic LCOV source inventory is ambiguous')
+        result[side] = {'lcov_sha256': coverage.sha256,
+                        'regions_sha256': hashlib.sha256(Path(archive).read_bytes()).hexdigest()}
+        snapshots.append((data, sections, sources))
+    for name in names:
+        row = {'file': name}; observed = []
+        for side, (data, sections, sources) in zip(('base', 'head'), snapshots):
+            if name not in sections:
+                raise ValueError(f'Diagnostic source has no mapped section: {name}')
+            filename, section = sections[name]
+            text = sources[name].decode('utf-8').split('\n')
+            row[side] = {'source_sha256': hashlib.sha256(sources[name]).hexdigest(),
+                         'summary': [section['LF'], section['LH']],
+                         'atoms': [dict(line=line, text=text[line - 1] if line <= len(text) else None,
+                                        count=count) for line, count in sorted(section['counts'].items())]}
+            try:
+                records = [item for item in data['files'] if type(item) is dict
+                           and item.get('filename') == filename]
+                if len(records) != 1:
+                    raise ValueError('Diagnostic needs exactly one raw filename record')
+                value = observe_llvm22_file(filename, sources[name], data['functions'], records[0], section)
+                row[side]['observer'] = {'status': 'reconciled', **vars(value)}
+                observed.append(value)
+            except (ValueError, TypeError, KeyError, IndexError) as error:
+                row[side]['observer'] = {'status': 'unsupported', 'reason': str(error)}
+                observed.append(None)
+        try:
+            ledger = source_obligation_ledger(base_sources[name], head_sources[name],
+                        snapshots[0][1][name][1]['counts'], snapshots[1][1][name][1]['counts'])
+            row['source_obligations'] = {'status': 'inventoried', **vars(ledger)}
+        except (ValueError, TypeError, KeyError, IndexError) as error:
+            ledger = None
+            row['source_obligations'] = {'status': 'unsupported', 'reason': str(error),
+                'old_obligations': [dict(old_line=item['line'], role='Unresolved') for item in row['base']['atoms']]}
+        if ledger is not None and observed[0] is not None:
+            roles = {item.old_line: item.role for item in ledger.obligations}
+            candidates = [key for key, indices in observed[0].groups
+                          if all(roles.get(line) in ('Unresolved', 'Replaced')
+                                 for index in indices for line, _ in observed[0].owners[index].rows)]
+            omissions = []; work = _ObserverWork()
+            for key in candidates:
+                try:
+                    if work.remaining < 0:
+                        raise ValueError('LLVM observer work bound exceeded')
+                    projection = project_observer_groups(observed[0], (key,), _work=work)
+                    omissions.append({'status': 'observed-only', 'source_credit': 'unproved',
+                        'removed_groups': projection.removed_groups, 'removed_owners': projection.removed_owners,
+                        'summary_without': projection.summary, 'mapped_without': len(projection.rows),
+                        'mapped_hit_without': sum(count > 0 for _, count in projection.rows),
+                        'rows_sha256': hashlib.sha256(json.dumps(projection.rows).encode()).hexdigest()})
+                except ValueError as error:
+                    omissions.append({'status': 'unsupported', 'removed_groups': [key], 'reason': str(error)})
+            row['group_omissions'] = {'status': 'diagnostic-only', 'candidate_groups': candidates,
+                'groups': omissions, 'unprojected_groups': [dict(group=key,
+                    reason='partial or retained source owner; attribution remains unsupported')
+                    for key, _ in observed[0].groups if key not in candidates]}
+        result['files'].append(row)
+    return _diagnostic_plain_value(result)
+
+
 def _boolean_attributes(code, index):
     attributes = []
     cursor = index - 1
@@ -1603,17 +2240,39 @@ def main():
     parser.add_argument("--source-repo", type=Path)
     parser.add_argument("--base-sha")
     parser.add_argument("--head-sha")
+    parser.add_argument('--diagnostic-output', type=Path)
+    parser.add_argument('--diagnostic-file', action='append', default=[])
     args = parser.parse_args()
     base = read_coverage(args.base, "base")
     head = read_coverage(args.head, "head")
     print(json.dumps({"base": {k: v for k, v in vars(base).items() if k != "sections"},
                       "head": {k: v for k, v in vars(head).items() if k != "sections"}}, sort_keys=True))
     evidence = (args.base_regions, args.head_regions, args.source_repo, args.base_sha, args.head_sha)
+    if bool(args.diagnostic_output) != bool(args.diagnostic_file):
+        parser.error('Diagnostic output and source file selections are required together')
+    if args.diagnostic_output and not all(evidence):
+        parser.error('Diagnostic output requires complete exact source/region evidence')
     if any(evidence):
         if not all(evidence):
             raise ValueError("Complete exact source/region evidence required")
+        base_sources = source_blobs(args.source_repo, args.base_sha)
+        head_sources = source_blobs(args.source_repo, args.head_sha)
+        if args.diagnostic_output:
+            try:
+                report = source_pair_diagnostics(base, head, args.base_regions, args.head_regions,
+                                                base_sources, head_sources, args.diagnostic_file)
+                report['source_commits'] = {'base': args.base_sha, 'head': args.head_sha}
+                if _diagnostic_size(report) + 1 > MAX_DIAGNOSTIC_BYTES:
+                    raise ValueError('Diagnostic output exceeds 64 MiB bound')
+                raw = json.dumps(report, sort_keys=True).encode('utf-8') + b'\n'
+                if len(raw) > MAX_DIAGNOSTIC_BYTES:
+                    raise ValueError('Diagnostic output exceeds 64 MiB bound')
+                with args.diagnostic_output.open('xb') as stream:
+                    stream.write(raw)
+            except (ValueError, OSError, TypeError, KeyError, IndexError) as error:
+                print(f'Diagnostic unavailable; strict comparison unchanged: {error}', file=sys.stderr)
         receipt = require_source_no_regression(base, head, args.base_regions, args.head_regions,
-            source_blobs(args.source_repo, args.base_sha), source_blobs(args.source_repo, args.head_sha))
+            base_sources, head_sources)
         print(json.dumps(receipt, sort_keys=True))
     else:
         require_no_regression(base, head)

@@ -2180,11 +2180,13 @@ mod tests {
                 header.set_size(content.len() as u64);
                 header.set_mode(0o644);
                 header.set_cksum();
-                archive.append_data(
-                    &mut header,
-                    format!("{name}-{version}/desc"),
-                    content.as_bytes(),
-                )?;
+                archive
+                    .append_data(
+                        &mut header,
+                        format!("{name}-{version}/desc"),
+                        content.as_bytes(),
+                    )
+                    .expect("private repository fixture record is writable");
             }
             archive.into_inner()?.finish()?;
             Ok(())
@@ -2196,19 +2198,21 @@ mod tests {
             std::fs::write(
                 package.join("desc"),
                 format!("%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%ARCH%\nany\n\n%REASON%\n0\n\n"),
-            )?;
+            )
+            .expect("private local package fixture descriptor is writable");
             Ok(())
         }
 
-        fn open(&self) -> anyhow::Result<alpm::Alpm> {
-            Ok(alpm::Alpm::new(
+        fn open(&self) -> alpm::Alpm {
+            alpm::Alpm::new(
                 self.directory
                     .path()
                     .join("root")
                     .to_str()
                     .expect("UTF-8 root"),
                 self.database().to_str().expect("UTF-8 database"),
-            )?)
+            )
+            .expect("private repository fixture opens in native ALPM")
         }
     }
 
@@ -2229,7 +2233,7 @@ mod tests {
         let desc = fixture.database().join(format!("local/{name}-1-1/desc"));
         let original = fs::read_to_string(&desc)?.replace("%REASON%\n0\n", "%REASON%\n1\n");
         fs::write(&desc, &original)?;
-        let mut alpm = fixture.open()?;
+        let mut alpm = fixture.open();
         assert_eq!(
             alpm.localdb().pkg(name)?.reason(),
             alpm::PackageReason::Depend
@@ -2277,7 +2281,7 @@ mod tests {
         fs::rename(&saved, &desc)?;
         assert_eq!(fs::read_to_string(&desc)?, original);
         drop(alpm);
-        let reopened = fixture.open()?;
+        let reopened = fixture.open();
         assert_eq!(
             reopened.localdb().pkg(name)?.reason(),
             alpm::PackageReason::Depend,
@@ -2313,7 +2317,7 @@ mod tests {
         fixture.write_local("helper", "1-1")?;
         fixture.write_sync("excluded", &[("helper", "9-1", "")])?;
         fixture.write_sync("eligible", &[("helper", "2-1", "")])?;
-        let alpm = fixture.open()?;
+        let alpm = fixture.open();
         let excluded = alpm.register_syncdb("excluded", alpm::SigLevel::NONE)?;
         excluded.set_usage(alpm::Usage::UPGRADE)?;
         alpm.register_syncdb("eligible", alpm::SigLevel::NONE)?
@@ -2346,9 +2350,10 @@ mod tests {
                 std::fs::write(
                     fixture.database().join("sync/unavailable.db"),
                     b"invalid database",
-                )?;
+                )
+                .expect("private malformed repository fixture is writable");
             }
-            let alpm = fixture.open()?;
+            let alpm = fixture.open();
             alpm.register_syncdb("healthy", alpm::SigLevel::NONE)?;
             alpm.register_syncdb("unavailable", alpm::SigLevel::NONE)?
                 .set_usage(alpm::Usage::SEARCH)?;
@@ -2376,7 +2381,7 @@ mod tests {
         let fixture = RepositoryFixture::new()?;
         let path = fixture.database().join("sync/nonregular.db");
         std::fs::create_dir(&path)?;
-        let alpm = fixture.open()?;
+        let alpm = fixture.open();
         let database = alpm.register_syncdb("nonregular", alpm::SigLevel::NONE)?;
         let error = super::validate_sync_database(&alpm, database)
             .expect_err("a database path must be a regular file");
@@ -2399,7 +2404,7 @@ mod tests {
         let original = RepositoryFixture::new()?;
         original.write_sync("selected", &[("helper", "2-1", "")])?;
         let selected = {
-            let alpm = original.open()?;
+            let alpm = original.open();
             let database = alpm.register_syncdb("selected", alpm::SigLevel::NONE)?;
             let package = database.pkg("helper")?;
             OfficialTarget {
@@ -2410,7 +2415,7 @@ mod tests {
         };
         let changed = RepositoryFixture::new()?;
         changed.write_sync("selected", &[("other", "2-1", "")])?;
-        let alpm = changed.open()?;
+        let alpm = changed.open();
         let error = super::validate_prepared_selections(&alpm, std::slice::from_ref(&selected))
             .expect_err("a removed selected repository cannot be substituted");
         assert!(
@@ -2440,7 +2445,7 @@ mod tests {
             if installed {
                 fixture.write_local("helper", "2-1")?;
             }
-            let mut alpm = fixture.open()?;
+            let mut alpm = fixture.open();
             alpm.register_syncdb("selected", alpm::SigLevel::NONE)?;
             let targets = if installed {
                 vec!["selected/helper".to_owned()]
@@ -2452,7 +2457,8 @@ mod tests {
                 targets,
                 super::TransactionKind::Install,
                 &crate::core::pacman_conf::PacmanConfig::default(),
-            )?;
+            )
+            .expect("private installed-state fixture transaction initializes");
             prepared
                 .0
                 .trans_prepare()
@@ -2491,18 +2497,21 @@ mod tests {
     fn selected_virtual_dependency_preserves_provision_constraints() -> anyhow::Result<()> {
         use crate::package_managers::arch_install::OfficialTarget;
         let fixture = RepositoryFixture::new()?;
-        fixture.write_sync(
-            "selected",
-            &[("provider", "7-1", "%PROVIDES%\nvirtual-helper=2\n\n")],
-        )?;
-        let mut alpm = fixture.open()?;
+        fixture
+            .write_sync(
+                "selected",
+                &[("provider", "7-1", "%PROVIDES%\nvirtual-helper=2\n\n")],
+            )
+            .expect("private virtual-provider repository is writable");
+        let mut alpm = fixture.open();
         alpm.register_syncdb("selected", alpm::SigLevel::NONE)?;
         let prepared = super::prepare_alpm_transaction(
             &mut alpm,
             vec!["selected/provider".to_owned()],
             super::TransactionKind::Install,
             &crate::core::pacman_conf::PacmanConfig::default(),
-        )?;
+        )
+        .expect("private virtual-provider fixture transaction initializes");
         prepared
             .0
             .trans_prepare()
@@ -2546,7 +2555,7 @@ mod tests {
         fixture.write_local("unrelated", "1-1")?;
         let description = fixture.database().join("local/unrelated-1-1/desc");
         let before = std::fs::read(&description)?;
-        let alpm = fixture.open()?;
+        let alpm = fixture.open();
         let error = super::persist_installation_reasons(
             &alpm,
             &[("absent".to_owned(), alpm::PackageReason::Depend)],
@@ -2578,7 +2587,7 @@ mod tests {
         let fixture = RepositoryFixture::new()?;
         fixture.write_sync("high", &[("helper", "1-1", "")])?;
         fixture.write_sync("low", &[("helper", "2-1", "")])?;
-        let mut alpm = fixture.open()?;
+        let mut alpm = fixture.open();
         alpm.register_syncdb("high", alpm::SigLevel::NONE)?;
         alpm.register_syncdb("low", alpm::SigLevel::NONE)?;
         let selected = OfficialTarget {
@@ -2593,7 +2602,8 @@ mod tests {
                 vec!["low/helper".to_owned()],
                 super::TransactionKind::Install,
                 &config,
-            )?;
+            )
+            .expect("selected-repository fixture transaction initializes");
             prepared
                 .0
                 .trans_prepare()
@@ -2619,7 +2629,8 @@ mod tests {
                 vec!["helper".to_owned()],
                 super::TransactionKind::Install,
                 &config,
-            )?;
+            )
+            .expect("unqualified fixture transaction initializes");
             prepared
                 .0
                 .trans_prepare()
@@ -2644,7 +2655,8 @@ mod tests {
             vec!["low/helper".to_owned()],
             super::TransactionKind::Install,
             &config,
-        )?;
+        )
+        .expect("disabled-repository fixture transaction initializes");
         prepared
             .0
             .trans_prepare()

@@ -633,7 +633,8 @@ mod tests {
         std::fs::write(
             file.path(),
             include_bytes!("../../../tests/data/mtree/makepkg-links.pkg.tar"),
-        )?;
+        )
+        .expect("genuine makepkg fixture is writable to the private archive");
         let admission = inspect_archive(file.path())?;
         assert_eq!(admission.inspection().package_name, "omg-mtree-probe");
         let root = tempfile::TempDir::new()?;
@@ -642,12 +643,15 @@ mod tests {
         let alpm = alpm::Alpm::new(
             root.path().to_str().context("fixture root is UTF-8")?,
             db.to_str().context("fixture database is UTF-8")?,
-        )?;
-        let package = alpm.pkg_load(
-            file.path().to_str().context("fixture archive is UTF-8")?,
-            true,
-            alpm::SigLevel::NONE,
-        )?;
+        )
+        .expect("private native fixture database opens");
+        let package = alpm
+            .pkg_load(
+                file.path().to_str().context("fixture archive is UTF-8")?,
+                true,
+                alpm::SigLevel::NONE,
+            )
+            .expect("native ALPM loads the genuine makepkg fixture");
         admission.verify_native_inventory(package.files())?;
         assert!(
             package

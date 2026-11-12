@@ -478,3 +478,57 @@ The shared driver passes in KVM with the Docker capability bounding set and
 preserves its database fingerprint. This does not reproduce Docker's AppArmor,
 seccomp, memory or process limits. Final frozen-source coverage and hosted
 verification remain open.
+
+## Combined native and public AUR verification
+
+Frozen product commit `64fe5365` passed 3,724 ordinary instrumented tests,
+the genuine Node installation case, 20 native Arch cases, 14 supplemental
+CLI cases and five CLI/daemon process checks. A storage interruption stopped
+two ordinary cases; those exact cases were rerun successfully. The union
+receipt inventories all 3,724 distinct passing identities. It does not claim
+that the interrupted component met its storage budget.
+
+A real `omg install --yes` invocation under an ordinary guest account also
+completed attended Hardened review, paired makepkg builds and real sudo/root
+transactions. The harmless app's build reads its installed dependency payload.
+Fresh native queries verified exact package identities, file lists and durable
+Requested/Automatic reasons. Further real invocations promoted the dependency
+to Explicit and preserved that reason on a later app installation. Payload
+bytes, modes, root ownership, audit order, unrelated package records and released
+transaction locks were checked. This does not establish a new Automatic-intent
+handoff for an already satisfied dependency, historical rollback, or immediate
+sudo-refresh attribution. The guest had no external network route; real Git
+repositories and a private TLS service supplied the fixed AUR hostname.
+
+The warm coverage target contained obsolete executables. Export now selects
+exactly the 98 current Nextest harnesses and the two actual Cargo CLI/daemon
+artifacts. Independent review verified those 100 physical objects, complete
+profile inventories and retained tar bytes. A local validator initially refused
+passing native parent/child logs because it expected one total libtest summary.
+Recovery checked every summary and preserved the original failure receipt;
+the actual native tests were not rerun to manufacture passing evidence.
+
+The frozen export combines 8,909 ordinary profiles, 283 native/supplemental
+profiles and eight profiles from the real public AUR wave. Source, executable
+and input-profile hashes remain bound to `64fe5365`. Strict comparison still
+fails. The diagnostic inventories eight affected files, including new test
+fixture error projections and ambiguous retained-source correspondence. No
+counter, threshold or deletion/fold acceptance was changed.
+
+The subsequent inventory refinement stores resolved hard-link sizes while
+preserving their distinct origin, so chains remain refused without a second
+fallible target lookup. Native mode/size conversion has safe scalar refusal
+tests alongside the real loaded-package checks. Fixed fixture setup fails with
+descriptive expectations; actual operation-error assertions remain intact.
+The corrected refinement passes 2,206 library tests with 12 ignored, the native
+transaction parent and its real child cases, all-target Clippy with warnings
+denied, CLI/daemon builds and documentation generation. The optional bounded
+coverage diagnostic passes 192 tests and leaves the strict verdict unchanged.
+This newer Rust source has not yet received a fresh full instrumented export.
+
+The normal native target budget is now 52 GiB, with a 20 GiB host reserve.
+Its earlier 2 GiB growth monitor stopped Clippy after the passing library run.
+The admitted continuation passed without rerunning the library suite. Coverage
+retains its separate 40 GiB target budget. Unresolved linker/debug evidence and
+the current QEMU backing images remain preserved. Host package state and
+privilege policy were not changed.

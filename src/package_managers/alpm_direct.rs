@@ -608,11 +608,13 @@ mod tests {
             header.set_size(content.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            archive.append_data(
-                &mut header,
-                format!("{name}-{version}/desc"),
-                content.as_bytes(),
-            )?;
+            archive
+                .append_data(
+                    &mut header,
+                    format!("{name}-{version}/desc"),
+                    content.as_bytes(),
+                )
+                .expect("private sync fixture record is writable");
         }
         archive.into_inner()?.finish()?;
         Ok(())

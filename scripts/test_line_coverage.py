@@ -1,8 +1,10 @@
 """Exercise exact coverage comparison and refusal of incomplete evidence."""
 import importlib.util
 import copy
+import contextlib
 import gzip
 import json
+import io
 import re
 from pathlib import Path
 import subprocess
@@ -2393,6 +2395,391 @@ class BooleanArgumentPaintTests(unittest.TestCase):
         with mock.patch.object(coverage, 'require_rustfmt_syntax', side_effect=ValueError('parser unavailable')):
             with self.assertRaisesRegex(ValueError, 'parser unavailable'):
                 self.proof()
+
+
+class ExactObserverTests(unittest.TestCase):
+    def fixture(self):
+        source = b"fn work() {\n    step();\n}\n"
+        filename = '/src/example.rs'
+        owners = [dict(name=name, count=count, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[1, 1, 3, 2, count, 0, 0, 0]])
+                  for name, count in [('live', 5), ('cold', 0)]]
+        record = dict(filename=filename, branches=[], mcdc_records=[], expansions=[],
+                      segments=[[1, 1, 5, True, True, False], [3, 2, 0, False, False, False]],
+                      summary={'lines': {'count': 3, 'covered': 3},
+                               'regions': {'count': 1, 'covered': 1},
+                               'functions': {'count': 1, 'covered': 1},
+                               'instantiations': {'count': 2, 'covered': 1}})
+        lcov = dict(LF=3, LH=3, counts={1: 5, 2: 5, 3: 5})
+        return filename, source, owners, record, lcov
+
+    def test_exact_observer_preserves_cold_copies_and_separate_surfaces(self):
+        observed = coverage.observe_llvm22_file(*self.fixture())
+        self.assertEqual(observed.summary, (3, 3))
+        self.assertEqual(observed.rows, ((1, 5), (2, 5), (3, 5)))
+        self.assertEqual([owner.count for owner in observed.owners], [5, 0])
+        self.assertEqual(observed.groups, (((1, 1), (0, 1)),))
+
+    def test_observer_reconciles_every_segment_and_da_count(self):
+        for kind in ('segment-count', 'segment-entry', 'segment-gap', 'missing-segment',
+                     'da-count', 'missing-da', 'summary-found', 'summary-hit'):
+            with self.subTest(kind=kind):
+                args = list(self.fixture())
+                if kind == 'segment-count': args[3]['segments'][0][2] = 4
+                if kind == 'segment-entry': args[3]['segments'][0][4] = False
+                if kind == 'segment-gap': args[3]['segments'][0][5] = True
+                if kind == 'missing-segment': args[3]['segments'].pop()
+                if kind == 'da-count': args[4]['counts'][2] = 4
+                if kind == 'missing-da': del args[4]['counts'][2]
+                if kind == 'summary-found': args[3]['summary']['lines']['count'] = 4; args[4]['LF'] = 4
+                if kind == 'summary-hit': args[3]['summary']['lines']['covered'] = 2; args[4]['LH'] = 2
+                with self.assertRaisesRegex(ValueError, 'reconciliation'):
+                    coverage.observe_llvm22_file(*args)
+
+    def test_observer_requires_complete_compiled_inventory_even_for_zero_owners(self):
+        for kind in ('drop-cold-copy', 'duplicate-copy', 'change-cold-entry', 'missing-owner-count'):
+            with self.subTest(kind=kind):
+                args = list(self.fixture())
+                if kind == 'drop-cold-copy': args[2].pop()
+                if kind == 'duplicate-copy': args[2].append(copy.deepcopy(args[2][1]))
+                if kind == 'change-cold-entry': args[2][1]['count'] = 1
+                if kind == 'missing-owner-count': del args[2][1]['count']
+                with self.assertRaisesRegex(ValueError, 'inventory|reconciliation'):
+                    coverage.observe_llvm22_file(*args)
+
+    def test_observer_refuses_unsupported_schema_geometry_and_saturation(self):
+        mutations = {
+            'foreign-file': lambda a: a[2][0]['filenames'].append('/src/foreign.rs'),
+            'file-id': lambda a: a[2][0]['regions'][0].__setitem__(5, 1),
+            'expanded-file': lambda a: a[2][0]['regions'][0].__setitem__(6, 1),
+            'gap': lambda a: a[2][0]['regions'][0].__setitem__(7, 3),
+            'reversed': lambda a: a[2][0]['regions'][0].__setitem__(2, 0),
+            'column': lambda a: a[2][0]['regions'][0].__setitem__(3, 3),
+            'negative': lambda a: a[2][0]['regions'][0].__setitem__(4, -1),
+            'bool-count': lambda a: a[2][0]['regions'][0].__setitem__(4, True),
+            'saturated-region': lambda a: a[2][0]['regions'][0].__setitem__(4, coverage.COUNTER_LIMIT),
+            'saturated-entry': lambda a: a[2][0].__setitem__('count', coverage.COUNTER_LIMIT),
+            'branch': lambda a: a[2][0]['branches'].append([1]),
+            'expansion': lambda a: a[3]['expansions'].append({}),
+            'record-filename': lambda a: a[3].__setitem__('filename', '/src/other.rs'),
+            'source-crlf': lambda a: a.__setitem__(1, a[1].replace(b'\n', b'\r\n')),
+        }
+        for kind, mutate in mutations.items():
+            with self.subTest(kind=kind):
+                args = list(self.fixture()); mutate(args)
+                with self.assertRaises(ValueError):
+                    coverage.observe_llvm22_file(*args)
+
+    def test_observer_rejects_counter_sum_that_would_saturate(self):
+        args = list(self.fixture())
+        args[2][0]['regions'][0][4] = coverage.COUNTER_LIMIT - 1
+        args[2][1]['regions'][0][4] = 1
+        with self.assertRaisesRegex(ValueError, 'saturated'):
+            coverage.observe_llvm22_file(*args)
+
+    def test_observer_validates_utf8_byte_boundaries(self):
+        args = list(self.fixture())
+        args[1] = b'fn work() {\n    step();\n}\xc3\xa9\n'
+        for owner in args[2]: owner['regions'][0][3] = 3
+        with self.assertRaisesRegex(ValueError, 'boundary'):
+            coverage.observe_llvm22_file(*args)
+
+    def test_group_maxima_do_not_require_identical_geometry_or_equal_da_hit_totals(self):
+        filename, _, _, record, _ = self.fixture()
+        source = b'fn work() {\n    a();\n    b();\n}\n'
+        owners = [dict(name='wide', count=1, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[1, 1, 4, 2, 1, 0, 0, 0], [2, 1, 4, 1, 0, 0, 0, 0]]),
+                  dict(name='short', count=2, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[1, 1, 3, 9, 2, 0, 0, 0]])]
+        record['segments'] = [[1, 1, 2, True, True, False], [2, 1, 0, True, True, False],
+                              [3, 9, 0, True, False, False], [4, 1, 1, True, False, False],
+                              [4, 2, 0, False, False, False]]
+        record['summary'] = {'lines': {'count': 4, 'covered': 3},
+                             'regions': {'count': 2, 'covered': 1},
+                             'functions': {'count': 1, 'covered': 1},
+                             'instantiations': {'count': 2, 'covered': 2}}
+        observed = coverage.observe_llvm22_file(filename, source, owners, record,
+                                                dict(LF=4, LH=3, counts={1: 2, 2: 2, 3: 0, 4: 0}))
+        self.assertEqual(observed.summary, (4, 3))
+        self.assertEqual(sum(count > 0 for _, count in observed.rows), 2)
+        self.assertEqual([len(owner.rows) for owner in observed.owners], [4, 3])
+
+    def test_owner_order_is_preserved_without_changing_reconstructed_observations(self):
+        args = list(self.fixture())
+        original = coverage.observe_llvm22_file(*args)
+        args[2].reverse()
+        reordered = coverage.observe_llvm22_file(*args)
+        self.assertEqual([owner.name for owner in reordered.owners], ['cold', 'live'])
+        self.assertEqual((original.summary, original.rows, original.segments),
+                         (reordered.summary, reordered.rows, reordered.segments))
+        self.assertNotEqual(original.inventory_sha256, reordered.inventory_sha256)
+
+    def test_whole_group_projection_preserves_all_compiled_copies_and_both_metrics(self):
+        args = list(self.fixture())
+        observed = coverage.observe_llvm22_file(*args)
+        kept = coverage.project_observer_groups(observed, ())
+        self.assertEqual((kept.summary, kept.rows), (observed.summary, observed.rows))
+        removed = coverage.project_observer_groups(observed, ((1, 1),))
+        self.assertEqual(removed.removed_owners, ('live', 'cold'))
+        self.assertEqual((removed.summary, removed.rows), ((0, 0), ()))
+        with self.assertRaisesRegex(ValueError, 'whole observer group'):
+            coverage.project_observer_groups(observed, ('cold',))
+
+    def test_overlap_projection_does_not_sum_mapped_rows_or_use_summary_as_da(self):
+        filename, source, _, record, _ = self.fixture()
+        owners = [dict(name='parent', count=5, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[1, 1, 3, 2, 5, 0, 0, 0]]),
+                  dict(name='cold-closure', count=0, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[2, 5, 2, 9, 0, 0, 0, 0]])]
+        record['segments'] = [[1, 1, 5, True, True, False], [2, 5, 0, True, True, False],
+                              [2, 9, 5, True, False, False], [3, 2, 0, False, False, False]]
+        record['summary'] = {'lines': {'count': 4, 'covered': 3},
+                             'regions': {'count': 2, 'covered': 1},
+                             'functions': {'count': 2, 'covered': 1},
+                             'instantiations': {'count': 2, 'covered': 1}}
+        observed = coverage.observe_llvm22_file(filename, source, owners, record,
+                                                dict(LF=4, LH=3, counts={1: 5, 2: 5, 3: 5}))
+        projected = coverage.project_observer_groups(observed, ((2, 5),))
+        self.assertEqual(projected.summary, (3, 3))
+        self.assertEqual(projected.rows, observed.rows)
+        self.assertEqual(projected.removed_owners, ('cold-closure',))
+
+    def test_projection_work_budget_is_shared_and_fails_closed(self):
+        observed = coverage.observe_llvm22_file(*self.fixture())
+        work = coverage._ObserverWork()
+        work.remaining = 0
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage.project_observer_groups(observed, (), _work=work)
+
+
+class SourceObligationLedgerTests(unittest.TestCase):
+    def ledger(self, old, new, old_counts=None, new_counts=None):
+        old_counts = old_counts or {i: 1 for i, line in enumerate(old.splitlines(), 1) if line.strip()}
+        new_counts = new_counts or {i: 1 for i, line in enumerate(new.splitlines(), 1) if line.strip()}
+        return coverage.source_obligation_ledger(old.encode(), new.encode(), old_counts, new_counts)
+
+    def test_nested_endpoint_identity_has_linear_expanded_size(self):
+        def expanded_units(value, memo):
+            if not isinstance(value, tuple):
+                return 1
+            if id(value) not in memo:
+                memo[id(value)] = 1 + sum(expanded_units(item, memo) for item in value)
+            return memo[id(value)]
+
+        for depth in (12, 30):
+            source = 'fn work() {\n' + '{\n' * depth + '}\n' * (depth + 1)
+            ledger = self.ledger(source, source)
+            largest = max(expanded_units(atom.endpoint, {}) for atom in ledger.base_atoms)
+            with self.subTest(depth=depth):
+                self.assertLessEqual(largest, 16 * (depth + 1),
+                                     'one endpoint must not recursively duplicate its ancestors')
+            self.assertEqual(len(ledger.base_atoms), len(ledger.obligations))
+
+    def test_wrong_function_to_struct_endpoint_keeps_every_old_obligation(self):
+        old = 'fn obsolete() {\n    old();\n}\n'
+        new = 'struct Manifest {\n    generation: String,\n}\n'
+        ledger = self.ledger(old, new)
+        self.assertEqual([atom.line for atom in ledger.base_atoms], [1, 2, 3])
+        self.assertEqual([item.old_line for item in ledger.obligations], [1, 2, 3])
+        endpoint = ledger.obligations[2]
+        self.assertEqual(endpoint.role, 'Unresolved')
+        self.assertEqual(endpoint.head_candidates, ())
+        self.assertIn('endpoint', endpoint.reason)
+        with self.assertRaisesRegex(ValueError, 'unresolved source obligations'):
+            ledger.require_resolved()
+
+    def test_function_endpoint_inventory_excludes_macro_with_same_spelling(self):
+        old = 'fn retained() -> usize {\n    1\n}\n'
+        new = 'fn retained() -> u64 {\n    2\n}\nthread_local! {\n    static VALUE: u8 = 0;\n}\n'
+        ledger = self.ledger(old, new)
+        endpoint = next(item for item in ledger.obligations if item.old_line == 3)
+        self.assertEqual((endpoint.role, endpoint.head_line, endpoint.head_candidates),
+                         ('Retained', 3, (3,)))
+        self.assertEqual(ledger.head_atoms[-1].endpoint[0], 'macro')
+
+    def test_repeated_function_candidates_are_not_selected_by_hit_count(self):
+        old = 'fn retained() {\n    step();\n}\n'
+        new = '#[cfg(first)]\nfn retained() {\n    step();\n}\n#[cfg(second)]\nfn retained() {\n    step();\n}\n'
+        ledger = self.ledger(old, new, new_counts={2: 1, 3: 1, 4: 1, 6: 0, 7: 0, 8: 0})
+        endpoint = next(item for item in ledger.obligations if item.old_line == 3)
+        self.assertEqual(endpoint.role, 'Unresolved')
+        self.assertEqual(endpoint.head_candidates, (4, 8))
+        self.assertEqual([atom.count for atom in ledger.head_atoms], [1, 1, 1, 0, 0, 0])
+
+    def test_same_function_path_and_parameters_bound_repeated_expression_inventory(self):
+        old = 'fn load(items: &[u8]) -> usize {\n    items.par_iter()\n}\nfn other() {\n    items.par_iter()\n}\n'
+        new = 'fn load(items: &[u8]) -> Result<usize> {\n    setup();\n    items.par_iter()\n}\nfn other() {\n    items.par_iter()\n}\n'
+        ledger = self.ledger(old, new)
+        expression = next(item for item in ledger.obligations if item.old_line == 2)
+        self.assertEqual((expression.role, expression.head_line, expression.head_candidates),
+                         ('Retained', 3, (3,)))
+
+    def test_unique_complete_body_rename_preserves_endpoint_extraction_candidate(self):
+        old = 'fn previous() {\n    step();\n}\n'
+        new = 'fn renamed() {\n    step();\n}\n'
+        ledger = self.ledger(old, new)
+        endpoint = next(item for item in ledger.obligations if item.old_line == 3)
+        self.assertEqual((endpoint.role, endpoint.head_line), ('Moved', 3))
+
+    def test_deleted_or_replaced_rows_never_gain_implicit_zero_credit(self):
+        for old, new in [('fn old() {\n    unhit();\n}\nfn keep() {}\n', 'fn keep() {}\n'),
+                         ('fn keep() {\n    unhit();\n}\n', 'fn keep() {\n    replacement();\n}\n')]:
+            ledger = self.ledger(old, new, old_counts={i: 0 for i in range(1, len(old.splitlines()) + 1)})
+            self.assertEqual(len(ledger.base_atoms), len(ledger.obligations))
+            self.assertFalse(any(item.role == 'Deleted' for item in ledger.obligations))
+            with self.assertRaisesRegex(ValueError, 'unresolved source obligations'):
+                ledger.require_resolved()
+
+    def test_changed_conditional_definition_does_not_establish_endpoint_retention(self):
+        old = '#[cfg(first)]\nfn retained() {\n    step();\n}\n'
+        new = '#[cfg(second)]\nfn retained() {\n    step();\n}\n'
+        endpoint = self.ledger(old, new).obligations[-1]
+        self.assertEqual((endpoint.role, endpoint.head_candidates), ('Unresolved', (4,)))
+
+
+class DiagnosticCoverageTests(unittest.TestCase):
+    def test_serialization_admission_counts_unicode_escapes_and_shared_references(self):
+        shared = ('"\t\\\x00é😀\x7f\n', True, False, None, -123)
+        value = {'first': shared, 'second': [shared, coverage.SourceAtom(1, 'é', 0, None)]}
+        plain = coverage._diagnostic_plain_value(value)
+        self.assertEqual(coverage._diagnostic_size(value),
+                         len(json.dumps(plain).encode('utf-8')))
+
+    def test_deep_shared_graph_and_cycles_are_refused_before_copying(self):
+        shared = ('x',)
+        for _ in range(40):
+            shared = (shared,)
+        deep = shared
+        for _ in range(30):
+            deep = (deep,)
+        cycle = []
+        cycle.append(cycle)
+        for value, reason in (({'shallow': shared, 'deep': deep}, 'nesting'), (cycle, 'cycle')):
+            with self.subTest(reason=reason), \
+                    mock.patch.object(coverage, 'asdict', side_effect=AssertionError('copy before admission')):
+                with self.assertRaisesRegex(ValueError, reason):
+                    coverage._diagnostic_plain_value(value)
+
+    def fixture(self, root, lost=False):
+        source = b'fn work() {\n    step();\n}\n'
+        arguments = ['check-line-coverage.py', '--source-repo', str(root),
+                     '--base-sha', 'a' * 40, '--head-sha', 'b' * 40]
+        for side in ('base', 'head'):
+            counts = [5, 0 if lost and side == 'head' else 5, 5]
+            lcov = root / (side + '.info')
+            lcov.write_text('SF:/src/example.rs\n' + ''.join(f'DA:{i},{c}\n' for i,c in enumerate(counts,1))
+                            + f'LF:3\nLH:{sum(c>0 for c in counts)}\nend_of_record\n')
+            regions = [[line, 1, line, end, count, 0, 0, 0]
+                       for line, end, count in zip((1, 2, 3), (12, 12, 2), counts)]
+            record = dict(filename='/src/example.rs', branches=[], mcdc_records=[], expansions=[],
+                          segments=[segment for line,end,count in zip((1,2,3),(12,12,2),counts)
+                                    for segment in ([line,1,count,True,True,False],[line,end,0,False,False,False])],
+                          summary={'lines':dict(count=3,covered=sum(c>0 for c in counts)),
+                                   'regions':dict(count=3,covered=sum(c>0 for c in counts)),
+                                   'functions':dict(count=1,covered=1),
+                                   'instantiations':dict(count=1,covered=1)})
+            document = dict(type='llvm.coverage.json.export', version='3.1.0', data=[dict(files=[record],
+                            functions=[dict(name='work', count=5, filenames=['/src/example.rs'],
+                                            branches=[], mcdc_records=[], regions=regions)])])
+            archive = root / (side + '.gz')
+            archive.write_bytes(gzip.compress(json.dumps(document).encode()))
+            arguments += ['--' + side, str(lcov), '--' + side + '-regions', str(archive)]
+        return arguments, {'example.rs': source}
+
+    def run_main(self, arguments, sources):
+        out, err = io.StringIO(), io.StringIO()
+        failure = None
+        with mock.patch.object(sys, 'argv', arguments), mock.patch.object(coverage, 'source_blobs', return_value=sources), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                coverage.main()
+            except ValueError as error:
+                failure = str(error)
+        return failure, out.getvalue(), err.getvalue()
+
+    def test_optional_diagnostic_preserves_the_original_strict_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            original = self.run_main(arguments, sources)
+            output = root / 'diagnostic.json'
+            diagnostic = self.run_main(arguments + ['--diagnostic-output', str(output),
+                                                     '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[:2], original[:2])
+            self.assertIn('Retained covered line lost', diagnostic[0])
+            self.assertNotIn('PASS:', diagnostic[1])
+            report = json.loads(output.read_text())
+            self.assertFalse(report['acceptance'])
+            self.assertEqual(report['source_commits'], {'base': 'a' * 40, 'head': 'b' * 40})
+            self.assertEqual([row['line'] for row in report['files'][0]['base']['atoms']], [1, 2, 3])
+            self.assertEqual(report['files'][0]['base']['observer']['status'], 'reconciled')
+            self.assertEqual(report['files'][0]['head']['observer']['status'], 'reconciled')
+
+    def test_expanded_report_is_refused_before_dataclass_copy_or_json_serialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            original = self.run_main(arguments, sources)
+            shared = ('x',)
+            for _ in range(26):
+                shared = (shared, shared)
+            ledger = coverage.SourceLedger((coverage.SourceAtom(1, 'x', 1, shared),), (), (), ())
+            output = root / 'report.json'
+            with mock.patch.object(coverage, 'source_obligation_ledger', return_value=ledger), \
+                    mock.patch.object(coverage, 'asdict', side_effect=AssertionError('copy before output admission')):
+                diagnostic = self.run_main(arguments + ['--diagnostic-output', str(output),
+                                                         '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[:2], original[:2])
+            self.assertFalse(output.exists())
+            self.assertIn('Diagnostic output exceeds 64 MiB bound', diagnostic[2])
+
+    def test_diagnostic_cannot_turn_a_passing_comparison_into_a_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root)
+            original = self.run_main(arguments, sources)
+            diagnostic = self.run_main(arguments + ['--diagnostic-output', str(root / 'report.json'),
+                                                     '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[:2], original[:2])
+            self.assertIsNone(diagnostic[0])
+            self.assertIn('PASS:', diagnostic[1])
+
+    def test_unsupported_diagnostic_retains_old_atoms_and_the_original_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            original = self.run_main(arguments, sources)
+            archive = root / 'head.gz'
+            document = json.loads(gzip.decompress(archive.read_bytes()))
+            document['data'][0]['functions'][0]['filenames'].append('/src/foreign.rs')
+            archive.write_bytes(gzip.compress(json.dumps(document).encode()))
+            output = root / 'report.json'
+            diagnostic = self.run_main(arguments + ['--diagnostic-output', str(output),
+                                                     '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[0], original[0])
+            row = json.loads(output.read_text())['files'][0]
+            self.assertEqual(len(row['base']['atoms']), 3)
+            self.assertEqual(row['head']['observer']['status'], 'unsupported')
+
+    def test_diagnostic_output_cannot_overwrite_an_input_or_change_the_verdict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            original = self.run_main(arguments, sources)
+            input_path = root / 'head.info'; original_bytes = input_path.read_bytes()
+            diagnostic = self.run_main(arguments + ['--diagnostic-output', str(input_path),
+                                                     '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[:2], original[:2])
+            self.assertEqual(input_path.read_bytes(), original_bytes)
+            self.assertIn('Diagnostic unavailable; strict comparison unchanged', diagnostic[2])
+
+    def test_unsupported_lexical_partition_keeps_raw_old_obligations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            sources = {'example.rs': b'fn work() {\n    step();\n'}
+            output = root / 'report.json'
+            self.run_main(arguments + ['--diagnostic-output', str(output),
+                                        '--diagnostic-file', 'example.rs'], sources)
+            row = json.loads(output.read_text())['files'][0]
+            self.assertEqual(row['source_obligations']['status'], 'unsupported')
+            self.assertEqual(row['source_obligations']['old_obligations'],
+                             [dict(old_line=i, role='Unresolved') for i in (1, 2, 3)])
+            self.assertEqual([item['count'] for item in row['base']['atoms']], [5, 5, 5])
 
 
 if __name__ == "__main__":

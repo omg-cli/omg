@@ -260,11 +260,13 @@ mod tests {
             header.set_size(content.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            archive.append_data(
-                &mut header,
-                format!("widget-{version}/desc"),
-                content.as_bytes(),
-            )?;
+            archive
+                .append_data(
+                    &mut header,
+                    format!("widget-{version}/desc"),
+                    content.as_bytes(),
+                )
+                .expect("private widget sync record is writable");
             archive.into_inner()?.finish()?;
             std::fs::rename(sync.join("core.db.next"), sync.join("core.db"))?;
             Ok(())
@@ -315,7 +317,8 @@ mod tests {
                 std::fs::write(
                     &config,
                     "[options]\nSigLevel = Never\nArchitecture = x86_64\nIgnorePkg = widget\n[core]\n",
-                )?;
+                )
+                .expect("private ignore-package configuration is writable");
                 assert!(futures::executor::block_on(worker.list_updates())?.is_empty());
                 std::fs::write(&config, configuration)?;
                 assert_update("1-1", "3-1")?;

@@ -36,6 +36,14 @@ enum LogicalNode {
     Symlink { mode: u32, target: String },
 }
 
+#[derive(Debug)]
+enum ArchiveMember {
+    File { mode: u32, size: u64 },
+    HardLink { mode: u32, size: u64 },
+    Directory { mode: u32 },
+    Symlink { mode: u32, target: String },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum NativeNode {
     File { mode: u32, size: u64 },
@@ -45,7 +53,7 @@ enum NativeNode {
 
 #[derive(Debug, Default)]
 pub(super) struct ArchiveInventory {
-    members: BTreeMap<String, TarNode>,
+    members: BTreeMap<String, ArchiveMember>,
     retained_bytes: usize,
 }
 
@@ -94,26 +102,33 @@ impl ArchiveInventory {
             self.retained_bytes <= MAX_INVENTORY_BYTES,
             "AUR inventory exceeds retained path and target byte limit"
         );
-        if let TarNode::HardLink { mode, target } = &node {
-            anyhow::ensure!(
-                !reserved(&path) && !reserved(target),
-                "AUR hard link refers to reserved metadata"
-            );
-            let Some(TarNode::File {
-                mode: target_mode, ..
-            }) = self.members.get(target)
-            else {
-                anyhow::bail!(
-                    "AUR hard link must refer directly to an earlier regular payload file"
+        let member = match node {
+            TarNode::File { mode, size } => ArchiveMember::File { mode, size },
+            TarNode::Directory { mode } => ArchiveMember::Directory { mode },
+            TarNode::Symlink { mode, target } => ArchiveMember::Symlink { mode, target },
+            TarNode::HardLink { mode, target } => {
+                anyhow::ensure!(
+                    !reserved(&path) && !reserved(&target),
+                    "AUR hard link refers to reserved metadata"
                 );
-            };
-            anyhow::ensure!(
-                mode & PERMISSION_MASK == target_mode & PERMISSION_MASK,
-                "AUR hard link permissions differ from its target"
-            );
-        }
+                let Some(ArchiveMember::File {
+                    mode: target_mode,
+                    size,
+                }) = self.members.get(&target)
+                else {
+                    anyhow::bail!(
+                        "AUR hard link must refer directly to an earlier regular payload file"
+                    );
+                };
+                anyhow::ensure!(
+                    mode & PERMISSION_MASK == target_mode & PERMISSION_MASK,
+                    "AUR hard link permissions differ from its target"
+                );
+                ArchiveMember::HardLink { mode, size: *size }
+            }
+        };
         anyhow::ensure!(
-            self.members.insert(path, node).is_none(),
+            self.members.insert(path, member).is_none(),
             "duplicate normalized path in AUR archive inventory"
         );
         Ok(())
@@ -122,31 +137,24 @@ impl ArchiveInventory {
     pub(super) fn agree(self, bytes: &[u8]) -> Result<NativeInventory> {
         let mut declared = parse(bytes)?;
         let mut expected = BTreeMap::new();
-        for (path, node) in &self.members {
+        for (path, node) in self.members {
             let logical = match node {
-                TarNode::File { mode, size } => LogicalNode::File {
-                    mode: mode & PERMISSION_MASK,
-                    size: *size,
-                },
-                TarNode::Directory { mode } => LogicalNode::Directory {
-                    mode: mode & PERMISSION_MASK,
-                },
-                TarNode::Symlink { mode, target } => LogicalNode::Symlink {
-                    mode: mode & PERMISSION_MASK,
-                    target: target.clone(),
-                },
-                TarNode::HardLink { mode, target } => {
-                    let Some(TarNode::File { size, .. }) = self.members.get(target) else {
-                        anyhow::bail!("AUR hard link target is not a regular payload file");
-                    };
+                ArchiveMember::File { mode, size } | ArchiveMember::HardLink { mode, size } => {
                     LogicalNode::File {
                         mode: mode & PERMISSION_MASK,
-                        size: *size,
+                        size,
                     }
                 }
+                ArchiveMember::Directory { mode } => LogicalNode::Directory {
+                    mode: mode & PERMISSION_MASK,
+                },
+                ArchiveMember::Symlink { mode, target } => LogicalNode::Symlink {
+                    mode: mode & PERMISSION_MASK,
+                    target,
+                },
             };
-            let record = declared.remove(path);
-            if reserved(path) {
+            let record = declared.remove(&path);
+            if reserved(&path) {
                 if let Some(record) = record {
                     anyhow::ensure!(
                         record == logical,
@@ -158,17 +166,17 @@ impl ArchiveInventory {
             anyhow::ensure!(
                 record.as_ref() == Some(&logical),
                 "MTREE payload inventory differs from archive at {}",
-                crate::cli::style::sanitize_terminal_text(path)
+                crate::cli::style::sanitize_terminal_text(&path)
             );
             let (name, native) = match logical {
                 LogicalNode::File { mode, size } => {
                     i64::try_from(size).context("MTREE file size exceeds native ALPM range")?;
-                    (path.clone(), NativeNode::File { mode, size })
+                    (path, NativeNode::File { mode, size })
                 }
                 LogicalNode::Directory { mode } => {
                     (format!("{path}/"), NativeNode::Directory { mode })
                 }
-                LogicalNode::Symlink { mode, .. } => (path.clone(), NativeNode::Symlink { mode }),
+                LogicalNode::Symlink { mode, .. } => (path, NativeNode::Symlink { mode }),
             };
             expected.insert(name, native);
         }
@@ -191,16 +199,7 @@ impl NativeInventory {
             let name = std::str::from_utf8(file.name())
                 .context("native ALPM inventory path is not UTF-8")?;
             anyhow::ensure!(seen.insert(name), "duplicate native ALPM inventory path");
-            let mode = file.mode() & PERMISSION_MASK;
-            let native = match file.mode() & TYPE_MASK {
-                0o100_000 => NativeNode::File {
-                    mode,
-                    size: u64::try_from(file.size()).context("negative native ALPM file size")?,
-                },
-                0o040_000 => NativeNode::Directory { mode },
-                0o120_000 => NativeNode::Symlink { mode },
-                _ => anyhow::bail!("unsupported native ALPM inventory file type"),
-            };
+            let native = NativeNode::from_alpm(file.mode(), file.size())?;
             anyhow::ensure!(
                 self.0.get(name) == Some(&native),
                 "native ALPM inventory differs from inspected archive at {}",
@@ -208,6 +207,21 @@ impl NativeInventory {
             );
         }
         Ok(())
+    }
+}
+
+impl NativeNode {
+    fn from_alpm(raw_mode: u32, size: i64) -> Result<Self> {
+        let mode = raw_mode & PERMISSION_MASK;
+        match raw_mode & TYPE_MASK {
+            0o100_000 => Ok(Self::File {
+                mode,
+                size: u64::try_from(size).context("negative native ALPM file size")?,
+            }),
+            0o040_000 => Ok(Self::Directory { mode }),
+            0o120_000 => Ok(Self::Symlink { mode }),
+            _ => anyhow::bail!("unsupported native ALPM inventory file type"),
+        }
     }
 }
 
@@ -379,6 +393,47 @@ fn parse_mode(raw: &str) -> Result<u32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_metadata_accepts_only_supported_types_and_regular_sizes() {
+        for (mode, size, expected) in [
+            (
+                0o100_644,
+                4,
+                NativeNode::File {
+                    mode: 0o644,
+                    size: 4,
+                },
+            ),
+            (
+                0o106_755,
+                0,
+                NativeNode::File {
+                    mode: 0o6755,
+                    size: 0,
+                },
+            ),
+            (0o041_755, -1, NativeNode::Directory { mode: 0o1755 }),
+            (0o120_777, -1, NativeNode::Symlink { mode: 0o777 }),
+        ] {
+            assert_eq!(
+                NativeNode::from_alpm(mode, size).expect("supported native metadata"),
+                expected
+            );
+        }
+        let error =
+            NativeNode::from_alpm(0o100_644, -1).expect_err("negative regular size is invalid");
+        assert!(error.to_string().contains("negative native ALPM file size"));
+        for kind in [0, 0o010_000, 0o020_000, 0o060_000, 0o140_000] {
+            let error = NativeNode::from_alpm(kind | 0o644, 0)
+                .expect_err("unsupported native type is invalid");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported native ALPM inventory file type")
+            );
+        }
+    }
+
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         use std::io::Write as _;
 
@@ -493,22 +548,26 @@ mod tests {
     }
 
     #[test]
-    fn hardlinks_require_an_earlier_regular_payload_with_coherent_permissions() -> Result<()> {
+    fn hardlinks_require_an_earlier_regular_payload_with_coherent_permissions() {
         let mut inventory = ArchiveInventory::default();
-        inventory.add(
-            "usr/file".to_owned(),
-            TarNode::File {
-                mode: 0o644,
-                size: 4,
-            },
-        )?;
-        inventory.add(
-            "usr/alias".to_owned(),
-            TarNode::HardLink {
-                mode: 0o644,
-                target: "usr/file".to_owned(),
-            },
-        )?;
+        inventory
+            .add(
+                "usr/file".to_owned(),
+                TarNode::File {
+                    mode: 0o644,
+                    size: 4,
+                },
+            )
+            .expect("regular payload fixture is valid");
+        inventory
+            .add(
+                "usr/alias".to_owned(),
+                TarNode::HardLink {
+                    mode: 0o644,
+                    target: "usr/file".to_owned(),
+                },
+            )
+            .expect("direct backward hard-link fixture is valid");
         for (path, target, mode) in [
             ("usr/chain", "usr/alias", 0o644),
             ("usr/missing", "usr/future", 0o644),
@@ -528,32 +587,34 @@ mod tests {
                 "unsupported hard link {path} -> {target}"
             );
         }
-        Ok(())
     }
 
     #[test]
-    fn symlink_target_and_reserved_metadata_must_agree() -> Result<()> {
+    fn symlink_target_and_reserved_metadata_must_agree() {
         let mut inventory = ArchiveInventory::default();
-        inventory.add(
-            "usr/link".to_owned(),
-            TarNode::Symlink {
-                mode: 0o777,
-                target: "target".to_owned(),
-            },
-        )?;
+        inventory
+            .add(
+                "usr/link".to_owned(),
+                TarNode::Symlink {
+                    mode: 0o777,
+                    target: "target".to_owned(),
+                },
+            )
+            .expect("symlink payload fixture is valid");
         let mismatch = b"./usr/link uid=0 gid=0 mode=777 type=link time=0.0 link=other\n";
         assert!(
             inventory.agree(mismatch).is_err(),
             "symlink targets are checked in Rust"
         );
         let mut inventory = ArchiveInventory::default();
-        inventory.add(".reserved".to_owned(), TarNode::Directory { mode: 0o755 })?;
+        inventory
+            .add(".reserved".to_owned(), TarNode::Directory { mode: 0o755 })
+            .expect("reserved directory fixture is valid");
         assert!(
             inventory
                 .agree(b"./.reserved uid=0 gid=0 mode=700 type=dir time=0.0\n")
                 .is_err(),
             "optional reserved records must match"
         );
-        Ok(())
     }
 }
