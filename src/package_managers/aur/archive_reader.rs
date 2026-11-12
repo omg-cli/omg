@@ -116,6 +116,16 @@ mod tests {
         error: Option<io::ErrorKind>,
     }
 
+    impl BoundaryErrorReader {
+        fn uninterrupted(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes: Cursor::new(bytes),
+                boundary: 0,
+                error: None,
+            }
+        }
+    }
+
     impl Read for BoundaryErrorReader {
         fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
             let source = self.bytes.fill_buf()?;
@@ -185,7 +195,7 @@ mod tests {
     fn invalid_next_frame_remains_failed_after_empty_reads() -> Result<()> {
         let mut bytes = zstd::stream::encode_all(b"first".as_slice(), 1)?;
         bytes.extend_from_slice(b"invalid frame");
-        let mut reader = ZstdFrames::new(BufReader::new(Cursor::new(bytes)))?;
+        let mut reader = ZstdFrames::new(BoundaryErrorReader::uninterrupted(bytes))?;
         let mut first = [0; 5];
         reader.read_exact(&mut first)?;
         assert_eq!(&first, b"first");
@@ -199,7 +209,7 @@ mod tests {
     fn empty_reads_preserve_data_and_repeated_eof_reads_stay_empty() -> Result<()> {
         let marker = b"inert marker";
         let compressed = zstd::stream::encode_all(marker.as_slice(), 1)?;
-        let mut reader = ZstdFrames::new(BufReader::new(Cursor::new(compressed)))?;
+        let mut reader = ZstdFrames::new(BoundaryErrorReader::uninterrupted(compressed))?;
         assert_eq!(reader.read(&mut [])?, 0);
         let mut output = Vec::new();
         reader.read_to_end(&mut output)?;
@@ -213,7 +223,8 @@ mod tests {
     fn empty_zstd_frames_are_bounded_even_without_expanded_bytes() -> Result<()> {
         let frame = zstd::stream::encode_all(std::io::empty(), 1)?;
         for count in [MAX_ZSTD_FRAMES, MAX_ZSTD_FRAMES + 1] {
-            let mut reader = ZstdFrames::new(BufReader::new(Cursor::new(frame.repeat(count))))?;
+            let mut reader =
+                ZstdFrames::new(BoundaryErrorReader::uninterrupted(frame.repeat(count)))?;
             let mut output = Vec::new();
             let result = reader.read_to_end(&mut output);
             assert!(output.is_empty(), "empty frames must not create output");

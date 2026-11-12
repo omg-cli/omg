@@ -31,13 +31,13 @@ class OptimizationContracts(unittest.TestCase):
     def test_native_coverage_passes_one_complete_guest_script_to_docker(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
         start = script.index('container=$(docker create')
-        end = script.index("\ntrap 'docker rm", start)
+        end = script.index("\ndocker cp", start)
         command = script[start:end]
         with tempfile.TemporaryDirectory() as directory:
             capture = Path(directory) / 'docker-arguments'
             driver = (
                 'docker() { printf \'%s\\0\' "$@" > "$ARGV_CAPTURE"; '
-                'printf \'%s\' fixture-container; }\n' + command
+                'printf \'%s\' fixture-container; }\nfixture_apparmor=test-profile\n' + command
             )
             result = subprocess.run(
                 [BASH, '-eu', '-c', driver],
@@ -50,6 +50,75 @@ class OptimizationContracts(unittest.TestCase):
             self.assertEqual(len(guest), 1, 'Docker must receive the entire guest program as one argument')
             syntax = subprocess.run([BASH, '-n'], input=guest[0], capture_output=True)
             self.assertEqual(syntax.returncode, 0, syntax.stderr.decode())
+
+    def test_fixture_profile_lifecycle_is_bounded_and_cleans_up(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        script = script.split('python3 - "$binary"', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'target/llvm-cov-target/debug/deps/omg_lib-test'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('fixture')
+            binary.chmod(0o755)
+            sysctl = root / 'restriction'
+            sysctl.write_text('1\n')
+            script = script.replace('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', str(sysctl))
+            for name in ('coverage-seccomp.json', 'coverage-sandbox-seccomp.json'):
+                script = script.replace('/tmp/' + name, str(root / name))
+            docker = root / 'docker'
+            docker.write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+data = sys.stdin.read() if args and args[0] == 'run' and '--interactive' in args else ''
+with open(os.environ['TRACE'], 'a') as trace:
+    trace.write(json.dumps([args, data]) + '\\n')
+if args and args[0] == 'create': print('fixture-container')
+if args[:2] == ['start', '--attach']: sys.exit(int(os.environ['START_STATUS']))
+if args and args[0] == 'rm': sys.exit(int(os.environ.get('REMOVE_STATUS', '0')))
+if '--remove' in args: sys.exit(int(os.environ.get('UNLOAD_STATUS', '0')))
+''')
+            docker.chmod(0o755)
+            launcher = '''curl() { :; }
+sha256sum() { if [ "$1" = --check ]; then cat >/dev/null; else command sha256sum "$@"; fi; }
+jq() { :; }
+'''
+            for run_id, attempt, status, remove, unload, expected in [
+                    ('123', '1', 0, 0, 0, 0), ('123', '2', 23, 0, 0, 23),
+                    ('123', '3', 23, 7, 9, 23), ('123', '4', 0, 7, 0, 7),
+                    ('123', '5', 0, 0, 9, 9)]:
+                trace = root / f'trace-{attempt}'
+                result = subprocess.run([BASH, '-e', '-c', launcher + script], cwd=root,
+                    env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                             TRACE=str(trace), START_STATUS=str(status), REMOVE_STATUS=str(remove),
+                             UNLOAD_STATUS=str(unload), GITHUB_RUN_ID=run_id,
+                             GITHUB_RUN_ATTEMPT=attempt, GITHUB_WORKSPACE=str(root), RUNNER_TEMP=str(root)),
+                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in trace.read_text().splitlines()]
+                loaders = [(args, data) for args, data in calls if '--entrypoint' in args]
+                self.assertEqual(len(loaders), 2)
+                name = f'omg-coverage-{run_id}-{attempt}'
+                for (args, data), operation in zip(loaders, ('--replace', '--remove')):
+                    self.assertIn(operation, args)
+                    self.assertIn('--network=none', args)
+                    self.assertIn('--cap-drop=ALL', args)
+                    self.assertIn('--cap-add=MAC_ADMIN', args)
+                    self.assertIn('--security-opt=apparmor=unconfined', args)
+                    self.assertIn('--pids-limit=32', args)
+                    self.assertIn('--memory=256m', args)
+                    self.assertIn('--cpus=1', args)
+                    self.assertIn('--read-only', args)
+                    self.assertEqual([arg for arg in args if arg.startswith(('--volume=', '--mount='))],
+                                     ['--mount=type=bind,src=/sys/kernel/security,dst=/sys/kernel/security'])
+                    self.assertTrue(data.startswith('abi <abi/4.0>,\n'))
+                    self.assertIn('profile ' + name + ' flags=(unconfined)', data)
+                    self.assertIn('userns,', data)
+                create = next(args for args, _ in calls if args[0] == 'create')
+                self.assertIn('apparmor=' + name, create)
+                self.assertIn('--network', create)
+                removal = next(i for i, (args, _) in enumerate(calls) if args[:2] == ['rm', '--force'])
+                unload = next(i for i, (args, _) in enumerate(calls) if '--remove' in args)
+                self.assertLess(removal, unload)
 
     def test_privileged_coverage_case_requires_real_execution_and_profiles(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')

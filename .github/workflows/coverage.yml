@@ -196,15 +196,66 @@ jobs:
 
           docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
-          RUN pacman -Syu --noconfirm --needed bubblewrap fakeroot python sudo debugedit && pacman -Scc --noconfirm
+          RUN pacman -Syu --noconfirm --needed apparmor bubblewrap fakeroot python sudo debugedit && pacman -Scc --noconfirm
           DOCKERFILE
           curl -fsS https://raw.githubusercontent.com/moby/profiles/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json -o /tmp/coverage-seccomp.json
           echo '536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74  /tmp/coverage-seccomp.json' | sha256sum --check
           jq '(.syscalls[] | select(.includes.caps == ["CAP_SYS_ADMIN"]) | .names) += ["pivot_root"]' \
             /tmp/coverage-seccomp.json > /tmp/coverage-sandbox-seccomp.json
 
+          restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -r "$restriction" ]; then
+            printf '%s=' "$restriction" | tee "$evidence_dir/apparmor-diagnostic.log"
+            cat "$restriction" | tee -a "$evidence_dir/apparmor-diagnostic.log"
+          else
+            printf '%s unreadable\n' "$restriction" | tee "$evidence_dir/apparmor-diagnostic.log"
+          fi
+          if docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json --network none \
+            --pids-limit 32 --memory 128m --cpus 1 \
+            omg-coverage-sandbox /bin/bash -c '
+              cat /proc/self/attr/current
+              runuser -u nobody -- unshare --user /bin/cat /proc/self/attr/current
+            ' >> "$evidence_dir/apparmor-diagnostic.log" 2>&1; then
+            diagnostic_status=0
+          else
+            diagnostic_status=$?
+          fi
+          printf 'diagnostic exit=%s\n' "$diagnostic_status" | tee -a "$evidence_dir/apparmor-diagnostic.log"
+
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          profile_name="omg-coverage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          profile_loaded=0
+          container=
+          profile_text=$(printf 'abi <abi/4.0>,\nprofile %s flags=(unconfined) {\n  userns,\n}\n' "$profile_name")
+          cleanup() {
+            local status=$? cleanup_status=0
+            trap - EXIT
+            if [ -n "$container" ]; then docker rm --force "$container" || cleanup_status=$?; fi
+            if [ "$profile_loaded" -eq 1 ]; then
+              printf '%s\n' "$profile_text" | docker run --rm --interactive --network=none \
+                --pids-limit=32 --memory=256m --cpus=1 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=16m \
+                --cap-drop=ALL --cap-add=MAC_ADMIN --security-opt=apparmor=unconfined \
+                --mount=type=bind,src=/sys/kernel/security,dst=/sys/kernel/security --entrypoint apparmor_parser \
+                omg-coverage-sandbox --skip-cache --jobs=1 --remove || cleanup_status=$?
+            fi
+            if [ "$status" -ne 0 ]; then exit "$status"; fi
+            exit "$cleanup_status"
+          }
+          trap cleanup EXIT
+          fixture_apparmor=unconfined
+          if [ -r "$restriction" ] && [ "$(cat "$restriction")" = 1 ]; then
+            printf '%s\n' "$profile_text" | docker run --rm --interactive --network=none \
+              --pids-limit=32 --memory=256m --cpus=1 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=16m \
+              --cap-drop=ALL --cap-add=MAC_ADMIN --security-opt=apparmor=unconfined \
+              --mount=type=bind,src=/sys/kernel/security,dst=/sys/kernel/security --entrypoint apparmor_parser \
+              omg-coverage-sandbox --skip-cache --jobs=1 --replace
+            profile_loaded=1
+            fixture_apparmor=$profile_name
+          fi
+
           # Namespace permissions apply only to this credential-free fixture.
-          container=$(docker create --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+          container=$(docker create --cap-add SYS_ADMIN --security-opt "apparmor=$fixture_apparmor" \
             --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json \
             --network none --add-host aur.archlinux.org:127.0.0.1 --pids-limit 128 --memory 1g --cpus 2 \
             omg-coverage-sandbox /bin/bash -euo pipefail -c '
@@ -222,6 +273,11 @@ jobs:
               bwrap --ro-bind / / --unshare-pid --proc /proc -- /bin/true
               bwrap --unshare-user --uid "$(id -u nobody)" --gid "$(id -g nobody)" \
                 --cap-drop ALL --ro-bind / / --proc /proc -- /usr/bin/id
+              cat /proc/self/attr/current | tee /evidence/apparmor-profile.txt
+              for network in --share-net --unshare-net; do
+                runuser -u nobody -- bwrap --clearenv --share-net --unshare-pid --new-session \
+                  --die-with-parent "$network" --ro-bind / / --proc /proc -- /bin/cat /proc/self/attr/current
+              done
               /fixture --include-ignored --list > /evidence/registry.txt
               run_case() {
                 local test_name=$1
@@ -286,7 +342,6 @@ jobs:
                 fi
               done
             ')
-          trap 'docker rm --force "$container"' EXIT
           docker cp "$binary" "$container:/fixture"
           if timeout --kill-after=5s 180s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
             run_status=0

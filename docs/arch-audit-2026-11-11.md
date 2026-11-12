@@ -216,6 +216,16 @@ after the boundary retry failed against the old implementation. The isolated
 CI build fixture also captures its private build log before removing temporary
 state, so unexpected build failures retain their diagnostic evidence.
 
+The hosted fixture exposed a loopback setup denial on Ubuntu. Its CI policy
+uses a unique named AppArmor profile with an explicit user-namespace permission,
+following [Ubuntu's documented exception](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions).
+A separate offline loader receives only `MAC_ADMIN` and the securityfs mount;
+the fixture receives neither. Cleanup removes the container before unloading
+its profile. The fixture keeps both Docker's offline network and Bubblewrap's
+private network namespace. No global sysctl or executable attachment changes
+are used. Profile syntax and the loader lifecycle are checked locally; actual
+policy loading and native execution require the hosted runner.
+
 ## Remaining work
 
 - Live searches and several inventory operations still use C libalpm. Move
