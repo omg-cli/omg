@@ -429,3 +429,52 @@ or overlapping evidence, ambiguous calls or bindings, oversized UTF-8 input and
 contradictory segments. The frozen prior-source replay proves that one pair and
 then fails on a separate retained line. A fresh combined-source coverage report
 and required hosted CI remain pending; no passing final coverage is claimed.
+
+## Archive admission and completion batch
+
+A harmless native fixture exposed an interpretation boundary: libalpm can use
+MTREE to replace the package file list and skip archive payload absent from that
+list. A new regression reproduced OMG accepting an ordinary payload with an
+empty MTREE before enforcement. This is an admission gap, not an exploit or
+severity claim.
+
+The inspector now uses the existing pinned official `alpm-mtree` crate. One
+private admission value owns the passive report and expected native inventory.
+It bounds metadata decoding, rejects duplicate declarations, and compares the
+complete tar and MTREE inventories. Root derives admission from its private
+staged archive immediately before native loading, then checks that same loaded
+package before insertion. Policy version 4 invalidates older paired-build keys.
+The ALPM pin guard now includes the fifth directly used official crate.
+
+Genuine makepkg output determined supported directory, link and escaped-name
+representations. A retained harmless fixture covers ordinary and empty paths,
+direct backward hard links, symlinks and unusual names. Derived path spellings
+and forward links demonstrated why native inventory equality alone cannot
+prove extraction. The initial supported subset and its restrictions are
+documented in [AUR support](./aur.md).
+
+The batch also gives transaction completion one typed outcome, preserving all
+six existing error combinations. Real native regressions cover commit-time file
+conflicts and a reason write that changes cache state but fails durably. Metadata
+tests cover actual reader I/O errors, preserved generations and snapshots,
+panicked tasks and observed cancellation. A missing future build directory is
+accepted without being created.
+
+The ordinary library run passed 2,204 tests with 12 tests ignored.
+Independent review then found repeated neutral root-directory declarations
+bypassing duplicate refusal. Its failing-before regression and passing fix are
+retained locally. Added native controls reject an inconsistent sealed handoff
+without database, payload or audit changes, and reject a different loaded
+package with the same file count. All-target Clippy with warnings denied,
+non-Arch all-target compilation, five ALPM pin tests, eight supplemental-producer
+tests and 42 existing CI tests pass. The default CLI and daemon build; seven
+read-only host CLI checks preserve the native package database fingerprint.
+
+Hosted coverage previously omitted 14 supplemental exact tests and five real
+process checks that local verification executed. One shared tracked driver now
+supplies them. Independent review caught its missing Docker `NET_ADMIN` grant;
+the failure was reproduced with that capability removed before the scoped fix.
+The shared driver passes in KVM with the Docker capability bounding set and
+preserves its database fingerprint. This does not reproduce Docker's AppArmor,
+seccomp, memory or process limits. Final frozen-source coverage and hosted
+verification remain open.

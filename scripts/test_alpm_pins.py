@@ -25,6 +25,11 @@ class AlpmPinsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pins.validate(self.manifest, self.lock)
 
+    def test_mtree_direct_dependency_cannot_escape_the_family_snapshot(self):
+        self.manifest["dependencies"]["alpm-mtree"]["rev"] = "0" * 40
+        with self.assertRaises(ValueError):
+            pins.validate(self.manifest, self.lock)
+
     def test_old_transitive_snapshot_is_refused(self):
         package = next(p for p in self.lock["package"] if p["name"] == "alpm-parsers")
         package["source"] = package["source"].replace(package["source"].split("#")[1], "0" * 40)

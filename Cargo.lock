@@ -3523,6 +3523,7 @@ dependencies = [
  "ahash",
  "alpm",
  "alpm-db",
+ "alpm-mtree",
  "alpm-repo-db",
  "alpm-srcinfo",
  "alpm-types",

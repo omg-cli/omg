@@ -548,13 +548,6 @@ fn execute_transaction_with_intents(
     let packages = staged
         .as_ref()
         .map_or(packages, |inputs| inputs.targets.clone());
-    if kind == TransactionKind::InstallAurArtifact {
-        for package in &packages {
-            crate::package_managers::aur::artifact_inspector::inspect_archive(
-                std::path::Path::new(package),
-            )?;
-        }
-    }
     let pacman_config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load transaction options from pacman.conf")?;
 
@@ -1538,6 +1531,16 @@ fn prepare_alpm_transaction<'a>(
                         .to_str()
                         .context("Package path contains invalid UTF-8")?;
 
+                    let admission = if kind == TransactionKind::InstallAurArtifact {
+                        Some(
+                            crate::package_managers::aur::artifact_inspector::inspect_archive(
+                                &canonical_path,
+                            )?,
+                        )
+                    } else {
+                        None
+                    };
+
                     let pkg = tx_guard
                         .0
                         .pkg_load(
@@ -1551,6 +1554,9 @@ fn prepare_alpm_transaction<'a>(
                         .map_err(|e| {
                             anyhow::anyhow!("Failed to load local package {pkg_name}: {e}")
                         })?;
+                    if let Some(admission) = admission {
+                        admission.verify_native_inventory(pkg.files())?;
+                    }
                     tx_guard.0.trans_add_pkg(pkg).map_err(|e| {
                         anyhow::anyhow!(
                             "Failed to add local package {pkg_name} to transaction: {e}"
@@ -1768,6 +1774,40 @@ fn ensure_removals_not_held<'a>(
     Ok(())
 }
 
+#[derive(Debug)]
+enum MutationCompletion {
+    CommitFailed(anyhow::Error),
+    Committed { reasons: Result<()> },
+}
+
+impl MutationCompletion {
+    fn audit_outcome(&self) -> &'static str {
+        match self {
+            Self::Committed { reasons: Ok(()) } => "succeeded",
+            Self::CommitFailed(_) | Self::Committed { reasons: Err(_) } => "failed",
+        }
+    }
+
+    fn finish(self, audit: Result<()>) -> Result<()> {
+        match (self, audit) {
+            (Self::CommitFailed(error), Ok(())) => Err(error),
+            (Self::CommitFailed(error), Err(audit)) => {
+                Err(error.context(format!("Audit persistence also failed: {audit:#}")))
+            }
+            (Self::Committed { reasons }, Ok(())) => reasons,
+            (Self::Committed { reasons }, Err(audit)) => {
+                let error = audit.context("Packages committed, but audit persistence failed; inspect installed state before retrying");
+                match reasons {
+                    Ok(()) => Err(error),
+                    Err(reason) => Err(error.context(format!(
+                        "Installation reason persistence also failed: {reason:#}"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
 fn commit_alpm_transaction(
     alpm: &mut alpm::Alpm,
     main_task: &ProgressTask,
@@ -1852,39 +1892,18 @@ fn commit_alpm_transaction(
             anyhow::anyhow!("Transaction failed to commit; package state may have changed: {error}")
         })
     };
-    let reason_result = if result.is_ok() {
-        persist_installation_reasons(alpm, reasons)
-    } else {
-        Ok(())
+    let completion = match result {
+        Ok(()) => MutationCompletion::Committed {
+            reasons: persist_installation_reasons(alpm, reasons),
+        },
+        Err(error) => MutationCompletion::CommitFailed(error),
     };
     let audit = crate::core::security::audit::record_operation(
         operation,
         &targets,
-        if result.is_ok() && reason_result.is_ok() {
-            "succeeded"
-        } else {
-            "failed"
-        },
+        completion.audit_outcome(),
     );
-    let result = match (result, audit) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(audit)) => {
-            Err(audit.context("Packages committed, but audit persistence failed; inspect installed state before retrying"))
-        }
-        (Err(operation), Ok(())) => Err(operation),
-        (Err(operation), Err(audit)) => {
-            Err(operation.context(format!("Audit persistence also failed: {audit:#}")))
-        }
-    };
-    match (result, reason_result) {
-        (Ok(()), Ok(())) => {}
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
-        (Err(error), Err(reason)) => {
-            return Err(error.context(format!(
-                "Installation reason persistence also failed: {reason:#}"
-            )));
-        }
-    }
+    completion.finish(audit)?;
 
     main_task.finish(Outcome::Done);
 
@@ -1997,6 +2016,133 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mutation_completion_preserves_outcomes_and_primary_causes() {
+        use super::MutationCompletion::{CommitFailed, Committed};
+
+        struct Case {
+            label: &'static str,
+            completion: super::MutationCompletion,
+            audit: anyhow::Result<()>,
+            outcome: &'static str,
+            primary: Option<&'static str>,
+            diagnostics: &'static [&'static str],
+        }
+
+        let cause = |label| anyhow::Error::from(std::io::Error::other(label));
+        let commit_error = || {
+            cause("commit cause")
+                .context("Transaction failed to commit; package state may have changed")
+        };
+        let reason_error = || {
+            cause("reason cause").context(
+                "Transaction completed, but installation reason could not be persisted; inspect installed state before retrying",
+            )
+        };
+        let cases = [
+            Case {
+                label: "mutation, reasons and audit succeeded",
+                completion: Committed { reasons: Ok(()) },
+                audit: Ok(()),
+                outcome: "succeeded",
+                primary: None,
+                diagnostics: &[],
+            },
+            Case {
+                label: "committed mutation with audit failure",
+                completion: Committed { reasons: Ok(()) },
+                audit: Err(cause("audit cause")),
+                outcome: "succeeded",
+                primary: Some("audit cause"),
+                diagnostics: &[
+                    "Packages committed, but audit persistence failed",
+                    "inspect installed state before retrying",
+                ],
+            },
+            Case {
+                label: "committed mutation with reason failure",
+                completion: Committed {
+                    reasons: Err(reason_error()),
+                },
+                audit: Ok(()),
+                outcome: "failed",
+                primary: Some("reason cause"),
+                diagnostics: &[
+                    "installation reason could not be persisted",
+                    "inspect installed state before retrying",
+                ],
+            },
+            Case {
+                label: "committed mutation with reason and audit failures",
+                completion: Committed {
+                    reasons: Err(reason_error()),
+                },
+                audit: Err(cause("audit cause")),
+                outcome: "failed",
+                primary: Some("audit cause"),
+                diagnostics: &[
+                    "Installation reason persistence also failed",
+                    "reason cause",
+                    "Packages committed, but audit persistence failed",
+                    "inspect installed state before retrying",
+                ],
+            },
+            Case {
+                label: "commit failure with persisted audit",
+                completion: CommitFailed(commit_error()),
+                audit: Ok(()),
+                outcome: "failed",
+                primary: Some("commit cause"),
+                diagnostics: &["Transaction failed to commit; package state may have changed"],
+            },
+            Case {
+                label: "commit and audit failures",
+                completion: CommitFailed(commit_error()),
+                audit: Err(cause("audit cause")),
+                outcome: "failed",
+                primary: Some("commit cause"),
+                diagnostics: &[
+                    "Transaction failed to commit; package state may have changed",
+                    "Audit persistence also failed",
+                    "audit cause",
+                ],
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                case.completion.audit_outcome(),
+                case.outcome,
+                "{}",
+                case.label
+            );
+            let result = case.completion.finish(case.audit);
+            let Some(primary) = case.primary else {
+                assert!(result.is_ok(), "{}: {result:?}", case.label);
+                continue;
+            };
+            let error = result.expect_err(case.label);
+            let diagnostic = format!("{error:#}");
+            assert_eq!(
+                error.root_cause().to_string(),
+                primary,
+                "{}: {diagnostic}",
+                case.label
+            );
+            assert!(
+                error.downcast_ref::<std::io::Error>().is_some(),
+                "{} must preserve its primary typed cause: {diagnostic}",
+                case.label
+            );
+            for expected in case.diagnostics {
+                assert!(
+                    diagnostic.contains(expected),
+                    "{} must preserve {expected:?}: {diagnostic}",
+                    case.label
+                );
+            }
+        }
+    }
+
     struct RepositoryFixture {
         directory: tempfile::TempDir,
     }
@@ -2064,6 +2210,101 @@ mod tests {
                 self.database().to_str().expect("UTF-8 database"),
             )?)
         }
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned isolated Arch container or QEMU guest"]
+    fn native_reason_write_failure_preserves_durable_reason() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::fs;
+
+        anyhow::ensure!(
+            std::env::var("OMG_ARCH_INSTALL_FIXTURE").as_deref() == Ok("isolated-container")
+                && crate::core::is_root(),
+            "reason-write fixture requires the disposable native root environment"
+        );
+        let fixture = RepositoryFixture::new()?;
+        let name = "omg-fixture-reason-failure";
+        fixture.write_local(name, "1-1")?;
+        let desc = fixture.database().join(format!("local/{name}-1-1/desc"));
+        let original = fs::read_to_string(&desc)?.replace("%REASON%\n0\n", "%REASON%\n1\n");
+        fs::write(&desc, &original)?;
+        let mut alpm = fixture.open()?;
+        assert_eq!(
+            alpm.localdb().pkg(name)?.reason(),
+            alpm::PackageReason::Depend
+        );
+        let saved = desc.with_extension("saved");
+        fs::rename(&desc, &saved)?;
+        fs::create_dir(&desc)?;
+
+        let audit_path = std::path::Path::new("/var/lib/omg/audit/audit.jsonl");
+        let audit_before = match fs::read_to_string(audit_path) {
+            Ok(contents) => contents.lines().count(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
+        };
+        alpm.trans_init(alpm::TransFlag::empty())?;
+        let transaction = super::AlpmTransaction(&mut alpm);
+        let task = super::ProgressTask::start(&super::TaskSpec {
+            label: "Reason persistence fixture".to_owned(),
+            kind: super::TaskKind::Items { total: 1 },
+            accent: super::Accent::System,
+        });
+        let error = super::commit_alpm_transaction(
+            transaction.0,
+            &task,
+            super::TransactionKind::InstallAurArtifact,
+            &[],
+            &[(name.to_owned(), alpm::PackageReason::Explicit)],
+            &[],
+        )
+        .expect_err("a directory in place of desc must refuse durable reason persistence");
+        drop(transaction);
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains(name)
+                && diagnostic.contains("could not be persisted")
+                && diagnostic.contains("inspect installed state before retrying"),
+            "reason-write failure must identify the package and require inspection: {diagnostic}"
+        );
+        assert_eq!(
+            error.downcast_ref::<alpm::Error>(),
+            Some(&alpm::Error::DbWrite),
+            "the native reason-write cause must remain available: {diagnostic}"
+        );
+        fs::remove_dir(&desc)?;
+        fs::rename(&saved, &desc)?;
+        assert_eq!(fs::read_to_string(&desc)?, original);
+        drop(alpm);
+        let reopened = fixture.open()?;
+        assert_eq!(
+            reopened.localdb().pkg(name)?.reason(),
+            alpm::PackageReason::Depend,
+            "a reopened database must retain the original durable reason after failed write"
+        );
+        assert!(
+            !fixture.database().join("db.lck").exists(),
+            "reason persistence failure must release the native transaction lock"
+        );
+        let audit = fs::read_to_string(audit_path)?;
+        let entries = audit
+            .lines()
+            .skip(audit_before)
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(entries.len(), 2, "one attempt and one terminal audit");
+        for (entry, outcome) in entries.iter().zip(["attempt", "failed"]) {
+            assert_eq!(entry["resource"].as_str(), Some(name));
+            assert!(
+                entry["description"]
+                    .as_str()
+                    .context("audit description")?
+                    .contains(&format!("Package operation install: {outcome};")),
+                "reason-write audit must report {outcome}: {entry}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

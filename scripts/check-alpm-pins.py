@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import tomllib
 
-FAMILY = {"alpm-types", "alpm-srcinfo", "alpm-db", "alpm-repo-db"}
+FAMILY = {"alpm-types", "alpm-srcinfo", "alpm-db", "alpm-repo-db", "alpm-mtree"}
 UPSTREAM = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git"
 
 
@@ -14,7 +14,7 @@ def validate(manifest, lock):
     pins = {name: dependencies[name] for name in FAMILY}
     revisions = {pin["rev"] for pin in pins.values()}
     if len(revisions) != 1 or not re.fullmatch(r"[0-9a-f]{40}", next(iter(revisions))):
-        raise ValueError("All four Rust ALPM dependencies must share a full immutable commit")
+        raise ValueError("All direct Rust ALPM dependencies must share a full immutable commit")
     revision = next(iter(revisions))
     expected_source = f"git+{UPSTREAM}?rev={revision}#{revision}"
     for name, pin in pins.items():

@@ -181,7 +181,7 @@ jobs:
       - name: Cover sandbox descendant cancellation
         id: native_fixture_tests
         shell: bash
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           profile_dir="$GITHUB_WORKSPACE/target/llvm-cov-target"
@@ -198,6 +198,8 @@ jobs:
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
           RUN pacman -Syu --noconfirm --needed apparmor bubblewrap fakeroot python sudo debugedit && pacman -Scc --noconfirm
           DOCKERFILE
+          python3 scripts/native-cli-coverage.py prepare --target "$profile_dir" \
+            --source-commit "$(git rev-parse HEAD)" --output "$evidence_dir/cli-manifest.json"
           curl -fsS https://raw.githubusercontent.com/moby/profiles/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json -o /tmp/coverage-seccomp.json
           echo '536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74  /tmp/coverage-seccomp.json' | sha256sum --check
           jq '(.syscalls[] | select(.includes.caps == ["CAP_SYS_ADMIN"]) | .names) += ["pivot_root"]' \
@@ -262,7 +264,7 @@ jobs:
           fi
 
           # Namespace permissions apply only to this credential-free fixture.
-          container=$(docker create --cap-add SYS_ADMIN --security-opt "apparmor=$fixture_apparmor" \
+          container=$(docker create --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt "apparmor=$fixture_apparmor" \
             --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json \
             --network none --add-host aur.archlinux.org:127.0.0.1 --pids-limit 128 --memory 1g --cpus 2 \
             omg-coverage-sandbox /bin/bash -euo pipefail -c '
@@ -294,6 +296,7 @@ jobs:
                 runuser -u nobody -- bwrap --clearenv --share-net --unshare-pid --new-session \
                   --die-with-parent "$network" --ro-bind / / --proc /proc -- /bin/cat /proc/self/attr/current
               done
+              python /native-cli-coverage.py run
               /fixture --include-ignored --list > /evidence/registry.txt
               run_case() {
                 local test_name=$1
@@ -362,7 +365,15 @@ jobs:
               done
             ')
           docker cp "$binary" "$container:/fixture"
-          if timeout --kill-after=5s 180s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
+          docker cp scripts/native-cli-coverage.py "$container:/native-cli-coverage.py"
+          docker cp "$evidence_dir/cli-manifest.json" "$container:/native-cli-manifest.json"
+          staging="$RUNNER_TEMP/native-cli-bin"
+          mkdir -m 755 "$staging"
+          while IFS=$'\t' read -r role artifact; do
+            install -m 755 "$artifact" "$staging/$role"
+          done < <(jq -r '.artifacts | to_entries[] | [.key, .value.path] | @tsv' "$evidence_dir/cli-manifest.json")
+          docker cp "$staging" "$container:/omg-extra-bin"
+          if timeout --kill-after=5s 780s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
             run_status=0
           else
             run_status=$?
@@ -372,6 +383,8 @@ jobs:
           docker cp "$container:/profiles/." "$profile_dir/" || collection_status=$?
           if [ "$run_status" -ne 0 ]; then exit "$run_status"; fi
           test "$collection_status" -eq 0
+          python3 scripts/native-cli-coverage.py verify --manifest "$evidence_dir/cli-manifest.json" \
+            --evidence "$evidence_dir/cli" --profiles "$profile_dir"
           python3 - "$binary" "$profile_dir" "$evidence_dir" "$(git rev-parse HEAD)" <<'PY'
           import hashlib, json, sys
           from pathlib import Path

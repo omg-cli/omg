@@ -1285,6 +1285,22 @@ fn redact_aur_transport_error(_: reqwest::Error) -> anyhow::Error {
     AurRpcRequestError::Transport.into()
 }
 
+async fn finish_metadata_read(
+    worker: tokio::task::JoinHandle<Result<Option<AurIndex>>>,
+) -> Option<AurIndex> {
+    match worker.await {
+        Ok(Ok(index)) => index,
+        Ok(Err(error)) => {
+            warn!("Failed to open fresh AUR metadata: {error:#}");
+            None
+        }
+        Err(error) => {
+            warn!("AUR metadata freshness worker failed: {error}");
+            None
+        }
+    }
+}
+
 impl AurClient {
     pub fn new() -> Result<Self> {
         let settings = Settings::load().context("Failed to load OMG settings for AUR")?;
@@ -1419,17 +1435,10 @@ impl AurClient {
         }
 
         let ttl = Duration::from_secs(self.settings.aur.metadata_cache_ttl_secs);
-        match tokio::task::spawn_blocking(move || open_fresh_metadata_index(ttl)).await {
-            Ok(Ok(index)) => index,
-            Ok(Err(error)) => {
-                warn!("Failed to open fresh AUR metadata: {error:#}");
-                None
-            }
-            Err(error) => {
-                warn!("AUR metadata freshness worker failed: {error}");
-                None
-            }
-        }
+        finish_metadata_read(tokio::task::spawn_blocking(move || {
+            open_fresh_metadata_index(ttl)
+        }))
+        .await
     }
 
     /// Search AUR packages
@@ -2929,7 +2938,8 @@ impl AurClient {
             .zip(outputs)
             .map(|(path, output)| {
                 let snapshot = ArchiveSnapshot::capture(path)?;
-                let inspection = artifact_inspector::inspect_archive(&snapshot.path())?;
+                let admission = artifact_inspector::inspect_archive(&snapshot.path())?;
+                let inspection = admission.inspection();
                 snapshot.verify_sha256(&inspection.archive_sha256)?;
                 let identity = Self::cached_archive_identity(Path::new(&snapshot.handoff()))?
                     .context("Archive lacks package identity")?;
@@ -3076,7 +3086,10 @@ impl AurClient {
         let primary = Self::authorize_archives(paths, source, base, outputs, fresh)?;
         let primary_inspections = primary
             .iter()
-            .map(|archive| artifact_inspector::inspect_archive(&archive.path()))
+            .map(|archive| {
+                artifact_inspector::inspect_archive(&archive.path())
+                    .map(artifact_inspector::ArchiveAdmission::into_inspection)
+            })
             .collect::<Result<Vec<_>>>()?;
         let profile = self.settings.aur.security_profile;
         self.settings.aur.validate_security_profile()?;
@@ -3134,7 +3147,10 @@ impl AurClient {
         let secondary = Self::authorize_archives(&secondary_paths, source, base, outputs, fresh)?;
         let secondary_inspections = secondary
             .iter()
-            .map(|archive| artifact_inspector::inspect_archive(&archive.path()))
+            .map(|archive| {
+                artifact_inspector::inspect_archive(&archive.path())
+                    .map(artifact_inspector::ArchiveAdmission::into_inspection)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         // Reproducible Builds recommends rebuilding independently and comparing
@@ -4604,7 +4620,8 @@ impl AurClient {
         for batch in batches {
             batch.require_profile(profile)?;
             for snapshot in &batch.archives {
-                let inspection = artifact_inspector::inspect_archive(&snapshot.path())?;
+                let inspection =
+                    artifact_inspector::inspect_archive(&snapshot.path())?.into_inspection();
                 snapshot.verify_sha256(&inspection.archive_sha256)?;
                 inspection.enforce_profile(profile)?;
                 items.push(InstallItem {
@@ -5041,6 +5058,197 @@ mod tests {
         fn drop(&mut self) {
             paths::reset_test_overrides();
         }
+    }
+
+    #[test]
+    fn aur_metadata_reader_lock_failure_preserves_generation() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::aur_metadata_reader_lock_failure_preserves_generation";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["installed-demo"])?;
+        fixture.with_environment(async {
+            S72Fixture::index(&["metadata-demo"])?;
+            let client = fixture.client();
+            let snapshot = client
+                .fresh_metadata_index()
+                .await
+                .context("published metadata must be readable before the lock fault")?;
+            assert_eq!(
+                snapshot
+                    .get("metadata-demo")?
+                    .context("published package")?
+                    .version
+                    .as_str(),
+                "2.0-1"
+            );
+            let local_before = fixture.local_bytes()?;
+            let metadata_root = paths::cache_dir().join("aur/_meta");
+            let manifest = metadata_root.join("manifest.json");
+            let manifest_before = std::fs::read(&manifest)?;
+            let published: serde_json::Value = serde_json::from_slice(&manifest_before)?;
+            let generation = metadata_root.join(
+                published["generation"]
+                    .as_str()
+                    .context("published fixture must name its generation")?,
+            );
+            let archive = generation.join("archive.gz");
+            let index = generation.join("index.rkyv");
+            let archive_before = std::fs::read(&archive)?;
+            let index_before = std::fs::read(&index)?;
+            let lock = metadata_root.join("publication.lock");
+            let saved_lock = metadata_root.join("publication.lock.saved");
+            std::fs::rename(&lock, &saved_lock)?;
+            std::fs::create_dir(&lock)?;
+
+            let error = open_fresh_metadata_index(Duration::from_hours(1))
+                .expect_err("a directory cannot be opened as the metadata publication lock");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<std::io::Error>().is_some()),
+                "the fixture must exercise a real metadata I/O failure: {error:#}"
+            );
+            assert!(
+                client.fresh_metadata_index().await.is_none(),
+                "an unreadable metadata generation must fall back instead of failing the caller"
+            );
+            assert!(
+                lock.is_dir(),
+                "reader fallback must preserve the failed lock for diagnosis"
+            );
+            assert_eq!(std::fs::read(&manifest)?, manifest_before);
+            assert_eq!(std::fs::read(&archive)?, archive_before);
+            assert_eq!(std::fs::read(&index)?, index_before);
+            assert_eq!(fixture.local_bytes()?, local_before);
+            assert!(
+                snapshot.get("metadata-demo")?.is_some(),
+                "an earlier owned snapshot stays usable"
+            );
+
+            std::fs::remove_dir(&lock)?;
+            std::fs::rename(&saved_lock, &lock)?;
+            assert!(
+                client.fresh_metadata_index().await.is_some(),
+                "restored access must make the same generation readable again"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn aur_metadata_task_completion_preserves_snapshots_and_falls_back() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::aur_metadata_task_completion_preserves_snapshots_and_falls_back";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&[])?;
+        fixture.with_environment(async {
+            S72Fixture::index(&["metadata-demo"])?;
+            let index = open_fresh_metadata_index(Duration::from_hours(1))?
+                .context("published metadata fixture must contain an index")?;
+            let snapshot = finish_metadata_read(tokio::spawn(async move { Ok(Some(index)) }))
+                .await
+                .context("a successful metadata worker must retain its owned snapshot")?;
+            assert_eq!(
+                snapshot
+                    .get("metadata-demo")?
+                    .context("published package")?
+                    .version
+                    .as_str(),
+                "2.0-1"
+            );
+            assert!(
+                finish_metadata_read(tokio::spawn(async { Ok(None) }))
+                    .await
+                    .is_none()
+            );
+            assert!(
+                finish_metadata_read(tokio::spawn(async {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "metadata reader sentinel",
+                    )
+                    .into())
+                }))
+                .await
+                .is_none(),
+                "metadata-reader errors must leave the caller free to use RPC"
+            );
+            let panicked = tokio::spawn(async {
+                panic!("metadata worker panic sentinel");
+            });
+            assert!(
+                finish_metadata_read(panicked).await.is_none(),
+                "a real panicked task must use the same fallback contract"
+            );
+
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let cancelled = tokio::spawn(async move {
+                started
+                    .send(())
+                    .expect("cancellation observer remains alive");
+                std::future::pending::<Result<Option<AurIndex>>>().await
+            });
+            entered
+                .await
+                .context("metadata cancellation task must have started")?;
+            cancelled.abort();
+            assert!(
+                finish_metadata_read(cancelled).await.is_none(),
+                "a genuinely cancelled async task must fall back without propagating a JoinError"
+            );
+            assert!(
+                snapshot.get("metadata-demo")?.is_some(),
+                "task failures must not invalidate a separately owned index"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn aur_official_dependencies_reject_oversized_install_request_before_mutation() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::aur_official_dependencies_reject_oversized_install_request_before_mutation";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["installed-demo"])?;
+        fixture.with_environment(async {
+            let local_before = fixture.local_bytes()?;
+            let selected = (0..4_097)
+                .map(|index| {
+                    let name = format!("dependency-{index}");
+                    OfficialTarget {
+                        repository: "fixture".to_owned(),
+                        relations: vec![format!("{name}>=1")],
+                        name,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let error = AurClient::install_official_dependencies(&selected)
+                .await
+                .expect_err(
+                    "an oversized dependency graph must be refused at the bounded request boundary",
+                );
+            assert_eq!(
+                error.to_string(),
+                "Invalid installation item count",
+                "the refusal must occur before native installation or elevation: {error:#}"
+            );
+            assert_eq!(
+                fixture.local_bytes()?,
+                local_before,
+                "bounded-request refusal must preserve the installed catalog"
+            );
+            assert!(
+                !fixture.db.join("db.lck").exists(),
+                "request refusal must not acquire a native transaction lock"
+            );
+            Ok(())
+        })
     }
 
     #[test]
@@ -9260,7 +9468,7 @@ mod tests {
                             );
                             let archives = result.context(diagnostic)?;
                             assert_eq!(archives.len(), 1);
-                            let inspected = artifact_inspector::inspect_archive(&archives.archives[0].path())?;
+                            let inspected = artifact_inspector::inspect_archive(&archives.archives[0].path())?.into_inspection();
                             assert_eq!(inspected.package_name, "omg-coverage-fixture");
                             assert!(inspected.install_hook.is_none());
                             hashes.push(inspected.archive_sha256);
@@ -9694,7 +9902,14 @@ finally:
                     settings: Settings::default(),
                     package_base_locks: Arc::new(dashmap::DashMap::new()),
                 };
-                let inspection = artifact_inspector::inspect_archive(&archive)?;
+                let inspection = artifact_inspector::inspect_archive(&archive)?.into_inspection();
+                let mut old_policy = inspection.clone();
+                old_policy.policy_version = 3;
+                assert_ne!(
+                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&old_policy)),
+                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection)),
+                    "a policy-3 paired-build proof must not authorize the current archive policy"
+                );
                 let standard_key =
                     client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
                 client.settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
@@ -9786,7 +10001,9 @@ finally:
                     .await?;
                 assert_eq!(accepted.len(), 1);
                 assert_eq!(
-                    artifact_inspector::inspect_archive(&accepted.archives[0].path())?.package_name,
+                    artifact_inspector::inspect_archive(&accepted.archives[0].path())?
+                        .into_inspection()
+                        .package_name,
                     "demo"
                 );
                 let journal = fixture.join("data/audit/audit.jsonl");

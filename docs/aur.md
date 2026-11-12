@@ -116,6 +116,26 @@ govern packages installed through yay, Aura or direct pacman commands. To refuse
 AUR entirely, set `allow_aur = false` in your OMG `policy.toml`; see
 [security](./security.md).
 
+Both profiles check each built archive against its MTREE inventory using the
+official Rust ALPM parser. Paths, file types, permissions, regular-file sizes
+and symlink targets must agree with the archive. Before installation, OMG checks
+the native loaded package's file names, types, permissions and regular-file
+sizes against that inventory. A profile exception cannot bypass malformed
+metadata or an inventory mismatch.
+
+Ordinary makepkg output is supported. Custom producers must use canonical
+relative archive names and plain UTF-8 or one complete gzip member for MTREE.
+Leading `./`, repeated separators and inner `./` in archive payload names are
+rejected. Hard links must refer directly to an earlier regular payload file;
+forward references and chains are rejected. Encoded and decoded MTREE each
+have a 16 MiB limit, alongside archive entry and path limits. These are OMG
+admission rules, so changing to `standard` does not disable them.
+
+Inventory agreement does not vet program behavior or authenticate MTREE content
+hashes. Native file-list agreement also does not prove successful extraction.
+The sealed-byte handoff, source review and paired-build checks remain separate
+controls.
+
 ## Update or remove
 
 ```bash

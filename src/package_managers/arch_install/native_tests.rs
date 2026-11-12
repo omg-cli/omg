@@ -126,6 +126,17 @@ fn descriptor_sealing_denial_refuses_installation_handoff() {
 }
 
 fn archive(dir: &Path, name: &str, version: &str) -> Result<ArchiveSnapshot> {
+    archive_with_mtree(dir, name, version, None)
+}
+
+fn archive_with_mtree(
+    dir: &Path,
+    name: &str,
+    version: &str,
+    mtree_override: Option<&str>,
+) -> Result<ArchiveSnapshot> {
+    use sha2::{Digest as _, Sha256};
+
     let path = dir.join(format!("{name}-{version}-any.pkg.tar.gz"));
     let file = File::create(&path)?;
     let mut tar = tar::Builder::new(GzEncoder::new(file, Compression::default()));
@@ -138,7 +149,11 @@ fn archive(dir: &Path, name: &str, version: &str) -> Result<ArchiveSnapshot> {
     let buildinfo = format!(
         "format = 2\npkgname = {name}\npkgbase = {name}\npkgver = {version}\npkgarch = any\n"
     );
-    let mtree = format!("#mtree\n./{payload_path} type=file mode=644 size={payload_size}\n");
+    let payload_sha256 = hex::encode(Sha256::digest(payload));
+    let mtree = format!(
+        "#mtree\n/set uid=0 gid=0\n./{payload_path} type=file mode=644 size={payload_size} time=1.0 sha256digest={payload_sha256}\n"
+    );
+    let mtree = mtree_override.unwrap_or(&mtree);
     for (name, contents) in [
         (".PKGINFO".to_owned(), info.as_bytes()),
         (".BUILDINFO".to_owned(), buildinfo.as_bytes()),
@@ -159,8 +174,9 @@ fn archive(dir: &Path, name: &str, version: &str) -> Result<ArchiveSnapshot> {
 fn fixture_archives_have_complete_admission_metadata() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let snapshot = archive(directory.path(), "omg-fixture-metadata", "1-1")?;
-    let inspection =
+    let admission =
         crate::package_managers::aur::artifact_inspector::inspect_archive(&snapshot.path())?;
+    let inspection = admission.inspection();
     assert_eq!(inspection.package_name, "omg-fixture-metadata");
     assert_eq!(inspection.package_version, "1-1");
     inspection.enforce_profile(crate::config::AurSecurityProfile::Standard)?;
@@ -183,6 +199,7 @@ fn fixture_archives_have_complete_admission_metadata() -> Result<()> {
     assert_eq!(package.base(), Some(inspection.package_base.as_str()));
     assert_eq!(package.arch(), Some(inspection.architecture.as_str()));
     let file_list = package.files();
+    admission.verify_native_inventory(file_list)?;
     let files = file_list.files();
     assert_eq!(files.len(), 1, "native ALPM must see the fixture payload");
     let payload = files
@@ -196,6 +213,23 @@ fn fixture_archives_have_complete_admission_metadata() -> Result<()> {
         "fixture payload is a regular file"
     );
     assert_eq!(package.isize(), payload.size());
+    let other = archive(directory.path(), "omg-fixture-other", "1-1")?;
+    let other_path = other.path();
+    let other_package = alpm.pkg_load(
+        other_path.to_str().context("other fixture archive path")?,
+        true,
+        alpm::SigLevel::NONE,
+    )?;
+    assert_eq!(other_package.files().files().len(), files.len());
+    let mismatch = admission
+        .verify_native_inventory(other_package.files())
+        .expect_err("an equally sized different native inventory must be refused");
+    assert!(
+        mismatch
+            .to_string()
+            .contains("native ALPM inventory differs"),
+        "native disagreement must retain its cause: {mismatch:#}"
+    );
     Ok(())
 }
 
@@ -405,8 +439,92 @@ fn native_installation_preserves_mixed_intents() -> Result<()> {
             .exists(),
         "the public asynchronous removal must remove the owned fixture payload"
     );
+    let invalid = archive_with_mtree(
+        &dir,
+        "omg-fixture-invalid-inventory",
+        "1-1",
+        Some("#mtree\n"),
+    )?;
+    let state_before = installed(&root, &db)?;
+    let journal_before = fs::read(audit_path)?;
+    let error = install(&[(&invalid, Requested)])
+        .expect_err("the sealed root receiver must refuse missing MTREE payload declarations");
+    assert!(
+        format!("{error:#}").contains("MTREE payload inventory differs"),
+        "root admission must report the inventory mismatch: {error:#}"
+    );
+    assert_eq!(installed(&root, &db)?, state_before);
+    assert_eq!(
+        fs::read(audit_path)?,
+        journal_before,
+        "refusal precedes mutation attempt audit"
+    );
+    assert!(
+        !root
+            .join("usr/share/omg-fixture/omg-fixture-invalid-inventory")
+            .exists()
+    );
+    assert!(
+        !db.join("db.lck").exists(),
+        "admission refusal must release the transaction lock"
+    );
+
+    let conflicting = archive(&dir, "omg-fixture-conflict", "1-1")?;
+    let conflicting_payload = root.join("usr/share/omg-fixture/omg-fixture-conflict");
+    fs::write(&conflicting_payload, b"unowned fixture data\n")?;
+    let audit_before = fs::read_to_string(audit_path)?.lines().count();
+    let mut alpm = alpm::Alpm::new(
+        root.to_str().context("conflict fixture root")?,
+        db.to_str().context("conflict fixture database")?,
+    )?;
+    crate::package_managers::alpm_ops::register_configured_syncdbs(&alpm, &configuration)?;
+    let error = crate::package_managers::execute_transaction(
+        vec![conflicting.handoff()],
+        crate::package_managers::TransactionKind::Install,
+        Some(&mut alpm),
+    )
+    .expect_err("an unowned payload conflict must refuse native commit");
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("failed to commit") && diagnostic.contains("conflicting files"),
+        "the fixture must fail during commit, after successful preparation: {diagnostic}"
+    );
+    assert_eq!(fs::read(&conflicting_payload)?, b"unowned fixture data\n");
+    assert_eq!(installed(&root, &db)?, expected);
+    assert!(
+        !db.join("db.lck").exists(),
+        "failed native commit must release the borrowed database lock"
+    );
+    let audit = fs::read_to_string(audit_path)?;
+    let entries = audit
+        .lines()
+        .skip(audit_before)
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    assert_eq!(entries.len(), 2, "one attempt and one terminal audit");
+    assert!(
+        entries[0]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("Package operation install: attempt;")
+            })
+    );
+    assert!(
+        entries[1]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("Package operation install: failed;")
+            })
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| { entry["resource"].as_str() == Some("omg-fixture-conflict") })
+    );
     for test in [
         "package_managers::aur::client::tests::batch2_native_automatic_dependency_reason",
+        "package_managers::pacman_db::db::tests::inaccessible_local_database_is_not_an_empty_catalog",
+        "package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason",
         CREATION_DENIAL_TEST,
         SEALING_DENIAL_TEST,
     ] {

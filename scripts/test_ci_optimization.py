@@ -53,6 +53,7 @@ class OptimizationContracts(unittest.TestCase):
 
     def test_fixture_profile_lifecycle_is_bounded_and_cleans_up(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        script = script.split('python3 scripts/native-cli-coverage.py verify', 1)[0]
         script = script.split('python3 - "$binary"', 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -60,6 +61,20 @@ class OptimizationContracts(unittest.TestCase):
             binary.parent.mkdir(parents=True)
             binary.write_text('fixture')
             binary.chmod(0o755)
+            (root / 'scripts').mkdir()
+            (root / 'scripts/native-cli-coverage.py').write_bytes(
+                (ROOT / 'scripts/native-cli-coverage.py').read_bytes())
+            for name in ('debug/omg', 'debug/omgd',
+                         'debug/deps/coverage_14-1111111111111111',
+                         'debug/deps/arch_cli_contracts-1111111111111111',
+                         'debug/deps/cli_comprehensive-1111111111111111',
+                         'debug/deps/omg-1111111111111111'):
+                artifact = root / 'target/llvm-cov-target' / name
+                artifact.write_text('fixture executable')
+                artifact.chmod(0o755)
+            readelf = root / 'readelf'
+            readelf.write_text('#!/bin/sh\nprintf "__llvm_covmap __llvm_prf_cnts\\n"\n')
+            readelf.chmod(0o755)
             sysctl = root / 'restriction'
             sysctl.write_text('1\n')
             script = script.replace('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', str(sysctl))
@@ -81,17 +96,20 @@ if '--remove' in args: sys.exit(int(os.environ.get('UNLOAD_STATUS', '0')))
             launcher = '''curl() { :; }
 sha256sum() { if [ "$1" = --check ]; then cat >/dev/null; else command sha256sum "$@"; fi; }
 jq() { :; }
+git() { printf '%040d\\n' 1; }
 '''
             for run_id, attempt, status, remove, unload, expected in [
                     ('123', '1', 0, 0, 0, 0), ('123', '2', 23, 0, 0, 23),
                     ('123', '3', 23, 7, 9, 23), ('123', '4', 0, 7, 0, 7),
                     ('123', '5', 0, 0, 9, 9)]:
                 trace = root / f'trace-{attempt}'
+                runner_temp = root / ('runner-' + attempt)
+                runner_temp.mkdir()
                 result = subprocess.run([BASH, '-e', '-c', launcher + script], cwd=root,
                     env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                              TRACE=str(trace), START_STATUS=str(status), REMOVE_STATUS=str(remove),
                              UNLOAD_STATUS=str(unload), GITHUB_RUN_ID=run_id,
-                             GITHUB_RUN_ATTEMPT=attempt, GITHUB_WORKSPACE=str(root), RUNNER_TEMP=str(root)),
+                             GITHUB_RUN_ATTEMPT=attempt, GITHUB_WORKSPACE=str(root), RUNNER_TEMP=str(runner_temp)),
                     text=True, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]

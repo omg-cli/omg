@@ -7,7 +7,7 @@
 //! Package identity is cross-checked against Arch's documented BUILDINFO
 //! fields: https://man.archlinux.org/man/BUILDINFO.5
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Component, Path};
@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 
 use super::archive_metadata;
 
+mod mtree;
+
 const MAX_DECLARED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_MEMBERS: u64 = 100_000;
 // Tar headers, padding, and extended metadata need room beyond member data.
@@ -26,7 +28,27 @@ const MAX_PATH_BYTES: usize = 4_096;
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PRIVILEGED_FILES: usize = 256;
 
-pub(crate) const INSPECTION_POLICY_VERSION: u32 = 3;
+pub(crate) const INSPECTION_POLICY_VERSION: u32 = 4;
+
+#[derive(Debug)]
+pub(crate) struct ArchiveAdmission {
+    inspection: ArtifactInspection,
+    inventory: mtree::NativeInventory,
+}
+
+impl ArchiveAdmission {
+    pub(crate) fn inspection(&self) -> &ArtifactInspection {
+        &self.inspection
+    }
+
+    pub(crate) fn into_inspection(self) -> ArtifactInspection {
+        self.inspection
+    }
+
+    pub(crate) fn verify_native_inventory(&self, files: &alpm::FileList<'_>) -> Result<()> {
+        self.inventory.verify(files)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrivilegedFile {
@@ -105,20 +127,12 @@ impl ArtifactInspection {
     }
 }
 
-fn normalize_member_path(path: &Path) -> Result<String> {
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => parts.push(
-                part.to_str()
-                    .context("non-UTF-8 path in AUR package archive")?,
-            ),
-            Component::CurDir => {}
-            _ => anyhow::bail!("unsafe path in AUR package archive: {}", path.display()),
-        }
-    }
-    anyhow::ensure!(!parts.is_empty(), "empty path in AUR package archive");
-    Ok(parts.join("/"))
+fn normalize_member_path(path: &Path, directory: bool) -> Result<String> {
+    mtree::canonical_path(
+        path.to_str()
+            .context("non-UTF-8 path in AUR package archive")?,
+        directory,
+    )
 }
 
 fn archive_sha256(path: &Path) -> Result<String> {
@@ -210,11 +224,10 @@ fn parse_buildinfo(content: &str) -> Result<(String, String, String, String)> {
     ))
 }
 
-pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
+pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
     let archive_sha256 = archive_sha256(path)?;
     archive_metadata::validate(archive_reader(path)?)?;
     let mut archive = tar::Archive::new(archive_reader(path)?);
-    let mut seen = HashSet::new();
     let mut member_count = 0_u64;
     let mut declared_bytes = 0_u64;
     let mut executable_files = Vec::new();
@@ -223,7 +236,8 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
     let mut install_hook = None;
     let mut pkginfo = None;
     let mut buildinfo = None;
-    let mut mtree_seen = false;
+    let mut mtree_bytes = None;
+    let mut inventory = mtree::ArchiveInventory::default();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -245,11 +259,8 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
             raw_path.as_os_str().len() <= MAX_PATH_BYTES,
             "AUR archive member path is too long"
         );
-        let member = normalize_member_path(&raw_path)?;
-        anyhow::ensure!(
-            seen.insert(member.clone()),
-            "duplicate normalized path in AUR archive: {member}"
-        );
+        let kind = entry.header().entry_type();
+        let member = normalize_member_path(&raw_path, kind.is_dir())?;
         if member.starts_with("etc/") {
             paired_build_reasons.insert("system-configuration".to_owned());
         }
@@ -286,19 +297,52 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
             paired_build_reasons.insert("privileged-system-integration".to_owned());
         }
 
-        let kind = entry.header().entry_type();
         anyhow::ensure!(
             kind.is_file() || kind.is_dir() || kind.is_symlink() || kind.is_hard_link(),
             "special file in AUR archive: {member}"
         );
-        if kind.is_symlink() || kind.is_hard_link() {
+        let target = if kind.is_symlink() || kind.is_hard_link() {
             let target = entry
                 .link_name()?
                 .context("link without target in AUR archive")?;
+            anyhow::ensure!(
+                target.as_os_str().len() <= MAX_PATH_BYTES,
+                "AUR archive link target is too long"
+            );
             validate_relative_link(&member, &target, kind.is_hard_link())?;
-        }
+            Some(target.into_owned())
+        } else {
+            None
+        };
 
         let mode = entry.header().mode()?;
+        let node = if kind.is_file() {
+            mtree::TarNode::File {
+                mode,
+                size: entry.size(),
+            }
+        } else if kind.is_dir() {
+            mtree::TarNode::Directory { mode }
+        } else {
+            let target = target
+                .as_ref()
+                .context("AUR archive link target is missing")?;
+            let target = target
+                .to_str()
+                .context("non-UTF-8 AUR archive link target")?;
+            if kind.is_symlink() {
+                mtree::TarNode::Symlink {
+                    mode,
+                    target: target.to_owned(),
+                }
+            } else {
+                mtree::TarNode::HardLink {
+                    mode,
+                    target: mtree::canonical_path(target, false)?,
+                }
+            }
+        };
+        inventory.add(member.clone(), node)?;
         let mut capability = None;
         if let Some(extensions) = entry.pax_extensions()? {
             for extension in extensions {
@@ -357,7 +401,7 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
                         .context("AUR archive .BUILDINFO is not UTF-8")?;
                     buildinfo = Some(parse_buildinfo(content)?);
                 }
-                ".MTREE" => mtree_seen = true,
+                ".MTREE" => mtree_bytes = Some(bytes),
                 ".INSTALL" => {
                     install_hook = Some(hex::encode(Sha256::digest(&bytes)));
                     paired_build_reasons.insert("install-hook".to_owned());
@@ -380,10 +424,10 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
             ),
         "AUR archive .BUILDINFO identity differs from .PKGINFO"
     );
-    anyhow::ensure!(mtree_seen, "AUR archive is missing .MTREE");
+    let inventory = inventory.agree(&mtree_bytes.context("AUR archive is missing .MTREE")?)?;
     executable_files.sort();
     privileged_files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(ArtifactInspection {
+    let inspection = ArtifactInspection {
         policy_version: INSPECTION_POLICY_VERSION,
         archive_sha256,
         package_name,
@@ -395,6 +439,10 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
         privileged_files,
         install_hook,
         paired_build_reasons: paired_build_reasons.into_iter().collect(),
+    };
+    Ok(ArchiveAdmission {
+        inspection,
+        inventory,
     })
 }
 
@@ -486,6 +534,13 @@ mod tests {
     fn fixture_archive(
         extra: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<File>>) -> Result<()>,
     ) -> Result<tempfile::NamedTempFile> {
+        fixture_archive_with_mtree(b"#mtree\n", extra)
+    }
+
+    fn fixture_archive_with_mtree(
+        mtree: &[u8],
+        extra: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<File>>) -> Result<()>,
+    ) -> Result<tempfile::NamedTempFile> {
         let file = tempfile::Builder::new().suffix(".pkg.tar.gz").tempfile()?;
         let output = file.reopen()?;
         let encoder = flate2::write::GzEncoder::new(output, flate2::Compression::fast());
@@ -502,19 +557,125 @@ mod tests {
             b"format = 2\npkgname = demo\npkgbase = demo\npkgver = 1.0-1\npkgarch = x86_64\n",
             0o644,
         )?;
-        append_file(&mut builder, ".MTREE", b"#mtree\n", 0o644)?;
+        append_file(&mut builder, ".MTREE", mtree, 0o644)?;
         extra(&mut builder)?;
         builder.finish()?;
         Ok(file)
     }
 
+    fn fixture_file_mtree(files: &[(&str, u32, usize)]) -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let mut text = "#mtree\n/set uid=0 gid=0 type=file\n".to_owned();
+        for (path, mode, size) in files {
+            writeln!(
+                text,
+                "./{path} mode={mode:o} size={size} time=0.0 sha256digest={}",
+                "0".repeat(64)
+            )
+            .expect("writing fixture MTREE to a String cannot fail");
+        }
+        text.into_bytes()
+    }
+
+    #[test]
+    fn archive_admission_rejects_mtree_inventory_disagreement() -> Result<()> {
+        let digest = "0".repeat(64);
+        for (case, declaration) in [
+            ("missing", String::new()),
+            (
+                "ghost",
+                format!("./usr/share/ghost type=file mode=644 size=4 sha256digest={digest}"),
+            ),
+            (
+                "size",
+                format!("./usr/share/marker type=file mode=644 size=5 sha256digest={digest}"),
+            ),
+            (
+                "mode",
+                format!("./usr/share/marker type=file mode=600 size=4 sha256digest={digest}"),
+            ),
+            ("type", "./usr/share/marker type=dir mode=644".to_owned()),
+        ] {
+            let mtree = if declaration.is_empty() {
+                "#mtree\n".to_owned()
+            } else {
+                format!("#mtree\n/set uid=0 gid=0\n{declaration} time=0.0\n")
+            };
+            let file = fixture_archive_with_mtree(mtree.as_bytes(), |builder| {
+                append_file(builder, "usr/share/marker", b"test", 0o644)
+            })?;
+            let result = inspect_archive(file.path());
+            assert!(
+                result.is_err(),
+                "{case} MTREE inventory disagreement must be refused"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn archive_admission_accepts_complete_payload_inventory() -> Result<()> {
+        let mtree = format!(
+            "#mtree\n/set uid=0 gid=0\n./usr/share/marker type=file mode=644 size=4 time=0.0 sha256digest={}\n",
+            "0".repeat(64)
+        );
+        let file = fixture_archive_with_mtree(mtree.as_bytes(), |builder| {
+            append_file(builder, "usr/share/marker", b"test", 0o644)
+        })?;
+        inspect_archive(file.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn archive_admission_accepts_genuine_makepkg_links_and_native_inventory() -> Result<()> {
+        let file = tempfile::Builder::new().suffix(".pkg.tar").tempfile()?;
+        std::fs::write(
+            file.path(),
+            include_bytes!("../../../tests/data/mtree/makepkg-links.pkg.tar"),
+        )?;
+        let admission = inspect_archive(file.path())?;
+        assert_eq!(admission.inspection().package_name, "omg-mtree-probe");
+        let root = tempfile::TempDir::new()?;
+        let db = root.path().join("db");
+        std::fs::create_dir(&db)?;
+        let alpm = alpm::Alpm::new(
+            root.path().to_str().context("fixture root is UTF-8")?,
+            db.to_str().context("fixture database is UTF-8")?,
+        )?;
+        let package = alpm.pkg_load(
+            file.path().to_str().context("fixture archive is UTF-8")?,
+            true,
+            alpm::SigLevel::NONE,
+        )?;
+        admission.verify_native_inventory(package.files())?;
+        assert!(
+            package
+                .files()
+                .files()
+                .iter()
+                .any(|file| file.name() == b"usr/share/omg-mtree-probe/hard-b")
+        );
+        assert!(
+            package
+                .files()
+                .files()
+                .iter()
+                .any(|file| file.name() == b"usr/share/omg-mtree-probe/empty/")
+        );
+        Ok(())
+    }
+
     #[test]
     fn member_paths_reject_absolute_parent_and_empty_paths() {
-        assert!(normalize_member_path(Path::new("../../etc/shadow")).is_err());
-        assert!(normalize_member_path(Path::new("/etc/shadow")).is_err());
-        assert!(normalize_member_path(Path::new(".")).is_err());
+        assert!(normalize_member_path(Path::new("../../etc/shadow"), false).is_err());
+        assert!(normalize_member_path(Path::new("/etc/shadow"), false).is_err());
+        assert!(normalize_member_path(Path::new("."), false).is_err());
+        assert!(normalize_member_path(Path::new("./usr/bin/demo"), false).is_err());
+        assert!(normalize_member_path(Path::new("usr//bin/demo"), false).is_err());
+        assert!(normalize_member_path(Path::new("usr/./bin/demo"), false).is_err());
         assert_eq!(
-            normalize_member_path(Path::new("./usr/bin/demo")).unwrap(),
+            normalize_member_path(Path::new("usr/bin/demo"), false).unwrap(),
             "usr/bin/demo"
         );
     }
@@ -592,7 +753,11 @@ mod tests {
     #[test]
     fn gnu_longlinks_are_inspected_and_cannot_mix_with_pax() -> Result<()> {
         for mixed in [false, true] {
-            let file = fixture_archive(|builder| {
+            let mtree = fixture_file_mtree(&[
+                ("usr/share/marker", 0o644, b"inert marker".len()),
+                ("usr/share/alias", 0o644, b"inert marker".len()),
+            ]);
+            let file = fixture_archive_with_mtree(&mtree, |builder| {
                 append_file(builder, "usr/share/marker", b"inert marker", 0o644)?;
                 let target = b"usr/share/marker\0";
                 let mut extension = tar::Header::new_gnu();
@@ -624,7 +789,7 @@ mod tests {
                     "{error}"
                 );
             } else {
-                let inspection = inspection?;
+                let inspection = inspection?.into_inspection();
                 assert_eq!(inspection.member_count, 5);
                 assert!(!inspection.requires_exception());
             }
@@ -635,8 +800,12 @@ mod tests {
     #[test]
     fn hardlinks_cannot_carry_data_or_unclassified_privilege_metadata() -> Result<()> {
         for data in [b"".as_slice(), b"harmless marker data".as_slice()] {
-            let file = fixture_archive(|builder| {
-                append_file(builder, "usr/share/marker", b"test", 0o644)?;
+            let mtree = fixture_file_mtree(&[
+                ("usr/share/marker", 0o4755, 4),
+                ("usr/share/alias", 0o4755, 4),
+            ]);
+            let file = fixture_archive_with_mtree(&mtree, |builder| {
+                append_file(builder, "usr/share/marker", b"test", 0o4755)?;
                 builder.append_pax_extensions([("comment", b"inert".as_slice())])?;
                 let mut header = tar::Header::new_gnu();
                 header.set_path("usr/share/alias")?;
@@ -650,7 +819,9 @@ mod tests {
             })?;
             if data.is_empty() {
                 assert!(
-                    inspect_archive(file.path())?.requires_exception(),
+                    inspect_archive(file.path())?
+                        .inspection()
+                        .requires_exception(),
                     "link privilege metadata must be classified"
                 );
             } else {
@@ -671,11 +842,17 @@ mod tests {
             "LIBARCHIVE.xattr.security%2Ecapability",
             "LIBARCHIVE.xattr.security.%63apability",
         ] {
-            let file = fixture_archive(|builder| {
+            let mtree = fixture_file_mtree(&[("usr/bin/marker", 0o755, 5)]);
+            let file = fixture_archive_with_mtree(&mtree, |builder| {
                 builder.append_pax_extensions([(key, b"AQAAAA==".as_slice())])?;
                 append_file(builder, "usr/bin/marker", b"inert", 0o755)
             })?;
-            assert!(inspect_archive(file.path())?.requires_exception(), "{key}");
+            assert!(
+                inspect_archive(file.path())?
+                    .inspection()
+                    .requires_exception(),
+                "{key}"
+            );
         }
         for key in [
             "SCHILY.xattr.security.capability\0suffix",
@@ -692,7 +869,8 @@ mod tests {
 
     #[test]
     fn ordinary_pax_metadata_and_literal_attributes_remain_accepted() -> Result<()> {
-        let file = fixture_archive(|builder| {
+        let mtree = fixture_file_mtree(&[("usr/share/marker", 0o644, 5)]);
+        let file = fixture_archive_with_mtree(&mtree, |builder| {
             builder.append_pax_extensions([
                 ("path", b"usr/share/marker".as_slice()),
                 ("size", b"5".as_slice()),
@@ -700,7 +878,7 @@ mod tests {
             ])?;
             append_file(builder, "marker", b"inert", 0o644)
         })?;
-        let inspection = inspect_archive(file.path())?;
+        let inspection = inspect_archive(file.path())?.into_inspection();
         assert!(!inspection.requires_exception());
         assert_eq!(inspection.member_count, 4);
         Ok(())
@@ -725,7 +903,11 @@ mod tests {
     }
 
     fn inspect_concatenated_compression_frames(kind: &str) -> Result<()> {
-        let prefix = fixture_archive(|builder| {
+        let mtree = fixture_file_mtree(&[
+            ("usr/share/first-marker", 0o644, 5),
+            ("usr/share/second-marker", 0o644, 5),
+        ]);
+        let prefix = fixture_archive_with_mtree(&mtree, |builder| {
             append_file(builder, "usr/share/first-marker", b"inert", 0o644)
         })?;
         let mut raw = Vec::new();
@@ -756,7 +938,7 @@ mod tests {
         let file = tempfile::NamedTempFile::new()?;
         std::fs::write(file.path(), compressed)?;
         assert_eq!(
-            inspect_archive(file.path())?.member_count,
+            inspect_archive(file.path())?.inspection().member_count,
             5,
             "{kind}: every frame must be inspected"
         );
@@ -815,8 +997,11 @@ mod tests {
             "usr/share/polkit-1/actions/demo.policy",
             ".INSTALL",
         ] {
-            let file = fixture_archive(|builder| append_file(builder, path, b"inert", 0o644))?;
-            let inspection = inspect_archive(file.path())?;
+            let mtree = fixture_file_mtree(&[(path, 0o644, 5)]);
+            let file = fixture_archive_with_mtree(&mtree, |builder| {
+                append_file(builder, path, b"inert", 0o644)
+            })?;
+            let inspection = inspect_archive(file.path())?.into_inspection();
             assert!(inspection.enforce_profile(Standard).is_ok());
             assert_eq!(
                 inspection.enforce_profile(Hardened).is_ok(),
@@ -863,11 +1048,12 @@ mod tests {
 
     #[test]
     fn inspector_classifies_install_hook_and_setuid_file() -> Result<()> {
-        let archive = fixture_archive(|builder| {
+        let mtree = fixture_file_mtree(&[("usr/bin/demo", 0o4755, 6)]);
+        let archive = fixture_archive_with_mtree(&mtree, |builder| {
             append_file(builder, ".INSTALL", b"post_install() { :; }\n", 0o644)?;
             append_file(builder, "usr/bin/demo", b"binary", 0o4755)
         })?;
-        let inspection = inspect_archive(archive.path())?;
+        let inspection = inspect_archive(archive.path())?.into_inspection();
         assert_eq!(inspection.package_name, "demo");
         assert!(inspection.install_hook.is_some());
         assert_eq!(inspection.privileged_files.len(), 1);
@@ -889,8 +1075,11 @@ mod tests {
                 "privileged-system-integration",
             ),
         ] {
-            let archive = fixture_archive(|builder| append_file(builder, path, b"payload", 0o644))?;
-            let inspection = inspect_archive(archive.path())?;
+            let mtree = fixture_file_mtree(&[(path, 0o644, 7)]);
+            let archive = fixture_archive_with_mtree(&mtree, |builder| {
+                append_file(builder, path, b"payload", 0o644)
+            })?;
+            let inspection = inspect_archive(archive.path())?.into_inspection();
             assert!(inspection.requires_paired_build());
             assert!(
                 inspection

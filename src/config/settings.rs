@@ -860,6 +860,17 @@ mod tests {
     }
 
     #[test]
+    fn config_paths_accept_missing_directory_without_creating_it() {
+        let directory = tempfile::tempdir().expect("private configuration fixture");
+        let path = directory.path().join("future-build-output");
+        validate_config_path(&path, "pkgdest").expect("a future private output path is valid");
+        assert!(
+            !path.exists(),
+            "configuration validation must not create the configured output directory"
+        );
+    }
+
+    #[test]
     fn config_paths_accept_the_current_home_and_reject_unrelated_roots() {
         if let Some(home) = dirs::home_dir() {
             assert!(validate_config_path(&home.join(".cache/omg"), "pkgdest").is_ok());
