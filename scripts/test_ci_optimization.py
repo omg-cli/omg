@@ -594,8 +594,181 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
     def collect(self):
         result = self.run_shell(step_script('coverage.yml', 'Collect invalid coverage diagnostics'))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        output = self.directory / 'coverage-diagnostics'
+        output = Path(self.environment['RUNNER_TEMP']) / 'coverage-diagnostics'
         return json.loads((output / 'receipt.json').read_text()), output / 'profiles.tar.gz'
+
+    def diagnostic_tools(self):
+        tools = self.directory / 'toolchain/bin'
+        tools.mkdir(parents=True)
+        script = f'#!{sys.executable}\n' + textwrap.dedent('''
+            import json, pathlib, sys
+            name = pathlib.Path(sys.argv[0]).name
+            if '--version' in sys.argv or '-vV' in sys.argv:
+                print('fixture tool version')
+            elif name == 'rustc':
+                print(pathlib.Path(__file__).parent.parent / 'lib')
+            elif name == 'llvm-cov':
+                assert sys.argv[1] == 'convert-for-testing'
+                pathlib.Path(sys.argv[4]).write_bytes(b'coverage map only')
+            elif name == 'llvm-profdata':
+                assert sys.argv[1:3] == ['show', '--text']
+                wanted = sys.argv[3].split('=', 1)[1]
+                with pathlib.Path(sys.argv[4]).open('rb') as stream:
+                    values = json.loads(stream.read(64).rstrip(b'\\0').strip())
+                for function, count in values.items():
+                    if wanted in function:
+                        print(function + '\\n# Func Hash:\\n1\\n# Num Counters:\\n1\\n# Counter Values:\\n' + str(count))
+        ''')
+        for name in ('rustc', 'cargo', 'llvm-cov', 'llvm-profdata'):
+            path = tools / name
+            path.write_text(script)
+            path.chmod(0o755)
+        self.environment['PATH'] = tools.as_posix() + os.pathsep + self.environment['PATH']
+
+    def test_diagnostics_prioritize_saturated_function_and_retain_only_coverage_map(self):
+        self.diagnostic_tools()
+        runner = tempfile.TemporaryDirectory()
+        self.addCleanup(runner.cleanup)
+        self.environment['RUNNER_TEMP'] = runner.name
+        self.reports(2**64 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        (target / (self.directory.name + '.profdata')).write_bytes(b'merged')
+        (target / (self.directory.name + '-profraw-list')).write_text('raw inventory\n')
+        filler = target / 'omg-100-111_0.profraw'
+        with filler.open('wb') as stream:
+            stream.write(b'{"a_suffix": 1}')
+            stream.truncate(128 * 1024 * 1024 - 1024)
+        (target / 'omg-200-222_0.profraw').write_text('{"a": 0}')
+        relevant = target / 'omg-999-222_0.profraw'
+        relevant.write_text('{"a": 19}' + ' ' * 2048)
+        executable = target / 'fixture-object'
+        executable.write_bytes(b'ELF executable must never be archived or executed')
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(executable.as_posix()) + '`\n')
+        receipt, archive = self.collect()
+        with tarfile.open(archive) as bundle:
+            self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
+            maps = [name for name in bundle.getnames() if name.endswith('.covmap')]
+            self.assertEqual(len(maps), 1)
+            self.assertEqual(bundle.extractfile(maps[0]).read(), b'coverage map only')
+            self.assertNotIn(executable.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertEqual(receipt['objects'][0]['sha256'], hashlib.sha256(executable.read_bytes()).hexdigest())
+        self.assertLessEqual(receipt['captured_input_bytes'], 128 * 1024 * 1024)
+
+    def test_diagnostics_report_missing_targeting_tools(self):
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        receipt, _ = self.collect()
+        self.assertFalse(receipt['complete'])
+        self.assertTrue(receipt['targeting']['errors'])
+
+    def test_diagnostics_keep_observed_nonzero_when_discovery_is_incomplete(self):
+        self.diagnostic_tools()
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        filler = target / 'omg-100-0_0.profraw'
+        with filler.open('wb') as stream:
+            stream.write(b'{"a_suffix": 1}')
+            stream.truncate(128 * 1024 * 1024 - 1024)
+        relevant = target / 'omg-200-1_0.profraw'
+        relevant.write_text('{"a": 19}' + ' ' * 2048)
+        for signature in range(2, 256):
+            (target / f'omg-{signature + 300}-{signature}_0.profraw').write_text('{"a_suffix": 1}')
+        receipt, archive = self.collect()
+        with tarfile.open(archive) as bundle:
+            self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertFalse(receipt['complete'])
+        self.assertTrue(any('budget exhausted' in error for error in receipt['targeting']['errors']))
+        probes = receipt['targeting']['probes']
+        self.assertLessEqual(len(probes), 256)
+        self.assertEqual(sum(probe['path'] == relevant.relative_to(self.directory).as_posix()
+                             for probe in probes), 1)
+
+    def test_diagnostics_share_member_budget_across_matching_groups(self):
+        self.diagnostic_tools()
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        filler = target / 'omg-100-0_0.profraw'
+        with filler.open('wb') as stream:
+            stream.write(b'{"a_suffix": 1}')
+            stream.truncate(128 * 1024 * 1024 - 1024)
+        for process in range(200, 456):
+            (target / f'omg-{process}-1_0.profraw').write_text('{"a": 0}')
+        (target / 'omg-500-2_0.profraw').write_text('{"a": 0}')
+        relevant = target / 'omg-999-2_0.profraw'
+        relevant.write_text('{"a": 19}' + ' ' * 2048)
+        receipt, archive = self.collect()
+        with tarfile.open(archive) as bundle:
+            self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertFalse(receipt['complete'])
+        self.assertLessEqual(len(receipt['targeting']['probes']), 256)
+
+    def test_diagnostics_prioritize_native_fixture_profile_names(self):
+        self.diagnostic_tools()
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        filler = target / 'omg-100-0_0.profraw'
+        with filler.open('wb') as stream:
+            stream.write(b'{"a_suffix": 1}')
+            stream.truncate(128 * 1024 * 1024 - 1024)
+        (target / 'omg-200-2_0.profraw').write_text('{"a": 0}')
+        relevant = target / 'omg-fixture-package_managers_alpm_direct_tests_native_inventory_and_search_match_pacman-49-2_0.profraw'
+        relevant.write_text('{"a": 19}' + ' ' * 2048)
+        receipt, archive = self.collect()
+        with tarfile.open(archive) as bundle:
+            self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertTrue(any(probe['path'] == relevant.relative_to(self.directory).as_posix()
+                            and probe['nonzero'] for probe in receipt['targeting']['probes']))
+
+    def assert_bad_region_report_preserves_diagnostics(self, report):
+        self.diagnostic_tools()
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        merged = target / (self.directory.name + '.profdata')
+        merged.write_bytes(b'merged')
+        raw = target / 'one.profraw'
+        raw.write_bytes(b'raw')
+        executable = target / 'fixture-object'
+        executable.write_bytes(b'ELF fixture')
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(executable.as_posix()) + '`\n')
+        (self.directory / 'coverage-regions.json.gz').write_bytes(report)
+        receipt, archive = self.collect()
+        self.assertFalse(receipt['complete'])
+        self.assertTrue(receipt['targeting']['errors'])
+        self.assertEqual(receipt['objects'][0]['sha256'], hashlib.sha256(executable.read_bytes()).hexdigest())
+        with tarfile.open(archive) as bundle:
+            self.assertEqual(bundle.extractfile(merged.relative_to(self.directory).as_posix()).read(), b'merged')
+            self.assertEqual(bundle.extractfile(raw.relative_to(self.directory).as_posix()).read(), b'raw')
+            self.assertEqual(bundle.extractfile('coverage-maps/0.covmap').read(), b'coverage map only')
+
+    def test_diagnostics_preserve_evidence_after_corrupt_deflate(self):
+        self.assert_bad_region_report_preserves_diagnostics(
+            b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x06')
+
+    def test_diagnostics_preserve_evidence_after_malformed_region_unit(self):
+        self.assert_bad_region_report_preserves_diagnostics(gzip.compress(b'{"data": [null]}'))
+
+    def test_diagnostics_preserve_evidence_after_malformed_region_function(self):
+        self.assert_bad_region_report_preserves_diagnostics(
+            gzip.compress(b'{"data": [{"functions": [null]}]}'))
+
+    def test_diagnostics_preserve_evidence_after_excessive_json_nesting(self):
+        self.assert_bad_region_report_preserves_diagnostics(
+            gzip.compress(b'[' * 100000 + b'0' + b']' * 100000))
 
     def test_failure_diagnostics_capture_profiles_and_object_identity_without_executable(self):
         target = self.directory / 'target/llvm-cov-target'
