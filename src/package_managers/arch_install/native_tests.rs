@@ -192,7 +192,7 @@ fn fixture_archives_have_complete_admission_metadata() -> Result<()> {
     assert_eq!(payload.size(), 8, "fixture payload is eight bytes");
     assert_eq!(
         payload.mode(),
-        0o100644,
+        0o100_644,
         "fixture payload is a regular file"
     );
     assert_eq!(package.isize(), payload.size());
