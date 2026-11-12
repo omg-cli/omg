@@ -268,11 +268,18 @@ jobs:
             omg-coverage-sandbox /bin/bash -euo pipefail -c '
               mkdir -m 1777 /profiles
               mkdir /evidence
+              chage -l nobody > /evidence/fixture-account-before.txt
+              chage -E -1 nobody
+              chage -l nobody > /evidence/fixture-account-after.txt
+              passwd -S nobody | tee /evidence/fixture-account-status.txt
+              grep -Eq "^nobody L " /evidence/fixture-account-status.txt
               install -d -m 700 -o nobody -g nobody /home/omg-fixture /var/tmp/omg-fixture-cache /var/tmp/omg-fixture-state /var/tmp/omg-fixture-config
               mkdir -p /var/cache/pacman/pkg /var/lib/pacman/local /var/lib/pacman/sync
               printf "nobody ALL=(root) NOPASSWD: /usr/bin/true\n" > /etc/sudoers.d/omg-fixture
               chmod 440 /etc/sudoers.d/omg-fixture
               visudo -cf /etc/sudoers.d/omg-fixture
+              runuser -u nobody -- sudo -n -- /usr/bin/true
+              runuser -u nobody -- sudo -n -v
               fixture_binary=/fixture
               fixture_profiles=/profiles
               fixture_evidence=/evidence
