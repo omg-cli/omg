@@ -472,7 +472,8 @@ jobs:
         timeout-minutes: 3
         run: |
           python3 - <<'PY'
-          import hashlib, json, os, re, shlex, stat, subprocess, tarfile
+          import gzip, hashlib, json, os, re, resource, shlex, stat, subprocess, tarfile, tempfile, time, zlib
+          from collections import deque
           from pathlib import Path
           root = Path.cwd()
           profiles = root / 'target/llvm-cov-target'
@@ -488,15 +489,29 @@ jobs:
           receipt['workflow_sha256'] = hashlib.sha256(workflow).hexdigest()
           job = workflow.decode().split('\n  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
           receipt['image'] = re.search(r'(?m)^      image: (.+)$', job)[1]
-          def command(argv):
+          deadline = time.monotonic() + 120
+          commands_left = 512
+          def command(argv, file_limit=8 * 1024 * 1024, pass_fds=(), timeout=5):
+              global commands_left
+              commands_left -= 1
+              remaining = deadline - time.monotonic()
+              if commands_left < 0 or remaining <= 0:
+                  return {'error': 'diagnostic command budget exhausted'}
               try:
-                  result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-                  return {'exit_code': result.returncode, 'output': (result.stdout + result.stderr)[:8192]}
+                  with tempfile.TemporaryFile() as stream:
+                      result = subprocess.run(argv, stdout=stream, stderr=subprocess.STDOUT,
+                          timeout=min(timeout, remaining), pass_fds=pass_fds, preexec_fn=lambda: resource.setrlimit(
+                              resource.RLIMIT_FSIZE, (file_limit, file_limit)))
+                      stream.seek(0)
+                      data = stream.read(65537)
+                  return {'exit_code': result.returncode, 'output': data[:65536].decode('utf-8', errors='replace'),
+                      'truncated': len(data) > 65536}
               except (OSError, subprocess.TimeoutExpired) as error:
                   return {'error': str(error)}
           receipt['tools']['rustc'] = command(['rustc', '-vV'])
           receipt['tools']['cargo-llvm-cov'] = command(['cargo', 'llvm-cov', '--version'])
           receipt['tools']['nextest'] = command(['cargo', 'nextest', '--version'])
+          tools = None
           libdir = command(['rustc', '--print', 'target-libdir'])
           if libdir.get('exit_code') == 0:
               tools = Path(libdir['output'].strip()).parent / 'bin'
@@ -518,6 +533,7 @@ jobs:
                           receipt['export_log_unparsed'] = True
                           continue
                       object_paths.update(argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == '-object')
+          object_identities = {}
           for name in sorted(object_paths):
               path = Path(name)
               entry = {'path': name}
@@ -542,21 +558,133 @@ jobs:
                       after = os.fstat(stream.fileno())
                       entry['changed_during_collection'] = (
                           after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns)
+                      object_identities[name] = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
               except (OSError, ValueError) as error:
                   entry['omitted'] = str(error)
               receipt['objects'].append(entry)
           expected = [profiles / (root.name + '.profdata'), profiles / (root.name + '-profraw-list')]
-          candidates = expected + sorted(profiles.glob('*.profraw')) + [export_log]
+          targeting = receipt['targeting'] = {'functions': [], 'probes': [], 'errors': []}
+          regions = root / 'coverage-regions.json.gz'
+          if regions.is_file() and not regions.is_symlink():
+              try:
+                  with gzip.open(regions, 'rb') as stream:
+                      data = stream.read(32 * 1024 * 1024 + 1)
+                  if len(data) > 32 * 1024 * 1024:
+                      raise ValueError('region decompression budget exceeded')
+                  names = {function['name'] for unit in json.loads(data)['data']
+                      for function in unit.get('functions', [])
+                      if any(region[4] >= 2**63 - 1 for region in function.get('regions', []))}
+                  if len(names) > 16 or any(not isinstance(name, str) or len(name) > 16384 for name in names):
+                      raise ValueError('saturated function name budget exceeded')
+                  targeting['functions'] = sorted(names)
+              except (OSError, EOFError, ValueError, KeyError, TypeError, IndexError, AttributeError, RecursionError, zlib.error) as error:
+                  targeting['errors'].append(str(error))
+          else:
+              targeting['errors'].append('regular region report unavailable')
+          raws = sorted(profiles.glob('*.profraw'))
+          groups = {}
+          for path in raws:
+              match = re.fullmatch(r'omg-(?:fixture-[A-Za-z0-9_]+-)?\d+-(\d+_\d+)\.profraw', path.name)
+              if match and not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(profiles.resolve()):
+                  groups.setdefault(match[1], []).append(path)
+          prioritized = []
+          if targeting['functions'] and (tools is None or receipt['tools'].get('llvm-profdata', {}).get('exit_code') != 0):
+              targeting['errors'].append('matching llvm-profdata unavailable')
+          elif targeting['functions']:
+              selection_start = time.monotonic()
+              discovery = {'calls_left': 128, 'deadline': selection_start + 20}
+              cache = {}
+              def probe(path, name, phase):
+                  key = (path, name)
+                  if key in cache:
+                      return cache[key]
+                  remaining = phase['deadline'] - time.monotonic()
+                  if phase['calls_left'] < 1 or remaining <= 0:
+                      return None
+                  phase['calls_left'] -= 1
+                  cache[key] = None
+                  result = command([str(tools / 'llvm-profdata'), 'show', '--text', '--function=' + name, str(path)],
+                      timeout=min(5, remaining))
+                  entry = {'path': path.relative_to(root).as_posix(), 'function': name}
+                  targeting['probes'].append(entry)
+                  if result.get('exit_code') != 0 or result.get('truncated'):
+                      entry['error'] = result
+                      targeting['errors'].append('profile probe failed or exceeded output budget')
+                      return None
+                  records = re.findall(r'(?m)^([^#\n][^\n]*)\n# Func Hash:\n\d+\n# Num Counters:\n\d+\n# Counter Values:\n((?:\d+\n)+)', result['output'])
+                  counts = [int(count) for function, counters in records if function == name for count in counters.splitlines()]
+                  entry['present'] = bool(counts)
+                  entry['nonzero'] = any(counts)
+                  cache[key] = entry['nonzero'] if counts else None
+                  if entry['nonzero'] and path not in prioritized:
+                      prioritized.append(path)
+                  return cache[key]
+              matching = []
+              for paths in groups.values():
+                  for name in targeting['functions']:
+                      if probe(paths[0], name, discovery) is not None:
+                          matching.append((paths, name))
+                      if discovery['calls_left'] < 1 or time.monotonic() >= discovery['deadline']:
+                          break
+                  if discovery['calls_left'] < 1 or time.monotonic() >= discovery['deadline']:
+                      break
+              if discovery['calls_left'] < 1 or time.monotonic() >= discovery['deadline']:
+                  targeting['errors'].append('profile discovery budget exhausted')
+              members = {'calls_left': 128, 'deadline': min(selection_start + 45, time.monotonic() + 25)}
+              pending = deque((iter(paths), name) for paths, name in matching)
+              while pending and members['calls_left'] > 0 and time.monotonic() < members['deadline']:
+                  paths, name = pending.popleft()
+                  path = next(paths, None)
+                  if path is not None:
+                      probe(path, name, members)
+                      pending.append((paths, name))
+              if pending:
+                  targeting['errors'].append('profile member selection budget exhausted')
+              if not prioritized:
+                  targeting['errors'].append('no nonzero saturated-function raw profile located')
+          covmaps = []
+          generated = 0
+          for index, entry in enumerate(receipt['objects']):
+              if entry.get('omitted') or entry.get('changed_during_collection'):
+                  continue
+              if tools is None or receipt['tools'].get('llvm-cov', {}).get('exit_code') != 0:
+                  targeting['errors'].append('matching llvm-cov unavailable')
+                  break
+              if generated >= 64 * 1024 * 1024:
+                  targeting['errors'].append('coverage map generation budget exhausted')
+                  break
+              path = output / (str(index) + '.covmap')
+              try:
+                  descriptor = os.open(entry['path'], os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                  with os.fdopen(descriptor, 'rb') as stream:
+                      info = os.fstat(stream.fileno())
+                      if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != object_identities[entry['path']]:
+                          raise ValueError('object changed before coverage map conversion')
+                      result = command([str(tools / 'llvm-cov'), 'convert-for-testing',
+                          '/proc/self/fd/' + str(stream.fileno()), '-o', str(path)],
+                          min(8 * 1024 * 1024, 64 * 1024 * 1024 - generated), (stream.fileno(),))
+              except (OSError, ValueError) as error:
+                  result = {'error': str(error)}
+              if result.get('exit_code') != 0 or result.get('truncated') or not path.is_file():
+                  targeting['errors'].append('coverage map conversion failed')
+                  entry['coverage_map_error'] = result
+                  path.unlink(missing_ok=True)
+                  continue
+              entry['coverage_map'] = 'coverage-maps/' + path.name
+              generated += path.stat().st_size
+              covmaps.append(path)
+          candidates = expected + covmaps + prioritized + [path for path in raws if path not in prioritized] + [export_log]
           used = 0
           archive = output / 'profiles.tar.gz'
           with tarfile.open(archive, 'w:gz', compresslevel=1) as bundle:
               for path in candidates:
-                  entry = {'path': path.relative_to(root).as_posix()}
+                  entry = {'path': ('coverage-maps/' + path.name) if path in covmaps else path.relative_to(root).as_posix()}
                   receipt['files'].append(entry)
                   try:
                       info = path.lstat()
                       entry['bytes'] = info.st_size
-                      if not stat.S_ISREG(info.st_mode) or not path.resolve().is_relative_to(root):
+                      container = output if path in covmaps else root
+                      if not stat.S_ISREG(info.st_mode) or not path.resolve().is_relative_to(container):
                           raise ValueError('not a regular contained file; symlinks are not followed')
                       if used + info.st_size > budget:
                           raise ValueError('input byte budget exceeded')
@@ -583,7 +711,9 @@ jobs:
               entry['path'].endswith('.profraw') and 'omitted' not in entry for entry in receipt['files'])
           receipt['admitted_input_bytes'] = used
           receipt['captured_input_bytes'] = sum(entry.get('captured_bytes', 0) for entry in receipt['files'])
-          receipt['complete'] = bool(object_paths) and not receipt['raw_profiles_missing'] and not any(
+          for path in covmaps:
+              path.unlink()
+          receipt['complete'] = bool(object_paths) and not targeting['errors'] and not receipt['raw_profiles_missing'] and not any(
               entry.get('omitted') or entry.get('changed_during_collection')
               for entry in receipt['files'] + receipt['objects']) and not receipt.get('export_log_truncated') and not receipt.get('export_log_unparsed') and all(
               receipt['tools'].get(name, {}).get('exit_code') == 0

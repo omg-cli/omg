@@ -243,8 +243,27 @@ mounts; a private-namespace control reproduced that denial and passed after
 this preparation. Other container path masks remain in place. The fixture
 records mount information and requires both nonroot network-namespace probes.
 
+All 19 selected native cases passed in the latest hosted run, including
+historical review acceptance followed by the inert recipe's intentional failure.
+The other platform, VM, Docker, Clippy and security jobs also passed. Coverage
+remains unverified because its producer rejected a wrapped daemon-worker count
+before comparison. The retained profiles and exports remain unchanged.
+
+The initial diagnostic archive contained no raw profile for that function.
+The collector now prioritizes profiles containing affected functions and saves
+compact coverage maps with original object identities. It retains the same
+archive budget and records incomplete capture explicitly. Corrupt report data
+must not prevent the remaining evidence from being preserved. Matching LLVM
+tools reproduced an executable's export from its compact map without retaining
+another executable.
+
 ## Remaining work
 
+- Classify the daemon coverage underflow from its contributing profiles and
+  coverage map. Current-thread shutdown and cancellation probes did not
+  reproduce it. An [open Rust compiler issue](https://github.com/rust-lang/rust/issues/164153)
+  describes underflow during incomplete execution, but does not establish the
+  cause here. The producer continues to reject invalid counters.
 - Live searches and several inventory operations still use C libalpm. Move
   individual queries only after matching repository priority, duplicate package
   identities, custom pacman configuration and malformed-metadata behavior.
