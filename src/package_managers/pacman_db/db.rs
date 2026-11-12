@@ -2740,6 +2740,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn inaccessible_local_database_is_not_an_empty_catalog() {
+        use std::os::unix::fs::PermissionsExt;
+        const TEST: &str = "package_managers::pacman_db::db::tests::inaccessible_local_database_is_not_an_empty_catalog";
+        if crate::config::Settings::rerun_test_unprivileged(TEST) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("blocked");
+        let local = parent.join("local");
+        fs::create_dir_all(&local).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = parse_local_db(&local);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let error =
+            result.expect_err("an inaccessible local database must not become an empty catalog");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(format!("{error:#}").contains(&local.display().to_string()));
+    }
+
+    #[test]
     fn test_parse_local_db_missing_desc_is_rejected() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(temp_dir.path().join("vim-9.1.0-1")).unwrap();
