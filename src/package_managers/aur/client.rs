@@ -9719,26 +9719,27 @@ mod tests {
         // The child owns its terminal and global --yes flag. Input is sent only
         // after the prompt appears, so an unexpected skipped prompt fails.
         let driver = r#"
-import errno, os, pty, select, shutil, signal, sys, tempfile, time
+import errno, os, pty, select, shutil, signal, subprocess, sys, tempfile, time
 mode, executable, test_name = sys.argv[1:]
 fixture = tempfile.mkdtemp(prefix='omg-review-pty-')
 with open(os.path.join(fixture, 'git'), 'w') as script:
     script.write('''#!/bin/sh
 set -eu
+sha=0123456789abcdef0123456789abcdef01234567
 if [ "$1" = clone ] && [ "$#" -eq 5 ] && [ "$2" = --filter=blob:none ] && [ "$3" = -- ] && [ "$4" = https://aur.archlinux.org/demo.git ]; then
     case "$5" in */_rollback/demo-*) exit 0;; *) exit 1;; esac
 fi
 if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
     case "$2" in */_rollback/demo-*) ;; *) exit 1;; esac
-    if [ "$#" -eq 4 ] && [ "$3" = log ] && [ "$4" = --format=%H ]; then
-        printf 'fixture-commit\\n'
+    if [ "$#" -eq 6 ] && [ "$3" = log ] && [ "$4" = --no-show-signature ] && [ "$5" = --format=%H ] && [ "$6" = --max-count=10001 ]; then
+        printf '%s\\n' "$sha"
         exit 0
     fi
-    if [ "$#" -eq 4 ] && [ "$3" = show ] && [ "$4" = fixture-commit:.SRCINFO ]; then
+    if [ "$#" -eq 4 ] && [ "$3" = show ] && [ "$4" = "${sha}:.SRCINFO" ]; then
         printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n'
         exit 0
     fi
-    if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = fixture-commit ]; then
+    if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = "$sha" ]; then
         printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\npackage() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' > "$2/PKGBUILD"
         printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n' > "$2/.SRCINFO"
         exit 0
@@ -9751,6 +9752,42 @@ printf 'pkgname=demo\\n' > "$6/PKGBUILD"
 printf 'pkgbase = demo\\n' > "$6/.SRCINFO"
 ''')
 os.chmod(os.path.join(fixture, 'git'), 0o700)
+if mode == 'git-contract':
+    try:
+        checkout = os.path.join(fixture, '_rollback', 'demo-contract')
+        os.makedirs(checkout)
+        git = os.path.join(fixture, 'git')
+        sha = '0123456789abcdef0123456789abcdef01234567'
+        bounded_log = ['log', '--no-show-signature', '--format=%H', '--max-count=10001']
+        commands = [
+            (bounded_log, True),
+            (['log', '--format=%H'], False),
+            (bounded_log[:-1], False),
+            (['log', '--format=%H', '--max-count=10001'], False),
+            (bounded_log[:-1] + ['--max-count=10002'], False),
+            (['show', sha + ':.SRCINFO'], True),
+            (['show', 'fixture-commit:.SRCINFO'], False),
+            (['checkout', '--detach', sha], True),
+            (['checkout', '--detach', 'fixture-commit'], False),
+        ]
+        for arguments, accepted in commands:
+            result = subprocess.run([git, '-C', checkout] + arguments,
+                                    capture_output=True, timeout=5)
+            if (result.returncode == 0) != accepted:
+                raise RuntimeError('Git fixture contract mismatch for ' + repr(arguments) +
+                                   ': status=' + str(result.returncode) +
+                                   ' stderr=' + repr(result.stderr))
+            if arguments == bounded_log and result.stdout != (sha + '\n').encode():
+                raise RuntimeError('Git fixture must emit one full commit ID: ' + repr(result.stdout))
+            if arguments == ['show', sha + ':.SRCINFO'] and b'pkgver = 1\n' not in result.stdout:
+                raise RuntimeError('Git fixture must emit historical metadata: ' + repr(result.stdout))
+        with open(os.path.join(checkout, 'PKGBUILD')) as recipe:
+            if 'intentional-history-fixture-failure' not in recipe.read():
+                raise RuntimeError('Git fixture must preserve the intentional build failure')
+        print('GIT_FIXTURE_CONTRACT_PASSED ' + str(len(commands)) + ' commands')
+    finally:
+        shutil.rmtree(fixture)
+    sys.exit(0)
 pid, fd = pty.fork()
 if pid == 0:
     os.environ['OMG_AUR_REVIEW_PTY_MODE'] = mode
@@ -9809,7 +9846,7 @@ finally:
     shutil.rmtree(fixture)
     sys.stdout.buffer.write(output)
 "#;
-        let mut modes = vec!["standard", "hardened", "authorize"];
+        let mut modes = vec!["git-contract", "standard", "hardened", "authorize"];
         if std::env::var("OMG_AUR_HISTORY_FIXTURE").as_deref() == Ok("1") {
             modes.extend(["history", "history-accept-failing-build"]);
         }
