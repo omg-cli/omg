@@ -129,20 +129,21 @@ fn archive(dir: &Path, name: &str, version: &str) -> Result<ArchiveSnapshot> {
     let path = dir.join(format!("{name}-{version}-any.pkg.tar.gz"));
     let file = File::create(&path)?;
     let mut tar = tar::Builder::new(GzEncoder::new(file, Compression::default()));
+    let payload = b"fixture\n".as_slice();
+    let payload_path = format!("usr/share/omg-fixture/{name}");
+    let payload_size = payload.len();
     let info = format!(
-        "pkgname = {name}\npkgbase = {name}\npkgver = {version}\npkgdesc = inert fixture\nurl = https://example.invalid\nbuilddate = 1\npackager = Fixture\nsize = 8\narch = any\nlicense = MIT\n"
+        "pkgname = {name}\npkgbase = {name}\npkgver = {version}\npkgdesc = inert fixture\nurl = https://example.invalid\nbuilddate = 1\npackager = Fixture\nsize = {payload_size}\narch = any\nlicense = MIT\n"
     );
     let buildinfo = format!(
         "format = 2\npkgname = {name}\npkgbase = {name}\npkgver = {version}\npkgarch = any\n"
     );
+    let mtree = format!("#mtree\n./{payload_path} type=file mode=644 size={payload_size}\n");
     for (name, contents) in [
         (".PKGINFO".to_owned(), info.as_bytes()),
         (".BUILDINFO".to_owned(), buildinfo.as_bytes()),
-        (".MTREE".to_owned(), b"#mtree\n".as_slice()),
-        (
-            format!("usr/share/omg-fixture/{name}"),
-            b"fixture\n".as_slice(),
-        ),
+        (".MTREE".to_owned(), mtree.as_bytes()),
+        (payload_path, payload),
     ] {
         let mut header = tar::Header::new_gnu();
         header.set_size(contents.len() as u64);
@@ -163,6 +164,38 @@ fn fixture_archives_have_complete_admission_metadata() -> Result<()> {
     assert_eq!(inspection.package_name, "omg-fixture-metadata");
     assert_eq!(inspection.package_version, "1-1");
     inspection.enforce_profile(crate::config::AurSecurityProfile::Standard)?;
+    let root = directory.path().join("root");
+    let db = directory.path().join("db");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(db.join("local"))?;
+    let alpm = alpm::Alpm::new(
+        root.to_str().context("fixture root path")?,
+        db.to_str().context("fixture database path")?,
+    )?;
+    let snapshot_path = snapshot.path();
+    let package = alpm.pkg_load(
+        snapshot_path.to_str().context("fixture archive path")?,
+        true,
+        alpm::SigLevel::NONE,
+    )?;
+    assert_eq!(package.name(), inspection.package_name);
+    assert_eq!(package.version().as_str(), inspection.package_version);
+    assert_eq!(package.base(), Some(inspection.package_base.as_str()));
+    assert_eq!(package.arch(), Some(inspection.architecture.as_str()));
+    let file_list = package.files();
+    let files = file_list.files();
+    assert_eq!(files.len(), 1, "native ALPM must see the fixture payload");
+    let payload = files
+        .iter()
+        .find(|file| file.name() == b"usr/share/omg-fixture/omg-fixture-metadata")
+        .context("native ALPM file list is missing the fixture payload")?;
+    assert_eq!(payload.size(), 8, "fixture payload is eight bytes");
+    assert_eq!(
+        payload.mode(),
+        0o100644,
+        "fixture payload is a regular file"
+    );
+    assert_eq!(package.isize(), payload.size());
     Ok(())
 }
 
