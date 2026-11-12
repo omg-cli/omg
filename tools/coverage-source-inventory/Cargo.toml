@@ -1,0 +1,16 @@
+[package]
+name = "coverage-source-inventory"
+version = "0.1.0"
+edition = "2024"
+publish = false
+rust-version = "1.95.0"
+license = "MIT"
+description = "Bounded Rust syntax inventory for source coverage checks"
+
+[workspace]
+
+[dependencies]
+syn = { version = "=2.0.114", features = ["full", "visit"] }
+proc-macro2 = { version = "=1.0.106", features = ["span-locations"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"

@@ -127,6 +127,14 @@ jobs:
         if: needs.quick-gate.outputs.checks-required == 'true'
         run: make ci-workflow-quick
 
+      - name: Verify bounded Rust source inventory
+        if: needs.quick-gate.outputs.checks-required == 'true'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/coverage-source-inventory-target
+        run: |
+          cargo fmt --manifest-path tools/coverage-source-inventory/Cargo.toml --check
+          cargo test --locked --manifest-path tools/coverage-source-inventory/Cargo.toml
+
       - name: Verify installer destination safety
         run: bash tests/installer_security.sh
 

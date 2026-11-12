@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from test_ci_gates import job_block
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / '.github/workflows'
-BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
+BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else (shutil.which('bash') or 'bash')
 
 
 def step_script(workflow, name):
@@ -688,6 +689,11 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
         output = Path(self.environment['RUNNER_TEMP']) / 'coverage-diagnostics'
         return json.loads((output / 'receipt.json').read_text()), output / 'profiles.tar.gz'
 
+    def without_diagnostic_tools(self):
+        tools = self.directory / 'empty-tool-path'
+        tools.mkdir()
+        self.environment['PATH'] = tools.as_posix()
+
     def diagnostic_tools(self):
         tools = self.directory / 'toolchain/bin'
         tools.mkdir(parents=True)
@@ -1051,6 +1057,7 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
             gzip.compress(b'[' * 100000 + b'0' + b']' * 100000))
 
     def test_failure_diagnostics_capture_profiles_and_object_identity_without_executable(self):
+        self.without_diagnostic_tools()
         target = self.directory / 'target/llvm-cov-target'
         target.mkdir(parents=True)
         (target / (self.directory.name + '.profdata')).write_bytes(b'merged')
@@ -1078,8 +1085,10 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
             self.assertEqual(files['target/llvm-cov-target/one.profraw']['sha256'], hashlib.sha256(raw).hexdigest())
             self.assertFalse(any('fixture-object' in name for name in bundle.getnames()))
         self.assertIn('rustc', receipt['tools'])
+        self.assertIn('error', receipt['tools']['rustc'])
 
     def test_diagnostics_read_colored_export_commands(self):
+        self.without_diagnostic_tools()
         target = self.directory / 'target/llvm-cov-target'
         target.mkdir(parents=True)
         executable = target / 'fixture object'
@@ -1091,6 +1100,7 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
         self.assertEqual(receipt['objects'], [{'path': executable.as_posix(),
             'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
             'bytes': executable.stat().st_size, 'changed_during_collection': False}])
+        self.assertIn('error', receipt['tools']['rustc'])
 
     def test_diagnostics_bound_input_and_report_missing_and_symlink_profiles(self):
         target = self.directory / 'target/llvm-cov-target'
