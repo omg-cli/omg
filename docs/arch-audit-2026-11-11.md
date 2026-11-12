@@ -682,3 +682,64 @@ This runtime proof does not close the hosted exact-base coverage comparison.
 The preceding published head `e59d3eb3` passed its instrumented producer but the
 comparison still rejected ALPM source correspondence at base line 523 versus
 head line 587. Current hosted results remain recorded on PR #1057.
+
+
+## Official schema and private staging batch
+
+Local database parsing now uses the official Rust `DbDescFile` schema dispatch
+and its V2-to-V1 conversion, with one projection into OMG's package record.
+The typed V1 fallback remains necessary when a description contains the literal
+text `%XDATA%`: upstream schema detection treats that text as a V2 hint. A
+regression caught a changed installation timestamp before publication. Tests
+cover both wire schemas, projected metadata, installation reasons and invalid
+NUL-bearing versions.
+
+Cache cleanup now distinguishes a missing directory from an inaccessible one.
+The failing-before test returned success and deleted an old archive and its
+signature despite another configured cache being unreadable. Canonicalization
+now preserves the permission error and aborts before removing any archive.
+
+The native test batch exposed another dependency on process-wide state. Vendored
+libalpm temporarily sets `umask(0000)` while creating directories. A child-only
+control reproduced an outer archive with mode `0666` and its directory with mode
+`0777`. The strict admission check correctly refused that fixture. Positive
+archive fixtures now request private permissions at creation; negative permission
+checks remain intact.
+
+The same review found production staging directories and copied files relying
+on umask. Privileged staging now requests `0700` directories and creates archives
+and detached signatures with `0600` and exclusive creation. Scoped PGP homes,
+exported key bundles, rollback checkouts and metadata generations also request
+private permissions at creation. Existing tests failed under a child process
+with umask zero before these fixes, then passed. Arch revalidates staged archive
+permissions before loading, so the demonstrated old staging behavior fails
+closed; this evidence does not establish arbitrary package installation.
+
+Transaction failure tests now cover both caller-supplied and internally owned
+native handles, using private databases and offline mirrors. A temporary fault
+control removed the native preparation error translation and made both
+missing-dependency cases fail with the raw native error. Restoring the production
+translation restores the intended refusal. Fresh native observers verify exact
+package absence and lock release. The Git helper fixture also exercises actual
+fallback termination and reaps its owned inert child.
+
+Local verification passed 2,282 library tests with 12 ignored, all 15 source
+integration tests, all nine transaction failure tests and five explicit
+umask-zero controls. All-target Clippy with warnings denied, the CLI/daemon build,
+version/help checks and read-only host `info pacman` and `list` checks passed.
+Independent reviews approved the runtime changes and the coverage checker.
+
+The existing coverage checker now proves a narrow transparent function
+extraction and direct `map_err` callback correspondence while retaining complete
+compiled-copy obligations. It validates full raw Rust symbol contexts, scoped
+capture construction and child geometry. Unsupported macros, attributes and
+ambiguous owners are refused. Its 212 tests pass. Replaying the unchanged hosted
+`3461d0d4` evidence clears the former correspondence refusal and stops at a real
+uncovered cache branch. This replay is not a current full coverage verdict.
+Counters, reports, instrumentation settings, exclusions and thresholds are
+unchanged. Fresh hosted producer and exact-base comparison results remain
+required before merging.
+
+The next security pass must examine general cache-directory creation and
+package-base and metadata lock inode handling. The private staging fixes do not
+claim those separate boundaries are complete.

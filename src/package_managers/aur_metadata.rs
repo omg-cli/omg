@@ -322,11 +322,20 @@ fn commit_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
 }
 
 fn publish_generation(root: &Path, bytes: &[u8], validators: AurMetaCache) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     std::fs::create_dir_all(root)?;
-    let generation = tempfile::Builder::new().prefix("gen-").tempdir_in(root)?;
+    let generation = tempfile::Builder::new()
+        .prefix("gen-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in(root)?;
     let archive = generation.path().join("archive.gz");
     let index = generation.path().join("index.rkyv");
-    let mut file = File::create(&archive)?;
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&archive)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     build_index(&archive, &index)?;
@@ -950,10 +959,29 @@ mod tests {
 
     #[test]
     fn published_metadata_generation_is_coherent_and_fresh() {
+        use std::os::unix::fs::PermissionsExt;
+
         let directory = tempfile::tempdir().unwrap();
         let data = catalogue("aur-helper");
         publish_generation(directory.path(), &data, AurMetaCache::default()).unwrap();
         let (manifest, index) = current_generation(directory.path()).unwrap().unwrap();
+        let (archive_path, index_path) = generation_paths(directory.path(), &manifest).unwrap();
+        assert_eq!(
+            std::fs::metadata(archive_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "published generations must remain private"
+        );
+        for path in [&archive_path, &index_path] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "published metadata files must remain private"
+            );
+        }
         assert_eq!(
             std::fs::read(generation_paths(directory.path(), &manifest).unwrap().0).unwrap(),
             data

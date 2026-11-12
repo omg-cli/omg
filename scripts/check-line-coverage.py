@@ -14,6 +14,8 @@ import sys
 import tempfile
 from pathlib import Path
 import re
+import shutil
+from functools import lru_cache
 
 COUNTER_LIMIT = 2**63 - 1
 MAX_DIAGNOSTIC_BYTES = 64 * 1024 * 1024
@@ -626,6 +628,400 @@ def source_function_prefixes(source, spans):
     return result
 
 
+def transparent_forwarder_groups(old, new, groups, fragments):
+    """Recognize one structurally forwarded extraction without inferring runtime roles."""
+    inventories = []
+    for source, owners in zip((old, new), groups):
+        code = _boolean_source(source)
+        if code is None or 'no_implicit_prelude' in code.words:
+            return {}
+        root = [i for i in range(len(code.words)) if code.parents[i] is None]
+        if any(code.words[i] in ('!', 'None') for i in root):
+            return {}
+        boundaries = [i for i, word in enumerate(code.words)
+                      if word == ';' and code.parents[i] is None
+                      or word == '}' and code.parents[code.pairs[i]] is None]
+        for i in root:
+            if code.words[i] == 'use':
+                ending = next((j for j in boundaries if j > i and code.words[j] == ';'), None)
+                if ending is None or any(word in ('*', 'None') for word in code.words[i:ending]):
+                    return {}
+        functions = {}
+        names = Counter(code.words[i + 1] for i, word in enumerate(code.words[:-1]) if word == 'fn')
+        by_line = {}
+        for i in root:
+            if code.words[i] == 'fn':
+                by_line.setdefault(code.position(code.starts[i])[0], []).append(i)
+        openings = [i for i in root if code.words[i] == '{']
+        for prefix, group in owners.items():
+            candidates = by_line.get(group[0], [])
+            if len(candidates) != 1:
+                continue
+            declaration = candidates[0]
+            previous = bisect.bisect_left(boundaries, declaration) - 1
+            first = boundaries[previous] + 1 if previous >= 0 else 0
+            visibility = code.words[first:declaration]
+            if visibility not in ([], ['pub'], ['pub', '(', 'crate', ')']):
+                continue
+            args = declaration + 2
+            if args >= len(code.words) or code.words[args] != '(':
+                continue
+            end_args = code.pairs[args]
+            at = bisect.bisect_right(openings, end_args)
+            if at == len(openings):
+                continue
+            opening = openings[at]
+            closing = code.pairs[opening]
+            if code.position(code.starts[closing])[0] != group[1]:
+                continue
+            parameters = []; chunk = []
+            for word in code.words[args + 1:end_args] + [',']:
+                if word == ',':
+                    if chunk:
+                        parameters.append(tuple(chunk))
+                    chunk = []
+                else:
+                    chunk.append(word)
+            if (any(len(row) < 3 or row[1] != ':' or not re.fullmatch(r'[A-Za-z_]\w*', row[0])
+                    for row in parameters) or len({row[0] for row in parameters}) != len(parameters)):
+                continue
+            functions[prefix] = dict(name=code.words[declaration + 1], parameters=parameters,
+                returns=code.words[end_args + 1:opening], body=code.words[opening + 1:closing],
+                signature=code.words[first:opening], group=group)
+        inventories.append((functions, names))
+    base, base_names = inventories[0]; head, _ = inventories[1]
+    by_name = {value['name']: (prefix, value) for prefix, value in head.items()}
+    proposals = {}
+    for prefix, origin in base.items():
+        wrapper = head.get(prefix)
+        if wrapper is None or origin['returns'] != wrapper['returns']:
+            continue
+        body = wrapper['body']
+        if len(body) < 3 or body[1] != '(' or body[-1] != ')' or body[0] not in by_name:
+            continue
+        _, callee = by_name[body[0]]
+        if (base_names[callee['name']] or callee['name'] in {row[0] for row in origin['parameters']}
+                or callee['returns'] != origin['returns']
+                or callee['parameters'][:len(origin['parameters'])] != origin['parameters']):
+            continue
+        arguments = []; chunk = []
+        for word in body[2:-1] + [',']:
+            if word == ',':
+                if chunk:
+                    arguments.append(chunk)
+                chunk = []
+            else:
+                chunk.append(word)
+        count = len(origin['parameters'])
+        if (len(arguments) != len(callee['parameters'])
+                or arguments[:count] != [[row[0]] for row in origin['parameters']]
+                or any(arg not in (['None'], ['&', '[', ']']) for arg in arguments[count:])):
+            continue
+        proposals[prefix] = wrapper, callee, arguments
+    claims = Counter(value[1]['name'] for value in proposals.values())
+    result = {}
+    for prefix, (wrapper, callee, arguments) in proposals.items():
+        origin = base[prefix]['group']; target = callee['group']
+        selected = [row for row in fragments if max(row[0] + 1, origin[0]) <= min(row[1], origin[1])]
+        if (claims[callee['name']] != 1 or not selected
+                or any(not (origin[0] <= a + 1 <= b <= origin[1]
+                            and target[0] <= c + 1 <= d <= target[1]) for a, b, c, d, _ in selected)):
+            continue
+        proof = dict(wrapper_range=list(wrapper['group'][:2]), callee_range=list(target[:2]),
+            wrapper_signature_sha256=hashlib.sha256(' '.join(wrapper['signature']).encode()).hexdigest(),
+            callee_signature_sha256=hashlib.sha256(' '.join(callee['signature']).encode()).hexdigest(),
+            forwarded_arguments=arguments, limitation='Structural forwarding only; no runtime-role inference')
+        result[prefix] = target, proof
+    return result
+
+
+def compiled_hit_state_matching(before, after):
+    """Assign each complete base hit vector to a distinct dominating head vector."""
+    before, after = sorted(map(tuple, before)), sorted(map(tuple, after))
+    if len(before) != len(after):
+        return None
+    if before == after:
+        return list(range(len(before)))
+    width = max((len(row) for row in before), default=0)
+    if len(before) * len(after) * max(width, 1) > 2**20:
+        return None
+    edges = [[index for index, candidate in enumerate(after)
+              if len(row) == len(candidate) and all(a <= b for a, b in zip(row, candidate))]
+             for row in before]
+    owners = [None] * len(after)
+    work = 0
+    for start in range(len(before)):
+        pending, visited, previous = [start], {start}, {}
+        found = False
+        for row in pending:
+            for target in edges[row]:
+                work += 1
+                if work > 2**20:
+                    return None
+                owner = owners[target]
+                if owner is None:
+                    while True:
+                        owners[target] = row
+                        if row == start:
+                            break
+                        row, target = previous[row]
+                    found = True
+                    break
+                if owner not in visited:
+                    visited.add(owner)
+                    previous[owner] = row, target
+                    pending.append(owner)
+            if found:
+                break
+        if not found:
+            return None
+    matching = [None] * len(before)
+    for target, row in enumerate(owners):
+        matching[row] = target
+    return matching
+
+
+def plain_rust_function_symbol(symbol):
+    """Recognize only complete ASCII v0 free-function paths without instantiating suffixes."""
+    if type(symbol) is not str or len(symbol) > 4096:
+        return None
+    prefix = re.match(r'_RNv((?:Nt){0,16})C(?:s[0-9A-Za-z]{0,32}_)?', symbol)
+    if prefix is None:
+        return None
+    modules = len(prefix[1]) // 2
+    at = prefix.end(); identifiers = []
+    for _ in range(modules + 2):
+        length = re.match(r'[1-9][0-9]{0,3}', symbol[at:])
+        if length is None:
+            return None
+        size = int(length[0]); at += len(length[0])
+        if size > 1024:
+            return None
+        if symbol[at:at + 1] == '_':
+            at += 1
+        value = symbol[at:at + size]
+        if len(value) != size or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value) is None:
+            return None
+        identifiers.append(value); at += size
+    if at != len(symbol):
+        return None
+    return modules, identifiers
+
+
+def direct_rust_callback_symbol(child, parent, modules):
+    if type(child) is not str or len(child) > 4096:
+        return False
+    # v0 NC + Nv + Nt* places the crate at offset 4 + 2*modules after _R; base62 encodes offset-1.
+    # https://doc.rust-lang.org/stable/rustc/symbol-mangling/v0.html#backref
+    backref = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'[3 + 2 * modules]
+    return re.fullmatch(re.escape('_RNC' + parent[2:])
+                        + r'(?:s[0-9A-Za-z]{0,32}_)?0(?:B' + backref + r'_)?', child) is not None
+
+
+@lru_cache(maxsize=64)
+def demangle_plain_rust_callbacks(symbols):
+    if (len(symbols) > 256 or len(set(symbols)) != len(symbols)
+            or any(type(symbol) is not str or len(symbol) > 4096 for symbol in symbols)):
+        raise ValueError('Unsupported callback symbol inventory')
+    if sum(len(symbol) + 1 for symbol in symbols) > 64 * 1024:
+        raise ValueError('Nested callback symbol inventory exceeds bound')
+    parents = {symbol: plain_rust_function_symbol(symbol) for symbol in symbols}
+    parents = {symbol: shape for symbol, shape in parents.items() if shape is not None}
+    if not parents or any(symbol not in parents and sum(
+            direct_rust_callback_symbol(symbol, parent, shape[0])
+            for parent, shape in parents.items()) != 1 for symbol in symbols):
+        raise ValueError('Unsupported raw Rust callback context')
+    payload = ('\n'.join(symbols) + '\n').encode('ascii')
+    if len(payload) > 64 * 1024:
+        raise ValueError('Nested callback symbol inventory exceeds bound')
+    executable = shutil.which('c++filt')
+    if executable is None:
+        raise ValueError('Nested callback ownership requires GNU c++filt with Rust support')
+    executable = str(Path(executable).resolve())
+    try:
+        version = subprocess.run([executable, '--version'], stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=5, check=True).stdout
+        result = subprocess.run([executable, '--format=rust', '--no-strip-underscore'],
+            input=payload, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, check=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError('GNU Rust callback symbol decoding failed') from error
+    if (len(result.stdout) > 256 * 1024 or len(version) > 4096
+            or not version.startswith(b'GNU c++filt')):
+        raise ValueError('Unsupported GNU callback symbol decoder output')
+    try:
+        decoded = result.stdout.decode('ascii').splitlines()
+    except UnicodeDecodeError as error:
+        raise ValueError('Unsupported non-ASCII callback identity') from error
+    if len(decoded) != len(symbols) or any(raw == value for raw, value in zip(symbols, decoded)):
+        raise ValueError('Unparsed Rust callback symbol inventory')
+    return dict(zip(symbols, decoded)), dict(program=executable,
+        program_sha256=hashlib.sha256(Path(executable).read_bytes()).hexdigest(),
+        version=version.decode('ascii').splitlines()[0])
+
+
+def nested_map_err_states(source, group, inventory, name_counts, first, last, code):
+    """Prove direct callback ownership and construction syntax, not capture values or runtime roles."""
+    if code is None:
+        return None
+    calls = []
+    for i, word in enumerate(code.words):
+        if (word != 'map_err' or i == 0 or code.words[i - 1] != '.'
+                or i + 1 >= len(code.words) or code.words[i + 1] != '('):
+            continue
+        opening = i + 1; closing = code.pairs[opening]
+        body = code.words[opening + 1:closing]
+        if (len(body) != 13 or body[0] != '|' or body[2] != '|'
+                or body[4:6] != ['(', '&'] or body[7:11] != [')', '.', 'unwrap_or', '(']
+                or body[11] != body[1] or body[12] != ')'
+                or any(re.fullmatch(r'[A-Za-z_]\w*', body[n]) is None for n in (1, 3, 6))):
+            continue
+        start = code.position(code.starts[opening + 1])[0]
+        end = code.position(code.ends[closing - 1])[0]
+        if first <= start <= end <= last:
+            calls.append((i, opening, closing, body))
+    if len(calls) != 1:
+        return None
+    call, opening, closing, body = calls[0]
+    parameter, function, capture = body[1], body[3], body[6]
+    block = code.parents[call]
+    if block is None or code.words[block] != '{' or parameter == capture:
+        return None
+    roots = [i for i, word in enumerate(code.words) if word == 'fn'
+             and i + 1 < len(code.words) and code.words[i + 1] == function]
+    if len(roots) != 1 or code.parents[roots[0]] is not None:
+        return None
+    boundaries = [i for i, word in enumerate(code.words)
+                  if word == ';' and code.parents[i] is None
+                  or word == '}' and code.parents[code.pairs[i]] is None]
+    previous = bisect.bisect_left(boundaries, roots[0]) - 1
+    declaration = boundaries[previous] + 1 if previous >= 0 else 0
+    if code.words[declaration:roots[0]] not in ([], ['pub'], ['pub', '(', 'crate', ')']):
+        return None
+    owners = [i for i, word in enumerate(code.words) if word == 'fn'
+              and code.parents[i] is None and code.position(code.starts[i])[0] == group[0]]
+    if len(owners) != 1:
+        return None
+    previous = bisect.bisect_left(boundaries, owners[0]) - 1
+    declaration = boundaries[previous] + 1 if previous >= 0 else 0
+    if code.words[declaration:owners[0]] not in ([], ['pub'], ['pub', '(', 'crate', ')']):
+        return None
+    for i, word in enumerate(code.words):
+        if word == 'use' and code.parents[i] is None:
+            ending = next((j for j in boundaries if j > i and code.words[j] == ';'), None)
+            if ending is None or any(word in ('*', function) for word in code.words[i:ending]):
+                return None
+    begin = next((i for i, offset in enumerate(code.starts)
+                  if code.position(offset)[0] >= group[0]), len(code.words))
+    end = bisect.bisect_left(code.starts, code.offsets[group[1]] if group[1] < len(code.offsets)
+                            else len(code.text))
+    scopes = set(code.ancestors(call))
+    items = {'use', 'const', 'static', 'fn', 'mod', 'struct', 'enum', 'type', 'trait', 'impl', 'extern'}
+    if any(code.words[i] in items and code.parents[i] in scopes for i in range(begin, end)):
+        return None
+    for i in range(begin, end):
+        if code.parents[i] not in scopes:
+            continue
+        if code.words[i] in ('#', 'macro_rules'):
+            return None
+        if (code.words[i] != '!' or i == 0 or i + 1 >= end
+                or code.words[i + 1] not in ('(', '[', '{')
+                or re.fullmatch(r'[A-Za-z_]\w*', code.words[i - 1]) is None):
+            continue
+        start = i - 1
+        if (code.words[start] in ('if', 'while', 'match', 'return', 'break', 'else', 'let')
+                and code.text[code.starts[start]:code.ends[start]] == code.words[start]):
+            continue
+        while start >= 2 and code.words[start - 1] == '::':
+            start -= 2
+        # Only these expression positions prevent an expansion from introducing
+        # bindings/items in the caller's scope. Statement macros stay opaque.
+        if start == 0 or code.words[start - 1] not in ('=', 'if'):
+            return None
+    if any(word == function and (i + 1 >= len(code.words) or code.words[i + 1] != '(')
+           for i, word in enumerate(code.words[begin:end], begin)):
+        return None
+    markers = [i for i in range(block + 1, code.pairs[block])
+               if code.parents[i] == block and code.words[i] in ('=', ';')]
+    semicolons = [i for i in markers if code.words[i] == ';']
+    capture_positions = [i for i, word in enumerate(code.words) if word == capture]
+    bindings = []
+    for i, word in enumerate(code.words):
+        if word != 'let' or code.parents[i] != block:
+            continue
+        at = bisect.bisect_right(markers, i)
+        if at == len(markers):
+            return None
+        equal = markers[at]
+        captured = bisect.bisect_right(capture_positions, i)
+        if captured == len(capture_positions) or capture_positions[captured] >= equal:
+            continue
+        at = bisect.bisect_right(semicolons, equal)
+        if (equal != i + 2 or code.words[i + 1] != capture or code.words[equal] != '='
+                or at == len(semicolons) or semicolons[at] >= call or bindings):
+            return None
+        bindings.append(tuple(code.words[equal + 1:semicolons[at]]))
+    if len(bindings) != 1:
+        return None
+    body_start = code.position(code.starts[opening + 4])
+    body_end = code.position(code.ends[closing - 1])
+    members = group[2]
+    if len(members) > 128:
+        return None
+    extras = [owner for owner in inventory if owner not in members and any(
+        owner_covers_lines([region], line, line) for region in owner['regions']
+        for line in range(first, last + 1))]
+    if len(extras) != len(members):
+        return None
+    parents = []
+    for owner in members:
+        shape = plain_rust_function_symbol(owner['name'])
+        declaration = re.search(r'\bfn\s+([A-Za-z_]\w*)', source[group[0] - 1])
+        if shape is None or declaration is None or shape[1][-1] != declaration[1]:
+            return None
+        parents.append(shape)
+    linked = []
+    for owner, shape in zip(members, parents):
+        children = [child for child in extras
+                    if direct_rust_callback_symbol(child['name'], owner['name'], shape[0])]
+        if len(children) != 1 or name_counts[children[0]['name']] != 1:
+            return None
+        child = children[0]
+        if (child['filenames'] != owner['filenames']
+                or type(child.get('count')) is not int or not 0 <= child['count'] < COUNTER_LIMIT
+                or max(region[4] for region in child['regions']) != child['count']
+                or any(not (body_start <= tuple(region[:2]) < tuple(region[2:4]) <= body_end)
+                       for region in child['regions'])):
+            return None
+        linked.append(child)
+    if len({id(child) for child in linked}) != len(extras):
+        return None
+    symbols = tuple(sorted(owner['name'] for owner in members + linked))
+    decoded, tool = demangle_plain_rust_callbacks(symbols)
+    parent_ids = [decoded[owner['name']] for owner in members]
+    if len(set(parent_ids)) != len(members):
+        return None
+    for owner, child, shape in zip(members, linked, parents):
+        parts = decoded[owner['name']].split('::')
+        crate = re.fullmatch(r'([A-Za-z_]\w*)(?:\[[0-9a-f]+\])?', parts[0])
+        if crate is None or [crate[1], *parts[1:]] != shape[1]:
+            return None
+        if re.fullmatch(re.escape(decoded[owner['name']]) + r'::\{closure#[0-9]+\}', decoded[child['name']]) is None:
+            return None
+    geometry = [tuple((region[0] - first, region[1], region[2] - first, region[3], *region[5:])
+                      for region in sorted(child['regions'], key=lambda r: tuple(r[:4]))) for child in linked]
+    if len(set(geometry)) != 1:
+        return None
+    states = [tuple(int(region[4] > 0) for region in sorted(child['regions'], key=lambda r: tuple(r[:4])))
+              for child in linked]
+    proof = dict(callback_body=[list(body_start), list(body_end)], capture=capture,
+        construction_sha256=hashlib.sha256(' '.join(bindings[0]).encode()).hexdigest(),
+        geometry=[list(row) for row in geometry[0]],
+        owners=[dict(parent=owner['name'], child=child['name'], parent_identity=decoded[owner['name']],
+                     child_identity=decoded[child['name']]) for owner, child in zip(members, linked)],
+        decoder=tool, limitation='Structural callback ownership and construction syntax only; no value or runtime-role equivalence')
+    return states, (tuple(body), bindings[0], geometry[0]), proof
+
+
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files, fragments):
     """Prove only positive pairs, retaining every compiled copy and candidate."""
     if not fragments:
@@ -633,7 +1029,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
     def refuse():
         a, b, c, d, _ = fragments[0]
         raise ValueError(f"Ambiguous unchanged source correspondence: {name}:{a + 1}-{b} -> {c + 1}-{d}")
-    inventories = []; groups = []
+    inventories = []; groups = []; inventory_names = []
     for owners, files, source in ((base, base_files, old), (head, head_files, new)):
         names = Counter(owner["name"] for owner in owners)
         inventory = [owner for owner in owners if any(
@@ -653,8 +1049,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     and all(any(r[2] == span[1] and r[3] > len(source[span[1] - 1].rstrip().encode())
                                 for r in owner["regions"]) for owner in members)):
                 valid[prefix] = (*span, members)
-        inventories.append(inventory); groups.append(valid)
-    claimed = {}; pairs = {}; excerpts = {}
+        inventories.append(inventory); groups.append(valid); inventory_names.append(names)
+    forwarders = transparent_forwarder_groups(old, new, groups, fragments)
+    for prefix, (group, _) in forwarders.items():
+        groups[1][prefix] = group
+    claimed = {}; pairs = {}; excerpts = {}; callback_sources = {}; callback_work = 20_000_000
     for a, b, c, d, pending in fragments:
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
@@ -671,7 +1070,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             "file": name, "base_range": list(bg[:2]), "head_range": list(hg[:2]),
             "instances": len(bg[2]), "pairs": [], "candidates": [],
             "source_prefix_sha256": hashlib.sha256(prefix.encode()).hexdigest()})
-        occurrences = []
+        if prefix in forwarders:
+            entry['forwarder'] = forwarders[prefix][1]
+            start, end = entry['forwarder']['wrapper_range']
+            excerpts[1, start, end] = ('\n'.join(new[start - 1:end]) + '\n').encode()
+        occurrences = []; callback_signature = None; callback_mode = None
         for side, source, counts, group, proposed in ((0, old, before, bg, a), (1, new, after, hg, c)):
             start, end, members = group
             starts = [offset for offset in range(start - 1, end - (b - a) + 1)
@@ -688,11 +1091,27 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 touched = {id(owner) for owner in inventories[side] if any(
                     owner_covers_lines([region], line, line) for region in owner["regions"]
                     for line in range(offset + 1, offset + b - a + 1))}
-                if touched != {id(owner) for owner in members}:
+                nested = touched != {id(owner) for owner in members}
+                if callback_mode is not None and callback_mode != nested:
                     refuse()
+                callback_mode = nested
+                children = [()] * len(members)
+                if nested:
+                    if side not in callback_sources:
+                        callback_sources[side] = _boolean_source(source)
+                    code = callback_sources[side]
+                    callback_work -= 8 * len(code.words) if code is not None else 0
+                    if callback_work < 0:
+                        refuse()
+                    callback = nested_map_err_states(source, group, inventories[side],
+                        inventory_names[side], offset + 1, offset + b - a, code)
+                    if callback is None or callback_signature is not None and callback_signature != callback[1]:
+                        refuse()
+                    children, callback_signature, witness = callback
+                    entry.setdefault('nested_callbacks', []).append(dict(side=side, candidate=offset + 1, **witness))
                 states = tuple(tuple(int(any(region[4] > 0 and owner_covers_lines([region], line, line)
-                                             for region in owner["regions"])) for line in lines)
-                               for owner in members)
+                                             for region in owner["regions"])) for line in lines) + tuple(child)
+                               for owner, child in zip(members, children))
                 if (any(not any(row[column] for row in states) for column in range(len(lines)))
                         or observed is not None and observed != states):
                     refuse()
@@ -710,9 +1129,12 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
     receipts = []
     for entry in claimed.values():
         states = entry.pop("states")
-        if Counter(map(tuple, states[0])) != Counter(map(tuple, states[1])):
+        matching = compiled_hit_state_matching(*states)
+        if matching is None:
             refuse()
         entry["instance_states"] = sorted(states[0])
+        entry["head_instance_states"] = sorted(states[1])
+        entry["instance_matching"] = matching
         receipts.append(entry)
     require_rustfmt_syntax(excerpts.values())
     return pairs, receipts

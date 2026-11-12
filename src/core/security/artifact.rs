@@ -293,6 +293,8 @@ pub struct StagedInputs {
 
 impl StagedInputs {
     pub fn prepare(targets: &[String]) -> Result<Self> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
         let mut result = Vec::new();
         let mut directories = Vec::new();
         for target in targets {
@@ -305,17 +307,23 @@ impl StagedInputs {
                 // Ignore caller TMPDIR. /var/tmp is a system-owned sticky directory.
                 let directory = tempfile::Builder::new()
                     .prefix("omg-package-")
+                    .permissions(std::fs::Permissions::from_mode(0o700))
                     .tempdir_in("/var/tmp")?;
                 let path = directory.path().join(snapshot.name());
                 let mut output = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
+                    .mode(0o600)
                     .open(&path)?;
                 std::io::copy(&mut snapshot.reader()?, &mut output)?;
                 if let Some((signature, _)) = &snapshot.signature {
                     let mut input = signature.try_clone()?;
                     input.rewind()?;
-                    let mut output = File::create(format!("{}.sig", path.display()))?;
+                    let mut output = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(path.with_added_extension("sig"))?;
                     std::io::copy(&mut input, &mut output)?;
                 }
                 result.push(path.to_str().context("Invalid staged path")?.to_owned());
@@ -336,9 +344,24 @@ mod tests {
     use super::*;
     #[test]
     fn snapshot_survives_replacement_and_in_place_writes() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
         let path = dir.path().join("example.pkg.tar.zst");
-        std::fs::write(&path, b"approved")?;
+        let mut input = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        input.write_all(b"approved")?;
+        let mut signature = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path.with_added_extension("sig"))?;
+        signature.write_all(b"approved signature")?;
         let snapshot = ArchiveSnapshot::capture(&path)?;
         snapshot.verify_sha256(&snapshot.digest)?;
         assert!(snapshot.verify_sha256(&"0".repeat(64)).is_err());
@@ -359,6 +382,29 @@ mod tests {
         );
         let staged = StagedInputs::prepare(&[snapshot.handoff()])?;
         assert_eq!(std::fs::read(&staged.targets[0])?, b"approved");
+        let staged_path = Path::new(&staged.targets[0]);
+        assert_eq!(
+            std::fs::metadata(staged_path.parent().context("staging parent")?)?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "staging must be private regardless of the inherited process umask"
+        );
+        for path in [
+            staged_path.to_path_buf(),
+            staged_path.with_added_extension("sig"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path)?.permissions().mode() & 0o777,
+                0o600,
+                "staged archive and signature must remain private"
+            );
+        }
+        assert_eq!(
+            std::fs::read(staged_path.with_added_extension("sig"))?,
+            b"approved signature"
+        );
         Ok(())
     }
 

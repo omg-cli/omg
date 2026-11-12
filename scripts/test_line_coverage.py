@@ -782,11 +782,416 @@ class SourceAwareCoverageTests(unittest.TestCase):
                             sources=tuple({"example.rs": ("\n".join(value[side]["source"]) + "\n").encode()}
                                           for side in ("base", "head")))
 
+    def nested_callback_compare(self, mutate=None, fragments=None):
+        old = ["fn retained(", "    value: Input,", ") -> Result<Value> {",
+               "    let capture = make_state();", "    old_step();", "    action()",
+               "        .map_err(|error| override_error(&capture).unwrap_or(error))?;",
+               "    old_middle();", "    action()",
+               "        .map_err(|error| override_error(&capture).unwrap_or(error))?;",
+               "    finish()", "}", "fn override_error(state: &State) -> Option<Error> {",
+               "    None", "}"]
+        new = [line.replace('old_', 'new_') for line in old]
+        value = {}
+        for side, source in (("base", old), ("head", new)):
+            owners = []
+            for instance in range(2):
+                parent = f"_RNvCs{instance + 1}_7example8retained"
+                owners.append(dict(name=parent, filenames=["/src/example.rs"],
+                    regions=[[n, 1, n, len(source[n - 1]) + 1, instance, 0, 0, 0]
+                             for n in range(1, 13)]))
+                for line, discriminator in ((7, ''), (10, 's_')):
+                    first = source[line - 1].index('override_error') + 1
+                    end = source[line - 1].rindex('))') + 2
+                    owners.append(dict(name='_RNC' + parent[2:] + discriminator + '0B3_', count=instance,
+                        filenames=["/src/example.rs"],
+                        regions=[[line, first, line, end, instance, 0, 0, 0]]))
+            owners.append(dict(name='override_error', filenames=["/src/example.rs"],
+                regions=[[n, 1, n, len(source[n - 1]) + 1, 1, 0, 0, 0] for n in (13, 14, 15)]))
+            value[side] = dict(source=source, owners=owners)
+        if mutate:
+            mutate(value)
+        counts = [{n: 1 for n in range(1, len(value[side]['source']) + 1)}
+                  for side in ('base', 'head')]
+        return coverage.positive_source_fragments('example.rs', value['base']['source'],
+            value['head']['source'], *counts, value['base']['owners'], value['head']['owners'],
+            {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'},
+            fragments if fragments is not None else [(6, 7, 6, 7, [7]), (9, 10, 9, 10, [10])])
+
+    def test_nested_callback_refuses_outer_owner_attributes(self):
+        for side in ('base', 'head'):
+            def mutate(value):
+                value[side]['source'].insert(0, '#[rewrite_capture]')
+                for owner in value[side]['owners']:
+                    for region in owner['regions']:
+                        region[0] += 1
+                        region[2] += 1
+            fragments = ([(7, 8, 6, 7, [8]), (10, 11, 9, 10, [11])] if side == 'base'
+                         else [(6, 7, 7, 8, [7]), (9, 10, 10, 11, [10])])
+            with self.subTest(side=side), self.assertRaisesRegex(ValueError, 'Ambiguous unchanged'):
+                self.nested_callback_compare(mutate=mutate, fragments=fragments)
+
+    def test_nested_map_err_owners_preserve_complete_child_obligations(self):
+        pairs, receipts = self.nested_callback_compare()
+        self.assertEqual(pairs, {7: 7, 10: 10})
+        self.assertEqual(receipts[0]['instances'], 2)
+        self.assertTrue(receipts[0]['nested_callbacks'])
+
+    def test_nested_callback_refuses_foreign_or_incomplete_compiled_children(self):
+        def children(value):
+            return [owner for owner in value['head']['owners'] if owner['name'].startswith('_RNC')]
+        def child_name(change):
+            def mutate(value):
+                children(value)[0]['name'] = change(children(value)[0]['name'])
+            return mutate
+        def missing(value):
+            value['head']['owners'].remove(children(value)[0])
+        def extra(value):
+            child = copy.deepcopy(children(value)[0]); child['name'] = child['name'].replace('0B3_', 's0_0B3_')
+            value['head']['owners'].append(child)
+        def escaping(value):
+            children(value)[0]['regions'][0][1] = 1
+        def changed_geometry(value):
+            for owner in children(value):
+                owner['regions'][0][3] -= 1
+        def lost_child(value):
+            for owner in children(value):
+                owner['count'] = 0
+                for region in owner['regions']:
+                    region[4] = 0
+        def split_credit(value):
+            for owner in value['head']['owners']:
+                if owner['name'].startswith('_RNv'):
+                    for region in owner['regions']:
+                        region[4] = int('Cs1_' in owner['name'])
+        cases = {
+            'missing': missing, 'extra': extra, 'outside_body': escaping,
+            'changed_geometry': changed_geometry, 'lost_child_hot_bits': lost_child,
+            'parent_child_credit_split': split_credit,
+            'wrong_crate': child_name(lambda name: name.replace('Cs1_', 'Cs9_')),
+            'shim': child_name(lambda name: name.replace('_RNC', '_RNS')),
+            'wrong_backref': child_name(lambda name: name.replace('B3_', 'B2_')),
+            'foreign_instantiation': child_name(lambda name: name + 'C3foo'),
+            'vendor_suffix': child_name(lambda name: name + '.llvm.1'),
+            'unknown_symbol': child_name(lambda name: 'foreign'),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.nested_callback_compare(mutate=mutate)
+
+    def test_nested_callback_refuses_changed_or_unsupported_capture_construction(self):
+        def lines(changes):
+            def mutate(value):
+                head = value['head']
+                for line, text in changes.items():
+                    head['source'][line - 1] = text
+                for owner in head['owners']:
+                    if not owner['name'].startswith('_RNC'):
+                        for region in owner['regions']:
+                            region[3] = len(head['source'][region[2] - 1]) + 1
+            return mutate
+        cases = {
+            'changed_initializer': {4: '    let capture = other_state();'},
+            'mutable': {4: '    let mut capture = make_state();'},
+            'type_annotation': {4: '    let capture: State = make_state();'},
+            'destructuring': {4: '    let (capture, other) = make_state();'},
+            'duplicate_binding': {8: '    let capture = make_state();'},
+            'scoped_import': {8: '    use overrides::override_error;'},
+            'shadowed_function': {5: '    let override_error = another_handler;'},
+            'ancestor_capture': {5: '    if ready {', 8: '    }'},
+            'if_let_function': {4: '    if let Some(override_error) = handler {',
+                                5: '        let capture = make_state();', 8: '    }'},
+            'for_function': {4: '    for override_error in handlers {',
+                             5: '        let capture = make_state();', 8: '    }'},
+            'conditional_root_function': {13: '#[cfg(any())] fn override_error(state: &State) -> Option<Error> {'},
+            'method_not_root_function': {13: 'impl Host {',
+                14: '    fn override_error(state: &State) -> Option<Error> { None }', 15: '}'},
+        }
+        for label, changes in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.nested_callback_compare(mutate=lines(changes))
+
+    def test_nested_callback_refuses_macro_or_attribute_created_capture_shadows(self):
+        cases = {
+            'parentheses': (5, '    shadow!(capture);'),
+            'braces': (5, '    shadow! { capture }'),
+            'brackets': (5, '    shadow![capture];'),
+            'qualified': (5, '    crate::shadow!(capture);'),
+            'raw_keyword': (5, '    r#return!(capture);'),
+            'late_item': (11, '    shadow!(); finish()'),
+            'local_definition': (5, '    macro_rules! shadow { () => { let capture = other_state(); }; }'),
+            'attribute': (4, '    #[replace_binding] let capture = make_state();'),
+        }
+        for label, (line, replacement) in cases.items():
+            def mutate(value):
+                head = value['head']
+                head['source'][line - 1] = replacement
+                head['source'].append(
+                    'macro_rules! shadow { () => { fn override_error(_: &State) -> Option<Error> { other_error() } }; }'
+                    if label == 'late_item' else
+                    'macro_rules! shadow { ($name:ident) => { let $name = other_state(); }; }')
+                for owner in head['owners']:
+                    if not owner['name'].startswith('_RNC'):
+                        for region in owner['regions']:
+                            region[3] = len(head['source'][region[2] - 1]) + 1
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.nested_callback_compare(mutate=mutate)
+
+    def test_nested_callback_preserves_expression_macro_construction(self):
+        def mutate(value):
+            for side in ('base', 'head'):
+                value[side]['source'][4] = (
+                    '    let extra = if matches!(value, Some(_)) { 1 } else { 0 };')
+                for owner in value[side]['owners']:
+                    if not owner['name'].startswith('_RNC'):
+                        for region in owner['regions']:
+                            region[3] = len(value[side]['source'][region[2] - 1]) + 1
+        pairs, _ = self.nested_callback_compare(mutate=mutate)
+        self.assertEqual(pairs, {7: 7, 10: 10})
+
+    def test_nested_callback_rejects_raw_context_suffixes_before_decoding(self):
+        def contexts(value):
+            for side in ('base', 'head'):
+                for owner in value[side]['owners']:
+                    if owner['name'].startswith('_RNv'):
+                        owner['name'] += 'C3foo'
+                    elif owner['name'].startswith('_RNC'):
+                        owner['name'] += 'C3bar'
+        with mock.patch.object(coverage, 'demangle_plain_rust_callbacks',
+                               side_effect=AssertionError('invalid raw context reached GNU')):
+            with self.assertRaises(ValueError):
+                self.nested_callback_compare(mutate=contexts)
+
+    def test_nested_callback_rejects_colliding_decoded_parent_contexts(self):
+        def collide(value):
+            for owner in value['head']['owners']:
+                owner['name'] = owner['name'].replace('Cs2_', 'Cs01_')
+        with self.assertRaises(ValueError):
+            self.nested_callback_compare(mutate=collide)
+
+    def test_nested_callback_requires_supported_gnu_decoder(self):
+        coverage.demangle_plain_rust_callbacks.cache_clear()
+        with mock.patch.object(coverage.shutil, 'which', return_value=None), \
+                self.assertRaisesRegex(ValueError, r'requires GNU c\+\+filt'):
+            self.nested_callback_compare()
+
+    def test_nested_callback_refuses_decoder_failures_and_unparsed_output(self):
+        def output(value):
+            def run(argv, **kwargs):
+                data = b'GNU c++filt fixture\n' if '--version' in argv else value(kwargs['input'])
+                return subprocess.CompletedProcess(argv, 0, data, b'')
+            return run
+        cases = {
+            'echo': output(lambda data: data),
+            'missing_row': output(lambda data: b'unknown\n'),
+            'oversized': output(lambda data: b'x' * (256 * 1024 + 1)),
+            'non_ascii': output(lambda data: b'\xff\n' * len(data.splitlines())),
+            'timeout': subprocess.TimeoutExpired(['c++filt'], 5),
+            'failed_process': subprocess.CalledProcessError(1, ['c++filt']),
+        }
+        for label, result in cases.items():
+            coverage.demangle_plain_rust_callbacks.cache_clear()
+            try:
+                with self.subTest(label=label), mock.patch.object(coverage.subprocess, 'run', side_effect=result), \
+                        self.assertRaises(ValueError):
+                    self.nested_callback_compare()
+            finally:
+                coverage.demangle_plain_rust_callbacks.cache_clear()
+
+    def test_callback_decoder_rejects_unsupported_input_before_process_execution(self):
+        parent = '_RNvCs1_7example8retained'
+        cases = [
+            (parent, parent),
+            ('_R' + 'x' * 4096,),
+            tuple('_RNvCs' + str(n) + '_7example8retained' for n in range(257)),
+            (parent, parent + 'C3foo'),
+            (parent, '_RNC' + parent[2:] + '0B2_'),
+            (parent, parent + 'I' + 'B0_' * 1000),
+        ]
+        for symbols in cases:
+            with self.subTest(count=len(symbols)), mock.patch.object(coverage.subprocess, 'run',
+                    side_effect=AssertionError('unsupported symbol inventory reached GNU')), self.assertRaises(ValueError):
+                coverage.demangle_plain_rust_callbacks(symbols)
+
+    def transparent_forwarder_compare(self, mutate=None):
+        def extracted(value):
+            head = value["head"]
+            end = head["owners"][0]["regions"][-1][0]
+            body, tail = head["source"][3:end], head["source"][end:]
+            wrapper = value["base"]["source"][:3] + ["    extracted(value, None, &[])", "}"]
+            header = ["fn extracted(", "    value: Input,", "    policy: Option<&[Policy]>,",
+                      "    selections: &[Selection],", ") -> Value {"]
+            source = wrapper + header + body + tail
+            last = len(wrapper + header + body)
+            owners = []
+            for instance, owner in enumerate(head["owners"][:2]):
+                owners.append({"name": owner["name"], "filenames": owner["filenames"],
+                    "regions": [[n, 1, n, len(source[n - 1].encode()) + 1, instance, 0, 0, 0]
+                                for n in range(len(wrapper) + 1, last + 1)]})
+            for name, first, final in (("wrapper", 1, len(wrapper)), ("tail", last + 1, len(source))):
+                owners.append({"name": name, "filenames": ["/src/example.rs"],
+                    "regions": [[n, 1, n, len(source[n - 1].encode()) + 1, 1, 0, 0, 0]
+                                for n in range(first, final + 1)]})
+            head.update(source=source, counts={n: 1 for n in range(1, len(source) + 1)}, owners=owners)
+            if mutate:
+                mutate(value)
+        return self.multiline_copies_compare(mutate=extracted)
+
+    def test_transparent_forwarder_preserves_extracted_fragment_obligations(self):
+        result = self.transparent_forwarder_compare()
+        witness = result["positive_source_fragments"][0]
+        self.assertEqual(witness["pairs"], [[6, 14], [10, 18]])
+        self.assertEqual(witness["forwarder"]["wrapper_range"], [1, 5])
+        self.assertEqual(witness["forwarder"]["callee_range"], [6, 20])
+
+    def test_transparent_forwarder_refuses_changed_arguments_and_signatures(self):
+        def change(line, text):
+            def mutate(value):
+                head = value["head"]
+                head["source"][line - 1] = text
+                for owner in head["owners"]:
+                    for region in owner["regions"]:
+                        region[3] = len(head["source"][region[2] - 1].encode()) + 1
+            return mutate
+        cases = {
+            "swapped": (4, "    extracted(None, value, &[])"),
+            "repeated": (4, "    extracted(value, value, &[])"),
+            "omitted": (4, "    extracted(None, &[])"),
+            "transformed": (4, "    extracted(&value, None, &[])"),
+            "nested_call": (4, "    extracted(rewrite(value), None, &[])"),
+            "question": (4, "    extracted(value, None, &[])?"),
+            "qualified": (4, "    self::extracted(value, None, &[])"),
+            "statement": (4, "    log(); extracted(value, None, &[])"),
+            "return": (4, "    return extracted(value, None, &[])"),
+            "different_default": (4, "    extracted(value, Some(value), &[])"),
+            "changed_parameter_type": (7, "    value: OtherInput,"),
+            "duplicate_parameter_name": (8, "    value: Option<&[Policy]>,"),
+            "changed_return": (10, ") -> OtherValue {"),
+            "unsafe_callee": (6, "unsafe fn extracted("),
+        }
+        for label, (line, text) in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "Ambiguous unchanged"):
+                self.transparent_forwarder_compare(mutate=change(line, text))
+        def shadowed(value):
+            change(6, "fn value(")(value)
+            change(4, "    value(value, None, &[])")(value)
+        with self.assertRaisesRegex(ValueError, "Ambiguous unchanged"):
+            self.transparent_forwarder_compare(mutate=shadowed)
+
+    def test_transparent_forwarder_refuses_conditional_nested_or_shadowed_contexts(self):
+        def insert(head, first, lines):
+            head["source"][first - 1:first - 1] = lines
+            for owner in head["owners"]:
+                for region in owner["regions"]:
+                    for field in (0, 2):
+                        if region[field] >= first:
+                            region[field] += len(lines)
+            head["counts"] = {n: 1 for n in range(1, len(head["source"]) + 1)}
+        def surrounded(before, after):
+            def mutate(value):
+                head = value["head"]
+                insert(head, 21, after)
+                insert(head, 6, before)
+            return mutate
+        cases = {
+            "attribute": surrounded(["#[", "cfg(test)", "]"], []),
+            "impl": surrounded(["impl Holder {"], ["}"]),
+            "module": surrounded(["mod nested {"], ["}"]),
+            "macro_parentheses": surrounded(["generate!("], [");"]),
+            "macro_braces": surrounded(["generate! {"], ["}"]),
+        }
+        for label, lines in {
+            "glob_import": ["use hidden::*;"],
+            "shadowed_none_import": ["use hidden::{None};"],
+            "shadowed_none_constant": ["const None: Option<&[Policy]> = Option::Some(&[]);"],
+            "no_prelude": ["#![no_implicit_prelude]"],
+        }.items():
+            cases[label] = lambda value, lines=lines: insert(value["head"], 1, lines)
+        for label, mutate in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.transparent_forwarder_compare(mutate=mutate)
+
+    def test_transparent_forwarder_refuses_existing_or_shared_callees(self):
+        def append_function(side, name, body):
+            start = len(side["source"]) + 1
+            side["source"] += [f"fn {name}(", "    value: Input,", ") -> Value {", body, "}"]
+            side["counts"] = {n: 1 for n in range(1, len(side["source"]) + 1)}
+            side["owners"].append({"name": name, "filenames": ["/src/example.rs"],
+                "regions": [[n, 1, n, len(side["source"][n - 1].encode()) + 1, 1, 0, 0, 0]
+                            for n in range(start, start + 5)]})
+        def existing(value):
+            append_function(value["base"], "extracted", "    keep()")
+        def shared(value):
+            append_function(value["base"], "another", "    keep()")
+            append_function(value["head"], "another", "    extracted(value, None, &[])")
+        for label, mutate in (("existing", existing), ("shared", shared)):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.transparent_forwarder_compare(mutate=mutate)
+
+    def test_transparent_forwarder_refuses_split_fragment_ownership(self):
+        captured = {}
+        self.transparent_forwarder_compare(mutate=lambda value: captured.update(value))
+        groups = []
+        for side in ("base", "head"):
+            value = captured[side]
+            by_span = {}
+            for owner in value["owners"]:
+                regions = owner["regions"]
+                by_span.setdefault((regions[0][0], regions[-1][2]), []).append(owner)
+            groups.append({prefix: (*span, by_span[span]) for span, prefix in
+                           coverage.source_function_prefixes(value["source"], by_span).items()})
+        self.assertEqual(coverage.transparent_forwarder_groups(
+            captured["base"]["source"], captured["head"]["source"], groups,
+            [(5, 6, 13, 14, [6]), (11, 12, 4, 5, [12])]), {})
+
+    def test_transparent_forwarder_retains_every_compiled_copy_and_foreign_owner_guard(self):
+        def missing(value):
+            value["head"]["owners"].pop(0)
+        def lost(value):
+            value["head"]["owners"][1]["regions"][8][4] = 0
+        def foreign(value):
+            value["head"]["owners"].append({"name": "foreign", "filenames": ["/src/example.rs"],
+                "regions": [[14, 1, 14, 6, 1, 0, 0, 0]]})
+        for label, mutate in (("missing_copy", missing), ("lost_hot_bit", lost), ("foreign_owner", foreign)):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.transparent_forwarder_compare(mutate=mutate)
+
     def test_multiline_return_change_preserves_covered_fragments_in_every_compiled_copy(self):
         result = self.multiline_copies_compare()
         self.assertEqual([result[key] for key in ("deleted_summary_found", "deleted_summary_hit",
                          "deleted_mapped", "deleted_mapped_hit")], [0, 0, 0, 0])
         self.assertEqual(result["positive_source_fragments"][0]["pairs"], [[6, 7], [10, 11]])
+
+    def test_multiline_fragment_accepts_newly_covered_compiled_copies(self):
+        def cover_cold_copy(value):
+            for owner in value["head"]["owners"][:2]:
+                for region in owner["regions"]:
+                    region[4] = 1
+        result = self.multiline_copies_compare(mutate=cover_cold_copy)
+        self.assertEqual(result["positive_source_fragments"][0]["pairs"], [[6, 7], [10, 11]])
+        self.assertEqual(result["positive_source_fragments"][0]["instance_states"], [[0, 0], [1, 1]])
+        witness = result["positive_source_fragments"][0]
+        self.assertEqual(witness["head_instance_states"], [[1, 1], [1, 1]])
+        self.assertEqual(sorted(witness["instance_matching"]), [0, 1])
+
+    def test_multiline_fragment_preserves_whole_copy_obligations_when_coverage_grows(self):
+        def grow(value):
+            for side in ("base", "head"):
+                for instance, owner in enumerate(value[side]["owners"][:2]):
+                    for region in owner["regions"]:
+                        text = value[side]["source"][region[0] - 1]
+                        if "shared_" in text:
+                            region[4] = int(instance == (0 if "shared_a" in text else 1))
+                            if side == "head" and instance == 0:
+                                region[4] = 1
+                            elif side == "head":
+                                region[4] = int("shared_a" in text)
+        result = self.multiline_copies_compare(mutate=grow, fragments=True)
+        self.assertTrue(result["positive_source_fragments"])
+
+    def test_compiled_hit_state_matching_refuses_excessive_work(self):
+        before = [[0, 0]] * 1024
+        after = [[0, 0]] * 1023 + [[0, 1]]
+        self.assertIsNone(coverage.compiled_hit_state_matching(before, after))
 
     def test_multiline_fragment_proof_preserves_instances_and_all_candidate_copies(self):
         def lose_instance(value):

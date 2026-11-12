@@ -1292,17 +1292,24 @@ mod public_source_tests {
             (start_time == current_start && state != "Z" && state != "X").then_some(pid)
         }
 
-        fn terminate(&self) -> Result<()> {
+        fn terminate(&self) {
             if let Some(pid) = self.running_pid() {
-                match nix::sys::signal::kill(
+                let result = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid),
                     nix::sys::signal::Signal::SIGKILL,
-                ) {
-                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-                    Err(error) => return Err(error).context("Stopping owned inert Git helper"),
-                }
+                );
+                eprintln!("Owned inert Git helper {pid} cleanup attempt: {result:?}");
             }
-            Ok(())
+        }
+
+        async fn wait_until_stopped(&self, budget: Duration) -> bool {
+            tokio::time::timeout(budget, async {
+                while self.running_pid().is_some() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok()
         }
 
         async fn stopped_before_cleanup(&self) -> bool {
@@ -1315,31 +1322,49 @@ mod public_source_tests {
                 state != "Z" && state != "X",
                 "fixture helper must start alive"
             );
-            let stopped = tokio::time::timeout(Duration::from_millis(250), async {
-                while self.running_pid().is_some() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .is_ok();
-            self.terminate().expect("owned inert helper cleanup");
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while self.running_pid().is_some() {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("owned inert helper must stop before the assertion");
+            let stopped = self.wait_until_stopped(Duration::from_millis(250)).await;
+            self.terminate();
+            assert!(
+                self.wait_until_stopped(Duration::from_secs(1)).await,
+                "owned inert helper must stop before the assertion"
+            );
             stopped
         }
     }
 
     impl Drop for OwnedGitHelper {
         fn drop(&mut self) {
-            if let Err(error) = self.terminate() {
-                eprintln!("Failed to clean up owned inert Git helper: {error:#}");
-            }
+            self.terminate();
         }
+    }
+
+    #[tokio::test]
+    async fn owned_git_helper_cleanup_stops_a_live_child_after_timeout() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt;
+
+        let staging = tempfile::tempdir()?;
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()?;
+        let pid = child.id().expect("inert helper was spawned");
+        let helper = OwnedGitHelper {
+            identity_file: staging.path().join("helper.stat"),
+        };
+        std::fs::write(
+            &helper.identity_file,
+            std::fs::read(format!("/proc/{pid}/stat"))?,
+        )?;
+        assert_eq!(helper.running_pid(), i32::try_from(pid).ok());
+        let stopped_without_cleanup = helper.stopped_before_cleanup().await;
+        let status = tokio::time::timeout(Duration::from_secs(1), child.wait()).await??;
+        assert!(
+            !stopped_without_cleanup,
+            "the live child must exercise fallback cleanup"
+        );
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+        assert!(helper.running_pid().is_none());
+        Ok(())
     }
 
     #[tokio::test]

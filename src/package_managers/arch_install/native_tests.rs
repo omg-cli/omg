@@ -1,4 +1,5 @@
-use std::fs::{self, File};
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -138,7 +139,11 @@ fn archive_with_mtree(
     use sha2::{Digest as _, Sha256};
 
     let path = dir.join(format!("{name}-{version}-any.pkg.tar.gz"));
-    let file = File::create(&path)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
     let mut tar = tar::Builder::new(GzEncoder::new(file, Compression::default()));
     let payload = b"fixture\n".as_slice();
     let payload_path = format!("usr/share/omg-fixture/{name}");
@@ -172,7 +177,9 @@ fn archive_with_mtree(
 
 #[test]
 fn fixture_archives_have_complete_admission_metadata() -> Result<()> {
-    let directory = tempfile::tempdir()?;
+    let directory = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let snapshot = archive(directory.path(), "omg-fixture-metadata", "1-1")?;
     let admission =
         crate::package_managers::aur::artifact_inspector::inspect_archive(&snapshot.path())?;
@@ -299,6 +306,7 @@ fn native_installation_preserves_mixed_intents() -> Result<()> {
 
     let temp = tempfile::Builder::new()
         .prefix("omg-native-intent-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir()?;
     let root = temp.path().join("root");
     let db = temp.path().join("db");
@@ -308,7 +316,10 @@ fn native_installation_preserves_mixed_intents() -> Result<()> {
         db.join("sync"),
         temp.path().join("archives"),
     ] {
-        fs::create_dir_all(dir)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
     fs::write(db.join("local/ALPM_DB_VERSION"), "9\n")?;
     crate::core::paths::set_test_overrides(Some(root.clone()), Some(db.clone()));

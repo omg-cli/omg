@@ -182,6 +182,9 @@ fn create_scoped_pgp_home(
     source_home: &Path,
     cache_dir: &Path,
 ) -> Result<tempfile::TempDir> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     use crate::core::security::keyserver;
 
     std::fs::create_dir_all(cache_dir).with_context(|| {
@@ -192,6 +195,7 @@ fn create_scoped_pgp_home(
     })?;
     let build_keyring = tempfile::Builder::new()
         .prefix("aur-pgp-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(cache_dir)
         .context("Failed to create package-scoped AUR PGP keyring")?;
     let gpg = crate::core::privilege::root_controlled_program_path("gpg")?;
@@ -212,7 +216,13 @@ fn create_scoped_pgp_home(
         export_stderr.trim()
     );
     let key_bundle = build_keyring.path().join("trusted-keys.pgp");
-    std::fs::write(&key_bundle, &exported.stdout).context("Failed to stage AUR PGP keys")?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&key_bundle)?
+        .write_all(&exported.stdout)
+        .context("Failed to stage AUR PGP keys")?;
     let imported = std::process::Command::new(&gpg)
         .arg("--no-options")
         .arg("--batch")
@@ -2046,9 +2056,12 @@ impl AurClient {
     }
 
     fn begin_rollback_worktree(work: &Path, base: &str) -> Result<tempfile::TempDir> {
+        use std::os::unix::fs::PermissionsExt;
+
         crate::core::security::validate_package_name(base)?;
         tempfile::Builder::new()
             .prefix(&format!("{base}-"))
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(work)
             .context("Failed to create owned AUR rollback checkout")
     }
@@ -4792,6 +4805,8 @@ fn compiler_job_flags(
 #[cfg(test)]
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     use super::*;
     use crate::package_managers::aur_metadata::{index_path, metadata_path, publish_test_metadata};
 
@@ -5743,7 +5758,7 @@ mod tests {
             "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
         )?;
         let source = ReviewedSource::capture(directory.path())?;
-        let archive_dir = tempfile::tempdir()?;
+        let archive_dir = private_fixture_dir()?;
         let archive = archive_dir.path().join("demo-2-1-any.pkg.tar.gz");
         write_pkg_archive(
             &archive,
@@ -5773,7 +5788,7 @@ mod tests {
             "post_install() { :; }\n",
         )?;
         let source = ReviewedSource::capture(directory.path())?;
-        let archive_dir = tempfile::tempdir()?;
+        let archive_dir = private_fixture_dir()?;
         let archive = archive_dir.path().join("demo-1-1-any.pkg.tar.gz");
         // write_pkg_archive supplies the fixture's single `arch = any` field.
         let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
@@ -5876,9 +5891,21 @@ mod tests {
         assert!(!message.contains("arg="));
     }
 
+    fn private_fixture_dir() -> std::io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    }
+
     fn write_tar_gz(path: &std::path::Path, entries: &[(&str, &[u8])]) {
         let encoder = flate2::write::GzEncoder::new(
-            std::fs::File::create(path).unwrap(),
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap(),
             flate2::Compression::fast(),
         );
         let mut tar = tar::Builder::new(encoder);
@@ -7477,6 +7504,13 @@ mod tests {
         let work = tempfile::tempdir()?;
         let first = AurClient::begin_rollback_worktree(work.path(), "example")?;
         let second = AurClient::begin_rollback_worktree(work.path(), "example")?;
+        for checkout in [&first, &second] {
+            assert_eq!(
+                std::fs::metadata(checkout.path())?.permissions().mode() & 0o777,
+                0o700,
+                "rollback checkouts must be private at creation"
+            );
+        }
         assert!(
             first
                 .path()
@@ -8121,7 +8155,7 @@ mod tests {
         let audit_dir = tempfile::tempdir()?;
         temp_env::with_var("OMG_DATA_DIR", Some(audit_dir.path()), || -> Result<()> {
             let source_dir = tempfile::tempdir()?;
-            let archive_dir = tempfile::tempdir()?;
+            let archive_dir = private_fixture_dir()?;
             let pkgbuild = b"pkgbase=split\npkgname=(app docs)\npkgver=1.0\npkgrel=1\n";
             std::fs::write(source_dir.path().join("PKGBUILD"), pkgbuild)?;
             std::fs::write(source_dir.path().join(".SRCINFO"), srcinfo)?;
@@ -8281,7 +8315,7 @@ mod tests {
 
     #[test]
     fn cached_architecture_eligibility_matches_sealed_authorization() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = private_fixture_dir()?;
         let root = dir.path().canonicalize()?;
         let pkg_dir = root.join("fixture");
         std::fs::create_dir(&pkg_dir)?;
@@ -8936,8 +8970,8 @@ mod tests {
         if which::which("gpg").is_err() {
             return;
         }
-        let source_home = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
+        let source_home = private_fixture_dir().unwrap();
+        let cache_dir = private_fixture_dir().unwrap();
         let identity = format!(
             "OMG scoped keyring test {} <test@example.invalid>",
             uuid::Uuid::new_v4()
@@ -8990,6 +9024,24 @@ mod tests {
             cache_dir.path(),
         )
         .unwrap();
+        assert_eq!(
+            std::fs::metadata(scoped.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "package-scoped keyrings must be private at creation"
+        );
+        assert_eq!(
+            std::fs::metadata(scoped.path().join("trusted-keys.pgp"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the staged key bundle must be private"
+        );
         assert!(keyserver::is_key_in_gnupg(&fingerprint, scoped.path()).unwrap());
         let secrets = std::process::Command::new("gpg")
             .args(["--no-options", "--batch", "--with-colons", "--homedir"])
@@ -9906,7 +9958,7 @@ finally:
         {
             return Ok(());
         }
-        let fixture = tempfile::tempdir()?;
+        let fixture = private_fixture_dir()?;
         let configuration = fixture.path().join("config");
         let data = fixture.path().join("data");
         let cache = fixture.path().join("cache");
@@ -9951,7 +10003,9 @@ finally:
                 let hook = "post_install() { :; }\n";
                 std::fs::write(checkout.path().join("demo.install"), hook).expect("write fixture file");
                 let source = ReviewedSource::capture(checkout.path())?;
-                let archives = tempfile::tempdir_in(fixture)?;
+                let archives = tempfile::Builder::new()
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(fixture)?;
                 let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
                 let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
                 write_pkg_archive(&archive, info, Some(hook));
@@ -10035,7 +10089,9 @@ finally:
                 )
                 .expect("write fixture file");
                 let source = ReviewedSource::capture(checkout.path())?;
-                let archives = tempfile::tempdir_in(fixture)?;
+                let archives = tempfile::Builder::new()
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(fixture)?;
                 let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
                 write_pkg_archive(
                     &archive,
@@ -10105,7 +10161,9 @@ finally:
                 )
                 .expect("write fixture file");
                 let source = ReviewedSource::capture(checkout.path())?;
-                let archives = tempfile::tempdir_in(fixture)?;
+                let archives = tempfile::Builder::new()
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(fixture)?;
                 let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
                 write_pkg_archive(
                     &archive,
@@ -10329,7 +10387,7 @@ finally:
         {
             return Ok(());
         }
-        let directory = tempfile::tempdir()?;
+        let directory = private_fixture_dir()?;
         let configuration = directory.path().join("config.toml");
         let socket = directory.path().join("absent.sock");
         std::fs::write(&configuration, "[aur]\nsecurity_profile = 'standard'\n")?;
@@ -10605,7 +10663,7 @@ finally:
         {
             return Ok(());
         }
-        let directory = tempfile::tempdir()?;
+        let directory = private_fixture_dir()?;
         let archive = directory.path().join("demo-1-1-any.pkg.tar.gz");
         write_pkg_archive(
             &archive,

@@ -967,44 +967,34 @@ fn parse_local_desc(path: &Path) -> Result<LocalDbPackage> {
 }
 
 fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
+    use alpm_db::desc::DbDescFile;
+
     // Modern pacman never writes `%REQUIREDBY%`/`%OPTFOR%` sections into local
     // desc files, so reverse dependencies cannot be read from disk. They are
     // derived from `%DEPENDS%`/`%PROVIDES%` at query time (see
     // `compute_required_names`) under the canonical orphan rule
     // (`types::is_orphan_package`, `pacman -Qdt` semantics).
-    if let Ok(desc) = alpm_db::desc::DbDescFileV1::from_str(content) {
-        Ok(LocalDbPackage {
-            name: desc.name.to_string(),
-            version: require_package_version(&desc.version.to_string())?,
-            desc: desc.description.to_string(),
-            install_date: desc.installdate.to_string(),
-            licenses: desc.license.iter().map(ToString::to_string).collect(),
-            groups: desc.groups.iter().map(ToString::to_string).collect(),
-            explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
-            depends: desc.depends.iter().map(ToString::to_string).collect(),
-            optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
-            provides: desc.provides.iter().map(ToString::to_string).collect(),
-        })
-    } else if let Ok(desc) = alpm_db::desc::DbDescFileV2::from_str(content) {
-        // V2 (has XDATA support)
-        Ok(LocalDbPackage {
-            name: desc.name.to_string(),
-            version: require_package_version(&desc.version.to_string())?,
-            desc: desc.description.to_string(),
-            install_date: desc.installdate.to_string(),
-            licenses: desc.license.iter().map(ToString::to_string).collect(),
-            groups: desc.groups.iter().map(ToString::to_string).collect(),
-            explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
-            depends: desc.depends.iter().map(ToString::to_string).collect(),
-            optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
-            provides: desc.provides.iter().map(ToString::to_string).collect(),
-        })
-    } else {
-        // Fallback: manual parsing for edge cases
-        parse_local_desc_manual(content)
-    }
+    let desc = match DbDescFile::from_str(content) {
+        Ok(DbDescFile::V1(desc)) => desc,
+        Ok(DbDescFile::V2(desc)) => desc.into(),
+        Err(_) => match alpm_db::desc::DbDescFileV1::from_str(content) {
+            Ok(desc) => desc,
+            Err(_) => return parse_local_desc_manual(content),
+        },
+    };
+    Ok(LocalDbPackage {
+        name: desc.name.to_string(),
+        version: require_package_version(&desc.version.to_string())?,
+        desc: desc.description.to_string(),
+        install_date: desc.installdate.to_string(),
+        licenses: desc.license.iter().map(ToString::to_string).collect(),
+        groups: desc.groups.iter().map(ToString::to_string).collect(),
+        explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
+        depends: desc.depends.iter().map(ToString::to_string).collect(),
+        optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
+        provides: desc.provides.iter().map(ToString::to_string).collect(),
+    })
 }
-
 /// Manual local desc parser as fallback
 fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
     let mut name = String::new();
@@ -3259,6 +3249,75 @@ mod tests {
                 assert!(message.contains("no NAME found"), "{case}: {message}");
             }
             assert_eq!(fs::read(&healthy_desc).unwrap(), healthy_bytes, "{case}");
+        }
+    }
+
+    #[test]
+    fn official_local_desc_formats_preserve_metadata_and_refuse_nul_versions() {
+        use std::fmt::Write as _;
+
+        let fields = [
+            ("NAME", "widget"),
+            ("VERSION", "1:2.3-01"),
+            ("BASE", "widget"),
+            ("DESC", "Offline metadata fixture"),
+            ("URL", "https://example.org/widget"),
+            ("ARCH", "x86_64"),
+            ("BUILDDATE", "1"),
+            ("INSTALLDATE", "2"),
+            ("PACKAGER", "Audit Fixture <fixture@example.org>"),
+            ("SIZE", "123"),
+            ("GROUPS", "pinned\nother"),
+            ("REASON", "1"),
+            ("LICENSE", "MIT"),
+            ("VALIDATION", "pgp"),
+            ("REPLACES", "old-widget"),
+            ("DEPENDS", "glibc>=2"),
+            ("OPTDEPENDS", "extra-widget: optional feature"),
+            ("CONFLICTS", "incompatible-widget"),
+            ("PROVIDES", "virtual-widget=1"),
+        ];
+        let mut v1 = String::new();
+        for (key, value) in fields {
+            writeln!(v1, "%{key}%\n{value}\n").expect("in-memory fixture formatting");
+        }
+        let v2 = format!("{v1}%XDATA%\npkgtype=pkg\n\n");
+        alpm_db::desc::DbDescFileV1::from_str(&v1).expect("complete V1 fixture");
+        alpm_db::desc::DbDescFileV2::from_str(&v2).expect("complete V2 fixture");
+        let marker = v1
+            .replace("Offline metadata fixture", "Literal %XDATA% marker")
+            .replace("%INSTALLDATE%\n2\n", "%INSTALLDATE%\n0002\n");
+        let explicit = v2.replace("%REASON%\n1\n", "%REASON%\n0\n");
+        assert!(matches!(
+            alpm_db::desc::DbDescFile::from_str(&v1),
+            Ok(alpm_db::desc::DbDescFile::V1(_))
+        ));
+        assert!(matches!(
+            alpm_db::desc::DbDescFile::from_str(&v2),
+            Ok(alpm_db::desc::DbDescFile::V2(_))
+        ));
+        for (body, description, is_explicit) in [
+            (&v1, "Offline metadata fixture", false),
+            (&v2, "Offline metadata fixture", false),
+            (&marker, "Literal %XDATA% marker", false),
+            (&explicit, "Offline metadata fixture", true),
+        ] {
+            let parsed =
+                parse_local_desc_content(body).expect("official local metadata must parse");
+            assert_eq!(parsed.name, "widget");
+            assert_eq!(parsed.desc, description);
+            assert_eq!(parsed.version.to_string(), "1:2.3-1");
+            assert_eq!(parsed.groups, ["pinned", "other"]);
+            assert_eq!(parsed.explicit, is_explicit);
+            assert_eq!(parsed.install_date, "2");
+            assert_eq!(parsed.licenses, ["MIT"]);
+            assert_eq!(parsed.depends, ["glibc>=2"]);
+            assert_eq!(parsed.provides, ["virtual-widget=1"]);
+            assert_eq!(parsed.optdepends, ["extra-widget: optional feature"]);
+            let malformed = body.replace("1:2.3-01", "1:2\0.3-01");
+            let error = parse_local_desc_content(&malformed)
+                .expect_err("a NUL version must be refused by either local metadata format");
+            assert!(format!("{error:#}").contains("Invalid package version"));
         }
     }
 

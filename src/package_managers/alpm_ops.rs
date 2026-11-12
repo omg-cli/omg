@@ -321,12 +321,15 @@ fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u
     let mut cache_dirs = std::collections::HashSet::new();
 
     for cache_dir in paths::pacman_cache_dirs_result()? {
-        if !cache_dir.exists() {
-            continue;
-        }
-        let cache_dir = std::fs::canonicalize(&cache_dir).with_context(|| {
-            format!("Failed to resolve pacman cache at {}", cache_dir.display())
-        })?;
+        let cache_dir = match std::fs::canonicalize(&cache_dir) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to resolve pacman cache at {}", cache_dir.display())
+                });
+            }
+        };
         if !cache_dirs.insert(cache_dir.clone()) {
             continue;
         }
@@ -3379,6 +3382,101 @@ mod tests {
                 assert_eq!(clean_cache(1).expect("cleanup"), (1, 3));
                 assert!(!old.exists());
                 assert_eq!(std::fs::read(&current).expect("retained archive"), b"new");
+            },
+        );
+    }
+
+    #[test]
+    fn clean_cache_distinguishes_missing_and_inaccessible_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST: &str = "package_managers::alpm_ops::tests::clean_cache_distinguishes_missing_and_inaccessible_directories";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "permission checks require an ordinary UID"
+        );
+        let owner = tempfile::tempdir().expect("private cache owner");
+        let cache = owner.path().join("cache");
+        let blocked = owner.path().join("blocked");
+        let hidden = blocked.join("cache");
+        let missing = owner.path().join("missing");
+        std::fs::create_dir(&cache).expect("private healthy cache");
+        std::fs::create_dir_all(&hidden).expect("private inaccessible cache");
+        let old = cache.join("demo-1.0-1-x86_64.pkg.tar.zst");
+        let current = cache.join("demo-2.0-1-x86_64.pkg.tar.zst");
+        let signature = old.with_added_extension("sig");
+        std::fs::write(&old, b"old").expect("old archive");
+        std::fs::write(&current, b"new").expect("current archive");
+        let config = owner.path().join("pacman.conf");
+        temp_env::with_vars(
+            [
+                (
+                    "OMG_PACMAN_CONF",
+                    Some(config.to_str().expect("private config path")),
+                ),
+                ("OMG_PACMAN_CACHE_DIR", None),
+                ("OMG_PACMAN_ROOT", None),
+            ],
+            || {
+                paths::reset_test_overrides();
+                std::fs::write(
+                    &config,
+                    format!(
+                        "[options]\nCacheDir = {} {}\n",
+                        cache.display(),
+                        missing.display()
+                    ),
+                )
+                .expect("missing cache configuration");
+                assert_eq!(
+                    clean_cache(1).expect("missing directories are harmless"),
+                    (1, 3)
+                );
+                assert!(!old.exists());
+                assert_eq!(std::fs::read(&current).expect("retained archive"), b"new");
+                std::fs::write(&old, b"old").expect("restore private old archive");
+                std::fs::write(&signature, b"sig").expect("private signature");
+                std::fs::write(
+                    &config,
+                    format!(
+                        "[options]\nCacheDir = {} {}\n",
+                        cache.display(),
+                        hidden.display()
+                    ),
+                )
+                .expect("inaccessible cache configuration");
+                let restore = scopeguard::guard(blocked.clone(), |path| {
+                    let result =
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+                    eprintln!("Private cache permission restoration: {result:?}");
+                });
+                std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0))
+                    .expect("private permission fault");
+                let result = clean_cache(1);
+                drop(restore);
+                let error = result.expect_err(
+                    "an unreadable configured cache must abort before deleting archives",
+                );
+                assert!(
+                    error.chain().any(|cause| cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|cause| cause.kind() == std::io::ErrorKind::PermissionDenied)),
+                    "{error:#}"
+                );
+                assert_eq!(std::fs::read(&old).expect("preserved old archive"), b"old");
+                assert_eq!(
+                    std::fs::read(&signature).expect("preserved signature"),
+                    b"sig"
+                );
+                assert_eq!(
+                    std::fs::read(&current).expect("preserved current archive"),
+                    b"new"
+                );
             },
         );
     }
