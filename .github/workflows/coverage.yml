@@ -276,6 +276,8 @@ jobs:
               fixture_binary=/fixture
               fixture_profiles=/profiles
               fixture_evidence=/evidence
+              mount -t proc -o nosuid,nodev,noexec proc /proc
+              cat /proc/self/mountinfo > /evidence/mountinfo.txt
               command -v fakeroot
               bwrap --ro-bind / / --unshare-pid --proc /proc -- /bin/true
               bwrap --unshare-user --uid "$(id -u nobody)" --gid "$(id -g nobody)" \

@@ -226,6 +226,12 @@ private network namespace. No global sysctl or executable attachment changes
 are used. Profile syntax and the loader lifecycle are checked locally; actual
 policy loading and native execution require the hosted runner.
 
+The container also prepares a fresh proc filesystem before dropping to the
+fixture user. Docker's hidden proc submounts prevent nested unprivileged proc
+mounts; a private-namespace control reproduced that denial and passed after
+this preparation. Other container path masks remain in place. The fixture
+records mount information and requires both nonroot network-namespace probes.
+
 ## Remaining work
 
 - Live searches and several inventory operations still use C libalpm. Move
