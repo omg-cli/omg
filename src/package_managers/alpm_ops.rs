@@ -1765,20 +1765,9 @@ fn ensure_removals_not_held<'a>(
     package_names: impl IntoIterator<Item = &'a str>,
     hold_pkg: &[String],
 ) -> Result<()> {
-    let matchers = hold_pkg
-        .iter()
-        .map(|pattern| {
-            globset::Glob::new(pattern)
-                .with_context(|| format!("Invalid HoldPkg pattern '{pattern}' in pacman.conf"))
-                .map(|glob| (pattern, glob.compile_matcher()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
+    let matchers = super::pacman_db::compile_package_patterns(hold_pkg, "HoldPkg")?;
     for package_name in package_names {
-        if let Some((pattern, _)) = matchers
-            .iter()
-            .find(|(_, matcher)| matcher.is_match(package_name))
-        {
+        if let Some(pattern) = matchers.matching_pattern(package_name) {
             anyhow::bail!(
                 "Package '{package_name}' is protected by HoldPkg pattern '{pattern}' in pacman.conf and cannot be removed"
             );
@@ -3254,8 +3243,21 @@ mod tests {
     }
 
     #[test]
+    fn hold_pkg_patterns_follow_pacman_literal_braces_and_brackets() {
+        ensure_removals_not_held(["widget-git"], &["widget{,-git}".to_owned()])
+            .expect("pacman does not expand brace alternatives");
+        let error = ensure_removals_not_held(["widget["], &["widget[".to_owned()])
+            .expect_err("unmatched bracket is a literal protected name");
+        assert!(
+            error
+                .to_string()
+                .starts_with("Package 'widget[' is protected by HoldPkg pattern 'widget['")
+        );
+    }
+
+    #[test]
     fn invalid_hold_pkg_patterns_fail_closed() {
-        let error = ensure_removals_not_held(["anything"], &["[".to_string()])
+        let error = ensure_removals_not_held(["anything"], &["held\0".to_string()])
             .expect_err("invalid HoldPkg patterns must not be ignored");
         assert!(error.to_string().contains("Invalid HoldPkg pattern"));
     }

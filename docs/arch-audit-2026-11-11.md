@@ -642,3 +642,43 @@ checks do not establish a fresh hosted coverage verdict.
 
 The local checkout stays on `main`; the approved remote PR branch is the only
 publication target.
+
+## Relation, catalog identity and policy compatibility batch
+
+A further boundary review found raw dependency and provision strings reaching
+native `CString` conversion without the package-version NUL guard. Three tests
+reproduced native `NulError` panics. The existing relation helpers now refuse NUL
+in either operand before parsing, comparison or unconstrained early returns.
+The shared health-relation parser rejects it before orphan and doctor matching.
+Healthy package and soname relation semantics remain covered.
+
+Sync catalogs now require one package directory whose native name and normalized
+version agree with the parsed metadata. Invalid names, nested paths and duplicate
+package identities refuse the catalog instead of overwriting a query candidate.
+A review found and reproduced a nested-path bypass before the final guard.
+Valid release spelling that normalizes numerically remains accepted. Active sync
+caches use `sync_db_source_v3`; old v2 caches cannot bypass identity validation.
+Invalidation removes both generations. Standalone version tests retain optional
+release semantics, while release-less sync identities are refused because native
+ALPM cannot represent them under the advertised package name.
+
+IgnorePkg, IgnoreGroup and HoldPkg now share pacman's POSIX pattern grammar.
+The small existing-module matcher owns its C strings and calls native `fnmatch`
+with flags zero. It preserves literal braces, bracket behavior and the matched
+HoldPkg diagnostic. NUL configuration patterns return an error. The unused
+direct globset dependency was removed without changing other dependency versions.
+AUR update discovery now applies installed IgnoreGroup membership from one local
+snapshot as well as IgnorePkg.
+
+The failing-before wave reproduced eight failing regressions. Final local verification
+passed 2,279 library tests with 12 ignored, all 15 source integration tests, all
+six transaction failure tests, all-target Clippy with warnings denied, and the
+CLI/daemon build. Independent review approved the final source diff. The built
+CLI passed version/help checks and read-only `info pacman` and `list` operations
+against this Arch host with isolated OMG state and the daemon disabled. No host
+packages were installed or removed.
+
+This runtime proof does not close the hosted exact-base coverage comparison.
+The preceding published head `e59d3eb3` passed its instrumented producer but the
+comparison still rejected ALPM source correspondence at base line 523 versus
+head line 587. Current hosted results remain recorded on PR #1057.

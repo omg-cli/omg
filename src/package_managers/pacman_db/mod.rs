@@ -5,7 +5,7 @@
 
 mod db;
 
-pub(crate) use db::compile_ignore_patterns;
+pub(crate) use db::compile_package_patterns;
 
 #[cfg(test)]
 pub(crate) use db::check_local_db_health;

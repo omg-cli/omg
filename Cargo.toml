@@ -252,9 +252,6 @@ urlencoding = "2.1"
 # Data parallelism
 rayon = "1.11.0"
 
-# Pacman IgnorePkg/IgnoreGroup shell-style pattern matching
-# (already present transitively; direct because the Arch cache path uses it)
-globset = { version = "0.4.18", optional = true }
 
 # Bundle the production crypto backend for portable package-signature verification.
 openssl-sys = { version = "=0.9.117", features = ["vendored", "vendored-4"], optional = true }
@@ -386,7 +383,6 @@ arch = [
   "alpm-db",
   "alpm-mtree",
   "alpm-repo-db",
-  "globset",
 ]
 # Optional PGP verification of package signatures (sequoia-openpgp).
 # Built against the MSRV pinned in rust-toolchain.toml / package.rust-version.

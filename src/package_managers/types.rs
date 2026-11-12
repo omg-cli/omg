@@ -359,6 +359,9 @@ pub fn parse_version_or_zero(s: &str) -> Version {
 
 #[cfg(feature = "arch")]
 pub(crate) fn provision_satisfies(dependency: &str, provision: &str) -> bool {
+    if dependency.as_bytes().contains(&0) || provision.as_bytes().contains(&0) {
+        return false;
+    }
     if alpm::Depend::new(dependency).name() != alpm::Depend::new(provision).name() {
         return false;
     }
@@ -374,6 +377,9 @@ pub(crate) fn provision_satisfies(dependency: &str, provision: &str) -> bool {
 
 #[cfg(feature = "arch")]
 pub(crate) fn dependency_version_satisfies(dependency: &str, candidate: &str) -> bool {
+    if dependency.as_bytes().contains(&0) || candidate.as_bytes().contains(&0) {
+        return false;
+    }
     let dependency = alpm::Depend::new(dependency);
     let compare = |required: &alpm::Ver| alpm::vercmp(candidate, required.to_string().as_str());
     match dependency.depmodver() {
@@ -482,6 +488,27 @@ mod tests {
                 "{relation} with {rejected}"
             );
         }
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn native_relation_helpers_refuse_nul_dependencies() {
+        assert!(!dependency_version_satisfies("widget>=1\0", "2"));
+        assert!(!provision_satisfies("virtual>=1\0", "virtual=2"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn native_relation_helpers_refuse_nul_candidates() {
+        assert!(!dependency_version_satisfies("widget>=1", "2\0"));
+        assert!(!dependency_version_satisfies("widget", "2\0"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn native_relation_helpers_refuse_nul_provisions() {
+        assert!(!provision_satisfies("virtual>=1", "virtual=2\0"));
+        assert!(!provision_satisfies("virtual", "virtual\0"));
     }
 
     /// ARCH-R14 regression: a version string that fails the strict parser

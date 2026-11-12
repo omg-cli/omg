@@ -1712,14 +1712,32 @@ impl AurClient {
     pub async fn get_update_list(&self) -> Result<Vec<(String, Version, Version)>> {
         // 1. Get all packages not in official repos
         let foreign_packages = tokio::task::spawn_blocking(|| -> Result<Vec<String>> {
-            let mut packages = get_potential_aur_packages()?;
+            let packages = get_potential_aur_packages()?;
             if packages.is_empty() {
                 return Ok(packages);
             }
             let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
                 .context("Failed to load AUR update filters from pacman.conf")?;
-            let ignored = pacman_db::compile_ignore_patterns(&config.ignore_pkg, "IgnorePkg")?;
-            packages.retain(|name| !ignored.is_match(name));
+            let ignored = pacman_db::compile_package_patterns(&config.ignore_pkg, "IgnorePkg")?;
+            let ignored_groups =
+                pacman_db::compile_package_patterns(&config.ignore_group, "IgnoreGroup")?;
+            let installed_groups = pacman_db::list_local_cached()?
+                .into_iter()
+                .map(|package| (package.name, package.groups))
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut retained = Vec::with_capacity(packages.len());
+            for name in packages {
+                if ignored.is_match(&name) {
+                    continue;
+                }
+                let groups = installed_groups.get(&name).with_context(|| {
+                    format!("Installed AUR package '{name}' disappeared while filtering updates")
+                })?;
+                if !groups.iter().any(|group| ignored_groups.is_match(group)) {
+                    retained.push(name);
+                }
+            }
+            let packages = retained;
             Ok(packages)
         })
         .await
@@ -5168,6 +5186,10 @@ mod tests {
         let fixture = S72Fixture::new(&["held-demo", "held-extra", "free-demo"])?;
         fixture.with_environment(async {
             S72Fixture::index(&["held-demo", "held-extra", "free-demo"])?;
+            let held_desc = fixture.db.join("local/held-demo-1.0-1/desc");
+            let mut content = std::fs::read_to_string(&held_desc)?;
+            content.push_str("%GROUPS%\npinned\n\n");
+            std::fs::write(&held_desc, content)?;
             let client = fixture.client();
             let before = fixture.local_bytes()?;
             let names = |mut updates: Vec<(String, Version, Version)>| {
@@ -5178,6 +5200,16 @@ mod tests {
                 }
                 updates.into_iter().map(|row| row.0).collect::<Vec<_>>()
             };
+            assert_eq!(
+                names(client.get_update_list().await?),
+                ["free-demo", "held-demo", "held-extra"]
+            );
+            std::fs::write(&fixture.conf, "[options]\nIgnoreGroup = pinned\n")?;
+            assert_eq!(
+                names(client.get_update_list().await?),
+                ["free-demo", "held-extra"]
+            );
+            std::fs::write(&fixture.conf, "[options]\nIgnorePkg = held{,-demo}\n")?;
             assert_eq!(
                 names(client.get_update_list().await?),
                 ["free-demo", "held-demo", "held-extra"]

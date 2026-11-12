@@ -352,7 +352,38 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
                 "Missing package name in {} from repository {repo_name}",
                 entry_path.display()
             );
-            packages.insert(pkg.name.clone(), pkg);
+            let directory = entry_path
+                .parent()
+                .and_then(Path::to_str)
+                .context("Invalid sync package directory identity")?;
+            anyhow::ensure!(
+                !directory.contains('/'),
+                "Nested sync package directory identity in {} from repository {repo_name}",
+                entry_path.display()
+            );
+            alpm_types::Name::from_str(&pkg.name).with_context(|| {
+                format!(
+                    "Invalid package name in {} from repository {repo_name}",
+                    entry_path.display()
+                )
+            })?;
+            let (before_release, _) = directory
+                .rsplit_once('-')
+                .context("Missing sync package release in directory identity")?;
+            let (native_name, _) = before_release
+                .rsplit_once('-')
+                .context("Missing sync package version in directory identity")?;
+            let native_version = require_package_version(&directory[native_name.len() + 1..])?;
+            anyhow::ensure!(
+                native_name == pkg.name && native_version.to_string() == pkg.version.to_string(),
+                "Inconsistent package identity in {} from repository {repo_name}",
+                entry_path.display()
+            );
+            anyhow::ensure!(
+                packages.insert(pkg.name.clone(), pkg).is_none(),
+                "Duplicate package identity in {} from repository {repo_name}",
+                entry_path.display()
+            );
         }
     }
 
@@ -1283,7 +1314,7 @@ fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
     let current_epoch = SyncDbEpoch::from_configured_sync_dir(sync_dir)?;
     // Configuration participates in the source identity, so persisted entries
     // produced before a repository-order change cannot be reused.
-    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v2", current_epoch, || {
+    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v3", current_epoch, || {
         let packages = load_sync_packages(sync_dir)?;
         anyhow::ensure!(
             current_epoch == SyncDbEpoch::from_configured_sync_dir(sync_dir)?,
@@ -1546,6 +1577,7 @@ pub fn invalidate_caches() -> Result<()> {
 
 fn invalidate_derived_cache_files(cache_dir: &Path) -> Result<()> {
     for name in [
+        "sync_db_source_v3",
         "sync_db_source_v2",
         "local_db_source_v3",
         "local_db_source_v2",
@@ -1602,8 +1634,8 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
     let before = AlpmCatalogEpoch::observe()?;
     let pacman_config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load update filters from pacman.conf")?;
-    let ignored_packages = compile_ignore_patterns(&pacman_config.ignore_pkg, "IgnorePkg")?;
-    let ignored_groups = compile_ignore_patterns(&pacman_config.ignore_group, "IgnoreGroup")?;
+    let ignored_packages = compile_package_patterns(&pacman_config.ignore_pkg, "IgnorePkg")?;
+    let ignored_groups = compile_package_patterns(&pacman_config.ignore_group, "IgnoreGroup")?;
     let sync_dir = paths::pacman_sync_dir_result()?;
     let local_dir = paths::pacman_local_dir_result()?;
 
@@ -1666,26 +1698,47 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
     Ok(updates)
 }
 
-pub(crate) fn compile_ignore_patterns(
+pub(crate) struct PacmanPatterns(Vec<(String, std::ffi::CString)>);
+
+impl PacmanPatterns {
+    #[expect(
+        unsafe_code,
+        reason = "POSIX fnmatch is the native pacman pattern grammar; owned CStrings satisfy its read-only pointer contract"
+    )]
+    pub(crate) fn matching_pattern(&self, name: &str) -> Option<&str> {
+        let name = std::ffi::CString::new(name).ok()?;
+        self.0.iter().find_map(|(source, pattern)| {
+            // SAFETY: both pointers refer to live NUL-terminated strings; fnmatch only reads them.
+            (unsafe { nix::libc::fnmatch(pattern.as_ptr(), name.as_ptr(), 0) } == 0)
+                .then_some(source.as_str())
+        })
+    }
+
+    pub(crate) fn is_match(&self, name: &str) -> bool {
+        self.matching_pattern(name).is_some()
+    }
+}
+
+pub(crate) fn compile_package_patterns(
     patterns: &[String],
     setting: &str,
-) -> Result<globset::GlobSet> {
-    let mut builder = globset::GlobSetBuilder::new();
-    for pattern in patterns {
-        let glob = globset::Glob::new(pattern)
-            .with_context(|| format!("Invalid {setting} pattern {pattern:?}"))?;
-        builder.add(glob);
-    }
-    builder
-        .build()
-        .with_context(|| format!("Failed to compile {setting} patterns"))
+) -> Result<PacmanPatterns> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            let native = std::ffi::CString::new(pattern.as_str())
+                .with_context(|| format!("Invalid {setting} pattern {pattern:?}"))?;
+            Ok((pattern.clone(), native))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(PacmanPatterns)
 }
 
 fn package_is_ignored(
     name: &str,
     groups: &[String],
-    ignored_packages: &globset::GlobSet,
-    ignored_groups: &globset::GlobSet,
+    ignored_packages: &PacmanPatterns,
+    ignored_groups: &PacmanPatterns,
 ) -> bool {
     ignored_packages.is_match(name) || groups.iter().any(|group| ignored_groups.is_match(group))
 }
@@ -1810,6 +1863,10 @@ struct HealthRelation<'a> {
 }
 
 fn health_relation(raw: &str) -> Result<HealthRelation<'_>> {
+    anyhow::ensure!(
+        !raw.as_bytes().contains(&0),
+        "NUL in dependency or provision"
+    );
     alpm_types::RelationOrSoname::from_str(raw)
         .with_context(|| format!("Invalid required dependency or provision {raw}"))?;
     if let Some(index) = raw.find(['<', '>', '=']) {
@@ -2421,7 +2478,26 @@ mod tests {
                     batch2_write_sync(&db.join("sync/core.db"), available);
                     invalidate_caches().unwrap();
 
-                    let updates = check_updates_cached().unwrap();
+                    let result = check_updates_cached();
+                    if !available.contains('-') {
+                        assert!(
+                            result.is_err(),
+                            "a sync archive without a release has no native package identity"
+                        );
+                        assert_eq!(
+                            usize::from(
+                                crate::package_managers::types::compare_versions(
+                                    &Version::from_str(installed).unwrap(),
+                                    &Version::from_str(available).unwrap(),
+                                )
+                                .is_lt()
+                            ),
+                            expected_count,
+                            "standalone version semantics remain valid for {installed} / {available}"
+                        );
+                        continue;
+                    }
+                    let updates = result.unwrap();
                     assert_eq!(
                         updates.len(),
                         expected_count,
@@ -2469,6 +2545,96 @@ mod tests {
                 assert_eq!(compare(&va, &vb), va.cmp(&vb), "{a} vs {b}");
             }
         }
+    }
+
+    fn write_sync_identity_fixture(path: &Path, entries: &[(&str, &str)]) {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (entry, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, entry, content.as_bytes())
+                .unwrap();
+        }
+        fs::write(path, archive.into_inner().unwrap().finish().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sync_archive_identity_refuses_conflicting_names_versions_and_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("core.db");
+        for entries in [
+            vec![(
+                "nested/actual-1-1/desc",
+                "%NAME%\nnested/actual\n\n%VERSION%\n1-1\n",
+            )],
+            vec![("actual-1-1/desc", "%NAME%\nother\n\n%VERSION%\n1-1\n")],
+            vec![("actual-1-1/desc", "%NAME%\nactual\n\n%VERSION%\n2-1\n")],
+            vec![
+                ("actual-1-1/desc", "%NAME%\nactual\n\n%VERSION%\n1-1\n"),
+                ("actual-2-1/desc", "%NAME%\nactual\n\n%VERSION%\n2-1\n"),
+            ],
+        ] {
+            write_sync_identity_fixture(&path, &entries);
+            assert!(
+                parse_sync_db(&path, "core").is_err(),
+                "accepted {entries:?}"
+            );
+        }
+        for version in ["1-1", "1:2-01", "2:1.0-3"] {
+            let entry = format!("actual-package-{version}/desc");
+            let desc = format!("%NAME%\nactual-package\n\n%VERSION%\n{version}\n");
+            write_sync_identity_fixture(&path, &[(&entry, &desc)]);
+            assert!(
+                parse_sync_db(&path, "core")
+                    .unwrap()
+                    .contains_key("actual-package")
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sync_archive_identity_does_not_reuse_unvalidated_legacy_cache() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::sync_archive_identity_does_not_reuse_unvalidated_legacy_cache",
+            "[core]\n",
+            |db| {
+                write_sync_identity_fixture(
+                    &db.join("sync/core.db"),
+                    &[("actual-1-1/desc", "%NAME%\nother\n\n%VERSION%\n1-1\n")],
+                );
+                let legacy = DbCache {
+                    packages: vec![RepositoryPackages {
+                        name: "core".to_owned(),
+                        usage: RepoUsage::ALL,
+                        packages: Ok(HashMap::from([(
+                            "widget".to_owned(),
+                            SyncDbPackage {
+                                name: "widget".to_owned(),
+                                repo: "core".to_owned(),
+                                version: Version::from_str("2-1").unwrap(),
+                                ..SyncDbPackage::default()
+                            },
+                        )])),
+                    }],
+                    last_modified: Some(
+                        SyncDbEpoch::from_configured_sync_dir(&db.join("sync")).unwrap(),
+                    ),
+                    ..DbCache::default()
+                };
+                save_cache_to_disk_in(&legacy, &paths::cache_dir(), "sync_db_source_v2").unwrap();
+                assert!(
+                    check_updates_cached().is_err(),
+                    "old cache must not conceal inconsistent source identities"
+                );
+            },
+        );
     }
 
     /// Regression: the compression-format probe must rewind the stream before
@@ -2754,9 +2920,9 @@ mod tests {
             groups: vec!["kernel".to_string()],
             ..SyncDbPackage::default()
         };
-        let packages = compile_ignore_patterns(&["linux".to_string()], "IgnorePkg").unwrap();
-        let groups = compile_ignore_patterns(&["kernel".to_string()], "IgnoreGroup").unwrap();
-        let none = compile_ignore_patterns(&[], "empty").unwrap();
+        let packages = compile_package_patterns(&["linux".to_string()], "IgnorePkg").unwrap();
+        let groups = compile_package_patterns(&["kernel".to_string()], "IgnoreGroup").unwrap();
+        let none = compile_package_patterns(&[], "empty").unwrap();
         assert!(package_is_ignored(
             &package.name,
             &package.groups,
@@ -2769,7 +2935,7 @@ mod tests {
             &none,
             &groups
         ));
-        let base = compile_ignore_patterns(&["base".to_string()], "IgnoreGroup").unwrap();
+        let base = compile_package_patterns(&["base".to_string()], "IgnoreGroup").unwrap();
         assert!(!package_is_ignored(
             &package.name,
             &package.groups,
@@ -2779,8 +2945,8 @@ mod tests {
 
         package.name = "linux-zen".to_string();
         package.groups = vec!["kernel-zen".to_string()];
-        let packages = compile_ignore_patterns(&["linux-*".to_string()], "IgnorePkg").unwrap();
-        let groups = compile_ignore_patterns(&["kernel-*".to_string()], "IgnoreGroup").unwrap();
+        let packages = compile_package_patterns(&["linux-*".to_string()], "IgnorePkg").unwrap();
+        let groups = compile_package_patterns(&["kernel-*".to_string()], "IgnoreGroup").unwrap();
         assert!(package_is_ignored(
             &package.name,
             &package.groups,
@@ -3353,9 +3519,9 @@ mod tests {
                 }],
                 ..DbCache::default()
             };
-            save_cache_to_disk_in(&sync, directory.path(), "sync_db_source_v2")?;
+            save_cache_to_disk_in(&sync, directory.path(), "sync_db_source_v3")?;
             let loaded_sync: Result<DbCache> =
-                load_cache_from_disk_in(directory.path(), "sync_db_source_v2");
+                load_cache_from_disk_in(directory.path(), "sync_db_source_v3");
             assert_eq!(
                 loaded_sync.is_ok(),
                 !raw.contains('\0'),
@@ -3394,10 +3560,10 @@ mod tests {
         };
         fs::write(directory.path().join("sync_db.bin"), b"legacy cache")?;
         fs::write(
-            directory.path().join("sync_db_source_v2.bin"),
+            directory.path().join("sync_db_source_v3.bin"),
             bitcode::serialize(&cache)?,
         )?;
-        let decoded: DbCache = load_cache_from_disk_in(directory.path(), "sync_db_source_v2")?;
+        let decoded: DbCache = load_cache_from_disk_in(directory.path(), "sync_db_source_v3")?;
         assert_eq!(decoded.last_modified, cache.last_modified);
         assert_eq!(
             fs::read(directory.path().join("sync_db.bin"))?,
@@ -3410,6 +3576,7 @@ mod tests {
     fn invalidate_derived_cache_files_removes_live_and_legacy_names() -> Result<()> {
         let directory = tempfile::tempdir()?;
         for name in [
+            "sync_db_source_v3.bin",
             "sync_db_source_v2.bin",
             "local_db_source_v3.bin",
             "local_db_source_v2.bin",
@@ -3424,6 +3591,7 @@ mod tests {
         }
         invalidate_derived_cache_files(directory.path())?;
         for name in [
+            "sync_db_source_v3.bin",
             "sync_db_source_v2.bin",
             "local_db_source_v3.bin",
             "local_db_source_v2.bin",
@@ -3986,6 +4154,39 @@ mod tests {
             let temp = health_fixture();
             write_local_desc(&temp, "app", "0", extra);
             assert!(check_local_db_health(temp.path()).is_err(), "{extra}");
+        }
+    }
+
+    #[test]
+    fn health_matching_refuses_nul_relations_before_native_comparison() {
+        for extra in [
+            "\n%DEPENDS%\nprovider>=1\0\n",
+            "\n%PROVIDES%\nvirtual=1\0\n",
+        ] {
+            let temp = health_fixture();
+            write_local_desc(&temp, "app", "0", extra);
+            assert!(check_local_db_health(temp.path()).is_err(), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn ignore_patterns_follow_native_fnmatch_grammar() {
+        for (pattern, value, expected) in [
+            ("widget{,-git}", "widget", false),
+            ("widget{,-git}", "widget-git", false),
+            ("widget{,-git}", "widget{,-git}", true),
+            ("[!a]*", "widget", true),
+            ("[!a]*", "arch", false),
+            ("widget[", "widget[", true),
+            ("widget-*", "widget-git", true),
+        ] {
+            let compiled = compile_package_patterns(&[pattern.to_owned()], "IgnorePkg")
+                .expect("pacman permits literal unmatched brackets");
+            assert_eq!(
+                compiled.is_match(value),
+                expected,
+                "{pattern:?} / {value:?}"
+            );
         }
     }
 
