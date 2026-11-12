@@ -475,6 +475,34 @@ mod tests {
     }
 
     #[test]
+    fn mtree_malformed_statements_preserve_syntax_diagnostics() {
+        for text in [
+            "/set uid=not-a-number\n",
+            "/unset unsupported\n",
+            "./payload uid=0 gid=0 mode=not-octal type=file time=0.0 size=4\n",
+            "#mtree\n/set uid=0",
+        ] {
+            let error = parse(text.as_bytes()).expect_err("malformed MTREE must be refused");
+            assert!(
+                error.to_string().contains("invalid AUR MTREE syntax"),
+                "malformed statement {text:?}: {error:#}"
+            );
+        }
+        let valid = format!(
+            "./payload uid=0 gid=0 mode=644 type=file time=0.0 size=4 sha256digest={}\n",
+            "0".repeat(64)
+        );
+        let inventory = parse(valid.as_bytes()).expect("valid MTREE statement remains eligible");
+        assert_eq!(
+            inventory.get("payload"),
+            Some(&LogicalNode::File {
+                mode: 0o644,
+                size: 4
+            })
+        );
+    }
+
+    #[test]
     fn mtree_duplicate_defaults_and_path_properties_are_refused() {
         for text in [
             "/set uid=0 uid=1\n",

@@ -95,6 +95,24 @@ mod tests {
     }
 
     #[test]
+    fn many_privileged_outputs_cannot_truncate_the_approval_summary() {
+        let inspections: Vec<_> = (0..512)
+            .map(|index| {
+                let mut output = inspection();
+                output.package_name = format!("demo-{index}");
+                output.install_hook = Some("b".repeat(64));
+                output
+            })
+            .collect();
+        let error = exception_prompt(&inspections)
+            .expect_err("all requested outputs must fit before approval can be offered");
+        assert_eq!(
+            error.to_string(),
+            "AUR privilege summary exceeds display limit"
+        );
+    }
+
+    #[test]
     fn prompt_buffer_refuses_overflow_without_extending_it() {
         let mut prompt = Prompt::default();
         prompt

@@ -295,6 +295,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_history_clone_reports_sanitized_repository_diagnostics() {
+        let owner = tempfile::tempdir().expect("owned missing repository");
+        let missing = owner.path().join("missing-repository\u{1b}[31m");
+        let checkout = tempfile::tempdir().expect("owned failed checkout");
+        let error = checkout_version(fixture_url(&missing), checkout.path(), "example", "1.0-1")
+            .await
+            .expect_err("a missing repository cannot produce a historical checkout");
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("Failed to clone AUR history"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("missing-repository"), "{diagnostic}");
+        assert!(
+            !diagnostic.chars().any(char::is_control),
+            "Git stderr must not control the review terminal: {diagnostic:?}"
+        );
+        assert!(!missing.exists());
+        assert!(!checkout.path().join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn empty_history_reports_log_failure_instead_of_an_absent_version() {
+        let repository = tempfile::tempdir().expect("owned empty history");
+        git(
+            repository.path(),
+            &["init", "--quiet", "--initial-branch=main"],
+        );
+        let checkout = tempfile::tempdir().expect("owned empty checkout");
+        let error = checkout_version(
+            fixture_url(repository.path()),
+            checkout.path(),
+            "example",
+            "1.0-1",
+        )
+        .await
+        .expect_err("an unborn branch cannot establish version absence");
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("Failed to list AUR history"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("was not found"), "{diagnostic}");
+        assert!(!checkout.path().join("marker").exists());
+        assert!(!repository.path().join("marker").exists());
+    }
+
+    #[test]
+    fn missing_git_reports_the_required_tool_without_creating_a_checkout() {
+        const TEST: &str = "package_managers::aur::history::tests::missing_git_reports_the_required_tool_without_creating_a_checkout";
+        if crate::core::testing::run_isolated_test(TEST) {
+            return;
+        }
+        let empty_path = tempfile::tempdir().expect("private empty executable path");
+        let checkout = tempfile::tempdir().expect("owned missing-tool checkout");
+        temp_env::with_var("PATH", Some(empty_path.path()), || {
+            let error = tokio::runtime::Runtime::new()
+                .expect("private history runtime")
+                .block_on(checkout_version(
+                    "/unused-local-history",
+                    checkout.path(),
+                    "example",
+                    "1.0-1",
+                ))
+                .expect_err("rollback cannot continue without Git");
+            assert!(
+                error
+                    .to_string()
+                    .contains("git is required for AUR version rollback"),
+                "{error:#}"
+            );
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(std::io::ErrorKind::NotFound),
+                "the missing executable cause must remain available to callers"
+            );
+        });
+        assert_eq!(
+            std::fs::read_dir(checkout.path())
+                .expect("checkout inventory")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn history_checkout_refuses_to_overwrite_untracked_content() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST: &str = "package_managers::aur::history::tests::history_checkout_refuses_to_overwrite_untracked_content";
+        if crate::core::testing::run_isolated_test(TEST) {
+            return;
+        }
+        let repository = tempfile::tempdir().expect("private historical repository");
+        git(
+            repository.path(),
+            &["init", "--quiet", "--initial-branch=main"],
+        );
+        std::fs::write(
+            repository.path().join("historical-only"),
+            "old tracked content",
+        )
+        .expect("historical file");
+        commit(repository.path(), Some("1.0"), "historical marker");
+        std::fs::remove_file(repository.path().join("historical-only"))
+            .expect("retire historical-only path from current tree");
+        commit(repository.path(), Some("2.0"), "current marker");
+        let actual_git = which::which("git").expect("real Git fixture executable");
+        let programs = tempfile::tempdir().expect("private Git wrapper directory");
+        let wrapper = programs.path().join("git");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nif [ \"$1\" = -C ] && [ \"$3\" = checkout ]; then\n  printf 'preserve untracked content' > \"$2/historical-only\"\nfi\nexec \"$OMG_HISTORY_REAL_GIT\" \"$@\"\n",
+        )
+        .expect("private conflict-injection wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("private executable mode");
+        let checkout = tempfile::tempdir().expect("owned conflicting checkout");
+        temp_env::with_vars(
+            [
+                ("PATH", Some(programs.path().as_os_str())),
+                ("OMG_HISTORY_REAL_GIT", Some(actual_git.as_os_str())),
+            ],
+            || {
+                let error = tokio::runtime::Runtime::new()
+                    .expect("private history runtime")
+                    .block_on(checkout_version(
+                        fixture_url(repository.path()),
+                        checkout.path(),
+                        "example",
+                        "1.0-1",
+                    ))
+                    .expect_err("historical checkout must refuse the real Git file conflict");
+                let diagnostic = error.to_string();
+                assert!(
+                    diagnostic.contains("Failed to checkout commit"),
+                    "{diagnostic}"
+                );
+                assert!(diagnostic.contains("historical-only"), "{diagnostic}");
+            },
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.path().join("historical-only"))
+                .expect("preserved untracked file"),
+            "preserve untracked content"
+        );
+        for directory in [checkout.path(), repository.path()] {
+            assert_eq!(
+                std::fs::read_to_string(directory.join("marker")).expect("preserved current tree"),
+                "current marker"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn history_log_remains_hash_only_when_signature_display_is_configured() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt;

@@ -818,6 +818,141 @@ mod tests {
 #[cfg(test)]
 mod public_source_tests {
     use super::*;
+
+    #[test]
+    fn mirror_command_publishes_only_successful_hardened_staging() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        const TEST: &str = "package_managers::aur_sources::public_source_tests::mirror_command_publishes_only_successful_hardened_staging";
+        if crate::core::testing::run_isolated_test(TEST) {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let bin = directory.path().join("bin");
+        let srcdest = directory.path().join("srcdest");
+        std::fs::create_dir(&bin)?;
+        std::fs::create_dir(&srcdest)?;
+        let program = bin.join("git");
+        let destination = srcdest.join("mirror");
+        let prefix = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$0.argv\"\nprintf '%s\\n' \"PATH=$PATH\" \"GIT_TERMINAL_PROMPT=$GIT_TERMINAL_PROMPT\" \"GIT_CONFIG_NOSYSTEM=$GIT_CONFIG_NOSYSTEM\" \"GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL\" \"GIT_CONFIG_SYSTEM=$GIT_CONFIG_SYSTEM\" > \"$0.env\"\n[ \"${HTTP_PROXY+x}\" != x ]\n[ \"${GIT_CONFIG_COUNT+x}\" != x ]\n[ \"${GIT_SSH_COMMAND+x}\" != x ]\nfor destination do :; done\n";
+        temp_env::with_vars(
+            [
+                ("PATH", Some(bin.as_os_str())),
+                (
+                    "HTTP_PROXY",
+                    Some(std::ffi::OsStr::new("http://127.0.0.1:9")),
+                ),
+                ("GIT_CONFIG_COUNT", Some(std::ffi::OsStr::new("1"))),
+                (
+                    "GIT_SSH_COMMAND",
+                    Some(std::ffi::OsStr::new("must-not-run")),
+                ),
+            ],
+            || -> Result<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                for success in [false, true] {
+                    let body = if success {
+                        "/usr/bin/mkdir -p \"$destination/objects\"\nprintf inert > \"$destination/HEAD\"\n"
+                    } else {
+                        "/usr/bin/mkdir -p \"$destination\"\nprintf partial > \"$destination/HEAD\"\nprintf '\\033[31mprivate failure\\033[0m' >&2\nexit 7\n"
+                    };
+                    std::fs::write(&program, format!("{prefix}{body}"))?;
+                    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+                    std::fs::write(&destination, b"stale occupant")?;
+                    let result = runtime.block_on(mirror_git_repository(
+                        "https://1.1.1.1/omg-inert.git",
+                        &destination,
+                    ));
+                    let arguments = std::fs::read_to_string(bin.join("git.argv"))?;
+                    let arguments: Vec<_> = arguments.lines().collect();
+                    assert_eq!(arguments.len(), 20);
+                    assert_eq!(
+                        &arguments[..19],
+                        [
+                            "-c",
+                            "http.curloptResolve=1.1.1.1:443:1.1.1.1",
+                            "-c",
+                            "http.followRedirects=false",
+                            "-c",
+                            "http.proxy=",
+                            "-c",
+                            "protocol.file.allow=never",
+                            "-c",
+                            "protocol.ssh.allow=never",
+                            "-c",
+                            "protocol.git.allow=never",
+                            "-c",
+                            "protocol.ext.allow=never",
+                            "clone",
+                            "--mirror",
+                            "--origin=origin",
+                            "--",
+                            "https://1.1.1.1/omg-inert.git",
+                        ]
+                    );
+                    let staged = std::path::Path::new(arguments[19]);
+                    assert_eq!(staged.file_name(), Some(std::ffi::OsStr::new("mirror")));
+                    let staging_owner = staged.parent().expect("staged clone owner");
+                    assert_eq!(staging_owner.parent(), Some(srcdest.as_path()));
+                    assert!(
+                        staging_owner
+                            .file_name()
+                            .expect("staging name")
+                            .as_encoded_bytes()
+                            .starts_with(b".vcs-")
+                    );
+                    assert!(
+                        !staging_owner.exists(),
+                        "the staging owner must be retired on either result"
+                    );
+                    let environment = std::fs::read_to_string(bin.join("git.env"))?;
+                    assert_eq!(
+                        environment,
+                        format!(
+                            "PATH={}\nGIT_TERMINAL_PROMPT=0\nGIT_CONFIG_NOSYSTEM=1\nGIT_CONFIG_GLOBAL=/dev/null\nGIT_CONFIG_SYSTEM=/dev/null\n",
+                            bin.display()
+                        )
+                    );
+                    if success {
+                        result?;
+                        assert_eq!(std::fs::read(destination.join("HEAD"))?, b"inert");
+                        assert!(destination.join("objects").is_dir());
+                    } else {
+                        let error =
+                            result.expect_err("nonzero clone must never publish partial output");
+                        let message = format!("{error:#}");
+                        assert!(message.contains("git clone --mirror failed"), "{message}");
+                        assert!(message.contains("private failure"), "{message}");
+                        assert!(!message.contains('\u{1b}'), "{message:?}");
+                        assert!(!destination.exists());
+                        assert_eq!(srcdest.read_dir()?.count(), 0);
+                    }
+                }
+                std::fs::remove_dir_all(&destination)?;
+                let untouched = directory.path().join("untouched");
+                std::fs::write(&untouched, b"keep")?;
+                symlink(&untouched, &destination)?;
+                std::fs::remove_file(bin.join("git.argv"))?;
+                let error = runtime
+                    .block_on(mirror_git_repository(
+                        "https://1.1.1.1/omg-inert.git",
+                        &destination,
+                    ))
+                    .expect_err("a symlink cannot select the clone destination");
+                assert!(error.to_string().contains("symlinked SRCDEST"));
+                assert!(
+                    !bin.join("git.argv").exists(),
+                    "refusal precedes Git execution"
+                );
+                assert_eq!(std::fs::read(&untouched)?, b"keep");
+                assert!(destination.is_symlink());
+                Ok(())
+            },
+        )
+    }
+
     #[test]
     fn private_and_transition_destinations_are_rejected() {
         for value in [

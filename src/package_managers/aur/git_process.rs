@@ -1,5 +1,6 @@
 //! Bounded Git subprocess capture and process-group cleanup.
 
+use std::convert::Infallible;
 use std::path::Path;
 use std::process::{Output, Stdio};
 use std::time::Duration;
@@ -68,7 +69,7 @@ async fn inspect_git_staging(path: &Path, limits: GitLimits) -> Result<()> {
         .context("AUR Git staging inspection failed")?
 }
 
-async fn monitor_git_staging(path: &Path, limits: GitLimits) -> Result<()> {
+async fn monitor_git_staging(path: &Path, limits: GitLimits) -> Result<Infallible> {
     loop {
         inspect_git_staging(path, limits).await?;
         tokio::time::sleep(limits.poll_interval).await;
@@ -211,10 +212,7 @@ pub(in crate::package_managers) async fn run_bounded_git(
                 inspect_git_staging(staging_path, limits).await?;
                 Ok((stdout, stderr))
             } => completed,
-            monitored = monitor_git_staging(staging_path, limits) => {
-                monitored?;
-                anyhow::bail!("AUR Git staging monitor stopped unexpectedly")
-            },
+            monitored = monitor_git_staging(staging_path, limits) => match monitored? {},
         }
     })
     .await
@@ -264,6 +262,94 @@ mod tests {
             staging_entries: 16,
             poll_interval: Duration::from_millis(5),
         }
+    }
+
+    #[tokio::test]
+    async fn staging_inspection_preserves_filesystem_errors() {
+        let staging = tempfile::tempdir().expect("private Git staging fixture");
+        let file = staging.path().join("file");
+        std::fs::write(&file, b"inert").expect("private non-directory ancestor");
+        let path = file.join("child");
+        let error = inspect_git_staging(&path, limits())
+            .await
+            .expect_err("a non-directory ancestor must not become absent staging");
+        assert!(format!("{error:#}").contains(&path.display().to_string()));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotADirectory)
+        );
+        assert_eq!(std::fs::read(&file).expect("unchanged ancestor"), b"inert");
+        let monitored =
+            tokio::time::timeout(Duration::from_secs(2), monitor_git_staging(&path, limits()))
+                .await
+                .expect("staging observation must propagate its filesystem error")
+                .expect_err("a failed monitor cannot authorize continued Git execution");
+        assert_eq!(
+            monitored
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotADirectory)
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_observation_refuses_a_process_that_is_not_our_child() {
+        let error =
+            tokio::time::timeout(Duration::from_secs(2), observe_git_exit(std::process::id()))
+                .await
+                .expect("non-child observation must not wait for a signal")
+                .expect_err("the caller cannot reserve its own child identity");
+        assert!(format!("{error:#}").contains("without reaping"));
+        assert_eq!(
+            error.downcast_ref::<nix::errno::Errno>(),
+            Some(&nix::errno::Errno::ECHILD)
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_preserves_read_failures_and_refuses_overflowing_limits() {
+        let directory = tempfile::tempdir().expect("private capture fixture");
+        let input = tokio::fs::File::open(directory.path())
+            .await
+            .expect("Linux permits opening a directory before refusing reads");
+        let error = capture_git_pipe(input, 16, "stderr")
+            .await
+            .expect_err("an input read failure must not become empty diagnostics");
+        assert!(format!("{error:#}").contains("Failed to capture AUR Git stderr"));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::IsADirectory)
+        );
+        let error = capture_git_pipe(tokio::io::empty(), u64::MAX, "stdout")
+            .await
+            .expect_err("the extra detection byte must not wrap the configured limit");
+        assert!(error.to_string().contains("output limit overflowed"));
+    }
+
+    #[tokio::test]
+    async fn missing_program_preserves_the_spawn_error_without_creating_staging() {
+        let owner = tempfile::tempdir().expect("private missing-command fixture");
+        let staging = owner.path().join("not-created");
+        let mut command = Command::new(owner.path().join("missing-git"));
+        let error = run_bounded_git(
+            &mut command,
+            &staging,
+            limits(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect_err("a missing executable must preserve its cause");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        assert!(!staging.exists());
     }
 
     #[tokio::test]

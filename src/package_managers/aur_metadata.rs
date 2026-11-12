@@ -921,6 +921,25 @@ mod tests {
     }
 
     #[test]
+    fn missing_metadata_root_does_not_create_a_cache_or_lock() {
+        let directory = tempfile::tempdir().expect("private metadata owner");
+        let root = directory.path().join("absent");
+        assert!(
+            open_fresh_metadata_index_at(&root, Duration::from_mins(1))
+                .expect("missing metadata root is a cache miss")
+                .is_none()
+        );
+        assert!(
+            !root.exists(),
+            "a read must not create the absent metadata root"
+        );
+        assert_eq!(
+            directory.path().read_dir().expect("private owner").count(),
+            0
+        );
+    }
+
+    #[test]
     fn stale_index_is_not_a_fresh_metadata_generation() {
         let directory = tempfile::tempdir().unwrap();
         publish_generation(directory.path(), &catalogue("one"), AurMetaCache::default()).unwrap();

@@ -222,6 +222,74 @@ fn runtime_sibling(
 mod tests {
     use super::{SourceInfoV1, dependency_info, dependency_plan, output_version_satisfies};
 
+    #[test]
+    fn public_dependency_reader_preserves_requests_when_metadata_is_absent() {
+        let directory = tempfile::tempdir().expect("private source directory");
+        let requested = vec!["example-docs".to_owned(), "example-cli".to_owned()];
+        let info = super::check_dependencies_for_outputs(directory.path(), &requested)
+            .expect("absent metadata has no declared dependencies");
+        assert!(info.missing.is_empty());
+        assert_eq!(info.package_outputs, requested);
+        assert!(
+            directory
+                .path()
+                .read_dir()
+                .expect("private directory")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn public_dependency_reader_uses_selected_outputs_and_installed_versions() {
+        const TEST: &str = "package_managers::aur_deps::tests::public_dependency_reader_uses_selected_outputs_and_installed_versions";
+        if crate::config::Settings::rerun_test_unprivileged(TEST)
+            || crate::core::testing::run_isolated_test(TEST)
+        {
+            return;
+        }
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+                crate::package_managers::alpm_direct::clear_alpm_cache();
+            }
+        }
+        let _restore = Restore;
+        let (directory, handle) =
+            installed_fixture(&[("external-old", "1.0-1"), ("external-new", "3.0-1")]);
+        drop(handle);
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).expect("private source checkout");
+        std::fs::write(
+            source.join(".SRCINFO"),
+            "pkgbase = example\n\tpkgver = 1.0.0\n\tpkgrel = 1\n\tarch = any\npkgname = example-cli\n\tdepends = external-old>=2\n\tdepends = external-new>=2\n\tdepends = example-lib=1.0.0\npkgname = example-lib\npkgname = example-docs\n\tdepends = docs-only\n",
+        )
+        .expect("selected-output metadata");
+        let config = directory.path().join("pacman.conf");
+        std::fs::write(&config, "[options]\nSigLevel = Never\n").expect("private pacman config");
+        crate::core::paths::set_test_overrides(
+            Some(directory.path().join("root")),
+            Some(directory.path().join("db")),
+        );
+        crate::package_managers::alpm_direct::clear_alpm_cache();
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+                ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
+            ],
+            || {
+                let info =
+                    super::check_dependencies_for_outputs(&source, &["example-cli".to_owned()])
+                        .expect("bounded metadata and private native installed state");
+                assert_eq!(info.package_outputs, ["example-cli", "example-lib"]);
+                assert_eq!(info.missing, ["external-old>=2"]);
+            },
+        );
+    }
+
     fn split_fixture(base_dependencies: &str, packages: &str) -> SourceInfoV1 {
         SourceInfoV1::from_string(&format!(
             "pkgbase = example\n\tpkgdesc = dependency plan fixture\n\tpkgver = 1.0.0\n\tpkgrel = 1\n\tarch = any\n{base_dependencies}\n{packages}"
