@@ -235,12 +235,14 @@ jq() { :; }
                     self.assertNotEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(receipt.exists())
 
-    def test_continuous_profiles_require_the_verified_coverage_toolchain(self):
+    def test_exit_flush_and_native_continuous_profiles_require_the_verified_coverage_toolchain(self):
         workflow = (WORKFLOWS / 'coverage.yml').read_text()
         self.assertNotIn('runtime-counter-relocation', workflow.split('jobs:', 1)[0])
         coverage = workflow.split('  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
         self.assertIn('RUSTFLAGS: -C llvm-args=-runtime-counter-relocation', coverage)
-        self.assertIn('LLVM_PROFILE_FILE_NAME: omg-%p-%m%c.profraw', coverage)
+        self.assertIn('LLVM_PROFILE_FILE_NAME: omg-%p-%m.profraw', coverage)
+        self.assertIn('LLVM_PROFILE_FILE="$fixture_profiles/omg-fixture-$case_id-%p-%m%c.profraw"', coverage)
+        self.assertIn('--default-toolchain 1.95.0', coverage)
         self.assertIn('tool: cargo-llvm-cov@0.9.0,nextest', coverage)
 
     def test_sandbox_coverage_requires_one_existing_instrumented_binary(self):
@@ -591,8 +593,15 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Unsupported region schema', result.stderr)
 
-    def collect(self):
-        result = self.run_shell(step_script('coverage.yml', 'Collect invalid coverage diagnostics'))
+    def collect(self, member_calls=None, input_budget=None, projection_budget=None):
+        script = step_script('coverage.yml', 'Collect invalid coverage diagnostics')
+        if member_calls is not None:
+            script = script.replace("members = {'calls_left': 8192,", "members = {'calls_left': " + str(member_calls) + ",")
+        if input_budget is not None:
+            script = script.replace('budget = 128 * 1024 * 1024', 'budget = ' + str(input_budget))
+        if projection_budget is not None:
+            script = script.replace('projection_budget = 16 * 1024 * 1024', 'projection_budget = ' + str(projection_budget))
+        result = self.run_shell(script)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         output = Path(self.environment['RUNNER_TEMP']) / 'coverage-diagnostics'
         return json.loads((output / 'receipt.json').read_text()), output / 'profiles.tar.gz'
@@ -601,7 +610,7 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
         tools = self.directory / 'toolchain/bin'
         tools.mkdir(parents=True)
         script = f'#!{sys.executable}\n' + textwrap.dedent('''
-            import json, pathlib, sys
+            import json, os, pathlib, sys, time
             name = pathlib.Path(sys.argv[0]).name
             if '--version' in sys.argv or '-vV' in sys.argv:
                 print('fixture tool version')
@@ -609,15 +618,40 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
                 print(pathlib.Path(__file__).parent.parent / 'lib')
             elif name == 'llvm-cov':
                 assert sys.argv[1] == 'convert-for-testing'
-                pathlib.Path(sys.argv[4]).write_bytes(b'coverage map only')
+                if os.environ.get('TEST_LARGE_MAP'):
+                    with pathlib.Path(sys.argv[2]).open('rb') as source:
+                        size = 9 * 1024 * 1024 if source.read(3) == b'BIG' else 3 * 1024 * 1024
+                    with pathlib.Path(sys.argv[4]).open('wb') as output:
+                        output.truncate(size)
+                else:
+                    pathlib.Path(sys.argv[4]).write_bytes(b'coverage map only')
+                for projection in pathlib.Path(os.environ['RUNNER_TEMP']).glob('coverage-diagnostics/*.proftext'):
+                    behavior = os.environ.get('TEST_PROJECTION_TAMPER')
+                    if behavior == 'alter': projection.write_bytes(b'corrupted')
+                    if behavior == 'oversize': projection.write_bytes(b'x' * 65537)
+                    if behavior == 'symlink':
+                        projection.unlink()
+                        projection.symlink_to(pathlib.Path(os.environ['RUNNER_TEMP']) / 'outside')
             elif name == 'llvm-profdata':
                 assert sys.argv[1:3] == ['show', '--text']
                 wanted = sys.argv[3].split('=', 1)[1]
                 with pathlib.Path(sys.argv[4]).open('rb') as stream:
                     values = json.loads(stream.read(64).rstrip(b'\\0').strip())
+                if os.environ.get('TEST_RAW_TAMPER') == 'mmap':
+                    marker = pathlib.Path(os.environ['RUNNER_TEMP']) / 'probe-started'
+                    marker.touch()
+                    until = time.monotonic() + 3
+                    while not marker.with_name('raw-mutated').exists() and time.monotonic() < until:
+                        time.sleep(0.005)
+                elif os.environ.get('TEST_RAW_TAMPER'):
+                    pathlib.Path(os.readlink(sys.argv[4])).write_text('{"a": 20}')
                 for function, count in values.items():
                     if wanted in function:
                         print(function + '\\n# Func Hash:\\n1\\n# Num Counters:\\n1\\n# Counter Values:\\n' + str(count))
+                if os.environ.get('TEST_CORRUPT_RECORD'):
+                    print(wanted + '\\n# Func Hash:\\n1\\n# Num Counters:\\n2\\n# Counter Values:\\n1')
+                if os.environ.get('TEST_PROBE_OVERSIZE'):
+                    print('x' * 65537)
         ''')
         for name in ('rustc', 'cargo', 'llvm-cov', 'llvm-profdata'):
             path = tools / name
@@ -657,6 +691,153 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
             self.assertNotIn(executable.relative_to(self.directory).as_posix(), bundle.getnames())
         self.assertEqual(receipt['objects'][0]['sha256'], hashlib.sha256(executable.read_bytes()).hexdigest())
         self.assertLessEqual(receipt['captured_input_bytes'], 128 * 1024 * 1024)
+
+    def projection_fixture(self):
+        self.diagnostic_tools()
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        raw = target / 'omg-200-222_0.profraw'
+        with raw.open('wb') as stream:
+            stream.write(b'{"a": 19}')
+            stream.truncate(2048)
+        executable = target / 'fixture-object'
+        executable.write_bytes(b'ELF fixture')
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(executable.as_posix()) + '`\n')
+        return raw
+
+    def test_diagnostics_keep_exact_projection_when_whole_raw_exceeds_archive_budget(self):
+        raw = self.projection_fixture()
+        expected = b'a\n# Func Hash:\n1\n# Num Counters:\n1\n# Counter Values:\n19\n'
+        receipt, archive = self.collect(input_budget=1024)
+        probes = receipt['targeting']['probes']
+        self.assertEqual(len(probes), 1)
+        self.assertIn('projection', probes[0], 'nonzero counter record was lost with the oversized whole raw')
+        probe = probes[0]
+        self.assertEqual(probe['raw_sha256'], hashlib.sha256(raw.read_bytes()).hexdigest())
+        self.assertEqual(probe['raw_identity']['inode'], raw.stat().st_ino)
+        self.assertFalse(probe['changed_during_collection'])
+        self.assertTrue(probe['projection'].startswith('profile-projections/'))
+        self.assertEqual(Path(probe['projection']).name, '0.proftext')
+        self.assertEqual(probe['projection_sha256'], hashlib.sha256(expected).hexdigest())
+        self.assertTrue(receipt['targeting']['projection_diagnostic_only'])
+        with tarfile.open(archive) as bundle:
+            self.assertEqual(bundle.getnames()[0], probe['projection'])
+            self.assertEqual(bundle.extractfile(probe['projection']).read(), expected)
+            self.assertNotIn(raw.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertFalse(receipt['complete'])
+
+    def test_diagnostics_refuse_changed_unsafe_or_oversize_projection(self):
+        import shutil
+        for behavior in ('alter', 'oversize', 'symlink'):
+            with self.subTest(behavior=behavior):
+                self.projection_fixture()
+                (self.directory / 'outside').write_bytes(b'private')
+                self.environment['TEST_PROJECTION_TAMPER'] = behavior
+                receipt, archive = self.collect(input_budget=1024 * 1024)
+                projection = receipt['targeting']['probes'][0]['projection']
+                entry = next(entry for entry in receipt['files'] if entry['path'] == projection)
+                self.assertIn('omitted', entry)
+                self.assertIn('symlinks' if behavior == 'symlink' else 'projection changed', entry['omitted'])
+                with tarfile.open(archive) as bundle:
+                    self.assertNotIn(projection, bundle.getnames())
+                shutil.rmtree(self.directory / 'coverage-diagnostics')
+                shutil.rmtree(self.directory / 'target')
+                shutil.rmtree(self.directory / 'toolchain')
+
+    def test_diagnostics_refuse_changed_raw_snapshot(self):
+        self.projection_fixture()
+        self.environment['TEST_RAW_TAMPER'] = '1'
+        receipt, archive = self.collect(input_budget=1024)
+        probe = receipt['targeting']['probes'][0]
+        self.assertTrue(probe['changed_during_collection'])
+        self.assertIn('profile shrank', probe['error'])
+        self.assertEqual(probe['raw_final_identity']['bytes'], len(b'{"a": 20}'))
+        self.assertNotIn('projection', probe)
+        with tarfile.open(archive) as bundle:
+            self.assertFalse(any(name.endswith('.proftext') for name in bundle.getnames()))
+
+    def test_diagnostics_refuse_mmap_counter_change_without_metadata_change(self):
+        import mmap
+        import threading
+        import time
+        raw = self.projection_fixture()
+        self.environment['TEST_RAW_TAMPER'] = 'mmap'
+        with raw.open('r+b') as stream, mmap.mmap(stream.fileno(), 0) as counters:
+            counters[6:8] = b'19'
+            counters.flush()
+            before = raw.stat()
+            mutated = []
+            def mutate_live_counters():
+                until = time.monotonic() + 5
+                while not (self.directory / 'probe-started').exists() and time.monotonic() < until:
+                    time.sleep(0.005)
+                counters[6:8] = b'20'
+                counters.flush()
+                mutated.append(True)
+                (self.directory / 'raw-mutated').touch()
+            writer = threading.Thread(target=mutate_live_counters)
+            writer.start()
+            try:
+                receipt, archive = self.collect(input_budget=1024)
+            finally:
+                writer.join(timeout=6)
+            after = raw.stat()
+        self.assertEqual(mutated, [True])
+        self.assertEqual((before.st_size, before.st_mtime_ns, before.st_ctime_ns),
+                         (after.st_size, after.st_mtime_ns, after.st_ctime_ns))
+        probe = receipt['targeting']['probes'][0]
+        self.assertTrue(probe['changed_during_collection'],
+                        'live mmap counters changed while metadata stayed identical')
+        self.assertNotIn('projection', probe)
+        with tarfile.open(archive) as bundle:
+            self.assertFalse(any(name.endswith('.proftext') for name in bundle.getnames()))
+
+    def test_diagnostics_refuse_corrupt_counter_record(self):
+        self.projection_fixture()
+        self.environment['TEST_CORRUPT_RECORD'] = '1'
+        receipt, _ = self.collect(input_budget=1024)
+        probe = receipt['targeting']['probes'][0]
+        self.assertIn('invalid counter record', probe['error'])
+        self.assertNotIn('projection', probe)
+
+    def test_diagnostics_bound_projection_total_and_probe_output(self):
+        import shutil
+        for behavior in ('total', 'output'):
+            with self.subTest(behavior=behavior):
+                self.projection_fixture()
+                if behavior == 'output': self.environment['TEST_PROBE_OVERSIZE'] = '1'
+                receipt, archive = self.collect(input_budget=1024,
+                    projection_budget=1 if behavior == 'total' else None)
+                self.assertTrue(receipt['targeting']['errors'])
+                self.assertNotIn('projection', receipt['targeting']['probes'][0])
+                with tarfile.open(archive) as bundle:
+                    self.assertFalse(any(name.endswith('.proftext') for name in bundle.getnames()))
+                shutil.rmtree(self.directory / 'coverage-diagnostics')
+                shutil.rmtree(self.directory / 'target')
+                shutil.rmtree(self.directory / 'toolchain')
+
+    def test_diagnostics_keep_large_main_map_before_smaller_object_maps(self):
+        self.diagnostic_tools()
+        self.environment['TEST_LARGE_MAP'] = '1'
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        smaller, larger = target / 'aaa-small', target / 'zzz-large'
+        smaller.write_bytes(b'small')
+        larger.write_bytes(b'BIG' + b'x' * 100)
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(smaller.as_posix())
+            + ' -object ' + shlex.quote(larger.as_posix()) + '`\n')
+        receipt, archive = self.collect(input_budget=10 * 1024 * 1024)
+        objects = {entry['path']: entry for entry in receipt['objects']}
+        with tarfile.open(archive) as bundle:
+            self.assertIn(objects[larger.as_posix()]['coverage_map'], bundle.getnames())
+            self.assertNotIn(objects[smaller.as_posix()]['coverage_map'], bundle.getnames())
+            self.assertEqual(bundle.getmember(objects[larger.as_posix()]['coverage_map']).size,
+                             9 * 1024 * 1024)
 
     def test_diagnostics_report_missing_targeting_tools(self):
         self.reports(2**63 - 1)
@@ -707,7 +888,7 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
         (target / 'omg-500-2_0.profraw').write_text('{"a": 0}')
         relevant = target / 'omg-999-2_0.profraw'
         relevant.write_text('{"a": 19}' + ' ' * 2048)
-        receipt, archive = self.collect()
+        receipt, archive = self.collect(member_calls=128)
         with tarfile.open(archive) as bundle:
             self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
         self.assertFalse(receipt['complete'])
