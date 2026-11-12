@@ -196,7 +196,7 @@ jobs:
 
           docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
-          RUN pacman -Syu --noconfirm --needed apparmor bubblewrap fakeroot python sudo debugedit && pacman -Scc --noconfirm
+          RUN pacman -Syu --noconfirm --needed apparmor bubblewrap fakeroot python sudo debugedit git make jq diffutils && pacman -Scc --noconfirm
           DOCKERFILE
           python3 scripts/native-cli-coverage.py prepare --target "$profile_dir" \
             --source-commit "$(git rev-parse HEAD)" --output "$evidence_dir/cli-manifest.json"

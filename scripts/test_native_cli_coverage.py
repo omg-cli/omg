@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -19,6 +20,35 @@ SPEC.loader.exec_module(PRODUCER)
 
 
 class HostedProducer(unittest.TestCase):
+    def test_native_image_installs_supplemental_runtime_dependencies(self):
+        workflow = (ROOT / '.github/workflows/coverage.yml').read_text()
+        image = workflow.split("docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'", 1)[1]
+        image = image.split('DOCKERFILE', 1)[0]
+        install = next(line.strip() for line in image.splitlines() if line.strip().startswith('RUN pacman '))
+        packages = set(shlex.split(install.split('&&', 1)[0]))
+        required = {'git', 'make', 'jq', 'diffutils'}
+        self.assertFalse(required - packages,
+                         'Native supplemental fixtures lack runtime packages: ' + ', '.join(sorted(required - packages)))
+
+    @unittest.skipIf(os.name == 'nt', 'Native prerequisite shell requires POSIX Bash')
+    def test_native_runtime_preflight_reports_all_missing_commands_and_refuses(self):
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
+        line = next(line for line in script.splitlines() if 'prerequisites.txt' in line)
+        args = shlex.split(line)
+        self.assertEqual(args[:3], ['ordinary', 'bash', '-c'])
+        loop = args[3]
+        self.assertIn('git make jq cmp', loop)
+        missing = ['omg-fixture-missing-tool-a', 'omg-fixture-missing-tool-b']
+        for tools, expected in [('true printf', 0), ('true ' + missing[0] + ' printf ' + missing[1], 1)]:
+            result = subprocess.run([BASH, '-euo', 'pipefail', '-c', loop.replace('git make jq cmp', tools)],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ['true', 'printf'])
+            if expected:
+                for tool in missing:
+                    self.assertIn('Missing native fixture command: ' + tool, result.stderr)
+
     def test_private_loopback_fixture_has_required_network_capability(self):
         workflow = (ROOT / '.github/workflows/coverage.yml').read_text()
         native = workflow.split('      - name: Cover sandbox descendant cancellation\n', 1)[1]

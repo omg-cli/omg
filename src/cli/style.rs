@@ -269,6 +269,7 @@ fn terminal_character_allowed(character: char) -> bool {
 }
 
 #[must_use]
+#[cfg(any(feature = "arch", test))]
 pub(crate) fn display_terminal_text(text: &str) -> impl std::fmt::Display + '_ {
     struct TerminalText<'a>(&'a str);
 

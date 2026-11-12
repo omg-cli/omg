@@ -119,6 +119,7 @@ ordinary() {
     OMG_CLI_BEHAVIOR_EVIDENCE_DIR=/evidence/cli/inventory "$@"
 }
 ordinary bash -c 'test "$(id -u)" -ne 0; umask 077; mkdir -p "$HOME/work" "$XDG_RUNTIME_DIR" "$OMG_CONFIG_DIR"; printf "telemetry_enabled = false\n" > "$OMG_CONFIG_DIR/config.toml"'
+ordinary bash -c 'missing=0; for tool in git make jq cmp; do if ! command -v "$tool"; then printf "Missing native fixture command: %s\n" "$tool" >&2; missing=1; fi; done; exit "$missing"' > /evidence/cli/prerequisites.txt
 for role in coverage14 arch-contracts comprehensive cli-unit; do
   LLVM_PROFILE_FILE="/profiles/omg-extra-registry-$role-%p-%m.profraw" \
     /omg-extra-bin/"$role" --list --format terse > /evidence/cli/registry-"$role".txt 2>&1
