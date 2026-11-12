@@ -275,6 +275,77 @@ regression showed that counters can change while size and timestamps stay
 unchanged. Such changed snapshots are refused. Five actual retained profiles
 round-tripped through LLVM with byte-identical projected records.
 
+## Repository and installation batch
+
+This follow-up covers repository policy, authoritative database snapshots, AUR
+dependency planning, installation reasons, build evidence, and metadata
+publication as one Arch batch. Work remains on the existing local main checkout.
+No additional branch or worktree was created, and no host packages were installed
+or removed.
+
+Repository `Usage` now controls Sync, Search, Install, and Upgrade independently.
+Rust catalogs retain ordered repository candidates until the query selects its
+eligible repositories. A missing or corrupt required repository fails instead of
+producing a partial update list or false foreign-package classification. Local
+queries remain independent of sync availability. Local parsing and derived reads
+check source epochs, and v2 caches do not reuse the older completeness claims.
+Native queries also require readable regular database files; libalpm's validity
+call alone did not establish file existence in the regression.
+
+Native controls confirmed an installation identity bug: `helper>=2` could select
+version 2 from a lower-priority repository, then the later bare-name lookup could
+select version 1. AUR plans now retain the selected repository, package identity,
+and every original relation through the sealed privilege descriptor. Combined
+relations select one compatible candidate. The prepared transaction rechecks
+identity, eligibility, and all relations before commit. Same-base runtime closure
+also handles unique versioned virtual providers. Ambiguous, incompatible, and
+ineligible sibling providers fail; make/check inputs remain pre-build requirements.
+
+Installation intent now survives the public, recursive, split-output, parallel,
+and elevated paths. Requested packages become explicit. New automatic packages
+remain dependencies, and existing explicit packages stay explicit. Reason-only
+promotions pass through pre-write audit and completion even when libalpm skips a
+same-version reinstall. Cache invalidation and daemon refresh run after failed
+attempts, with operation and completion errors retained. Known post-commit audit
+or reason failures instruct the caller to inspect installed state before retrying.
+
+A real CLI promotion also exposed unsafe historical install rollback: every
+listed package was scheduled for removal, even when it predated the request.
+Install history does not establish package pre-existence. Automatic Install
+rollback now refuses before consent or mutation; its unproven removal path is
+deleted. Known-version Remove/Update restoration remains available. Supporting
+safe install reversal requires authoritative provenance and current-state checks;
+missing versions must not be interpreted as a new installation.
+
+Built outputs carry the actual build profile and requested-output membership.
+A Standard build cannot satisfy a current Hardened policy. Final admission checks
+run again after approval, installation queueing, and sudo refresh. Parallel waves
+retain each build's evidence. Metadata readers acquire an owned index from one
+immutable archive/index/validator generation. Cross-process locks and one durable
+manifest publication replace timestamp pairing. Legacy archives are reindexed;
+unbound old indexes are not accepted as current. Old generation reclamation is
+deferred in this batch.
+
+The batch has failing-before evidence for these findings, independent Rust and
+blue-team reviews, and 2,157 passing ordinary library tests. The 205 focused
+workflow, source-comparison, and base-authority tests pass. Formatting,
+all-target Clippy with warnings denied, binary tests, documentation, and the
+checkout CLI build pass on Arch. The all-features lint command requires Debian's
+native apt development dependency; this Arch host was not modified to supply it.
+Cross-platform CI remains required.
+
+Disposable KVM Arch guests verified the original automatic-dependency failure,
+its correction, and real mixed archive transactions. Checks cover dependency
+reasons, preservation of explicit packages during upgrades, same-version
+promotion, public-request promotion, unrelated state, and reason-only audit.
+A self-contained native case joins the isolated CI selection. The prepared guest
+backing image remains unchanged. Guest setup and native checks do not reproduce
+the hosted Docker AppArmor lifecycle. A real unprivileged CLI-to-sudo drive also preserved unrelated state and
+recorded the promotion once. A subsequent install rollback was refused without
+changing that package or history. Five read-only checkout CLI checks passed with
+an unchanged host pacman fingerprint. Local coverage comparison and fresh hosted
+CI are still pending for this batch.
+
 ## Remaining work
 
 - Require fresh producer and exact-base comparison evidence for the retention
@@ -290,9 +361,9 @@ round-tripped through LLVM with byte-identical projected records.
 - The pure Rust database reader retains tolerant manual parsing for metadata
   accepted by native pacman but rejected by the stricter upstream formats.
   Removing this fallback requires a compatibility corpus, not just a crate bump.
-- A full privileged transaction and rollback matrix belongs in disposable Arch
-  guests. This run did not install/remove host packages or claim those destructive
-  operations were exercised end to end.
+- Extend the disposable-guest transaction matrix beyond the installation and
+  reason cases covered here. Removal, rollback, and failure recovery need their
+  own real state assertions. No host package mutations are authorized.
 - Hardened admission rejects classified integration paths. It does not vet
   arbitrary program behavior or provide independent builder provenance. Use
   `allow_aur = false` when official repositories are the required trust boundary.

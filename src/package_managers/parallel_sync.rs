@@ -621,7 +621,10 @@ fn verify_staged_databases(
     crate::package_managers::alpm_ops::configure_signature_verification(&mut alpm, config)?;
     let policy = crate::package_managers::alpm_ops::signature_policy(config)?;
 
-    for repo in &config.repos {
+    for repo in config.repos.iter().filter(|repo| {
+        repo.usage
+            .contains(crate::core::pacman_conf::RepoUsage::SYNC)
+    }) {
         let siglevel = crate::package_managers::alpm_ops::repository_siglevel(
             policy.default,
             repo.sig_level.as_deref(),
@@ -824,6 +827,10 @@ fn repository_database_urls(
     config
         .repos
         .iter()
+        .filter(|repo| {
+            repo.usage
+                .contains(crate::core::pacman_conf::RepoUsage::SYNC)
+        })
         .map(|repo| {
             let servers = config
                 .resolve_servers(repo, architecture)
@@ -846,6 +853,20 @@ fn repository_database_urls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_database_urls_respect_sync_usage() {
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
+            "[hidden]\nUsage = Search Install Upgrade\n[visible]\nUsage = Sync\nServer = https://mirror.example/$repo/os/$arch\n"
+        ).unwrap();
+        let urls = repository_database_urls(&config, "x86_64").unwrap();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].0, "visible");
+        assert_eq!(
+            urls[0].1,
+            ["https://mirror.example/visible/os/x86_64/visible.db"]
+        );
+    }
 
     #[test]
     fn database_publication_preserves_unexpected_directories() {

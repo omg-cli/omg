@@ -1005,6 +1005,7 @@ mod tests {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
+                    crate::package_managers::aur_metadata::publish_test_metadata(&archive_path)?;
                     runtime.block_on(async {
                         anyhow::ensure!(!crate::core::paths::test_mode());
                         let client = AurClient::new()?;

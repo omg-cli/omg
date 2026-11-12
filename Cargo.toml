@@ -135,6 +135,7 @@ toml = { version = "1.0.3", features = ["preserve_order"] }
 # Comment- and key-preserving config rewrites in settings.rs save().
 toml_edit = "0.25"
 bitcode = { version = "0.6", features = ["serde"] }
+bitflags = { version = "2", features = ["serde"] }
 
 # HTTP client (zstd for faster compressed downloads, read_timeout for reliability)
 reqwest = { version = "0.13.1", features = [

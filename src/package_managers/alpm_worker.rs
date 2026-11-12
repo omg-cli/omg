@@ -100,7 +100,7 @@ impl AlpmWorker {
                     }
                     AlpmRequest::ListUpdates(reply) => {
                         let res = match refresh_if_catalog_changed(&mut loaded) {
-                            Ok(()) => Ok(collect_updates(&loaded.handle)),
+                            Ok(()) => collect_updates(&loaded.handle),
                             Err(error) => Err(error),
                         };
                         let _ = reply.send(res);

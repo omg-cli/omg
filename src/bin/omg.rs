@@ -96,7 +96,7 @@ fn execute_recorded_system_update(
 #[cfg(feature = "arch")]
 fn split_elevated_invocation(args: &[String], parent_records: bool) -> Option<(&str, &[String])> {
     let command = args.get(1)?;
-    if matches!(command.as_str(), "install" | "remove") && !parent_records {
+    if matches!(command.as_str(), "install" | "install-plan" | "remove") && !parent_records {
         return None;
     }
     let separator_pos = args.iter().position(|a| a == "--")?;
@@ -189,6 +189,15 @@ fn try_fast_elevated(
 
     // Handle commands that may have packages
     match command {
+        omg_lib::package_managers::arch_install::ELEVATED_INSTALL => {
+            Some(if let [handoff] = packages.as_slice() {
+                omg_lib::package_managers::arch_install::execute_handoff(handoff)
+            } else {
+                Err(anyhow::anyhow!(
+                    "Private installation requires exactly one sealed descriptor"
+                ))
+            })
+        }
         "install" if !packages.is_empty() => {
             // Validate package names or local package files (security).
             omg_lib::core::security::validate_package_names_or_files(&packages).ok()?;
@@ -1983,7 +1992,7 @@ mod fast_path_tests {
     #[cfg(feature = "arch")]
     #[test]
     fn unowned_elevated_mutations_defer_to_full_history_owner() {
-        for command in ["remove", "install"] {
+        for command in ["remove", "install", "install-plan"] {
             let argv = args(&["omg", command, "--", "ripgrep"]);
             assert!(
                 split_elevated_invocation(&argv, false).is_none(),
@@ -2000,6 +2009,26 @@ mod fast_path_tests {
                 split_elevated_invocation(&argv, false),
                 Some((command, &argv[3..]))
             );
+        }
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn private_install_plan_rejects_missing_or_invalid_descriptors() {
+        for argv in [
+            args(&["omg", "install-plan", "--"]),
+            args(&["omg", "install-plan", "--", "invalid"]),
+            args(&["omg", "install-plan", "--", "invalid", "extra"]),
+        ] {
+            let result = super::try_fast_elevated(&argv, true, true);
+            if omg_lib::core::privilege::is_root() {
+                assert!(result.expect("private protocol dispatch").is_err());
+            } else {
+                assert!(
+                    result.is_none(),
+                    "unprivileged callers cannot dispatch root operations"
+                );
+            }
         }
     }
 

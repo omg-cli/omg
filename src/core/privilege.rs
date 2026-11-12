@@ -803,7 +803,8 @@ async fn sudo_payload_status(args: &[&str]) -> anyhow::Result<std::process::Exit
 /// Privileged re-exec verbs that are not clap user commands. `update --fast`
 /// and `update --turbo` elevate as `fullupdate` / `turboupdate`; the elevated
 /// child also accepts `upgrade`. See `try_fast_elevated` in `src/bin/omg.rs`.
-const INTERNAL_PRIVILEGED_ENTRYPOINTS: &[&str] = &["upgrade", "fullupdate", "turboupdate"];
+const INTERNAL_PRIVILEGED_ENTRYPOINTS: &[&str] =
+    &["upgrade", "fullupdate", "turboupdate", "install-plan"];
 
 fn snapshot_install_inputs(
     args: &[String],

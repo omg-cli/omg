@@ -183,7 +183,8 @@ jq() { :; }
         self.assertIsNotNone(cases, 'coverage must select its required fixture cases explicitly')
         selected = [line.strip() for line in cases.group(1).splitlines() if line.strip()]
         self.assertEqual(len(selected), len(set(selected)))
-        self.assertEqual(len(selected), 19)
+        self.assertEqual(len(selected), 20)
+        self.assertIn("package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents", selected)
         self.assertIn('package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes', selected)
         self.assertIn('package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing', selected)
         self.assertIn('package_managers::aur::client::tests::native_isolated_history_requires_hardened_review', selected)
@@ -766,10 +767,27 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
         import time
         raw = self.projection_fixture()
         self.environment['TEST_RAW_TAMPER'] = 'mmap'
+        # Freeze observed metadata to isolate content-change detection.
+        observer = self.directory / 'frozen-metadata-python'
+        observer.write_text(f'#!{sys.executable}\n' + f'raw = {str(raw)!r}\n' + textwrap.dedent('''
+            import os, sys
+            original = os.stat(raw)
+            identity = (original.st_dev, original.st_ino)
+            def frozen(info):
+                return original if (info.st_dev, info.st_ino) == identity else info
+            real_fstat, real_stat, real_lstat = os.fstat, os.stat, os.lstat
+            os.fstat = lambda *args, **kwargs: frozen(real_fstat(*args, **kwargs))
+            os.stat = lambda *args, **kwargs: frozen(real_stat(*args, **kwargs))
+            os.lstat = lambda *args, **kwargs: frozen(real_lstat(*args, **kwargs))
+            sys.argv = sys.argv[1:]
+            assert sys.argv == ['-']
+            exec(compile(sys.stdin.read(), '<stdin>', 'exec'))
+        '''))
+        observer.chmod(0o755)
+        self.environment['TEST_PYTHON'] = str(observer)
         with raw.open('r+b') as stream, mmap.mmap(stream.fileno(), 0) as counters:
             counters[6:8] = b'19'
             counters.flush()
-            before = raw.stat()
             mutated = []
             def mutate_live_counters():
                 until = time.monotonic() + 5
@@ -785,13 +803,13 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
                 receipt, archive = self.collect(input_budget=1024)
             finally:
                 writer.join(timeout=6)
-            after = raw.stat()
         self.assertEqual(mutated, [True])
-        self.assertEqual((before.st_size, before.st_mtime_ns, before.st_ctime_ns),
-                         (after.st_size, after.st_mtime_ns, after.st_ctime_ns))
+        self.assertEqual(raw.read_bytes()[6:8], b'20')
         probe = receipt['targeting']['probes'][0]
         self.assertTrue(probe['changed_during_collection'],
-                        'live mmap counters changed while metadata stayed identical')
+                        'live mmap counters changed while observed metadata stayed identical')
+        self.assertEqual(probe['raw_identity'], probe['raw_final_identity'])
+        self.assertEqual(probe['raw_identity'], probe['raw_path_final_identity'])
         self.assertNotIn('projection', probe)
         with tarfile.open(archive) as bundle:
             self.assertFalse(any(name.endswith('.proftext') for name in bundle.getnames()))

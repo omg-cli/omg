@@ -354,6 +354,38 @@ pub fn parse_version_or_zero(s: &str) -> Version {
     parse_version(s).unwrap_or_else(zero_version)
 }
 
+#[cfg(feature = "arch")]
+pub(crate) fn provision_satisfies(dependency: &str, provision: &str) -> bool {
+    if alpm::Depend::new(dependency).name() != alpm::Depend::new(provision).name() {
+        return false;
+    }
+    if alpm::Depend::new(dependency).version().is_none() {
+        return true;
+    }
+    let provision = alpm::Depend::new(provision);
+    provision.depmod() == alpm::DepMod::Eq
+        && provision
+            .version()
+            .is_some_and(|version| dependency_version_satisfies(dependency, version.as_ref()))
+}
+
+#[cfg(feature = "arch")]
+pub(crate) fn dependency_version_satisfies(dependency: &str, candidate: &str) -> bool {
+    let dependency = alpm::Depend::new(dependency);
+    let Some(required) = dependency.version() else {
+        return true;
+    };
+    let comparison = alpm::vercmp(candidate, required.to_string().as_str());
+    match dependency.depmod() {
+        alpm::DepMod::Any => true,
+        alpm::DepMod::Eq => comparison.is_eq(),
+        alpm::DepMod::Ge => !comparison.is_lt(),
+        alpm::DepMod::Le => !comparison.is_gt(),
+        alpm::DepMod::Gt => comparison.is_gt(),
+        alpm::DepMod::Lt => comparison.is_lt(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

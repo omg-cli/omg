@@ -20,6 +20,9 @@ pub mod arch;
 #[cfg(feature = "arch")]
 pub(crate) mod arch_advisory;
 #[cfg(feature = "arch")]
+#[doc(hidden)]
+pub mod arch_install;
+#[cfg(feature = "arch")]
 pub mod aur;
 #[cfg(feature = "arch")]
 pub mod aur_deps;

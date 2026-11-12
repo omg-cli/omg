@@ -25,6 +25,23 @@ async fn run_alpm_transaction(packages: Vec<String>, kind: TransactionKind) -> A
     Ok(())
 }
 
+pub(crate) async fn install_request(
+    request: super::arch_install::InstallRequest,
+) -> AnyhowResult<()> {
+    let descriptor = request.seal()?;
+    let handoff = vec![descriptor.handoff()];
+    run_privileged_operation(
+        super::arch_install::ELEVATED_INSTALL,
+        &handoff,
+        &[],
+        || async move {
+            tokio::task::spawn_blocking(move || super::alpm_ops::execute_install_request(&request))
+                .await?
+        },
+    )
+    .await
+}
+
 impl ArchPackageManager {
     #[must_use]
     pub const fn new() -> Self {
@@ -61,14 +78,12 @@ where
 {
     if can_write_pacman_db() {
         tracing::debug!("Using direct ALPM access as root");
-        operation().await?;
-        after_privileged_alpm_write().await?;
-        return Ok(());
+        return finish_alpm_write(operation(), after_privileged_alpm_write()).await;
     }
 
     // A live parent spinner redraws over sudo's password prompt and over the
     // elevated child's own progress, which looks like a hung duplicate bar.
-    {
+    let operation = async {
         let _quiesce = crate::cli::modern_ui::quiesce_terminal();
         tracing::debug!("Elevating privileges for {command}");
         let mut args = vec![command];
@@ -79,18 +94,40 @@ where
         // has richer change metadata and AUR handling); the child must stay silent
         // to avoid double entries. System-upgrade delegations (fullupdate /
         // turboupdate) carry no packages and the child is their only recorder.
-        if matches!(command, "install" | "remove" | "sync") {
+        if matches!(command, "install" | "install-plan" | "remove" | "sync") {
             args.push(privilege::FLOW_PARENT_RECORDS);
         }
-        privilege::run_privileged_child(&args).await?;
+        privilege::run_privileged_child(&args).await
+    };
+    finish_alpm_write(operation, after_privileged_alpm_write()).await
+}
+
+async fn finish_alpm_write(
+    operation: impl Future<Output = AnyhowResult<()>>,
+    completion: impl Future<Output = AnyhowResult<()>>,
+) -> AnyhowResult<()> {
+    let operation = operation.await;
+    let completion = completion.await;
+    combine_write_results(operation, completion)
+}
+
+fn combine_write_results(
+    operation: AnyhowResult<()>,
+    completion: AnyhowResult<()>,
+) -> AnyhowResult<()> {
+    match (operation, completion) {
+        (Ok(()), completion) => completion,
+        (Err(operation), Ok(())) => Err(operation),
+        (Err(operation), Err(completion)) => {
+            Err(operation.context(format!("Catalog completion also failed: {completion:#}")))
+        }
     }
-    after_privileged_alpm_write().await?;
-    Ok(())
 }
 
 async fn after_privileged_alpm_write() -> AnyhowResult<()> {
-    invalidate_caches()?;
-    crate::core::client::refresh_daemon_after_catalog_write().await
+    let invalidation = invalidate_caches();
+    let refresh = crate::core::client::refresh_daemon_after_catalog_write().await;
+    combine_write_results(invalidation, refresh)
 }
 
 impl PackageManager for ArchPackageManager {
@@ -189,19 +226,21 @@ impl PackageManager for ArchPackageManager {
             }
             crate::core::security::validate_package_names_or_files(&packages)?;
 
-            run_privileged_operation("install", &packages, &[], || {
-                let pkgs = packages.clone();
-                let is_local_artifact = pkgs
-                    .iter()
-                    .any(|package| crate::core::security::is_local_package_file(package));
-                let kind = if is_local_artifact {
-                    TransactionKind::InstallAurArtifact
-                } else {
-                    TransactionKind::Install
-                };
-                async move { run_alpm_transaction(pkgs, kind).await }
-            })
-            .await
+            use super::arch_install::{InstallIntent, InstallItem, InstallRequest, InstallTarget};
+            let pinned = crate::core::security::artifact::SnapshotInputs::capture(&packages)?;
+            let items = pinned
+                .targets
+                .iter()
+                .map(|package| InstallItem {
+                    target: if crate::core::security::artifact::is_handoff(package) {
+                        InstallTarget::Archive(package.clone())
+                    } else {
+                        InstallTarget::Named(package.clone())
+                    },
+                    intent: InstallIntent::Requested,
+                })
+                .collect();
+            install_request(InstallRequest::new(items)?).await
         })
     }
 
@@ -467,6 +506,53 @@ pub async fn is_installed(package: &str) -> AnyhowResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_write_still_completes_once() {
+        let completed = std::cell::Cell::new(0);
+        let result = finish_alpm_write(
+            async { anyhow::bail!("packages committed; audit persistence failed") },
+            async {
+                completed.set(completed.get() + 1);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("packages committed")
+        );
+        assert_eq!(
+            completed.get(),
+            1,
+            "failed write bypassed catalog completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_write_retains_operation_and_completion_errors() {
+        let error = finish_alpm_write(
+            async { anyhow::bail!("native commit failed; state may have changed") },
+            async { anyhow::bail!("daemon refresh failed") },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("native commit failed"));
+        assert!(message.contains("daemon refresh failed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn successful_write_reports_completion_failure() {
+        let error = finish_alpm_write(async { Ok(()) }, async {
+            anyhow::bail!("catalog refresh failed")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("catalog refresh failed"));
+    }
 
     #[test]
     fn orphan_removals_have_rollback_history_metadata() {

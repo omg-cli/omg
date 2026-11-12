@@ -300,7 +300,9 @@ jobs:
                 local case_id=${test_name//::/_}
                 local log="$fixture_evidence/$case_id.log"
                 local runner=()
-                if [[ "$test_name" == package_managers::aur::client::tests::native_isolated_* ]]; then
+                if [[ "$test_name" == package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents ]]; then
+                  runner=(env OMG_ARCH_INSTALL_FIXTURE=isolated-container)
+                elif [[ "$test_name" == package_managers::aur::client::tests::native_isolated_* ]]; then
                   runner=(runuser -u nobody -- env HOME=/home/omg-fixture
                     OMG_CACHE_DIR=/var/tmp/omg-fixture-cache OMG_DATA_DIR=/var/tmp/omg-fixture-state
                     OMG_CONFIG_DIR=/var/tmp/omg-fixture-config OMG_AUR_NATIVE_FIXTURE=isolated-container)
@@ -340,6 +342,7 @@ jobs:
                 package_managers::aur::client::tests::native_isolated_history_requires_hardened_review
                 config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options
                 package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation
+                package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents
                 core::usage::tests::elevated_state_roundtrip_preserves_caller_files
               )
               printf "%s\n" "${cases[@]}" > /evidence/expected-tests.txt

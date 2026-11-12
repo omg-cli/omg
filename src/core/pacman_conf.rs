@@ -5,8 +5,70 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+bitflags::bitflags! {
+    /// Operations for which a configured repository may supply package data.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RepoUsage: u8 {
+        /// Refresh this repository during database synchronization.
+        const SYNC = 1;
+        /// Include this repository in package searches.
+        const SEARCH = 2;
+        /// Use this repository for implicit package installation.
+        const INSTALL = 4;
+        /// Use this repository for system upgrades.
+        const UPGRADE = 8;
+        /// Enable every repository operation.
+        const ALL = Self::SYNC.bits() | Self::SEARCH.bits() | Self::INSTALL.bits() | Self::UPGRADE.bits();
+    }
+}
+
+impl Default for RepoUsage {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl std::str::FromStr for RepoUsage {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let mut usage = Self::empty();
+        for token in value.split_whitespace() {
+            usage |= match token {
+                "Sync" => Self::SYNC,
+                "Search" => Self::SEARCH,
+                "Install" => Self::INSTALL,
+                "Upgrade" => Self::UPGRADE,
+                "All" => Self::ALL,
+                _ => anyhow::bail!("Invalid repository Usage token: {token}"),
+            };
+        }
+        anyhow::ensure!(!usage.is_empty(), "Repository Usage cannot be empty");
+        Ok(usage)
+    }
+}
+
+#[cfg(feature = "arch")]
+impl RepoUsage {
+    pub(crate) fn to_alpm(self) -> alpm::Usage {
+        let mut usage = alpm::Usage::empty();
+        for (configured, native) in [
+            (Self::SYNC, alpm::Usage::SYNC),
+            (Self::SEARCH, alpm::Usage::SEARCH),
+            (Self::INSTALL, alpm::Usage::INSTALL),
+            (Self::UPGRADE, alpm::Usage::UPGRADE),
+        ] {
+            if self.contains(configured) {
+                usage |= native;
+            }
+        }
+        usage
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RepoConfig {
+    pub usage: RepoUsage,
     pub name: String,
     pub servers: Vec<String>,
     pub sig_level: Option<String>,
@@ -137,7 +199,10 @@ impl PacmanConfig {
             }
 
             if line.starts_with('[') && line.ends_with(']') {
-                if let Some(repo) = current_repo.take() {
+                if let Some(mut repo) = current_repo.take() {
+                    if repo.usage.is_empty() {
+                        repo.usage = RepoUsage::ALL;
+                    }
                     config.repos.push(repo);
                 }
 
@@ -152,6 +217,7 @@ impl PacmanConfig {
                     );
                     current_repo = Some(RepoConfig {
                         name: section.to_string(),
+                        usage: RepoUsage::empty(),
                         ..Default::default()
                     });
                 }
@@ -172,14 +238,17 @@ impl PacmanConfig {
                 }
                 Some(_) => {
                     if let Some(ref mut repo) = current_repo {
-                        Self::parse_repo_option(repo, key, value);
+                        Self::parse_repo_option(repo, key, value)?;
                     }
                 }
                 None => {}
             }
         }
 
-        if let Some(repo) = current_repo {
+        if let Some(mut repo) = current_repo {
+            if repo.usage.is_empty() {
+                repo.usage = RepoUsage::ALL;
+            }
             config.repos.push(repo);
         }
 
@@ -278,7 +347,7 @@ impl PacmanConfig {
         Ok(())
     }
 
-    fn parse_repo_option(repo: &mut RepoConfig, key: &str, value: Option<&str>) {
+    fn parse_repo_option(repo: &mut RepoConfig, key: &str, value: Option<&str>) -> Result<()> {
         match key {
             "Server" => {
                 if let Some(v) = value {
@@ -287,8 +356,14 @@ impl PacmanConfig {
             }
             "SigLevel" => Self::append_signature_option(&mut repo.sig_level, value),
             "Include" => repo.include = value.map(String::from),
+            "Usage" => {
+                repo.usage |= value
+                    .context("Repository Usage requires a value")?
+                    .parse::<RepoUsage>()?;
+            }
             _ => {}
         }
+        Ok(())
     }
 
     pub fn get_repo_names(&self) -> Vec<&str> {
@@ -357,6 +432,31 @@ pub fn get_configured_repos() -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_usage_defaults_and_repeated_directives() {
+        let config = PacmanConfig::parse_str(
+            "[default]\n[restricted]\nUsage = Sync Search\nUsage = Upgrade\n[all]\nUsage = All\n",
+        )
+        .unwrap();
+        assert_eq!(config.repos[0].usage, RepoUsage::ALL);
+        assert_eq!(
+            config.repos[1].usage,
+            RepoUsage::SYNC | RepoUsage::SEARCH | RepoUsage::UPGRADE
+        );
+        assert_eq!(config.repos[2].usage, RepoUsage::ALL);
+    }
+
+    #[test]
+    fn batch2_rejects_invalid_repository_usage() {
+        for usage in ["Upgarde", "", "Search Unknown"] {
+            let result = PacmanConfig::parse_str(&format!("[core]\nUsage = {usage}\n"));
+            assert!(
+                result.is_err(),
+                "invalid Usage {usage:?} was accepted: {result:?}"
+            );
+        }
+    }
 
     #[test]
     #[serial_test::serial]

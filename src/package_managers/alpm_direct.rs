@@ -129,6 +129,10 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
         let mut results = Vec::with_capacity(64);
 
         for db in handle.syncdbs() {
+            if !db.usage()?.contains(alpm::Usage::SEARCH) {
+                continue;
+            }
+            super::alpm_ops::validate_sync_database(handle, db)?;
             for pkg in db.pkgs() {
                 if contains_ignore_case(pkg.name(), query)
                     || pkg.desc().is_some_and(|d| contains_ignore_case(d, query))
@@ -195,6 +199,10 @@ pub fn get_package_info(name: &str) -> Result<Option<PackageInfo>> {
 
         // Try sync databases
         for db in handle.syncdbs() {
+            if !db.usage()?.contains(alpm::Usage::SEARCH) {
+                continue;
+            }
+            super::alpm_ops::validate_sync_database(handle, db)?;
             if let Ok(pkg) = db.pkg(name) {
                 let Some(version) = parse_version(pkg.version()) else {
                     tracing::warn!(
@@ -424,14 +432,17 @@ pub fn get_explicit_count_fast() -> Result<usize> {
 pub fn list_all_package_names() -> Result<Vec<String>> {
     with_handle(|handle| {
         let localdb = handle.localdb();
-        let sync_count: usize = handle.syncdbs().iter().map(|db| db.pkgs().len()).sum();
-        let mut names = ahash::AHashSet::with_capacity(localdb.pkgs().len() + sync_count);
+        let mut names = ahash::AHashSet::with_capacity(localdb.pkgs().len());
 
         for pkg in localdb.pkgs() {
             names.insert(pkg.name().to_string());
         }
 
         for db in handle.syncdbs() {
+            if !db.usage()?.contains(alpm::Usage::SEARCH) {
+                continue;
+            }
+            super::alpm_ops::validate_sync_database(handle, db)?;
             for pkg in db.pkgs() {
                 names.insert(pkg.name().to_string());
             }

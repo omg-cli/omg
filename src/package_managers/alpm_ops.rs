@@ -91,6 +91,32 @@ pub fn open_default_alpm() -> anyhow::Result<alpm::Alpm> {
     alpm::Alpm::new(root, db_path).context("Failed to initialize ALPM")
 }
 
+pub(crate) fn validate_sync_database(alpm: &alpm::Alpm, database: &alpm::Db) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = std::path::Path::new(alpm.dbpath())
+        .join("sync")
+        .join(format!("{}.db", database.name()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "Repository '{}' is unavailable at {}; run 'omg sync'",
+                database.name(),
+                path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "Repository '{}' is not a regular database",
+        database.name()
+    );
+    database
+        .is_valid()
+        .with_context(|| format!("Repository '{}' failed native validation", database.name()))
+}
+
 pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
     if crate::core::paths::test_mode() {
         let updates = crate::package_managers::pacman_db::check_updates_cached()?;
@@ -110,7 +136,7 @@ pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
 
     crate::package_managers::alpm_direct::with_handle_mut(|alpm| {
         configure_package_filters(alpm, &pacman_config)?;
-        Ok(collect_updates(alpm))
+        collect_updates(alpm)
     })
 }
 
@@ -120,7 +146,7 @@ pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
 /// Single authoritative update-collection implementation: shared by the CLI
 /// (`get_update_list`) and the daemon worker (`alpm_worker`) so both honor
 /// `IgnorePkg`/`IgnoreGroup`/`Replacement` handling identically.
-pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Vec<UpdateInfo> {
+pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Result<Vec<UpdateInfo>> {
     let localdb = alpm.localdb();
     let syncdbs = alpm.syncdbs();
     let local_pkg_count = localdb.pkgs().len();
@@ -131,6 +157,10 @@ pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Vec<UpdateInfo> {
         ahash::AHashMap::with_capacity(local_pkg_count);
 
     for db in syncdbs {
+        if !db.usage()?.contains(alpm::Usage::UPGRADE) {
+            continue;
+        }
+        validate_sync_database(alpm, db)?;
         let repo_name = db.name();
         for pkg in db.pkgs() {
             if pkg.should_ignore() {
@@ -161,7 +191,7 @@ pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Vec<UpdateInfo> {
         }
     }
 
-    updates
+    Ok(updates)
 }
 
 /// Get package info from sync DBs - INSTANT (<1ms)
@@ -197,6 +227,10 @@ pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
 /// Get package info using an existing ALPM handle - ULTRA FAST
 pub fn get_pkg_info_from_db(alpm: &alpm::Alpm, name: &str) -> Result<Option<PackageInfo>> {
     for db in alpm.syncdbs() {
+        if !db.usage()?.contains(alpm::Usage::SEARCH) {
+            continue;
+        }
+        validate_sync_database(alpm, db)?;
         if let Ok(pkg) = db.pkg(name) {
             // A version that fails the strict parser must not compare as a
             // fabricated 0 (ARCH-R14); skip the entry visibly.
@@ -465,6 +499,42 @@ pub fn execute_transaction(
     kind: TransactionKind,
     handle: Option<&mut alpm::Alpm>,
 ) -> Result<()> {
+    execute_transaction_with_intents(packages, kind, handle, None, &[])
+}
+
+pub(crate) fn execute_install_request(request: &super::arch_install::InstallRequest) -> Result<()> {
+    let kind = request.kind();
+    let packages = request
+        .items()
+        .iter()
+        .map(|item| item.target.argument())
+        .collect();
+    let intents = request
+        .items()
+        .iter()
+        .map(|item| item.intent)
+        .collect::<Vec<_>>();
+    let selections = request
+        .items()
+        .iter()
+        .filter_map(|item| {
+            if let super::arch_install::InstallTarget::Resolved(target) = &item.target {
+                Some(target.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    execute_transaction_with_intents(packages, kind, None, Some(&intents), &selections)
+}
+
+fn execute_transaction_with_intents(
+    packages: Vec<String>,
+    kind: TransactionKind,
+    handle: Option<&mut alpm::Alpm>,
+    intents: Option<&[super::arch_install::InstallIntent]>,
+    selections: &[super::arch_install::OfficialTarget],
+) -> Result<()> {
     validate_aur_artifact_handoffs(kind, &packages)?;
     let staged = if matches!(
         kind,
@@ -494,15 +564,23 @@ pub fn execute_transaction(
         configure_mirrors(alpm)?;
         let refusals = Arc::new(Mutex::new(AlpmQuestionRefusals::default()));
         let main_task = setup_alpm_callbacks(alpm, &refusals);
-        let tx_guard = prepare_alpm_transaction(alpm, packages, kind, &pacman_config)
+        let tx_guard = prepare_alpm_transaction(alpm, packages.clone(), kind, &pacman_config)
             .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
+        let reasons = installation_reasons(tx_guard.0, &packages, intents)?;
         // Declined replacement questions make libalpm skip the replacement
         // silently, so a successful prepare can still hide a refused mutation.
         if let Some(error) = question_refusal_error(&refusals) {
             return Err(error);
         }
-        commit_alpm_transaction(tx_guard.0, &main_task, kind, &pacman_config.hold_pkg)
-            .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
+        commit_alpm_transaction(
+            tx_guard.0,
+            &main_task,
+            kind,
+            &pacman_config.hold_pkg,
+            &reasons,
+            selections,
+        )
+        .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
         return Ok(());
     }
 
@@ -519,14 +597,154 @@ pub fn execute_transaction(
 
     let refusals = Arc::new(Mutex::new(AlpmQuestionRefusals::default()));
     let main_task = setup_alpm_callbacks(&alpm, &refusals);
-    let tx_guard = prepare_alpm_transaction(&mut alpm, packages, kind, &pacman_config)
+    let tx_guard = prepare_alpm_transaction(&mut alpm, packages.clone(), kind, &pacman_config)
         .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
+    let reasons = installation_reasons(tx_guard.0, &packages, intents)?;
     if let Some(error) = question_refusal_error(&refusals) {
         return Err(error);
     }
-    commit_alpm_transaction(tx_guard.0, &main_task, kind, &pacman_config.hold_pkg)
-        .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
+    commit_alpm_transaction(
+        tx_guard.0,
+        &main_task,
+        kind,
+        &pacman_config.hold_pkg,
+        &reasons,
+        selections,
+    )
+    .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
 
+    Ok(())
+}
+
+fn installation_reasons(
+    alpm: &alpm::Alpm,
+    packages: &[String],
+    intents: Option<&[super::arch_install::InstallIntent]>,
+) -> Result<Vec<(String, alpm::PackageReason)>> {
+    use super::arch_install::InstallIntent;
+    let Some(intents) = intents else {
+        return Ok(Vec::new());
+    };
+    anyhow::ensure!(
+        packages.len() == intents.len(),
+        "Installation intent count mismatch"
+    );
+    let mut reasons = Vec::with_capacity(packages.len());
+    let mut names = std::collections::HashSet::with_capacity(packages.len());
+    for (target, intent) in packages.iter().zip(intents) {
+        let name = if crate::core::security::is_local_package_file(target) {
+            alpm.pkg_load(target.as_str(), false, alpm::SigLevel::NONE)?
+                .name()
+                .to_owned()
+        } else {
+            target
+                .rsplit('/')
+                .next()
+                .context("Missing installation target name")?
+                .to_owned()
+        };
+        anyhow::ensure!(
+            names.insert(name.clone()),
+            "Multiple installation targets resolve to '{name}'"
+        );
+        let previous = alpm
+            .localdb()
+            .pkg(name.as_str())
+            .ok()
+            .map(|package| package.reason());
+        let reason = match (intent, previous) {
+            (InstallIntent::Requested, _) | (_, Some(alpm::PackageReason::Explicit)) => {
+                alpm::PackageReason::Explicit
+            }
+            (InstallIntent::Automatic, _) => alpm::PackageReason::Depend,
+        };
+        reasons.push((name, reason));
+    }
+    Ok(reasons)
+}
+
+fn persist_installation_reasons(
+    alpm: &alpm::Alpm,
+    reasons: &[(String, alpm::PackageReason)],
+) -> Result<()> {
+    for (name, reason) in reasons {
+        let package = alpm.localdb().pkg(name.as_str()).with_context(|| {
+            format!("Transaction completed, but installed package '{name}' could not be found while preserving installation intent; inspect installed state before retrying")
+        })?;
+        if package.reason() != *reason {
+            package.set_reason(*reason).with_context(|| {
+                format!("Transaction completed, but installation reason for '{name}' could not be persisted; inspect installed state before retrying")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_prepared_selections(
+    alpm: &alpm::Alpm,
+    selections: &[super::arch_install::OfficialTarget],
+) -> Result<()> {
+    for selection in selections {
+        let database = alpm
+            .syncdbs()
+            .into_iter()
+            .find(|database| database.name() == selection.repository)
+            .with_context(|| {
+                format!(
+                    "Selected repository '{}' is no longer configured",
+                    selection.repository
+                )
+            })?;
+        anyhow::ensure!(
+            database.usage()?.contains(alpm::Usage::INSTALL),
+            "Selected repository '{}' no longer allows dependency installation",
+            selection.repository
+        );
+        validate_sync_database(alpm, database)?;
+        let selected = database.pkg(selection.name.as_str()).with_context(|| {
+            format!(
+                "Selected package '{}/{}' is no longer available",
+                selection.repository, selection.name
+            )
+        })?;
+        let prepared = alpm
+            .trans_add()
+            .into_iter()
+            .find(|package| package.name() == selection.name);
+        let candidate = if let Some(package) = prepared {
+            anyhow::ensure!(
+                package
+                    .db()
+                    .is_some_and(|database| database.name() == selection.repository),
+                "Prepared package '{}' differs from its selected repository",
+                selection.name
+            );
+            package
+        } else {
+            alpm.localdb()
+                .pkg(selection.name.as_str())
+                .context("Selected dependency was neither prepared nor already installed")?
+        };
+        for package in [selected, candidate] {
+            for relation in &selection.relations {
+                let dependency = alpm::Depend::new(relation.as_str());
+                let direct = package.name() == dependency.name()
+                    && super::types::dependency_version_satisfies(
+                        relation,
+                        package.version().as_str(),
+                    );
+                let provided = package.provides().into_iter().any(|provided| {
+                    super::types::provision_satisfies(relation, &provided.to_string())
+                });
+                anyhow::ensure!(
+                    direct || provided,
+                    "Selected dependency '{}/{}' no longer satisfies '{relation}'; resolve dependencies again",
+                    selection.repository,
+                    selection.name
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -553,13 +771,14 @@ pub(crate) fn register_configured_syncdbs(
     for repo in &pacman_config.repos {
         let siglevel = repository_siglevel(policy.default, repo.sig_level.as_deref())?;
         let siglevel = enforce_required_package_signature(siglevel, require_pgp);
-        alpm.register_syncdb(repo.name.as_str(), siglevel)
+        let database = alpm.register_syncdb(repo.name.as_str(), siglevel)
             .with_context(|| {
                 format!(
                     "Failed to register configured sync database '{}'; refusing a partial repository set",
                     repo.name
                 )
             })?;
+        database.set_usage(repo.usage.to_alpm())?;
     }
     Ok(())
 }
@@ -1359,8 +1578,19 @@ fn prepare_alpm_transaction<'a>(
                 }
 
                 let mut found = false;
+                let (repository, target) = pkg_name
+                    .split_once('/')
+                    .map_or((None, pkg_name.as_str()), |(repository, target)| {
+                        (Some(repository), target)
+                    });
                 for db in tx_guard.0.syncdbs() {
-                    if let Ok(pkg) = db.pkg(pkg_name.as_str()) {
+                    if repository.is_some_and(|repository| repository != db.name())
+                        || (repository.is_none() && !db.usage()?.contains(alpm::Usage::INSTALL))
+                    {
+                        continue;
+                    }
+                    validate_sync_database(tx_guard.0, db)?;
+                    if let Ok(pkg) = db.pkg(target) {
                         tx_guard.0.trans_add_pkg(pkg).map_err(|e| {
                             anyhow::anyhow!("Failed to add {pkg_name} to installation list: {e}")
                         })?;
@@ -1561,11 +1791,15 @@ fn commit_alpm_transaction(
     main_task: &ProgressTask,
     kind: TransactionKind,
     hold_pkg: &[String],
+    reasons: &[(String, alpm::PackageReason)],
+    selections: &[super::arch_install::OfficialTarget],
 ) -> Result<()> {
     main_task.set_message("Preparing transaction...");
 
     alpm.trans_prepare()
         .map_err(|e| anyhow::anyhow!(format_trans_prepare_error(&e.to_string())))?;
+
+    validate_prepared_selections(alpm, selections)?;
 
     let candidates = alpm
         .trans_add()
@@ -1596,7 +1830,13 @@ fn commit_alpm_transaction(
         )?;
     }
 
-    if alpm.trans_add().is_empty() && alpm.trans_remove().is_empty() {
+    let no_package_changes = alpm.trans_add().is_empty() && alpm.trans_remove().is_empty();
+    let reason_changes = reasons.iter().any(|(name, reason)| {
+        alpm.localdb()
+            .pkg(name.as_str())
+            .map_or(true, |package| package.reason() != *reason)
+    });
+    if no_package_changes && !reason_changes {
         main_task.clear();
         println!();
         // Deliberately neutral wording: this also fires when every requested
@@ -1613,6 +1853,9 @@ fn commit_alpm_transaction(
         .into_iter()
         .chain(alpm.trans_remove())
         .map(|package| package.name().to_owned())
+        .chain(reasons.iter().map(|(name, _)| name.clone()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     let operation = match kind {
         TransactionKind::Install | TransactionKind::InstallAurArtifact => "install",
@@ -1620,20 +1863,46 @@ fn commit_alpm_transaction(
         TransactionKind::SystemUpgrade => "upgrade",
     };
     crate::core::security::audit::record_operation(operation, &targets, "attempt")?;
-    let result = alpm
-        .trans_commit()
-        .map_err(|error| anyhow::anyhow!("Transaction failed to commit: {error}"));
-    crate::core::security::audit::record_operation(
+    let result = if no_package_changes {
+        Ok(())
+    } else {
+        alpm.trans_commit().map_err(|error| {
+            anyhow::anyhow!("Transaction failed to commit; package state may have changed: {error}")
+        })
+    };
+    let reason_result = if result.is_ok() {
+        persist_installation_reasons(alpm, reasons)
+    } else {
+        Ok(())
+    };
+    let audit = crate::core::security::audit::record_operation(
         operation,
         &targets,
-        if result.is_ok() {
+        if result.is_ok() && reason_result.is_ok() {
             "succeeded"
         } else {
             "failed"
         },
-    )
-    .context("Package transaction finished but audit persistence failed")?;
-    result?;
+    );
+    let result = match (result, audit) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(audit)) => {
+            Err(audit.context("Packages committed, but audit persistence failed; inspect installed state before retrying"))
+        }
+        (Err(operation), Ok(())) => Err(operation),
+        (Err(operation), Err(audit)) => {
+            Err(operation.context(format!("Audit persistence also failed: {audit:#}")))
+        }
+    };
+    match (result, reason_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+        (Err(error), Err(reason)) => {
+            return Err(error.context(format!(
+                "Installation reason persistence also failed: {reason:#}"
+            )));
+        }
+    }
 
     main_task.finish(Outcome::Done);
 
@@ -1746,6 +2015,117 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_dependency_keeps_selected_repository_and_constraints() -> anyhow::Result<()> {
+        use crate::package_managers::arch_install::OfficialTarget;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = directory.path().join("db");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(database.join("local"))?;
+        std::fs::create_dir_all(database.join("sync"))?;
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
+        for (repository, version) in [("high", "1-1"), ("low", "2-1")] {
+            let content = format!(
+                "%NAME%\nhelper\n\n%VERSION%\n{version}\n\n%FILENAME%\nhelper-{version}-any.pkg.tar.zst\n\n%ARCH%\nany\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n"
+            );
+            let file = std::fs::File::create(database.join(format!("sync/{repository}.db")))?;
+            let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+                file,
+                flate2::Compression::fast(),
+            ));
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(
+                &mut header,
+                format!("helper-{version}/desc"),
+                content.as_bytes(),
+            )?;
+            archive.into_inner()?.finish()?;
+        }
+        let mut alpm = alpm::Alpm::new(root.to_str().unwrap(), database.to_str().unwrap())?;
+        alpm.register_syncdb("high", alpm::SigLevel::NONE)?;
+        alpm.register_syncdb("low", alpm::SigLevel::NONE)?;
+        let selected = OfficialTarget {
+            repository: "low".to_owned(),
+            name: "helper".to_owned(),
+            relations: vec!["helper>=2".to_owned(), "helper<3".to_owned()],
+        };
+        let config = crate::core::pacman_conf::PacmanConfig::default();
+        {
+            let prepared = super::prepare_alpm_transaction(
+                &mut alpm,
+                vec!["low/helper".to_owned()],
+                super::TransactionKind::Install,
+                &config,
+            )?;
+            prepared
+                .0
+                .trans_prepare()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            super::validate_prepared_selections(prepared.0, std::slice::from_ref(&selected))?;
+            assert_eq!(
+                prepared.0.trans_add().first().unwrap().version().as_str(),
+                "2-1"
+            );
+            let stale = OfficialTarget {
+                relations: vec!["helper>=3".to_owned()],
+                ..selected.clone()
+            };
+            let error = super::validate_prepared_selections(prepared.0, &[stale]).unwrap_err();
+            assert!(
+                error.to_string().contains("no longer satisfies"),
+                "{error:#}"
+            );
+        }
+        {
+            let prepared = super::prepare_alpm_transaction(
+                &mut alpm,
+                vec!["helper".to_owned()],
+                super::TransactionKind::Install,
+                &config,
+            )?;
+            prepared
+                .0
+                .trans_prepare()
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            let error =
+                super::validate_prepared_selections(prepared.0, std::slice::from_ref(&selected))
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("differs from its selected repository"),
+                "{error:#}"
+            );
+        }
+        alpm.syncdbs()
+            .into_iter()
+            .find(|db| db.name() == "low")
+            .unwrap()
+            .set_usage(alpm::Usage::SEARCH)?;
+        let prepared = super::prepare_alpm_transaction(
+            &mut alpm,
+            vec!["low/helper".to_owned()],
+            super::TransactionKind::Install,
+            &config,
+        )?;
+        prepared
+            .0
+            .trans_prepare()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let error = super::validate_prepared_selections(prepared.0, &[selected]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer allows dependency installation"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
     use std::sync::Mutex;
 
     use super::{
