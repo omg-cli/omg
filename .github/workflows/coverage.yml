@@ -45,7 +45,7 @@ jobs:
     timeout-minutes: 45
     env:
       RUSTFLAGS: -C llvm-args=-runtime-counter-relocation
-      LLVM_PROFILE_FILE_NAME: omg-%p-%m%c.profraw
+      LLVM_PROFILE_FILE_NAME: omg-%p-%m.profraw
     container:
       image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
 
@@ -469,10 +469,10 @@ jobs:
 
       - name: Collect invalid coverage diagnostics
         if: ${{ !cancelled() && steps.coverage_sanity.outcome == 'failure' }}
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           python3 - <<'PY'
-          import gzip, hashlib, json, os, re, resource, shlex, stat, subprocess, tarfile, tempfile, time, zlib
+          import gzip, hashlib, io, json, os, re, resource, shlex, stat, subprocess, tarfile, tempfile, time, zlib
           from collections import deque
           from pathlib import Path
           root = Path.cwd()
@@ -489,9 +489,9 @@ jobs:
           receipt['workflow_sha256'] = hashlib.sha256(workflow).hexdigest()
           job = workflow.decode().split('\n  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
           receipt['image'] = re.search(r'(?m)^      image: (.+)$', job)[1]
-          deadline = time.monotonic() + 120
-          commands_left = 512
-          def command(argv, file_limit=8 * 1024 * 1024, pass_fds=(), timeout=5):
+          deadline = time.monotonic() + 240
+          commands_left = 8500
+          def command(argv, file_limit=8 * 1024 * 1024, pass_fds=(), timeout=5, raw_output=False):
               global commands_left
               commands_left -= 1
               remaining = deadline - time.monotonic()
@@ -504,8 +504,11 @@ jobs:
                               resource.RLIMIT_FSIZE, (file_limit, file_limit)))
                       stream.seek(0)
                       data = stream.read(65537)
-                  return {'exit_code': result.returncode, 'output': data[:65536].decode('utf-8', errors='replace'),
+                  response = {'exit_code': result.returncode, 'output': data[:65536].decode('utf-8', errors='replace'),
                       'truncated': len(data) > 65536}
+                  if raw_output:
+                      response['raw_output'] = data
+                  return response
               except (OSError, subprocess.TimeoutExpired) as error:
                   return {'error': str(error)}
           receipt['tools']['rustc'] = command(['rustc', '-vV'])
@@ -587,13 +590,30 @@ jobs:
               match = re.fullmatch(r'omg-(?:fixture-[A-Za-z0-9_]+-)?\d+-(\d+_\d+)\.profraw', path.name)
               if match and not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(profiles.resolve()):
                   groups.setdefault(match[1], []).append(path)
-          prioritized = []
+          prioritized = {}
+          projections = {}
+          projection_bytes = 0
+          projection_budget = 16 * 1024 * 1024
+          targeting['projection_diagnostic_only'] = True
+          targeting['projection_budget_bytes'] = projection_budget
           if targeting['functions'] and (tools is None or receipt['tools'].get('llvm-profdata', {}).get('exit_code') != 0):
               targeting['errors'].append('matching llvm-profdata unavailable')
           elif targeting['functions']:
               selection_start = time.monotonic()
               discovery = {'calls_left': 128, 'deadline': selection_start + 20}
               cache = {}
+              def profile_digest(stream, size, phase):
+                  stream.seek(0)
+                  digest = hashlib.sha256()
+                  while size:
+                      if time.monotonic() >= min(phase['deadline'], deadline):
+                          raise ValueError('profile hashing time budget exhausted')
+                      chunk = stream.read(min(size, 1024 * 1024))
+                      if not chunk:
+                          raise ValueError('profile shrank during hashing')
+                      digest.update(chunk)
+                      size -= len(chunk)
+                  return digest.hexdigest()
               def probe(path, name, phase):
                   key = (path, name)
                   if key in cache:
@@ -603,21 +623,80 @@ jobs:
                       return None
                   phase['calls_left'] -= 1
                   cache[key] = None
-                  result = command([str(tools / 'llvm-profdata'), 'show', '--text', '--function=' + name, str(path)],
-                      timeout=min(5, remaining))
                   entry = {'path': path.relative_to(root).as_posix(), 'function': name}
                   targeting['probes'].append(entry)
-                  if result.get('exit_code') != 0 or result.get('truncated'):
-                      entry['error'] = result
-                      targeting['errors'].append('profile probe failed or exceeded output budget')
-                      return None
-                  records = re.findall(r'(?m)^([^#\n][^\n]*)\n# Func Hash:\n\d+\n# Num Counters:\n\d+\n# Counter Values:\n((?:\d+\n)+)', result['output'])
-                  counts = [int(count) for function, counters in records if function == name for count in counters.splitlines()]
-                  entry['present'] = bool(counts)
-                  entry['nonzero'] = any(counts)
-                  cache[key] = entry['nonzero'] if counts else None
-                  if entry['nonzero'] and path not in prioritized:
-                      prioritized.append(path)
+                  try:
+                      if path.is_symlink() or not path.resolve().is_relative_to(profiles.resolve()):
+                          raise ValueError('profile is a symlink or outside the profile target')
+                      descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                      with os.fdopen(descriptor, 'rb') as stream:
+                          before = os.fstat(stream.fileno())
+                          if not stat.S_ISREG(before.st_mode):
+                              raise ValueError('profile is not a regular file')
+                          entry['raw_identity'] = {'device': before.st_dev, 'inode': before.st_ino,
+                              'bytes': before.st_size, 'mtime_ns': before.st_mtime_ns, 'ctime_ns': before.st_ctime_ns}
+                          try:
+                              entry['raw_sha256_before_probe'] = profile_digest(stream, before.st_size, phase)
+                              result = command([str(tools / 'llvm-profdata'), 'show', '--text', '--function=' + name,
+                                  '/proc/self/fd/' + str(stream.fileno())], pass_fds=(stream.fileno(),),
+                                  timeout=min(5, remaining), raw_output=True)
+                              data = result.pop('raw_output', b'')
+                              if result.get('exit_code') != 0 or result.get('truncated'):
+                                  entry['command_error'] = result
+                                  raise ValueError('profile probe failed or exceeded output budget')
+                              records = list(re.finditer(rb'(?m)^([^#\n][^\n]*)\n# Func Hash:\n(\d+)\n# Num Counters:\n(\d+)\n# Counter Values:\n((?:\d+\n)+)(?:\n|$)', data))
+                              selected = [record for record in records if record[1] == name.encode('utf-8')]
+                              if any(int(record[3]) != len(record[4].splitlines())
+                                      or int(record[2]) > 2**64 - 1
+                                      or any(int(count) > 2**64 - 1 for count in record[4].splitlines())
+                                      for record in selected):
+                                  raise ValueError('invalid counter record in profile probe')
+                              if name.encode('utf-8') + b'\n' in data and not selected:
+                                  raise ValueError('malformed counter record in profile probe')
+                              counts = [int(count) for record in selected for count in record[4].splitlines()]
+                              entry['present'] = bool(counts)
+                              entry['nonzero'] = any(counts)
+                              if entry['nonzero']:
+                                  entry['raw_sha256'] = profile_digest(stream, before.st_size, phase)
+                          finally:
+                              after = os.fstat(stream.fileno())
+                              try:
+                                  current = path.lstat()
+                              except OSError as error:
+                                  current = None
+                                  entry['raw_path_error'] = str(error)
+                              entry['changed_during_collection'] = (
+                                  (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) !=
+                                  (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                                  or entry.get('raw_sha256_before_probe') != entry.get('raw_sha256', entry.get('raw_sha256_before_probe'))
+                                  or current is None or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns) !=
+                                  (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns))
+                              if entry['changed_during_collection']:
+                                  entry['raw_final_identity'] = {'device': after.st_dev, 'inode': after.st_ino,
+                                      'bytes': after.st_size, 'mtime_ns': after.st_mtime_ns, 'ctime_ns': after.st_ctime_ns}
+                                  if current is not None:
+                                      entry['raw_path_final_identity'] = {'device': current.st_dev, 'inode': current.st_ino,
+                                          'bytes': current.st_size, 'mtime_ns': current.st_mtime_ns, 'ctime_ns': current.st_ctime_ns}
+                          if entry['changed_during_collection']:
+                              raise ValueError('profile changed during probing or hashing')
+                      cache[key] = entry['nonzero'] if counts else None
+                      if entry['nonzero']:
+                          if path not in prioritized:
+                              prioritized[path] = None
+                          projection = b''.join(record[0] for record in selected)
+                          global projection_bytes
+                          if projection_bytes + len(projection) > projection_budget:
+                              raise ValueError('profile projection byte budget exhausted')
+                          projection_path = output / (str(len(projections)) + '.proftext')
+                          projection_path.write_bytes(projection)
+                          entry['projection'] = 'profile-projections/' + projection_path.name
+                          entry['projection_sha256'] = hashlib.sha256(projection).hexdigest()
+                          projections[projection_path] = {'path': entry['projection'],
+                              'bytes': len(projection), 'sha256': entry['projection_sha256']}
+                          projection_bytes += len(projection)
+                  except (OSError, ValueError) as error:
+                      entry['error'] = str(error)
+                      targeting['errors'].append(str(error))
                   return cache[key]
               matching = []
               for paths in groups.values():
@@ -630,7 +709,7 @@ jobs:
                       break
               if discovery['calls_left'] < 1 or time.monotonic() >= discovery['deadline']:
                   targeting['errors'].append('profile discovery budget exhausted')
-              members = {'calls_left': 128, 'deadline': min(selection_start + 45, time.monotonic() + 25)}
+              members = {'calls_left': 8192, 'deadline': time.monotonic() + 120}
               pending = deque((iter(paths), name) for paths, name in matching)
               while pending and members['calls_left'] > 0 and time.monotonic() < members['deadline']:
                   paths, name = pending.popleft()
@@ -644,13 +723,13 @@ jobs:
                   targeting['errors'].append('no nonzero saturated-function raw profile located')
           covmaps = []
           generated = 0
-          for index, entry in enumerate(receipt['objects']):
+          for index, entry in sorted(enumerate(receipt['objects']), key=lambda pair: pair[1].get('bytes', 0), reverse=True):
               if entry.get('omitted') or entry.get('changed_during_collection'):
                   continue
               if tools is None or receipt['tools'].get('llvm-cov', {}).get('exit_code') != 0:
                   targeting['errors'].append('matching llvm-cov unavailable')
                   break
-              if generated >= 64 * 1024 * 1024:
+              if generated >= 96 * 1024 * 1024:
                   targeting['errors'].append('coverage map generation budget exhausted')
                   break
               path = output / (str(index) + '.covmap')
@@ -662,7 +741,7 @@ jobs:
                           raise ValueError('object changed before coverage map conversion')
                       result = command([str(tools / 'llvm-cov'), 'convert-for-testing',
                           '/proc/self/fd/' + str(stream.fileno()), '-o', str(path)],
-                          min(8 * 1024 * 1024, 64 * 1024 * 1024 - generated), (stream.fileno(),))
+                          min(32 * 1024 * 1024, 96 * 1024 * 1024 - generated), (stream.fileno(),))
               except (OSError, ValueError) as error:
                   result = {'error': str(error)}
               if result.get('exit_code') != 0 or result.get('truncated') or not path.is_file():
@@ -673,23 +752,34 @@ jobs:
               entry['coverage_map'] = 'coverage-maps/' + path.name
               generated += path.stat().st_size
               covmaps.append(path)
-          candidates = expected + covmaps + prioritized + [path for path in raws if path not in prioritized] + [export_log]
+          candidates = list(projections) + expected + covmaps + list(prioritized) + [path for path in raws if path not in prioritized] + [export_log]
           used = 0
           archive = output / 'profiles.tar.gz'
           with tarfile.open(archive, 'w:gz', compresslevel=1) as bundle:
               for path in candidates:
-                  entry = {'path': ('coverage-maps/' + path.name) if path in covmaps else path.relative_to(root).as_posix()}
+                  entry = {'path': projections[path]['path'] if path in projections else (
+                      ('coverage-maps/' + path.name) if path in covmaps else path.relative_to(root).as_posix())}
                   receipt['files'].append(entry)
                   try:
                       info = path.lstat()
                       entry['bytes'] = info.st_size
-                      container = output if path in covmaps else root
+                      container = output if path in covmaps or path in projections else root
                       if not stat.S_ISREG(info.st_mode) or not path.resolve().is_relative_to(container):
                           raise ValueError('not a regular contained file; symlinks are not followed')
                       if used + info.st_size > budget:
                           raise ValueError('input byte budget exceeded')
                       descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
                       with os.fdopen(descriptor, 'rb') as stream:
+                          opened = os.fstat(stream.fileno())
+                          if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                                  info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+                              raise ValueError('file changed before archive capture')
+                          if path in projections:
+                              data = stream.read(65537)
+                              if (len(data) > 65536 or len(data) != projections[path]['bytes']
+                                      or hashlib.sha256(data).hexdigest() != projections[path]['sha256']):
+                                  raise ValueError('profile projection changed or exceeded output budget')
+                              stream = io.BytesIO(data)
                           digest = hashlib.sha256()
                           class ProfileReader:
                               def read(self, size):
@@ -702,7 +792,7 @@ jobs:
                           used += info.st_size
                           bundle.addfile(member, ProfileReader())
                           entry['sha256'] = digest.hexdigest()
-                          changed = os.fstat(stream.fileno())
+                          changed = path.lstat() if path in projections else os.fstat(stream.fileno())
                           entry['changed_during_collection'] = (
                               changed.st_size != info.st_size or changed.st_mtime_ns != info.st_mtime_ns)
                   except (OSError, ValueError) as error:
@@ -711,7 +801,7 @@ jobs:
               entry['path'].endswith('.profraw') and 'omitted' not in entry for entry in receipt['files'])
           receipt['admitted_input_bytes'] = used
           receipt['captured_input_bytes'] = sum(entry.get('captured_bytes', 0) for entry in receipt['files'])
-          for path in covmaps:
+          for path in covmaps + list(projections):
               path.unlink()
           receipt['complete'] = bool(object_paths) and not targeting['errors'] and not receipt['raw_profiles_missing'] and not any(
               entry.get('omitted') or entry.get('changed_during_collection')

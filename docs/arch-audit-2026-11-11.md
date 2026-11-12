@@ -246,8 +246,9 @@ records mount information and requires both nonroot network-namespace probes.
 All 19 selected native cases passed in the latest hosted run, including
 historical review acceptance followed by the inert recipe's intentional failure.
 The other platform, VM, Docker, Clippy and security jobs also passed. Coverage
-remains unverified because its producer rejected a wrapped daemon-worker count
-before comparison. The retained profiles and exports remain unchanged.
+remains unverified because successive producers rejected wrapped counts in a
+daemon worker and runtime-pin detection before comparison. The retained profiles
+and exports remain unchanged.
 
 The initial diagnostic archive contained no raw profile for that function.
 The collector now prioritizes profiles containing affected functions and saves
@@ -257,13 +258,32 @@ must not prevent the remaining evidence from being preserved. Matching LLVM
 tools reproduced an executable's export from its compact map without retaining
 another executable.
 
+A controlled Rust 1.95/LLVM 22.1.2 probe reproduced an invalid branch count when
+continuous profiling retained a worker killed during initialization. Ordinary
+exit-flush profiling emitted no profile for that killed child, while retaining
+valid coverage from 20 completed workers. The ordinary test producer now uses
+exit-flush profiles. Every crash test still runs. The native fixture cases keep
+their explicit continuous profiles and remain subject to strict validation.
+This changes which interrupted executions contribute coverage; it can reduce
+coverage against the existing main baseline. Counter validation, comparison
+thresholds and exact-base authority remain unchanged.
+
+The bounded diagnostic collector also retains exact LLVM function-counter
+records when whole raw profiles cannot fit. Each projection is linked to its
+source identity and content hashes before and after probing. A real mmap
+regression showed that counters can change while size and timestamps stay
+unchanged. Such changed snapshots are refused. Five actual retained profiles
+round-tripped through LLVM with byte-identical projected records.
+
 ## Remaining work
 
-- Classify the daemon coverage underflow from its contributing profiles and
-  coverage map. Current-thread shutdown and cancellation probes did not
-  reproduce it. An [open Rust compiler issue](https://github.com/rust-lang/rust/issues/164153)
-  describes underflow during incomplete execution, but does not establish the
-  cause here. The producer continues to reject invalid counters.
+- Require fresh producer and exact-base comparison evidence for the retention
+  correction. Its controlled failure class is established; the exact processes
+  responsible for the earlier CI failures were not identified. An
+  [open Rust compiler issue](https://github.com/rust-lang/rust/issues/164153)
+  describes underflow during incomplete execution. Exit flushing does not
+  guarantee every emitted profile is valid. Any recurrence remains fatal and
+  receives the bounded diagnostic capture.
 - Live searches and several inventory operations still use C libalpm. Move
   individual queries only after matching repository priority, duplicate package
   identities, custom pacman configuration and malformed-metadata behavior.
