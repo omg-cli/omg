@@ -9940,13 +9940,15 @@ finally:
                     package_base_locks: Arc::new(dashmap::DashMap::new()),
                 };
                 let inspection = artifact_inspector::inspect_archive(&archive)?.into_inspection();
-                let mut old_policy = inspection.clone();
-                old_policy.policy_version = 3;
-                assert_ne!(
-                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&old_policy)),
-                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection)),
-                    "a policy-3 paired-build proof must not authorize the current archive policy"
-                );
+                for old_version in [3, 4, 5] {
+                    let mut old_policy = inspection.clone();
+                    old_policy.policy_version = old_version;
+                    assert_ne!(
+                        client.paired_build_cache_key(&source, &env, std::slice::from_ref(&old_policy)),
+                        client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection)),
+                        "a policy-{old_version} paired-build proof must not authorize the current archive policy"
+                    );
+                }
                 let standard_key =
                     client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
                 client.settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;

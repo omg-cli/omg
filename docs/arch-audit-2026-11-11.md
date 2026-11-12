@@ -532,3 +532,44 @@ The admitted continuation passed without rerunning the library suite. Coverage
 retains its separate 40 GiB target budget. Unresolved linker/debug evidence and
 the current QEMU backing images remain preserved. Host package state and
 privilege policy were not changed.
+
+## November 12 resource and integration checkpoint
+
+The next Arch batch keeps parsed `.SRCINFO` owned by the reviewed source snapshot
+through dependency planning, installed-state rechecks, source extraction and
+offline builds. Public path APIs retain their signatures through a shared bounded
+regular-file reader. Git mirrors and historical rollback share bounded capture,
+staging observation, deadlines and process-group cleanup. Capability retention and
+approval formatting now check byte budgets before encoding or extending buffers.
+That product batch passed 2,232 library tests, 15 source API tests, lint, builds
+and docs checks.
+
+The production CLI completed a genuine AUR install, update and historical rollback
+in a disposable Arch guest. A separate current-build scenario observed a sealed
+Automatic request for a previously Explicit split sibling, preserved its Explicit
+reason, captured immediate credential refresh before handoff, and observed two
+native makepkg processes overlap before one successful update transaction.
+Payloads, inventories, ownership, reasons, unrelated records, locks and cleanup
+were checked. These are scoped offline KVM observations, not Docker-policy parity
+or a claim that arbitrary AUR programs are safe.
+
+Hosted verification then exposed incomplete native fixture prerequisites. The
+corrected image supplies Git, Make, jq and diffutils, and reports every missing
+tool under the actual ordinary-user PATH before running tests. All 14 supplemental
+tests and five CLI/daemon process checks subsequently passed in hosted CI, and
+the resulting coverage counters passed strict validation. The remaining stale
+history fixture was corrected to the bounded Git contract; its actual native
+review case passed locally with its original approval and failure assertions.
+
+A combined independent review covered all 49 prepared source items in the PR.
+It found a Hardened admission gap in omitted local and runtime loader locations.
+Inert archive tests reproduced acceptance under both omitted systemd generator
+roots and 19 related loader/configuration aliases. Inspection policy 6 groups the
+documented privileged prefixes and exact configuration files in explicit tables.
+Focused tests now refuse those paths while retaining ordinary local application
+paths and adjacent names. No generator payload was installed or executed.
+
+This is a source checkpoint. The complete policy-6 verification, review and fresh
+hosted source-bound coverage remain required. The strict coverage criteria are
+unchanged. Current CI results are recorded on PR #1057. The local checkout stays
+on `main`; the approved remote PR branch is the only publication target.

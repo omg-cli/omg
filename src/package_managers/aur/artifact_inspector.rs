@@ -30,7 +30,76 @@ const MAX_PRIVILEGED_FILES: usize = 256;
 const MAX_CAPABILITY_BYTES: usize = 8 * 1024;
 const MAX_PRIVILEGE_METADATA_BYTES: usize = 64 * 1024;
 
-pub(crate) const INSPECTION_POLICY_VERSION: u32 = 5;
+pub(crate) const INSPECTION_POLICY_VERSION: u32 = 6;
+
+// Loader roots include local administrator and volatile runtime locations.
+// https://man.archlinux.org/man/systemd.generator.7
+// https://man.archlinux.org/man/udev.7
+// https://man.archlinux.org/man/tmpfiles.d.5
+// https://man.archlinux.org/man/sysusers.d.5
+// https://man.archlinux.org/man/modules-load.d.5
+// https://man.archlinux.org/man/polkit.8
+// https://man.archlinux.org/man/dbus-daemon.1
+// https://man.archlinux.org/man/kernel-install.8
+const PRIVILEGED_PATH_PREFIXES: &[(&str, &[&str])] = &[
+    ("system-configuration", &["etc/"]),
+    (
+        "systemd-unit",
+        &[
+            "usr/lib/systemd/",
+            "usr/local/lib/systemd/",
+            "run/systemd/",
+            "etc/systemd/",
+        ],
+    ),
+    ("kernel-module", &["usr/lib/modules/", "lib/modules/"]),
+    (
+        "package-manager-hook",
+        &["usr/share/libalpm/hooks/", "usr/share/libalpm/scripts/"],
+    ),
+    (
+        "privileged-system-integration",
+        &[
+            "usr/lib/udev/rules.d/",
+            "usr/local/lib/udev/rules.d/",
+            "run/udev/rules.d/",
+            "usr/lib/tmpfiles.d/",
+            "usr/local/lib/tmpfiles.d/",
+            "run/tmpfiles.d/",
+            "usr/lib/sysusers.d/",
+            "usr/local/lib/sysusers.d/",
+            "run/sysusers.d/",
+            "usr/lib/modules-load.d/",
+            "usr/local/lib/modules-load.d/",
+            "run/modules-load.d/",
+            "usr/share/polkit-1/",
+            "usr/local/share/polkit-1/",
+            "run/polkit-1/",
+            "usr/share/dbus-1/system-services/",
+            "usr/local/share/dbus-1/system-services/",
+            "run/dbus-1/system-services/",
+            "lib/dbus-1/system-services/",
+            "usr/share/dbus-1/system.d/",
+            "usr/lib/kernel/install.d/",
+            "usr/lib/kernel/install.conf.d/",
+            "usr/local/lib/kernel/install.conf.d/",
+            "run/kernel/install.conf.d/",
+            "usr/lib/initcpio/",
+            "usr/share/mkinitcpio/",
+            "usr/lib/dracut/",
+            "usr/lib/NetworkManager/dispatcher.d/",
+        ],
+    ),
+];
+
+const PRIVILEGED_EXACT_PATHS: &[(&str, &[&str])] = &[(
+    "privileged-system-integration",
+    &[
+        "usr/lib/kernel/install.conf",
+        "usr/local/lib/kernel/install.conf",
+        "run/kernel/install.conf",
+    ],
+)];
 
 #[derive(Debug, Default)]
 struct PrivilegeMetadataBudget(usize);
@@ -296,40 +365,15 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
         );
         let kind = entry.header().entry_type();
         let member = normalize_member_path(&raw_path, kind.is_dir())?;
-        if member.starts_with("etc/") {
-            paired_build_reasons.insert("system-configuration".to_owned());
+        for (reason, prefixes) in PRIVILEGED_PATH_PREFIXES {
+            if prefixes.iter().any(|prefix| member.starts_with(prefix)) {
+                paired_build_reasons.insert((*reason).to_owned());
+            }
         }
-        // These package locations are consumed by privileged system managers
-        // or execute during later root-owned transactions:
-        // https://man.archlinux.org/man/alpm-hooks.5
-        // https://man.archlinux.org/man/systemd.generator.7
-        // https://man.archlinux.org/man/tmpfiles.d.5
-        // https://man.archlinux.org/man/sysusers.d.5
-        if member.starts_with("usr/lib/systemd/") || member.starts_with("etc/systemd/") {
-            paired_build_reasons.insert("systemd-unit".to_owned());
-        }
-        if member.starts_with("usr/lib/modules/") || member.starts_with("lib/modules/") {
-            paired_build_reasons.insert("kernel-module".to_owned());
-        }
-        if member.starts_with("usr/share/libalpm/hooks/")
-            || member.starts_with("usr/share/libalpm/scripts/")
-        {
-            paired_build_reasons.insert("package-manager-hook".to_owned());
-        }
-        if member.starts_with("usr/lib/udev/rules.d/")
-            || member.starts_with("usr/lib/tmpfiles.d/")
-            || member.starts_with("usr/lib/sysusers.d/")
-            || member.starts_with("usr/lib/modules-load.d/")
-            || member.starts_with("usr/share/polkit-1/")
-            || member.starts_with("usr/share/dbus-1/system-services/")
-            || member.starts_with("usr/share/dbus-1/system.d/")
-            || member.starts_with("usr/lib/kernel/install.d/")
-            || member.starts_with("usr/lib/initcpio/")
-            || member.starts_with("usr/share/mkinitcpio/")
-            || member.starts_with("usr/lib/dracut/")
-            || member.starts_with("usr/lib/NetworkManager/dispatcher.d/")
-        {
-            paired_build_reasons.insert("privileged-system-integration".to_owned());
+        for (reason, paths) in PRIVILEGED_EXACT_PATHS {
+            if paths.contains(&member.as_str()) {
+                paired_build_reasons.insert((*reason).to_owned());
+            }
         }
 
         anyhow::ensure!(
@@ -1170,6 +1214,96 @@ mod tests {
                 format!("AUR archive .BUILDINFO must contain one {field}")
             );
         }
+    }
+
+    #[test]
+    fn hardened_profile_refuses_every_system_generator_search_root() -> Result<()> {
+        use crate::config::AurSecurityProfile::{Hardened, Standard};
+        let mut admitted = Vec::new();
+        for root in ["usr/lib", "usr/local/lib", "run", "etc"] {
+            let path = format!("{root}/systemd/system-generators/omg-inert-marker");
+            let mtree = fixture_file_mtree(&[(&path, 0o755, 5)]);
+            let file = fixture_archive_with_mtree(&mtree, |builder| {
+                append_file(builder, &path, b"inert", 0o755)
+            })?;
+            let inspection = inspect_archive(file.path())?.into_inspection();
+            assert!(inspection.executable_files.contains(&path));
+            assert!(inspection.enforce_profile(Standard).is_ok());
+            if inspection.enforce_profile(Hardened).is_ok() {
+                admitted.push(path);
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "Hardened accepted system generator paths: {admitted:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hardened_profile_refuses_local_and_runtime_privileged_loader_aliases() -> Result<()> {
+        use crate::config::AurSecurityProfile::{Hardened, Standard};
+        let mut admitted = Vec::new();
+        for path in [
+            "usr/local/lib/udev/rules.d/marker.rules",
+            "run/udev/rules.d/marker.rules",
+            "usr/local/lib/tmpfiles.d/marker.conf",
+            "run/tmpfiles.d/marker.conf",
+            "usr/local/lib/sysusers.d/marker.conf",
+            "run/sysusers.d/marker.conf",
+            "usr/local/lib/modules-load.d/marker.conf",
+            "run/modules-load.d/marker.conf",
+            "usr/local/share/polkit-1/actions/marker.policy",
+            "run/polkit-1/rules.d/marker.rules",
+            "usr/local/share/dbus-1/system-services/marker.service",
+            "run/dbus-1/system-services/marker.service",
+            "lib/dbus-1/system-services/marker.service",
+            "usr/lib/kernel/install.conf",
+            "usr/local/lib/kernel/install.conf",
+            "run/kernel/install.conf",
+            "usr/lib/kernel/install.conf.d/marker.conf",
+            "usr/local/lib/kernel/install.conf.d/marker.conf",
+            "run/kernel/install.conf.d/marker.conf",
+        ] {
+            let mtree = fixture_file_mtree(&[(path, 0o644, 5)]);
+            let file = fixture_archive_with_mtree(&mtree, |builder| {
+                append_file(builder, path, b"inert", 0o644)
+            })?;
+            let inspection = inspect_archive(file.path())?.into_inspection();
+            assert!(inspection.enforce_profile(Standard).is_ok());
+            if inspection.enforce_profile(Hardened).is_ok() {
+                admitted.push(path);
+            }
+        }
+        assert!(
+            admitted.is_empty(),
+            "Hardened accepted privileged loader aliases: {admitted:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hardened_profile_keeps_ordinary_local_paths_and_prefix_neighbors_eligible() -> Result<()> {
+        use crate::config::AurSecurityProfile::{Hardened, Standard};
+        for path in [
+            "usr/local/bin/marker",
+            "usr/local/lib/example/marker",
+            "run/example/marker",
+            "usr/local/lib/systemd-neighbor/marker",
+            "run/systemd-neighbor/marker",
+            "usr/local/share/polkit-10/marker",
+            "usr/local/share/dbus-1/system-services-backup/marker",
+            "usr/lib/kernel/install.conf.keep",
+        ] {
+            let mtree = fixture_file_mtree(&[(path, 0o644, 5)]);
+            let file = fixture_archive_with_mtree(&mtree, |builder| {
+                append_file(builder, path, b"inert", 0o644)
+            })?;
+            let inspection = inspect_archive(file.path())?.into_inspection();
+            assert!(inspection.enforce_profile(Hardened).is_ok(), "{path}");
+            assert!(!inspection.requires_paired_build_for(Standard), "{path}");
+        }
+        Ok(())
     }
 
     #[test]

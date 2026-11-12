@@ -104,7 +104,10 @@ cannot skip its confirmation in hardened mode.
 
 This profile rejects install hooks, setuid/setgid files, file capabilities,
 `/etc` content and the privileged integration paths classified by OMG, such as
-systemd units, kernel modules, ALPM hooks and polkit policies. It requires two
+systemd units, kernel modules, ALPM hooks and polkit policies. The classifier
+includes the documented local and runtime loader roots for systemd, udev,
+tmpfiles, sysusers, module loading, polkit and D-Bus system services, along with
+kernel-install configuration. It requires two
 builds with separate output, source and compiler-cache directories to produce
 identical archive hashes for every accepted output. Some legitimate AUR recipes
 will fail these requirements. Use `standard` to restore the default profile.
@@ -136,8 +139,9 @@ before hex encoding, and 64 KiB per archive for retained privileged paths and
 encoded capability values. The attended privilege summary has a 32 KiB display
 limit. OMG refuses approval when the complete summary exceeds that limit,
 even if each archive passes inspection. These are OMG compatibility limits,
-not a claim that the metadata is a valid Linux capability. Inspection policy 5
-invalidates admission evidence produced under earlier limits.
+not a claim that the metadata is a valid Linux capability. Inspection policy 6
+invalidates admission evidence produced before the current limits and loader-path
+classification.
 
 Inventory agreement does not vet program behavior or authenticate MTREE content
 hashes. Native file-list agreement also does not prove successful extraction.
