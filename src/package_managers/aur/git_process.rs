@@ -327,36 +327,56 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn interrupted_observation_yields_and_retries_before_accepting_exit() {
+    async fn pending_observation_waits_then_interruption_yields_before_exit() {
+        let mut child = Command::new("sh")
+            .args(["-c", "read release; exit 0"])
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("owned child held until observation registers SIGCHLD");
+        let mut release = child.stdin.take();
         let mut observed = Vec::new();
         let mut outcomes = [
+            Ok(WaitStatus::StillAlive),
             Err(Errno::EINTR),
             Ok(WaitStatus::Exited(Pid::from_raw(123), 0)),
         ]
         .into_iter();
         let yielded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let witness = yielded.clone();
-        let peer = tokio::spawn(async move {
-            witness.store(true, std::sync::atomic::Ordering::SeqCst);
-        });
+        let mut peer = None;
         tokio::time::timeout(
             Duration::from_secs(2),
             observe_git_exit_with(123, |pid| {
                 observed.push(pid.as_raw());
-                if observed.len() == 2 {
+                if observed.len() == 1 {
+                    drop(release.take());
+                } else if observed.len() == 2 {
+                    let witness = yielded.clone();
+                    peer = Some(tokio::spawn(async move {
+                        witness.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }));
+                } else {
+                    assert_eq!(observed.len(), 3, "observation continued after exit");
                     assert!(
                         yielded.load(std::sync::atomic::Ordering::SeqCst),
-                        "EINTR retry must yield to other runtime work"
+                        "EINTR retry must yield to work spawned at the interruption"
                     );
                 }
-                outcomes.next().expect("interruption then exit")
+                outcomes.next().expect("pending, interruption, then exit")
             }),
         )
         .await
-        .expect("interrupted observation deadline")
-        .expect("EINTR must not become terminal failure");
-        peer.await.expect("yield witness task");
-        assert_eq!(observed, [123, 123]);
+        .expect("pending and interrupted observation deadline")
+        .expect("Pending and EINTR must not become terminal failure");
+        peer.expect("EINTR scheduled a yield witness")
+            .await
+            .expect("yield witness task");
+        assert_eq!(observed, [123, 123, 123]);
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("released child reap deadline")
+            .expect("reap only the owned signal fixture");
+        assert!(status.success(), "released child status: {status:?}");
     }
 
     #[tokio::test]
@@ -480,26 +500,58 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cancellation_reports_failed_group_termination_without_panicking() {
-        let capture = WarningCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(capture.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            let guard = GitGroupGuard::new(123, |_| Err(nix::errno::Errno::EPERM)).unwrap();
-            drop(guard);
-        });
-        let bytes = capture.0.lock().expect("warning capture lock");
-        let warning = String::from_utf8_lossy(&bytes);
-        assert!(
-            warning.contains("Failed to terminate cancelled AUR Git process group"),
-            "{warning}"
-        );
+    fn inert_group_signal(
+        events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        result: std::result::Result<(), Errno>,
+    ) -> impl FnMut(Pid) -> std::result::Result<(), Errno> {
+        move |pid| {
+            assert_eq!(
+                pid.as_raw(),
+                123,
+                "only the inert fixture identity is accepted"
+            );
+            events.lock().expect("cleanup events").push("group kill");
+            result
+        }
     }
 
+    #[test]
+    fn cancellation_warns_only_for_an_armed_guard_that_cannot_terminate() {
+        for armed in [true, false] {
+            for signal_result in [Ok(()), Err(Errno::ESRCH), Err(Errno::EPERM)] {
+                let capture = WarningCapture::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(capture.clone())
+                    .finish();
+                let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                tracing::subscriber::with_default(subscriber, || {
+                    let mut guard =
+                        GitGroupGuard::new(123, inert_group_signal(events.clone(), signal_result))
+                            .expect("inert cancellation guard");
+                    if !armed {
+                        guard.disarm();
+                    }
+                    drop(guard);
+                });
+                let bytes = capture.0.lock().expect("warning capture lock");
+                let warning = String::from_utf8_lossy(&bytes);
+                assert_eq!(
+                    warning.contains("Failed to terminate cancelled AUR Git process group"),
+                    armed && signal_result == Err(Errno::EPERM),
+                    "armed={armed}, signal={signal_result:?}: {warning}"
+                );
+                assert_eq!(
+                    events.lock().expect("cleanup events").as_slice(),
+                    if armed { &["group kill"][..] } else { &[] },
+                    "armed={armed}, signal={signal_result:?}"
+                );
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
     enum CleanupWait {
         Exited,
         Denied,
@@ -538,121 +590,123 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cleanup_tries_child_after_group_failure_and_bounds_reaping() {
-        use nix::errno::Errno;
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let signal_events = events.clone();
-        let mut guard = GitGroupGuard::new(123, move |_| {
-            signal_events
-                .lock()
-                .expect("cleanup events")
-                .push("group kill");
-            Err(Errno::EPERM)
-        })
-        .unwrap();
-        let mut child = CleanupChild {
-            events: events.clone(),
-            kill_fails: true,
-            wait: CleanupWait::Pending,
-        };
-        let started = Instant::now();
-        let error = cleanup_git_child(&mut guard, &mut child).await.unwrap_err();
-        assert_eq!(Instant::now() - started, Duration::from_secs(5));
-        assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
-        let diagnostic = format!("{error:#}");
-        assert!(
-            diagnostic.contains("five-second reap grace"),
-            "the reap deadline was lost from the combined cleanup failure: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("direct AUR Git child"),
-            "the failed fallback kill was lost from the cleanup failure: {diagnostic}"
-        );
-        assert!(
-            diagnostic.contains("Failed to terminate AUR Git process group"),
-            "the primary group failure was lost: {diagnostic}"
-        );
-        let operation_error =
-            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::InvalidData));
-        let combined = finish_git_output(Err(operation_error), Err(error)).unwrap_err();
-        assert_eq!(
-            combined
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind),
-            Some(std::io::ErrorKind::InvalidData),
-            "cleanup context must preserve the operation's primary cause"
-        );
-        let diagnostic = format!("{combined:#}");
-        for context in [
-            "process group",
-            "direct AUR Git child",
-            "five-second reap grace",
-        ] {
-            assert!(diagnostic.contains(context), "lost {context}: {diagnostic}");
+    async fn cleanup_preserves_order_causes_and_deadlines_across_failure_combinations() {
+        for signal_result in [Ok(()), Err(Errno::EPERM)] {
+            for kill_fails in [false, true] {
+                for wait in [
+                    CleanupWait::Exited,
+                    CleanupWait::Denied,
+                    CleanupWait::Pending,
+                ] {
+                    let scenario = format!(
+                        "signal={signal_result:?}, fallback_fails={kill_fails}, reap={wait:?}"
+                    );
+                    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let mut guard =
+                        GitGroupGuard::new(123, inert_group_signal(events.clone(), signal_result))
+                            .expect("inert cleanup guard");
+                    let mut child = CleanupChild {
+                        events: events.clone(),
+                        kill_fails,
+                        wait,
+                    };
+                    let started = Instant::now();
+                    let result = cleanup_git_child(&mut guard, &mut child).await;
+                    assert_eq!(
+                        Instant::now() - started,
+                        if matches!(wait, CleanupWait::Pending) {
+                            Duration::from_secs(5)
+                        } else {
+                            Duration::ZERO
+                        },
+                        "{scenario}"
+                    );
+                    assert!(guard.process_group.is_none(), "{scenario}");
+                    drop(guard);
+                    assert_eq!(
+                        events.lock().expect("cleanup events").as_slice(),
+                        if signal_result.is_err() {
+                            &["group kill", "child kill", "reap"][..]
+                        } else {
+                            &["group kill", "reap"][..]
+                        },
+                        "cleanup must disarm before Drop and reap after termination: {scenario}"
+                    );
+                    if signal_result.is_ok() && matches!(wait, CleanupWait::Exited) {
+                        assert!(result.expect(&scenario).success(), "{scenario}");
+                        continue;
+                    }
+                    let error = result.expect_err(&scenario);
+                    let diagnostic = format!("{error:#}");
+                    if signal_result.is_err() {
+                        assert_eq!(
+                            error.downcast_ref::<Errno>(),
+                            Some(&Errno::EPERM),
+                            "group failure stays primary: {scenario}"
+                        );
+                        assert!(
+                            diagnostic.contains("Failed to terminate AUR Git process group"),
+                            "{scenario}: {diagnostic}"
+                        );
+                    } else if matches!(wait, CleanupWait::Pending) {
+                        assert!(
+                            error.to_string().contains("five-second reap grace"),
+                            "{scenario}: {error}"
+                        );
+                        assert!(
+                            error
+                                .downcast_ref::<tokio::time::error::Elapsed>()
+                                .is_some(),
+                            "{scenario}: {diagnostic}"
+                        );
+                    } else {
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("Failed to reap AUR Git command during cleanup"),
+                            "{scenario}: {error}"
+                        );
+                        assert_eq!(
+                            error
+                                .downcast_ref::<std::io::Error>()
+                                .map(std::io::Error::kind),
+                            Some(std::io::ErrorKind::PermissionDenied),
+                            "{scenario}"
+                        );
+                    }
+                    assert_eq!(
+                        diagnostic.contains("direct AUR Git child"),
+                        signal_result.is_err() && kill_fails,
+                        "fallback failure context: {scenario}: {diagnostic}"
+                    );
+                    assert_eq!(
+                        diagnostic.contains("Failed to reap AUR Git command during cleanup"),
+                        matches!(wait, CleanupWait::Denied),
+                        "reap failure context: {scenario}: {diagnostic}"
+                    );
+                    assert_eq!(
+                        diagnostic.contains("five-second reap grace"),
+                        matches!(wait, CleanupWait::Pending),
+                        "deadline context: {scenario}: {diagnostic}"
+                    );
+                    let operation_error =
+                        anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                    let combined = finish_git_output(Err(operation_error), Err(error))
+                        .expect_err("operation failure remains primary after cleanup");
+                    assert_eq!(
+                        combined
+                            .downcast_ref::<std::io::Error>()
+                            .map(std::io::Error::kind),
+                        Some(std::io::ErrorKind::InvalidData),
+                        "{scenario}"
+                    );
+                    assert!(
+                        format!("{combined:#}").contains(&diagnostic),
+                        "operation context lost the cleanup diagnostic: {scenario}: {combined:#}"
+                    );
+                }
+            }
         }
-        assert!(
-            guard.process_group.is_none(),
-            "identity authority ends before reaping"
-        );
-        drop(guard);
-        assert_eq!(
-            *events.lock().expect("cleanup events"),
-            ["group kill", "child kill", "reap"]
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cleanup_reap_deadline_preserves_elapsed_cause() {
-        let mut guard = GitGroupGuard::new(123, |_| Ok(())).unwrap();
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut child = CleanupChild {
-            events: events.clone(),
-            kill_fails: false,
-            wait: CleanupWait::Pending,
-        };
-        let error = cleanup_git_child(&mut guard, &mut child).await.unwrap_err();
-        assert!(error.to_string().contains("five-second reap grace"));
-        assert!(
-            error
-                .downcast_ref::<tokio::time::error::Elapsed>()
-                .is_some()
-        );
-        assert_eq!(*events.lock().expect("cleanup events"), ["reap"]);
-    }
-
-    #[tokio::test]
-    async fn cleanup_preserves_wait_errors_and_group_errors_after_successful_fallback() {
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut child = CleanupChild {
-            events: events.clone(),
-            kill_fails: false,
-            wait: CleanupWait::Denied,
-        };
-        let mut guard = GitGroupGuard::new(123, |_| Ok(())).unwrap();
-        let error = cleanup_git_child(&mut guard, &mut child).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Failed to reap AUR Git command during cleanup")
-        );
-        assert_eq!(
-            error
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind),
-            Some(std::io::ErrorKind::PermissionDenied)
-        );
-
-        child.wait = CleanupWait::Exited;
-        let mut guard = GitGroupGuard::new(123, |_| Err(nix::errno::Errno::EPERM)).unwrap();
-        let error = cleanup_git_child(&mut guard, &mut child).await.unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<nix::errno::Errno>(),
-            Some(&nix::errno::Errno::EPERM)
-        );
-        assert_eq!(
-            *events.lock().expect("cleanup events"),
-            ["reap", "child kill", "reap"]
-        );
     }
 
     #[test]
