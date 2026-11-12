@@ -4,7 +4,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::process::Stdio;
 use std::time::Duration;
 
 const MAX_AUR_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -20,6 +19,7 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
+use super::aur::git_process::{GitLimits, run_bounded_git};
 use crate::cli::progress::{Accent, Outcome, ProgressTask, TaskKind, TaskSpec};
 
 /// Represents a source file that can be downloaded
@@ -31,29 +31,25 @@ pub struct SourceFile {
     pub filename: String,
 }
 
-/// Parse .SRCINFO to extract HTTP/HTTPS source URLs
+/// Acquires a bounded regular .SRCINFO file and extracts its HTTP/HTTPS sources.
+pub fn parse_sources(pkg_dir: &Path) -> Result<Vec<SourceFile>> {
+    Ok(super::aur::source_file::read_srcinfo(pkg_dir)?
+        .as_ref()
+        .map_or_else(Vec::new, http_sources))
+}
+
+/// Extract HTTP/HTTPS source URLs from captured, parsed metadata.
 ///
 /// Returns a list of downloadable sources that makepkg would normally fetch.
 /// Only includes http:// and https:// URLs, skipping local files and git repos.
-pub fn parse_sources(pkg_dir: &Path) -> Result<Vec<SourceFile>> {
-    let srcinfo_path = pkg_dir.join(".SRCINFO");
-    if !srcinfo_path.exists() {
-        debug!("No .SRCINFO found at {}", srcinfo_path.display());
-        return Ok(Vec::new());
-    }
-
-    let content = std::fs::read_to_string(&srcinfo_path)
-        .with_context(|| format!("Failed to read .SRCINFO at {}", srcinfo_path.display()))?;
-
-    let srcinfo = SourceInfoV1::from_string(&content).context("Failed to parse .SRCINFO")?;
-
-    let sources = source_entries(&srcinfo)
+pub(crate) fn http_sources(srcinfo: &SourceInfoV1) -> Vec<SourceFile> {
+    let sources = source_entries(srcinfo)
         .iter()
         .filter_map(|source| extract_http_source(source))
         .collect::<Vec<_>>();
 
     debug!("Parsed {} HTTP/HTTPS sources from .SRCINFO", sources.len());
-    Ok(sources)
+    sources
 }
 
 /// Every declared source string, including architecture-specific entries.
@@ -99,24 +95,22 @@ pub struct VcsSource {
     pub raw: String,
 }
 
-/// Parse `.SRCINFO` for VCS sources (`git+`, `svn+`, `hg+`, `bzr+`, `fossil+`).
+/// Acquires a bounded regular .SRCINFO file and extracts its VCS sources.
 pub fn parse_vcs_sources(pkg_dir: &Path) -> Result<Vec<VcsSource>> {
-    let srcinfo_path = pkg_dir.join(".SRCINFO");
-    if !srcinfo_path.exists() {
-        return Ok(Vec::new());
-    }
+    Ok(super::aur::source_file::read_srcinfo(pkg_dir)?
+        .as_ref()
+        .map_or_else(Vec::new, vcs_sources))
+}
 
-    let content = std::fs::read_to_string(&srcinfo_path)
-        .with_context(|| format!("Failed to read .SRCINFO at {}", srcinfo_path.display()))?;
-    let srcinfo = SourceInfoV1::from_string(&content).context("Failed to parse .SRCINFO")?;
-
-    let sources = source_entries(&srcinfo)
+/// Extract VCS sources from captured, parsed metadata.
+pub(crate) fn vcs_sources(srcinfo: &SourceInfoV1) -> Vec<VcsSource> {
+    let sources = source_entries(srcinfo)
         .iter()
         .filter_map(|source| extract_vcs_source(source))
         .collect::<Vec<_>>();
 
     debug!("Parsed {} VCS sources from .SRCINFO", sources.len());
-    Ok(sources)
+    sources
 }
 
 /// Extract a VCS source from a `.SRCINFO` source entry.
@@ -300,153 +294,6 @@ fn is_prefetchable_git_url(url: &str) -> bool {
     })
 }
 
-#[derive(Clone, Copy)]
-struct GitCloneLimits {
-    output_bytes: u64,
-    staging_bytes: u64,
-    duration: Duration,
-    poll_interval: Duration,
-}
-
-fn check_git_staging_budget(path: &Path, byte_limit: u64) -> Result<()> {
-    let mut pending = vec![path.to_path_buf()];
-    let mut entries = 0usize;
-    let mut total = 0u64;
-    while let Some(path) = pending.pop() {
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("Inspecting {}", path.display()));
-            }
-        };
-        entries += 1;
-        anyhow::ensure!(
-            entries <= MAX_GIT_MIRROR_ENTRIES,
-            "AUR Git mirror has too many staged entries"
-        );
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(&path)? {
-                pending.push(entry?.path());
-            }
-        } else {
-            total = total
-                .checked_add(metadata.len())
-                .context("AUR Git mirror size overflowed")?;
-            anyhow::ensure!(
-                total <= byte_limit,
-                "AUR Git mirror exceeded the staged-byte limit"
-            );
-        }
-    }
-    Ok(())
-}
-
-async fn monitor_git_staging(path: &Path, limits: GitCloneLimits) -> Result<()> {
-    loop {
-        tokio::time::sleep(limits.poll_interval).await;
-        let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || check_git_staging_budget(&path, limits.staging_bytes))
-            .await??;
-    }
-}
-
-fn terminate_git_clone_group(process_group: u32) -> Result<()> {
-    use nix::errno::Errno;
-    use nix::sys::signal::{Signal, killpg};
-    use nix::unistd::Pid;
-
-    let process_group = i32::try_from(process_group).context("Git process ID exceeded i32")?;
-    match killpg(Pid::from_raw(process_group), Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => Ok(()),
-        Err(error) => Err(error).context("Failed to terminate AUR Git clone process group"),
-    }
-}
-
-struct GitCloneGroupGuard(Option<u32>);
-
-impl GitCloneGroupGuard {
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for GitCloneGroupGuard {
-    fn drop(&mut self) {
-        if let Some(process_group) = self.0 {
-            let _ = terminate_git_clone_group(process_group);
-        }
-    }
-}
-
-async fn run_bounded_git_clone(
-    command: &mut tokio::process::Command,
-    staging_path: &Path,
-    limits: GitCloneLimits,
-) -> Result<(std::process::ExitStatus, Vec<u8>)> {
-    use tokio::io::AsyncReadExt;
-
-    command
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    let mut child = command
-        .spawn()
-        .context("Failed to run git clone --mirror")?;
-    let process_group = child.id().context("Git clone has no process ID")?;
-    // A cancelled prefetch drops this guard and kills Git's helpers too;
-    // kill_on_drop alone only terminates the direct child.
-    let mut group_guard = GitCloneGroupGuard(Some(process_group));
-    let stderr = child
-        .stderr
-        .take()
-        .context("Git clone has no stderr pipe")?;
-    let result = tokio::time::timeout(limits.duration, async {
-        tokio::select! {
-            completed = async {
-                let wait = async { Ok::<_, anyhow::Error>(child.wait().await?) };
-                let capture = async {
-                    let mut output = Vec::new();
-                    stderr.take(limits.output_bytes + 1).read_to_end(&mut output).await?;
-                    anyhow::ensure!(
-                        output.len() as u64 <= limits.output_bytes,
-                        "AUR Git clone exceeded its captured-output limit"
-                    );
-                    Ok::<_, anyhow::Error>(output)
-                };
-                tokio::try_join!(wait, capture)
-            } => completed,
-            monitored = monitor_git_staging(staging_path, limits) => {
-                monitored?;
-                anyhow::bail!("AUR Git mirror monitor stopped unexpectedly")
-            },
-        }
-    })
-    .await;
-    let (status, output) = match result {
-        Ok(Ok(completed)) => completed,
-        Ok(Err(error)) => {
-            terminate_git_clone_group(process_group)?;
-            child.wait().await.context("Failed to reap AUR Git clone")?;
-            group_guard.disarm();
-            return Err(error);
-        }
-        Err(_) => {
-            terminate_git_clone_group(process_group)?;
-            child
-                .wait()
-                .await
-                .context("Failed to reap timed-out AUR Git clone")?;
-            group_guard.disarm();
-            anyhow::bail!("AUR Git clone exceeded its duration limit");
-        }
-    };
-    check_git_staging_budget(staging_path, limits.staging_bytes)?;
-    group_guard.disarm();
-    Ok((status, output))
-}
-
 /// `git clone --mirror` a source into its SRCDEST entry, atomically.
 async fn mirror_git_repository(url: &str, destination: &Path) -> Result<()> {
     anyhow::ensure!(
@@ -547,20 +394,23 @@ async fn mirror_git_repository(url: &str, destination: &Path) -> Result<()> {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null");
 
-    let (status, output) = run_bounded_git_clone(
+    let output = run_bounded_git(
         &mut command,
         &staging_path,
-        GitCloneLimits {
-            output_bytes: MAX_GIT_STDERR_BYTES,
+        GitLimits {
+            stdout_bytes: MAX_GIT_STDERR_BYTES,
+            stderr_bytes: MAX_GIT_STDERR_BYTES,
             staging_bytes: MAX_GIT_MIRROR_BYTES,
-            duration: MAX_GIT_CLONE_DURATION,
+            staging_entries: MAX_GIT_MIRROR_ENTRIES,
             poll_interval: Duration::from_millis(250),
         },
+        tokio::time::Instant::now() + MAX_GIT_CLONE_DURATION,
     )
     .await?;
-    let stderr = crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output));
+    let stderr =
+        crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
     anyhow::ensure!(
-        status.success(),
+        output.status.success(),
         "git clone --mirror failed for {url}: {}",
         stderr.trim()
     );
@@ -1193,34 +1043,50 @@ mod public_source_tests {
         let temp = tempfile::tempdir().expect("isolated Git staging");
         let staging = temp.path().join("mirror");
         std::fs::create_dir(&staging).expect("staging directory");
-        let limits = GitCloneLimits {
-            output_bytes: 64,
+        let limits = GitLimits {
+            stdout_bytes: 64,
+            stderr_bytes: 64,
             staging_bytes: 64,
-            duration: Duration::from_millis(500),
+            staging_entries: 32,
             poll_interval: Duration::from_millis(10),
         };
 
         let mut noisy = tokio::process::Command::new("sh");
         noisy.args(["-c", "head -c 4096 /dev/zero >&2"]);
-        let error = run_bounded_git_clone(&mut noisy, &staging, limits)
-            .await
-            .expect_err("excessive Git output must fail");
+        let error = run_bounded_git(
+            &mut noisy,
+            &staging,
+            limits,
+            tokio::time::Instant::now() + Duration::from_millis(500),
+        )
+        .await
+        .expect_err("excessive Git output must fail");
         assert!(format!("{error:#}").contains("captured-output limit"));
 
         let mut stalled = tokio::process::Command::new("sh");
         stalled.args(["-c", "sleep 10"]);
-        let error = run_bounded_git_clone(&mut stalled, &staging, limits)
-            .await
-            .expect_err("stalled Git clone must fail");
+        let error = run_bounded_git(
+            &mut stalled,
+            &staging,
+            limits,
+            tokio::time::Instant::now() + Duration::from_millis(500),
+        )
+        .await
+        .expect_err("stalled Git clone must fail");
         assert!(format!("{error:#}").contains("duration limit"));
 
         let mut oversized = tokio::process::Command::new("sh");
         oversized
             .current_dir(&staging)
             .args(["-c", "head -c 4096 /dev/zero > payload; sleep 10"]);
-        let error = run_bounded_git_clone(&mut oversized, &staging, limits)
-            .await
-            .expect_err("oversized Git mirror must fail");
+        let error = run_bounded_git(
+            &mut oversized,
+            &staging,
+            limits,
+            tokio::time::Instant::now() + Duration::from_millis(500),
+        )
+        .await
+        .expect_err("oversized Git mirror must fail");
         assert!(format!("{error:#}").contains("staged-byte limit"));
 
         let normal_staging = temp.path().join("normal");
@@ -1229,11 +1095,186 @@ mod public_source_tests {
         normal
             .current_dir(&normal_staging)
             .args(["-c", "printf ok >&2; printf x > payload"]);
-        let (status, stderr) = run_bounded_git_clone(&mut normal, &normal_staging, limits)
+        let output = run_bounded_git(
+            &mut normal,
+            &normal_staging,
+            limits,
+            tokio::time::Instant::now() + Duration::from_millis(500),
+        )
+        .await
+        .expect("small Git output and mirror must be accepted");
+        assert!(output.status.success());
+        assert_eq!(output.stderr, b"ok");
+    }
+
+    struct OwnedGitHelper {
+        identity_file: std::path::PathBuf,
+    }
+
+    impl OwnedGitHelper {
+        fn identity(stat: &str) -> Option<(i32, &str, &str)> {
+            let (pid, _) = stat.split_once(' ')?;
+            let (_, fields) = stat.rsplit_once(')')?;
+            let mut fields = fields.split_whitespace();
+            let state = fields.next()?;
+            let start_time = fields.nth(18)?;
+            Some((pid.parse().ok()?, start_time, state))
+        }
+
+        fn running_pid(&self) -> Option<i32> {
+            let recorded = std::fs::read_to_string(&self.identity_file).ok()?;
+            let (pid, start_time, _) = Self::identity(&recorded)?;
+            let current = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let (_, current_start, state) = Self::identity(&current)?;
+            (start_time == current_start && state != "Z" && state != "X").then_some(pid)
+        }
+
+        fn terminate(&self) -> Result<()> {
+            if let Some(pid) = self.running_pid() {
+                match nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                ) {
+                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                    Err(error) => return Err(error).context("Stopping owned inert Git helper"),
+                }
+            }
+            Ok(())
+        }
+
+        async fn stopped_before_cleanup(&self) -> bool {
+            let recorded = std::fs::read_to_string(&self.identity_file)
+                .expect("helper identity must be recorded");
+            let (pid, _, state) = Self::identity(&recorded)
+                .expect("recorded helper identity must contain PID and start time");
+            assert!(pid > 0, "recorded helper PID must be positive");
+            assert!(
+                state != "Z" && state != "X",
+                "fixture helper must start alive"
+            );
+            let stopped = tokio::time::timeout(Duration::from_millis(250), async {
+                while self.running_pid().is_some() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
             .await
-            .expect("small Git output and mirror must be accepted");
-        assert!(status.success());
-        assert_eq!(stderr, b"ok");
+            .is_ok();
+            self.terminate().expect("owned inert helper cleanup");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while self.running_pid().is_some() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("owned inert helper must stop before the assertion");
+            stopped
+        }
+    }
+
+    impl Drop for OwnedGitHelper {
+        fn drop(&mut self) {
+            if let Err(error) = self.terminate() {
+                eprintln!("Failed to clean up owned inert Git helper: {error:#}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_host_git_clone_terminates_descendants_with_closed_pipes() {
+        let staging = tempfile::tempdir().expect("isolated Git staging");
+        let helper = OwnedGitHelper {
+            identity_file: staging.path().join("helper.stat"),
+        };
+        let mut command = tokio::process::Command::new("sh");
+        command.current_dir(staging.path()).args([
+            "-c",
+            "sleep 60 </dev/null >/dev/null 2>&1 & helper=$!; cat /proc/$helper/stat > helper.stat",
+        ]);
+        let result = run_bounded_git(
+            &mut command,
+            staging.path(),
+            GitLimits {
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+                staging_bytes: 4096,
+                staging_entries: 32,
+                poll_interval: Duration::from_millis(10),
+            },
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        let output = result.expect("direct Git fixture child must succeed");
+        assert!(output.status.success());
+        assert!(
+            helper.stopped_before_cleanup().await,
+            "successful Git clone left its owned helper alive after the direct child exited"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_git_command_closes_pipes_inherited_by_surviving_helper() {
+        let staging = tempfile::tempdir().expect("isolated Git staging");
+        let helper = OwnedGitHelper {
+            identity_file: staging.path().join("helper.stat"),
+        };
+        let mut command = tokio::process::Command::new("sh");
+        command.current_dir(staging.path()).args([
+            "-c",
+            "sleep 60 & helper=$!; cat /proc/$helper/stat > helper.stat; printf completed",
+        ]);
+        let result = run_bounded_git(
+            &mut command,
+            staging.path(),
+            GitLimits {
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+                staging_bytes: 4096,
+                staging_entries: 32,
+                poll_interval: Duration::from_millis(10),
+            },
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        let stopped = helper.stopped_before_cleanup().await;
+        let output = result.expect("inherited pipes must close after the direct child exits");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"completed");
+        assert!(stopped, "successful Git command must terminate its helper");
+    }
+
+    #[tokio::test]
+    async fn git_output_refusal_terminates_its_owned_helper() {
+        let staging = tempfile::tempdir().expect("isolated Git staging");
+        let helper = OwnedGitHelper {
+            identity_file: staging.path().join("helper.stat"),
+        };
+        let mut command = tokio::process::Command::new("sh");
+        command.current_dir(staging.path()).args([
+            "-c",
+            "sleep 60 </dev/null >/dev/null 2>&1 & helper=$!; cat /proc/$helper/stat > helper.stat; head -c 65 /dev/zero; wait",
+        ]);
+        let result = run_bounded_git(
+            &mut command,
+            staging.path(),
+            GitLimits {
+                stdout_bytes: 64,
+                stderr_bytes: 64,
+                staging_bytes: 4096,
+                staging_entries: 32,
+                poll_interval: Duration::from_millis(10),
+            },
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        let stopped = helper.stopped_before_cleanup().await;
+        let error = result.expect_err("finite output overrun must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("stdout exceeded its captured-output limit"),
+            "{error:#}"
+        );
+        assert!(stopped, "Git output refusal must terminate its helper");
     }
 
     #[tokio::test]
@@ -1250,15 +1291,17 @@ mod public_source_tests {
                 "-c",
                 "printf ready > ready; (sleep 1; printf survived > survived) & wait",
             ]);
-            run_bounded_git_clone(
+            run_bounded_git(
                 &mut command,
                 &task_staging,
-                GitCloneLimits {
-                    output_bytes: 64,
+                GitLimits {
+                    stdout_bytes: 64,
+                    stderr_bytes: 64,
                     staging_bytes: 1024,
-                    duration: Duration::from_secs(10),
+                    staging_entries: 32,
                     poll_interval: Duration::from_millis(10),
                 },
+                tokio::time::Instant::now() + Duration::from_secs(10),
             )
             .await
         });

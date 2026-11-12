@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tarfile
@@ -28,6 +29,68 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Native Arch input permissions require POSIX mode bits')
+    def test_native_coverage_stages_protected_inputs_from_writable_sources(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        start = script.index('docker cp "$binary"')
+        end = script.index('\nif timeout ', start)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts, evidence, runner = root / 'scripts', root / 'evidence', root / 'runner'
+            for path in (scripts, evidence, runner):
+                path.mkdir()
+            producer = scripts / 'native-cli-coverage.py'
+            producer.write_bytes(b'print("fixture producer")\n')
+            producer.chmod(0o666)
+            artifacts = {}
+            for role in ('coverage14', 'arch-contracts', 'comprehensive', 'cli-unit', 'cli', 'daemon'):
+                artifact = root / (role + ' source')
+                artifact.write_bytes(('fixture executable ' + role).encode())
+                artifact.chmod(0o666)
+                artifacts[role] = {'path': str(artifact)}
+            manifest = evidence / 'cli-manifest.json'
+            manifest.write_text(json.dumps({'artifacts': artifacts}))
+            manifest.chmod(0o666)
+            originals = {path: (stat.S_IMODE(path.stat().st_mode), path.read_bytes())
+                         for path in (producer, manifest, *(Path(a['path']) for a in artifacts.values()))}
+            fixture = root / 'fixture'
+            fixture.write_bytes(b'native fixture')
+            fixture.chmod(0o755)
+            capture = root / 'copy-arguments'
+            rows = root / 'manifest-rows.py'
+            rows.write_text('import json,sys\n'
+                            'with open(sys.argv[1]) as stream: artifacts=json.load(stream)["artifacts"]\n'
+                            'for role, artifact in artifacts.items(): print(role+"\\t"+artifact["path"])\n')
+            driver = '''umask 000
+docker() { test "$1" = cp; printf '%s\\0%s\\0' "$2" "$3" >> "$COPY_CAPTURE"; }
+jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
+''' + script[start:end]
+            result = subprocess.run([BASH, '-euo', 'pipefail', '-c', driver], cwd=root,
+                env=dict(os.environ, COPY_CAPTURE=str(capture), TEST_PYTHON=sys.executable,
+                         MANIFEST_ROWS=str(rows), binary=str(fixture), container='fixture-container',
+                         RUNNER_TEMP=str(runner), evidence_dir=str(evidence)),
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            arguments = capture.read_bytes().split(b'\0')[:-1]
+            copied = {target.decode(): (root / source.decode()).resolve()
+                      for source, target in zip(arguments[::2], arguments[1::2])}
+            for original, name in ((producer, 'native-cli-coverage.py'),
+                                   (manifest, 'native-cli-manifest.json')):
+                staged = copied['fixture-container:/' + name]
+                self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o644,
+                                 'Supplemental input must be staged without group/other write permissions')
+                self.assertNotEqual(staged, original)
+                self.assertTrue(staged.is_relative_to(runner))
+                self.assertEqual(staged.read_bytes(), original.read_bytes())
+            binaries = copied['fixture-container:/omg-extra-bin']
+            self.assertEqual(stat.S_IMODE(binaries.stat().st_mode), 0o755)
+            self.assertEqual({p.name for p in binaries.iterdir()}, set(artifacts))
+            for role, artifact in artifacts.items():
+                self.assertEqual(stat.S_IMODE((binaries / role).stat().st_mode), 0o755)
+                self.assertEqual((binaries / role).read_bytes(), Path(artifact['path']).read_bytes())
+            for path, identity in originals.items():
+                self.assertEqual((stat.S_IMODE(path.stat().st_mode), path.read_bytes()), identity)
+
     def test_native_coverage_passes_one_complete_guest_script_to_docker(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
         start = script.index('container=$(docker create')

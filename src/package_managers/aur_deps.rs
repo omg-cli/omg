@@ -25,28 +25,30 @@ pub(crate) fn dependency_name(dependency: &str) -> &str {
         .map_or(dependency, |index| &dependency[..index])
 }
 
-/// Parse .SRCINFO and check dependencies for the requested output closure.
+/// Read bounded current `.SRCINFO` and check the requested output dependencies.
 pub fn check_dependencies_for_outputs(
     pkg_dir: &Path,
     requested_outputs: &[String],
 ) -> Result<DependencyInfo> {
-    let srcinfo_path = pkg_dir.join(".SRCINFO");
-
-    if !srcinfo_path.exists() {
+    let Some(srcinfo) = super::aur::source_file::read_srcinfo(pkg_dir)? else {
         return Ok(DependencyInfo {
             missing: Vec::new(),
             package_outputs: requested_outputs.to_vec(),
         });
-    }
+    };
+    check_dependencies_from_metadata(&srcinfo, requested_outputs)
+}
 
-    let content = std::fs::read_to_string(&srcinfo_path).context("Failed to read .SRCINFO")?;
-    let srcinfo = SourceInfoV1::from_string(&content).context("Failed to parse .SRCINFO")?;
+pub(crate) fn check_dependencies_from_metadata(
+    srcinfo: &SourceInfoV1,
+    requested_outputs: &[String],
+) -> Result<DependencyInfo> {
     // Ask libalpm to evaluate the complete dependency expression. A package
     // with the right name but an older version is not a satisfier, while a
     // compatible virtual provider can be.
     crate::package_managers::alpm_direct::with_handle(|alpm| {
         let installed = alpm.localdb().pkgs();
-        dependency_info(&srcinfo, requested_outputs, |dependency| {
+        dependency_info(srcinfo, requested_outputs, |dependency| {
             installed.find_satisfier(dependency.to_string()).is_some()
         })
     })

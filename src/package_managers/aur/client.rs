@@ -21,6 +21,9 @@ use tokio::process::Command;
 use tracing::{instrument, warn};
 
 use super::error::AurError;
+#[cfg(test)]
+use super::history::historical_version_not_found_message;
+use super::history::srcinfo_version;
 use super::parallel_build::BuildJob;
 use super::utils::{
     build_user, create_dir_as_user, create_dir_as_user_sync, has_word_boundary_match, is_symlink,
@@ -29,11 +32,11 @@ use super::utils::{
 };
 use super::{approval, artifact_inspector};
 
-use super::super::aur_deps::{check_dependencies_for_outputs, dependency_name};
+use super::super::aur_deps::{check_dependencies_from_metadata, dependency_name};
 use super::super::aur_index::AurIndex;
 use super::super::aur_metadata::{AurJsonPackage, open_fresh_metadata_index};
 use super::super::aur_sources::{
-    download_sources, parse_sources, parse_vcs_sources, prefetch_vcs_sources,
+    download_sources, http_sources, prefetch_vcs_sources, vcs_sources,
 };
 #[cfg(feature = "pgp")]
 use super::super::pkgbuild::PkgBuild;
@@ -368,27 +371,12 @@ impl BuiltPackages {
 struct ReviewedSource {
     files: std::collections::BTreeMap<PathBuf, Vec<u8>>,
     digest: String,
+    parsed_srcinfo: OnceLock<Arc<alpm_srcinfo::SourceInfoV1>>,
 }
 
 impl ReviewedSource {
     fn read_source_file(path: &Path) -> Result<Vec<u8>> {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-            .open(path)?;
-        anyhow::ensure!(
-            file.metadata()?.is_file(),
-            "AUR source must be a regular file"
-        );
-        let mut bytes = Vec::new();
-        file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        anyhow::ensure!(
-            bytes.len() <= 16 * 1024 * 1024,
-            "AUR source file exceeds limit"
-        );
-        Ok(bytes)
+        super::source_file::read_regular(path)
     }
     fn capture(directory: &Path) -> Result<Self> {
         fn visit(
@@ -435,7 +423,7 @@ impl ReviewedSource {
                 } else {
                     anyhow::ensure!(
                         metadata.is_file()
-                            && metadata.len() <= 16 * 1024 * 1024
+                            && metadata.len() <= super::source_file::MAX_SOURCE_FILE_BYTES
                             && files.len() < 10_000,
                         "AUR source manifest exceeds file/count limits"
                     );
@@ -476,7 +464,33 @@ impl ReviewedSource {
         Ok(Self {
             files,
             digest: hex::encode(hash.finalize()),
+            parsed_srcinfo: OnceLock::new(),
         })
+    }
+
+    fn optional_srcinfo(&self) -> Result<Option<Arc<alpm_srcinfo::SourceInfoV1>>> {
+        if let Some(parsed) = self.parsed_srcinfo.get() {
+            return Ok(Some(Arc::clone(parsed)));
+        }
+        let Some(bytes) = self.files.get(Path::new(".SRCINFO")) else {
+            return Ok(None);
+        };
+        let content = std::str::from_utf8(bytes).context("Failed to read .SRCINFO")?;
+        let parsed = Arc::new(
+            alpm_srcinfo::SourceInfoV1::from_string(content).context("Failed to parse .SRCINFO")?,
+        );
+        let _ = self.parsed_srcinfo.set(Arc::clone(&parsed));
+        Ok(Some(Arc::clone(
+            self.parsed_srcinfo.get().unwrap_or(&parsed),
+        )))
+    }
+
+    fn required_srcinfo(&self, package: &str) -> Result<Arc<alpm_srcinfo::SourceInfoV1>> {
+        self.optional_srcinfo()
+            .with_context(|| format!("Failed to inspect dependencies for '{package}'"))?
+            .with_context(|| format!(
+            "AUR package '{package}' has no regular .SRCINFO; refusing to source its PKGBUILD to discover dependencies"
+        ))
     }
 
     fn verify(&self, directory: &Path) -> Result<()> {
@@ -2021,12 +2035,6 @@ impl AurClient {
             .context("Failed to create owned AUR rollback checkout")
     }
 
-    fn historical_version_not_found_message(base: &str, version: &str) -> String {
-        format!(
-            "version {version} of '{base}' was not found in the AUR git history (the repository may have been force-pushed since it was installed)"
-        )
-    }
-
     fn historical_build_failure_message(package: &str, version: &str, log_path: &Path) -> String {
         format!(
             "Historical build of {package} {version} failed; check {}\n  → The AUR may no longer support building this version (changed sources/dependencies)",
@@ -2066,96 +2074,8 @@ impl AurClient {
         let checkout_owner = Self::begin_rollback_worktree(&work, &base)?;
         let repo_dir = checkout_owner.path().to_path_buf();
 
-        // Full-history partial clone (blobs fetched on demand at checkout).
         let url = format!("{AUR_GIT_URL}/{base}.git");
-        let clone = Command::new("git")
-            .kill_on_drop(true)
-            .args([
-                "clone",
-                "--filter=blob:none",
-                "--",
-                &url,
-                repo_dir.to_string_lossy().as_ref(),
-            ])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .output()
-            .await;
-        match clone {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                let stderr = crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(
-                    &output.stderr,
-                ));
-                anyhow::bail!(
-                    "Failed to clone AUR history for '{base}': {}",
-                    stderr.trim()
-                );
-            }
-            Err(error) => {
-                anyhow::bail!("git is required for AUR version rollback: {error}");
-            }
-        }
-
-        // Walk commits newest -> oldest looking for the recorded version.
-        let shas = Command::new("git")
-            .kill_on_drop(true)
-            .args(["-C"])
-            .arg(&repo_dir)
-            .args(["log", "--format=%H"])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .context("Failed to list AUR repository history")?;
-        if !shas.status.success() {
-            let stderr =
-                crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&shas.stderr));
-            anyhow::bail!("Failed to list AUR history for '{base}': {}", stderr.trim());
-        }
-        let sha_list = String::from_utf8_lossy(&shas.stdout);
-        let mut matched_sha: Option<String> = None;
-        for sha in sha_list.lines().map(str::trim).filter(|s| !s.is_empty()) {
-            let show = Command::new("git")
-                .kill_on_drop(true)
-                .args(["-C"])
-                .arg(&repo_dir)
-                .args(["show", &format!("{sha}:.SRCINFO")])
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(Stdio::null())
-                .output()
-                .await
-                .context("Failed to read .SRCINFO from history")?;
-            if !show.status.success() {
-                continue; // commit predates .SRCINFO generation or blob gone
-            }
-            let content = String::from_utf8_lossy(&show.stdout);
-            if Self::srcinfo_version(&content).as_deref() == Some(version) {
-                matched_sha = Some(sha.to_string());
-                break;
-            }
-        }
-
-        let Some(sha) = matched_sha else {
-            anyhow::bail!(
-                "{}",
-                Self::historical_version_not_found_message(&base, version)
-            );
-        };
-
-        let checkout = Command::new("git")
-            .kill_on_drop(true)
-            .args(["-C"])
-            .arg(&repo_dir)
-            .args(["checkout", "--detach", &sha])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .status()
-            .await
-            .context("Failed to checkout historical commit")?;
-        if !checkout.success() {
-            anyhow::bail!("Failed to checkout commit {sha} of '{base}'");
-        }
+        super::history::checkout_version(&url, &repo_dir, &base, version).await?;
 
         // Use the same hardened validation, environment, and sandboxing
         // pipeline as regular installs.
@@ -2187,7 +2107,7 @@ impl AurClient {
         );
         reviewed_digest.verify(&pkg_dir)?;
         let status = self
-            .run_build(&pkg_dir, &env, package)
+            .run_build(&pkg_dir, &env, package, &reviewed_digest)
             .await
             .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
         if !status.success() {
@@ -2233,32 +2153,6 @@ impl AurClient {
             );
         }
         Ok(())
-    }
-
-    /// Extract `pkgver-pkgrel` from `.SRCINFO` text (first occurrences).
-    fn srcinfo_version(content: &str) -> Option<String> {
-        let mut epoch: Option<&str> = None;
-        let mut pkgver: Option<&str> = None;
-        let mut pkgrel: Option<&str> = None;
-        for line in content.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            match key.trim() {
-                "epoch" if epoch.is_none() => epoch = Some(value.trim()),
-                "pkgver" if pkgver.is_none() => pkgver = Some(value.trim()),
-                "pkgrel" if pkgrel.is_none() => pkgrel = Some(value.trim()),
-                _ => {}
-            }
-        }
-        let prefix = epoch
-            .filter(|value| !value.is_empty())
-            .map_or_else(String::new, |value| format!("{value}:"));
-        match (pkgver, pkgrel) {
-            (Some(v), Some(r)) => Some(format!("{prefix}{v}-{r}")),
-            (Some(v), None) => Some(format!("{prefix}{v}")),
-            _ => None,
-        }
     }
 
     pub async fn install(&self, package: &str) -> Result<()> {
@@ -2454,7 +2348,7 @@ impl AurClient {
         env.pgp_home = pgp_home;
 
         let dependency_plan = self
-            .aur_dependency_plan(&pkg_dir, &package, &requested_outputs)
+            .aur_dependency_plan(&reviewed_digest, &package, &requested_outputs)
             .await?;
         let package_outputs = dependency_plan.package_outputs;
         let mut dependency_builds =
@@ -2472,14 +2366,17 @@ impl AurClient {
             Self::install_built_packages(std::slice::from_ref(&dep_packages), sudoloop).await?;
             crate::cli::modern_ui::print_success(&format!("Installed dependency: {dep}"));
         }
-        self.ensure_dependencies_satisfied(&pkg_dir, &package_outputs)
+        self.ensure_dependencies_satisfied(&reviewed_digest, &package_outputs)
             .await?;
 
         let _package_build_guard = package_lock.lock().await;
         let _package_build_file_guard = self.acquire_package_base_file_lock(&package).await?;
 
         // Best-effort pre-download: makepkg still fetches anything we miss.
-        match parse_sources(&pkg_dir) {
+        match reviewed_digest
+            .optional_srcinfo()
+            .map(|metadata| metadata.map_or_else(Vec::new, |info| http_sources(&info)))
+        {
             Ok(sources) if sources.is_empty() => {}
             Ok(sources) => {
                 let summary = download_sources(sources, &env.srcdest).await;
@@ -2500,7 +2397,10 @@ impl AurClient {
 
         // Best-effort VCS mirroring: it warms SRCDEST for a later offline
         // rebuild, but a failure here is not fatal when networking is allowed.
-        match parse_vcs_sources(&pkg_dir) {
+        match reviewed_digest
+            .optional_srcinfo()
+            .map(|metadata| metadata.map_or_else(Vec::new, |info| vcs_sources(&info)))
+        {
             Ok(vcs_sources) if !vcs_sources.is_empty() => {
                 let summary = prefetch_vcs_sources(&vcs_sources, &env.srcdest).await;
                 if !summary.needs_network.is_empty() {
@@ -2519,7 +2419,7 @@ impl AurClient {
         reviewed_digest.verify(&pkg_dir)?;
         let log_path = self.build_log_path(&package);
         let status = self
-            .run_build(&pkg_dir, &env, &package)
+            .run_build(&pkg_dir, &env, &package, &reviewed_digest)
             .await
             .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
         if !status.success() {
@@ -2674,7 +2574,7 @@ impl AurClient {
         let pgp_home = Self::fetch_missing_pgp_keys(&pkgbuild_path).await?;
 
         let dependency_plan = self
-            .aur_dependency_plan(&pkg_dir, package, &[package.to_string()])
+            .aur_dependency_plan(&reviewed_digest, package, &[package.to_string()])
             .await?;
         let package_outputs = dependency_plan.package_outputs;
         drop(package_checkout_file_guard);
@@ -2688,7 +2588,7 @@ impl AurClient {
             Self::install_built_packages(std::slice::from_ref(&archives), sudoloop).await?;
             crate::cli::modern_ui::print_success(&format!("Installed dependency: {dependency}"));
         }
-        self.ensure_dependencies_satisfied(&pkg_dir, &package_outputs)
+        self.ensure_dependencies_satisfied(&reviewed_digest, &package_outputs)
             .await?;
 
         let _package_build_guard = package_lock.lock().await;
@@ -2699,7 +2599,7 @@ impl AurClient {
         reviewed_digest.verify(&pkg_dir)?;
         let log_path = self.build_log_path(package);
         let status = self
-            .run_build(&pkg_dir, &env, package)
+            .run_build(&pkg_dir, &env, package, &reviewed_digest)
             .await
             .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
 
@@ -2917,7 +2817,7 @@ impl AurClient {
     ) -> Result<Vec<ArchiveSnapshot>> {
         let srcinfo = source.text(Path::new(".SRCINFO"))?;
         let expected_version =
-            Self::srcinfo_version(srcinfo).context("Missing reviewed package version")?;
+            srcinfo_version(srcinfo).context("Missing reviewed package version")?;
         anyhow::ensure!(
             Self::srcinfo_pkgbase(srcinfo) == Some(base)
                 && paths.len() == outputs.len()
@@ -3136,7 +3036,9 @@ impl AurClient {
         let mut secondary_env = self.makepkg_env(pkg_dir).await?;
         set_reproducible_source_epoch(&mut secondary_env, source)?;
         secondary_env.pgp_home = Self::fetch_missing_pgp_keys(&pkg_dir.join("PKGBUILD")).await?;
-        let status = self.run_build(pkg_dir, &secondary_env, base).await?;
+        let status = self
+            .run_build(pkg_dir, &secondary_env, base, source)
+            .await?;
         anyhow::ensure!(
             status.success(),
             "Independent verification build failed for high-risk AUR package {base}"
@@ -3199,7 +3101,7 @@ impl AurClient {
                 return false;
             }
         };
-        let Some(expected_version) = Self::srcinfo_version(&srcinfo) else {
+        let Some(expected_version) = srcinfo_version(&srcinfo) else {
             tracing::warn!(
                 "Cached artifact provenance for {output}: .SRCINFO has no usable version; rejecting cache hit"
             );
@@ -3502,18 +3404,14 @@ impl AurClient {
 
     async fn aur_dependency_plan(
         &self,
-        pkg_dir: &Path,
+        source: &ReviewedSource,
         package: &str,
         requested_outputs: &[String],
     ) -> Result<AurDependencyPlan> {
-        anyhow::ensure!(
-            pkg_dir.join(".SRCINFO").is_file(),
-            "AUR package '{package}' has no regular .SRCINFO; refusing to source its PKGBUILD to discover dependencies"
-        );
-        let dependency_dir = pkg_dir.to_path_buf();
+        let srcinfo = source.required_srcinfo(package)?;
         let requested_outputs = requested_outputs.to_vec();
         let dep_info = tokio::task::spawn_blocking(move || {
-            check_dependencies_for_outputs(&dependency_dir, &requested_outputs)
+            check_dependencies_from_metadata(&srcinfo, &requested_outputs)
         })
         .await
         .context("AUR dependency inspection task failed")?
@@ -3607,13 +3505,15 @@ impl AurClient {
 
     async fn ensure_dependencies_satisfied(
         &self,
-        pkg_dir: &Path,
+        source: &ReviewedSource,
         package_outputs: &[String],
     ) -> Result<()> {
-        let pkg_dir = pkg_dir.to_path_buf();
+        let srcinfo = source
+            .optional_srcinfo()?
+            .context("AUR build has no .SRCINFO")?;
         let package_outputs = package_outputs.to_vec();
         self.blocking_build_work(move || {
-            let remaining = check_dependencies_for_outputs(&pkg_dir, &package_outputs)
+            let remaining = check_dependencies_from_metadata(&srcinfo, &package_outputs)
                 .context("Failed to verify AUR build dependencies")?
                 .missing;
             anyhow::ensure!(
@@ -3720,10 +3620,12 @@ impl AurClient {
         pkg_dir: &Path,
         env: &MakepkgEnv,
         package: &str,
+        source: &ReviewedSource,
     ) -> Result<std::process::ExitStatus> {
         self.settings.aur.validate_security_profile()?;
         if !self.settings.aur.allow_network {
-            let sources = parse_sources(pkg_dir)?;
+            let metadata = source.optional_srcinfo()?;
+            let sources = metadata.as_deref().map_or_else(Vec::new, http_sources);
             let summary = download_sources(sources, &env.srcdest).await;
             anyhow::ensure!(
                 summary.failed == 0,
@@ -3735,7 +3637,7 @@ impl AurClient {
             // the ones omg can reproduce into SRCDEST, and fail with an
             // actionable message for the rest instead of letting makepkg
             // surface a bare DNS failure from inside the namespace.
-            let vcs_sources = parse_vcs_sources(pkg_dir)?;
+            let vcs_sources = metadata.as_deref().map_or_else(Vec::new, vcs_sources);
             if !vcs_sources.is_empty() {
                 let vcs = prefetch_vcs_sources(&vcs_sources, &env.srcdest).await;
                 anyhow::ensure!(
@@ -5704,6 +5606,40 @@ mod tests {
         Ok(())
     }
 
+    async fn replaced_reviewed_source_fixture() -> Result<(tempfile::TempDir, ReviewedSource)> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        let srcinfo = directory.path().join(".SRCINFO");
+        std::fs::write(
+            &srcinfo,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/reviewed.tar.gz\nsource = git+https://example.org/reviewed.git\npkgname = demo\n",
+        )?;
+        let reviewed = ReviewedSource::capture(directory.path())?;
+        tokio::task::yield_now().await;
+        std::fs::write(
+            &srcinfo,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/replacement.tar.gz\nsource = git+https://example.org/replacement.git\npkgname = demo\n",
+        )?;
+
+        Ok((directory, reviewed))
+    }
+
+    #[tokio::test]
+    async fn reviewed_http_prefetch_uses_captured_metadata_after_checkout_changes() -> Result<()> {
+        let (_directory, reviewed) = replaced_reviewed_source_fixture().await?;
+        let http = http_sources(reviewed.required_srcinfo("demo")?.as_ref());
+        assert_eq!(http[0].url, "https://example.org/reviewed.tar.gz");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reviewed_vcs_prefetch_uses_captured_metadata_after_checkout_changes() -> Result<()> {
+        let (_directory, reviewed) = replaced_reviewed_source_fixture().await?;
+        let vcs = vcs_sources(reviewed.required_srcinfo("demo")?.as_ref());
+        assert_eq!(vcs[0].url, "https://example.org/reviewed.git");
+        Ok(())
+    }
+
     #[test]
     fn contained_license_symlink_is_reviewed_by_target() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -6614,6 +6550,7 @@ mod tests {
                 format!("install = {hook}\n").into_bytes(),
             )]),
             digest: "a".repeat(64),
+            parsed_srcinfo: OnceLock::new(),
         };
         let error = declared_install_hook_previews(&source)
             .unwrap_err()
@@ -6797,6 +6734,7 @@ mod tests {
         let source = ReviewedSource {
             files,
             digest: String::new(),
+            parsed_srcinfo: OnceLock::new(),
         };
         let hooks = declared_install_hook_previews(&source).unwrap();
         assert_eq!(hooks.len(), 1);
@@ -7326,11 +7264,73 @@ mod tests {
             settings: Settings::default(),
             package_base_locks: Arc::new(dashmap::DashMap::new()),
         };
+        let source = ReviewedSource {
+            files: std::collections::BTreeMap::new(),
+            digest: String::new(),
+            parsed_srcinfo: OnceLock::new(),
+        };
         let error = client
-            .aur_dependency_plan(directory.path(), "example", &["example".to_string()])
+            .aur_dependency_plan(&source, "example", &["example".to_string()])
             .await
             .expect_err("missing .SRCINFO must fail before PKGBUILD execution");
         assert!(error.to_string().contains("has no regular .SRCINFO"));
+    }
+
+    #[test]
+    fn reviewed_source_optional_metadata_preserves_absence_and_parse_errors() -> Result<()> {
+        let mut source = ReviewedSource {
+            files: std::collections::BTreeMap::new(),
+            digest: String::new(),
+            parsed_srcinfo: OnceLock::new(),
+        };
+        assert!(source.optional_srcinfo()?.is_none());
+        source.files.insert(
+            PathBuf::from(".SRCINFO"),
+            b"\tnonsense-key with no value structure\n".to_vec(),
+        );
+        assert!(
+            format!(
+                "{:#}",
+                source.optional_srcinfo().expect_err("malformed metadata")
+            )
+            .contains("Failed to parse .SRCINFO")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reviewed_dependency_consumers_use_captured_metadata_after_checkout_changes() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::reviewed_dependency_consumers_use_captured_metadata_after_checkout_changes";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&[])?;
+        std::fs::create_dir_all(fixture.db.join("local"))?;
+        std::fs::write(fixture.db.join("local/ALPM_DB_VERSION"), "9\n")?;
+        std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        let path = fixture.directory.path().join(".SRCINFO");
+        std::fs::write(
+            &path,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
+        )?;
+        let source = ReviewedSource::capture(fixture.directory.path())?;
+        std::fs::write(
+            &path,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = replacement\n",
+        )?;
+        fixture.with_environment(async {
+            tokio::task::yield_now().await;
+            let client = fixture.client();
+            let plan = client
+                .aur_dependency_plan(&source, "demo", &["demo".to_owned()])
+                .await?;
+            assert_eq!(plan.package_outputs, ["demo"]);
+            client
+                .ensure_dependencies_satisfied(&source, &plan.package_outputs)
+                .await?;
+            Ok(())
+        })
     }
 
     #[test]
@@ -7514,7 +7514,7 @@ mod tests {
 
     #[test]
     fn rollback_errors_do_not_contain_literal_escape_text() {
-        let not_found = AurClient::historical_version_not_found_message("example", "1.0-1");
+        let not_found = historical_version_not_found_message("example", "1.0-1");
         assert!(!not_found.contains('\\'));
 
         let build_failed = AurClient::historical_build_failure_message(
@@ -7843,6 +7843,7 @@ mod tests {
                 b"install = demo.install\n".to_vec(),
             )]),
             digest: String::new(),
+            parsed_srcinfo: OnceLock::new(),
         };
         assert!(declared_install_hook_previews(&source).is_err());
         source.files.insert(
@@ -8010,17 +8011,14 @@ mod tests {
              pkgdesc = PostgreSQL\n\
              \n\
              pkgname = postgresql18\n";
-        assert_eq!(
-            AurClient::srcinfo_version(srcinfo).as_deref(),
-            Some("18.4-1")
-        );
+        assert_eq!(srcinfo_version(srcinfo).as_deref(), Some("18.4-1"));
         // First occurrences win over later split-package duplicates.
         let dup = "pkgver = 1.0\npkgrel = 2\npkgname = a\npkgver = 9.9\n";
-        assert_eq!(AurClient::srcinfo_version(dup).as_deref(), Some("1.0-2"));
-        assert_eq!(AurClient::srcinfo_version("pkgname = x"), None);
+        assert_eq!(srcinfo_version(dup).as_deref(), Some("1.0-2"));
+        assert_eq!(srcinfo_version("pkgname = x"), None);
         // makepkg emits epoch after pkgver/pkgrel in the pkgbase section.
         assert_eq!(
-            AurClient::srcinfo_version("pkgver = 1.0~rc1\npkgrel = 3\nepoch = 2"),
+            srcinfo_version("pkgver = 1.0~rc1\npkgrel = 3\nepoch = 2"),
             Some("2:1.0~rc1-3".to_string())
         );
     }
@@ -9437,7 +9435,8 @@ mod tests {
                             "pkgbase = omg-coverage-fixture\n\tpkgdesc = Inert OMG coverage fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-fixture\n",
                         ).expect("write fixture file");
                         let outputs = vec!["omg-coverage-fixture".to_owned()];
-                        let dependencies = check_dependencies_for_outputs(&checkout, &outputs)?;
+                        let source = ReviewedSource::capture(&checkout)?;
+                        let dependencies = check_dependencies_from_metadata(source.required_srcinfo("fixture")?.as_ref(), &outputs)?;
                         anyhow::ensure!(
                             dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
                             "fixture must never require dependency installation"
@@ -9528,7 +9527,8 @@ mod tests {
                         for package in &packages {
                             let checkout = client.build_dir.join(package);
                             let outputs = vec![package.clone()];
-                            let dependencies = check_dependencies_for_outputs(&checkout, &outputs)?;
+                            let source = ReviewedSource::capture(&checkout)?;
+                            let dependencies = check_dependencies_from_metadata(source.required_srcinfo("fixture")?.as_ref(), &outputs)?;
                             anyhow::ensure!(
                                 dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
                                 "parallel fixture must never require dependency installation"
@@ -9938,7 +9938,7 @@ finally:
                 );
                 client.settings.aur.review_pkgbuild = false;
                 let error = client
-                    .run_build(checkout.path(), &env, "demo")
+                    .run_build(checkout.path(), &env, "demo", &source)
                     .await
                     .expect_err("an invalid hardened configuration must fail before running a build");
                 assert!(
@@ -10191,12 +10191,13 @@ finally:
             &fixture.conf,
             "[options]\nSigLevel = Never\n[missing]\n[low]\n",
         )?;
+        std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
         fixture.with_environment(async {
             S72Fixture::index(&["aur-helper"])?;
             let client = fixture.client();
             assert!(client.info("aur-helper").await?.is_some(), "same-named AUR candidate exists");
             std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
-            let error = client.aur_dependency_plan(fixture.directory.path(), "demo", &["demo".to_owned()]).await
+            let error = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await
                 .expect_err("incomplete official classification must fail before accepting the AUR candidate");
             assert!(format!("{error:#}").contains("missing"), "{error:#}");
             Ok(())
@@ -10221,11 +10222,12 @@ finally:
             &fixture.conf,
             "[options]\nSigLevel = Never\n[search-only]\nUsage = Search\n[empty]\n[high]\n[low]\n",
         )?;
+        std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
         fixture.with_environment(async {
             let client = fixture.client();
             for relations in [["helper>=1", "helper>=2"], ["helper>=2", "virtual-helper>=10"], ["virtual-helper>=1", "virtual-helper>=10"]] {
                 std::fs::write(fixture.directory.path().join(".SRCINFO"), format!("pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = {}\ndepends = {}\n", relations[0], relations[1]))?;
-                let plan = client.aur_dependency_plan(fixture.directory.path(), "demo", &["demo".to_owned()]).await?;
+                let plan = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await?;
                 assert!(plan.aur_dependencies.is_empty(), "official relations must not fall back to AUR");
                 assert_eq!(plan.official_dependencies, vec![OfficialTarget {
                     repository: "low".to_owned(),
@@ -10239,11 +10241,11 @@ finally:
             }
             S72Fixture::index(&["aur-helper"])?;
             std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
-            let plan = client.aur_dependency_plan(fixture.directory.path(), "demo", &["demo".to_owned()]).await?;
+            let plan = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await?;
             assert!(plan.official_dependencies.is_empty());
             assert_eq!(plan.aur_dependencies, ["aur-helper"]);
             std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = helper<2\ndepends = helper>=2\n")?;
-            client.aur_dependency_plan(fixture.directory.path(), "demo", &["demo".to_owned()]).await
+            client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await
                 .expect_err("contradictory constraints must fail closed before installation");
             Ok(())
         })

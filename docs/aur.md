@@ -131,6 +131,14 @@ forward references and chains are rejected. Encoded and decoded MTREE each
 have a 16 MiB limit, alongside archive entry and path limits. These are OMG
 admission rules, so changing to `standard` does not disable them.
 
+Privilege metadata has separate admission bounds: 8 KiB per capability value
+before hex encoding, and 64 KiB per archive for retained privileged paths and
+encoded capability values. The attended privilege summary has a 32 KiB display
+limit. OMG refuses approval when the complete summary exceeds that limit,
+even if each archive passes inspection. These are OMG compatibility limits,
+not a claim that the metadata is a valid Linux capability. Inspection policy 5
+invalidates admission evidence produced under earlier limits.
+
 Inventory agreement does not vet program behavior or authenticate MTREE content
 hashes. Native file-list agreement also does not prove successful extraction.
 The sealed-byte handoff, source review and paired-build checks remain separate

@@ -365,14 +365,16 @@ jobs:
               done
             ')
           docker cp "$binary" "$container:/fixture"
-          docker cp scripts/native-cli-coverage.py "$container:/native-cli-coverage.py"
-          docker cp "$evidence_dir/cli-manifest.json" "$container:/native-cli-manifest.json"
-          staging="$RUNNER_TEMP/native-cli-bin"
-          mkdir -m 755 "$staging"
+          staging="$RUNNER_TEMP/native-cli-inputs"
+          mkdir -m 755 "$staging" "$staging/bin"
+          install -m 644 scripts/native-cli-coverage.py "$staging/native-cli-coverage.py"
+          install -m 644 "$evidence_dir/cli-manifest.json" "$staging/native-cli-manifest.json"
           while IFS=$'\t' read -r role artifact; do
-            install -m 755 "$artifact" "$staging/$role"
+            install -m 755 "$artifact" "$staging/bin/$role"
           done < <(jq -r '.artifacts | to_entries[] | [.key, .value.path] | @tsv' "$evidence_dir/cli-manifest.json")
-          docker cp "$staging" "$container:/omg-extra-bin"
+          docker cp "$staging/native-cli-coverage.py" "$container:/native-cli-coverage.py"
+          docker cp "$staging/native-cli-manifest.json" "$container:/native-cli-manifest.json"
+          docker cp "$staging/bin" "$container:/omg-extra-bin"
           if timeout --kill-after=5s 780s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
             run_status=0
           else

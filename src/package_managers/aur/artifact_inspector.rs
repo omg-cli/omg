@@ -27,8 +27,42 @@ const MAX_ARCHIVE_STREAM_BYTES: u64 = MAX_DECLARED_BYTES + MAX_MEMBERS * 1024;
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PRIVILEGED_FILES: usize = 256;
+const MAX_CAPABILITY_BYTES: usize = 8 * 1024;
+const MAX_PRIVILEGE_METADATA_BYTES: usize = 64 * 1024;
 
-pub(crate) const INSPECTION_POLICY_VERSION: u32 = 4;
+pub(crate) const INSPECTION_POLICY_VERSION: u32 = 5;
+
+#[derive(Debug, Default)]
+struct PrivilegeMetadataBudget(usize);
+
+impl PrivilegeMetadataBudget {
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        let total = self
+            .0
+            .checked_add(bytes)
+            .context("AUR privilege metadata size overflow")?;
+        anyhow::ensure!(
+            total <= MAX_PRIVILEGE_METADATA_BYTES,
+            "AUR privilege metadata exceeds retained byte limit"
+        );
+        self.0 = total;
+        Ok(())
+    }
+
+    fn encode_capability(&mut self, bytes: &[u8]) -> Result<String> {
+        anyhow::ensure!(
+            bytes.len() <= MAX_CAPABILITY_BYTES,
+            "AUR privilege capability metadata exceeds per-attribute byte limit"
+        );
+        self.reserve(
+            bytes
+                .len()
+                .checked_mul(2)
+                .context("AUR privilege capability size overflow")?,
+        )?;
+        Ok(hex::encode(bytes))
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ArchiveAdmission {
@@ -232,6 +266,7 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
     let mut declared_bytes = 0_u64;
     let mut executable_files = Vec::new();
     let mut privileged_files = Vec::new();
+    let mut privilege_metadata = PrivilegeMetadataBudget::default();
     let mut paired_build_reasons = BTreeSet::new();
     let mut install_hook = None;
     let mut pkginfo = None;
@@ -350,7 +385,8 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
                 if archive_metadata::attribute_name(extension.key_bytes()).as_deref()
                     == Some(b"security.capability".as_slice())
                 {
-                    capability = Some(hex::encode(extension.value_bytes()));
+                    capability =
+                        Some(privilege_metadata.encode_capability(extension.value_bytes())?);
                 }
             }
         }
@@ -364,6 +400,7 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
                 privileged_files.len() < MAX_PRIVILEGED_FILES,
                 "AUR archive has too many privileged files"
             );
+            privilege_metadata.reserve(member.len())?;
             privileged_files.push(PrivilegedFile {
                 path: member.clone(),
                 mode,
@@ -836,6 +873,151 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn oversized_capability_metadata_is_refused_before_retention() {
+        assert_capability_metadata_refused(1, 65_537);
+    }
+
+    #[test]
+    fn aggregate_capability_metadata_is_refused_before_retention() {
+        assert_capability_metadata_refused(256, 256);
+    }
+
+    #[test]
+    fn capability_retention_limits_include_exact_boundary_and_path_bytes() {
+        let single = fixture_file_mtree(&[("usr/bin/marker", 0o755, 4)]);
+        let raw = vec![b'x'; MAX_CAPABILITY_BYTES];
+        let file = fixture_archive_with_mtree(&single, |builder| {
+            builder
+                .append_pax_extensions([("SCHILY.xattr.security.capability", raw.as_slice())])
+                .expect("private capability fixture");
+            append_file(builder, "usr/bin/marker", b"data", 0o755)
+        })
+        .expect("private capability archive");
+        let inspection = inspect_archive(file.path())
+            .expect("capability at per-attribute limit")
+            .into_inspection();
+        assert_eq!(
+            inspection.privileged_files[0].capability.as_deref(),
+            Some(hex::encode(&raw).as_str())
+        );
+        assert_capability_metadata_refused(1, MAX_CAPABILITY_BYTES + 1);
+
+        for extra_path_byte in [false, true] {
+            let mut names = (0..4)
+                .map(|i| format!("usr/bin/marker-{i}"))
+                .collect::<Vec<_>>();
+            let path_bytes = names.iter().map(String::len).sum::<usize>();
+            let last_size =
+                (MAX_PRIVILEGE_METADATA_BYTES - path_bytes - 6 * MAX_CAPABILITY_BYTES) / 2;
+            assert_eq!(
+                path_bytes + 6 * MAX_CAPABILITY_BYTES + 2 * last_size,
+                MAX_PRIVILEGE_METADATA_BYTES
+            );
+            if extra_path_byte {
+                names[3].push('x');
+            }
+            let records = names
+                .iter()
+                .map(|name| (name.as_str(), 0o755, 4))
+                .collect::<Vec<_>>();
+            let mtree = fixture_file_mtree(&records);
+            let file = fixture_archive_with_mtree(&mtree, |builder| {
+                for (index, name) in names.iter().enumerate() {
+                    let capability = vec![
+                        b'x';
+                        if index == 3 {
+                            last_size
+                        } else {
+                            MAX_CAPABILITY_BYTES
+                        }
+                    ];
+                    builder
+                        .append_pax_extensions([(
+                            "SCHILY.xattr.security.capability",
+                            capability.as_slice(),
+                        )])
+                        .expect("private aggregate capability fixture");
+                    append_file(builder, name, b"data", 0o755)
+                        .expect("private aggregate fixture payload");
+                }
+                Ok(())
+            })
+            .expect("private aggregate capability archive");
+            let admitted = inspect_archive(file.path());
+            if extra_path_byte {
+                let error = admitted.expect_err("one retained path byte over the aggregate limit");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("privilege metadata exceeds retained byte limit")
+                );
+            } else {
+                let inspection = admitted
+                    .expect("exact retained metadata byte limit")
+                    .into_inspection();
+                assert_eq!(inspection.privileged_files.len(), 4);
+                let bytes = inspection
+                    .privileged_files
+                    .iter()
+                    .map(|file| {
+                        file.path.len()
+                            + file.capability.as_ref().expect("fixture capability").len()
+                    })
+                    .sum::<usize>();
+                assert_eq!(bytes, MAX_PRIVILEGE_METADATA_BYTES);
+            }
+        }
+    }
+
+    fn assert_capability_metadata_refused(file_count: usize, capability_bytes: usize) {
+        let names = (0..file_count)
+            .map(|index| format!("usr/bin/marker-{index}"))
+            .collect::<Vec<_>>();
+        let records = names
+            .iter()
+            .map(|name| (name.as_str(), 0o755, 4))
+            .collect::<Vec<_>>();
+        let mtree = fixture_file_mtree(&records);
+        let capability = vec![b'x'; capability_bytes];
+        let file = fixture_archive_with_mtree(&mtree, |builder| {
+            for name in &names {
+                builder
+                    .append_pax_extensions([(
+                        "SCHILY.xattr.security.capability",
+                        capability.as_slice(),
+                    )])
+                    .expect("private fixture capability metadata is writable");
+                append_file(builder, name, b"data", 0o755)
+                    .expect("private fixture payload is writable");
+            }
+            Ok(())
+        })
+        .expect("bounded inert privilege metadata fixture is writable");
+        match inspect_archive(file.path()) {
+            Err(error) => {
+                let diagnostic = format!("{error:#}");
+                assert!(
+                    diagnostic.contains("privilege")
+                        && (diagnostic.contains("limit") || diagnostic.contains("budget")),
+                    "refusal must reach the privilege metadata budget: {diagnostic}"
+                );
+            }
+            Ok(admission) => {
+                let retained = admission
+                    .inspection()
+                    .privileged_files
+                    .iter()
+                    .filter_map(|file| file.capability.as_ref())
+                    .map(String::len)
+                    .sum::<usize>();
+                panic!(
+                    "accepted {retained} encoded capability bytes across {file_count} privileged files"
+                );
+            }
+        }
     }
 
     #[test]

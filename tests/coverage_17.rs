@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use omg_lib::package_managers::aur_sources::{SourceFile, download_sources, parse_sources};
+use omg_lib::package_managers::aur_sources::{
+    SourceFile, download_sources, parse_sources, parse_vcs_sources,
+};
 
 /// Local HTTP server with observable requests and deterministic shutdown.
 struct LocalHttpServer {
@@ -255,6 +257,51 @@ fn parse_sources_invalid_content_is_error_naming_cause() {
     assert!(
         message.contains("Failed to parse .SRCINFO"),
         "error must name the parsing stage, got: {message}"
+    );
+}
+
+#[test]
+fn source_path_apis_refuse_oversized_regular_metadata() {
+    let directory = tempfile::tempdir().expect("isolated metadata fixture");
+    let metadata = fs::File::create(directory.path().join(".SRCINFO")).expect("metadata file");
+    metadata
+        .set_len(16 * 1024 * 1024 + 1)
+        .expect("bounded sparse metadata fixture");
+    let http_error =
+        parse_sources(directory.path()).expect_err("oversized HTTP metadata must fail");
+    let vcs_error =
+        parse_vcs_sources(directory.path()).expect_err("oversized VCS metadata must fail");
+    for error in [http_error, vcs_error] {
+        assert!(
+            format!("{error:#}").contains("source file exceeds limit"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
+fn source_path_apis_refuse_symlinked_metadata_and_preserve_missing_vcs() {
+    let directory = tempfile::tempdir().expect("isolated metadata fixture");
+    assert!(
+        parse_vcs_sources(directory.path())
+            .expect("absent VCS metadata")
+            .is_empty()
+    );
+    let target = directory.path().join("metadata");
+    fs::write(
+        &target,
+        srcinfo_body(&["source = git+https://example.com/repo.git"]),
+    )
+    .expect("valid metadata target");
+    std::os::unix::fs::symlink(&target, directory.path().join(".SRCINFO"))
+        .expect("symlinked metadata fixture");
+    assert!(
+        parse_sources(directory.path()).is_err(),
+        "HTTP metadata must not follow a symlink"
+    );
+    assert!(
+        parse_vcs_sources(directory.path()).is_err(),
+        "VCS metadata must not follow a symlink"
     );
 }
 
