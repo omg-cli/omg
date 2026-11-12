@@ -1337,51 +1337,8 @@ impl AurClient {
         })
     }
 
-    /// This inode must survive removal and recreation of the build tree.
     fn open_lifecycle_lock(&self) -> Result<File> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-        let lock_path = self.build_dir.with_added_extension("lifecycle.lock");
-        let parent = lock_path
-            .parent()
-            .context("AUR build directory has no parent")?;
-        create_dir_as_user_sync(parent)?;
-        let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-        let (file, created) = match options.create_new(true).open(&lock_path) {
-            Ok(file) => (file, true),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                (options.create_new(false).open(&lock_path)?, false)
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to open AUR lifecycle lock {}", lock_path.display())
-                });
-            }
-        };
-        let metadata = file.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file() && metadata.nlink() == 1,
-            "AUR lifecycle lock must be a single-link regular file"
-        );
-        if let Some(user) = original_user() {
-            let account = nix::unistd::User::from_name(&user)?
-                .with_context(|| format!("Original user '{user}' has no system account"))?;
-            if created {
-                nix::unistd::fchown(&file, Some(account.uid), Some(account.gid))
-                    .context("Failed to set AUR lifecycle lock ownership")?;
-            } else {
-                anyhow::ensure!(
-                    metadata.uid() == account.uid.as_raw(),
-                    "Existing AUR lifecycle lock is not owned by the original user"
-                );
-            }
-        }
-        Ok(file)
+        super::utils::open_build_lifecycle_lock(&self.build_dir)
     }
 
     /// File ownership spans async build work intentionally. Acquisition never
@@ -1417,15 +1374,7 @@ impl AurClient {
         create_dir_as_user(&lock_dir).await?;
         let lock_path = lock_dir.join(format!("{package_base}.lock"));
         self.blocking_build_work(move || -> Result<File> {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-                .with_context(|| {
-                    format!("Failed to open AUR build lock {}", lock_path.display())
-                })?;
+            let file = super::utils::open_effective_user_lock(&lock_path)?;
             file.lock().with_context(|| {
                 format!("Failed to acquire AUR build lock {}", lock_path.display())
             })?;
@@ -7723,9 +7672,9 @@ mod tests {
 
     #[tokio::test]
     async fn package_base_file_locks_live_under_the_build_directory() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_fixture_dir().unwrap();
         let client = AurClient {
-            build_dir: directory.path().to_path_buf(),
+            build_dir: directory.path().join("aur"),
             settings: Settings::default(),
             package_base_locks: Arc::new(dashmap::DashMap::new()),
         };
@@ -7735,8 +7684,55 @@ mod tests {
             .await
             .expect("package-base file lock");
 
-        assert!(directory.path().join("_locks/shared-base.lock").is_file());
+        let lock_path = client.build_dir.join("_locks/shared-base.lock");
+        assert!(lock_path.is_file());
+        assert_eq!(
+            std::fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "package-base coordination files must be private at creation"
+        );
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn package_base_file_locks_reject_symlinks_and_hardlinks() -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let directory = private_fixture_dir()?;
+        let client = AurClient {
+            build_dir: directory.path().join("aur"),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let locks = client.build_dir.join("_locks");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&locks)?;
+        let ordinary = client.acquire_package_base_file_lock("ordinary").await?;
+        drop(ordinary);
+        let target = directory.path().join("unrelated");
+        std::fs::write(&target, b"unrelated inode")?;
+        let lock_path = locks.join("shared-base.lock");
+        std::os::unix::fs::symlink(&target, &lock_path)?;
+        assert!(
+            client
+                .acquire_package_base_file_lock("shared-base")
+                .await
+                .is_err(),
+            "a package-base lock must not follow a symlink to an unrelated inode"
+        );
+        std::fs::remove_file(&lock_path)?;
+        std::fs::hard_link(&target, &lock_path)?;
+        assert!(
+            client
+                .acquire_package_base_file_lock("shared-base")
+                .await
+                .is_err(),
+            "a package-base lock must not share an unrelated hardlinked inode"
+        );
+        assert_eq!(std::fs::read(target)?, b"unrelated inode");
+        Ok(())
     }
 
     #[test]

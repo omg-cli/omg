@@ -743,3 +743,44 @@ required before merging.
 The next security pass must examine general cache-directory creation and
 package-base and metadata lock inode handling. The private staging fixes do not
 claim those separate boundaries are complete.
+
+
+## Metadata ownership and lock inode batch
+
+Five private-fixture regressions reproduced metadata cleanup during an active
+publication lease, acceptance of package-base and publication lock symlinks,
+and fresh coordination files with mode `0644` instead of `0600`.
+
+Metadata locations now carry their build directory explicitly and derive `_meta`
+from it. The owned metadata guard retains both publication coordination and the
+shared build lifecycle lease. It acquires lifecycle ownership before metadata
+creation and keeps both descriptors through the existing blocking publication
+workers. Cleanup continues to request exclusive lifecycle ownership without
+waiting. A cancelled awaiting task cannot release the worker's cleanup protection
+early. Tests observe cleanup refusal while the detached worker is active,
+publication completion, then successful cleanup after ownership is released.
+
+Package-base and publication files now refuse symlinks, multiply linked or
+nonregular inodes, unexpected effective-user ownership and group/other writable
+permissions. Fresh files request `0600`. Existing owner-held `0644` locks remain
+accepted; this batch does not silently change their permissions. The existing
+lifecycle opener retains its separate original-user ownership behavior. General
+cache-parent ownership and creation policy remain pending.
+
+Generic metadata fixtures now use explicit private `owner/aur/_meta` locations.
+No implementation infers a build root from an arbitrary temporary directory's
+parent. Missing metadata reads and disabled synchronization retain their early
+returns without creating cache or coordination paths.
+
+Verification passed 2,286 library tests with 12 ignored, all 15 source integration
+tests, all nine transaction failure tests, three umask-zero lock controls,
+all-target Clippy with warnings denied, and the CLI/daemon build. Independent
+correctness and security review approved the runtime diff. The fresh CLI passed
+version/help and read-only host `info pacman` and `list` checks with private OMG
+state and the daemon disabled.
+
+The published `d4ce2e6a` coverage producer passes, but its exact-base comparison
+remains open. Fresh evidence identifies a real lost hit in mirror configuration,
+additional uncovered branches and several incorrect source correspondences.
+Those findings require explicit tests or mapping proof; passing the lock batch
+does not close that gate.

@@ -70,8 +70,34 @@ struct Manifest {
     validators: AurMetaCache,
 }
 
-fn metadata_root() -> PathBuf {
-    paths::cache_dir().join("aur").join("_meta")
+#[derive(Clone)]
+struct MetadataRoot {
+    build_dir: PathBuf,
+}
+
+impl MetadataRoot {
+    const fn new(build_dir: PathBuf) -> Self {
+        Self { build_dir }
+    }
+
+    fn path(&self) -> PathBuf {
+        self.build_dir.join("_meta")
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MetadataAccess {
+    Shared,
+    Exclusive,
+}
+
+struct MetadataLock {
+    _publication: File,
+    _lifecycle: File,
+}
+
+fn metadata_root() -> MetadataRoot {
+    MetadataRoot::new(paths::cache_dir().join("aur"))
 }
 
 fn generation_paths(root: &Path, manifest: &Manifest) -> Result<(PathBuf, PathBuf)> {
@@ -87,20 +113,37 @@ fn generation_paths(root: &Path, manifest: &Manifest) -> Result<(PathBuf, PathBu
     Ok((generation.join("archive.gz"), generation.join("index.rkyv")))
 }
 
-fn lock_metadata(root: &Path, exclusive: bool) -> Result<File> {
-    std::fs::create_dir_all(root)?;
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join("publication.lock"))?;
-    if exclusive {
-        file.lock()?;
-    } else {
-        file.lock_shared()?;
+fn lock_metadata(location: &MetadataRoot, access: MetadataAccess) -> Result<MetadataLock> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    use crate::package_managers::aur::utils::{
+        open_build_lifecycle_lock, open_effective_user_lock,
+    };
+
+    let lifecycle = open_build_lifecycle_lock(&location.build_dir)?;
+    lifecycle
+        .try_lock_shared()
+        .context("Failed to acquire AUR metadata ownership; cleanup may be active")?;
+    let root = location.path();
+    match access {
+        MetadataAccess::Exclusive => std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)?,
+        MetadataAccess::Shared => anyhow::ensure!(
+            std::fs::metadata(&root)?.is_dir(),
+            "AUR metadata root is not a directory"
+        ),
     }
-    Ok(file)
+    let publication = open_effective_user_lock(&root.join("publication.lock"))?;
+    match access {
+        MetadataAccess::Shared => publication.lock_shared()?,
+        MetadataAccess::Exclusive => publication.lock()?,
+    }
+    Ok(MetadataLock {
+        _publication: publication,
+        _lifecycle: lifecycle,
+    })
 }
 
 fn current_generation(root: &Path) -> Result<Option<(Manifest, AurIndex)>> {
@@ -119,11 +162,25 @@ fn current_generation(root: &Path) -> Result<Option<(Manifest, AurIndex)>> {
     Ok(Some((manifest, AurIndex::open(&index)?)))
 }
 
-fn open_fresh_metadata_index_at(root: &Path, ttl: Duration) -> Result<Option<AurIndex>> {
+fn open_fresh_metadata_index_at(
+    location: &MetadataRoot,
+    ttl: Duration,
+) -> Result<Option<AurIndex>> {
+    let root = location.path();
     if !root.is_dir() {
         return Ok(None);
     }
-    let _lock = lock_metadata(root, false)?;
+    let _lock = match lock_metadata(location, MetadataAccess::Shared) {
+        Ok(lock) => lock,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     let manifest = root.join("manifest.json");
     let fresh = std::fs::metadata(manifest)
         .and_then(|m| m.modified())
@@ -131,7 +188,7 @@ fn open_fresh_metadata_index_at(root: &Path, ttl: Duration) -> Result<Option<Aur
     if !fresh {
         return Ok(None);
     }
-    Ok(current_generation(root)?.map(|(_, index)| index))
+    Ok(current_generation(&root)?.map(|(_, index)| index))
 }
 
 /// Open an owned snapshot of the currently published, fresh metadata generation.
@@ -171,16 +228,17 @@ async fn sync_aur_metadata_at(
     client: &reqwest::Client,
     settings: &Settings,
     force: bool,
-    root: PathBuf,
+    location: MetadataRoot,
     endpoint: &str,
 ) -> Result<()> {
     if !settings.aur.use_metadata_archive {
         return Ok(());
     }
 
-    let lock_root = root.clone();
+    let root = location.path();
     let publication_lock =
-        tokio::task::spawn_blocking(move || lock_metadata(&lock_root, true)).await??;
+        tokio::task::spawn_blocking(move || lock_metadata(&location, MetadataAccess::Exclusive))
+            .await??;
     let current = current_generation(&root).unwrap_or_else(|error| {
         tracing::warn!("Ignoring incomplete AUR metadata generation: {error}");
         None
@@ -360,9 +418,13 @@ fn publish_generation(root: &Path, bytes: &[u8], validators: AurMetaCache) -> Re
 
 #[cfg(test)]
 pub(crate) fn publish_test_metadata(archive: &Path) -> Result<()> {
-    let root = metadata_root();
-    let _lock = lock_metadata(&root, true)?;
-    publish_generation(&root, &std::fs::read(archive)?, AurMetaCache::default())
+    let location = metadata_root();
+    let _lock = lock_metadata(&location, MetadataAccess::Exclusive)?;
+    publish_generation(
+        &location.path(),
+        &std::fs::read(archive)?,
+        AurMetaCache::default(),
+    )
 }
 
 fn persist_file_atomically(dest: &Path, data: &[u8]) -> Result<()> {
@@ -499,12 +561,13 @@ mod tests {
     #[tokio::test]
     async fn sync_disabled_metadata_does_not_create_cache_or_request() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("unused-cache");
+        let location = MetadataRoot::new(directory.path().join("unused-cache"));
+        let root = location.path();
         let mut settings = Settings::default();
         settings.aur.use_metadata_archive = false;
         let (endpoint, listener) = unused_metadata_endpoint();
 
-        sync_aur_metadata_at(&metadata_client(), &settings, true, root.clone(), &endpoint)
+        sync_aur_metadata_at(&metadata_client(), &settings, true, location, &endpoint)
             .await
             .unwrap();
 
@@ -515,7 +578,10 @@ mod tests {
     #[tokio::test]
     async fn sync_fresh_complete_generation_does_not_request_or_republish() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root_path = location.path();
+        let root = root_path.as_path();
+        std::fs::create_dir_all(root).unwrap();
         publish_generation(root, &catalogue("cached"), AurMetaCache::default()).unwrap();
         let manifest_before = std::fs::read(root.join("manifest.json")).unwrap();
         let (endpoint, listener) = unused_metadata_endpoint();
@@ -524,7 +590,7 @@ mod tests {
             &metadata_client(),
             &Settings::default(),
             false,
-            root.to_owned(),
+            location,
             &endpoint,
         )
         .await
@@ -542,7 +608,10 @@ mod tests {
     #[tokio::test]
     async fn sync_fresh_legacy_archive_migrates_without_request() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root_path = location.path();
+        let root = root_path.as_path();
+        std::fs::create_dir_all(root).unwrap();
         let archive = catalogue("legacy");
         let legacy = root.join("packages-meta-ext-v1.json.gz");
         std::fs::write(&legacy, &archive).unwrap();
@@ -552,7 +621,7 @@ mod tests {
             &metadata_client(),
             &Settings::default(),
             false,
-            root.to_owned(),
+            location,
             &endpoint,
         )
         .await
@@ -571,7 +640,10 @@ mod tests {
     #[tokio::test]
     async fn sync_200_publishes_archive_index_and_validators_together() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root_path = location.path();
+        let root = root_path.as_path();
+        std::fs::create_dir_all(root).unwrap();
         publish_generation(root, &catalogue("old"), AurMetaCache::default()).unwrap();
         let (old_manifest, snapshot) = current_generation(root).unwrap().unwrap();
         let archive = catalogue("new");
@@ -587,7 +659,7 @@ mod tests {
             &metadata_client(),
             &Settings::default(),
             true,
-            root.to_owned(),
+            location,
             &endpoint,
         )
         .await
@@ -614,7 +686,10 @@ mod tests {
     #[tokio::test]
     async fn sync_304_reuses_complete_generation_and_refreshes_manifest() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root_path = location.path();
+        let root = root_path.as_path();
+        std::fs::create_dir_all(root).unwrap();
         let modified = "Wed, 11 Nov 2026 12:00:00 GMT";
         publish_generation(
             root,
@@ -643,7 +718,7 @@ mod tests {
             &metadata_client(),
             &Settings::default(),
             false,
-            root.to_owned(),
+            location.clone(),
             &endpoint,
         )
         .await
@@ -659,7 +734,7 @@ mod tests {
         assert_eq!(std::fs::read(archive).unwrap(), archive_before);
         assert_eq!(std::fs::read(index).unwrap(), index_before);
         assert!(
-            open_fresh_metadata_index_at(root, Duration::from_mins(1))
+            open_fresh_metadata_index_at(&location, Duration::from_mins(1))
                 .unwrap()
                 .unwrap()
                 .get("cached")
@@ -683,7 +758,10 @@ mod tests {
             Damage::CorruptManifest,
         ] {
             let directory = tempfile::tempdir().unwrap();
-            let root = directory.path();
+            let location = MetadataRoot::new(directory.path().join("aur"));
+            let root_path = location.path();
+            let root = root_path.as_path();
+            std::fs::create_dir_all(root).unwrap();
             publish_generation(
                 root,
                 &catalogue("old"),
@@ -710,7 +788,7 @@ mod tests {
                 &metadata_client(),
                 &Settings::default(),
                 false,
-                root.to_owned(),
+                location,
                 &endpoint,
             )
             .await
@@ -733,14 +811,17 @@ mod tests {
     #[tokio::test]
     async fn sync_304_without_complete_generation_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root_path = location.path();
+        let root = root_path.as_path();
+        std::fs::create_dir_all(root).unwrap();
         let (endpoint, server) = metadata_server("304 Not Modified", &[], &[]).await;
 
         let error = sync_aur_metadata_at(
             &metadata_client(),
             &Settings::default(),
             true,
-            root.to_owned(),
+            location,
             &endpoint,
         )
         .await
@@ -760,7 +841,10 @@ mod tests {
     #[tokio::test]
     async fn sync_invalid_200_preserves_published_generation_and_validators() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root_path = location.path();
+        let root = root_path.as_path();
+        std::fs::create_dir_all(root).unwrap();
         publish_generation(
             root,
             &catalogue("cached"),
@@ -779,7 +863,7 @@ mod tests {
                 &metadata_client(),
                 &Settings::default(),
                 true,
-                root.to_owned(),
+                location,
                 &endpoint,
             )
             .await
@@ -812,7 +896,10 @@ mod tests {
     #[test]
     fn mismatched_archive_and_index_are_not_a_fresh_generation() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root_path = location.path();
+        let root = root_path.as_path();
+        std::fs::create_dir_all(root).unwrap();
         let archive = root.join("metadata.json.gz");
         let index = root.join("metadata.rkyv");
         std::fs::write(&archive, catalogue("package-a")).unwrap();
@@ -843,7 +930,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            open_fresh_metadata_index_at(root, Duration::from_mins(1))
+            open_fresh_metadata_index_at(&location, Duration::from_mins(1))
                 .unwrap()
                 .is_none()
         );
@@ -852,7 +939,10 @@ mod tests {
     #[test]
     fn published_generation_survives_failed_publication_and_304() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root_path = location.path();
+        let root = root_path.as_path();
+        std::fs::create_dir_all(root).unwrap();
         publish_generation(
             root,
             &catalogue("old"),
@@ -862,7 +952,7 @@ mod tests {
             },
         )
         .unwrap();
-        let snapshot = open_fresh_metadata_index_at(root, Duration::from_mins(1))
+        let snapshot = open_fresh_metadata_index_at(&location, Duration::from_mins(1))
             .unwrap()
             .unwrap();
         assert!(publish_generation(root, b"invalid gzip", AurMetaCache::default()).is_err());
@@ -871,7 +961,7 @@ mod tests {
         commit_manifest(root, &manifest).unwrap();
         publish_generation(root, &catalogue("new"), AurMetaCache::default()).unwrap();
         assert!(snapshot.get("old").unwrap().is_some());
-        let current = open_fresh_metadata_index_at(root, Duration::from_mins(1))
+        let current = open_fresh_metadata_index_at(&location, Duration::from_mins(1))
             .unwrap()
             .unwrap();
         assert!(current.get("new").unwrap().is_some());
@@ -913,28 +1003,31 @@ mod tests {
     #[test]
     fn binary_index_freshness_follows_the_archive_ttl() {
         let directory = tempfile::tempdir().unwrap();
-        publish_generation(directory.path(), &catalogue("one"), AurMetaCache::default()).unwrap();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root = location.path();
+        publish_generation(&root, &catalogue("one"), AurMetaCache::default()).unwrap();
         assert!(
-            open_fresh_metadata_index_at(directory.path(), Duration::from_mins(1))
+            open_fresh_metadata_index_at(&location, Duration::from_mins(1))
                 .unwrap()
                 .is_some()
         );
         assert!(
-            open_fresh_metadata_index_at(directory.path(), Duration::ZERO)
+            open_fresh_metadata_index_at(&location, Duration::ZERO)
                 .unwrap()
                 .is_none()
         );
-        let (manifest, _) = current_generation(directory.path()).unwrap().unwrap();
-        std::fs::remove_file(generation_paths(directory.path(), &manifest).unwrap().0).unwrap();
-        assert!(open_fresh_metadata_index_at(directory.path(), Duration::from_mins(1)).is_err());
+        let (manifest, _) = current_generation(&root).unwrap().unwrap();
+        std::fs::remove_file(generation_paths(&root, &manifest).unwrap().0).unwrap();
+        assert!(open_fresh_metadata_index_at(&location, Duration::from_mins(1)).is_err());
     }
 
     #[test]
     fn missing_metadata_root_does_not_create_a_cache_or_lock() {
         let directory = tempfile::tempdir().expect("private metadata owner");
-        let root = directory.path().join("absent");
+        let location = MetadataRoot::new(directory.path().join("absent"));
+        let root = location.path();
         assert!(
-            open_fresh_metadata_index_at(&root, Duration::from_mins(1))
+            open_fresh_metadata_index_at(&location, Duration::from_mins(1))
                 .expect("missing metadata root is a cache miss")
                 .is_none()
         );
@@ -951,10 +1044,12 @@ mod tests {
     #[test]
     fn stale_index_is_not_a_fresh_metadata_generation() {
         let directory = tempfile::tempdir().unwrap();
-        publish_generation(directory.path(), &catalogue("one"), AurMetaCache::default()).unwrap();
-        let (manifest, _) = current_generation(directory.path()).unwrap().unwrap();
-        std::fs::remove_file(generation_paths(directory.path(), &manifest).unwrap().1).unwrap();
-        assert!(open_fresh_metadata_index_at(directory.path(), Duration::from_mins(1)).is_err());
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root = location.path();
+        publish_generation(&root, &catalogue("one"), AurMetaCache::default()).unwrap();
+        let (manifest, _) = current_generation(&root).unwrap().unwrap();
+        std::fs::remove_file(generation_paths(&root, &manifest).unwrap().1).unwrap();
+        assert!(open_fresh_metadata_index_at(&location, Duration::from_mins(1)).is_err());
     }
 
     #[test]
@@ -1014,6 +1109,179 @@ mod tests {
     }
 
     #[test]
+    fn metadata_lock_preserves_generation_during_cache_cleanup() -> Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        const TEST: &str = "package_managers::aur_metadata::tests::metadata_lock_preserves_generation_during_cache_cleanup";
+        if Settings::rerun_test_unprivileged(TEST) || crate::core::testing::run_isolated_test(TEST)
+        {
+            return Ok(());
+        }
+        assert!(
+            !crate::core::is_root(),
+            "cache fixture requires an ordinary UID"
+        );
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let configuration = directory.path().join("config");
+        let data = directory.path().join("data");
+        let cache = directory.path().join("cache");
+        for path in [&configuration, &data, &cache] {
+            std::fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        std::fs::write(
+            configuration.join("config.toml"),
+            "[aur]\nsecurity_profile = 'standard'\n",
+        )?;
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(configuration.as_path())),
+                ("OMG_DATA_DIR", Some(data.as_path())),
+                ("OMG_CACHE_DIR", Some(cache.as_path())),
+            ],
+            || -> Result<()> {
+                let client = crate::package_managers::aur::AurClient::new()?;
+                let location = metadata_root();
+                let root = location.path();
+                assert_eq!(root, cache.join("aur/_meta"));
+                let expected = catalogue("held-generation");
+                for access in [MetadataAccess::Shared, MetadataAccess::Exclusive] {
+                    publish_generation(&root, &expected, AurMetaCache::default())?;
+                    let (manifest, _) =
+                        current_generation(&root)?.context("published generation")?;
+                    let (archive, _) = generation_paths(&root, &manifest)?;
+                    let lease = lock_metadata(&location, access)?;
+                    assert!(
+                        client.clean_all().is_err(),
+                        "cache cleanup must refuse an active metadata lease, access={access:?}"
+                    );
+                    assert_eq!(std::fs::read(&archive)?, expected);
+                    assert_eq!(
+                        current_generation(&root)?
+                            .context("retained generation")?
+                            .0
+                            .generation,
+                        manifest.generation
+                    );
+                    drop(lease);
+                    client.clean_all()?;
+                    assert!(!root.exists(), "released metadata may be cleaned");
+                }
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let (started, started_rx) = tokio::sync::oneshot::channel();
+                        let (release, release_rx) = std::sync::mpsc::channel();
+                        let (finished, finished_rx) = tokio::sync::oneshot::channel();
+                        let worker_location = location.clone();
+                        let waiting = tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                let result = (|| -> Result<()> {
+                                    let _lease =
+                                        lock_metadata(&worker_location, MetadataAccess::Exclusive)?;
+                                    started.send(()).map_err(|()| {
+                                        anyhow::anyhow!("metadata observer dropped")
+                                    })?;
+                                    release_rx.recv()?;
+                                    publish_generation(
+                                        &worker_location.path(),
+                                        &catalogue("worker-generation"),
+                                        AurMetaCache::default(),
+                                    )
+                                })();
+                                let delivered = finished.send(result);
+                                assert!(delivered.is_ok(), "metadata completion observer dropped");
+                            })
+                            .await
+                        });
+                        tokio::time::timeout(Duration::from_secs(5), started_rx).await??;
+                        waiting.abort();
+                        assert!(waiting.await.expect_err("cancelled waiter").is_cancelled());
+                        assert!(
+                            client.clean_all().is_err(),
+                            "a detached metadata worker must retain cleanup protection"
+                        );
+                        release.send(())?;
+                        tokio::time::timeout(Duration::from_secs(5), finished_rx).await???;
+                        let (manifest, index) =
+                            current_generation(&root)?.context("worker generation")?;
+                        assert!(index.get("worker-generation")?.is_some());
+                        assert_eq!(
+                            std::fs::read(generation_paths(&root, &manifest)?.0)?,
+                            catalogue("worker-generation")
+                        );
+                        client.clean_all()?;
+                        assert!(!root.exists(), "completed metadata work may be cleaned");
+                        Ok::<_, anyhow::Error>(())
+                    })?;
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn metadata_locks_reject_symlinks_and_hardlinks() -> Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root = location.path();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)?;
+        let ordinary = lock_metadata(&location, MetadataAccess::Shared)?;
+        drop(ordinary);
+        let lock_path = root.join("publication.lock");
+        std::fs::remove_file(&lock_path)?;
+        let target = directory.path().join("unrelated");
+        std::fs::write(&target, b"unrelated inode")?;
+        std::os::unix::fs::symlink(&target, &lock_path)?;
+        assert!(
+            lock_metadata(&location, MetadataAccess::Shared).is_err(),
+            "a metadata lock must not follow a symlink to an unrelated inode"
+        );
+        std::fs::remove_file(&lock_path)?;
+        std::fs::hard_link(&target, &lock_path)?;
+        assert!(
+            lock_metadata(&location, MetadataAccess::Exclusive).is_err(),
+            "a metadata lock must not share an unrelated hardlinked inode"
+        );
+        assert_eq!(std::fs::read(target)?, b"unrelated inode");
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_locks_are_private_at_creation() -> Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root = location.path();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&root)?;
+        let lease = lock_metadata(&location, MetadataAccess::Shared)?;
+        assert_eq!(
+            std::fs::metadata(root.join("publication.lock"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "metadata coordination files must be private at creation"
+        );
+        drop(lease);
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "invoked as a separate process by metadata_lock_is_cross_process"]
     fn metadata_lock_child() {
         use std::io::{BufRead, Write};
@@ -1041,10 +1309,13 @@ mod tests {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
         let directory = tempfile::tempdir().unwrap();
-        let shared = lock_metadata(directory.path(), false).unwrap();
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root = location.path();
+        std::fs::create_dir_all(&root).unwrap();
+        let shared = lock_metadata(&location, MetadataAccess::Shared).unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["metadata_lock_child", "--ignored", "--nocapture"])
-            .env("OMG_METADATA_LOCK_TEST_ROOT", directory.path())
+            .env("OMG_METADATA_LOCK_TEST_ROOT", &root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

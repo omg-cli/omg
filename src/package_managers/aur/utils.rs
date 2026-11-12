@@ -282,6 +282,89 @@ pub fn create_dir_as_user_sync(path: &Path) -> Result<()> {
     }
 }
 
+/// Open the stable inode shared by AUR builders, metadata and cleanup.
+pub(in crate::package_managers) fn open_build_lifecycle_lock(
+    build_dir: &Path,
+) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let lock_path = build_dir.with_added_extension("lifecycle.lock");
+    let parent = lock_path
+        .parent()
+        .context("AUR build directory has no parent")?;
+    create_dir_as_user_sync(parent)?;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let (file, created) = match options.create_new(true).open(&lock_path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            (options.create_new(false).open(&lock_path)?, false)
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to open AUR lifecycle lock {}", lock_path.display())
+            });
+        }
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "AUR lifecycle lock must be a single-link regular file"
+    );
+    if let Some(user) = original_user() {
+        let account = nix::unistd::User::from_name(&user)?
+            .with_context(|| format!("Original user '{user}' has no system account"))?;
+        if created {
+            nix::unistd::fchown(&file, Some(account.uid), Some(account.gid))
+                .context("Failed to set AUR lifecycle lock ownership")?;
+        } else {
+            anyhow::ensure!(
+                metadata.uid() == account.uid.as_raw(),
+                "Existing AUR lifecycle lock is not owned by the original user"
+            );
+        }
+    }
+    Ok(file)
+}
+
+/// Open an effective-user-owned coordination inode that is not group/other writable.
+pub(in crate::package_managers) fn open_effective_user_lock(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let file = match options.create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            options.create_new(false).open(path)?
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to open AUR lock {}", path.display()));
+        }
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "AUR lock must be a single-link regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.uid() == nix::unistd::geteuid().as_raw() && metadata.mode() & 0o022 == 0,
+        "AUR lock must be owned by the effective user and not group/other writable: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
