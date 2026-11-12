@@ -222,6 +222,8 @@ pub struct LocalDbPackage {
     pub desc: String,
     pub install_date: String,
     pub licenses: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
     pub explicit: bool, // Explicitly installed vs dependency
     /// Runtime dependencies this package declares (`%DEPENDS%`).
     ///
@@ -245,6 +247,7 @@ impl Default for LocalDbPackage {
             desc: String::new(),
             install_date: String::new(),
             licenses: Vec::new(),
+            groups: Vec::new(),
             explicit: false,
             depends: Vec::new(),
             optdepends: Vec::new(),
@@ -945,6 +948,7 @@ fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
             desc: desc.description.to_string(),
             install_date: desc.installdate.to_string(),
             licenses: desc.license.iter().map(ToString::to_string).collect(),
+            groups: desc.groups.iter().map(ToString::to_string).collect(),
             explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
             depends: desc.depends.iter().map(ToString::to_string).collect(),
             optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
@@ -958,6 +962,7 @@ fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
             desc: desc.description.to_string(),
             install_date: desc.installdate.to_string(),
             licenses: desc.license.iter().map(ToString::to_string).collect(),
+            groups: desc.groups.iter().map(ToString::to_string).collect(),
             explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
             depends: desc.depends.iter().map(ToString::to_string).collect(),
             optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
@@ -977,6 +982,7 @@ fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
     let mut install_date = String::new();
     let mut reason = String::new();
     let mut licenses = Vec::new();
+    let mut groups = Vec::new();
     let mut depends = Vec::new();
     let mut optdepends = Vec::new();
     let mut provides = Vec::new();
@@ -1001,6 +1007,7 @@ fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
             Some("%INSTALLDATE%") => install_date = line.to_string(),
             Some("%REASON%") => reason = line.to_string(),
             Some("%LICENSE%") => licenses.push(line.to_string()),
+            Some("%GROUPS%") => groups.push(line.to_string()),
             Some("%DEPENDS%") => depends.push(line.to_string()),
             Some("%OPTDEPENDS%") => optdepends.push(line.to_string()),
             Some("%PROVIDES%") => provides.push(line.to_string()),
@@ -1026,6 +1033,7 @@ fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
         desc,
         install_date,
         licenses,
+        groups,
         explicit,
         depends,
         optdepends,
@@ -1295,8 +1303,8 @@ fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
 /// Ensure local cache is loaded (fast if already loaded)
 fn ensure_local_cache_loaded(local_dir: &Path) -> Result<()> {
     let current_epoch = LocalDbEpoch::from_local_dir(local_dir)?;
-    // v2 excludes partial catalogs accepted by the former tolerant parser.
-    ensure_cache_loaded(&LOCAL_DB_CACHE, "local_db_source_v2", current_epoch, || {
+    // v3 retains installed groups for IgnoreGroup filtering.
+    ensure_cache_loaded(&LOCAL_DB_CACHE, "local_db_source_v3", current_epoch, || {
         let packages = parse_local_db(local_dir)?;
         #[cfg(test)]
         AFTER_LOCAL_PARSE.with(|hook| {
@@ -1539,6 +1547,7 @@ pub fn invalidate_caches() -> Result<()> {
 fn invalidate_derived_cache_files(cache_dir: &Path) -> Result<()> {
     for name in [
         "sync_db_source_v2",
+        "local_db_source_v3",
         "local_db_source_v2",
         "sync_db_source_v1",
         "local_db_source_v1",
@@ -1613,10 +1622,23 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
         .packages
         .par_iter()
         .filter_map(|(name, local_pkg)| {
+            if package_is_ignored(
+                &local_pkg.name,
+                &local_pkg.groups,
+                &ignored_packages,
+                &ignored_groups,
+            ) {
+                return None;
+            }
             sync_packages
                 .get(name.as_str())
                 .filter(|sync_pkg| {
-                    !sync_package_is_ignored(sync_pkg, &ignored_packages, &ignored_groups)
+                    !package_is_ignored(
+                        &sync_pkg.name,
+                        &sync_pkg.groups,
+                        &ignored_packages,
+                        &ignored_groups,
+                    )
                 })
                 .filter(|sync_pkg| {
                     crate::package_managers::types::compare_versions(
@@ -1659,16 +1681,13 @@ pub(crate) fn compile_ignore_patterns(
         .with_context(|| format!("Failed to compile {setting} patterns"))
 }
 
-fn sync_package_is_ignored(
-    package: &SyncDbPackage,
+fn package_is_ignored(
+    name: &str,
+    groups: &[String],
     ignored_packages: &globset::GlobSet,
     ignored_groups: &globset::GlobSet,
 ) -> bool {
-    ignored_packages.is_match(&package.name)
-        || package
-            .groups
-            .iter()
-            .any(|group| ignored_groups.is_match(group))
+    ignored_packages.is_match(name) || groups.iter().any(|group| ignored_groups.is_match(group))
 }
 
 /// Get a specific local package - FAST (<1ms)
@@ -2275,6 +2294,78 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn cached_updates_preserve_installed_ignore_groups_across_disk_reuse() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::cached_updates_preserve_installed_ignore_groups_across_disk_reuse",
+            "IgnoreGroup = pinned\n[core]\n",
+            |db| {
+                for (groups, expected) in [("pinned", 0), ("other", 1), ("misc\npinned", 0)] {
+                    fs::write(
+                        db.join("local/widget-1/desc"),
+                        format!("%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%GROUPS%\n{groups}\n\n"),
+                    )
+                    .unwrap();
+                    batch2_write_sync(&db.join("sync/core.db"), "2-1");
+                    invalidate_caches().unwrap();
+                    assert_eq!(
+                        check_updates_cached().unwrap().len(),
+                        expected,
+                        "groups {groups:?}"
+                    );
+                    *write_lock(&LOCAL_DB_CACHE) = LocalDbCache::default();
+                    *write_lock(&SYNC_DB_CACHE) = DbCache::default();
+                    assert_eq!(
+                        check_updates_cached().unwrap().len(),
+                        expected,
+                        "disk groups {groups:?}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_updates_do_not_reuse_group_unaware_local_cache() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::cached_updates_do_not_reuse_group_unaware_local_cache",
+            "IgnoreGroup = pinned\n[core]\n",
+            |db| {
+                fs::write(
+                    db.join("local/widget-1/desc"),
+                    "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%GROUPS%\npinned\n\n",
+                )
+                .unwrap();
+                batch2_write_sync(&db.join("sync/core.db"), "2-1");
+                let legacy = LocalDbCache {
+                    packages: HashMap::from([(
+                        "widget".to_owned(),
+                        LocalDbPackage {
+                            name: "widget".to_owned(),
+                            version: Version::from_str("1-1").unwrap(),
+                            ..LocalDbPackage::default()
+                        },
+                    )]),
+                    last_modified: Some(LocalDbEpoch::from_local_dir(&db.join("local")).unwrap()),
+                    ..LocalDbCache::default()
+                };
+                let bytes = bitcode::serialize(&legacy).unwrap();
+                let cache_dir = paths::cache_dir();
+                fs::create_dir_all(&cache_dir).unwrap();
+                let old_path = cache_dir.join("local_db_source_v2.bin");
+                fs::write(&old_path, &bytes).unwrap();
+                assert!(
+                    check_updates_cached().unwrap().is_empty(),
+                    "old cache must not erase installed IgnoreGroup membership"
+                );
+                assert_eq!(fs::read(&old_path).unwrap(), bytes);
+                assert!(cache_dir.join("local_db_source_v3.bin").is_file());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn batch3_cached_updates_reject_nul_before_native_comparison() {
         batch2_catalog_fixture(
             "package_managers::pacman_db::db::tests::batch3_cached_updates_reject_nul_before_native_comparison",
@@ -2666,17 +2757,42 @@ mod tests {
         let packages = compile_ignore_patterns(&["linux".to_string()], "IgnorePkg").unwrap();
         let groups = compile_ignore_patterns(&["kernel".to_string()], "IgnoreGroup").unwrap();
         let none = compile_ignore_patterns(&[], "empty").unwrap();
-        assert!(sync_package_is_ignored(&package, &packages, &none));
-        assert!(sync_package_is_ignored(&package, &none, &groups));
+        assert!(package_is_ignored(
+            &package.name,
+            &package.groups,
+            &packages,
+            &none
+        ));
+        assert!(package_is_ignored(
+            &package.name,
+            &package.groups,
+            &none,
+            &groups
+        ));
         let base = compile_ignore_patterns(&["base".to_string()], "IgnoreGroup").unwrap();
-        assert!(!sync_package_is_ignored(&package, &none, &base));
+        assert!(!package_is_ignored(
+            &package.name,
+            &package.groups,
+            &none,
+            &base
+        ));
 
         package.name = "linux-zen".to_string();
         package.groups = vec!["kernel-zen".to_string()];
         let packages = compile_ignore_patterns(&["linux-*".to_string()], "IgnorePkg").unwrap();
         let groups = compile_ignore_patterns(&["kernel-*".to_string()], "IgnoreGroup").unwrap();
-        assert!(sync_package_is_ignored(&package, &packages, &none));
-        assert!(sync_package_is_ignored(&package, &none, &groups));
+        assert!(package_is_ignored(
+            &package.name,
+            &package.groups,
+            &packages,
+            &none
+        ));
+        assert!(package_is_ignored(
+            &package.name,
+            &package.groups,
+            &none,
+            &groups
+        ));
     }
 
     #[test]
@@ -3257,9 +3373,9 @@ mod tests {
                 )]),
                 ..LocalDbCache::default()
             };
-            save_cache_to_disk_in(&local, directory.path(), "local_db_source_v2")?;
+            save_cache_to_disk_in(&local, directory.path(), "local_db_source_v3")?;
             let loaded_local: Result<LocalDbCache> =
-                load_cache_from_disk_in(directory.path(), "local_db_source_v2");
+                load_cache_from_disk_in(directory.path(), "local_db_source_v3");
             assert_eq!(
                 loaded_local.is_ok(),
                 !raw.contains('\0'),
@@ -3295,6 +3411,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         for name in [
             "sync_db_source_v2.bin",
+            "local_db_source_v3.bin",
             "local_db_source_v2.bin",
             "sync_db_source_v1.bin",
             "local_db_source_v1.bin",
@@ -3308,6 +3425,7 @@ mod tests {
         invalidate_derived_cache_files(directory.path())?;
         for name in [
             "sync_db_source_v2.bin",
+            "local_db_source_v3.bin",
             "local_db_source_v2.bin",
             "sync_db_source_v1.bin",
             "local_db_source_v1.bin",
@@ -4441,9 +4559,9 @@ mod tests {
         };
 
         fs::write(temp.path().join("local_db_rdeps.bin"), b"legacy cache").unwrap();
-        save_cache_to_disk_in(&cache, temp.path(), "local_db_source_v2").unwrap();
+        save_cache_to_disk_in(&cache, temp.path(), "local_db_source_v3").unwrap();
         let loaded: LocalDbCache =
-            load_cache_from_disk_in(temp.path(), "local_db_source_v2").unwrap();
+            load_cache_from_disk_in(temp.path(), "local_db_source_v3").unwrap();
         assert!(loaded.packages.contains_key("firefox"));
         assert_eq!(loaded.last_modified, cache.last_modified);
         assert_eq!(

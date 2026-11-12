@@ -148,15 +148,15 @@ pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
 ///
 /// Single authoritative update-collection implementation: shared by the CLI
 /// (`get_update_list`) and the daemon worker (`alpm_worker`) so both honor
-/// `IgnorePkg`/`IgnoreGroup`/`Replacement` handling identically.
+/// installed and selected packages' `IgnorePkg`/`IgnoreGroup` policy identically.
 pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Result<Vec<UpdateInfo>> {
     let localdb = alpm.localdb();
     let syncdbs = alpm.syncdbs();
     let local_pkg_count = localdb.pkgs().len();
 
-    // Build HashMap of sync packages: name -> (version_str, repo_name)
+    // Build HashMap of sync packages: name -> (package, repo_name)
     // This converts O(n×m) lookups to O(n+m) with single HashMap lookup per package
-    let mut sync_map: ahash::AHashMap<&str, (&str, &str)> =
+    let mut sync_map: ahash::AHashMap<&str, (&alpm::Package, &str)> =
         ahash::AHashMap::with_capacity(local_pkg_count);
 
     for db in syncdbs {
@@ -166,29 +166,29 @@ pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Result<Vec<UpdateInfo>> {
         validate_sync_database(alpm, db)?;
         let repo_name = db.name();
         for pkg in db.pkgs() {
-            if pkg.should_ignore() {
-                continue;
-            }
             // First repo wins (core > extra > multilib priority)
-            sync_map
-                .entry(pkg.name())
-                .or_insert_with(|| (pkg.version().as_str(), repo_name));
+            sync_map.entry(pkg.name()).or_insert((pkg, repo_name));
         }
     }
 
     let mut updates = Vec::with_capacity(local_pkg_count / 20); // ~5% typically have updates
 
     for pkg in localdb.pkgs() {
+        if pkg.should_ignore() {
+            continue;
+        }
         let name = pkg.name();
         let local_ver_str = pkg.version().as_str();
 
-        if let Some(&(sync_ver_str, repo)) = sync_map.get(name)
-            && alpm::vercmp(sync_ver_str, local_ver_str) == std::cmp::Ordering::Greater
+        if let Some(&(sync_pkg, repo)) = sync_map.get(name)
+            && !sync_pkg.should_ignore()
+            && alpm::vercmp(sync_pkg.version().as_str(), local_ver_str)
+                == std::cmp::Ordering::Greater
         {
             updates.push(UpdateInfo {
                 name: name.to_string(),
                 old_version: local_ver_str.to_string(),
-                new_version: sync_ver_str.to_string(),
+                new_version: sync_pkg.version().to_string(),
                 repo: repo.to_string(),
             });
         }
@@ -2351,6 +2351,106 @@ mod tests {
         assert_eq!(updates[0].old_version, "1-1");
         assert_eq!(updates[0].new_version, "2-1");
         assert_eq!(updates[0].repo, "eligible");
+        Ok(())
+    }
+
+    #[test]
+    fn updates_ignore_installed_group_when_upgrade_drops_group() -> anyhow::Result<()> {
+        use std::io::Write as _;
+
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_local("helper", "1-1")?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.database().join("local/helper-1-1/desc"))?
+            .write_all(b"%GROUPS%\nheld\n\n")?;
+        fixture.write_sync("preferred", &[("helper", "2-1", "")])?;
+        let mut alpm = fixture.open();
+        alpm.register_syncdb("preferred", alpm::SigLevel::NONE)?
+            .set_usage(alpm::Usage::UPGRADE)?;
+        alpm.set_ignoregroups(std::iter::once("held"))?;
+
+        assert!(alpm.localdb().pkg("helper")?.should_ignore());
+        assert!(
+            !alpm
+                .syncdbs()
+                .iter()
+                .next()
+                .expect("preferred repository")
+                .pkg("helper")?
+                .should_ignore(),
+            "the upgrade must have dropped the ignored group"
+        );
+        alpm.trans_init(alpm::TransFlag::NO_LOCK)?;
+        alpm.sync_sysupgrade(false)?;
+        assert!(
+            alpm.trans_add().is_empty(),
+            "native sysupgrade must retain the installed package's ignored group"
+        );
+        alpm.trans_release()?;
+
+        alpm.set_ignoregroups(std::iter::empty::<&str>())?;
+        let control = super::collect_updates(&alpm)?;
+        assert_eq!(control.len(), 1, "the unignored upgrade must be visible");
+        assert_eq!(control[0].name, "helper");
+        assert_eq!(control[0].old_version, "1-1");
+        assert_eq!(control[0].new_version, "2-1");
+        assert_eq!(control[0].repo, "preferred");
+
+        alpm.set_ignoregroups(std::iter::once("held"))?;
+        let updates = super::collect_updates(&alpm)?;
+        assert!(
+            updates.is_empty(),
+            "updates must match native sysupgrade when the installed package alone is ignored: {updates:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn updates_do_not_fall_through_ignored_preferred_repository() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_local("helper", "1-1")?;
+        fixture.write_sync("preferred", &[("helper", "2-1", "%GROUPS%\nheld\n\n")])?;
+        fixture.write_sync("lower", &[("helper", "9-1", "")])?;
+        let mut alpm = fixture.open();
+        alpm.register_syncdb("preferred", alpm::SigLevel::NONE)?
+            .set_usage(alpm::Usage::UPGRADE)?;
+        alpm.register_syncdb("lower", alpm::SigLevel::NONE)?
+            .set_usage(alpm::Usage::UPGRADE)?;
+        alpm.set_ignoregroups(std::iter::once("held"))?;
+
+        assert!(!alpm.localdb().pkg("helper")?.should_ignore());
+        assert!(
+            alpm.syncdbs()
+                .iter()
+                .next()
+                .expect("preferred repository")
+                .pkg("helper")?
+                .should_ignore(),
+            "the preferred repository candidate must belong to the ignored group"
+        );
+        alpm.trans_init(alpm::TransFlag::NO_LOCK)?;
+        alpm.sync_sysupgrade(false)?;
+        assert!(
+            alpm.trans_add().is_empty(),
+            "native sysupgrade must not fall through an ignored preferred repository candidate"
+        );
+        alpm.trans_release()?;
+
+        alpm.set_ignoregroups(std::iter::empty::<&str>())?;
+        let control = super::collect_updates(&alpm)?;
+        assert_eq!(control.len(), 1, "the unignored upgrade must be visible");
+        assert_eq!(control[0].name, "helper");
+        assert_eq!(control[0].old_version, "1-1");
+        assert_eq!(control[0].new_version, "2-1");
+        assert_eq!(control[0].repo, "preferred");
+
+        alpm.set_ignoregroups(std::iter::once("held"))?;
+        let updates = super::collect_updates(&alpm)?;
+        assert!(
+            updates.is_empty(),
+            "updates must match native sysupgrade instead of selecting the lower repository: {updates:?}"
+        );
         Ok(())
     }
 

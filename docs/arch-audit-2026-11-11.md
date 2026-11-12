@@ -400,6 +400,22 @@ Independent review approved the final five-file code/test diff. These results
 do not establish a passing hosted coverage comparison or completion of the
 remaining work below.
 
+The update-policy follow-up checks ignored groups on both the installed package
+and the selected repository candidate. Native discovery retains the preferred
+repository before filtering, so an ignored candidate cannot select a different
+version from a lower-priority repository. Private libalpm fixtures first verify
+the corresponding native sysupgrade queue without preparing or committing a
+transaction, then check OMG's update results and unignored positive controls.
+
+The Rust local database model now retains groups from both official descriptor
+formats and the compatibility parser. Its derived cache uses
+`local_db_source_v3`; older group-unaware entries cannot suppress installed-group
+policy. Invalidation retires both current and legacy names. Four regressions
+reproduced the policy failures before the fixes. Verification passed 2,271
+library tests, with 12 ignored, all 15 source API integration tests, and
+all-target Clippy with warnings denied. Independent review approved the runtime
+changes. No package transaction was committed by these fixtures.
+
 ## Remaining work
 
 - Require fresh producer and exact-base comparison evidence for the retention
