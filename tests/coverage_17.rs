@@ -173,10 +173,8 @@ fn parse_sources_rename_syntax_rewrites_filename_only() {
     assert_eq!(sources[0].filename, "renamed-output.tar.gz");
 }
 
-/// Query strings and fragments must be stripped from derived filenames but
-/// preserved in the URL.
 #[test]
-fn parse_sources_strips_query_from_filename_keeps_in_url() {
+fn parse_sources_preserves_makepkg_query_filename_and_url() {
     let dir = tempfile::tempdir().unwrap();
     write_srcinfo(
         dir.path(),
@@ -189,7 +187,7 @@ fn parse_sources_strips_query_from_filename_keeps_in_url() {
     let sources = parse_sources(dir.path()).expect("parse must succeed");
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].url, "https://example.com/f.tar.gz?token=abc");
-    assert_eq!(sources[0].filename, "f.tar.gz");
+    assert_eq!(sources[0].filename, "f.tar.gz?token=abc");
 }
 
 /// Architecture-specific `source_<arch>` entries are merged in for the running

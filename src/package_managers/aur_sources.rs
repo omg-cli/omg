@@ -428,7 +428,7 @@ async fn mirror_git_repository(url: &str, destination: &Path) -> Result<()> {
 fn extract_http_source(source_url: &str) -> Option<SourceFile> {
     // Handle PKGBUILD rename syntax: "newname::url".
     // https://man.archlinux.org/PKGBUILD.5#sources_and_checksums
-    let (custom_filename, url) = match source_url.rsplit_once("::") {
+    let (custom_filename, url) = match source_url.split_once("::") {
         Some((name, url)) => (Some(name.to_string()), url),
         None => (None, source_url),
     };
@@ -439,16 +439,9 @@ fn extract_http_source(source_url: &str) -> Option<SourceFile> {
         return None;
     }
 
-    // Use custom filename if provided, otherwise derive it from the URL by
-    // stripping any query string / fragment. `split` always yields at least
-    // one element, so a trailing-slash URL simply produces an empty name
-    // (rejected later as unsafe) rather than a fabricated fallback.
-    let filename = custom_filename.unwrap_or_else(|| {
-        let base = url.split('?').next().unwrap_or_default();
-        let base = base.split('#').next().unwrap_or_default();
-        // rsplit on '/' always yields at least one element
-        base.rsplit('/').next().unwrap_or_default().to_string()
-    });
+    // makepkg's plain HTTP get_filename uses the literal suffix after the last '/'.
+    let filename =
+        custom_filename.unwrap_or_else(|| url.rsplit('/').next().unwrap_or_default().to_string());
 
     Some(SourceFile {
         url: url.to_string(),
@@ -781,7 +774,7 @@ mod tests {
         assert!(result.is_some());
         let source = result.unwrap();
         assert_eq!(source.url, "https://example.com/file.tar.gz?token=abc");
-        assert_eq!(source.filename, "file.tar.gz");
+        assert_eq!(source.filename, "file.tar.gz?token=abc");
     }
 
     #[test]
@@ -790,7 +783,25 @@ mod tests {
         assert!(result.is_some());
         let source = result.unwrap();
         assert_eq!(source.url, "https://example.com/file.tar.gz#hash");
-        assert_eq!(source.filename, "file.tar.gz");
+        assert_eq!(source.filename, "file.tar.gz#hash");
+    }
+
+    #[test]
+    fn test_extract_http_source_filename_after_query_or_fragment_slash() {
+        for (url, filename) in [
+            (
+                "https://example.com/file.tar.gz?path=release/query-archive.tar.gz",
+                "query-archive.tar.gz",
+            ),
+            (
+                "https://example.com/file.tar.gz#release/fragment-archive.tar.gz",
+                "fragment-archive.tar.gz",
+            ),
+        ] {
+            let source = extract_http_source(url).expect("HTTPS source must be recognized");
+            assert_eq!(source.url, url, "input {url:?}");
+            assert_eq!(source.filename, filename, "input {url:?}");
+        }
     }
 
     #[test]
@@ -800,6 +811,23 @@ mod tests {
         let source = result.unwrap();
         assert_eq!(source.url, "https://example.com/original.tar.gz");
         assert_eq!(source.filename, "custom-name.tar.gz");
+    }
+
+    #[test]
+    fn test_extract_http_source_rename_uses_first_separator() {
+        let result = extract_http_source(
+            "archive.tar.gz::https://example.com/releases/tag::v1/archive.tar.gz",
+        )
+        .map(|source| (source.url, source.filename));
+
+        assert_eq!(
+            result,
+            Some((
+                "https://example.com/releases/tag::v1/archive.tar.gz".to_string(),
+                "archive.tar.gz".to_string(),
+            )),
+            "a separator inside the URL must not discard a renamed HTTPS source",
+        );
     }
 
     #[test]

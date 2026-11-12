@@ -318,15 +318,25 @@ pub fn clean_cache(keep_versions: usize) -> Result<(usize, u64)> {
 fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u64)> {
     let mut packages: ahash::AHashMap<String, Vec<(std::path::PathBuf, String)>> =
         ahash::AHashMap::new();
+    let mut cache_dirs = std::collections::HashSet::new();
 
     for cache_dir in paths::pacman_cache_dirs_result()? {
         if !cache_dir.exists() {
+            continue;
+        }
+        let cache_dir = std::fs::canonicalize(&cache_dir).with_context(|| {
+            format!("Failed to resolve pacman cache at {}", cache_dir.display())
+        })?;
+        if !cache_dirs.insert(cache_dir.clone()) {
             continue;
         }
         for entry in std::fs::read_dir(&cache_dir)
             .with_context(|| format!("Failed to read pacman cache at {}", cache_dir.display()))?
         {
             let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
             let path = entry.path();
 
             let Some(filename) = path
@@ -402,10 +412,13 @@ fn remove_cache_file_and_signature(archive: &std::path::Path, removed: &mut usiz
             *removed += 1;
             freed = freed.saturating_add(archive_len.unwrap_or(0));
         }
-        Err(error) => tracing::warn!("Failed to remove cache file {}: {error}", archive.display()),
+        Err(error) => {
+            tracing::warn!("Failed to remove cache file {}: {error}", archive.display());
+            return freed;
+        }
     }
 
-    let signature = std::path::PathBuf::from(format!("{}.sig", archive.display()));
+    let signature = archive.with_added_extension("sig");
     let sig_len = std::fs::metadata(&signature)
         .map(|metadata| metadata.len())
         .ok();
@@ -3210,6 +3223,121 @@ mod tests {
         assert_eq!(package_base_name("not-a-package-file.tar.zst"), None);
         assert_eq!(package_base_name("linux-6.7.0-1-x86_64.zip"), None);
         assert_eq!(package_base_name("-1-2-x86_64.pkg.tar.zst"), None);
+    }
+
+    #[test]
+    fn clean_cache_keeps_the_newest_archive_with_duplicate_directory_aliases() {
+        const TEST: &str = "package_managers::alpm_ops::tests::clean_cache_keeps_the_newest_archive_with_duplicate_directory_aliases";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "cache configuration overrides require an unprivileged caller"
+        );
+        let owner = tempfile::tempdir().expect("private cache owner");
+        let cache = owner.path().join("cache");
+        std::fs::create_dir(&cache).expect("private cache");
+        let alias = owner.path().join("cache-alias");
+        std::os::unix::fs::symlink(&cache, &alias).expect("private cache alias");
+        let old = cache.join("demo-1.0-1-x86_64.pkg.tar.zst");
+        let current = cache.join("demo-2.0-1-x86_64.pkg.tar.zst");
+        std::fs::write(&old, b"old").expect("old archive");
+        std::fs::write(&current, b"new").expect("current archive");
+        let config = owner.path().join("pacman.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "[options]\nCacheDir = {} {} {} {}\n",
+                cache.display(),
+                cache.display(),
+                cache.join(".").display(),
+                alias.display()
+            ),
+        )
+        .expect("private cache configuration");
+        temp_env::with_vars(
+            [
+                (
+                    "OMG_PACMAN_CONF",
+                    Some(config.to_str().expect("configuration path")),
+                ),
+                ("OMG_PACMAN_CACHE_DIR", None),
+                ("OMG_PACMAN_ROOT", None),
+            ],
+            || {
+                paths::reset_test_overrides();
+                assert_eq!(clean_cache_preview(1).expect("preview"), (1, 3));
+                assert!(
+                    old.is_file() && current.is_file(),
+                    "preview mutated the cache"
+                );
+                assert_eq!(clean_cache(1).expect("cleanup"), (1, 3));
+                assert!(!old.exists());
+                assert_eq!(std::fs::read(&current).expect("retained archive"), b"new");
+            },
+        );
+    }
+
+    #[test]
+    fn clean_cache_preserves_non_regular_entries_and_their_signatures() {
+        if crate::core::testing::run_isolated_test(
+            "package_managers::alpm_ops::tests::clean_cache_preserves_non_regular_entries_and_their_signatures",
+        ) {
+            return;
+        }
+        temp_env::with_var_unset("OMG_PACMAN_CACHE_DIR", || {
+            let owner = tempfile::tempdir().expect("private cache owner");
+            let cache = owner.path().join("var/cache/pacman/pkg");
+            std::fs::create_dir_all(&cache).expect("private cache");
+            let old = cache.join("demo-1.0-1-x86_64.pkg.tar.zst");
+            let current = cache.join("demo-2.0-1-x86_64.pkg.tar.zst");
+            let directory = cache.join("demo-99.0-1-x86_64.pkg.tar.zst");
+            let link = cache.join("demo-100.0-1-x86_64.pkg.tar.zst");
+            let external = owner.path().join("outside-cache");
+            std::fs::write(&old, b"old").expect("old archive");
+            std::fs::write(&current, b"new").expect("current archive");
+            std::fs::write(&external, b"owner data").expect("private symlink target");
+            std::fs::create_dir(&directory).expect("package-shaped directory");
+            std::fs::write(directory.with_added_extension("sig"), b"keep-signature")
+                .expect("directory companion");
+            std::os::unix::fs::symlink(&external, &link).expect("package-shaped symlink");
+            paths::set_test_overrides(Some(owner.path().to_path_buf()), None);
+            assert_eq!(clean_cache_preview(1).expect("preview"), (1, 3));
+            assert_eq!(clean_cache(1).expect("cleanup"), (1, 3));
+            paths::reset_test_overrides();
+            assert!(!old.exists());
+            assert_eq!(std::fs::read(&current).expect("retained archive"), b"new");
+            assert!(directory.is_dir());
+            assert!(link.is_symlink());
+            assert_eq!(std::fs::read(external).expect("owner data"), b"owner data");
+            assert_eq!(
+                std::fs::read(directory.with_added_extension("sig")).expect("directory companion"),
+                b"keep-signature"
+            );
+        });
+    }
+
+    #[test]
+    fn failed_cache_archive_removal_preserves_its_signature() {
+        let owner = tempfile::tempdir().expect("private removal owner");
+        let archive = owner.path().join("demo-1.0-1-x86_64.pkg.tar.zst");
+        std::fs::create_dir(&archive).expect("archive unlink failure fixture");
+        let signature = archive.with_added_extension("sig");
+        std::fs::write(&signature, b"preserve").expect("signature fixture");
+        let mut removed = 0;
+        assert_eq!(
+            super::remove_cache_file_and_signature(&archive, &mut removed),
+            0
+        );
+        assert_eq!(removed, 0);
+        assert_eq!(
+            std::fs::read(signature).expect("preserved signature"),
+            b"preserve"
+        );
+        assert!(archive.is_dir());
     }
 
     #[test]

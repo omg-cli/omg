@@ -362,6 +362,44 @@ isolated selection; revised-source guest execution and source-bound coverage
 remain pending. Existing native CLI contracts will also run in the Arch guest,
 since their explicit Arch prerequisite excludes this Omarchy host.
 
+## Runtime compatibility follow-up
+
+The follow-up keeps changes in the existing Arch implementation and tests.
+Official upstream Git release tags were rechecked on 2026-11-12. The pinned
+Rust ALPM package versions still match the latest release tags.
+
+- Version comparison now uses native libalpm when epoch or package-release
+  presence differs. The pinned Rust comparator distinguishes an absent epoch
+  from explicit zero and orders an absent release below a present release.
+  Pacman treats the first pair as equivalent and compares releases only when
+  both are present. Direct and cached-update regressions cover hidden upgrades,
+  false downgrades, equality and positive epochs. Other ordinary comparisons
+  continue through Rust; the existing numeric-overflow fallback remains.
+- Strict version parsing rejects NUL before a native comparison. Typed and
+  manual database readers share this validation. Both persisted package-cache
+  types validate deserialized versions too, while preserving their existing
+  serialization format. Regressions reproduced the native CString panic and
+  acceptance of malformed versions from an older cache before the fixes.
+- HTTPS source prefetching follows installed makepkg's first `::` rename
+  separator and literal filename suffix after the last slash. Query strings
+  and fragments remain part of unrenamed filenames. This prevents successful
+  prefetches from landing under a name an offline makepkg build cannot find.
+  HTTPS, destination validation and network-address policy are unchanged.
+- Cache cleanup resolves and deduplicates configured directory aliases before
+  selecting retained archives. Repeated paths previously counted the same
+  newest archive more than once and could delete the retained copy. Package-
+  shaped directories and symlinks are excluded. A failed archive unlink leaves
+  its detached signature intact. Fixtures use private paths, and the
+  environment-dependent configuration fixture enforces unprivileged execution.
+
+The initial grouped regression run reproduced nine failures. Two subsequent
+checks reproduced the NUL parsing/comparison failure and the persisted-cache
+bypass. Final verification passed 2,267 library tests, with 12 ignored, all 15
+`coverage_17` integration tests, and all-target Clippy with warnings denied.
+Independent review approved the final five-file code/test diff. These results
+do not establish a passing hosted coverage comparison or completion of the
+remaining work below.
+
 ## Remaining work
 
 - Require fresh producer and exact-base comparison evidence for the retention

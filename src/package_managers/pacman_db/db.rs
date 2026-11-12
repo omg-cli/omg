@@ -169,6 +169,7 @@ struct LocalDbCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncDbPackage {
     pub name: String,
+    #[serde(deserialize_with = "deserialize_package_version")]
     pub version: Version,
     pub desc: String,
     pub filename: String,
@@ -216,6 +217,7 @@ impl Default for SyncDbPackage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalDbPackage {
     pub name: String,
+    #[serde(deserialize_with = "deserialize_package_version")]
     pub version: Version,
     pub desc: String,
     pub install_date: String,
@@ -368,7 +370,7 @@ macro_rules! sync_pkg_from_desc {
     ($desc:expr, $repo:expr) => {
         SyncDbPackage {
             name: $desc.name.to_string(),
-            version: $desc.version.into(),
+            version: require_package_version(&$desc.version.to_string())?,
             desc: $desc.description.to_string(),
             filename: $desc.file_name.to_string(),
             csize: $desc.compressed_size,
@@ -889,8 +891,16 @@ pub fn parse_local_db(path: &Path) -> Result<HashMap<String, LocalDbPackage>> {
 }
 
 fn require_package_version(raw: &str) -> Result<Version> {
-    Version::from_str(raw)
-        .map_err(|error| anyhow::anyhow!("Invalid package version {raw}: {error}"))
+    crate::package_managers::parse_version(raw)
+        .with_context(|| format!("Invalid package version {raw:?}"))
+}
+
+fn deserialize_package_version<'de, D>(deserializer: D) -> std::result::Result<Version, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = Version::deserialize(deserializer)?;
+    require_package_version(&version.to_string()).map_err(serde::de::Error::custom)
 }
 
 fn parse_local_desc(path: &Path) -> Result<LocalDbPackage> {
@@ -931,7 +941,7 @@ fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
     if let Ok(desc) = alpm_db::desc::DbDescFileV1::from_str(content) {
         Ok(LocalDbPackage {
             name: desc.name.to_string(),
-            version: desc.version.into(),
+            version: require_package_version(&desc.version.to_string())?,
             desc: desc.description.to_string(),
             install_date: desc.installdate.to_string(),
             licenses: desc.license.iter().map(ToString::to_string).collect(),
@@ -944,7 +954,7 @@ fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
         // V2 (has XDATA support)
         Ok(LocalDbPackage {
             name: desc.name.to_string(),
-            version: desc.version.into(),
+            version: require_package_version(&desc.version.to_string())?,
             desc: desc.description.to_string(),
             install_date: desc.installdate.to_string(),
             licenses: desc.license.iter().map(ToString::to_string).collect(),
@@ -1990,7 +2000,7 @@ mod tests {
         archive
             .append_data(
                 &mut header,
-                format!("widget-{version}/desc"),
+                format!("widget-{version}/desc").replace('\0', "_"),
                 content.as_bytes(),
             )
             .unwrap();
@@ -2259,6 +2269,80 @@ mod tests {
                         .to_string(),
                     "22-1"
                 );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch3_cached_updates_reject_nul_before_native_comparison() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch3_cached_updates_reject_nul_before_native_comparison",
+            "[core]\n",
+            |db| {
+                for (installed, available) in [("1\0-1", "0:2-1"), ("1-1", "0:2\0-1")] {
+                    fs::write(
+                        db.join("local/widget-1/desc"),
+                        format!("%NAME%\nwidget\n\n%VERSION%\n{installed}\n\n%REASON%\n0\n"),
+                    )
+                    .unwrap();
+                    batch2_write_sync(&db.join("sync/core.db"), available);
+                    invalidate_caches().unwrap();
+                    let error =
+                        check_updates_cached().expect_err("malformed versions must fail closed");
+                    assert!(
+                        format!("{error:#}").contains("Invalid package version"),
+                        "installed {installed:?}, available {available:?}: {error:#}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_cached_updates_preserve_optional_epoch_and_release_semantics() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_cached_updates_preserve_optional_epoch_and_release_semantics",
+            "[core]\n",
+            |db| {
+                for (installed, available, expected_count) in [
+                    ("0:2.0-1", "3.0-1", 1),
+                    ("3.0-1", "0:2.0-1", 0),
+                    ("0:1.0-1", "1.0-1", 0),
+                    ("1.0-1", "0:1.0-1", 0),
+                    ("2.0-1", "0:3.0-1", 1),
+                    ("0:3.0-1", "2.0-1", 0),
+                    ("9.0-1", "1:1.0-1", 1),
+                    ("1:1.0-1", "0:9.0-1", 0),
+                    ("1.0", "1.0-1", 0),
+                    ("1.0-1", "1.0", 0),
+                    ("1.0", "2.0-1", 1),
+                    ("2.0-1", "1.0", 0),
+                    ("1.0-1", "2.0", 1),
+                    ("2.0", "1.0-1", 0),
+                ] {
+                    fs::write(
+                        db.join("local/widget-1/desc"),
+                        format!("%NAME%\nwidget\n\n%VERSION%\n{installed}\n\n%REASON%\n0\n"),
+                    )
+                    .unwrap();
+                    batch2_write_sync(&db.join("sync/core.db"), available);
+                    invalidate_caches().unwrap();
+
+                    let updates = check_updates_cached().unwrap();
+                    assert_eq!(
+                        updates.len(),
+                        expected_count,
+                        "installed {installed}, available {available}: {updates:?}"
+                    );
+                    for update in updates {
+                        assert_eq!(update.name, "widget");
+                        assert_eq!(update.old_version.to_string(), installed);
+                        assert_eq!(update.new_version.to_string(), available);
+                        assert_eq!(update.repo, "core");
+                    }
+                }
             },
         );
     }
@@ -3130,6 +3214,58 @@ mod tests {
         assert_ne!(before, SyncDbEpoch::from_sync_dir(&sync)?);
         fs::remove_file(&target)?;
         assert!(SyncDbEpoch::from_sync_dir(&sync).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_caches_reject_nul_versions_and_accept_healthy_versions() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for raw in ["1\0-1", "0:2-1"] {
+            let version = Version::from_str(raw)?;
+            let sync = DbCache {
+                packages: vec![RepositoryPackages {
+                    name: "core".to_owned(),
+                    usage: RepoUsage::UPGRADE,
+                    packages: Ok(HashMap::from([(
+                        "widget".to_owned(),
+                        SyncDbPackage {
+                            name: "widget".to_owned(),
+                            version: version.clone(),
+                            ..SyncDbPackage::default()
+                        },
+                    )])),
+                }],
+                ..DbCache::default()
+            };
+            save_cache_to_disk_in(&sync, directory.path(), "sync_db_source_v2")?;
+            let loaded_sync: Result<DbCache> =
+                load_cache_from_disk_in(directory.path(), "sync_db_source_v2");
+            assert_eq!(
+                loaded_sync.is_ok(),
+                !raw.contains('\0'),
+                "sync cache {raw:?}"
+            );
+
+            let local = LocalDbCache {
+                packages: HashMap::from([(
+                    "widget".to_owned(),
+                    LocalDbPackage {
+                        name: "widget".to_owned(),
+                        version,
+                        ..LocalDbPackage::default()
+                    },
+                )]),
+                ..LocalDbCache::default()
+            };
+            save_cache_to_disk_in(&local, directory.path(), "local_db_source_v2")?;
+            let loaded_local: Result<LocalDbCache> =
+                load_cache_from_disk_in(directory.path(), "local_db_source_v2");
+            assert_eq!(
+                loaded_local.is_ok(),
+                !raw.contains('\0'),
+                "local cache {raw:?}"
+            );
+        }
         Ok(())
     }
 

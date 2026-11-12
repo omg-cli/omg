@@ -324,6 +324,9 @@ impl VersionDisplay for String {
 #[must_use]
 #[inline]
 pub fn parse_version(s: &str) -> Option<Version> {
+    if s.as_bytes().contains(&0) {
+        return None;
+    }
     AlpmVersion::from_str(s).ok()
 }
 
@@ -391,6 +394,49 @@ mod tests {
     fn version_display_is_borrowed_and_backend_independent() {
         let version = parse_version("1:2.3.4-5").expect("valid version must parse");
         assert_eq!(version.version_string(), "1:2.3.4-5");
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn version_parser_rejects_nul_before_native_comparison() {
+        for raw in ["1\0-1", "0:2\0-1", "1.18446744073709551616\0-1"] {
+            assert!(
+                parse_version(raw).is_none(),
+                "invalid C-string version {raw:?}"
+            );
+        }
+        assert!(parse_version("0:2-1").is_some());
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn version_comparison_preserves_optional_epoch_and_release_semantics() {
+        use std::cmp::Ordering;
+
+        for (left, right, expected) in [
+            ("0:1.0-1", "1.0-1", Ordering::Equal),
+            ("0:2.0-1", "3.0-1", Ordering::Less),
+            ("0:3.0-1", "2.0-1", Ordering::Greater),
+            ("0:1.0-1", "1.0-2", Ordering::Less),
+            ("1:1.0-1", "9.0-1", Ordering::Greater),
+            ("1:1.0-1", "0:9.0-1", Ordering::Greater),
+            ("1.0", "1.0-1", Ordering::Equal),
+            ("1.0", "2.0-1", Ordering::Less),
+            ("2.0", "1.0-1", Ordering::Greater),
+        ] {
+            let left_version = parse_version(left).expect("valid comparison version must parse");
+            let right_version = parse_version(right).expect("valid comparison version must parse");
+            assert_eq!(
+                compare_versions(&left_version, &right_version),
+                expected,
+                "{left} vs {right}"
+            );
+            assert_eq!(
+                compare_versions(&right_version, &left_version),
+                expected.reverse(),
+                "{right} vs {left}"
+            );
+        }
     }
 
     #[cfg(feature = "arch")]
@@ -579,15 +625,16 @@ pub fn zero_version() -> Version {
 /// `AurIndex::updates_for`, and `AurClient::{get_update_list,query_aur_updates}`.
 /// All version ordering on update-check paths must go through this helper.
 ///
-/// Versions without an overflowing numeric segment keep the exact upstream
-/// ordering (`Ord::cmp`). Versions carrying an overflowing segment fall back
-/// to libalpm's `alpm::vercmp` on the rendered version string: pacman
-/// semantics, deterministic, and it compares numeric runs by length and
-/// text, so it cannot overflow.
+/// Native comparison also preserves pacman's optional-component semantics:
+/// an omitted epoch is zero, and pkgrel is compared only when both versions
+/// include it. The pinned Rust comparator orders optional fields directly.
+/// Matching component presence and non-overflowing numeric runs use Rust.
 #[cfg(feature = "arch")]
 #[must_use]
 pub fn compare_versions(a: &AlpmVersion, b: &AlpmVersion) -> std::cmp::Ordering {
-    if pkgver_has_overflowing_numeric_segment(a.pkgver.as_ref())
+    if a.epoch.is_some() != b.epoch.is_some()
+        || a.pkgrel.is_some() != b.pkgrel.is_some()
+        || pkgver_has_overflowing_numeric_segment(a.pkgver.as_ref())
         || pkgver_has_overflowing_numeric_segment(b.pkgver.as_ref())
     {
         // `Display` renders the canonical `epoch:pkgver-pkgrel` form.
