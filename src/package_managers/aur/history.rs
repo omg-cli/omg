@@ -230,7 +230,9 @@ mod tests {
     use super::*;
 
     fn git(directory: &Path, arguments: &[&str]) -> std::process::Output {
-        let output = std::process::Command::new("git")
+        use assert_cmd::assert::OutputAssertExt;
+
+        std::process::Command::new("git")
             .arg("-C")
             .arg(directory)
             .args(arguments)
@@ -240,14 +242,10 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "history@example.invalid")
             .env("GIT_COMMITTER_NAME", "OMG history fixture")
             .env("GIT_COMMITTER_EMAIL", "history@example.invalid")
-            .output()
-            .expect("Git is required for the history fixture");
-        assert!(
-            output.status.success(),
-            "Git fixture {arguments:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        output
+            .assert()
+            .success()
+            .get_output()
+            .clone()
     }
 
     fn commit(directory: &Path, version: Option<&str>, marker: &str) {

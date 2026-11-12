@@ -443,11 +443,12 @@ mod tests {
     #[test]
     fn group_authority_refuses_unrepresentable_or_broadcast_identity() {
         let calls = std::cell::Cell::new(0);
+        let signal = |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
         for process_group in [0, u32::MAX] {
-            let guard = GitGroupGuard::new(process_group, |_| {
-                calls.set(calls.get() + 1);
-                Ok(())
-            });
+            let guard = GitGroupGuard::new(process_group, signal);
             assert!(
                 guard.is_err(),
                 "invalid group {process_group} acquired signal authority"
@@ -458,32 +459,34 @@ mod tests {
             0,
             "invalid identities must never reach the signal boundary"
         );
+        let mut valid = GitGroupGuard::new(123, signal).expect("positive identity control");
+        valid.terminate().expect("signal capability control");
+        drop(valid);
+        assert_eq!(
+            calls.get(),
+            1,
+            "a valid identity invokes the same signal capability once"
+        );
     }
 
     #[derive(Clone, Default)]
     struct WarningCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
-    impl std::io::Write for WarningCapture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("warning capture lock")
-                .extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for WarningCapture {
+        type Writer = tracing_subscriber::fmt::writer::MutexGuardWriter<'a, Vec<u8>>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            tracing_subscriber::fmt::MakeWriter::make_writer(self.0.as_ref())
         }
     }
 
     #[test]
     fn cancellation_reports_failed_group_termination_without_panicking() {
         let capture = WarningCapture::default();
-        let writer = capture.clone();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
-            .with_writer(move || writer.clone())
+            .with_writer(capture.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let guard = GitGroupGuard::new(123, |_| Err(nix::errno::Errno::EPERM)).unwrap();
