@@ -1922,9 +1922,16 @@ fn validate_health_relations(packages: &HashMap<String, LocalDbPackage>) -> Resu
 
 /// Identify potential AUR packages (installed but not in any sync database).
 ///
-/// Uses pure Rust cache for extreme speed (<1ms).
 /// Excludes packages from ALL sync databases (official + custom repos).
 pub fn get_potential_aur_packages() -> Result<Vec<String>> {
+    Ok(get_potential_aur_package_records()?
+        .into_iter()
+        .map(|package| package.name)
+        .collect())
+}
+
+/// Read foreign identities and metadata from the same epoch-checked cached catalogs.
+pub(crate) fn get_potential_aur_package_records() -> Result<Vec<LocalDbPackage>> {
     let before = AlpmCatalogEpoch::observe()?;
     let sync_dir = paths::pacman_sync_dir_result()?;
     let local_dir = paths::pacman_local_dir_result()?;
@@ -1937,9 +1944,9 @@ pub fn get_potential_aur_packages() -> Result<Vec<String>> {
 
     let sync_packages = sync_cache.select(RepoUsage::ALL)?;
     let mut potential = Vec::with_capacity(local_cache.packages.len() / 10);
-    for name in local_cache.packages.keys() {
-        if !sync_packages.contains_key(name.as_str()) {
-            potential.push(name.clone());
+    for package in local_cache.packages.values() {
+        if !sync_packages.contains_key(package.name.as_str()) {
+            potential.push(package.clone());
         }
     }
 
@@ -2137,6 +2144,46 @@ mod tests {
                 batch2_write_sync(&db.join("sync/unconfigured.db"), "99-1");
                 assert!(check_updates_cached().unwrap().is_empty());
                 assert_eq!(get_potential_aur_packages().unwrap(), ["widget"]);
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn foreign_package_records_keep_identity_and_groups_across_cache_refresh() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::foreign_package_records_keep_identity_and_groups_across_cache_refresh",
+            "",
+            |db| {
+                let desc = db.join("local/widget-1/desc");
+                fs::write(
+                    &desc,
+                    "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%GROUPS%\nreviewed-group\n",
+                )
+                .expect("write original private package metadata");
+                let held = get_potential_aur_package_records().expect("original foreign records");
+                assert_eq!(held.len(), 1);
+                assert_eq!(held[0].name, "widget");
+                assert_eq!(held[0].version.to_string(), "1-1");
+                assert_eq!(held[0].groups, ["reviewed-group"]);
+                assert_eq!(get_potential_aur_packages().unwrap(), ["widget"]);
+
+                fs::write(
+                    &desc,
+                    "%NAME%\nwidget\n\n%VERSION%\n2-1\n\n%REASON%\n0\n\n%GROUPS%\nnew-group\n",
+                )
+                .expect("replace private package metadata");
+                invalidate_caches().expect("refresh private package catalogs");
+                let fresh = get_potential_aur_package_records().expect("refreshed foreign records");
+                assert_eq!(fresh.len(), 1);
+                assert_eq!(fresh[0].name, "widget");
+                assert_eq!(fresh[0].version.to_string(), "2-1");
+                assert_eq!(fresh[0].groups, ["new-group"]);
+                assert_eq!(get_potential_aur_packages().unwrap(), ["widget"]);
+
+                assert_eq!(held[0].name, "widget");
+                assert_eq!(held[0].version.to_string(), "1-1");
+                assert_eq!(held[0].groups, ["reviewed-group"]);
             },
         );
     }

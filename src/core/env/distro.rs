@@ -83,6 +83,27 @@ pub fn is_debian_like() -> bool {
     matches!(detect_distro(), Distro::Debian | Distro::Ubuntu)
 }
 
+/// Identify Omarchy separately from the shared Arch package backend.
+#[must_use]
+pub fn is_omarchy() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static OMARCHY: OnceLock<bool> = OnceLock::new();
+        *OMARCHY.get_or_init(|| {
+            fs::read_to_string("/etc/os-release").is_ok_and(|contents| omarchy_release(&contents))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn omarchy_release(contents: &str) -> bool {
+    parse_os_release(contents)
+        .get("ID")
+        .is_some_and(|id| id == "omarchy")
+}
+
 /// Check if we should use Debian backend based on current distro and features
 #[must_use]
 pub fn use_debian_backend() -> bool {
@@ -323,5 +344,16 @@ mod tests {
         assert_eq!(classify("alpine", ""), Distro::Unknown);
         assert_eq!(classify("opensuse-leap", "suse opensuse"), Distro::Unknown);
         assert_eq!(classify("", ""), Distro::Unknown);
+    }
+
+    #[test]
+    fn omarchy_identity_is_separate_from_arch_family_membership() {
+        assert!(omarchy_release("ID=omarchy\nID_LIKE=arch\n"));
+        assert!(omarchy_release("ID=\"omarchy\"\n"));
+        assert!(!omarchy_release("ID=arch\nID_LIKE=omarchy\n"));
+        assert!(!omarchy_release("ID=endeavouros\nID_LIKE=arch\n"));
+        assert!(!omarchy_release("ID=omarchy-dev\nID_LIKE=arch\n"));
+        assert!(!omarchy_release("# ID=omarchy\n"));
+        assert_eq!(classify("omarchy", "arch"), Distro::Arch);
     }
 }

@@ -486,15 +486,12 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
-                loop {
+                while !request.ends_with(b"\r\n\r\n") {
                     let mut bytes = [0_u8; 1024];
                     let count = stream.read(&mut bytes).await.unwrap();
                     assert_ne!(count, 0, "request ended before its headers");
                     request.extend_from_slice(&bytes[..count]);
                     assert!(request.len() <= 16 * 1024, "request headers are too large");
-                    if request.ends_with(b"\r\n\r\n") {
-                        break;
-                    }
                 }
                 stream.write_all(&response).await.unwrap();
                 String::from_utf8(request).unwrap()
@@ -1133,7 +1130,8 @@ mod tests {
         std::fs::write(
             configuration.join("config.toml"),
             "[aur]\nsecurity_profile = 'standard'\n",
-        )?;
+        )
+        .expect("write private metadata fixture configuration");
         temp_env::with_vars(
             [
                 ("OMG_CONFIG_DIR", Some(configuration.as_path())),
@@ -1176,26 +1174,26 @@ mod tests {
                         let (release, release_rx) = std::sync::mpsc::channel();
                         let (finished, finished_rx) = tokio::sync::oneshot::channel();
                         let worker_location = location.clone();
-                        let waiting = tokio::spawn(async move {
-                            tokio::task::spawn_blocking(move || {
-                                let result = (|| -> Result<()> {
-                                    let _lease =
-                                        lock_metadata(&worker_location, MetadataAccess::Exclusive)?;
-                                    started.send(()).map_err(|()| {
-                                        anyhow::anyhow!("metadata observer dropped")
-                                    })?;
-                                    release_rx.recv()?;
-                                    publish_generation(
-                                        &worker_location.path(),
-                                        &catalogue("worker-generation"),
-                                        AurMetaCache::default(),
-                                    )
-                                })();
-                                let delivered = finished.send(result);
-                                assert!(delivered.is_ok(), "metadata completion observer dropped");
-                            })
-                            .await
+                        let worker = tokio::task::spawn_blocking(move || {
+                            let result = (|| -> Result<()> {
+                                let _lease =
+                                    lock_metadata(&worker_location, MetadataAccess::Exclusive)?;
+                                started
+                                    .send(())
+                                    .expect("metadata start observer remains alive");
+                                release_rx
+                                    .recv()
+                                    .expect("metadata release observer remains alive");
+                                publish_generation(
+                                    &worker_location.path(),
+                                    &catalogue("worker-generation"),
+                                    AurMetaCache::default(),
+                                )
+                            })();
+                            let delivered = finished.send(result);
+                            assert!(delivered.is_ok(), "metadata completion observer dropped");
                         });
+                        let waiting = tokio::spawn(worker);
                         tokio::time::timeout(Duration::from_secs(5), started_rx).await??;
                         waiting.abort();
                         assert!(waiting.await.expect_err("cancelled waiter").is_cancelled());
@@ -1322,29 +1320,23 @@ mod tests {
             .unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap());
         let mut line = String::new();
-        loop {
+        while !line.contains("METADATA_LOCK_BLOCKED") {
             line.clear();
             assert_ne!(
                 output.read_line(&mut line).unwrap(),
                 0,
                 "child exited before lock check"
             );
-            if line.contains("METADATA_LOCK_BLOCKED") {
-                break;
-            }
         }
         drop(shared);
         writeln!(child.stdin.take().unwrap(), "continue").unwrap();
-        loop {
+        while !line.contains("METADATA_LOCK_ACQUIRED") {
             line.clear();
             assert_ne!(
                 output.read_line(&mut line).unwrap(),
                 0,
                 "child exited before acquiring lock"
             );
-            if line.contains("METADATA_LOCK_ACQUIRED") {
-                break;
-            }
         }
         assert!(child.wait().unwrap().success());
     }

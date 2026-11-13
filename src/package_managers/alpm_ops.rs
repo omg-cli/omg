@@ -2248,11 +2248,11 @@ mod tests {
         fs::create_dir(&desc)?;
 
         let audit_path = std::path::Path::new("/var/lib/omg/audit/audit.jsonl");
-        let audit_before = match fs::read_to_string(audit_path) {
-            Ok(contents) => contents.lines().count(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error.into()),
-        };
+        let audit_before = crate::core::security::AuditLogger::new_in(audit_path)
+            .expect("initialize disposable fixture audit state")
+            .get_recent(usize::MAX)
+            .expect("read a valid disposable fixture audit baseline")
+            .len();
         alpm.trans_init(alpm::TransFlag::empty())?;
         let transaction = super::AlpmTransaction(&mut alpm);
         let task = super::ProgressTask::start(&super::TaskSpec {
@@ -3212,11 +3212,13 @@ mod tests {
                 mirror.display(),
                 mirror.display()
             ),
-        )?;
+        )
+        .expect("write private mirror configuration");
         let mut alpm = alpm::Alpm::new(
             root.to_str().expect("private root path"),
             database.to_str().expect("private database path"),
-        )?;
+        )
+        .expect("open the private mirror fixture database");
         alpm.register_syncdb_mut("core", alpm::SigLevel::NONE)?;
         assert!(ensure_mirror_servers(&alpm).is_err());
         temp_env::with_var("OMG_PACMAN_CONF", Some(&configuration), || {

@@ -139,6 +139,9 @@ const fn should_sync(no_sync: bool, check_only: bool, dry_run: bool) -> bool {
 }
 
 pub async fn update_fast() -> Result<()> {
+    if super::omarchy::maybe_coordinate(super::omarchy::UpdateIntent::Fast).await? {
+        return Ok(());
+    }
     modern_ui::print_phase_header("⚡", "Fast System Update", "sync + upgrade");
     crate::package_managers::arch::run_privileged_operation(
         "fullupdate",
@@ -182,6 +185,9 @@ async fn run_sysupgrade() -> anyhow::Result<()> {
 }
 
 pub async fn update_turbo() -> Result<()> {
+    if super::omarchy::maybe_coordinate(super::omarchy::UpdateIntent::Turbo).await? {
+        return Ok(());
+    }
     modern_ui::print_phase_header("🚀", "TURBO System Update", "cached, no sync");
     println!(
         "  {} Checking for updates (cached, no sync)...",
@@ -244,6 +250,37 @@ pub async fn update(
     dry_run: bool,
     no_sync: bool,
     aur_only: bool,
+) -> Result<()> {
+    let intent = if aur_only {
+        super::omarchy::UpdateIntent::AurOnly
+    } else if check_only {
+        super::omarchy::UpdateIntent::Check
+    } else if dry_run {
+        super::omarchy::UpdateIntent::DryRun
+    } else {
+        super::omarchy::UpdateIntent::Standard { yes, no_sync }
+    };
+    if super::omarchy::maybe_coordinate(intent).await? {
+        return Ok(());
+    }
+    update_with_aur_exclusions(check_only, yes, dry_run, no_sync, aur_only, &[]).await
+}
+
+pub(super) async fn update_omarchy_aur(yes: bool) -> Result<()> {
+    update_with_aur_exclusions(false, yes, false, true, true, &["gcc14", "gcc14-libs"]).await
+}
+
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Existing CLI flags enter the shared update implementation"
+)]
+async fn update_with_aur_exclusions(
+    check_only: bool,
+    yes: bool,
+    dry_run: bool,
+    no_sync: bool,
+    aur_only: bool,
+    excluded: &[&str],
 ) -> Result<()> {
     let pm = get_package_manager()?;
 
@@ -338,7 +375,8 @@ pub async fn update(
             ));
             Vec::new()
         }
-        Ok(AurCheck::Ready { policy, raw }) => {
+        Ok(AurCheck::Ready { policy, mut raw }) => {
+            raw.retain(|(name, _, _)| !excluded.contains(&name.as_str()));
             let aur_elapsed = check_start.elapsed();
             let count = raw.len();
             let ScreenedAurUpdates { allowed, skipped } =

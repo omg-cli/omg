@@ -47,9 +47,131 @@ ROLES = ('cli', 'daemon', *TESTS)
 CASES = tuple((f'test-{index:02}', role, name)
               for index, (role, name) in enumerate(
                   ((role, name) for role, names in TESTS.items() for name in names), 1))
-STAGES = tuple('registry-' + role for role in TESTS) + tuple(row[0] for row in CASES) + (
-    'cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon')
+OMARCHY_PREFIX = (
+    'omarchy-update-requires-free-space', 'sudo\ttrue', 'omarchy-update-pkg-prune',
+    'omarchy-snapshot\tcreate', 'omarchy-update-stay-awake\tstart',
+    'omarchy-update-dev', 'omarchy-update-keyring', 'omarchy-update-system-pkgs')
+OMARCHY_SUFFIX = (
+    'omarchy-migrate\t--pending', 'omarchy-restart-shell', 'omarchy-migrate',
+    'omarchy-update-orphan-pkgs\t-y', 'omarchy-update-analyze-logs',
+    'omarchy-shell\t-q\tomarchy.system-update\tclear',
+    'omarchy-update-restart\t--services-only', 'omarchy-hook\tpost-update',
+    'omarchy-update-mise', 'omarchy-update-boot', 'omarchy-update-stay-awake\tstop',
+    'omarchy-update-restart\t--reboot-only')
+OMARCHY_CASES = {
+    'omarchy-success': (0, OMARCHY_PREFIX + OMARCHY_SUFFIX),
+    'omarchy-vendor-failure': (1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',)),
+    'omarchy-declined': (0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
+    'omarchy-optional-failures': (0, OMARCHY_PREFIX + OMARCHY_SUFFIX),
+    'omarchy-migration-refusal': (1, ()),
+    'omarchy-unsupported-mode': (1, ()),
+    'omarchy-invalid-transport': (1, ()),
+}
+PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES)
+STAGES = tuple('registry-' + role for role in TESTS) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
+
+
+def omarchy_guest_script():
+    return r'''unshare --mount --net --fork bash -s <<'OMG_OMARCHY_NAMESPACE'
+set -euo pipefail
+mount --make-rprivate /
+for tool in script flock tar mount readlink runuser; do
+  command -v "$tool" > /dev/null || { printf 'Missing Omarchy fixture command: %s\n' "$tool" >&2; exit 1; }
+done
+fixture=/opt/omg-omarchy-coverage
+test ! -e "$fixture" && test ! -L "$fixture"
+install -d -m 755 "$fixture"
+printf 'ID=omarchy\nID_LIKE=arch\n' > "$fixture/release"
+mount --bind "$fixture/release" /etc/os-release
+mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
+cat > "$fixture/stage" <<'OMG_INERT_OMARCHY_STAGE'
+#!/bin/bash
+set -euo pipefail
+name=${0##*/}
+{ printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
+case "$name" in
+  yay|aura|paru) printf 'external AUR helper must never run\n' >&2; exit 99 ;;
+  omarchy-update-confirm) test "$OMARCHY_FIXTURE_CASE" != omarchy-declined ;;
+  omarchy-update-system-pkgs) test "$OMARCHY_FIXTURE_CASE" != omarchy-vendor-failure ;;
+  omarchy-snapshot|omarchy-update-mise) test "$OMARCHY_FIXTURE_CASE" != omarchy-optional-failures ;;
+  *) exit 0 ;;
+esac
+OMG_INERT_OMARCHY_STAGE
+cat > "$fixture/sudo" <<'OMG_INERT_SUDO'
+#!/bin/bash
+set -euo pipefail
+case "$*" in true|'-n true') ;; *) printf 'unexpected fixture sudo request\n' >&2; exit 99 ;; esac
+{ printf sudo; printf '\t%s' "$@"; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
+OMG_INERT_SUDO
+chmod 755 "$fixture/stage" "$fixture/sudo"
+mount --bind "$fixture/sudo" "$(readlink -f /usr/bin/sudo)"
+created=()
+trap 'for path in "${created[@]}"; do rm -f -- "$path"; done; rm -rf -- "$fixture"' EXIT
+for name in omarchy-update-requires-free-space omarchy-update-confirm omarchy-update-pkg-prune \
+  omarchy-snapshot omarchy-update-stay-awake omarchy-update-dev omarchy-update-keyring \
+  omarchy-update-system-pkgs omarchy-migrate omarchy-restart-shell omarchy-update-orphan-pkgs \
+  omarchy-update-analyze-logs omarchy-shell omarchy-update-restart omarchy-hook \
+  omarchy-update-mise omarchy-update-boot yay aura paru; do
+  test ! -e "/usr/bin/$name" && test ! -L "/usr/bin/$name"
+  install -m 755 "$fixture/stage" "/usr/bin/$name"
+  created+=("/usr/bin/$name")
+done
+case_root=/var/tmp/omg-extra-nobody/omarchy
+install -d -m 700 -o nobody -g nobody "$case_root"
+for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-optional-failures \
+  omarchy-migration-refusal omarchy-unsupported-mode omarchy-invalid-transport; do
+  case_dir="$case_root/$stage"
+  install -d -m 700 -o nobody -g nobody "$case_dir" "$case_dir/config" "$case_dir/run" \
+    "$case_dir/db" "$case_dir/db/local" "$case_dir/db/sync" "$case_dir/migrations" \
+    "$case_dir/checkout/bin" "$case_dir/checkout/migrations"
+  printf 'telemetry_enabled = false\n[aur]\nsecurity_profile = "standard"\n' > "$case_dir/config/config.toml"
+  printf '[options]\nArchitecture = auto\nDBPath = %s/db\n[core]\nSigLevel = Never\nServer = file:///nonexistent\n' "$case_dir" > "$case_dir/pacman.conf"
+  tar -czf "$case_dir/db/sync/core.db" --files-from /dev/null
+  printf '9\n' > "$case_dir/db/local/ALPM_DB_VERSION"
+  : > "$case_dir/helpers.tsv"
+  printf '#!/bin/bash\nexit 88\n' > "$case_dir/checkout/bin/omarchy-migrate"
+  chmod 755 "$case_dir/checkout/bin/omarchy-migrate"
+  chown -R nobody:nobody "$case_dir"
+  if test "$stage" = omarchy-migration-refusal; then
+    printf 'omarchy-pkg-aur-add forbidden-fixture\n' > "$case_dir/checkout/migrations/1.sh"
+  else
+    rm -f "$case_dir/checkout/migrations/1.sh"
+  fi
+  args=(--yes)
+  extra=()
+  case "$stage" in
+    omarchy-declined) args=() ;;
+    omarchy-unsupported-mode) args=(--fast) ;;
+    omarchy-invalid-transport) extra=(OMG_OMARCHY_LOCK_FD=999999) ;;
+  esac
+  result=0
+  timeout --signal=TERM --kill-after=3 40 runuser -u nobody -- env -i \
+    PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
+    XDG_RUNTIME_DIR="$case_dir/run" XDG_CONFIG_HOME="$case_dir/config" \
+    XDG_CACHE_HOME="$case_dir/cache" XDG_DATA_HOME="$case_dir/data" XDG_STATE_HOME="$case_dir/state" \
+    OMG_CONFIG_DIR="$case_dir/config" OMG_CACHE_DIR="$case_dir/cache" OMG_DATA_DIR="$case_dir/data" \
+    OMG_DAEMON_DATA_DIR="$case_dir/daemon" OMG_DISABLE_DAEMON=1 OMG_DISABLE_TELEMETRY=1 \
+    OMG_PACMAN_CONF="$case_dir/pacman.conf" OMG_PACMAN_DB_DIR="$case_dir/db" \
+    OMARCHY_PATH="$case_dir/checkout" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
+    OMARCHY_FIXTURE_CASE="$stage" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
+    LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
+    bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@"' \
+    bash "${args[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  printf '%s\n' "$result" > "/evidence/cli/$stage-exit.txt"
+  cp "$case_dir/helpers.tsv" "/evidence/cli/$stage-helpers.tsv"
+  if test -f "$case_dir/run/omarchy-update.lock"; then
+    flock --nonblock "$case_dir/run/omarchy-update.lock" true
+    test "$(stat -c '%u:%a' "$case_dir/run/omarchy-update.lock")" = "$(id -u nobody):600"
+    test "$(stat -c '%u:%a' /tmp/omarchy-update.log)" = "$(id -u nobody):600"
+    test -s /tmp/omarchy-update.log
+    cp /tmp/omarchy-update.log "/evidence/cli/$stage-transcript.log"
+    printf 'released private lock; owned transcript mode=600\n' > "/evidence/cli/$stage-coordination.txt"
+  fi
+  printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
+done
+OMG_OMARCHY_NAMESPACE
+'''
 
 
 def guest_script(artifacts, compiled_cli):
@@ -179,6 +301,7 @@ ordinary env LLVM_PROFILE_FILE='/profiles/omg-extra-daemon-%p-%m.profraw' RUST_L
     printf "[extra-daemon] sigterm_exit=0 socket_removed=yes\n"
   ' > /evidence/cli/daemon.log 2>&1
 printf 'daemon\t0\n' >> /evidence/cli/process-checks.tsv
+OMARCHY_CASE_BODY
 OMG_EXTRA_NAMESPACE
 fingerprint_db > /evidence/cli/db-after.txt
 cmp /evidence/cli/db-before.txt /evidence/cli/db-after.txt
@@ -187,6 +310,7 @@ printf 'PASS\n' > /evidence/cli/all-stages-pass.txt
 '''
     script = script.replace('RECEIPT', quote(receipt)).replace('ARTIFACTS', quote(artifact_lines))
     script = script.replace('SELECTION', quote(selection)).replace('COMPILED_CLI', quote(compiled_cli))
+    script = script.replace('OMARCHY_CASE_BODY', omarchy_guest_script())
     # The timeout shell inherits this function, never a caller-supplied environment.
     script = script.replace('ordinary bash -c', 'export -f ordinary\nordinary bash -c', 1)
     return script
@@ -204,7 +328,7 @@ def validate_evidence(evidence, profiles, artifacts, commit):
     expected = ['\t'.join(row) for row in CASES]
     require((evidence / 'expected-tests.tsv').read_text().splitlines() == expected, 'Guest selection mismatch')
     require((evidence / 'passed.tsv').read_text().splitlines() == [row + '\tPASS' for row in expected], 'Incomplete/reordered tests')
-    require((evidence / 'process-checks.tsv').read_text().splitlines() == [s + '\t0' for s in STAGES[-5:]], 'Process checks incomplete')
+    require((evidence / 'process-checks.tsv').read_text().splitlines() == [s + '\t0' for s in PROCESS_STAGES], 'Process checks incomplete')
     require((evidence / 'db-before.txt').read_bytes() == (evidence / 'db-after.txt').read_bytes(), 'Real guest package DB changed')
     require(re.fullmatch(r'actual_id=arch ordinary_uid=[1-9][0-9]* root_uid=0\n', (evidence / 'identity.txt').read_text()), 'Guest UID/distro identity differs')
     require((evidence / 'artifacts.sha256').read_text().splitlines() == [f"{a['sha256']}  /omg-extra-bin/{r}" for r, a in artifacts.items()], 'Guest artifact hash receipt mismatch')
@@ -250,13 +374,43 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                 and matches[0][-1] != 'unavailable', 'Missing/failed native inventory row: ' + name)
     daemon = (evidence / 'daemon.log').read_text()
     require('[extra-daemon] startup_socket=ready uid=' in daemon and '[extra-daemon] sigterm_exit=0 socket_removed=yes' in daemon, 'Daemon lifecycle incomplete')
+    for stage, (status, helpers) in OMARCHY_CASES.items():
+        require((evidence / f'{stage}-exit.txt').read_text() == f'{status}\n',
+                'Omarchy CLI exit status differs: ' + stage)
+        require((evidence / f'{stage}-helpers.tsv').read_text().splitlines() == list(helpers),
+                'Omarchy helper execution differs: ' + stage)
+        modules = {PROFILE.fullmatch(p.name)[3] for p in grouped[stage]}
+        require(modules == cli_modules, 'Omarchy profiles do not match the actual CLI: ' + stage)
+        log = (evidence / f'{stage}.log').read_text()
+        if helpers:
+            require((evidence / f'{stage}-coordination.txt').read_text()
+                    == 'released private lock; owned transcript mode=600\n',
+                    'Omarchy coordination cleanup differs: ' + stage)
+            transcript = (evidence / f'{stage}-transcript.log').read_text()
+            require(transcript.startswith('OMG Omarchy update started\n')
+                    and '\nOMG Omarchy update finished: ' in transcript,
+                    'Omarchy has no complete genuine PTY transcript: ' + stage)
+        if stage in ('omarchy-success', 'omarchy-optional-failures'):
+            require('up to date' in log.lower(),
+                    'Native OMG AUR did not complete: ' + stage)
+        if stage == 'omarchy-optional-failures':
+            require('snapshot' in log.lower() and 'mise' in log.lower(),
+                    'Optional Omarchy update failures were not visible: ' + stage)
+        elif stage == 'omarchy-vendor-failure':
+            require('Omarchy update did not complete' in log, 'Missing vendor failure diagnostic')
+        elif stage == 'omarchy-migration-refusal':
+            require('external AUR helper' in log, 'Missing native-AUR migration refusal')
+        elif stage == 'omarchy-unsupported-mode':
+            require('complete update lifecycle' in log, 'Unsupported Omarchy scope accepted')
+        elif stage == 'omarchy-invalid-transport':
+            require('Incomplete Omarchy update transport' in log, 'Incomplete transport accepted')
     for path in evidence.rglob('*'):
         if path.is_file():
             require(not re.search(rb'LLVM Profile (Error|Warning)', path.read_bytes()), 'LLVM runtime diagnostic in evidence')
     ET.ElementTree(suite).write(evidence / 'tests.xml', encoding='unicode', xml_declaration=True)
     selected = sorted(path for paths in grouped.values() for path in paths)
     (evidence / 'verification.json').write_text(json.dumps(dict(source_commit=commit, tests=tests,
-        process_checks=list(STAGES[-5:]), artifacts=artifacts,
+        process_checks=list(PROCESS_STAGES), artifacts=artifacts,
         profiles=[dict(name=p.name, bytes=p.stat().st_size, sha256=sha(p)) for p in selected]), indent=2) + '\n')
     return selected
 

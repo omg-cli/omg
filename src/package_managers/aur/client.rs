@@ -46,7 +46,9 @@ use crate::core::{Package, PackageSource, paths};
 use crate::package_managers::arch_install::{
     InstallIntent, InstallItem, InstallRequest, InstallTarget, OfficialTarget,
 };
-use crate::package_managers::{get_potential_aur_packages, pacman_db};
+#[cfg(test)]
+use crate::package_managers::get_potential_aur_packages;
+use crate::package_managers::pacman_db;
 use crate::runtimes::common::MAX_DECOMPRESSED_BYTES;
 
 use crate::core::security::artifact::ArchiveSnapshot;
@@ -1671,33 +1673,29 @@ impl AurClient {
     pub async fn get_update_list(&self) -> Result<Vec<(String, Version, Version)>> {
         // 1. Get all packages not in official repos
         let foreign_packages = tokio::task::spawn_blocking(|| -> Result<Vec<String>> {
-            let packages = get_potential_aur_packages()?;
+            let packages = pacman_db::get_potential_aur_package_records()?;
             if packages.is_empty() {
-                return Ok(packages);
+                return Ok(Vec::new());
             }
             let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
                 .context("Failed to load AUR update filters from pacman.conf")?;
             let ignored = pacman_db::compile_package_patterns(&config.ignore_pkg, "IgnorePkg")?;
             let ignored_groups =
                 pacman_db::compile_package_patterns(&config.ignore_group, "IgnoreGroup")?;
-            let installed_groups = pacman_db::list_local_cached()?
-                .into_iter()
-                .map(|package| (package.name, package.groups))
-                .collect::<std::collections::HashMap<_, _>>();
             let mut retained = Vec::with_capacity(packages.len());
-            for name in packages {
-                if ignored.is_match(&name) {
+            for package in packages {
+                if ignored.is_match(&package.name) {
                     continue;
                 }
-                let groups = installed_groups.get(&name).with_context(|| {
-                    format!("Installed AUR package '{name}' disappeared while filtering updates")
-                })?;
-                if !groups.iter().any(|group| ignored_groups.is_match(group)) {
-                    retained.push(name);
+                if !package
+                    .groups
+                    .iter()
+                    .any(|group| ignored_groups.is_match(group))
+                {
+                    retained.push(package.name);
                 }
             }
-            let packages = retained;
-            Ok(packages)
+            Ok(retained)
         })
         .await
         .context("AUR foreign-package scan task failed")??;
@@ -7364,6 +7362,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_only_refuses_an_in_flight_package_without_touching_the_checkout() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::build_only_refuses_an_in_flight_package_without_touching_the_checkout";
+        if Settings::rerun_test_unprivileged(TEST) {
+            return Ok(());
+        }
+        assert!(
+            !crate::core::is_root(),
+            "build fixture requires an ordinary UID"
+        );
+        let owner = private_fixture_dir()?;
+        let client = AurClient {
+            build_dir: owner.path().join("aur"),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut in_flight =
+            AHashSet::from_iter(["root-package".to_owned(), "unrelated-package".to_owned()]);
+        let error = client
+            .build_only("root-package", &mut in_flight, None)
+            .await
+            .expect_err("the public dependency build entry must reject a cycle before lookup");
+        assert_eq!(
+            error.to_string(),
+            "Circular AUR dependency detected while resolving 'root-package'"
+        );
+        assert_eq!(
+            in_flight,
+            AHashSet::from_iter(["root-package".to_owned(), "unrelated-package".to_owned()])
+        );
+        assert!(!client.build_dir.exists());
+        assert_eq!(std::fs::read_dir(owner.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_only_inner_refuses_an_invalid_package_before_creating_a_checkout() -> Result<()>
+    {
+        const TEST: &str = "package_managers::aur::client::tests::build_only_inner_refuses_an_invalid_package_before_creating_a_checkout";
+        if Settings::rerun_test_unprivileged(TEST) {
+            return Ok(());
+        }
+        assert!(
+            !crate::core::is_root(),
+            "build fixture requires an ordinary UID"
+        );
+        let owner = private_fixture_dir()?;
+        let client = AurClient {
+            build_dir: owner.path().join("aur"),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut in_flight = AHashSet::from_iter(["unrelated-package".to_owned()]);
+        let error = client
+            .build_only_inner("-invalid", "valid-base", &mut in_flight, None)
+            .await
+            .expect_err("an invalid external package name must fail before checkout creation");
+        assert_eq!(
+            error.downcast_ref::<crate::core::security::ValidationError>(),
+            Some(&crate::core::security::ValidationError::PackageNameStartsWithDash)
+        );
+        assert_eq!(
+            in_flight,
+            AHashSet::from_iter(["unrelated-package".to_owned()])
+        );
+        assert!(!client.build_dir.exists());
+        assert_eq!(std::fs::read_dir(owner.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lifecycle_lease_excludes_cleanup_until_all_builds_finish() {
         use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
@@ -10420,6 +10488,20 @@ finally:
                             format!("{control:#}")
                                 .contains("Privilege elevation not supported in development mode"),
                             "{control:#}"
+                        );
+                        let mut stopped = crate::core::sudoloop::SudoLoop::start();
+                        stopped.stop();
+                        assert!(!stopped.is_running());
+                        let stopped_control = AurClient::install_built_packages(
+                            std::slice::from_ref(&standard),
+                            Some(&stopped),
+                        )
+                        .await
+                        .expect_err("a stopped sudoloop must retain the inert elevation refusal");
+                        assert!(
+                            format!("{stopped_control:#}")
+                                .contains("Privilege elevation not supported in development mode"),
+                            "{stopped_control:#}"
                         );
                         let lock = INSTALL_LOCK.lock().await;
                         let mut install = Box::pin(AurClient::install_built_packages(

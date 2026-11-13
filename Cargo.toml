@@ -215,7 +215,7 @@ p384 = { version = "=0.14.0", features = ["ecdsa", "pkcs8"] }
 x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }
 
 # System calls (for disk space checks, etc.)
-nix = { version = "0.31", features = ["fs", "signal", "user"] }
+nix = { version = "0.31", features = ["fs", "signal", "term", "user"] }
 
 # Date & Time
 jiff = { version = "0.2.21", features = ["serde"] }
@@ -267,7 +267,7 @@ uuid = { version = "1.21", features = ["v4"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
 rust-apt = { version = "0.11.3", optional = true }
-rustix = { version = "1.1.6", features = ["fs", "process"] } # RUSTSEC-2026-0486
+rustix = { version = "1.1.6", features = ["fs", "process", "termios"] } # RUSTSEC-2026-0486
 
 # Debian/Ubuntu package support
 ar = { version = "0.9", optional = true } # Pure Rust .ar archive parsing

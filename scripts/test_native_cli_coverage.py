@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -68,6 +69,57 @@ class HostedProducer(unittest.TestCase):
         self.assertLess(native.index('python /native-cli-coverage.py run'),
                         native.index('mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib'))
 
+    def test_generated_omarchy_cases_use_the_real_cli_in_a_private_namespace(self):
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
+        self.assertIn("OMG_OMARCHY_NAMESPACE", script)
+        self.assertIn('ID=omarchy', script)
+        self.assertIn('mount --bind "$fixture/release" /etc/os-release', script)
+        self.assertIn('omarchy-success', script)
+        self.assertIn('omarchy-vendor-failure', script)
+        self.assertIn('omarchy-migration-refusal', script)
+        self.assertIn('mount --bind "$fixture/sudo"', script)
+        self.assertIn('exec /omg-extra-bin/cli update', script)
+
+    @unittest.skipIf(os.name == 'nt', 'Inert guest helper scripts require POSIX Bash')
+    def test_inert_omarchy_helpers_record_arguments_and_reject_external_aur(self):
+        script = PRODUCER.omarchy_guest_script()
+        helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
+        sudo = script.split("<<'OMG_INERT_SUDO'\n", 1)[1].split('\nOMG_INERT_SUDO', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = root / 'helpers.tsv'
+            env = dict(os.environ, OMARCHY_FIXTURE_CASE='omarchy-success', OMARCHY_HELPER_TRACE=str(trace))
+            for name, args, source, status in (
+                    ('omarchy-update-dev', [], helper, 0),
+                    ('omarchy-shell', ['-q', 'omarchy.system-update', 'clear'], helper, 0),
+                    ('sudo', ['true'], sudo, 0),
+                    ('sudo', ['-n', 'true'], sudo, 0),
+                    ('yay', ['-Sua'], helper, 99),
+                    ('sudo', ['pacman', '-Syu'], sudo, 99)):
+                path = root / name
+                path.write_text(source)
+                result = subprocess.run([BASH, str(path), *args], env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, status, result.stderr)
+            self.assertEqual(trace.read_text().splitlines(), [
+                'omarchy-update-dev', 'omarchy-shell\t-q\tomarchy.system-update\tclear',
+                'sudo\ttrue', 'sudo\t-n\ttrue', 'yay\t-Sua'])
+
+    @unittest.skipIf(os.name == 'nt', 'Native sync archive fixture requires POSIX tar')
+    def test_omarchy_fixture_database_uses_supported_compression(self):
+        command = next(line.strip() for line in PRODUCER.omarchy_guest_script().splitlines()
+                       if line.strip().startswith('tar ') and 'db/sync/core.db' in line)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'db/sync').mkdir(parents=True)
+            result = subprocess.run(
+                [BASH, '-euo', 'pipefail', '-c', 'case_dir="$OMARCHY_FIXTURE_DIRECTORY"\n' + command],
+                env=dict(os.environ, OMARCHY_FIXTURE_DIRECTORY=str(root)),
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with tarfile.open(root / 'db/sync/core.db', 'r:gz') as archive:
+                self.assertEqual(archive.getmembers(), [])
+
     def test_generated_guest_program_is_one_valid_bash_program(self):
         artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
         script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
@@ -89,7 +141,7 @@ def evidence_fixture(root):
     rows = ['\t'.join(row) for row in PRODUCER.CASES]
     (evidence / 'expected-tests.tsv').write_text('\n'.join(rows) + '\n')
     (evidence / 'passed.tsv').write_text('\n'.join(row + '\tPASS' for row in rows) + '\n')
-    (evidence / 'process-checks.tsv').write_text('\n'.join(stage + '\t0' for stage in PRODUCER.STAGES[-5:]) + '\n')
+    (evidence / 'process-checks.tsv').write_text('\n'.join(stage + '\t0' for stage in PRODUCER.PROCESS_STAGES) + '\n')
     for name in ('db-before.txt', 'db-after.txt'):
         (evidence / name).write_text('unchanged private guest DB\n')
     (evidence / 'identity.txt').write_text('actual_id=arch ordinary_uid=65534 root_uid=0\n')
@@ -117,6 +169,23 @@ def evidence_fixture(root):
         for name in ('why', 'why-reverse', 'size', 'size-tree', 'blame')))
     (evidence / 'daemon.log').write_text('[extra-daemon] startup_socket=ready uid=65534\n'
                                        '[extra-daemon] sigterm_exit=0 socket_removed=yes\n')
+    for stage, (status, helpers) in PRODUCER.OMARCHY_CASES.items():
+        (evidence / f'{stage}-exit.txt').write_text(f'{status}\n')
+        (evidence / f'{stage}-helpers.tsv').write_text(''.join(row + '\n' for row in helpers))
+        if helpers:
+            (evidence / f'{stage}-coordination.txt').write_text(
+                'released private lock; owned transcript mode=600\n')
+            (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
+        log = {
+            'omarchy-success': '| System is up to date',
+            'omarchy-optional-failures': '| System is up to date\n! Continuing without a snapshot\n! Some mise tools could not be updated',
+            'omarchy-vendor-failure': 'Omarchy update did not complete',
+            'omarchy-declined': 'declined',
+            'omarchy-migration-refusal': 'external AUR helper',
+            'omarchy-unsupported-mode': 'complete update lifecycle',
+            'omarchy-invalid-transport': 'Incomplete Omarchy update transport',
+        }[stage]
+        (evidence / f'{stage}.log').write_text(log)
     return evidence, profiles, artifacts
 
 
@@ -127,8 +196,16 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 5)
+            self.assertEqual(len(receipt['process_checks']), 12)
             self.assertEqual(len(files), len(receipt['profiles']))
+
+    def test_forged_omarchy_helper_evidence_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            (evidence / 'omarchy-success-helpers.tsv').write_text('yay\t-Sua\n')
+            with self.assertRaises(ValueError):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            self.assertFalse((evidence / 'verification.json').exists())
 
     def test_incomplete_or_misleading_guest_evidence_is_refused(self):
         mutations = {
@@ -144,6 +221,16 @@ class SupplementalEvidence(unittest.TestCase):
             'missing-process': lambda e, p: (e / 'process-checks.tsv').write_text('cli-q\t0\n'),
             'wrong-artifact': lambda e, p: (e / 'artifacts.sha256').write_text('different'),
             'llvm-warning': lambda e, p: (e / 'cli-q.log').write_text('LLVM Profile Warning: write failed'),
+            'omarchy-failed-status': lambda e, p: (e / 'omarchy-success-exit.txt').write_text('1\n'),
+            'omarchy-skipped-aur': lambda e, p: (e / 'omarchy-success.log').write_text('only vendor commands ran'),
+            'omarchy-false-transcript': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('fake output'),
+            'omarchy-no-update-result': lambda e, p: (e / 'omarchy-success.log').write_text('No update result was emitted'),
+            'omarchy-hidden-optional-warnings': lambda e, p: (e / 'omarchy-optional-failures.log').write_text('| System is up to date'),
+            'omarchy-old-logger': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('Script started on fixture\nScript done on fixture\n'),
+            'omarchy-no-cleanup': lambda e, p: (e / 'omarchy-success-coordination.txt').write_text('lock still held'),
+            'omarchy-no-refusal': lambda e, p: (e / 'omarchy-migration-refusal.log').write_text('failed for another reason'),
+            'omarchy-wrong-cli': lambda e, p: (p / 'omg-extra-omarchy-success-123-100_0.profraw').rename(
+                p / 'omg-extra-omarchy-success-123-200_0.profraw'),
         }
         for name, mutate in mutations.items():
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
