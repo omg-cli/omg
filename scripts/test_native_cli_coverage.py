@@ -374,11 +374,17 @@ class HostedProducer(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             (root / 'bin').mkdir()
-            for name, scene, expected in [('omarchy-snapshot', 'snapshot-unsupported', 127),
-                                          ('omarchy-system', 'reboot-failure', 7)]:
+            for name, scene, arguments, expected in [
+                    ('omarchy-snapshot', 'snapshot-unsupported', [], 127),
+                    ('omarchy-system', 'reboot-failure', [], 7),
+                    ('omarchy-update-requires-free-space', 'preflight-failure', [], 7),
+                    ('omarchy-update-confirm', 'confirmation-failure', [], 2),
+                    ('omarchy-update-dev', 'development-failure', [], 7),
+                    ('omarchy-update-stay-awake', 'inhibitor-start-failure', ['start'], 7),
+                    ('omarchy-update-stay-awake', 'inhibitor-stop-failure', ['stop'], 7)]:
                 program = root / 'bin' / name
                 program.write_text(helper)
-                result = subprocess.run([BASH, str(program)],
+                result = subprocess.run([BASH, str(program), *arguments],
                     env=dict(os.environ, OMARCHY_PATH=str(root), OMARCHY_FIXTURE_SCENE=scene,
                              OMARCHY_FIXTURE_CASE='inert-lifecycle-control',
                              OMARCHY_HELPER_TRACE=str(root / 'helpers.tsv')),
@@ -572,7 +578,11 @@ def evidence_fixture(root):
             'omarchy-migration-refusal': 'external package helper',
             'omarchy-unsupported-mode': 'complete update lifecycle',
             'omarchy-invalid-transport': 'Incomplete Omarchy update transport',
-        }[stage]
+        }.get(stage, '')
+        if case.failure_command:
+            log = f'Omarchy stage {case.failure_command} did not complete: exit status: {case.failure_status}'
+            if case.native_phase == 'complete':
+                log += '\nSystem is up to date\nOmarchy cleanup failed'
         (evidence / f'{stage}.log').write_text(log)
     return evidence, profiles, artifacts
 
@@ -604,7 +614,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 24)
+            self.assertEqual(len(receipt['process_checks']), 29)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):

@@ -1126,3 +1126,21 @@ Its embedded receipt identifies the exact source, binary hashes and guest proof.
 It supersedes the 0584c726 candidate for the pipe-disconnection fix; the host
 installation remains unchanged. Exact-head hosted CI and coverage comparison
 still require acceptance before merging.
+
+The next native metadata batch reproduced two fallback inconsistencies against
+private Rust-parsed package records. All three native info paths discarded
+comparison operators and version values from dependencies, including distinct
+`libfoo.so=2-64` and `libfoo.so=3-64` requirements. The direct sync query also
+reported `Some(0)` for a declared 4096-byte archive before a transaction was
+prepared; the other native query correctly reported `Some(4096)`. Both failures
+were observed before changing the production getters.
+
+Native info now serializes complete ALPM dependencies and reports the declared
+archive size rather than transaction-specific download state. Regression checks
+compare local, direct-sync and shared-handle results with the Rust parser,
+covering every comparison operator, an epoch/release and distinct soname values.
+The two regressions pass, as do 2410 library tests (13 existing ignores), all three
+feature Clippy lanes and normal CLI/daemon builds. Five additional fatal vendor
+lifecycle controls have passing producer/export-boundary tests; their actual
+guest execution, the expanded 24-scenario coverage producer and a new optimized
+pair still require verification before this batch is published.

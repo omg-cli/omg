@@ -269,7 +269,7 @@ pub fn get_pkg_info_from_db(alpm: &alpm::Alpm, name: &str) -> Result<Option<Pack
                 install_size: Some(pkg.isize()),
                 download_size: Some(u64::try_from(pkg.size()).unwrap_or(0)),
                 repo: db.name().to_string(),
-                depends: pkg.depends().iter().map(|d| d.name().to_string()).collect(),
+                depends: pkg.depends().iter().map(ToString::to_string).collect(),
                 licenses: pkg
                     .licenses()
                     .iter()

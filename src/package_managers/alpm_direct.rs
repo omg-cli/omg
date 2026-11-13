@@ -187,7 +187,7 @@ pub fn get_package_info(name: &str) -> Result<Option<PackageInfo>> {
                 install_size: Some(pkg.isize()),
                 download_size: None,
                 repo: "local".to_string(),
-                depends: pkg.depends().iter().map(|d| d.name().to_string()).collect(),
+                depends: pkg.depends().iter().map(ToString::to_string).collect(),
                 licenses: pkg
                     .licenses()
                     .iter()
@@ -218,9 +218,9 @@ pub fn get_package_info(name: &str) -> Result<Option<PackageInfo>> {
                     url: pkg.url().map(std::string::ToString::to_string),
                     size: pkg.isize().try_into().unwrap_or(0),
                     install_size: Some(pkg.isize()),
-                    download_size: Some(pkg.download_size().try_into().unwrap_or(0)),
+                    download_size: Some(u64::try_from(pkg.size()).unwrap_or(0)),
                     repo: db.name().to_string(),
-                    depends: pkg.depends().iter().map(|d| d.name().to_string()).collect(),
+                    depends: pkg.depends().iter().map(ToString::to_string).collect(),
                     licenses: pkg
                         .licenses()
                         .iter()
@@ -594,16 +594,16 @@ mod tests {
     fn write_sync_fixture(
         database: &std::path::Path,
         repository: &str,
-        packages: &[(&str, &str)],
+        packages: &[(&str, &str, &str)],
     ) -> Result<()> {
         let encoder = flate2::write::GzEncoder::new(
             std::fs::File::create(database.join("sync").join(format!("{repository}.db")))?,
             flate2::Compression::fast(),
         );
         let mut archive = tar::Builder::new(encoder);
-        for (name, version) in packages {
+        for (name, version, fields) in packages {
             let content = format!(
-                "%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nfixture {name}\n\n%ARCH%\nx86_64\n"
+                "%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nfixture {name}\n\n%ARCH%\nx86_64\n\n{fields}"
             );
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
@@ -643,7 +643,7 @@ mod tests {
             "%NAME%\npacman\n\n%VERSION%\n1.0-1\n\n%DESC%\nfixture package manager\n\n%ARCH%\nx86_64\n\n%REASON%\n0\n",
         )
         .unwrap();
-        write_sync_fixture(&database, "core", &[("linux", "6.1.0-1")]).unwrap();
+        write_sync_fixture(&database, "core", &[("linux", "6.1.0-1", "")]).unwrap();
         let config = directory.path().join("pacman.conf");
         std::fs::write(&config, "[options]\nSigLevel = Never\n[core]\nServer = https://example.invalid/$repo/os/$arch\n").unwrap();
         struct Restore;
@@ -669,6 +669,93 @@ mod tests {
     }
 
     #[test]
+    fn native_info_preserves_dependency_constraints_across_all_query_paths() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(native_info_preserves_dependency_constraints_across_all_query_paths)
+            ),
+            || {
+                let dependencies = [
+                    "glibc>=2.40",
+                    "runtime=1:2.3-4",
+                    "older<3",
+                    "upper<=5",
+                    "newer>2",
+                    "plain",
+                    "libfoo.so=2-64",
+                    "libfoo.so=3-64",
+                ];
+                let fields = format!("%DEPENDS%\n{}\n\n", dependencies.join("\n"));
+                let database = paths::pacman_db_dir_result().expect("private database");
+                let local = database.join("local/pacman-1.0-1/desc");
+                let original = std::fs::read_to_string(&local).expect("initial local metadata");
+                std::fs::write(&local, original + &fields).expect("local dependency metadata");
+                write_sync_fixture(&database, "core", &[("linux", "6.1.0-1", &fields)])
+                    .expect("sync dependency metadata");
+                clear_alpm_cache();
+                pacman_db::invalidate_caches().expect("invalidate private metadata caches");
+                let rust_local = pacman_db::get_local_package("pacman").unwrap().unwrap();
+                let rust_sync = pacman_db::get_sync_package("linux").unwrap().unwrap();
+                assert_eq!(rust_local.depends, dependencies);
+                assert_eq!(rust_sync.depends, dependencies);
+                let native = [
+                    get_package_info("pacman").unwrap().unwrap().depends,
+                    get_package_info("linux").unwrap().unwrap().depends,
+                    with_handle(|handle| {
+                        super::super::alpm_ops::get_pkg_info_from_db(handle, "linux")
+                    })
+                    .unwrap()
+                    .unwrap()
+                    .depends,
+                ];
+                assert_eq!(
+                    native,
+                    [
+                        dependencies.to_vec(),
+                        dependencies.to_vec(),
+                        dependencies.to_vec()
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn native_sync_info_reports_archive_size_before_transaction_preparation() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(native_sync_info_reports_archive_size_before_transaction_preparation)
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().expect("private database");
+                write_sync_fixture(
+                    &database,
+                    "core",
+                    &[("linux", "6.1.0-1", "%CSIZE%\n4096\n\n%ISIZE%\n65536\n\n")],
+                )
+                .expect("sync size metadata");
+                clear_alpm_cache();
+                pacman_db::invalidate_caches().expect("invalidate private metadata caches");
+                let rust = pacman_db::get_sync_package("linux").unwrap().unwrap();
+                assert_eq!((rust.csize, rust.isize), (4096, 65536));
+                let direct = get_package_info("linux").unwrap().unwrap();
+                let shared = with_handle(|handle| {
+                    super::super::alpm_ops::get_pkg_info_from_db(handle, "linux")
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    [direct.download_size, shared.download_size],
+                    [Some(rust.csize); 2]
+                );
+                assert_eq!([direct.install_size, shared.install_size], [Some(65536); 2]);
+            },
+        );
+    }
+
+    #[test]
     fn search_usage_excludes_repository_from_info_search_and_completion() {
         with_private_alpm(
             concat!(
@@ -680,7 +767,7 @@ mod tests {
                 write_sync_fixture(
                     &database,
                     "upgrade-only",
-                    &[("linux", "99.0-1"), ("hidden-only", "1.0-1")],
+                    &[("linux", "99.0-1", ""), ("hidden-only", "1.0-1", "")],
                 )
                 .unwrap();
                 std::fs::write(

@@ -348,6 +348,8 @@ class OmarchyCase(NamedTuple):
     authorization: str | None = None
     lock_location: str = 'session'
     control: str | None = None
+    failure_command: str | None = None
+    failure_status: int = 7
 
 
 OMARCHY_CASES = {
@@ -388,6 +390,16 @@ OMARCHY_CASES = {
         scene='cancellation-hold', native_phase='cache-pruned', control='interrupt'),
     'omarchy-output-closed': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
         scene='cancellation-hold', native_phase='cache-pruned', control='output-closed'),
+    'omarchy-preflight-failure': OmarchyCase(1, OMARCHY_PREFIX[:1],
+        scene='preflight-failure', failure_command='omarchy-update-requires-free-space'),
+    'omarchy-confirmation-failure': OmarchyCase(1, OMARCHY_PREFIX[:1] + ('omarchy-update-confirm',),
+        scene='confirmation-failure', failure_command='omarchy-update-confirm', failure_status=2),
+    'omarchy-development-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='development-failure', native_phase='cache-pruned', failure_command='omarchy-update-dev'),
+    'omarchy-inhibitor-start-failure': OmarchyCase(1, OMARCHY_PREFIX[:3] + ('omarchy-update-stay-awake\tstop',),
+        scene='inhibitor-start-failure', native_phase='cache-pruned', failure_command='omarchy-update-stay-awake'),
+    'omarchy-inhibitor-stop-failure': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='inhibitor-stop-failure', native_phase='complete', failure_command='omarchy-update-stay-awake'),
 }
 
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES)
@@ -451,6 +463,13 @@ omarchy_security_require_source_root() {
 }
 case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
+case "$name:${OMARCHY_FIXTURE_SCENE:-none}:${1:-}" in
+  omarchy-update-requires-free-space:preflight-failure:*) exit 7 ;;
+  omarchy-update-confirm:confirmation-failure:*) exit 2 ;;
+  omarchy-update-dev:development-failure:*) exit 7 ;;
+  omarchy-update-stay-awake:inhibitor-start-failure:start) exit 7 ;;
+  omarchy-update-stay-awake:inhibitor-stop-failure:stop) exit 7 ;;
+esac
 case "$name:${OMARCHY_FIXTURE_SCENE:-none}" in
   omarchy-snapshot:snapshot-unsupported) exit 127 ;;
   omarchy-system:reboot-failure) exit 7 ;;
@@ -706,7 +725,7 @@ for stage in OMARCHY_STAGE_NAMES; do
   args=(--yes)
   extra=()
   case "$stage" in
-    omarchy-declined) args=() ;;
+    omarchy-declined|omarchy-confirmation-failure) args=() ;;
     omarchy-unsupported-mode) args=(--fast) ;;
     omarchy-invalid-transport) extra=(OMG_OMARCHY_LOCK_FD=999999) ;;
   esac
@@ -1096,6 +1115,11 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         if case.native_phase == 'complete':
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if case.failure_command:
+            require(f'Omarchy stage {case.failure_command} did not complete: exit status: {case.failure_status}' in log,
+                    'Lifecycle helper failure was not reported: ' + stage)
+            if case.scene == 'inhibitor-stop-failure':
+                require('Omarchy cleanup' in log, 'Cleanup failure was hidden')
         if case.control:
             control = json.loads((evidence / f'{stage}-control.json').read_text())
             require(set(control) == {'mode', 'ready_observed', 'cli_exit_code', 'unrelated_pid',
