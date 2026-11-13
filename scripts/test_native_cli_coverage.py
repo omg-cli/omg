@@ -232,6 +232,18 @@ class HostedProducer(unittest.TestCase):
         self.assertLess(native.index('--native-cli-coverage-dir'),
                         native.index('docker start --attach'))
 
+    def test_missing_runtime_directory_keeps_the_lock_private(self):
+        names = {'omarchy-runtime-fallback', 'omarchy-runtime-foreign-lock'}
+        self.assertTrue(names <= PRODUCER.OMARCHY_CASES.keys(),
+                        'Native coverage omits session runtime fallback and foreign lock refusal')
+        self.assertEqual(PRODUCER.OMARCHY_CASES['omarchy-runtime-fallback'].lock_location, 'temporary')
+        self.assertEqual(PRODUCER.OMARCHY_CASES['omarchy-runtime-foreign-lock'].lock_location, 'foreign')
+        script = PRODUCER.omarchy_guest_script()
+        self.assertIn('runtime_environment=()', script)
+        self.assertIn('coordination_lock=/tmp/omarchy-update.lock', script)
+        self.assertIn('flock --nonblock 9 9< \"$coordination_lock\"', script)
+        self.assertIn('foreign fallback lock was preserved', script)
+
     def test_authorization_refresh_cases_require_real_sudo_audit_records(self):
         names = {'omarchy-authorization-refresh', 'omarchy-authorization-denied'}
         self.assertTrue(names <= PRODUCER.OMARCHY_CASES.keys(),
@@ -467,6 +479,9 @@ def evidence_fixture(root):
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         if case.native_committed:
             (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
+        if case.lock_location == 'foreign':
+            (evidence / f'{stage}-layout.txt').write_text(
+                'foreign fallback lock was preserved; transcript unchanged\n')
         if case.authorization:
             authorization_log = evidence / f'{stage}-authorization.log'
             authorization_log.write_text(
@@ -490,6 +505,8 @@ def evidence_fixture(root):
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': '| System is up to date',
+            'omarchy-runtime-fallback': '| System is up to date',
+            'omarchy-runtime-foreign-lock': 'Omarchy coordination file must be single-link',
             'omarchy-authorization-refresh': '| System is up to date',
             'omarchy-authorization-denied': '| System is up to date\nOmarchy update authorization refresh stopped',
             'omarchy-reboot-decline': '| System is up to date\nReboot now?',
@@ -536,7 +553,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 20)
+            self.assertEqual(len(receipt['process_checks']), 22)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -570,6 +587,8 @@ class SupplementalEvidence(unittest.TestCase):
             'omarchy-old-logger': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('Script started on fixture\nScript done on fixture\n'),
             'omarchy-no-cleanup': lambda e, p: (e / 'omarchy-success-coordination.txt').write_text('lock still held'),
             'omarchy-no-refusal': lambda e, p: (e / 'omarchy-migration-refusal.log').write_text('failed for another reason'),
+            'foreign-fallback-was-overwritten': lambda e, p: (e / 'omarchy-runtime-foreign-lock-layout.txt').write_text('overwritten'),
+            'foreign-fallback-no-ownership-diagnostic': lambda e, p: (e / 'omarchy-runtime-foreign-lock.log').write_text('failed for another reason'),
             'no-real-authorization-refresh': lambda e, p: (e / 'omarchy-authorization-refresh-authorization.json').write_text('{}'),
             'authorization-log-changed': lambda e, p: (e / 'omarchy-authorization-refresh-authorization.log').write_text('different'),
             'authorization-refusal-hidden': lambda e, p: (e / 'omarchy-authorization-denied.log').write_text('System is up to date'),

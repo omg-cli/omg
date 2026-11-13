@@ -44,7 +44,8 @@ class AllowlistTests(unittest.TestCase):
         for stage in ('omarchy-snapshot-missing', 'omarchy-snapshot-unsupported',
                       'omarchy-required-helper-missing', 'omarchy-reboot-decline',
                       'omarchy-reboot-accept', 'omarchy-reboot-failure',
-                      'omarchy-authorization-refresh', 'omarchy-authorization-denied'):
+                      'omarchy-authorization-refresh', 'omarchy-authorization-denied',
+                      'omarchy-runtime-fallback', 'omarchy-runtime-foreign-lock'):
             for suffix in ('.log', '-helpers.tsv', '-native-state.json', '-layout.txt', '-interaction.json', '-authorization.json', '-authorization.log', '-exit.txt'):
                 name = stage + suffix
                 with self.subTest(name=name):

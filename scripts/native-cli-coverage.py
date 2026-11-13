@@ -308,6 +308,7 @@ class OmarchyCase(NamedTuple):
     native_committed: bool = False
     reboot_answer: str | None = None
     authorization: str | None = None
+    lock_location: str = 'session'
 
 
 OMARCHY_CASES = {
@@ -341,6 +342,9 @@ OMARCHY_CASES = {
         scene='authorization-hold', native_committed=True, authorization='refresh'),
     'omarchy-authorization-denied': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
         scene='authorization-hold', native_committed=True, authorization='denied'),
+    'omarchy-runtime-fallback': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        native_committed=True, lock_location='temporary'),
+    'omarchy-runtime-foreign-lock': OmarchyCase(1, (), lock_location='foreign'),
 }
 
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES)
@@ -597,6 +601,24 @@ OMARCHY_CASE_SETUP
     test ! -e "$fixture/saved/$absent_helper"
     mv "/usr/bin/$absent_helper" "$fixture/saved/$absent_helper"
   fi
+  runtime_environment=(XDG_RUNTIME_DIR="$case_dir/run")
+  coordination_lock="$case_dir/run/omarchy-update.lock"
+  if test "$lock_location" != session; then
+    runtime_environment=()
+    coordination_lock=/tmp/omarchy-update.lock
+  fi
+  if test "$lock_location" = foreign; then
+    if test -e "$coordination_lock"; then
+      test -f "$coordination_lock" && test ! -L "$coordination_lock"
+      test "$(stat -c '%u:%a' "$coordination_lock")" = "$(id -u nobody):600"
+      flock --nonblock 9 9< "$coordination_lock"
+      rm -- "$coordination_lock"
+    fi
+    printf 'foreign lock remains untouched\n' > "$coordination_lock"
+    chmod 666 "$coordination_lock"
+    foreign_identity=$(stat -c '%d:%i:%u:%a' "$coordination_lock")
+    foreign_log=$(sha256sum /tmp/omarchy-update.log | cut -d ' ' -f 1)
+  fi
   launch=(bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@"' bash "${args[@]}")
   if test -n "$reboot_answer"; then
     install -d -m 700 -o nobody -g nobody "$case_dir/.local/state/omarchy"
@@ -621,7 +643,7 @@ OMARCHY_CASE_SETUP
   result=0
   timeout --signal=TERM --kill-after=3 "$stage_timeout" runuser -u nobody -- env -i \
     PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
-    XDG_RUNTIME_DIR="$case_dir/run" XDG_CONFIG_HOME="$case_dir/config" \
+    "${runtime_environment[@]}" XDG_CONFIG_HOME="$case_dir/config" \
     XDG_CACHE_HOME="$case_dir/cache" XDG_DATA_HOME="$case_dir/data" XDG_STATE_HOME="$case_dir/state" \
     OMG_CONFIG_DIR="$case_dir/config" OMG_CACHE_DIR="$case_dir/cache" OMG_DATA_DIR="$case_dir/data" \
     OMG_DAEMON_DATA_DIR="$case_dir/daemon" OMG_DISABLE_DAEMON=1 OMG_DISABLE_TELEMETRY=1 \
@@ -680,9 +702,16 @@ OMG_AUTHORIZATION_RECEIPT
   fi
   printf '%s\n' "$result" > "/evidence/cli/$stage-exit.txt"
   cp "$case_dir/helpers.tsv" "/evidence/cli/$stage-helpers.tsv"
-  if test -f "$case_dir/run/omarchy-update.lock"; then
-    flock --nonblock "$case_dir/run/omarchy-update.lock" true
-    test "$(stat -c '%u:%a' "$case_dir/run/omarchy-update.lock")" = "$(id -u nobody):600"
+  if test "$lock_location" = foreign; then
+    test "$(stat -c '%d:%i:%u:%a' "$coordination_lock")" = "$foreign_identity"
+    test "$(cat "$coordination_lock")" = 'foreign lock remains untouched'
+    test "$(sha256sum /tmp/omarchy-update.log | cut -d ' ' -f 1)" = "$foreign_log"
+    printf 'foreign fallback lock was preserved; transcript unchanged\n' > "/evidence/cli/$stage-layout.txt"
+    rm -- "$coordination_lock"
+  fi
+  if test -f "$coordination_lock"; then
+    flock --nonblock 9 9< "$coordination_lock"
+    test "$(stat -c '%u:%a' "$coordination_lock")" = "$(id -u nobody):600"
     test "$(stat -c '%u:%a' /tmp/omarchy-update.log)" = "$(id -u nobody):600"
     test -s /tmp/omarchy-update.log
     cp /tmp/omarchy-update.log "/evidence/cli/$stage-transcript.log"
@@ -697,6 +726,7 @@ OMG_OMARCHY_NAMESPACE
         f'absent_helper={shlex.quote(case.absent_helper or "")}; '
         f'reboot_answer={shlex.quote(case.reboot_answer or "")}; '
         f'authorization={shlex.quote(case.authorization or "")}; '
+        f'lock_location={shlex.quote(case.lock_location)}; '
         f'stage_timeout={95 if case.authorization else 40} ;;'
         for stage, case in OMARCHY_CASES.items())
     return (script.replace('OMARCHY_STAGE_NAMES', ' '.join(map(shlex.quote, OMARCHY_CASES)))
@@ -927,6 +957,12 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     == 'PASS_SIGNED_NATIVE_STATE', 'Missing committed native package state')
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if case.lock_location == 'foreign':
+            require((evidence / f'{stage}-layout.txt').read_text()
+                    == 'foreign fallback lock was preserved; transcript unchanged\n',
+                    'Foreign fallback coordination state changed')
+            require('Omarchy coordination file must be single-link' in log,
+                    'Missing fallback lock ownership refusal')
         if case.authorization:
             observation = authorization_audit((evidence / f'{stage}-authorization.log').read_text())
             require(observation['denied'] == (case.authorization == 'denied'),
