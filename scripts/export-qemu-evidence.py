@@ -154,7 +154,7 @@ def allowed_directory(parts):
     if not re.fullmatch(RUN, parts[0]):
         return False
     rest = parts[1:]
-    return rest in ((), ("guest",), ("guest", "evidence"),
+    return rest in ((), ("native-evidence",), ("native-evidence", "cli"), ("guest",), ("guest", "evidence"),
                     ("guest", "evidence", "benchmarks"), ("guest", "evidence", "apt-abi"), ("guest", "evidence", "osv"), ("guest", "evidence", "arch-advisory"), ("guest", "evidence", "fedora-advisory"), ("inventory",),
                     ("inventory", "rows"), ("mutation-refusal",),
                     ("mutation-refusal", "inventory"), ("mutation-refusal", "inventory", "rows"),
@@ -173,6 +173,14 @@ def allowed_file(parts):
     parent, name = parts[1:-1], parts[-1]
     if parent == ():
         return name in HOST_FILES
+    if parent == ("native-evidence", "cli"):
+        return name in {"tests.xml", "verification.json", "expected-tests.tsv", "passed.tsv",
+                        "process-checks.tsv", "db-before.txt", "db-after.txt", "identity.txt",
+                        "artifacts.sha256", "artifact-check.txt", "all-stages-pass.txt"} or re.fullmatch(
+            r"(?:omarchy-(?:success|vendor-failure|declined|optional-failures|migration-refusal|unsupported-mode|invalid-transport)"
+            r"(?:\.log|-helpers\.tsv|-native-state\.json|-transcript\.log|-coordination\.txt|-layout\.txt|-exit\.txt)"
+            r"|test-[0-9]{2}\.log|daemon\.log|cli-(?:q|v|vv|vvv)\.log)", name
+        ) is not None
     if parent == ("guest",):
         return name in {"serial.log", "qemu-startup.log"}
     if parent == ("guest", "evidence"):

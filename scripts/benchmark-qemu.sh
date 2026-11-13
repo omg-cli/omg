@@ -444,7 +444,10 @@ printf 'distro=%s\narch=%s\nhost_arch=%s\naccel=%s\ntiming_scope=%s\nrelease=%s\
 bash "$here/pull-qemu-controller.sh" "$controller_image" "$work/controller-pull-attempt.log" \
   > "$work/controller-pull.log" 2>&1 || exit 3
 controller_work=$work
+controller_init_args=()
 if [[ -n "$native_cli_coverage_dir" ]]; then
+  # Reap the orphaned QEMU process so the native clean-poweroff check can finish.
+  controller_init_args=(--init)
   if [[ -e /.dockerenv ]]; then
     docker inspect --format '{{json .Mounts}}' "${HOSTNAME:?Missing job container identity}" > "$work/job-mounts.json"
     controller_work=$(python3 "$here/native-cli-coverage.py" controller-path --path "$work" < "$work/job-mounts.json")
@@ -453,7 +456,7 @@ if [[ -n "$native_cli_coverage_dir" ]]; then
   printf '%s\n' "$binding_token" > "$work/controller-binding-token"
 fi
 started=true
-timeout 120 docker run --pull=never -d --name "$controller" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 "${docker_device_args[@]}" \
+timeout 120 docker run --pull=never -d --name "$controller" "${controller_init_args[@]}" --cpus 2 --memory 3g --memory-swap 3g --pids-limit 512 --log-opt max-size=10m --log-opt max-file=2 "${docker_device_args[@]}" \
   --cap-drop NET_RAW --cap-drop NET_ADMIN --dns 1.1.1.1 --dns 9.9.9.9 \
   --mount "type=bind,src=$controller_work,dst=/work" --workdir /work \
   "$controller_image" sleep infinity > "$work/controller-id.txt"
@@ -979,6 +982,7 @@ if [[ -n "${native_cli_coverage_dir:-}" ]]; then
 set -euo pipefail
 cd /work/guest
 opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
+printf '[native-coverage] preparing guest dependencies\n'
 ssh "${opts[@]}" bench@127.0.0.1 'sudo -n bash -s' <<'NATIVE_SETUP'
 set -euo pipefail
 test "$(id -u)" = 0
@@ -995,16 +999,21 @@ NATIVE_SETUP
 # Tar is only transport: the guest independently checks every admitted digest.
 tar -C /work/native-cli -cf - . | ssh "${opts[@]}" bench@127.0.0.1   'sudo -n sh -c "install -d -m 755 /native-cli-inputs; tar -C /native-cli-inputs -xf -; install -m 644 /native-cli-inputs/native-cli-coverage.py /native-cli-coverage.py; install -m 644 /native-cli-inputs/native-cli-manifest.json /native-cli-manifest.json; install -m 755 /native-cli-inputs/bin/* /omg-extra-bin/"'
 status=0
+printf '[native-coverage] running admitted producer\n'
 ssh "${opts[@]}" bench@127.0.0.1 'sudo -n python3 /native-cli-coverage.py run' || status=$?
+printf '[native-coverage] producer_exit=%s; collecting evidence\n' "$status"
 for kind in evidence profiles; do
   timeout --kill-after=2s 60s ssh "${opts[@]}" bench@127.0.0.1 "sudo -n tar -C /$kind -cf - ." \
     | head -c 1073741825 > "/work/native-$kind.tar"
   python3 /work/native-cli/native-cli-coverage.py unpack \
     --archive "/work/native-$kind.tar" --directory "/work/native-$kind"
 done
+printf '[native-coverage] requesting clean poweroff\n'
+qemu_pid=$(< /work/guest/qemu.pid)
+[[ "$qemu_pid" =~ ^[0-9]+$ ]]
 ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl poweroff'
 for ((attempt=0; attempt<30; attempt++)); do
-  if ! kill -0 "$(cat /work/guest/qemu.pid)" 2>/dev/null; then
+  if ! kill -0 "$qemu_pid" 2>/dev/null; then
     exit "$status"
   fi
   sleep 1

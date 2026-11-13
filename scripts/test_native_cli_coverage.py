@@ -70,6 +70,33 @@ class HostedProducer(unittest.TestCase):
             self.assertNotEqual(refused.returncode, 0)
             self.assertFalse(calls.exists(), 'Unbound executable bytes reached Docker')
 
+    @unittest.skipIf(os.name == 'nt', 'Controller launch uses POSIX Bash')
+    def test_native_controller_reaps_exited_qemu_without_changing_other_modes(self):
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
+        launch = source[source.index('controller_work=$work\n'):
+                        source.index('if [[ "$restrict_egress" == true ]]; then', source.index('controller_work=$work\n'))]
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            docker = owner / 'docker'
+            docker.write_text('#!/usr/bin/env python3\nimport json,os,sys\n'
+                              'if sys.argv[1] == "run":\n'
+                              ' with open(os.environ["CAPTURE"], "w") as f: json.dump(sys.argv[2:],f)\n'
+                              ' print("unit-controller")\n'
+                              'elif sys.argv[1] == "inspect":\n'
+                              ' print(json.dumps([dict(Type="bind", Source=os.environ["WORK"], Destination=os.environ["WORK"], RW=True)]))\n')
+            docker.chmod(0o755)
+            capture = owner / 'launch.json'
+            for native in ('/admitted-fixture', ''):
+                prefix = 'work="$WORK"; here="$PRODUCER_DIRECTORY"; controller=unit-controller; controller_image=fixture; docker_device_args=(); native_cli_coverage_dir="$NATIVE";\n'
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', prefix + launch],
+                                        env=dict(os.environ, PATH=str(owner) + os.pathsep + os.environ['PATH'],
+                                                 WORK=str(owner), PRODUCER_DIRECTORY=str(ROOT / 'scripts'),
+                                                 CAPTURE=str(capture), NATIVE=native),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual('--init' in json.loads(capture.read_text()), bool(native),
+                                 'The native controller must reap QEMU after clean poweroff')
+
     def test_signed_fixture_package_has_native_signature_preflight_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = PRODUCER.fixture_package(Path(directory), 'fixture-app', '3-1',
