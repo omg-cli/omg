@@ -1196,3 +1196,14 @@ ordinary user without test-mode bypasses. Producer tests pass 33 cases and expor
 allowlist tests pass 17 cases. Actual terminal-disconnect cleanup, the new normal
 Arch boundary controls, expanded native producer and optimized build remain
 pending verification before this batch is published.
+
+The corrected narrow guest probe passed in 20.196 seconds. Closing the actual
+controlling terminal now returns status 1, stops the observed owned helper and
+descendant, preserves an unrelated process and records interruption in the
+private durable transcript. Normal Arch dry-run and check commands then passed
+with vendor files still present, zero vendor helper calls, unchanged installed
+package state and the preceding vendor transcript preserved. The fixture reuses
+the existing release-file bind source instead of stacking mounts; the latter
+left an extra fixture mount busy at teardown. No profiles from these exploratory
+probes were imported. Full expanded execution and the new optimized pair remain
+required.

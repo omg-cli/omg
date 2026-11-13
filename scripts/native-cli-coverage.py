@@ -889,8 +889,7 @@ OMG_AUTHORIZATION_RECEIPT
   fi
   printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
 done
-printf 'ID=arch\n' > "$fixture/arch-release"
-mount --bind "$fixture/arch-release" /etc/os-release
+printf 'ID=arch\n' > "$fixture/release"
 case_dir="$case_root/omarchy-success"
 signed_owner=/opt/omg-coverage-omarchy-success
 chmod 755 "$signed_owner/gnupg"
