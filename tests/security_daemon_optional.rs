@@ -256,7 +256,7 @@ fn security_scan_without_daemon_preserves_inventory_errors_and_recovers() -> any
     assert!(
         result
             .stdout
-            .contains("No vulnerabilities found in scanned packages.")
+            .contains("No vulnerabilities found in assessed packages.")
     );
     assert_eq!(std::fs::read(&path)?, clean, "scan changed the inventory");
     let audit_path = project.data_dir.path().join("audit/audit.jsonl");

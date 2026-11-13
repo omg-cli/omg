@@ -1313,7 +1313,7 @@ mod security {
         let result = project.run(&["audit", "scan"]);
         result.assert_success();
         assert!(
-            result.stdout_contains("No vulnerabilities found in scanned packages."),
+            result.stdout_contains("No vulnerabilities found in assessed packages."),
             "audit scan did not complete: {}",
             result.combined_output()
         );
@@ -2024,7 +2024,7 @@ mod integration_scenarios {
         let result = project.run(&["audit"]);
         assert!(!result.stderr_contains("panicked at"));
         result.assert_success();
-        result.assert_stdout_contains("No vulnerabilities found in scanned packages.");
+        result.assert_stdout_contains("No vulnerabilities found in assessed packages.");
         assert_eq!(project.read_file("omg.lock").unwrap(), lock);
         assert_eq!(std::fs::read(&state_path).unwrap(), state);
         project.close_checked();

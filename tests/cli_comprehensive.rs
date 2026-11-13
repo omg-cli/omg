@@ -2882,9 +2882,11 @@ fn behavior_inventory_runs_in_hermetic_state() {
         }
         let audit_success = match case.id.as_str() {
             "audit" | "audit-scan" | "audit-scan-fail-on-findings-offline" => {
-                Some("No vulnerabilities found in scanned packages.")
+                Some("No vulnerabilities found in assessed packages.")
             }
-            "audit-fix" | "audit-fix-flags" => Some("No vulnerabilities found!"),
+            "audit-fix" | "audit-fix-flags" => {
+                Some("No vulnerabilities found in assessed packages!")
+            }
             _ => None,
         };
         if let Some(expected) = audit_success

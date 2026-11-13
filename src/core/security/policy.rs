@@ -2413,17 +2413,14 @@ mod tests {
         }
         assert!(!crate::core::privilege::is_root());
         let directory = tempfile::tempdir()?;
+        let data_dir = directory.path().join("data");
         temp_env::with_vars(
             [
                 ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_DATA_DIR", Some(data_dir.as_os_str())),
                 ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),
-                ("OMG_TEST_DISTRO", Some(std::ffi::OsStr::new("fedora"))),
             ],
             || -> anyhow::Result<()> {
-                assert_eq!(
-                    crate::core::env::distro::detect_distro(),
-                    crate::core::env::distro::Distro::Fedora
-                );
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
@@ -2442,13 +2439,10 @@ mod tests {
                 fs::write(&path, &bytes)?;
                 let loaded = SecurityPolicy::load_default()?;
                 assert_eq!(loaded.advisory_requirement, AdvisoryRequirement::Review);
-                let service = update_service(
-                    loaded,
-                    std::sync::Arc::new(super::super::vulnerability::VulnerabilityScanner::new()),
-                )?;
+                let service = update_service(loaded, std::sync::Arc::new(FailingVulns))?;
                 let error = runtime.block_on(service.update()).expect_err("explicit policy requires available advisory evidence even when all legacy fields have their default values");
                 assert!(
-                    matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "OSV has no configured ecosystem for the running package backend")
+                    matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "osv unavailable")
                 );
                 assert_eq!(fs::read_to_string(&path)?, bytes);
                 Ok(())
