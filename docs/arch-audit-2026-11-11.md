@@ -1144,3 +1144,38 @@ feature Clippy lanes and normal CLI/daemon builds. Five additional fatal vendor
 lifecycle controls have passing producer/export-boundary tests; their actual
 guest execution, the expanded 24-scenario coverage producer and a new optimized
 pair still require verification before this batch is published.
+
+The f0262592 metadata and fatal-lifecycle batch passed complete normal and
+instrumented library runs (2410 tests each, 13 existing ignores), all three Clippy
+lanes, normal binaries and the optimized pair build. All five new failure
+controls passed the narrow disposable guest probe in 26.985 seconds. The full
+six-role producer then passed its 14 selected tests and all 24 scenarios in
+222.832 seconds, validating and importing 325 genuine profiles after clean
+shutdown. The optimized pair independently passed all 24 scenarios, the full
+signed update, user-manager reexecution and six refusal controls in 171.863
+seconds. Package-state, helper-trace, diagnostic, process-cleanup and unchanged
+real guest database checks remained required. No package wrapper executed.
+
+The new bundle is `omg-pr1057-f0262592-x86_64-arch.tar.gz`, SHA-256
+`7bbe7eb64499d693b601db4c5acaef0a298c1b01941f3114c545d1db01f0a429`.
+It supersedes the 0fa345e7 pair for dependency and archive metadata fidelity; the
+host installation remains unchanged. The fresh local Omarchy report reaches
+234/234 functions and 3419/3501 summary lines, with 63 uncovered mapped lines.
+The published 9884b1d0 Arch and instrumented CI jobs passed; its strict comparison
+still failed with `Added file summary is not fully covered` for this module.
+Exact-head acceptance remains pending, without changing coverage policy.
+
+Official upstream release refs were rechecked on 2026-11-13. The advertised
+release set still ends at alpm-types 0.14.0, alpm-srcinfo 0.7.0, alpm-db 0.3.0,
+alpm-mtree 0.4.0 and alpm-repo-db 0.2.0. The types release peels to the existing
+7342c1d0 pin. Upstream HEAD is newer and unreleased; it was not automatically
+substituted for the tested release cohort. This checks advertised refs, without
+claiming independent signature certification.
+
+For guest-wave storage admission, four stopped trial disks for resolved sudo-log
+and SIGPIPE probes were retired after verifying their ownership, pinned backing
+image and superseding successful proofs. Their hashes, logs, returned evidence,
+profiles, receipts and source records remain; base/setup images, current useful
+proofs, native debug/incremental outputs and installed host binaries were
+preserved. The retirement reclaimed 724123648 allocated bytes without raising
+the existing owner budget.
