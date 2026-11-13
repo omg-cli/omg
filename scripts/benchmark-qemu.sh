@@ -616,10 +616,14 @@ legacy_apic=()
 case "$6" in q35|q35,*) legacy_apic=(-global apic-common.vapic=false) ;; esac
 accel=$7
 [[ "$accel" != tcg ]] || accel=tcg,thread=multi
+native_monitor=()
+if [[ -f /work/controller-binding-token ]]; then
+  native_monitor=(-qmp unix:/work/guest/native-qmp.sock,server=on,wait=off)
+fi
 nohup "$5" -machine "$6" -accel "$accel" -cpu "$8" -smp 2 -m 1536 \
   -run-with user=65534:65534 \
   -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny \
-  -monitor none "${legacy_apic[@]}" \
+  -monitor none "${legacy_apic[@]}" "${native_monitor[@]}" \
   "${firmware[@]}" -display none -serial "file:$vm_serial" \
   -drive "file=$vm_disk,if=virtio,format=qcow2" -drive file=seed.img,if=virtio,format=raw \
   -netdev user,id=n,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off,hostfwd=tcp:127.0.0.1:2222-10.0.2.15:22 -device virtio-net-pci,netdev=n,mac=52:54:00:12:34:56,romfile= \
@@ -1011,15 +1015,11 @@ done
 printf '[native-coverage] requesting clean poweroff\n'
 qemu_pid=$(< /work/guest/qemu.pid)
 [[ "$qemu_pid" =~ ^[0-9]+$ ]]
-ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl poweroff'
-for ((attempt=0; attempt<30; attempt++)); do
-  if ! kill -0 "$qemu_pid" 2>/dev/null; then
-    exit "$status"
-  fi
-  sleep 1
-done
-printf 'Native coverage guest did not power off cleanly\n' >&2
-exit 1
+python3 /work/native-cli/native-cli-coverage.py poweroff \
+  --qmp /work/guest/native-qmp.sock --pid "$qemu_pid" -- \
+  ssh "${opts[@]}" bench@127.0.0.1 'sudo -n systemctl poweroff' \
+  > /work/native-poweroff.json
+exit "$status"
 NATIVE_COVERAGE
   native_status=0
   timeout --kill-after=5s 1200 docker exec "$controller" bash /work/native-coverage.sh > "$work/native-coverage.log" 2>&1 || native_status=$?

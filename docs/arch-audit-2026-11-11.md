@@ -1207,3 +1207,31 @@ the existing release-file bind source instead of stacking mounts; the latter
 left an extra fixture mount busy at teardown. No profiles from these exploratory
 probes were imported. Full expanded execution and the new optimized pair remain
 required.
+
+The 6691ee3c runtime passed 2410 library tests and all 32 CLI unit tests in both
+normal and instrumented runs, all three feature Clippy lanes, normal binaries
+and the optimized build. The protected six-role producer passed its 14 selected
+tests, all 25 Omarchy scenarios and both normal Arch read-only commands in
+219.518 seconds. The optimized pair independently passed the same expanded
+boundaries, the full signed update, user-manager reexecution and six refusal
+controls in 173.148 seconds. The updated bundle is
+`omg-pr1057-6691ee3c-x86_64-arch.tar.gz`, SHA-256
+`0bf994e466604308c5d32228cfadf3f8dd98401e34dbe9683cc108e831d809d5`.
+The host pair remains unchanged. Omarchy coverage is 234/234 functions and
+3421/3501 summary lines, with 61 uncovered mapped lines; strict comparison is
+still unresolved.
+
+The published 3f1224f1 native coverage job exposed a separate harness race. Its
+preserved artifact records `producer_exit=0`, all stages passed and evidence
+collected, followed by clean poweroff closing SSH. The unhandled SSH status 255
+aborted the harness while the guest was shutting down. A focused shell regression
+reproduced both `255 != 0` and `255 != 17`: the transport status replaced either
+successful or failed producer status. The native controller now subscribes to
+its owned QEMU monitor before requesting shutdown, requires kernel peer PID
+identity, a guest-initiated poweroff event and process disappearance, and then
+preserves the original producer status. SSH status 255 alone never establishes
+success. Protocol tests reject other SSH errors, host termination, guest reset,
+missing shutdown events and a foreign monitor peer. The existing 30-second
+shutdown deadline and profile validation remain required. All 34 producer tests
+and 18 export-boundary tests pass; actual KVM verification of the new shutdown
+observer remains pending before publication.

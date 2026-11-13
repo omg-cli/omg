@@ -19,6 +19,7 @@ MAX_TOTAL_BYTES = 256 * 1024 * 1024
 NAME = r"[a-zA-Z0-9][a-zA-Z0-9_.-]*"
 RUN = r"run-[a-zA-Z0-9-]+"
 HOST_FILES = {
+    "native-poweroff.json",
     "fedora-sqlite-manifest.json", "fedora-sqlite-admission.log", "fedora-sqlite-install.log",
     "results.json", "sentry-results.json", "backend-mismatch-results.json",
     "backend-mismatch.json", "backend-mismatch.log", "metadata.txt", "host-metadata.txt",

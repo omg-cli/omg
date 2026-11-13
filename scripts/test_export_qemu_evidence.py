@@ -39,6 +39,11 @@ FEDORA_EXCLUSION_DIAGNOSTICS = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_native_poweroff_receipt_stays_at_controller_root(self):
+        self.assertTrue(exporter.allowed_file(('run-test', 'native-poweroff.json')))
+        self.assertFalse(exporter.allowed_file(('run-test', 'guest', 'native-poweroff.json')))
+        self.assertFalse(exporter.allowed_file(('run-test', 'native-poweroff.json.bak')))
+
     def test_arch_readonly_reports_have_exact_boundaries(self):
         root = ('run-test', 'native-evidence', 'cli')
         for stage in ('arch-dry-run', 'arch-check'):

@@ -12,7 +12,9 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -39,6 +41,62 @@ def fixture_tree_hashes(directory):
         else:
             require(path.is_dir(), 'Native fixture tree contains a special file')
     return result
+
+
+def poweroff_guest(qmp_path, pid, command, timeout=30):
+    require(type(pid) is int and 1 < pid < 2**31 and pid != os.getpid(), 'Invalid owned QEMU PID')
+    require(command, 'Missing guest poweroff command')
+    require(stat.S_ISSOCK(qmp_path.lstat().st_mode), 'Native QMP endpoint is not a socket')
+    deadline = time.monotonic() + timeout
+
+    def remaining():
+        value = deadline - time.monotonic()
+        require(value > 0, 'Native coverage guest did not power off cleanly')
+        return value
+
+    with socket.socket(socket.AF_UNIX) as monitor:
+        monitor.settimeout(remaining())
+        monitor.connect(str(qmp_path))
+        peer, _, _ = struct.unpack('3i', monitor.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        require(peer == pid, 'Native QMP peer does not match the owned QEMU process')
+        with monitor.makefile('rb') as stream:
+            messages = 0
+
+            def receive():
+                nonlocal messages
+                messages += 1
+                require(messages <= 64, 'Native QMP response count exceeded its bound')
+                monitor.settimeout(remaining())
+                line = stream.readline(65537)
+                require(line and len(line) <= 65536, 'Native QMP closed or exceeded its response bound')
+                value = json.loads(line)
+                require(type(value) is dict, 'Invalid native QMP response')
+                return value
+
+            require(type(receive().get('QMP')) is dict, 'Missing native QMP greeting')
+            monitor.sendall(b'{"execute":"qmp_capabilities","id":"native-poweroff"}\r\n')
+            while True:
+                reply = receive()
+                if reply.get('id') == 'native-poweroff':
+                    require('return' in reply and 'error' not in reply, 'Native QMP capability negotiation failed')
+                    break
+            status = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    timeout=remaining(), check=False).returncode
+            require(status in (0, 255), 'Guest poweroff command failed: ' + str(status))
+            while True:
+                reply = receive()
+                if reply.get('event') == 'SHUTDOWN':
+                    event = reply.get('data', {})
+                    require(type(event) is dict and event.get('guest') is True and event.get('reason') == 'guest-shutdown',
+                            'QEMU did not report guest-initiated poweroff')
+                    break
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return dict(status='PASS_GUEST_POWEROFF', qemu_pid=pid, qmp_peer_pid=peer,
+                        ssh_exit_code=status, shutdown=event, process_gone=True)
+        time.sleep(min(0.05, remaining()))
 
 
 def fixture_command(argv, **kwargs):
@@ -1350,6 +1408,10 @@ def main():
     verification.add_argument('--manifest', required=True, type=Path)
     verification.add_argument('--evidence', required=True, type=Path)
     verification.add_argument('--profiles', required=True, type=Path)
+    shutdown = commands.add_parser('poweroff')
+    shutdown.add_argument('--qmp', required=True, type=Path)
+    shutdown.add_argument('--pid', required=True, type=int)
+    shutdown.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.operation == 'prepare':
         value = prepare(args.target, args.source_commit)
@@ -1368,6 +1430,9 @@ def main():
         print(controller_bind_path(args.path, json.loads(metadata)))
     elif args.operation == 'run':
         run_guest(read_manifest(Path('/native-cli-manifest.json')))
+    elif args.operation == 'poweroff':
+        command = args.command[1:] if args.command[:1] == ['--'] else args.command
+        print(json.dumps(poweroff_guest(args.qmp, args.pid, command)))
     else:
         manifest = read_manifest(args.manifest)
         validate_evidence(args.evidence, args.profiles, manifest['artifacts'], manifest['source_commit'])

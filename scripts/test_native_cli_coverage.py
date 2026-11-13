@@ -24,6 +24,89 @@ SPEC.loader.exec_module(PRODUCER)
 
 
 class HostedProducer(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'linux', 'Native QMP identity requires Linux peer credentials')
+    def test_poweroff_ssh_disconnect_preserves_producer_status_after_observed_guest_shutdown(self):
+        import threading
+        import time
+
+        source = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
+        body = source.split("printf '[native-coverage] requesting clean poweroff\\n'", 1)[1].split('\nNATIVE_COVERAGE', 1)[0]
+        server_code = r'''
+import json,socket,sys,time
+from pathlib import Path
+path,trigger,event=sys.argv[1:]
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(path);server.listen(1)
+    with server.accept()[0] as peer:
+        stream=peer.makefile('rwb',buffering=0)
+        stream.write(b'{"QMP":{"version":{}}}\r\n')
+        line=stream.readline()
+        if not line: sys.exit(0)
+        command=json.loads(line)
+        stream.write((json.dumps({'return':{},'id':command['id']})+'\r\n').encode())
+        deadline=time.monotonic()+5
+        while not Path(trigger).exists():
+            assert time.monotonic()<deadline
+            time.sleep(0.01)
+        if event != 'null':
+            stream.write((json.dumps({'event':'SHUTDOWN','data':json.loads(event)})+'\r\n').encode())
+'''
+        guest_shutdown = {'guest': True, 'reason': 'guest-shutdown'}
+        cases = [
+            (0, 0, guest_shutdown, False, True),
+            (0, 255, guest_shutdown, False, True),
+            (17, 255, guest_shutdown, False, True),
+            (0, 1, guest_shutdown, False, False),
+            (0, 255, {'guest': False, 'reason': 'host-signal'}, False, False),
+            (0, 255, {'guest': True, 'reason': 'guest-reset'}, False, False),
+            (0, 255, None, False, False),
+            (0, 255, guest_shutdown, True, False),
+        ]
+        for producer_status, ssh_status, event, wrong_peer, accepted in cases:
+            with self.subTest(producer_status=producer_status, ssh_status=ssh_status,
+                              event=event, wrong_peer=wrong_peer), tempfile.TemporaryDirectory() as directory:
+                owner = Path(directory)
+                (owner / 'guest').mkdir()
+                (owner / 'native-cli').mkdir()
+                (owner / 'native-cli/native-cli-coverage.py').write_bytes((ROOT / 'scripts/native-cli-coverage.py').read_bytes())
+                trigger = owner / 'shutdown-request'
+                monitor = owner / 'guest/native-qmp.sock'
+                server = subprocess.Popen([sys.executable, '-c', server_code, str(monitor), str(trigger), json.dumps(event)],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                reaper = threading.Thread(target=server.wait)
+                reaper.start()
+                try:
+                    deadline = time.monotonic() + 5
+                    while not monitor.exists():
+                        self.assertLess(time.monotonic(), deadline, 'owned protocol peer did not start')
+                        time.sleep(0.01)
+                    (owner / 'guest/qemu.pid').write_text(str(server.pid + int(wrong_peer)))
+                    ssh = owner / 'ssh'
+                    ssh.write_text('#!/usr/bin/env python3\nimport os\nfrom pathlib import Path\n'
+                                   'Path(os.environ["SHUTDOWN_TRIGGER"]).touch()\nraise SystemExit(int(os.environ["SSH_RESULT"]))\n')
+                    ssh.chmod(0o755)
+                    script = 'set -euo pipefail\nopts=(); status=' + str(producer_status) + '\n' + body.replace('/work/', str(owner) + '/')
+                    result = subprocess.run([BASH, '-c', script],
+                        env=dict(os.environ, PATH=str(owner) + os.pathsep + os.environ['PATH'],
+                                 SHUTDOWN_TRIGGER=str(trigger), SSH_RESULT=str(ssh_status)),
+                        capture_output=True, text=True, timeout=10)
+                finally:
+                    if server.poll() is None:
+                        server.terminate()
+                    reaper.join(timeout=5)
+                    server.stderr.close()
+                if accepted:
+                    self.assertEqual(result.returncode, producer_status, result.stdout + result.stderr)
+                    receipt = json.loads((owner / 'native-poweroff.json').read_text())
+                    self.assertEqual(receipt['shutdown'], guest_shutdown)
+                    self.assertTrue(receipt['process_gone'])
+                    self.assertEqual(receipt['qmp_peer_pid'], server.pid)
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn('PASS_GUEST_POWEROFF', (owner / 'native-poweroff.json').read_text())
+                    if wrong_peer:
+                        self.assertFalse(trigger.exists(), 'Poweroff must not run against another monitor process')
+
     def test_interrupted_update_requires_exact_partial_native_state(self):
         with tempfile.TemporaryDirectory() as directory:
             owner = Path(directory)
