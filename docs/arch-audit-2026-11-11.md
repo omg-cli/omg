@@ -796,3 +796,18 @@ All 578 package-manager tests passed with 11 ignored, as did all-target Clippy
 with warnings denied. Independent review approved these test changes. These are
 passing behavior cases for expected production behavior, not reproduced runtime
 bugs or a fresh complete coverage verdict.
+
+
+## November 13: Omarchy checkout and advisory verification
+
+The Omarchy preflight treated the user-owned data checkout as a trusted executable path. The fix accepts that checkout while retaining fixed system executable resolution. Regression tests place an executable sentinel in the checkout and require it never to run. Empty checkout and migration-state variables fail before scanning.
+
+The follow-up batch adds real filesystem, child-process, authorization-worker and terminal-input failure tests. All 41 Omarchy tests pass. The full library suite passes 2,351 tests with 13 ignored. All-target Clippy with warnings denied passes after converting one test-only match to let-else. These tests do not establish exhaustive OS-error coverage.
+
+The coverage checker now binds a qualified literal-only macro site to its function parameters, preceding visible statements, control context and imports, including visible extern-crate aliases. Changed aliases and invalid compiler-copy evidence refuse proof. All 257 comparison tests and six external regression tests pass. The frozen earlier comparison progresses past config.rs but still refuses the cross-owner predicate extraction in style.rs. Acceptance thresholds, counter evidence and compiler-copy matching remain unchanged.
+
+Hosted coverage production passed on bf6c83f8. Its comparison reports incomplete coverage in the new Omarchy module: 1,877 of 1,972 summary lines. Hosted Arch QEMU also exposed a stale fixture destination after the production client moved to Cloudflare. The fixture now binds isolated DNS and TLS to that fixed destination and serves the exact snapshot envelope. It tests bad payload hashes, stale or future timestamps, reversed timestamps and strict JSON field types. Seventeen focused fixture checks pass.
+
+A disposable KVM rerun used the exact binary pair and archive from the failed hosted run. TLS refusal, snapshot rejection, direct and daemon findings, and evidence replay pass. The native package database and prepared guest image remain unchanged. This local rerun does not replace the pending hosted verdict or instrumented coverage acceptance.
+
+The tested PR release-profile pair is installed in the user's local binary directory. A real read-only host audit validates the fresh production Arch snapshot and preserves the package database. No host package update or service change was performed. Historical CVE archive verification, AUR applicability and operation-level advisory admission remain incomplete.

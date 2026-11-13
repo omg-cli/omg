@@ -520,6 +520,102 @@ class SourceAwareCoverageTests(unittest.TestCase):
             inventories, groups, proposals, work)
         return result
 
+    def macro_literal_obligations(self, *, capture=False, mutate=None, rewrite=None):
+        old = ('fn retained(key: &str) {\n'
+               '    anyhow::bail!(\n'
+               '        "Unknown key. \\\n'
+               '         old explanation"\n'
+               '    );\n'
+               '}\n')
+        if capture:
+            old = old.replace('Unknown key.', "Unknown '{key}'.")
+        new = old.replace('old explanation', 'new explanation')
+        if rewrite:
+            old, new = rewrite(old, new)
+        return self.attribution_obligations(old, new, excluded=(3, 4, 5), painted=(3, 4, 5),
+            parent_states=((1, 0), (1, 0)), mutation=mutate)
+
+    def test_qualified_macro_retains_head_and_associated_literal_paint(self):
+        for capture in (False, True):
+            with self.subTest(capture=capture):
+                pairs, receipts, _ = self.macro_literal_obligations(capture=capture)
+                self.assertIn((2, 2), pairs.items())
+                self.assertIn([3, 3], receipts[0]['non_executable_rows'])
+
+    def test_macro_literal_refuses_binding_fine_geometry_and_copy_changes(self):
+        rewrites = (
+            lambda old, new: (old, new.replace('key: &str', 'other: &str')),
+            lambda old, new: (old, new.replace('key: &str', '(key, other): (&str, &str)')),
+            lambda old, new: (old.replace('{\n', '{ let key = original();\n', 1),
+                              new.replace('{\n', '{ let key = replacement();\n', 1)),
+            lambda old, new: (old.replace('{\n', '{ let (key, _) = original();\n', 1),
+                              new.replace('{\n', '{ let (key, _) = replacement();\n', 1)),
+            lambda old, new: (old, new.replace('{\n', '{ use replacement as anyhow;\n', 1)),
+            lambda old, new: (old, new.replace('{\n', '{ macro_rules! shadow { () => {} }\n', 1)),
+            lambda old, new: (old, new.replace("'{key}'", "'{key:?}'")),
+        )
+        for rewrite in rewrites:
+            with self.subTest(rewrite=rewrites.index(rewrite)):
+                self.assertEqual(self.macro_literal_obligations(capture=True, rewrite=rewrite)[0], {})
+        def foreign(owners, sources):
+            owners[1].append(dict(name='foreign', filenames=['/src/example.rs'],
+                regions=[[3, 9, 3, 18, 0, 0, 0, 0]]))
+        def child(owners, sources):
+            owners[1].append(dict(name='_RNCNvCs1_7example8retained0B3_', filenames=['/src/example.rs'],
+                regions=[[3, 9, 3, 18, 0, 0, 0, 0]]))
+        def added_fine(owners, sources):
+            owners[1][0]['regions'].append([3, 9, 3, 18, 0, 0, 0, 0])
+        for mutation in (foreign, child, added_fine):
+            with self.subTest(mutation=mutation.__name__):
+                self.assertEqual(self.macro_literal_obligations(mutate=mutation)[0], {})
+        def swap(owners, sources):
+            for copy, owner in enumerate(owners[1]):
+                for region in owner['regions']:
+                    if region[0] == 2:
+                        region[4] = copy
+        try:
+            result = self.macro_literal_obligations(mutate=swap)
+        except ValueError:
+            pass
+        else:
+            self.assertEqual(result[0], {})
+
+    def test_macro_literal_preserves_visible_extern_crate_bindings(self):
+        body = ('fn retained(key: &str) {\n    anyhow::bail!(\n'
+                '        "Unknown key. \\\n         old explanation"\n    );\n}\n')
+        def proof(prefix, replacement, suffix=''):
+            old = prefix + body + suffix
+            new = replacement + body.replace('old explanation', 'new explanation') + suffix
+            start = prefix.count('\n') + 1
+            paint = tuple(start + offset for offset in (2, 3, 4))
+            excluded = tuple(range(1, start)) + paint + tuple(range(start + 6, len(old.splitlines()) + 1))
+            return self.attribution_obligations(old, new, excluded=excluded, painted=paint,
+                parent_states=((1, 0), (1, 0)))
+        declaration = 'extern crate original as anyhow;\n'
+        changed = declaration.replace('original', 'replacement')
+        with self.subTest(context='visible module binding changed'):
+            self.assertEqual(proof(declaration, changed)[0], {})
+        with self.subTest(context='visible module binding unchanged'):
+            self.assertTrue(proof(declaration, declaration)[1])
+        with self.subTest(context='ancestor module binding changed'):
+            self.assertEqual(proof('mod scope {\n' + declaration,
+                'mod scope {\n' + changed, '}\n')[0], {})
+        with self.subTest(context='foreign module binding changed'):
+            self.assertTrue(proof('mod foreign { ' + declaration.strip() + ' }\n',
+                'mod foreign { ' + changed.strip() + ' }\n')[1])
+
+    def test_macro_literal_cannot_hide_a_cold_runtime_argument(self):
+        old = ('fn retained() {\n    anyhow::bail!(\n'
+               '        "old message",\n        gate() && verify()\n    );\n}\n')
+        new = old.replace('old message', 'new message')
+        def cold(owners, sources):
+            for side, members in enumerate(owners):
+                for copy, owner in enumerate(members):
+                    owner['regions'].append([4, 19, 4, 27, int(not(side == 1 and copy == 0)), 0, 0, 0])
+        result = self.attribution_obligations(old, new, excluded=(3, 5), painted=(3, 5),
+            parent_states=((1, 1), (1, 1)), mutation=cold)
+        self.assertEqual(result[0], {})
+
     def test_replacement_obligations_ignore_only_tokenless_rows_without_any_ir(self):
         old = 'fn retained() {\n    // unchanged security explanation\n    old();\n    verified();\n}\n'
         new = old.replace('old();', 'new();')

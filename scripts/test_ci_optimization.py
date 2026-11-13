@@ -30,6 +30,35 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "The hosted service workflow uses POSIX executable scripts")
+    def test_advisory_service_is_verified_without_remote_deployment(self):
+        workflow = job_block((WORKFLOWS / 'ci.yml').read_text(), 'workflow-checks')
+        steps = dict(re.findall(r'^      - name: ([^\n]+)\n(.*?)(?=^      - (?:name:|uses:)|\Z)',
+                                workflow, re.MULTILINE | re.DOTALL))
+        scripts = [textwrap.dedent(block.split('        run: |\n', 1)[1])
+                   for name, block in steps.items() if name == 'Verify Arch advisory service']
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'commands.jsonl'
+            commands.touch()
+            recorder = root / 'bun'
+            recorder.write_text('#!' + sys.executable + '\nimport json,os,sys\n'
+                                'with open(os.environ["BUN_COMMANDS"], "a") as stream: '
+                                'stream.write(json.dumps(sys.argv[1:])+"\\n")\n')
+            recorder.chmod(0o755)
+            for script in scripts:
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', script],
+                    env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ.get('PATH', ''),
+                             BUN_COMMANDS=str(commands)), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            calls = [json.loads(line) for line in commands.read_text().splitlines()]
+            self.assertEqual(calls, [
+                ['install', '--cwd', 'services/advisories', '--frozen-lockfile', '--ignore-scripts'],
+                ['run', '--cwd', 'services/advisories', 'test'],
+                ['run', '--cwd', 'services/advisories', 'check'],
+                ['run', '--cwd', 'services/advisories', 'dry-run'],
+            ], 'The advisory service must have frozen dependencies, behavioral tests, types and a non-deploying build')
+
     @unittest.skipIf(os.name == 'nt', 'Native Arch input permissions require POSIX mode bits')
     def test_native_coverage_stages_protected_inputs_from_writable_sources(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')

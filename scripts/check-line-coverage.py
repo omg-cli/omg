@@ -1321,7 +1321,8 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 _construct_charge(work, len(code.words))
                 bindings = {}
                 for index, word in enumerate(code.words):
-                    if word not in ('use', 'macro_rules'):
+                    if (word not in ('use', 'macro_rules')
+                            and not (word == 'extern' and code.words[index + 1:index + 2] == ['crate'])):
                         continue
                     end = index + 1
                     while end < len(code.words):
@@ -1446,6 +1447,105 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         span = (number, 1), (number, len(source[number - 1].encode()) + 1)
         return not any(tuple(region[:2]) < span[1] and span[0] < tuple(region[2:4])
                        for owner in compiled[0] for region in owner['regions'])
+    macro_paint_cache = {}
+    def macro_literal_paint(descriptor, inventory, compiled, source, number, mapped_lines):
+        code = inventory[0]
+        _construct_charge(work, 2 * (len(code.words).bit_length() + 1))
+        low = code.offsets[number - 1]
+        token = bisect.bisect_right(code.ends, low)
+        if token >= len(code.words):
+            return None
+        is_head = False
+        end = token
+        while end + 2 < len(code.words) and code.words[end + 1] == '::':
+            _construct_charge(work, 1)
+            end += 2
+        if (end > token and code.words[end + 1:end + 3] == ['!', '(']
+                and code.position(code.starts[token])[0] == number):
+            token = end + 3; is_head = True
+        key = id(code), token, descriptor['row']['opening']
+        refusal = False if is_head else None
+        if key not in macro_paint_cache:
+            macro_paint_cache[key] = False
+            word = code.words[token]; opening = code.parents[token]
+            if (re.match(r'(?:"|r#*")', word) is None or opening is None
+                    or code.words[opening] != '(' or opening < 4
+                    or code.words[opening - 1] != '!'):
+                return refusal
+            closing = code.pairs[opening]
+            if code.words[token + 1:closing] not in ([], [',']) or token != opening + 1:
+                return refusal
+            first = opening - 2
+            while first >= 2 and code.words[first - 1] == '::':
+                first -= 2
+            path = tuple(code.words[first:opening - 1])
+            if (len(path) < 3 or any(re.fullmatch(r'[A-Za-z_]\w*', value) is None
+                    for value in path[::2]) or any(value != '::' for value in path[1::2])):
+                return refusal
+            row = descriptor['row']; scopes = set(_construct_ancestors(code, first, work))
+            context = statement_context(descriptor, code, dict(first=first))
+            if context is None or not row['opening'] < first < closing < row['end']:
+                return refusal
+            _construct_charge(work, len(code.words) + row['end'] - row['opening'])
+            # A qualified path still needs a stable lexical root. Local items
+            # and statement expansions cannot silently supply a replacement.
+            items = {'use', 'const', 'static', 'fn', 'mod', 'struct', 'enum', 'type', 'trait', 'impl', 'extern'}
+            for index in range(row['opening'] + 1, row['end']):
+                if code.parents[index] in scopes and (code.words[index] in items | {'#', 'macro_rules'}
+                        or index < first and code.words[index] == '!'):
+                    return refusal
+            for index, value in enumerate(code.words):
+                if value == path[0] and index and code.words[index - 1] in (items - {'use'}) | {'crate'}:
+                    return refusal
+                if value in ('!', '#'):
+                    ancestors = _construct_ancestors(code, index, work)
+                    if not any(descriptor['constructs'].get(parent, {}).get('kind') == 'fn'
+                               for parent in ancestors):
+                        return refusal
+            _construct_charge(work, len(word))
+            body = re.sub(r'\\\n[ \t]*', '', word)
+            captures = tuple(re.findall(r'\{([A-Za-z_]\w*)\}', body))
+            remainder = re.sub(r'\{[A-Za-z_]\w*\}', '', body)
+            if any(value in remainder for value in ('{', '}', '\\')):
+                return refusal
+            fn = row['first'] + list(row['header']).index('fn')
+            parameters = fn + 2
+            if code.words[parameters] != '(':
+                return refusal
+            parameter_names = {code.words[index] for index in range(parameters + 1, code.pairs[parameters])
+                if code.parents[index] == parameters and code.words[index - 1] in ('(', ',')
+                and index + 1 < code.pairs[parameters] and code.words[index + 1] == ':'}
+            if not set(captures) <= parameter_names:
+                return refusal
+            preceding = []
+            for rows in descriptor['statements'].values():
+                _construct_charge(work, len(rows))
+                for statement in rows:
+                    if (row['opening'] < statement['first'] <= statement['end'] < first
+                            and code.parents[statement['first']] in scopes):
+                        _construct_charge(work, statement['end'] - statement['first'] + 1)
+                        preceding.append((statement['first'], tuple(code.words[statement['first']:statement['end'] + 1])))
+            _construct_charge(work, len(preceding) * (len(preceding).bit_length() + 1))
+            preceding.sort()
+            head = code.position(code.starts[first])[0]
+            if head not in mapped_lines or code.position(code.ends[opening])[0] != head:
+                return refusal
+            span = code.position(code.starts[token]), code.position(code.ends[closing])
+            _construct_charge(work, sum(len(owner['regions']) + 1 for owner in compiled[0]))
+            if any(tuple(region[:2]) < span[1] and span[0] < tuple(region[2:4])
+                   for owner in compiled[0] for region in owner['regions']):
+                return refusal
+            macro_paint_cache[key] = (head, path, captures, context, tuple(value for index, value in preceding))
+        proof = macro_paint_cache[key]
+        if proof is False:
+            return refusal
+        if is_head:
+            return proof, False
+        high = code.offsets[number] - 1 if number < len(code.offsets) else len(code.text)
+        if not (code.starts[token] < high and low < code.ends[token]):
+            return None
+        outside = code.text[low:min(high, code.starts[token])] + code.text[max(low, code.ends[token]):high]
+        return (proof, True) if not outside.strip() else None
     _construct_charge(work, sum(len(inventory[1]) for inventory in inventories))
     file_counts = [Counter(row['digest'] for row in inventory[1] if row['kind'] == 'statement')
                    for inventory in inventories]
@@ -1569,6 +1669,26 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         tokenless = {line: target for line, target in mapped.items() if all(
             tokenless_without_regions(inventory[0], number, compiled, source)
             for inventory, number, compiled, source in zip(inventories, (line, target), grouped, (old, new)))}
+        macro_paint = {}; macro_bindings = {}
+        mapped_sides = set(mapped), set(mapped.values())
+        for line, target in mapped.items():
+            if line in tokenless:
+                continue
+            proofs = [macro_literal_paint(descriptor, inventory, compiled, source, number, mapped_sides[side])
+                      for side, (descriptor, inventory, compiled, source, number) in enumerate(
+                          zip((left, right), inventories, grouped, (old, new), (line, target)))]
+            if any(proof is False for proof in proofs):
+                failed = True; break
+            if proofs[0] is not None or proofs[1] is not None:
+                if (any(proof is None for proof in proofs) or proofs[0][0][1:] != proofs[1][0][1:]
+                        or proofs[0][1] != proofs[1][1] or mapped.get(proofs[0][0][0]) != proofs[1][0][0]):
+                    failed = True; break
+                macro_bindings[(proofs[0][0][0], proofs[1][0][0])] = proofs[0][0][1:]
+                if proofs[0][1]:
+                    macro_paint[line] = target
+        if failed:
+            continue
+        tokenless.update(macro_paint)
         ordered = sorted((line, target) for line, target in mapped.items() if line not in tokenless)
         if not ordered:
             continue
@@ -1651,9 +1771,15 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
             for side, group in enumerate(groups)]
         _construct_charge(work, sum(4 * len(word) + 8 for key in callback_keys
                                    for part in ((key[0],), key[1], *key[2]) for word in part))
+        _construct_charge(work, sum(len(repr(binding)) for binding in macro_bindings.values()))
         receipts.append(dict(file=name, pairs=[[line, target] for line, target in mapped.items()
                                               if line in before and target in after],
             non_executable_rows=[[line, target] for line, target in tokenless.items()],
+            macro_literal_rows=[[line, target] for line, target in macro_paint.items()],
+            macro_literal_bindings=[dict(base_head_line=base_head, head_head_line=head_head,
+                path=list(binding[0]), captures=list(binding[1]),
+                context_sha256=hashlib.sha256(repr(binding).encode()).hexdigest())
+                for (base_head, head_head), binding in macro_bindings.items()],
             callback_owners=callback_receipt,
             callback_capsule_sha256=[hashlib.sha256(repr(key).encode()).hexdigest() for key in callback_keys],
             base_range=list(groups[0][:2]), head_range=list(groups[1][:2]),

@@ -58,7 +58,9 @@ def validate_evidence(directory, archive, fixture):
                 or text("private-nss.conf") != oracle.private_hosts_nss(original_nss)):
             raise ValueError("private NSS altered services beyond hostname resolution")
         hosts_rows = [line for line in text("private-nss.conf").splitlines() if line.startswith("hosts:")]
-        if hosts_rows != ["hosts: files"] or data("dns-isolation.json").get("resolved_addresses") != ["127.0.0.1"]:
+        dns = data("dns-isolation.json")
+        if (hosts_rows != ["hosts: files"] or dns.get("hostname") != oracle.ARCH_HOST
+                or dns.get("resolved_addresses") != ["127.0.0.1"]):
             raise ValueError("advisory resolution escapes isolated guest hosts")
         release = dict(line.split("=", 1) for line in text("os-release").splitlines() if "=" in line)
         if release.get("ID", "").strip('"') != "arch":
@@ -106,10 +108,23 @@ def validate_evidence(directory, archive, fixture):
         first = next(index for index, event in enumerate(events) if event.get("kind") == "request")
         if any(event.get("kind") != "tls-error" for event in events[:first]):
             raise ValueError("invalid native TLS phase")
-        requests = events[first:]; count = receipt.get("daemon_fixture_requests")
+        controls = receipt.get("snapshot_controls")
+        if not isinstance(controls, dict) or set(controls) != set(oracle.SNAPSHOT_REFUSALS):
+            raise ValueError("snapshot integrity and freshness controls missing")
+        requests = events[first:]
+        for index, mode in enumerate(oracle.SNAPSHOT_REFUSALS):
+            control = controls[mode]
+            if (not isinstance(control, dict) or set(control) != {"argv", "exit_code", "stdout", "stderr", "requests"}
+                    or control["argv"] != ["audit", "scan"] or type(control["exit_code"]) is not int
+                    or control["exit_code"] != 1 or type(control["requests"]) is not int or control["requests"] != 1):
+                raise ValueError("snapshot refusal outcome or request count mismatch")
+            oracle.verify_snapshot_refusal(SimpleNamespace(returncode=control["exit_code"], stdout=control["stdout"], stderr=control["stderr"]), mode)
+            oracle.verify_arch_requests(requests[index:index + 1], version, 1, 1, mode)
+        requests = requests[len(controls):]
+        count = receipt.get("daemon_fixture_requests")
         if (type(count) is not int or count not in (2, 3) or len(requests) != count + 2
                 or receipt.get("direct-plain_requests") != 1 or receipt.get("direct-findings_requests") != 1):
-            raise ValueError("native feed request phases incomplete")
+            raise ValueError("native snapshot request phases incomplete")
         for start, minimum, maximum in ((0, 1, 1), (1, 1, 1), (2, 2, 3)):
             oracle.verify_arch_requests(requests[start:start + 1] if start < 2 else requests[start:], version, minimum, maximum)
         counters = []

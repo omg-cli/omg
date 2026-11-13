@@ -1462,6 +1462,251 @@ mod tests {
     }
 
     #[test]
+    fn migration_inventory_errors_cannot_admit_an_uninspected_update() {
+        let owner = private_directory();
+        let inventory = owner.path().join("inventory");
+        let markers = owner.path().join("markers");
+        std::fs::write(&inventory, b"not a directory").expect("invalid inventory fixture");
+        let error = ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect_err("a non-directory inventory must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot inspect pending Omarchy migrations")
+        );
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[test]
+    fn migration_preflight_ignores_non_scripts_but_refuses_unreadable_scripts() {
+        let owner = private_directory();
+        let inventory = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&inventory).expect("private migration inventory");
+        for name in ["README", "notes.txt", "0001.SH"] {
+            std::fs::write(inventory.join(name), b"yay -Sua\n")
+                .expect("non-script helper documentation");
+        }
+        ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect("non-shell entries are not pending migrations");
+        let script = inventory.join("0002.sh");
+        std::fs::create_dir(&script).expect("directory masquerading as a script");
+        let error = ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect_err("a shell migration must be a regular file");
+        assert!(error.to_string().contains("0002.sh"));
+        std::fs::remove_dir(&script).expect("retire private directory fixture");
+        std::os::unix::fs::symlink(owner.path().join("absent"), &script)
+            .expect("dangling migration link");
+        let error = ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect_err("missing migration contents must fail closed");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("metadata error")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::remove_file(&script).expect("retire dangling link");
+        std::fs::write(&script, [0xff, 0xfe]).expect("non-UTF8 shell contents");
+        let error = ensure_migrations_use_native_aur(&inventory, &markers)
+            .expect_err("uninspectable shell contents must fail closed");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("decoding error")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_worker_failure_does_not_prevent_cleanup_or_reuse() {
+        let mut commands = Commands::new(false);
+        let worker = tokio::spawn(async { panic!("isolated authorization worker failure") });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker failure is observable before cleanup");
+        commands.authorization = Some(worker);
+        commands
+            .cleanup()
+            .await
+            .expect("panicked worker is released");
+        commands
+            .cleanup()
+            .await
+            .expect("cleanup remains idempotent");
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        assert!(
+            commands
+                .run_program(&shell, &["-c", "exit 0"])
+                .await
+                .expect("next inert stage can run after worker failure")
+                .success()
+        );
+        assert!(commands.authorization.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_stage_rejection_preserves_the_owned_child() {
+        let owner = private_directory();
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        let mut commands = Commands::new(false);
+        let mut first = Command::new(&shell);
+        first
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .kill_on_drop(true);
+        commands.start(&mut first).await.expect("owned inert stage");
+        let pid = commands
+            .active
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .expect("owned active child");
+        let marker = owner.path().join("unexpected-second-stage");
+        let error = commands
+            .run_program(
+                &shell,
+                &[
+                    "-c",
+                    "printf unexpected > \"$1\"",
+                    "fixture",
+                    marker.to_str().expect("marker path"),
+                ],
+            )
+            .await
+            .expect_err("overlapping stage must be refused");
+        assert!(error.to_string().contains("already running"));
+        assert!(!marker.exists(), "the rejected stage must never execute");
+        assert_eq!(
+            commands.active.as_ref().and_then(tokio::process::Child::id),
+            Some(pid)
+        );
+        commands
+            .cleanup()
+            .await
+            .expect("original child still belongs to cleanup");
+        assert_eq!(
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).expect("pid")),
+                None
+            ),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_input_pipe_fixture() {
+        let Some(root) = std::env::var_os("OMG_OMARCHY_PIPE_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let lock = open_owned_file(&root.join("lock")).expect("private pipe lock");
+        lock.try_lock().expect("private pipe lease");
+        let log = open_owned_file(&root.join("log")).expect("private pipe transcript");
+        let shell =
+            crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        execute_logged(
+            &shell,
+            &["-c", "IFS= read -r value; printf 'received:<%s>\\n' \"$value\"; if IFS= read -r extra; then exit 19; fi"],
+            &lock,
+            &log,
+        ).await.expect("pipe bytes and EOF reach the owned terminal");
+        let transcript = std::fs::read_to_string(root.join("log")).expect("pipe transcript");
+        assert!(
+            transcript.contains("received:<literal; $(not-a-command) \\tail>"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("OMG Omarchy update finished: exit status: 0"),
+            "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_pipe_input_reaches_the_pty_without_shell_interpretation() {
+        use tokio::io::AsyncWriteExt;
+        let owner = private_directory();
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::terminal_input_pipe_fixture",
+                "--nocapture",
+            ])
+            .env("OMG_OMARCHY_PIPE_FIXTURE", owner.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("isolated pipe transport fixture");
+        let mut input = child.stdin.take().expect("owned pipe input");
+        input
+            .write_all(b"literal; $(not-a-command) \\tail\n")
+            .await
+            .expect("write real pipe bytes");
+        drop(input);
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+            .await
+            .expect("pipe EOF must not strand the coordinator")
+            .expect("pipe fixture status");
+        assert!(
+            output.status.success(),
+            "pipe fixture failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_input_socket_fixture() {
+        if std::env::var_os("OMG_OMARCHY_SOCKET_FIXTURE").is_none() {
+            return;
+        }
+        let Err(error) = terminal_input() else {
+            panic!("socket stdin cannot be reopened as terminal input");
+        };
+        assert!(error.to_string().contains("Cannot open update input"));
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[tokio::test]
+    async fn unsupported_socket_input_fails_before_launching_a_coordinator() {
+        use std::os::fd::OwnedFd;
+        let (input, _peer) = std::os::unix::net::UnixStream::pair().expect("private socket pair");
+        let descriptor: OwnedFd = input.into();
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::terminal_input_socket_fixture",
+                    "--nocapture",
+                ])
+                .env("OMG_OMARCHY_SOCKET_FIXTURE", "1")
+                .stdin(Stdio::from(descriptor))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("socket rejection is bounded")
+        .expect("socket fixture status");
+        assert!(
+            output.status.success(),
+            "socket fixture failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn inherited_descriptors_are_bound_to_their_owned_inodes() {
         let owner = private_directory();
         let path = owner.path().join("handoff");
