@@ -1034,6 +1034,18 @@ failure and cancellation handling remains in place.
 
 The batch passed 2408 library tests with 13 existing ignores, all-target Clippy
 with warnings denied for default, minimal and Debian pure features, and the
-normal CLI/daemon build. The three attended guest scenarios still require a
-fresh instrumented run and optimized-pair verification before an updated build
-can be offered. The earlier d4726393 bundle predates this prompt-flush fix.
+normal CLI/daemon build. The exact committed fix then passed the protected six-artifact guest producer,
+its 14 selected tests, and all 13 Omarchy scenarios. Actual terminal receipts
+recorded the reboot prompt, decline/accept response, window resize and expected
+CLI status, including the failing inert reboot helper. The fresh merged local
+report reached 232/234 Omarchy functions and 3394/3500 lines. Strict source
+coverage comparison still needs work; no threshold or exclusion was changed.
+
+The normal optimized pair from 0584c726 also passed the full signed update,
+user-manager reexecution, six refusal/collision controls, and all 13 Omarchy
+scenarios in a separate disposable guest. Its three attended outcomes passed
+with the same real terminal protocol. The replacement local bundle is
+`omg-pr1057-0584c726-x86_64-arch.tar.gz`, SHA-256
+`b200517913e38b92cfb0d9632297beff1fe59f891fbb96c6097a4e067fa9e30a`.
+This replaces the d4726393 candidate, which predates the prompt-flush fix. The
+host installation remains unchanged, and hosted comparison is still pending.
