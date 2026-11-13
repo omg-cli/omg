@@ -307,6 +307,7 @@ class OmarchyCase(NamedTuple):
     absent_helper: str | None = None
     native_committed: bool = False
     reboot_answer: str | None = None
+    authorization: str | None = None
 
 
 OMARCHY_CASES = {
@@ -336,11 +337,35 @@ OMARCHY_CASES = {
     'omarchy-reboot-failure': OmarchyCase(1, OMARCHY_PREFIX[:1] +
         ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
         scene='reboot-failure', native_committed=True, reboot_answer='y'),
+    'omarchy-authorization-refresh': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='authorization-hold', native_committed=True, authorization='refresh'),
+    'omarchy-authorization-denied': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='authorization-hold', native_committed=True, authorization='denied'),
 }
 
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES)
 STAGES = tuple('registry-' + role for role in TESTS) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
+
+
+def authorization_audit(text):
+    records = [record for record in re.split(
+        r'(?m)(?=^[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+:)', text)
+        if re.search(r'(?:^|[;\n])\s*COMMAND=/usr/bin/true\s*(?:\n|$)', record)]
+    require(len(records) == 2, 'One initial authorization and one timed refresh are required')
+    timestamps = []
+    for record in records:
+        stamp = re.match(r'^[A-Za-z]{3}\s+\d{1,2}\s+(\d{2}):(\d{2}):(\d{2})\s+:', record)
+        require(stamp is not None and ': nobody :' in record and 'USER=root' in record,
+                'Authorization audit has an unexpected actor, target or timestamp')
+        hour, minute, second = map(int, stamp.groups())
+        require(hour < 24 and minute < 60 and second < 60, 'Invalid authorization audit time')
+        timestamps.append(hour * 3600 + minute * 60 + second)
+    require('command not allowed' not in records[0], 'Initial authorization was refused')
+    elapsed = (timestamps[1] - timestamps[0]) % (24 * 3600)
+    require(59 <= elapsed <= 95, 'Authorization refresh did not follow the real interval')
+    return dict(initial_authorizations=1, refresh_count=1, refresh_after_seconds=elapsed,
+                denied='command not allowed' in records[1])
 
 
 def omarchy_guest_script():
@@ -382,6 +407,7 @@ case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
 case "$name:${OMARCHY_FIXTURE_SCENE:-none}" in
   omarchy-snapshot:snapshot-unsupported) exit 127 ;;
   omarchy-system:reboot-failure) exit 7 ;;
+  omarchy-update-dev:authorization-hold) sleep 65 ;;
 esac
 case "$name" in
   omarchy-update-pkg-prune|omarchy-update-keyring|omarchy-update-system-pkgs|omarchy-update-orphan-pkgs|pacman|pacman-key|paccache|yay|aura|paru)
@@ -558,6 +584,9 @@ for stage in OMARCHY_STAGE_NAMES; do
     done
   fi
   scene=none
+  authorization=
+  stage_timeout=40
+  authorization_job=
   reboot_answer=
   absent_helper=
   case "$stage" in
@@ -575,8 +604,22 @@ OMARCHY_CASE_SETUP
     chown nobody:nobody "$case_dir/.local/state/omarchy/reboot-required"
     launch=(python3 "$fixture/attended.py" "$reboot_answer")
   fi
+  if test -n "$authorization"; then
+    printf 'Defaults logfile="/evidence/cli/%s-authorization.log"\nDefaults log_denied\n' "$stage" > /etc/sudoers.d/zz-omg-authorization-log
+    chmod 440 /etc/sudoers.d/zz-omg-authorization-log
+    visudo -cf /etc/sudoers.d/zz-omg-authorization-log
+    if test "$authorization" = denied; then
+      (
+        sleep 5
+        printf 'nobody ALL=(root) NOPASSWD: !/usr/bin/true\n' > /etc/sudoers.d/zzzz-omg-authorization-denied
+        chmod 440 /etc/sudoers.d/zzzz-omg-authorization-denied
+        visudo -cf /etc/sudoers.d/zzzz-omg-authorization-denied
+      ) &
+      authorization_job=$!
+    fi
+  fi
   result=0
-  timeout --signal=TERM --kill-after=3 40 runuser -u nobody -- env -i \
+  timeout --signal=TERM --kill-after=3 "$stage_timeout" runuser -u nobody -- env -i \
     PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
     XDG_RUNTIME_DIR="$case_dir/run" XDG_CONFIG_HOME="$case_dir/config" \
     XDG_CACHE_HOME="$case_dir/cache" XDG_DATA_HOME="$case_dir/data" XDG_STATE_HOME="$case_dir/state" \
@@ -587,6 +630,23 @@ OMARCHY_CASE_SETUP
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  if test -n "$authorization"; then
+    if test -n "$authorization_job"; then wait "$authorization_job"; fi
+    rm -f /etc/sudoers.d/zzzz-omg-authorization-denied /etc/sudoers.d/zz-omg-authorization-log
+    python3 - "$stage" "$authorization" <<'OMG_AUTHORIZATION_RECEIPT'
+import hashlib, json, runpy, stat, sys
+from pathlib import Path
+stage, expected = sys.argv[1:]
+path = Path('/evidence/cli') / (stage + '-authorization.log')
+metadata = path.lstat()
+assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0
+producer = runpy.run_path('/native-cli-coverage.py', run_name='authorization_fixture')
+receipt = producer['authorization_audit'](path.read_text())
+assert receipt['denied'] == (expected == 'denied'), 'Real sudo refusal differs from the selected control'
+receipt.update(log_uid=metadata.st_uid, log_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+path.with_suffix('.json').write_text(json.dumps(receipt)+'\n')
+OMG_AUTHORIZATION_RECEIPT
+  fi
   for profile in /profiles/native-root/omg-extra-*.profraw; do
     test -f "$profile" || continue
     test "$(stat -c %u "$profile")" = 0
@@ -635,7 +695,9 @@ OMG_OMARCHY_NAMESPACE
     setup = '\n'.join(
         f'    {shlex.quote(stage)}) scene={shlex.quote(case.scene)}; '
         f'absent_helper={shlex.quote(case.absent_helper or "")}; '
-        f'reboot_answer={shlex.quote(case.reboot_answer or "")} ;;'
+        f'reboot_answer={shlex.quote(case.reboot_answer or "")}; '
+        f'authorization={shlex.quote(case.authorization or "")}; '
+        f'stage_timeout={95 if case.authorization else 40} ;;'
         for stage, case in OMARCHY_CASES.items())
     return (script.replace('OMARCHY_STAGE_NAMES', ' '.join(map(shlex.quote, OMARCHY_CASES)))
             .replace('OMARCHY_CASE_SETUP', setup)
@@ -865,6 +927,16 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     == 'PASS_SIGNED_NATIVE_STATE', 'Missing committed native package state')
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if case.authorization:
+            observation = authorization_audit((evidence / f'{stage}-authorization.log').read_text())
+            require(observation['denied'] == (case.authorization == 'denied'),
+                    'Real sudo refresh result differs: ' + stage)
+            observation.update(log_uid=0, log_sha256=sha(evidence / f'{stage}-authorization.log'))
+            refresh = json.loads((evidence / f'{stage}-authorization.json').read_text())
+            require(refresh == observation, 'Real authorization audit differs: ' + stage)
+            if case.authorization == 'denied':
+                require('Omarchy update authorization refresh stopped' in log,
+                        'Authorization refusal was not visible')
         if case.reboot_answer:
             interaction = json.loads((evidence / f'{stage}-interaction.json').read_text())
             require(interaction == dict(prompt_observed=True, answer=case.reboot_answer,

@@ -232,6 +232,20 @@ class HostedProducer(unittest.TestCase):
         self.assertLess(native.index('--native-cli-coverage-dir'),
                         native.index('docker start --attach'))
 
+    def test_authorization_refresh_cases_require_real_sudo_audit_records(self):
+        names = {'omarchy-authorization-refresh', 'omarchy-authorization-denied'}
+        self.assertTrue(names <= PRODUCER.OMARCHY_CASES.keys(),
+                        'The real authorization keeper is never exercised past its interval')
+        for stage in names:
+            case = PRODUCER.OMARCHY_CASES[stage]
+            self.assertEqual(case.scene, 'authorization-hold')
+            self.assertIn(case.authorization, ('refresh', 'denied'))
+            self.assertTrue(case.native_committed)
+        script = PRODUCER.omarchy_guest_script()
+        self.assertIn('omarchy-update-dev:authorization-hold) sleep 65', script)
+        self.assertIn("producer['authorization_audit']", script)
+        self.assertIn('!/usr/bin/true', script)
+
     def test_attended_reboot_cases_require_prompt_and_terminal_receipts(self):
         names = {'omarchy-reboot-decline', 'omarchy-reboot-accept', 'omarchy-reboot-failure'}
         self.assertTrue(names <= PRODUCER.OMARCHY_CASES.keys(),
@@ -453,6 +467,17 @@ def evidence_fixture(root):
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         if case.native_committed:
             (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
+        if case.authorization:
+            authorization_log = evidence / f'{stage}-authorization.log'
+            authorization_log.write_text(
+                'Nov 13 23:59:30 : nobody : USER=root ;\n    COMMAND=/usr/bin/true\n'
+                + 'Nov 14 00:00:30 : nobody : '
+                + ('command not allowed ; ' if case.authorization == 'denied' else '')
+                + 'USER=root ;\n    COMMAND=/usr/bin/true\n')
+            (evidence / f'{stage}-authorization.json').write_text(json.dumps(dict(
+                initial_authorizations=1, refresh_count=1, refresh_after_seconds=60,
+                denied=case.authorization == 'denied', log_uid=0,
+                log_sha256=PRODUCER.sha(authorization_log))))
         if case.reboot_answer:
             (evidence / f'{stage}-interaction.json').write_text(json.dumps(dict(
                 prompt_observed=True, answer=case.reboot_answer, resize_sent=1,
@@ -465,6 +490,8 @@ def evidence_fixture(root):
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': '| System is up to date',
+            'omarchy-authorization-refresh': '| System is up to date',
+            'omarchy-authorization-denied': '| System is up to date\nOmarchy update authorization refresh stopped',
             'omarchy-reboot-decline': '| System is up to date\nReboot now?',
             'omarchy-reboot-accept': '| System is up to date\nReboot now?',
             'omarchy-reboot-failure': '| System is up to date\nReboot now?\nOmarchy reboot failed',
@@ -483,13 +510,33 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_authorization_audit_requires_initial_success_and_one_real_interval(self):
+        initial = 'Nov 13 23:59:30 : nobody : USER=root ;\n    COMMAND=/usr/bin/true\n'
+        refresh = 'Nov 14 00:00:30 : nobody : USER=root ;\n    COMMAND=/usr/bin/true\n'
+        observation = PRODUCER.authorization_audit(initial + refresh)
+        self.assertEqual(observation, dict(initial_authorizations=1, refresh_count=1,
+                                          refresh_after_seconds=60, denied=False))
+        denied = ('Nov 14 00:00:30 : nobody : command not allowed ; PWD=/home/bench ;\n'
+                  '    USER=root ; COMMAND=/usr/bin/true\n')
+        self.assertEqual(PRODUCER.authorization_audit(initial + denied),
+                         dict(initial_authorizations=1, refresh_count=1,
+                              refresh_after_seconds=60, denied=True))
+        for text in (initial, initial + refresh + refresh,
+                     initial + refresh.replace('/usr/bin/true', '/usr/bin/true-extra'),
+                     initial + refresh.replace('00:00:30', '23:59:31'),
+                     initial.replace('nobody', 'root') + refresh,
+                     initial.replace('USER=root', 'USER=nobody') + refresh,
+                     initial.replace('USER=root', 'command not allowed ; USER=root') + refresh):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                PRODUCER.authorization_audit(text)
+
     def test_complete_observed_selection_and_processes_have_a_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 18)
+            self.assertEqual(len(receipt['process_checks']), 20)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -523,6 +570,9 @@ class SupplementalEvidence(unittest.TestCase):
             'omarchy-old-logger': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('Script started on fixture\nScript done on fixture\n'),
             'omarchy-no-cleanup': lambda e, p: (e / 'omarchy-success-coordination.txt').write_text('lock still held'),
             'omarchy-no-refusal': lambda e, p: (e / 'omarchy-migration-refusal.log').write_text('failed for another reason'),
+            'no-real-authorization-refresh': lambda e, p: (e / 'omarchy-authorization-refresh-authorization.json').write_text('{}'),
+            'authorization-log-changed': lambda e, p: (e / 'omarchy-authorization-refresh-authorization.log').write_text('different'),
+            'authorization-refusal-hidden': lambda e, p: (e / 'omarchy-authorization-denied.log').write_text('System is up to date'),
             'no-attended-reboot-prompt': lambda e, p: (e / 'omarchy-reboot-accept-interaction.json').write_text('{}'),
             'reboot-failure-hidden': lambda e, p: (e / 'omarchy-reboot-failure.log').write_text('System is up to date\nReboot now?'),
             'missing-helper-not-restored': lambda e, p: (e / 'omarchy-snapshot-missing-layout.txt').write_text('still absent'),
