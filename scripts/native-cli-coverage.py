@@ -30,6 +30,17 @@ def sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def fixture_tree_hashes(directory):
+    result = {}
+    for path in sorted(directory.rglob('*')):
+        require(not path.is_symlink(), 'Native fixture tree contains a symlink')
+        if path.is_file():
+            result[str(path.relative_to(directory))] = sha(path)
+        else:
+            require(path.is_dir(), 'Native fixture tree contains a special file')
+    return result
+
+
 def fixture_command(argv, **kwargs):
     return subprocess.run(argv, check=True, capture_output=True, timeout=40, **kwargs)
 
@@ -164,6 +175,8 @@ def create_signed_fixture(owner):
                'fixture_signer_fingerprint': fingerprint, 'signer_is_authored_throwaway_key': True,
                'host_or_publisher_secret_material_used': False, 'siglevel_weakened': False,
                'initial_packages': initial, 'config_sha256': sha(owner / 'pacman.conf'),
+               'initial_database_sha256': fixture_tree_hashes(owner / 'db/local'),
+               'initial_payload_sha256': fixture_tree_hashes(owner / 'root'),
                'public_before_sha256': hashlib.sha256(before_public).hexdigest(),
                'public_updated_sha256': hashlib.sha256(updated_public).hexdigest(),
                'archive_sha256': {str(p.relative_to(owner)): sha(p) for p in sorted((owner / 'repos').rglob('*')) if p.is_file()}}
@@ -172,25 +185,50 @@ def create_signed_fixture(owner):
 
 
 
-def verify_signed_fixture(owner):
+NATIVE_PHASES = {
+    'initial': 'PASS_NATIVE_INITIAL_STATE',
+    'cache-pruned': 'PASS_NATIVE_CACHE_PRUNED_STATE',
+    'complete': 'PASS_SIGNED_NATIVE_STATE',
+}
+
+
+def verify_signed_fixture(owner, phase='complete'):
+    require(phase in NATIVE_PHASES, 'Unknown native fixture phase')
     receipt = json.loads((owner / 'data-receipt.json').read_text())
+    version = '3-1' if phase == 'complete' else '1-1'
+    obsolete = '1-1' if phase == 'complete' else '3-1'
+    payload_hash = 'after_sha256' if phase == 'complete' else 'before_sha256'
+    expected_records = {name + '-' + version for name in receipt['initial_packages']}
+    if phase != 'complete':
+        expected_records.add('omg-coverage-dead-dep-1-1')
+    actual_records = {path.name for path in (owner / 'db/local').iterdir() if path.is_dir()}
+    require(actual_records == expected_records, 'Native package inventory differs from expected phase')
+    if phase != 'complete':
+        require(fixture_tree_hashes(owner / 'db/local') == receipt['initial_database_sha256'],
+                'Native package database differs from initial state')
+        require(fixture_tree_hashes(owner / 'root') == receipt['initial_payload_sha256'],
+                'Native transaction payload differs from initial state')
     for name, expected in receipt['initial_packages'].items():
-        installed = owner / 'db/local' / (name + '-3-1')
-        require(installed.is_dir() and not (owner / 'db/local' / (name + '-1-1')).exists(),
-                'Native transaction did not upgrade ' + name)
+        installed = owner / 'db/local' / (name + '-' + version)
+        require(installed.is_dir() and not (owner / 'db/local' / (name + '-' + obsolete)).exists(),
+                'Native transaction has an unexpected version for ' + name)
         fields = dict(re.findall(r'%([A-Z]+)%\n(.*?)\n\n', (installed / 'desc').read_text(), re.S))
-        require(fields['NAME'] == name and fields['VERSION'] == '3-1'
+        require(fields['NAME'] == name and fields['VERSION'] == version
                 and int(fields.get('REASON', '0')) == expected['reason'],
                 'Native transaction changed package identity or install intent')
-        require(sha(owner / 'root' / expected['payload_path']) == expected['after_sha256'],
+        require(sha(owner / 'root' / expected['payload_path']) == expected[payload_hash],
                 'Native transaction payload differs for ' + name)
-    require(not (owner / 'db/local/omg-coverage-dead-dep-1-1').exists(), 'Native orphan was retained')
     require((owner / 'cache/unrelated.txt').read_text() == 'must survive pruning\n'
             and (owner / 'outside-cache.txt').read_text() == 'must survive symlink escape\n'
             and (owner / 'cache/escape.pkg.tar.gz').is_symlink(), 'Cache pruning escaped its package scope')
-    require(not (owner / 'cache/omg-coverage-app-0-1-any.pkg.tar.gz').exists(), 'Native cache pruning did not run')
+    for suffix in ('', '.sig'):
+        oldest = owner / ('cache/omg-coverage-app-0-1-any.pkg.tar.gz' + suffix)
+        require(oldest.exists() == (phase == 'initial'), 'Native cache pruning differs from expected phase')
+        for retained in ('1-1', '2-1'):
+            require((owner / f'cache/omg-coverage-app-{retained}-any.pkg.tar.gz{suffix}').is_file(),
+                    'Native cache pruning removed a retained version')
     require(not (owner / 'db/db.lck').exists(), 'Native transaction leaked its database lock')
-    return dict(status='PASS_SIGNED_NATIVE_STATE', packages=receipt['initial_packages'])
+    return dict(status=NATIVE_PHASES[phase], packages=receipt['initial_packages'])
 
 
 def unpack_evidence(archive, directory):
@@ -305,46 +343,51 @@ class OmarchyCase(NamedTuple):
     helpers: tuple[str, ...]
     scene: str = 'none'
     absent_helper: str | None = None
-    native_committed: bool = False
+    native_phase: str = 'initial'
     reboot_answer: str | None = None
     authorization: str | None = None
     lock_location: str = 'session'
+    control: str | None = None
 
 
 OMARCHY_CASES = {
-    'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_committed=True),
-    'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',)),
+    'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
     'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
     'omarchy-optional-failures': OmarchyCase(0, tuple(
         item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
         if item.split('\t')[0] not in ('omarchy-snapshot', 'omarchy-restart-shell', 'omarchy-update-mise')),
-        native_committed=True),
+        native_phase='complete'),
     'omarchy-migration-refusal': OmarchyCase(1, ()),
     'omarchy-unsupported-mode': OmarchyCase(1, ()),
     'omarchy-invalid-transport': OmarchyCase(1, ()),
     'omarchy-snapshot-missing': OmarchyCase(0, tuple(
         item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
-        if item != 'omarchy-snapshot\tcreate'), absent_helper='omarchy-snapshot', native_committed=True),
+        if item != 'omarchy-snapshot\tcreate'), absent_helper='omarchy-snapshot', native_phase='complete'),
     'omarchy-snapshot-unsupported': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
-        scene='snapshot-unsupported', native_committed=True),
+        scene='snapshot-unsupported', native_phase='complete'),
     'omarchy-required-helper-missing': OmarchyCase(1, OMARCHY_PREFIX[:3] +
-        ('omarchy-update-stay-awake\tstop',), absent_helper='omarchy-update-dev'),
+        ('omarchy-update-stay-awake\tstop',), absent_helper='omarchy-update-dev', native_phase='cache-pruned'),
     'omarchy-reboot-decline': OmarchyCase(0, OMARCHY_PREFIX[:1] +
         ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX,
-        native_committed=True, reboot_answer='n'),
+        native_phase='complete', reboot_answer='n'),
     'omarchy-reboot-accept': OmarchyCase(0, OMARCHY_PREFIX[:1] +
         ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
-        native_committed=True, reboot_answer='y'),
+        native_phase='complete', reboot_answer='y'),
     'omarchy-reboot-failure': OmarchyCase(1, OMARCHY_PREFIX[:1] +
         ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
-        scene='reboot-failure', native_committed=True, reboot_answer='y'),
+        scene='reboot-failure', native_phase='complete', reboot_answer='y'),
     'omarchy-authorization-refresh': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
-        scene='authorization-hold', native_committed=True, authorization='refresh'),
+        scene='authorization-hold', native_phase='complete', authorization='refresh'),
     'omarchy-authorization-denied': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
-        scene='authorization-hold', native_committed=True, authorization='denied'),
+        scene='authorization-hold', native_phase='complete', authorization='denied'),
     'omarchy-runtime-fallback': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
-        native_committed=True, lock_location='temporary'),
+        native_phase='complete', lock_location='temporary'),
     'omarchy-runtime-foreign-lock': OmarchyCase(1, (), lock_location='foreign'),
+    'omarchy-interrupted': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='cancellation-hold', native_phase='cache-pruned', control='interrupt'),
+    'omarchy-output-closed': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='cancellation-hold', native_phase='cache-pruned', control='output-closed'),
 }
 
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES)
@@ -412,6 +455,17 @@ case "$name:${OMARCHY_FIXTURE_SCENE:-none}" in
   omarchy-snapshot:snapshot-unsupported) exit 127 ;;
   omarchy-system:reboot-failure) exit 7 ;;
   omarchy-update-dev:authorization-hold) sleep 65 ;;
+  omarchy-update-dev:cancellation-hold)
+    sleep 30 &
+    descendant=$!
+    printf '%s %s\n' "$$" "$descendant" > "$OMARCHY_HELPER_TRACE.stage"
+    printf 'omg-owned-stage-ready\n'
+    while kill -0 "$descendant" 2>/dev/null; do
+      printf 'owned-stage-pulse\n'
+      sleep 0.1
+    done
+    wait "$descendant"
+    ;;
 esac
 case "$name" in
   omarchy-update-pkg-prune|omarchy-update-keyring|omarchy-update-system-pkgs|omarchy-update-orphan-pkgs|pacman|pacman-key|paccache|yay|aura|paru)
@@ -421,6 +475,88 @@ case "$name" in
   *) exit 0 ;;
 esac
 OMG_INERT_OMARCHY_STAGE
+cat > "$fixture/control.py" <<'OMG_CONTROL_OMARCHY_DRIVER'
+import json, os, select, signal, stat, subprocess, sys, time
+from pathlib import Path
+
+mode = sys.argv[1]
+assert mode in ('interrupt', 'output-closed')
+unrelated = subprocess.Popen(['/usr/bin/sleep', '60'], start_new_session=True)
+process = None
+identities = []
+acted = False
+seen = bytearray()
+size = 0
+
+def identity(pid):
+    path = Path('/proc') / str(pid) / 'stat'
+    try:
+        fields = path.read_text().rsplit(')', 1)[1].split()
+        return dict(pid=pid, start=fields[19], group=int(fields[2]), uid=path.stat().st_uid)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+try:
+    process = subprocess.Popen(['/omg-extra-bin/cli', 'update', '--yes'],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True)
+    streams = {process.stdout.fileno(): process.stdout, process.stderr.fileno(): process.stderr}
+    stdout_fd = process.stdout.fileno()
+    deadline = time.monotonic() + 25
+    while streams or process.poll() is None:
+        assert time.monotonic() < deadline, 'Controlled CLI did not stop within its deadline'
+        for fd in select.select(list(streams), [], [], 0.1)[0]:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                streams.pop(fd).close()
+                continue
+            size += len(chunk)
+            assert size <= 1024 * 1024, 'Controlled CLI output exceeded its budget'
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            if fd == stdout_fd:
+                seen.extend(chunk)
+            if not acted and b'omg-owned-stage-ready' in seen:
+                marker = Path(os.environ['OMARCHY_HELPER_TRACE'] + '.stage')
+                metadata = marker.lstat()
+                assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid()
+                pids = [int(value) for value in marker.read_text().split()]
+                assert len(pids) == 2 and len(set(pids)) == 2
+                identities = [identity(pid) for pid in pids]
+                assert all(row and row['uid'] == os.getuid() for row in identities)
+                assert all(row['group'] == pids[0] for row in identities)
+                assert unrelated.pid not in pids and process.pid not in pids
+                if mode == 'interrupt':
+                    os.kill(process.pid, signal.SIGINT)
+                else:
+                    streams.pop(stdout_fd).close()
+                acted = True
+    code = process.wait(timeout=2)
+    assert acted, 'Owned stage readiness was not observed'
+    assert code == 1, f'Controlled CLI returned {code}; expected a handled failure (1)'
+    retired = time.monotonic() + 2
+    while any(identity(row['pid']) == row for row in identities) and time.monotonic() < retired:
+        time.sleep(0.05)
+    assert all(identity(row['pid']) != row for row in identities), 'Owned stage or descendant survived cleanup'
+    survived = unrelated.poll() is None
+    assert survived, 'Unrelated process was terminated by update cleanup'
+    receipt = dict(mode=mode, ready_observed=acted, cli_exit_code=code,
+        unrelated_pid=unrelated.pid, unrelated_survived=survived,
+        owned_processes=identities, owned_processes_gone=True)
+    Path(os.environ['OMARCHY_HELPER_TRACE']).with_name('control.json').write_text(json.dumps(receipt)+'\n')
+finally:
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+    if unrelated.poll() is None:
+        unrelated.terminate()
+    unrelated.wait(timeout=3)
+sys.exit(code)
+OMG_CONTROL_OMARCHY_DRIVER
 cat > "$fixture/foreign-stage-prefix" <<'OMG_FOREIGN_OMARCHY_STAGE_PREFIX'
 #!/bin/bash
 set -euo pipefail
@@ -626,6 +762,9 @@ OMARCHY_CASE_SETUP
     chown nobody:nobody "$case_dir/.local/state/omarchy/reboot-required"
     launch=(python3 "$fixture/attended.py" "$reboot_answer")
   fi
+  if test -n "$control"; then
+    launch=(python3 "$fixture/control.py" "$control")
+  fi
   if test -n "$authorization"; then
     printf 'Defaults logfile="/evidence/cli/%s-authorization.log"\nDefaults log_denied\n' "$stage" > /etc/sudoers.d/zz-omg-authorization-log
     chmod 440 /etc/sudoers.d/zz-omg-authorization-log
@@ -680,11 +819,8 @@ OMG_AUTHORIZATION_RECEIPT
     cmp "$fixture/stage" "/usr/bin/$absent_helper"
     printf 'absent helper restored after genuine CLI execution\n' > "/evidence/cli/$stage-layout.txt"
   fi
-  case "$stage" in
-    OMARCHY_COMMITTED_CASES)
-    python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" \
-      > "/evidence/cli/$stage-native-state.json" ;;
-  esac
+  python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" --phase "$native_phase" \
+    > "/evidence/cli/$stage-native-state.json"
   if test "$stage" = omarchy-optional-failures; then
     for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
       test -L "/usr/bin/$name"
@@ -699,6 +835,9 @@ OMG_AUTHORIZATION_RECEIPT
   fi
   if test -n "$reboot_answer"; then
     cp "$case_dir/interaction.json" "/evidence/cli/$stage-interaction.json"
+  fi
+  if test -n "$control"; then
+    cp "$case_dir/control.json" "/evidence/cli/$stage-control.json"
   fi
   printf '%s\n' "$result" > "/evidence/cli/$stage-exit.txt"
   cp "$case_dir/helpers.tsv" "/evidence/cli/$stage-helpers.tsv"
@@ -727,12 +866,12 @@ OMG_OMARCHY_NAMESPACE
         f'reboot_answer={shlex.quote(case.reboot_answer or "")}; '
         f'authorization={shlex.quote(case.authorization or "")}; '
         f'lock_location={shlex.quote(case.lock_location)}; '
+        f'native_phase={shlex.quote(case.native_phase)}; '
+        f'control={shlex.quote(case.control or "")}; '
         f'stage_timeout={95 if case.authorization else 40} ;;'
         for stage, case in OMARCHY_CASES.items())
     return (script.replace('OMARCHY_STAGE_NAMES', ' '.join(map(shlex.quote, OMARCHY_CASES)))
-            .replace('OMARCHY_CASE_SETUP', setup)
-            .replace('OMARCHY_COMMITTED_CASES', '|'.join(shlex.quote(stage)
-                     for stage, case in OMARCHY_CASES.items() if case.native_committed)))
+            .replace('OMARCHY_CASE_SETUP', setup))
 
 
 def guest_script(artifacts, compiled_cli):
@@ -952,11 +1091,35 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require(transcript.startswith('OMG Omarchy update started\n')
                     and '\nOMG Omarchy update finished: ' in transcript,
                     'Omarchy has no complete genuine PTY transcript: ' + stage)
-        if case.native_committed:
-            require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
-                    == 'PASS_SIGNED_NATIVE_STATE', 'Missing committed native package state')
+        require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
+                == NATIVE_PHASES[case.native_phase], 'Native package state differs: ' + stage)
+        if case.native_phase == 'complete':
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if case.control:
+            control = json.loads((evidence / f'{stage}-control.json').read_text())
+            require(set(control) == {'mode', 'ready_observed', 'cli_exit_code', 'unrelated_pid',
+                                     'unrelated_survived', 'owned_processes', 'owned_processes_gone'},
+                    'Unexpected cancellation receipt schema')
+            require(control['mode'] == case.control and control['ready_observed'] is True
+                    and control['cli_exit_code'] == case.exit_status
+                    and control['unrelated_survived'] is True and control['owned_processes_gone'] is True,
+                    'Controlled cancellation or process cleanup differs')
+            rows = control['owned_processes']
+            require(type(control['unrelated_pid']) is int and control['unrelated_pid'] > 1
+                    and type(rows) is list and len(rows) == 2,
+                    'Cancellation process inventory differs')
+            for row in rows:
+                require(set(row) == {'pid', 'start', 'group', 'uid'}
+                        and type(row['pid']) is int and row['pid'] > 1
+                        and type(row['group']) is int and row['group'] == rows[0]['pid']
+                        and row['uid'] == 65534 and re.fullmatch(r'[0-9]+', row['start']),
+                        'Cancellation process identity differs')
+            require(len({row['pid'] for row in rows}) == 2
+                    and control['unrelated_pid'] not in {row['pid'] for row in rows},
+                    'Unrelated process overlaps the owned stage')
+            diagnostic = 'Omarchy update interrupted' if case.control == 'interrupt' else 'Update output disconnected'
+            require(diagnostic in log, 'Cancellation failure was not reported: ' + stage)
         if case.lock_location == 'foreign':
             require((evidence / f'{stage}-layout.txt').read_text()
                     == 'foreign fallback lock was preserved; transcript unchanged\n',
@@ -1098,6 +1261,7 @@ def main():
     signed.add_argument('--owner', required=True, type=Path)
     signed_check = commands.add_parser('verify-signed-fixture')
     signed_check.add_argument('--owner', required=True, type=Path)
+    signed_check.add_argument('--phase', choices=tuple(NATIVE_PHASES), default='complete')
     extraction = commands.add_parser('unpack')
     extraction.add_argument('--archive', required=True, type=Path)
     extraction.add_argument('--directory', required=True, type=Path)
@@ -1116,7 +1280,7 @@ def main():
     elif args.operation == 'signed-fixture':
         create_signed_fixture(args.owner)
     elif args.operation == 'verify-signed-fixture':
-        print(json.dumps(verify_signed_fixture(args.owner)))
+        print(json.dumps(verify_signed_fixture(args.owner, args.phase)))
     elif args.operation == 'unpack':
         unpack_evidence(args.archive, args.directory)
     elif args.operation == 'controller-path':

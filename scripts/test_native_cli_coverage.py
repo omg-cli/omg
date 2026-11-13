@@ -24,6 +24,50 @@ SPEC.loader.exec_module(PRODUCER)
 
 
 class HostedProducer(unittest.TestCase):
+    def test_interrupted_update_requires_exact_partial_native_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            database = owner / 'db'
+            (database / 'local').mkdir(parents=True)
+            (owner / 'cache').mkdir()
+            payload = b'original payload\n'
+            PRODUCER.fixture_local_package(owner / 'root', database, 'fixture-app', '1-1',
+                                           'usr/share/fixture/value', payload, 0)
+            PRODUCER.fixture_local_package(owner / 'root', database, 'omg-coverage-dead-dep', '1-1',
+                                           'usr/share/fixture/orphan', b'orphan\n', 1)
+            (owner / 'data-receipt.json').write_text(json.dumps(dict(
+                initial_database_sha256=PRODUCER.fixture_tree_hashes(database / 'local'),
+                initial_payload_sha256=PRODUCER.fixture_tree_hashes(owner / 'root'), initial_packages={
+                'fixture-app': dict(reason=0, payload_path='usr/share/fixture/value',
+                                    before_sha256=hashlib.sha256(payload).hexdigest(),
+                                    after_sha256=hashlib.sha256(b'updated\n').hexdigest())})))
+            (owner / 'cache/unrelated.txt').write_text('must survive pruning\n')
+            (owner / 'outside-cache.txt').write_text('must survive symlink escape\n')
+            (owner / 'cache/escape.pkg.tar.gz').symlink_to(owner / 'outside-cache.txt')
+            for version in ('1-1', '2-1'):
+                (owner / f'cache/omg-coverage-app-{version}-any.pkg.tar.gz').write_bytes(b'cached')
+                (owner / f'cache/omg-coverage-app-{version}-any.pkg.tar.gz.sig').write_bytes(b'signature')
+            state = PRODUCER.verify_signed_fixture(owner, phase='cache-pruned')
+            self.assertEqual(state['status'], 'PASS_NATIVE_CACHE_PRUNED_STATE')
+            original = owner / 'root/usr/share/fixture/value'
+            original.write_bytes(b'unexpected write')
+            with self.assertRaisesRegex(ValueError, 'payload differs'):
+                PRODUCER.verify_signed_fixture(owner, phase='cache-pruned')
+            original.write_bytes(payload)
+            (owner / 'db/db.lck').write_text('leaked')
+            with self.assertRaisesRegex(ValueError, 'database lock'):
+                PRODUCER.verify_signed_fixture(owner, phase='cache-pruned')
+
+    def test_cancellation_cases_keep_unrelated_processes_and_native_state(self):
+        for stage, control in [('omarchy-interrupted', 'interrupt'),
+                               ('omarchy-output-closed', 'output-closed')]:
+            self.assertIn(stage, PRODUCER.OMARCHY_CASES,
+                          'Native coverage omits cancellation or output-disconnection behavior')
+            case = PRODUCER.OMARCHY_CASES[stage]
+            self.assertEqual(case.control, control)
+            self.assertEqual(case.native_phase, 'cache-pruned')
+            self.assertEqual(case.exit_status, 1)
+
     @unittest.skipIf(os.name == 'nt', 'QEMU transport preflight requires POSIX Bash')
     def test_native_coverage_transport_reaches_preflight_with_bound_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -252,7 +296,7 @@ class HostedProducer(unittest.TestCase):
             case = PRODUCER.OMARCHY_CASES[stage]
             self.assertEqual(case.scene, 'authorization-hold')
             self.assertIn(case.authorization, ('refresh', 'denied'))
-            self.assertTrue(case.native_committed)
+            self.assertEqual(case.native_phase, 'complete')
         script = PRODUCER.omarchy_guest_script()
         self.assertIn('omarchy-update-dev:authorization-hold) sleep 65', script)
         self.assertIn("producer['authorization_audit']", script)
@@ -265,7 +309,7 @@ class HostedProducer(unittest.TestCase):
         for stage in names:
             case = PRODUCER.OMARCHY_CASES[stage]
             self.assertIn(case.reboot_answer, ('y', 'n'))
-            self.assertTrue(case.native_committed)
+            self.assertEqual(case.native_phase, 'complete')
         script = PRODUCER.omarchy_guest_script()
         self.assertIn('pty.fork()', script)
         self.assertIn('signal.SIGWINCH', script)
@@ -477,8 +521,13 @@ def evidence_fixture(root):
             (evidence / f'{stage}-coordination.txt').write_text(
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
-        if case.native_committed:
-            (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
+        (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status=PRODUCER.NATIVE_PHASES[case.native_phase])))
+        if case.control:
+            (evidence / f'{stage}-control.json').write_text(json.dumps(dict(
+                mode=case.control, ready_observed=True, cli_exit_code=1, unrelated_pid=600,
+                unrelated_survived=True, owned_processes_gone=True,
+                owned_processes=[dict(pid=700, start='1000', group=700, uid=65534),
+                                 dict(pid=701, start='1001', group=700, uid=65534)])))
         if case.lock_location == 'foreign':
             (evidence / f'{stage}-layout.txt').write_text(
                 'foreign fallback lock was preserved; transcript unchanged\n')
@@ -505,6 +554,8 @@ def evidence_fixture(root):
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': '| System is up to date',
+            'omarchy-interrupted': 'Omarchy update interrupted',
+            'omarchy-output-closed': 'Update output disconnected',
             'omarchy-runtime-fallback': '| System is up to date',
             'omarchy-runtime-foreign-lock': 'Omarchy coordination file must be single-link',
             'omarchy-authorization-refresh': '| System is up to date',
@@ -553,7 +604,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 22)
+            self.assertEqual(len(receipt['process_checks']), 24)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -587,6 +638,8 @@ class SupplementalEvidence(unittest.TestCase):
             'omarchy-old-logger': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('Script started on fixture\nScript done on fixture\n'),
             'omarchy-no-cleanup': lambda e, p: (e / 'omarchy-success-coordination.txt').write_text('lock still held'),
             'omarchy-no-refusal': lambda e, p: (e / 'omarchy-migration-refusal.log').write_text('failed for another reason'),
+            'cancelled-but-stage-survived': lambda e, p: (e / 'omarchy-interrupted-control.json').write_text('{}'),
+            'cancelled-before-package-state-check': lambda e, p: (e / 'omarchy-interrupted-native-state.json').write_text('{"status":"PASS_SIGNED_NATIVE_STATE"}'),
             'foreign-fallback-was-overwritten': lambda e, p: (e / 'omarchy-runtime-foreign-lock-layout.txt').write_text('overwritten'),
             'foreign-fallback-no-ownership-diagnostic': lambda e, p: (e / 'omarchy-runtime-foreign-lock.log').write_text('failed for another reason'),
             'no-real-authorization-refresh': lambda e, p: (e / 'omarchy-authorization-refresh-authorization.json').write_text('{}'),

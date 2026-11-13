@@ -953,6 +953,9 @@ struct Interruptions {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
     hangup: tokio::signal::unix::Signal,
+    // The CLI restores SIGPIPE's default at startup. Keep pipe writes fallible
+    // during an update so the relay can drain the coordinator's cleanup.
+    _broken_pipe: tokio::signal::unix::Signal,
 }
 
 impl Interruptions {
@@ -962,6 +965,7 @@ impl Interruptions {
             interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
             hangup: signal(SignalKind::hangup())?,
+            _broken_pipe: signal(SignalKind::pipe())?,
         })
     }
 

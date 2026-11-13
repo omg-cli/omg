@@ -1077,3 +1077,29 @@ and 16 tests. The current merged local report reaches all 234 instrumented
 Omarchy functions and 3408/3500 lines; this does not establish full branch or
 line coverage, and strict source comparison remains open. Rust and Cargo inputs
 still match the verified 0584c726 bundle.
+
+The cancellation batch exposed a production failure through the actual CLI,
+which the library-only terminal tests did not reproduce. Closing its output
+pipe after a helper and descendant became ready terminated the CLI with
+`SIGPIPE`: the regression reported `Controlled CLI returned -13; expected a
+handled failure (1)`. CLI startup deliberately restores Unix pipe termination.
+The updater now registers pipe handling with its existing interruption streams,
+allowing its write-error path to stop and drain the coordinator before reporting
+failure. Ordinary commands retain their existing startup pipe behavior.
+
+The two real cancellation controls passed in a narrow disposable Arch guest
+probe in 18.671 seconds. They observed helper process identities before the
+signal or pipe closure, checked their disappearance after cleanup, and confirmed
+that an unrelated process survived. Installed payload and local database hashes
+remained unchanged, the cache retained its two intended versions, and the lock
+was released. No profiles from this exploratory probe were imported. The full
+six-role producer, 19 scenarios, broad Rust checks and replacement release build
+still require verification. The prior optimized bundle predates this fix.
+
+Native fixture verification now distinguishes initial, cache-pruned and completed
+states. Every declared scenario verifies its expected package state, including
+refused or interrupted updates. All original scenarios, coverage thresholds,
+source checks and artifact roles remain required. Producer tests passed 32 cases;
+45 ordinary-user exporter tests passed, and the root-only exporter case passed
+inside the disposable guest. The current hosted instrumented run passed, while
+its strict added-file coverage comparison still fails for the Omarchy module.

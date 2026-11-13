@@ -45,8 +45,9 @@ class AllowlistTests(unittest.TestCase):
                       'omarchy-required-helper-missing', 'omarchy-reboot-decline',
                       'omarchy-reboot-accept', 'omarchy-reboot-failure',
                       'omarchy-authorization-refresh', 'omarchy-authorization-denied',
-                      'omarchy-runtime-fallback', 'omarchy-runtime-foreign-lock'):
-            for suffix in ('.log', '-helpers.tsv', '-native-state.json', '-layout.txt', '-interaction.json', '-authorization.json', '-authorization.log', '-exit.txt'):
+                      'omarchy-runtime-fallback', 'omarchy-runtime-foreign-lock',
+                      'omarchy-interrupted', 'omarchy-output-closed'):
+            for suffix in ('.log', '-helpers.tsv', '-native-state.json', '-layout.txt', '-interaction.json', '-control.json', '-authorization.json', '-authorization.log', '-exit.txt'):
                 name = stage + suffix
                 with self.subTest(name=name):
                     self.assertTrue(exporter.allowed_file((*prefix, name)))
