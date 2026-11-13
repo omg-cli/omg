@@ -815,6 +815,11 @@ fn main() {
 
     let mut args: Vec<String> = std::env::args().collect();
 
+    #[cfg(feature = "arch")]
+    if let Err(error) = omg_lib::cli::packages::contain_inherited_transport(&args) {
+        finish(Err(error));
+    }
+
     if omg_lib::cli::update_notice::try_handle(&args) {
         std::process::exit(0);
     }

@@ -10,6 +10,10 @@ mod arch;
 #[cfg(feature = "arch")]
 mod omarchy;
 
+#[cfg(feature = "arch")]
+#[doc(hidden)]
+pub use omarchy::contain_inherited_transport;
+
 pub async fn update_fast() -> Result<()> {
     dispatch_backend! {
         debian: { super::common::update_official_only(false, true, false, false, super::common::UpdateMode::Fast).await },

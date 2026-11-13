@@ -30,6 +30,9 @@ pub use remove::remove;
 pub use search::{search, search_sync_cli, search_sync_cli_with_limit, search_with_json};
 pub use status::{status, status_with_json};
 pub use sync_db::sync_databases as sync;
+#[cfg(feature = "arch")]
+#[doc(hidden)]
+pub use update::contain_inherited_transport;
 pub use update::{update, update_fast, update_turbo};
 
 /// Dispatch to the compiled package-manager backend.
