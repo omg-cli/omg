@@ -296,7 +296,6 @@ jobs:
                 runuser -u nobody -- bwrap --clearenv --share-net --unshare-pid --new-session \
                   --die-with-parent "$network" --ro-bind / / --proc /proc -- /bin/cat /proc/self/attr/current
               done
-              python /native-cli-coverage.py run
               /fixture --include-ignored --list > /evidence/registry.txt
               run_case() {
                 local test_name=$1
@@ -376,9 +375,14 @@ jobs:
           while IFS=$'\t' read -r role artifact; do
             install -m 755 "$artifact" "$staging/bin/$role"
           done < <(jq -r '.artifacts | to_entries[] | [.key, .value.path] | @tsv' "$evidence_dir/cli-manifest.json")
-          docker cp "$staging/native-cli-coverage.py" "$container:/native-cli-coverage.py"
-          docker cp "$staging/native-cli-manifest.json" "$container:/native-cli-manifest.json"
-          docker cp "$staging/bin" "$container:/omg-extra-bin"
+          bash scripts/benchmark-qemu.sh --distro arch --arch x86_64 \
+            --staged-dir "$staging" --native-cli-coverage-dir "$staging" \
+            --evidence-dir "$RUNNER_TEMP/native-cli-qemu"
+          mapfile -t native_returns < <(find "$RUNNER_TEMP/native-cli-qemu" -type d -name native-evidence)
+          test "${#native_returns[@]}" = 1
+          cp -a "${native_returns[0]}/cli" "$evidence_dir/cli"
+          native_profiles="${native_returns[0]%/native-evidence}/native-profiles"
+          find "$native_profiles" -maxdepth 1 -type f -name 'omg-extra-*.profraw' -exec cp -t "$profile_dir" {} +
           if timeout --kill-after=5s 780s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
             run_status=0
           else
@@ -416,7 +420,12 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: coverage-native-fixtures
-          path: ${{ runner.temp }}/native-coverage-evidence/
+          path: |
+            ${{ runner.temp }}/native-coverage-evidence/
+            ${{ runner.temp }}/native-cli-qemu/**/native-coverage.log
+            ${{ runner.temp }}/native-cli-qemu/**/native-evidence/
+            ${{ runner.temp }}/native-cli-qemu/**/boot*.log
+            ${{ runner.temp }}/native-cli-qemu/**/results.json
           if-no-files-found: error
           retention-days: 14
 

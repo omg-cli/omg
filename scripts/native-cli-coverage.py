@@ -2,14 +2,20 @@
 """Run the same exact Arch CLI coverage cases in disposable Docker or QEMU guests."""
 
 import argparse
+import base64
+import gzip
+import io
+import time
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import stat
 import subprocess
+import sys
+import tarfile
 import xml.etree.ElementTree as ET
 
 
@@ -21,6 +27,241 @@ def require(condition, message):
 def sha(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def fixture_command(argv, **kwargs):
+    return subprocess.run(argv, check=True, capture_output=True, timeout=40, **kwargs)
+
+
+def fixture_member(archive, name, value):
+    data = value.encode() if isinstance(value, str) else value
+    info = tarfile.TarInfo(name)
+    info.uid = info.gid = 0
+    info.mode = 0o644
+    info.mtime = 1
+    info.size = len(data)
+    archive.addfile(info, io.BytesIO(data))
+
+
+def fixture_package(directory, name, version, payload_path, payload, depends=()):
+    path = directory / f'{name}-{version}-any.pkg.tar.gz'
+    info = (f'pkgname = {name}\npkgbase = {name}\npkgver = {version}\n'
+            'pkgdesc = inert coverage fixture\nbuilddate = 1\npackager = Native Fixture <coverage@example.invalid>\n'
+            f'size = {len(payload)}\narch = any\nlicense = MIT\n'
+            + ''.join(f'depend = {dep}\n' for dep in depends)).encode()
+    build = (f'format = 2\npkgname = {name}\npkgbase = {name}\npkgver = {version}\n'
+             'pkgarch = any\nbuilddate = 1\npackager = Native Fixture <coverage@example.invalid>\n').encode()
+    contents = [('.PKGINFO', info), ('.BUILDINFO', build), (payload_path, payload)]
+    mtree = '#mtree\n/set uid=0 gid=0 type=file\n' + ''.join(
+        f'./{p} mode=644 size={len(b)} time=1.0 sha256digest={hashlib.sha256(b).hexdigest()}\n'
+        for p, b in contents)
+    with tarfile.open(path, 'w:gz', format=tarfile.GNU_FORMAT) as archive:
+        fixture_member(archive, '.PKGINFO', info)
+        fixture_member(archive, '.BUILDINFO', build)
+        fixture_member(archive, '.MTREE', gzip.compress(mtree.encode(), mtime=0))
+        fixture_member(archive, payload_path, payload)
+    return path
+
+
+def fixture_local_package(root, database, name, version, payload_path, payload, reason, depends=()):
+    location = database / 'local' / f'{name}-{version}'
+    location.mkdir()
+    fields = {'NAME': name, 'BASE': name, 'VERSION': version, 'DESC': 'inert coverage fixture',
+              'ARCH': 'any', 'BUILDDATE': '1', 'INSTALLDATE': '1',
+              'SIZE': str(len(payload)), 'REASON': str(reason), 'LICENSE': 'MIT', 'VALIDATION': 'pgp', 'PACKAGER': 'Native Fixture <coverage@example.invalid>'}
+    if depends:
+        fields['DEPENDS'] = '\n'.join(depends)
+    (location / 'desc').write_text(''.join(f'%{k}%\n{v}\n\n' for k, v in fields.items()))
+    (location / 'files').write_text(f'%FILES%\n{payload_path}\n\n')
+    target = root / payload_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(payload)
+
+
+def create_signed_fixture(owner):
+    if os.geteuid() != 0:
+        raise RuntimeError('Guest root setup required')
+    for kind in ('mnt', 'net'):
+        if os.readlink('/proc/self/ns/' + kind) == os.readlink('/proc/1/ns/' + kind):
+            raise RuntimeError('Private guest namespaces required before fixture setup')
+    if fixture_command(['systemd-detect-virt', '--vm'], text=True).stdout.strip() not in ('qemu', 'kvm'):
+        raise RuntimeError('Disposable QEMU guest required')
+    if owner.parent != Path('/opt') or not owner.name.startswith('omg-coverage-') or owner.exists():
+        raise RuntimeError('New exact /opt/omg-coverage-* fixture owner required')
+    owner.mkdir(mode=0o755)
+    for path in ('root', 'db/local', 'db/sync', 'cache', 'repos/core', 'repos/omarchy', 'signing', 'gnupg'):
+        (owner / path).mkdir(parents=True, exist_ok=True)
+    for path in ('signing', 'gnupg'):
+        (owner / path).chmod(0o700)
+    (owner / 'db/local/ALPM_DB_VERSION').write_text('9\n')
+    signing = ['gpg', '--batch', '--homedir', str(owner / 'signing'), '--pinentry-mode', 'loopback', '--passphrase', '']
+    fixture_command(signing + ['--quick-generate-key', 'OMG coverage fixture <coverage@example.invalid>', 'ed25519', 'cert,sign', '1d'])
+    listing = fixture_command(signing + ['--with-colons', '--fingerprint', '--list-keys'], text=True).stdout
+    fingerprints = [line.split(':')[9] for line in listing.splitlines() if line.startswith('fpr:')]
+    if len(fingerprints) != 1 or len(fingerprints[0]) != 40:
+        raise RuntimeError('One exact private fixture signing fingerprint required')
+    fingerprint = fingerprints[0]
+    before_public = fixture_command(signing + ['--export', fingerprint]).stdout
+    public_path = owner / 'fixture-public.gpg'
+    public_path.write_bytes(before_public)
+    ring = ['gpg', '--batch', '--homedir', str(owner / 'gnupg'), '--no-default-keyring', '--keyring', str(owner / 'gnupg/pubring.gpg')]
+    fixture_command(ring + ['--import', str(public_path)])
+    fixture_command(ring + ['--import-ownertrust'], input=(fingerprint + ':6:\n').encode())
+    fixture_command(ring + ['--check-trustdb'])
+    if not (owner / 'gnupg/pubring.gpg').is_file():
+        raise RuntimeError('Initialized pacman-compatible public keyring required')
+    fixture_command(signing + ['--quick-add-uid', fingerprint, 'Updated coverage fixture <updated19@example.invalid>'])
+    updated_public = fixture_command(signing + ['--export', fingerprint]).stdout
+    if before_public == updated_public:
+        raise RuntimeError('Updated public bundle must differ from initial bundle')
+    initial = {}
+    repositories = {'core': [], 'omarchy': []}
+    for name, repository, reason, depends in (
+        ('archlinux-keyring', 'core', 0, ()), ('omarchy-keyring', 'omarchy', 0, ()),
+        ('omg-coverage-app', 'core', 0, ('omg-coverage-dep>=1-1',)),
+        ('omg-coverage-dep', 'core', 1, ()), ('omg-coverage-desktop', 'omarchy', 0, ())):
+        keyring = name.endswith('-keyring')
+        payload_path = ('usr/share/pacman/keyrings/' + name.removesuffix('-keyring') + '.gpg'
+                        if keyring else 'usr/share/omg-coverage/' + name + '.txt')
+        old_payload = before_public if keyring else (name + ': installed1\n').encode()
+        new_payload = updated_public if keyring else (name + ': upgraded3\n').encode()
+        fixture_local_package(owner / 'root', owner / 'db', name, '1-1', payload_path, old_payload, reason, depends)
+        archive = fixture_package(owner / 'repos' / repository, name, '3-1', payload_path, new_payload, depends)
+        fixture_command(signing + ['--local-user', fingerprint, '--detach-sign', '--output', str(archive) + '.sig', str(archive)])
+        repositories[repository].append((name, archive, payload_path, new_payload, depends))
+        initial[name] = {'version': '1-1', 'reason': reason, 'payload_path': payload_path,
+                         'before_sha256': hashlib.sha256(old_payload).hexdigest(),
+                         'after_sha256': hashlib.sha256(new_payload).hexdigest()}
+    for name, reason in (('omg-coverage-dead-dep', 1),):
+        fixture_local_package(owner / 'root', owner / 'db', name, '1-1', 'usr/share/omg-coverage/' + name + '.txt', b'retain unless actual orphan\n', reason)
+    for repository, records in repositories.items():
+        database = owner / 'repos' / repository / (repository + '.db')
+        with tarfile.open(database, 'w:gz') as archive:
+            for name, file, payload_path, payload, depends in records:
+                fields = {'NAME': name, 'BASE': name, 'VERSION': '3-1', 'FILENAME': file.name,
+                          'DESC': 'inert signed coverage fixture', 'ARCH': 'any', 'PACKAGER': 'Native Fixture <coverage@example.invalid>',
+                          'CSIZE': str(file.stat().st_size), 'ISIZE': str(len(payload)),
+                          'SHA256SUM': sha(file), 'PGPSIG': base64.b64encode(Path(str(file) + '.sig').read_bytes()).decode(), 'LICENSE': 'MIT'}
+                if depends:
+                    fields['DEPENDS'] = '\n'.join(depends)
+                fixture_member(archive, name + '-3-1/desc', ''.join(f'%{k}%\n{v}\n\n' for k, v in fields.items()))
+        fixture_command(signing + ['--local-user', fingerprint, '--detach-sign', '--output', str(database) + '.sig', str(database)])
+    for version in ('0-1', '1-1', '2-1'):
+        file = fixture_package(owner / 'cache', 'omg-coverage-app', version, 'usr/share/omg-coverage/omg-coverage-app.txt', b'cached fixture\n', ('omg-coverage-dep>=1-1',))
+        fixture_command(signing + ['--local-user', fingerprint, '--detach-sign', '--output', str(file) + '.sig', str(file)])
+    (owner / 'cache/unrelated.txt').write_text('must survive pruning\n')
+    (owner / 'outside-cache.txt').write_text('must survive symlink escape\n')
+    (owner / 'cache/escape.pkg.tar.gz').symlink_to(owner / 'outside-cache.txt')
+    configuration = ('[options]\nRootDir = ' + str(owner / 'root') + '\nDBPath = ' + str(owner / 'db')
+                     + '\nCacheDir = ' + str(owner / 'cache') + '\nGPGDir = ' + str(owner / 'gnupg')
+                     + '\nLogFile = ' + str(owner / 'pacman.log')
+                     + '\nArchitecture = auto\nSigLevel = Required TrustedOnly\nLocalFileSigLevel = Required TrustedOnly\n')
+    for repository in repositories:
+        configuration += '[' + repository + ']\nSigLevel = Required TrustedOnly\nServer = file://' + str(owner / 'repos' / repository) + '\n'
+    (owner / 'pacman.conf').write_text(configuration)
+    receipt = {'status': 'PREPARED_DATA_ONLY_NOT_RUNTIME_PROOF', 'owner': str(owner), 'created_unix': time.time(),
+               'fixture_signer_fingerprint': fingerprint, 'signer_is_authored_throwaway_key': True,
+               'host_or_publisher_secret_material_used': False, 'siglevel_weakened': False,
+               'initial_packages': initial, 'config_sha256': sha(owner / 'pacman.conf'),
+               'public_before_sha256': hashlib.sha256(before_public).hexdigest(),
+               'public_updated_sha256': hashlib.sha256(updated_public).hexdigest(),
+               'archive_sha256': {str(p.relative_to(owner)): sha(p) for p in sorted((owner / 'repos').rglob('*')) if p.is_file()}}
+    (owner / 'data-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    return receipt
+
+
+
+def verify_signed_fixture(owner):
+    receipt = json.loads((owner / 'data-receipt.json').read_text())
+    for name, expected in receipt['initial_packages'].items():
+        installed = owner / 'db/local' / (name + '-3-1')
+        require(installed.is_dir() and not (owner / 'db/local' / (name + '-1-1')).exists(),
+                'Native transaction did not upgrade ' + name)
+        fields = dict(re.findall(r'%([A-Z]+)%\n(.*?)\n\n', (installed / 'desc').read_text(), re.S))
+        require(fields['NAME'] == name and fields['VERSION'] == '3-1'
+                and int(fields.get('REASON', '0')) == expected['reason'],
+                'Native transaction changed package identity or install intent')
+        require(sha(owner / 'root' / expected['payload_path']) == expected['after_sha256'],
+                'Native transaction payload differs for ' + name)
+    require(not (owner / 'db/local/omg-coverage-dead-dep-1-1').exists(), 'Native orphan was retained')
+    require((owner / 'cache/unrelated.txt').read_text() == 'must survive pruning\n'
+            and (owner / 'outside-cache.txt').read_text() == 'must survive symlink escape\n'
+            and (owner / 'cache/escape.pkg.tar.gz').is_symlink(), 'Cache pruning escaped its package scope')
+    require(not (owner / 'cache/omg-coverage-app-0-1-any.pkg.tar.gz').exists(), 'Native cache pruning did not run')
+    require(not (owner / 'db/db.lck').exists(), 'Native transaction leaked its database lock')
+    return dict(status='PASS_SIGNED_NATIVE_STATE', packages=receipt['initial_packages'])
+
+
+def unpack_evidence(archive, directory):
+    metadata = archive.lstat()
+    require(stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 ** 3,
+            'Returned archive must be a bounded regular file')
+    owner = directory.parent.stat()
+    directory.mkdir(mode=0o700)
+    seen = set()
+    total = 0
+    with tarfile.open(archive, 'r:') as bundle:
+        for index, member in enumerate(bundle):
+            require(index < 8192, 'Returned archive has too many members')
+            name = PurePosixPath(member.name)
+            require(not name.is_absolute() and '..' not in name.parts
+                    and not any(ord(character) < 32 or character == '\\' for character in member.name),
+                    'Unsafe returned archive path')
+            require(member.isdir() or member.isreg(), 'Returned archive contains a non-regular entry')
+            if name == PurePosixPath('.'):
+                require(member.isdir(), 'Archive root must be a directory')
+                continue
+            require(name not in seen, 'Duplicate returned archive path')
+            seen.add(name)
+            target = directory.joinpath(*name.parts)
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if member.isdir():
+                target.mkdir(mode=0o700, exist_ok=True)
+                continue
+            total += member.size
+            require(0 <= member.size <= 64 * 1024 ** 2 and total <= 512 * 1024 ** 2,
+                    'Returned archive exceeds its extraction budget')
+            with bundle.extractfile(member) as source, target.open('xb') as output:
+                remaining = member.size
+                while remaining:
+                    chunk = source.read(min(remaining, 1024 * 1024))
+                    require(chunk, 'Truncated returned archive member')
+                    output.write(chunk)
+                    remaining -= len(chunk)
+            target.chmod(0o600)
+    # The controller may run as root; ownership follows the caller's work directory.
+    for path in (directory, *directory.rglob('*')):
+        if (path.stat().st_uid, path.stat().st_gid) != (owner.st_uid, owner.st_gid):
+            os.chown(path, owner.st_uid, owner.st_gid)
+
+
+def controller_bind_path(path, mounts):
+    def absolute(value):
+        require(isinstance(value, str) and value and not value.startswith('//')
+                and not any(ord(character) < 32 or character == ',' for character in value),
+                'Unsafe controller mount path')
+        parsed = PurePosixPath(value)
+        require(parsed.is_absolute() and '..' not in parsed.parts, 'Controller mount path must be absolute without parent traversal')
+        return parsed
+
+    requested = absolute(path)
+    require(isinstance(mounts, list), 'Docker mounts must be an array')
+    candidates = []
+    for mount in mounts:
+        require(isinstance(mount, dict), 'Invalid Docker mount record')
+        if mount.get('Type') != 'bind':
+            continue
+        destination = absolute(mount.get('Destination'))
+        if requested.is_relative_to(destination):
+            candidates.append((destination, mount))
+    require(candidates, 'No bind mount maps the requested controller directory')
+    depth = max(len(destination.parts) for destination, _ in candidates)
+    closest = [(destination, mount) for destination, mount in candidates if len(destination.parts) == depth]
+    require(len(closest) == 1, 'Ambiguous controller mount mapping')
+    destination, mount = closest[0]
+    require(mount.get('RW') is True, 'Controller workspace bind must be writable')
+    source = absolute(mount.get('Source'))
+    return str(source / requested.relative_to(destination))
 
 
 TESTS = {
@@ -48,16 +289,14 @@ CASES = tuple((f'test-{index:02}', role, name)
               for index, (role, name) in enumerate(
                   ((role, name) for role, names in TESTS.items() for name in names), 1))
 OMARCHY_PREFIX = (
-    'omarchy-update-requires-free-space', 'sudo\ttrue', 'omarchy-update-pkg-prune',
-    'omarchy-snapshot\tcreate', 'omarchy-update-stay-awake\tstart',
-    'omarchy-update-dev', 'omarchy-update-keyring', 'omarchy-update-system-pkgs')
+    'omarchy-update-requires-free-space', 'omarchy-snapshot\tcreate',
+    'omarchy-update-stay-awake\tstart', 'omarchy-update-dev')
 OMARCHY_SUFFIX = (
     'omarchy-migrate\t--pending', 'omarchy-restart-shell', 'omarchy-migrate',
-    'omarchy-update-orphan-pkgs\t-y', 'omarchy-update-analyze-logs',
+    'omarchy-update-analyze-logs',
     'omarchy-shell\t-q\tomarchy.system-update\tclear',
     'omarchy-update-restart\t--services-only', 'omarchy-hook\tpost-update',
-    'omarchy-update-mise', 'omarchy-update-boot', 'omarchy-update-stay-awake\tstop',
-    'omarchy-update-restart\t--reboot-only')
+    'omarchy-update-mise', 'omarchy-update-boot', 'omarchy-update-stay-awake\tstop')
 OMARCHY_CASES = {
     'omarchy-success': (0, OMARCHY_PREFIX + OMARCHY_SUFFIX),
     'omarchy-vendor-failure': (1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',)),
@@ -111,19 +350,13 @@ omarchy_security_require_source_root() {
 case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
 case "$name" in
-  yay|aura|paru) printf 'external AUR helper must never run\n' >&2; exit 99 ;;
+  omarchy-update-pkg-prune|omarchy-update-keyring|omarchy-update-system-pkgs|omarchy-update-orphan-pkgs|pacman|pacman-key|paccache|yay|aura|paru)
+    printf 'external package helper must never run in the native fixture\n' >&2; exit 99 ;;
   omarchy-update-confirm) test "$OMARCHY_FIXTURE_CASE" != omarchy-declined ;;
-  omarchy-update-system-pkgs) test "$OMARCHY_FIXTURE_CASE" != omarchy-vendor-failure ;;
   omarchy-snapshot|omarchy-update-mise) test "$OMARCHY_FIXTURE_CASE" != omarchy-optional-failures ;;
   *) exit 0 ;;
 esac
 OMG_INERT_OMARCHY_STAGE
-cat > "$fixture/sudo" <<'OMG_INERT_SUDO'
-#!/bin/bash
-set -euo pipefail
-case "$*" in true|'-n true') ;; *) printf 'unexpected fixture sudo request\n' >&2; exit 99 ;; esac
-{ printf sudo; printf '\t%s' "$@"; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
-OMG_INERT_SUDO
 cat > "$fixture/foreign-stage-prefix" <<'OMG_FOREIGN_OMARCHY_STAGE_PREFIX'
 #!/bin/bash
 set -euo pipefail
@@ -135,8 +368,20 @@ for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-u
   tail -n +2 "$fixture/stage" >> "$fixture/foreign/bin/$name"
   chmod 755 "$fixture/foreign/bin/$name"
 done
-chmod 755 "$fixture/stage" "$fixture/sudo"
-mount --bind "$fixture/sudo" "$(readlink -f /usr/bin/sudo)"
+chmod 755 "$fixture/stage"
+test -u /usr/bin/sudo
+runuser -u nobody -- sudo -n /usr/bin/true
+for name in pacman pacman-key paccache; do
+  if test -e "/usr/bin/$name"; then
+    mount --bind "$fixture/stage" "$(readlink -e "/usr/bin/$name")"
+  else
+    install -m 755 "$fixture/stage" "/usr/bin/$name"
+  fi
+done
+install -d -m 700 /profiles/native-root
+printf 'Defaults env_file="/etc/omg-native-coverage.env"\nnobody ALL=(root) NOPASSWD: /usr/bin/true, /usr/bin/systemd-run --scope --quiet --collect -- /omg-extra-bin/cli *\n' > /etc/sudoers.d/omg-native-coverage
+chmod 440 /etc/sudoers.d/omg-native-coverage
+visudo -cf /etc/sudoers.d/omg-native-coverage
 created=()
 trap 'for path in "${created[@]}"; do rm -f -- "$path"; done; rm -rf -- "$fixture"' EXIT
 for name in omarchy-update-requires-free-space omarchy-update-confirm omarchy-update-pkg-prune \
@@ -150,6 +395,15 @@ for name in omarchy-update-requires-free-space omarchy-update-confirm omarchy-up
 done
 case_root=/var/tmp/omg-extra-nobody/omarchy
 install -d -m 700 -o nobody -g nobody "$case_root"
+ip link set lo up
+python3 -m http.server 18080 --bind 127.0.0.1 --directory /opt > "$fixture/repository-server.log" 2>&1 &
+repository_server=$!
+trap 'kill "$repository_server"; wait "$repository_server" || true; for path in "${created[@]}"; do rm -f -- "$path"; done; rm -rf -- "$fixture"' EXIT
+for ((attempt=0; attempt<50; attempt++)); do
+  if python3 -c 'import socket; socket.create_connection(("127.0.0.1", 18080), 1).close()' 2>/dev/null; then break; fi
+  kill -0 "$repository_server"
+  sleep 0.1
+done
 for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-optional-failures \
   omarchy-migration-refusal omarchy-unsupported-mode omarchy-invalid-transport; do
   case_dir="$case_root/$stage"
@@ -157,9 +411,16 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
     "$case_dir/db" "$case_dir/db/local" "$case_dir/db/sync" "$case_dir/migrations" \
     "$case_dir/checkout/bin" "$case_dir/checkout/migrations"
   printf 'telemetry_enabled = false\n[aur]\nsecurity_profile = "standard"\n' > "$case_dir/config/config.toml"
-  printf '[options]\nArchitecture = auto\nDBPath = %s/db\n[core]\nSigLevel = Never\nServer = file:///nonexistent\n' "$case_dir" > "$case_dir/pacman.conf"
-  tar -czf "$case_dir/db/sync/core.db" --files-from /dev/null
-  printf '9\n' > "$case_dir/db/local/ALPM_DB_VERSION"
+  signed_owner="/opt/omg-coverage-$stage"
+  python3 /native-cli-coverage.py signed-fixture --owner "$signed_owner"
+  sed -i "s|file://$signed_owner/repos/|http://127.0.0.1:18080/${signed_owner##*/}/repos/|g" "$signed_owner/pacman.conf"
+  cp "$signed_owner/pacman.conf" "$case_dir/pacman.conf"
+  mount --bind "$signed_owner/pacman.conf" /etc/pacman.conf
+  if test "$stage" = omarchy-vendor-failure; then
+    printf 'invalid database signature\n' > "$signed_owner/repos/core/core.db.sig"
+  fi
+  printf 'LLVM_PROFILE_FILE=/profiles/native-root/omg-extra-%s-%%p-%%m.profraw\n' "$stage" > /etc/omg-native-coverage.env
+  chmod 600 /etc/omg-native-coverage.env
   : > "$case_dir/helpers.tsv"
   printf '#!/bin/bash\nexit 88\n' > "$case_dir/checkout/bin/omarchy-migrate"
   chmod 755 "$case_dir/checkout/bin/omarchy-migrate"
@@ -200,12 +461,21 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
     XDG_CACHE_HOME="$case_dir/cache" XDG_DATA_HOME="$case_dir/data" XDG_STATE_HOME="$case_dir/state" \
     OMG_CONFIG_DIR="$case_dir/config" OMG_CACHE_DIR="$case_dir/cache" OMG_DATA_DIR="$case_dir/data" \
     OMG_DAEMON_DATA_DIR="$case_dir/daemon" OMG_DISABLE_DAEMON=1 OMG_DISABLE_TELEMETRY=1 \
-    OMG_PACMAN_CONF="$case_dir/pacman.conf" OMG_PACMAN_DB_DIR="$case_dir/db" \
+    OMG_PACMAN_CONF="$case_dir/pacman.conf" OMG_PACMAN_DB_DIR="$signed_owner/db" \
     OMARCHY_PATH="$case_dir/checkout" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@"' \
     bash "${args[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  for profile in /profiles/native-root/omg-extra-*.profraw; do
+    test -f "$profile" || continue
+    test "$(stat -c %u "$profile")" = 0
+    mv "$profile" /profiles/
+  done
+  if test "$stage" = omarchy-success || test "$stage" = omarchy-optional-failures; then
+    python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" \
+      > "/evidence/cli/$stage-native-state.json"
+  fi
   if test "$stage" = omarchy-optional-failures; then
     for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
       test -L "/usr/bin/$name"
@@ -451,6 +721,8 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     and '\nOMG Omarchy update finished: ' in transcript,
                     'Omarchy has no complete genuine PTY transcript: ' + stage)
         if stage in ('omarchy-success', 'omarchy-optional-failures'):
+            require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
+                    == 'PASS_SIGNED_NATIVE_STATE', 'Missing committed native package state')
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
         if stage == 'omarchy-optional-failures':
@@ -462,7 +734,7 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         elif stage == 'omarchy-vendor-failure':
             require('Omarchy update did not complete' in log, 'Missing vendor failure diagnostic')
         elif stage == 'omarchy-migration-refusal':
-            require('external AUR helper' in log, 'Missing native-AUR migration refusal')
+            require('external package helper' in log, 'Missing native package migration refusal')
         elif stage == 'omarchy-unsupported-mode':
             require('complete update lifecycle' in log, 'Unsupported Omarchy scope accepted')
         elif stage == 'omarchy-invalid-transport':
@@ -525,6 +797,15 @@ def read_manifest(path):
     return value
 
 
+def validate_artifact_copies(directory, artifacts):
+    for role, artifact in artifacts.items():
+        path = directory / role
+        info = path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_size == artifact['bytes']
+                and os.access(path, os.X_OK) and sha(path) == artifact['sha256'],
+                'Copied artifact identity differs: ' + role)
+
+
 def run_guest(manifest):
     require(os.geteuid() == 0, 'Supplemental execution requires a disposable root guest')
     directory = Path('/omg-extra-bin')
@@ -534,10 +815,7 @@ def run_guest(manifest):
         info = path.lstat()
         require(not stat.S_ISLNK(info.st_mode) and info.st_uid == 0 and info.st_mode & 0o022 == 0,
                 'Supplemental input is writable or not root-owned: ' + str(path))
-    for role, artifact in manifest['artifacts'].items():
-        path = directory / role
-        require(path.is_file() and path.stat().st_size == artifact['bytes']
-                and sha(path) == artifact['sha256'], 'Copied artifact identity differs: ' + role)
+    validate_artifact_copies(directory, manifest['artifacts'])
     script = guest_script(manifest['artifacts'], manifest['artifacts']['cli']['path'])
     subprocess.run(['bash', '-euo', 'pipefail', '-c', script], check=True, timeout=660)
     for role, artifact in manifest['artifacts'].items():
@@ -553,6 +831,15 @@ def main():
     admission.add_argument('--source-commit', required=True)
     admission.add_argument('--output', required=True, type=Path)
     commands.add_parser('run')
+    signed = commands.add_parser('signed-fixture')
+    signed.add_argument('--owner', required=True, type=Path)
+    signed_check = commands.add_parser('verify-signed-fixture')
+    signed_check.add_argument('--owner', required=True, type=Path)
+    extraction = commands.add_parser('unpack')
+    extraction.add_argument('--archive', required=True, type=Path)
+    extraction.add_argument('--directory', required=True, type=Path)
+    mapping = commands.add_parser('controller-path')
+    mapping.add_argument('--path', required=True)
     verification = commands.add_parser('verify')
     verification.add_argument('--manifest', required=True, type=Path)
     verification.add_argument('--evidence', required=True, type=Path)
@@ -563,6 +850,16 @@ def main():
         with args.output.open('x') as stream:
             json.dump(value, stream, indent=2)
             stream.write('\n')
+    elif args.operation == 'signed-fixture':
+        create_signed_fixture(args.owner)
+    elif args.operation == 'verify-signed-fixture':
+        print(json.dumps(verify_signed_fixture(args.owner)))
+    elif args.operation == 'unpack':
+        unpack_evidence(args.archive, args.directory)
+    elif args.operation == 'controller-path':
+        metadata = sys.stdin.buffer.read(1024 * 1024 + 1)
+        require(len(metadata) <= 1024 * 1024, 'Docker mount metadata exceeds its bound')
+        print(controller_bind_path(args.path, json.loads(metadata)))
     elif args.operation == 'run':
         run_guest(read_manifest(Path('/native-cli-manifest.json')))
     else:

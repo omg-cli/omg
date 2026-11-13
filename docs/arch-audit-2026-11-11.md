@@ -965,8 +965,11 @@ response is held. AUR RPC occurs only after post-update hooks. Forbidden package
 helper execution remains zero, the real guest database and prepared images remain
 unchanged, and shutdown is clean.
 
-These are source-bound local results. CI's older fake-sudo/package-helper fixture
-still needs migration to real systemd execution before publication. Hosted
-coverage comparison and optimized installation acceptance remain pending. New
+These are source-bound local results. Supplemental CLI coverage now uses the
+existing KVM runner with real sudo and systemd; package-helper sentinels refuse
+execution. All seven migrated Omarchy scenarios pass locally, including signed
+package payload, install-reason, orphan and cache assertions for both successful
+updates. The workflow and transport checks pass. Full hosted instrumented
+execution, coverage comparison and optimized installation acceptance remain pending. New
 trust bootstrap is unsupported, and controlled helper fixtures do not certify all
 vendor migrations or maintainer hooks. No host system update was performed.

@@ -1,11 +1,14 @@
 """The native coverage job must execute its supplemental CLI producer."""
 
 import importlib.util
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -21,6 +24,138 @@ SPEC.loader.exec_module(PRODUCER)
 
 
 class HostedProducer(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'QEMU transport preflight requires POSIX Bash')
+    def test_native_coverage_transport_reaches_preflight_with_bound_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            inputs = owner / 'inputs'
+            binaries = inputs / 'bin'
+            binaries.mkdir(parents=True)
+            artifacts = {}
+            for role in PRODUCER.ROLES:
+                executable = binaries / role
+                executable.write_bytes(b'preflight-only fixture, never executed\n')
+                executable.chmod(0o755)
+                artifacts[role] = dict(path='/compiled/' + role, bytes=executable.stat().st_size,
+                                       sha256=hashlib.sha256(executable.read_bytes()).hexdigest())
+            commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+            manifest = dict(source_commit=commit,
+                            producer_sha256=PRODUCER.sha(ROOT / 'scripts/native-cli-coverage.py'),
+                            artifacts=artifacts)
+            (inputs / 'native-cli-manifest.json').write_text(json.dumps(manifest))
+            fake_tools = owner / 'tools'
+            fake_tools.mkdir()
+            docker = fake_tools / 'docker'
+            docker.write_text('#!/bin/sh\nprintf "%s\n" "$*" >> "$FAKE_DOCKER_LOG"\nexit 7\n')
+            docker.chmod(0o755)
+            staged = owner / 'staged'
+            staged.mkdir()
+            calls = owner / 'docker-calls'
+            environment = dict(os.environ, PATH=str(fake_tools) + os.pathsep + os.environ['PATH'],
+                               OMG_QEMU_ALLOW_NO_KVM='1', FAKE_DOCKER_LOG=str(calls))
+            benchmark = os.environ.get('OMG_NATIVE_BENCHMARK_UNDER_TEST', str(ROOT / 'scripts/benchmark-qemu.sh'))
+            args = [BASH, benchmark, '--distro', 'arch', '--arch', 'x86_64', '--release', 'v0.1.224',
+                    '--staged-dir', str(staged), '--native-cli-coverage-dir', str(inputs),
+                    '--evidence-dir', str(owner / 'evidence')]
+            result = subprocess.run(args, cwd=ROOT, env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertTrue(calls.is_file(), 'Closed native transport was not admitted to its Docker preflight')
+            self.assertEqual(calls.read_text(), 'version --format {{.Server.Version}}\n')
+            reports = list((owner / 'evidence').glob('run-*/results.json'))
+            self.assertEqual(len(reports), 1)
+            self.assertEqual(json.loads(reports[0].read_text())[0]['case_id'], 'qemu-arch-native-cli-coverage')
+            calls.unlink()
+            (binaries / 'cli').write_bytes(b'tampered')
+            refused = subprocess.run(args, cwd=ROOT, env=environment, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertFalse(calls.exists(), 'Unbound executable bytes reached Docker')
+
+    def test_signed_fixture_package_has_native_signature_preflight_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = PRODUCER.fixture_package(Path(directory), 'fixture-app', '3-1',
+                                               'usr/share/fixture/value', b'updated', ('fixture-dep>=1-1',))
+            with tarfile.open(archive) as package:
+                metadata = package.extractfile('.PKGINFO').read().decode()
+                self.assertIn('packager = ', metadata)
+                self.assertIn('depend = fixture-dep>=1-1\n', metadata)
+                self.assertEqual(package.extractfile('usr/share/fixture/value').read(), b'updated')
+                self.assertIsNotNone(package.getmember('.MTREE'))
+
+    def test_guest_archive_transport_extracts_only_bounded_regular_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            archive = owner / 'returned.tar'
+            with tarfile.open(archive, 'w') as tar:
+                member = tarfile.TarInfo('cli/real.log')
+                value = b'actual captured evidence\n'
+                member.size = len(value)
+                tar.addfile(member, io.BytesIO(value))
+            destination = owner / 'evidence'
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/native-cli-coverage.py'),
+                                     'unpack', '--archive', str(archive), '--directory', str(destination)],
+                                    text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((destination / 'cli/real.log').read_bytes(), value)
+            self.assertFalse((destination / 'cli/real.log').is_symlink())
+
+    def test_guest_archive_transport_refuses_escape_links_devices_and_duplicates(self):
+        cases = [('../escape', tarfile.REGTYPE, ''), ('/absolute', tarfile.REGTYPE, ''),
+                 ('cli/link', tarfile.SYMTYPE, '../../escape'),
+                 ('cli/hard', tarfile.LNKTYPE, 'cli/real.log'), ('cli/fifo', tarfile.FIFOTYPE, '')]
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            sentinel = owner / 'escape'
+            sentinel.write_bytes(b'unchanged')
+            for index, (name, kind, target) in enumerate(cases):
+                archive = owner / ('bad-' + str(index) + '.tar')
+                with tarfile.open(archive, 'w') as tar:
+                    member = tarfile.TarInfo(name)
+                    member.type, member.linkname = kind, target
+                    tar.addfile(member)
+                result = subprocess.run([sys.executable, str(ROOT / 'scripts/native-cli-coverage.py'),
+                                         'unpack', '--archive', str(archive),
+                                         '--directory', str(owner / ('evidence-' + str(index)))],
+                                        text=True, capture_output=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0, name)
+                self.assertEqual(sentinel.read_bytes(), b'unchanged')
+            archive = owner / 'duplicate.tar'
+            with tarfile.open(archive, 'w') as tar:
+                for _ in range(2):
+                    tar.addfile(tarfile.TarInfo('same'))
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/native-cli-coverage.py'),
+                                     'unpack', '--archive', str(archive), '--directory', str(owner / 'duplicate')],
+                                    text=True, capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_controller_mapping_uses_the_most_specific_writable_bind(self):
+        mounts = [
+            {'Type': 'bind', 'Source': '/home/runner/work', 'Destination': '/__w', 'RW': True},
+            {'Type': 'bind', 'Source': '/runner/temp', 'Destination': '/__w/_temp', 'RW': True},
+        ]
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/native-cli-coverage.py'),
+                                 'controller-path', '--path', '/__w/_temp/owned-native/run-one'],
+                                input=json.dumps(mounts), text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '/runner/temp/owned-native/run-one\n')
+
+    def test_controller_mapping_refuses_unmapped_ambiguous_or_unsafe_paths(self):
+        writable = {'Type': 'bind', 'Source': '/runner/temp', 'Destination': '/__w/_temp', 'RW': True}
+        cases = [
+            ('/__w/_temporary/run', [writable]),
+            ('/__w/_temp/../outside', [writable]),
+            ('/__w/_temp/run,other', [writable]),
+            ('/__w/_temp/run', [dict(writable, RW=False)]),
+            ('/__w/_temp/run', [dict(writable, Type='volume')]),
+            ('/__w/_temp/run', [writable, dict(writable, Source='/different')]),
+            ('/__w/_temp/run', [dict(writable, Source='relative')]),
+        ]
+        for path, mounts in cases:
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/native-cli-coverage.py'),
+                                     'controller-path', '--path', path], input=json.dumps(mounts),
+                                    text=True, capture_output=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0, path)
+            self.assertFalse(result.stdout, 'Refused mount mappings must not produce a usable host path')
+
     def test_native_image_installs_supplemental_runtime_dependencies(self):
         workflow = (ROOT / '.github/workflows/coverage.yml').read_text()
         image = workflow.split("docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'", 1)[1]
@@ -64,10 +199,11 @@ class HostedProducer(unittest.TestCase):
         native = native.split('\n      - name:', 1)[0]
         self.assertIn('python3 scripts/native-cli-coverage.py prepare', native,
                       'Hosted native coverage omits the six-artifact supplemental CLI producer')
-        self.assertIn('python /native-cli-coverage.py run', native)
+        self.assertIn('--native-cli-coverage-dir', native)
+        self.assertNotIn('python /native-cli-coverage.py run', native)
         self.assertIn('python3 scripts/native-cli-coverage.py verify', native)
-        self.assertLess(native.index('python /native-cli-coverage.py run'),
-                        native.index('mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib'))
+        self.assertLess(native.index('--native-cli-coverage-dir'),
+                        native.index('docker start --attach'))
 
     def test_generated_omarchy_cases_use_the_real_cli_in_a_private_namespace(self):
         artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
@@ -78,14 +214,37 @@ class HostedProducer(unittest.TestCase):
         self.assertIn('omarchy-success', script)
         self.assertIn('omarchy-vendor-failure', script)
         self.assertIn('omarchy-migration-refusal', script)
-        self.assertIn('mount --bind "$fixture/sudo"', script)
+        self.assertIn('test -u /usr/bin/sudo', script)
+        self.assertNotIn('mount --bind "$fixture/sudo"', script)
         self.assertIn('exec /omg-extra-bin/cli update', script)
+
+    @unittest.skipIf(os.name == 'nt', 'Guest sentinel scripts require POSIX Bash')
+    def test_package_helper_sentinels_refuse_instead_of_faking_success(self):
+        script = PRODUCER.omarchy_guest_script()
+        helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'bin').mkdir()
+            trace = root / 'helpers.tsv'
+            environment = dict(os.environ, OMARCHY_PATH=str(root),
+                               OMARCHY_FIXTURE_CASE='omarchy-success', OMARCHY_HELPER_TRACE=str(trace))
+            for name in ('omarchy-update-pkg-prune', 'omarchy-update-keyring',
+                         'omarchy-update-system-pkgs', 'omarchy-update-orphan-pkgs',
+                         'pacman', 'pacman-key', 'paccache', 'yay', 'aura', 'paru'):
+                program = root / 'bin' / name
+                program.write_text(helper)
+                program.chmod(0o755)
+                result = subprocess.run([str(program)], env=environment, text=True,
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 99,
+                                 name + ' must refuse with the package sentinel status: ' + result.stderr)
+                self.assertEqual(trace.read_text().splitlines()[-1], name,
+                                 'Forbidden execution must leave a real invocation record')
 
     @unittest.skipIf(os.name == 'nt', 'Inert guest helper scripts require POSIX Bash')
     def test_inert_omarchy_helpers_record_arguments_and_reject_external_aur(self):
         script = PRODUCER.omarchy_guest_script()
         helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
-        sudo = script.split("<<'OMG_INERT_SUDO'\n", 1)[1].split('\nOMG_INERT_SUDO', 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             (root / 'bin').mkdir()
@@ -95,17 +254,14 @@ class HostedProducer(unittest.TestCase):
             for name, args, source, status in (
                     ('omarchy-update-dev', [], helper, 0),
                     ('omarchy-shell', ['-q', 'omarchy.system-update', 'clear'], helper, 0),
-                    ('sudo', ['true'], sudo, 0),
-                    ('sudo', ['-n', 'true'], sudo, 0),
-                    ('yay', ['-Sua'], helper, 99),
-                    ('sudo', ['pacman', '-Syu'], sudo, 99)):
+                    ('yay', ['-Sua'], helper, 99)):
                 path = root / 'bin' / name
                 path.write_text(source)
                 result = subprocess.run([BASH, str(path), *args], env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, status, result.stderr)
             self.assertEqual(trace.read_text().splitlines(), [
                 'omarchy-update-dev', 'omarchy-shell\t-q\tomarchy.system-update\tclear',
-                'sudo\ttrue', 'sudo\t-n\ttrue', 'yay\t-Sua'])
+                'yay\t-Sua'])
 
     @unittest.skipIf(os.name == 'nt', 'Inert guest helper scripts require POSIX Bash')
     def test_inert_omarchy_helper_rejects_mismatched_runtime_before_trace(self):
@@ -157,18 +313,12 @@ class HostedProducer(unittest.TestCase):
 
     @unittest.skipIf(os.name == 'nt', 'Native sync archive fixture requires POSIX tar')
     def test_omarchy_fixture_database_uses_supported_compression(self):
-        command = next(line.strip() for line in PRODUCER.omarchy_guest_script().splitlines()
-                       if line.strip().startswith('tar ') and 'db/sync/core.db' in line)
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / 'db/sync').mkdir(parents=True)
-            result = subprocess.run(
-                [BASH, '-euo', 'pipefail', '-c', 'case_dir="$OMARCHY_FIXTURE_DIRECTORY"\n' + command],
-                env=dict(os.environ, OMARCHY_FIXTURE_DIRECTORY=str(root)),
-                capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            with tarfile.open(root / 'db/sync/core.db', 'r:gz') as archive:
-                self.assertEqual(archive.getmembers(), [])
+            archive = PRODUCER.fixture_package(Path(directory), 'fixture', '1-1',
+                                               'usr/share/fixture/value', b'data')
+            with tarfile.open(archive, 'r:gz') as package:
+                self.assertEqual(package.extractfile('usr/share/fixture/value').read(), b'data')
+
 
     def test_generated_guest_program_is_one_valid_bash_program(self):
         artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
@@ -226,6 +376,8 @@ def evidence_fixture(root):
             (evidence / f'{stage}-coordination.txt').write_text(
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
+        if stage in ('omarchy-success', 'omarchy-optional-failures'):
+            (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
         if stage == 'omarchy-optional-failures':
             (evidence / f'{stage}-layout.txt').write_text(
                 'foreign optional helpers never executed; original helpers restored\n')
@@ -234,7 +386,7 @@ def evidence_fixture(root):
             'omarchy-optional-failures': '| System is up to date\n! Continuing without a snapshot\n! Some mise tools could not be updated',
             'omarchy-vendor-failure': 'Omarchy update did not complete',
             'omarchy-declined': 'declined',
-            'omarchy-migration-refusal': 'external AUR helper',
+            'omarchy-migration-refusal': 'external package helper',
             'omarchy-unsupported-mode': 'complete update lifecycle',
             'omarchy-invalid-transport': 'Incomplete Omarchy update transport',
         }[stage]

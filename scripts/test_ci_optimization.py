@@ -63,7 +63,7 @@ class OptimizationContracts(unittest.TestCase):
     def test_native_coverage_stages_protected_inputs_from_writable_sources(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
         start = script.index('docker cp "$binary"')
-        end = script.index('\nif timeout ', start)
+        end = script.index('\nbash scripts/benchmark-qemu.sh', start)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             scripts, evidence, runner = root / 'scripts', root / 'evidence', root / 'runner'
@@ -104,15 +104,16 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
             arguments = capture.read_bytes().split(b'\0')[:-1]
             copied = {target.decode(): (root / source.decode()).resolve()
                       for source, target in zip(arguments[::2], arguments[1::2])}
+            self.assertEqual(copied, {'fixture-container:/fixture': fixture})
             for original, name in ((producer, 'native-cli-coverage.py'),
                                    (manifest, 'native-cli-manifest.json')):
-                staged = copied['fixture-container:/' + name]
+                staged = runner / 'native-cli-inputs' / name
                 self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o644,
                                  'Supplemental input must be staged without group/other write permissions')
                 self.assertNotEqual(staged, original)
                 self.assertTrue(staged.is_relative_to(runner))
                 self.assertEqual(staged.read_bytes(), original.read_bytes())
-            binaries = copied['fixture-container:/omg-extra-bin']
+            binaries = runner / 'native-cli-inputs/bin'
             self.assertEqual(stat.S_IMODE(binaries.stat().st_mode), 0o755)
             self.assertEqual({p.name for p in binaries.iterdir()}, set(artifacts))
             for role, artifact in artifacts.items():
@@ -165,6 +166,19 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
                 artifact = root / 'target/llvm-cov-target' / name
                 artifact.write_text('fixture executable')
                 artifact.chmod(0o755)
+            benchmark = root / 'scripts/benchmark-qemu.sh'
+            benchmark.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+test "$1" = --distro && test "$2" = arch
+while test "$#" -gt 0; do
+  if test "$1" = --evidence-dir; then
+    mkdir -p "$2/unit-transport/native-evidence/cli" "$2/unit-transport/native-profiles"
+    exit 0
+  fi
+  shift
+done
+exit 2
+''')
             readelf = root / 'readelf'
             readelf.write_text('#!/bin/sh\nprintf "__llvm_covmap __llvm_prf_cnts\\n"\n')
             readelf.chmod(0o755)
