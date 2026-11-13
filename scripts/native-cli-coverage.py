@@ -390,6 +390,8 @@ OMARCHY_CASES = {
         scene='cancellation-hold', native_phase='cache-pruned', control='interrupt'),
     'omarchy-output-closed': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
         scene='cancellation-hold', native_phase='cache-pruned', control='output-closed'),
+    'omarchy-terminal-closed': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='cancellation-hold', native_phase='cache-pruned', control='terminal-closed'),
     'omarchy-preflight-failure': OmarchyCase(1, OMARCHY_PREFIX[:1],
         scene='preflight-failure', failure_command='omarchy-update-requires-free-space'),
     'omarchy-confirmation-failure': OmarchyCase(1, OMARCHY_PREFIX[:1] + ('omarchy-update-confirm',),
@@ -402,7 +404,8 @@ OMARCHY_CASES = {
         scene='inhibitor-stop-failure', native_phase='complete', failure_command='omarchy-update-stay-awake'),
 }
 
-PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES)
+ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
+PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES)
 STAGES = tuple('registry-' + role for role in TESTS) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
 
@@ -495,11 +498,11 @@ case "$name" in
 esac
 OMG_INERT_OMARCHY_STAGE
 cat > "$fixture/control.py" <<'OMG_CONTROL_OMARCHY_DRIVER'
-import json, os, select, signal, stat, subprocess, sys, time
+import json, os, pty, select, signal, stat, subprocess, sys, time
 from pathlib import Path
 
 mode = sys.argv[1]
-assert mode in ('interrupt', 'output-closed')
+assert mode in ('interrupt', 'output-closed', 'terminal-closed')
 unrelated = subprocess.Popen(['/usr/bin/sleep', '60'], start_new_session=True)
 process = None
 identities = []
@@ -516,11 +519,20 @@ def identity(pid):
         return None
 
 try:
-    process = subprocess.Popen(['/omg-extra-bin/cli', 'update', '--yes'],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True)
-    streams = {process.stdout.fileno(): process.stdout, process.stderr.fileno(): process.stderr}
-    stdout_fd = process.stdout.fileno()
+    if mode == 'terminal-closed':
+        master, slave = pty.openpty()
+        with os.fdopen(slave, 'rb+', buffering=0) as peer:
+            process = subprocess.Popen(['/usr/bin/setsid', '--ctty', '--', '/omg-extra-bin/cli', 'update', '--yes'],
+                stdin=peer, stdout=peer, stderr=peer)
+        terminal = os.fdopen(master, 'rb', buffering=0)
+        streams = {master: terminal}
+        stdout_fd = master
+    else:
+        process = subprocess.Popen(['/omg-extra-bin/cli', 'update', '--yes'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+        streams = {process.stdout.fileno(): process.stdout, process.stderr.fileno(): process.stderr}
+        stdout_fd = process.stdout.fileno()
     deadline = time.monotonic() + 25
     while streams or process.poll() is None:
         assert time.monotonic() < deadline, 'Controlled CLI did not stop within its deadline'
@@ -877,6 +889,38 @@ OMG_AUTHORIZATION_RECEIPT
   fi
   printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
 done
+printf 'ID=arch\n' > "$fixture/arch-release"
+mount --bind "$fixture/arch-release" /etc/os-release
+case_dir="$case_root/omarchy-success"
+signed_owner=/opt/omg-coverage-omarchy-success
+chmod 755 "$signed_owner/gnupg"
+chmod 644 "$signed_owner/gnupg/pubring.gpg" "$signed_owner/gnupg/trustdb.gpg"
+transcript_before=$(sha256sum /tmp/omarchy-update.log)
+for stage in arch-dry-run arch-check; do
+  args=(--dry-run)
+  if test "$stage" = arch-check; then args=(--check); fi
+  : > "$case_dir/arch-helpers.tsv"
+  chown nobody:nobody "$case_dir/arch-helpers.tsv"
+  timeout --signal=TERM --kill-after=3 40 runuser -u nobody -- env -i \
+    PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
+    XDG_RUNTIME_DIR="$case_dir/run" XDG_CONFIG_HOME="$case_dir/config" \
+    XDG_CACHE_HOME="$case_dir/cache" XDG_DATA_HOME="$case_dir/data" XDG_STATE_HOME="$case_dir/state" \
+    OMG_CONFIG_DIR="$case_dir/config" OMG_CACHE_DIR="$case_dir/cache" OMG_DATA_DIR="$case_dir/data" \
+    OMG_DAEMON_DATA_DIR="$case_dir/daemon" OMG_DISABLE_DAEMON=1 OMG_DISABLE_TELEMETRY=1 \
+    OMG_PACMAN_CONF="$case_dir/pacman.conf" OMG_PACMAN_DB_DIR="$signed_owner/db" \
+    OMARCHY_PATH="$case_dir/checkout" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
+    OMARCHY_FIXTURE_CASE="$stage" OMARCHY_HELPER_TRACE="$case_dir/arch-helpers.tsv" \
+    LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
+    bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@" --no-sync --yes' bash "${args[@]}" \
+    < /dev/null > "/evidence/cli/$stage.log" 2>&1
+  test ! -s "$case_dir/arch-helpers.tsv"
+  test "$(sha256sum /tmp/omarchy-update.log)" = "$transcript_before"
+  python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" --phase complete \
+    > "/evidence/cli/$stage-native-state.json"
+  printf 'actual_id=arch ordinary_uid=%s vendor_helpers=0 transcript_unchanged=yes\n' "$(id -u nobody)" \
+    > "/evidence/cli/$stage-isolation.txt"
+  printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
+done
 OMG_OMARCHY_NAMESPACE
 '''
     setup = '\n'.join(
@@ -1142,8 +1186,9 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require(len({row['pid'] for row in rows}) == 2
                     and control['unrelated_pid'] not in {row['pid'] for row in rows},
                     'Unrelated process overlaps the owned stage')
-            diagnostic = 'Omarchy update interrupted' if case.control == 'interrupt' else 'Update output disconnected'
-            require(diagnostic in log, 'Cancellation failure was not reported: ' + stage)
+            diagnostic = 'Update output disconnected' if case.control == 'output-closed' else 'Omarchy update interrupted'
+            observation = transcript if case.control == 'terminal-closed' else log
+            require(diagnostic in observation, 'Cancellation failure was not reported: ' + stage)
         if case.lock_location == 'foreign':
             require((evidence / f'{stage}-layout.txt').read_text()
                     == 'foreign fallback lock was preserved; transcript unchanged\n',
@@ -1189,6 +1234,17 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require('complete update lifecycle' in log, 'Unsupported Omarchy scope accepted')
         elif stage == 'omarchy-invalid-transport':
             require('Incomplete Omarchy update transport' in log, 'Incomplete transport accepted')
+    for stage in ARCH_READONLY_STAGES:
+        require((evidence / f'{stage}-isolation.txt').read_text()
+                == 'actual_id=arch ordinary_uid=65534 vendor_helpers=0 transcript_unchanged=yes\n',
+                'Normal Arch update crossed the vendor lifecycle boundary')
+        require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
+                == NATIVE_PHASES['complete'], 'Read-only Arch update changed native package state')
+        log = (evidence / f'{stage}.log').read_text()
+        require('up to date' in log.lower() and 'Omarchy runtime' not in log,
+                'Normal Arch read-only update did not complete independently')
+        modules = {PROFILE.fullmatch(p.name)[3] for p in grouped[stage]}
+        require(modules == cli_modules, 'Normal Arch profiles do not match the actual CLI')
     for path in evidence.rglob('*'):
         if path.is_file():
             require(not re.search(rb'LLVM Profile (Error|Warning)', path.read_bytes()), 'LLVM runtime diagnostic in evidence')

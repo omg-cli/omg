@@ -920,9 +920,11 @@ fn finish(result: Result<()>) -> ! {
             std::process::exit(0);
         }
         Err(error) => {
-            eprintln!("Error: {error:#}");
+            use std::io::Write;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "Error: {error:#}");
             if let Some(suggestion) = omg_lib::core::error::suggest_for_anyhow(&error) {
-                eprintln!("\nSuggestion: {suggestion}");
+                let _ = writeln!(stderr, "\nSuggestion: {suggestion}");
             }
             std::process::exit(1);
         }
@@ -2172,6 +2174,48 @@ mod fast_path_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn error_reporting_fixture() {
+        if std::env::var_os("OMG_ERROR_REPORTING_FIXTURE").is_some() {
+            super::finish(Err(anyhow::anyhow!(
+                "package not found: inert error-reporting fixture"
+            )));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_error_output_preserves_failure_exit_status() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
+
+        for disconnected in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "tests::error_reporting_fixture", "--nocapture"])
+                .env("OMG_ERROR_REPORTING_FIXTURE", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            if disconnected {
+                let (writer, peer) = UnixStream::pair().unwrap();
+                drop(peer);
+                command.stderr(Stdio::from(OwnedFd::from(writer)));
+            } else {
+                command.stderr(Stdio::piped());
+            }
+            let output = command.output().expect("isolated error-reporting fixture");
+            assert_eq!(output.status.code(), Some(1), "disconnected={disconnected}");
+            if !disconnected {
+                let diagnostic = String::from_utf8(output.stderr).unwrap();
+                assert!(
+                    diagnostic.contains("Error: package not found: inert error-reporting fixture")
+                );
+                assert!(diagnostic.contains("Suggestion: Try: omg search"));
+            }
+        }
+    }
+
     #[test]
     fn privacy_commands_cannot_advertise_unimplemented_json() {
         use omg_lib::cli::PrivacyCommands;

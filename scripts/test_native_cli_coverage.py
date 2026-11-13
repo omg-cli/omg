@@ -60,13 +60,21 @@ class HostedProducer(unittest.TestCase):
 
     def test_cancellation_cases_keep_unrelated_processes_and_native_state(self):
         for stage, control in [('omarchy-interrupted', 'interrupt'),
-                               ('omarchy-output-closed', 'output-closed')]:
+                               ('omarchy-output-closed', 'output-closed'),
+                               ('omarchy-terminal-closed', 'terminal-closed')]:
             self.assertIn(stage, PRODUCER.OMARCHY_CASES,
                           'Native coverage omits cancellation or output-disconnection behavior')
             case = PRODUCER.OMARCHY_CASES[stage]
             self.assertEqual(case.control, control)
             self.assertEqual(case.native_phase, 'cache-pruned')
             self.assertEqual(case.exit_status, 1)
+
+    def test_normal_arch_readonly_updates_are_required_after_vendor_scenarios(self):
+        for stage in ('arch-dry-run', 'arch-check'):
+            self.assertIn(stage, PRODUCER.PROCESS_STAGES)
+        script = PRODUCER.omarchy_guest_script()
+        self.assertIn('ID=arch', script)
+        self.assertIn('transcript_unchanged=yes', script)
 
     @unittest.skipIf(os.name == 'nt', 'QEMU transport preflight requires POSIX Bash')
     def test_native_coverage_transport_reaches_preflight_with_bound_inputs(self):
@@ -534,6 +542,10 @@ def evidence_fixture(root):
                 unrelated_survived=True, owned_processes_gone=True,
                 owned_processes=[dict(pid=700, start='1000', group=700, uid=65534),
                                  dict(pid=701, start='1001', group=700, uid=65534)])))
+            if case.control == 'terminal-closed':
+                (evidence / f'{stage}-transcript.log').write_text(
+                    'OMG Omarchy update started\nError: Omarchy update interrupted\n'
+                    'OMG Omarchy update finished: exit status: 1\n')
         if case.lock_location == 'foreign':
             (evidence / f'{stage}-layout.txt').write_text(
                 'foreign fallback lock was preserved; transcript unchanged\n')
@@ -584,6 +596,11 @@ def evidence_fixture(root):
             if case.native_phase == 'complete':
                 log += '\nSystem is up to date\nOmarchy cleanup failed'
         (evidence / f'{stage}.log').write_text(log)
+    for stage in PRODUCER.ARCH_READONLY_STAGES:
+        (evidence / f'{stage}.log').write_text('System is up to date\n')
+        (evidence / f'{stage}-isolation.txt').write_text(
+            'actual_id=arch ordinary_uid=65534 vendor_helpers=0 transcript_unchanged=yes\n')
+        (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
     return evidence, profiles, artifacts
 
 
@@ -614,7 +631,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 29)
+            self.assertEqual(len(receipt['process_checks']), 32)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -649,6 +666,9 @@ class SupplementalEvidence(unittest.TestCase):
             'omarchy-no-cleanup': lambda e, p: (e / 'omarchy-success-coordination.txt').write_text('lock still held'),
             'omarchy-no-refusal': lambda e, p: (e / 'omarchy-migration-refusal.log').write_text('failed for another reason'),
             'cancelled-but-stage-survived': lambda e, p: (e / 'omarchy-interrupted-control.json').write_text('{}'),
+            'normal-arch-crossed-vendor-boundary': lambda e, p: (e / 'arch-check-isolation.txt').write_text('vendor_helpers=1'),
+            'normal-arch-mutated-packages': lambda e, p: (e / 'arch-dry-run-native-state.json').write_text('{"status":"PASS_NATIVE_INITIAL_STATE"}'),
+            'normal-arch-used-vendor-runtime': lambda e, p: (e / 'arch-check.log').write_text('System is up to date\nOmarchy runtime selected'),
             'cancelled-before-package-state-check': lambda e, p: (e / 'omarchy-interrupted-native-state.json').write_text('{"status":"PASS_SIGNED_NATIVE_STATE"}'),
             'foreign-fallback-was-overwritten': lambda e, p: (e / 'omarchy-runtime-foreign-lock-layout.txt').write_text('overwritten'),
             'foreign-fallback-no-ownership-diagnostic': lambda e, p: (e / 'omarchy-runtime-foreign-lock.log').write_text('failed for another reason'),

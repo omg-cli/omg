@@ -1179,3 +1179,20 @@ profiles, receipts and source records remain; base/setup images, current useful
 proofs, native debug/incremental outputs and installed host binaries were
 preserved. The retirement reclaimed 724123648 allocated bytes without raising
 the existing owner budget.
+
+The next terminal-boundary regression closes a real controlling terminal after
+an owned helper and descendant become ready. Against f0262592 the actual CLI
+returned panic status 101 instead of the expected handled failure. A separate
+binary regression reproduced the cause with a disconnected stderr stream:
+`disconnected=true`, `Some(101)` versus `Some(1)`. Error reporting used `eprintln!`,
+which panics when the terminal cannot accept the diagnostic. It now uses fallible
+writes while preserving the chosen exit status. The isolated regression passes
+and still checks both the error and suggestion on a readable stream.
+
+The producer also requires normal Arch dry-run/check commands after vendor
+scenarios, with vendor files present. These commands must avoid vendor helpers,
+preserve the previous transcript and installed package state, and run as an
+ordinary user without test-mode bypasses. Producer tests pass 33 cases and export
+allowlist tests pass 17 cases. Actual terminal-disconnect cleanup, the new normal
+Arch boundary controls, expanded native producer and optimized build remain
+pending verification before this batch is published.

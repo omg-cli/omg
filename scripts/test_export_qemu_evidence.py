@@ -39,6 +39,16 @@ FEDORA_EXCLUSION_DIAGNOSTICS = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_arch_readonly_reports_have_exact_boundaries(self):
+        root = ('run-test', 'native-evidence', 'cli')
+        for stage in ('arch-dry-run', 'arch-check'):
+            for suffix in ('.log', '-native-state.json', '-isolation.txt'):
+                self.assertTrue(exporter.allowed_file((*root, stage + suffix)))
+                self.assertFalse(exporter.allowed_file((*root, 'private', stage + suffix)))
+                self.assertFalse(exporter.allowed_file((*root, stage + suffix + '.bak')))
+            self.assertFalse(exporter.allowed_file((*root, stage + '-helpers.tsv')))
+        self.assertFalse(exporter.allowed_file((*root, 'arch-unknown.log')))
+
     def test_native_optional_helper_diagnostics_stay_at_the_cli_root(self):
         prefix = ('run-test', 'native-evidence', 'cli')
         for stage in ('omarchy-snapshot-missing', 'omarchy-snapshot-unsupported',
@@ -46,7 +56,7 @@ class AllowlistTests(unittest.TestCase):
                       'omarchy-reboot-accept', 'omarchy-reboot-failure',
                       'omarchy-authorization-refresh', 'omarchy-authorization-denied',
                       'omarchy-runtime-fallback', 'omarchy-runtime-foreign-lock',
-                      'omarchy-interrupted', 'omarchy-output-closed',
+                      'omarchy-interrupted', 'omarchy-output-closed', 'omarchy-terminal-closed',
                       'omarchy-preflight-failure', 'omarchy-confirmation-failure',
                       'omarchy-development-failure', 'omarchy-inhibitor-start-failure',
                       'omarchy-inhibitor-stop-failure'):
