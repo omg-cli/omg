@@ -13,6 +13,8 @@ use nix::fcntl::FdFlag;
 use nix::fcntl::{FcntlArg, fcntl};
 use tokio::process::Command;
 
+use crate::package_managers::arch::NativeOmarchyOperation;
+
 const LOG_PATH: &str = "/tmp/omarchy-update.log";
 const LOCK_FD: &str = "OMG_OMARCHY_LOCK_FD";
 const LOG_FD: &str = "OMG_OMARCHY_LOG_FD";
@@ -68,17 +70,14 @@ enum Stage {
     Preflight,
     Confirm,
     Authorize,
-    Prune,
+    NativePackage(NativeOmarchyOperation),
     Snapshot,
     InhibitSleep,
     DevelopmentCheckout,
-    Keyrings,
-    OfficialPackages,
     MigrationPreflight,
     MigrationsPending,
     RestartShell,
     Migrations,
-    Orphans,
     AnalyzeLog,
     ClearIndicator,
     RestartServices,
@@ -123,7 +122,9 @@ async fn workflow(executor: &mut impl StageExecutor, yes: bool) -> Result<()> {
     let update = async {
         authorization_attempted = true;
         executor.execute(Stage::Authorize).await?;
-        executor.execute(Stage::Prune).await?;
+        executor
+            .execute(Stage::NativePackage(NativeOmarchyOperation::PruneCache))
+            .await?;
         if let Err(error) = executor.execute(Stage::Snapshot).await {
             crate::cli::modern_ui::print_warning(&format!(
                 "Continuing the Omarchy update without a snapshot: {error:#}"
@@ -133,8 +134,8 @@ async fn workflow(executor: &mut impl StageExecutor, yes: bool) -> Result<()> {
         executor.execute(Stage::InhibitSleep).await?;
         for stage in [
             Stage::DevelopmentCheckout,
-            Stage::Keyrings,
-            Stage::OfficialPackages,
+            Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
+            Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories),
         ] {
             executor.execute(stage).await?;
         }
@@ -146,7 +147,7 @@ async fn workflow(executor: &mut impl StageExecutor, yes: bool) -> Result<()> {
         }
         for stage in [
             Stage::Migrations,
-            Stage::Orphans,
+            Stage::NativePackage(NativeOmarchyOperation::RemoveOrphans),
             Stage::AnalyzeLog,
             Stage::ClearIndicator,
             Stage::RestartServices,
@@ -204,10 +205,7 @@ fn stage_command(stage: Stage) -> Option<(&'static str, &'static [&'static str])
         Stage::Mise => ("omarchy-update-mise", &[]),
         Stage::VerifyBoot => ("omarchy-update-boot", &[]),
         Stage::ReleaseInhibitor => ("omarchy-update-stay-awake", &["stop"]),
-        Stage::Prune
-        | Stage::Keyrings
-        | Stage::OfficialPackages
-        | Stage::Orphans
+        Stage::NativePackage(_)
         | Stage::MigrationPreflight
         | Stage::NativeAur
         | Stage::ReleaseAuthorization
@@ -541,17 +539,8 @@ impl Commands {
 impl StageExecutor for Commands {
     async fn execute(&mut self, stage: Stage) -> Result<Outcome> {
         match stage {
-            Stage::Prune | Stage::Keyrings | Stage::OfficialPackages | Stage::Orphans => {
-                use crate::package_managers::arch::{
-                    NativeOmarchyInteraction, NativeOmarchyOperation,
-                };
-                let operation = match stage {
-                    Stage::Prune => NativeOmarchyOperation::PruneCache,
-                    Stage::Keyrings => NativeOmarchyOperation::RefreshKeyrings,
-                    Stage::OfficialPackages => NativeOmarchyOperation::UpgradeRepositories,
-                    Stage::Orphans => NativeOmarchyOperation::RemoveOrphans,
-                    _ => unreachable!(),
-                };
+            Stage::NativePackage(operation) => {
+                use crate::package_managers::arch::NativeOmarchyInteraction;
                 let interaction = if self.yes {
                     NativeOmarchyInteraction::Unattended
                 } else {
@@ -709,7 +698,39 @@ fn ensure_migrations_use_native_aur(migrations: &Path, state: &Path) -> Result<(
 }
 
 fn native_reboot_reason() -> Result<Option<&'static str>> {
-    let running = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+    let home = dirs::home_dir();
+    let inspection = RebootInspection {
+        root: Path::new("/"),
+        processes: Path::new("/proc"),
+        home: home.as_deref(),
+        uid: rustix::process::getuid().as_raw(),
+    };
+    reboot_reason_at(&inspection, |modules| {
+        crate::package_managers::alpm_direct::with_handle(|handle| {
+            Ok(handle.localdb().pkgs().iter().any(|package| {
+                package
+                    .files()
+                    .files()
+                    .iter()
+                    .any(|file| file.name() == modules.as_bytes())
+            }))
+        })
+    })
+}
+
+#[derive(Debug)]
+struct RebootInspection<'a> {
+    root: &'a Path,
+    processes: &'a Path,
+    home: Option<&'a Path>,
+    uid: u32,
+}
+
+fn reboot_reason_at(
+    inspection: &RebootInspection<'_>,
+    owns_modules: impl FnOnce(&str) -> Result<bool>,
+) -> Result<Option<&'static str>> {
+    let running = std::fs::read_to_string(inspection.processes.join("sys/kernel/osrelease"))
         .context("Cannot inspect the running kernel")?;
     let running = running.trim();
     anyhow::ensure!(
@@ -717,27 +738,18 @@ fn native_reboot_reason() -> Result<Option<&'static str>> {
         "Invalid running kernel release"
     );
     let modules = format!("usr/lib/modules/{running}/modules.builtin");
-    let owned = crate::package_managers::alpm_direct::with_handle(|handle| {
-        Ok(handle.localdb().pkgs().iter().any(|package| {
-            package
-                .files()
-                .files()
-                .iter()
-                .any(|file| file.name() == modules.as_bytes())
-        }))
-    })?;
-    if !owned || !Path::new("/").join(&modules).is_file() {
+    if !owns_modules(&modules)? || !inspection.root.join(&modules).is_file() {
         return Ok(Some(
             "The installed kernel differs from the running kernel.",
         ));
     }
-    if dirs::home_dir()
+    if inspection
+        .home
         .is_some_and(|home| home.join(".local/state/omarchy/reboot-required").is_file())
     {
         return Ok(Some("Omarchy marked this update as requiring a reboot."));
     }
-    let uid = rustix::process::getuid().as_raw();
-    for entry in std::fs::read_dir("/proc")? {
+    for entry in std::fs::read_dir(inspection.processes)? {
         let entry = entry?;
         if entry
             .file_name()
@@ -750,7 +762,7 @@ fn native_reboot_reason() -> Result<Option<&'static str>> {
         let Ok(metadata) = std::fs::metadata(&path) else {
             continue;
         };
-        if metadata.uid() != uid {
+        if metadata.uid() != inspection.uid {
             continue;
         }
         if std::fs::read_to_string(path.join("comm")).is_ok_and(|name| name.trim() == "Hyprland")
@@ -814,7 +826,17 @@ fn validate_file(file: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_descriptor_inheritance(raw: i32, enabled: bool) -> std::io::Result<()> {
+#[derive(Clone, Copy, Debug)]
+enum DescriptorOperation {
+    ReadFlags,
+    WriteFlags(i32),
+}
+
+fn descriptor_control(raw: i32, operation: DescriptorOperation) -> std::io::Result<i32> {
+    let (operation, flags) = match operation {
+        DescriptorOperation::ReadFlags => (nix::libc::F_GETFD, 0),
+        DescriptorOperation::WriteFlags(flags) => (nix::libc::F_SETFD, flags),
+    };
     // SAFETY: fcntl only inspects or changes descriptor flags. It does not
     // borrow, close or adopt the descriptor. This helper also runs after fork,
     // so it uses only async-signal-safe calls and raw OS error capture.
@@ -822,21 +844,29 @@ fn set_descriptor_inheritance(raw: i32, enabled: bool) -> std::io::Result<()> {
         unsafe_code,
         reason = "raw descriptor flags are needed before ownership is established"
     )]
-    unsafe {
-        let flags = nix::libc::fcntl(raw, nix::libc::F_GETFD);
-        if flags == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let updated = if enabled {
-            flags & !nix::libc::FD_CLOEXEC
-        } else {
-            flags | nix::libc::FD_CLOEXEC
-        };
-        if nix::libc::fcntl(raw, nix::libc::F_SETFD, updated) == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
+    let result = unsafe { nix::libc::fcntl(raw, operation, flags) };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(result)
     }
-    Ok(())
+}
+
+fn set_descriptor_inheritance(raw: i32, enabled: bool) -> std::io::Result<()> {
+    let flags = descriptor_control(raw, DescriptorOperation::ReadFlags)?;
+    let updated = if enabled {
+        flags & !nix::libc::FD_CLOEXEC
+    } else {
+        flags | nix::libc::FD_CLOEXEC
+    };
+    descriptor_control(raw, DescriptorOperation::WriteFlags(updated)).map(|_| ())
+}
+
+fn transport_inheritance_action(lock: i32, log: i32) -> impl FnMut() -> std::io::Result<()> {
+    move || {
+        set_descriptor_inheritance(lock, true)?;
+        set_descriptor_inheritance(log, true)
+    }
 }
 
 fn transport_descriptor(value: &str) -> Result<i32> {
@@ -1189,10 +1219,7 @@ async fn execute_logged(
         reason = "only the coordinator child may inherit its transport"
     )]
     unsafe {
-        command.pre_exec(move || {
-            set_descriptor_inheritance(lock_fd, true)?;
-            set_descriptor_inheritance(log_fd, true)
-        });
+        command.pre_exec(transport_inheritance_action(lock_fd, log_fd));
     }
     // Inherit the outer process group so setsid can exec directly without
     // forking. Child::id then remains the inner coordinator's session leader.
@@ -1435,17 +1462,17 @@ mod tests {
                 Stage::MigrationPreflight,
                 Stage::Confirm,
                 Stage::Authorize,
-                Stage::Prune,
+                Stage::NativePackage(NativeOmarchyOperation::PruneCache),
                 Stage::Snapshot,
                 Stage::InhibitSleep,
                 Stage::DevelopmentCheckout,
-                Stage::Keyrings,
-                Stage::OfficialPackages,
+                Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
+                Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories),
                 Stage::MigrationPreflight,
                 Stage::MigrationsPending,
                 Stage::RestartShell,
                 Stage::Migrations,
-                Stage::Orphans,
+                Stage::NativePackage(NativeOmarchyOperation::RemoveOrphans),
                 Stage::AnalyzeLog,
                 Stage::ClearIndicator,
                 Stage::RestartServices,
@@ -1473,10 +1500,10 @@ mod tests {
             }
         }
         for stage in [
-            Stage::Prune,
-            Stage::Keyrings,
-            Stage::OfficialPackages,
-            Stage::Orphans,
+            Stage::NativePackage(NativeOmarchyOperation::PruneCache),
+            Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
+            Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories),
+            Stage::NativePackage(NativeOmarchyOperation::RemoveOrphans),
             Stage::RebootPrompt,
         ] {
             assert!(
@@ -1491,14 +1518,14 @@ mod tests {
     async fn failures_never_report_completion_or_leave_lifecycle_cleanup_out() {
         for failure in [
             Stage::Authorize,
-            Stage::Prune,
+            Stage::NativePackage(NativeOmarchyOperation::PruneCache),
             Stage::InhibitSleep,
             Stage::DevelopmentCheckout,
-            Stage::Keyrings,
-            Stage::OfficialPackages,
+            Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
+            Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories),
             Stage::MigrationsPending,
             Stage::Migrations,
-            Stage::Orphans,
+            Stage::NativePackage(NativeOmarchyOperation::RemoveOrphans),
             Stage::AnalyzeLog,
             Stage::ClearIndicator,
             Stage::RestartServices,
@@ -1553,7 +1580,9 @@ mod tests {
             async fn execute(&mut self, stage: Stage) -> Result<Outcome> {
                 self.events.push(stage);
                 match stage {
-                    Stage::OfficialPackages => anyhow::bail!("official package operation failed"),
+                    Stage::NativePackage(NativeOmarchyOperation::UpgradeRepositories) => {
+                        anyhow::bail!("official package operation failed")
+                    }
                     Stage::ReleaseAuthorization => {
                         anyhow::bail!("authorization release failed")
                     }
@@ -2271,6 +2300,196 @@ mod tests {
     }
 
     #[test]
+    fn reboot_inspection_distinguishes_kernel_marker_and_replaced_executable() -> Result<()> {
+        let owner = private_directory();
+        let root = owner.path().join("root");
+        let processes = owner.path().join("proc");
+        let home = owner.path().join("home");
+        std::fs::create_dir_all(processes.join("sys/kernel"))?;
+        std::fs::write(processes.join("sys/kernel/osrelease"), "fixture-kernel\n")?;
+        let modules = root.join("usr/lib/modules/fixture-kernel/modules.builtin");
+        std::fs::create_dir_all(modules.parent().expect("module directory"))?;
+        std::fs::write(&modules, "fixture module inventory\n")?;
+        let paths = RebootInspection {
+            root: &root,
+            processes: &processes,
+            home: Some(&home),
+            uid: rustix::process::getuid().as_raw(),
+        };
+        assert_eq!(
+            reboot_reason_at(&paths, |_| Ok(false))?,
+            Some("The installed kernel differs from the running kernel.")
+        );
+        assert_eq!(reboot_reason_at(&paths, |_| Ok(true))?, None);
+        let marker = home.join(".local/state/omarchy/reboot-required");
+        std::fs::create_dir_all(marker.parent().expect("marker directory"))?;
+        std::fs::write(&marker, "reboot requested\n")?;
+        assert_eq!(
+            reboot_reason_at(&paths, |_| Ok(true))?,
+            Some("Omarchy marked this update as requiring a reboot.")
+        );
+        std::fs::remove_file(marker)?;
+        let hyprland = processes.join("123");
+        std::fs::create_dir(&hyprland)?;
+        std::fs::write(hyprland.join("comm"), "Hyprland\n")?;
+        std::os::unix::fs::symlink("/inert/Hyprland", hyprland.join("exe"))?;
+        assert_eq!(reboot_reason_at(&paths, |_| Ok(true))?, None);
+        std::fs::remove_file(hyprland.join("exe"))?;
+        std::os::unix::fs::symlink("/inert/Hyprland (deleted)", hyprland.join("exe"))?;
+        assert_eq!(
+            reboot_reason_at(&paths, |_| Ok(true))?,
+            Some("The running Hyprland executable was replaced during the update.")
+        );
+        let other_user = RebootInspection {
+            uid: paths.uid.checked_add(1).expect("test uid fits"),
+            ..paths
+        };
+        assert_eq!(reboot_reason_at(&other_user, |_| Ok(true))?, None);
+        std::fs::remove_file(modules)?;
+        assert_eq!(
+            reboot_reason_at(&paths, |_| Ok(true))?,
+            Some("The installed kernel differs from the running kernel.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reboot_inspection_rejects_invalid_kernel_data_and_tolerates_process_churn() -> Result<()> {
+        use std::cell::Cell;
+        use std::os::unix::ffi::OsStringExt;
+        let owner = private_directory();
+        let root = owner.path().join("root");
+        let processes = owner.path().join("proc");
+        std::fs::create_dir_all(processes.join("sys/kernel"))?;
+        let release = processes.join("sys/kernel/osrelease");
+        let paths = RebootInspection {
+            root: &root,
+            processes: &processes,
+            home: None,
+            uid: rustix::process::getuid().as_raw(),
+        };
+        let queries = Cell::new(0);
+        let owns = |_: &str| {
+            queries.set(queries.get() + 1);
+            Ok(true)
+        };
+        assert!(reboot_reason_at(&paths, owns).is_err());
+        for invalid in [b"".as_slice(), b"../escape", b"/absolute", b"\xff"] {
+            std::fs::write(&release, invalid)?;
+            assert!(reboot_reason_at(&paths, owns).is_err());
+            assert_eq!(
+                queries.get(),
+                0,
+                "invalid kernel data must not query native ownership"
+            );
+        }
+        std::fs::write(&release, "fixture\n")?;
+        let modules = root.join("usr/lib/modules/fixture/modules.builtin");
+        std::fs::create_dir_all(modules.parent().expect("module directory"))?;
+        std::fs::write(modules, "inert module inventory")?;
+        std::fs::write(processes.join("not-a-process"), "ignored")?;
+        std::fs::write(
+            processes.join(std::ffi::OsString::from_vec(vec![0xff])),
+            "ignored",
+        )?;
+        std::os::unix::fs::symlink(
+            owner.path().join("disappeared-process"),
+            processes.join("123"),
+        )?;
+        assert_eq!(reboot_reason_at(&paths, owns)?, None);
+        assert_eq!(queries.get(), 1);
+        let result = reboot_reason_at(&paths, |_| {
+            std::fs::remove_dir_all(&processes)?;
+            Ok(true)
+        });
+        assert_eq!(
+            result
+                .expect_err("lost process inventory must remain an error")
+                .downcast_ref::<std::io::Error>()
+                .expect("filesystem cause")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_state_defaults_to_the_session_home() -> Result<()> {
+        const CHILD: &str = "OMG_OMARCHY_DEFAULT_STATE_FIXTURE";
+        if std::env::var_os(CHILD).is_some() {
+            let home = PathBuf::from(std::env::var_os("HOME").context("fixture home")?);
+            assert_eq!(
+                OmarchyRuntime::migration_state()?,
+                home.join(".local/state/omarchy/migrations")
+            );
+            return Ok(());
+        }
+        let owner = private_directory();
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "cli::packages::update::omarchy::tests::migration_state_defaults_to_the_session_home", "--nocapture"])
+            .env(CHILD, "1")
+            .env("HOME", owner.path())
+            .env_remove("OMARCHY_MIGRATION_STATE")
+            .output()?;
+        let diagnostic = format!(
+            "default migration state: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{diagnostic}");
+        Ok(())
+    }
+
+    #[test]
+    fn transport_inheritance_action_contains_failures_and_preserves_file_identity() -> Result<()> {
+        use crate::core::testing::run_isolated_test;
+        if run_isolated_test(
+            "cli::packages::update::omarchy::tests::transport_inheritance_action_contains_failures_and_preserves_file_identity",
+        ) {
+            return Ok(());
+        }
+        let owner = private_directory();
+        let lock = open_owned_file(&owner.path().join("lock"))?;
+        let log = open_owned_file(&owner.path().join("log"))?;
+        let lock_identity = lock.metadata()?.ino();
+        let log_identity = log.metadata()?.ino();
+        let mut expose = transport_inheritance_action(lock.as_raw_fd(), log.as_raw_fd());
+        expose()?;
+        for file in [&lock, &log] {
+            assert!(
+                !FdFlag::from_bits_truncate(fcntl(file, FcntlArg::F_GETFD)?)
+                    .contains(FdFlag::FD_CLOEXEC)
+            );
+            set_descriptor_inheritance(file.as_raw_fd(), false)?;
+        }
+        assert_eq!(lock.metadata()?.ino(), lock_identity);
+        assert_eq!(log.metadata()?.ino(), log_identity);
+        for operation in [
+            DescriptorOperation::ReadFlags,
+            DescriptorOperation::WriteFlags(nix::libc::FD_CLOEXEC),
+        ] {
+            assert_eq!(
+                descriptor_control(-1, operation)
+                    .expect_err("invalid descriptor cannot be inspected or changed")
+                    .raw_os_error(),
+                Some(nix::libc::EBADF)
+            );
+        }
+        for (lock_fd, log_fd) in [(-1, log.as_raw_fd()), (lock.as_raw_fd(), -1)] {
+            let result = transport_inheritance_action(lock_fd, log_fd)();
+            set_descriptor_inheritance(lock.as_raw_fd(), false)?;
+            set_descriptor_inheritance(log.as_raw_fd(), false)?;
+            assert_eq!(
+                result
+                    .expect_err("invalid transport descriptor refuses exec")
+                    .raw_os_error(),
+                Some(nix::libc::EBADF)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn inherited_descriptors_are_bound_to_their_owned_inodes() {
         let owner = private_directory();
         let path = owner.path().join("handoff");
@@ -2500,11 +2719,7 @@ mod tests {
             }
         }
         let owner = private_directory();
-        let pty = nix::pty::openpty(None, None).expect("private PTY pair");
-        fcntl(&pty.master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-            .expect("master cannot leak into child");
-        fcntl(&pty.slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-            .expect("slave descriptor inheritance");
+        let (master, slave) = open_transport_pty(None).expect("private PTY pair");
         let program =
             crate::core::privilege::root_controlled_program_path("setsid").expect("system setsid");
         let mut child = Command::new(program)
@@ -2516,7 +2731,7 @@ mod tests {
                 "--nocapture",
             ])
             .env("OMG_OMARCHY_DISCONNECT_FIXTURE", owner.path())
-            .stdin(Stdio::from(File::from(pty.slave)))
+            .stdin(Stdio::from(slave))
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -2540,7 +2755,7 @@ mod tests {
         })
         .await
         .expect("private controlling terminal is ready");
-        drop(pty.master);
+        drop(master);
         let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
             .await
             .expect("disconnected fixture exits")
@@ -2782,11 +2997,7 @@ mod tests {
         }
         let owner = private_directory();
         let mut cleanup = KillInner(Some(owner.path().to_owned()));
-        let pty = nix::pty::openpty(None, None).expect("private outer terminal");
-        for descriptor in [&pty.master, &pty.slave] {
-            fcntl(descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-                .expect("private terminal descriptors");
-        }
+        let (master, slave) = open_transport_pty(None).expect("private outer terminal");
         let launcher = crate::core::privilege::root_controlled_program_path("setsid")
             .expect("system session launcher");
         let mut child = Command::new(launcher)
@@ -2799,7 +3010,7 @@ mod tests {
             ])
             .env("OMG_OMARCHY_OUTER_CLEANUP_FIXTURE", owner.path())
             .env("OMG_OMARCHY_OUTER_DISCONNECT_FIXTURE", "1")
-            .stdin(Stdio::from(File::from(pty.slave)))
+            .stdin(Stdio::from(slave))
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -2816,7 +3027,7 @@ mod tests {
         })
         .await
         .expect("inner ready before physical outer hangup");
-        drop(pty.master);
+        drop(master);
         let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
             .await
             .expect("physical outer disconnect completes")
@@ -2875,15 +3086,32 @@ mod tests {
     #[tokio::test]
     async fn completed_coordinator_waits_for_terminal_eof() {
         use std::io::Write;
+        struct ReapChild(std::process::Child);
+        impl Drop for ReapChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
         let owner = private_directory();
         let transcript = open_owned_file(&owner.path().join("transcript"))
             .expect("private pending-tail transcript");
-        let pty = nix::pty::openpty(None, None).expect("private pending-tail PTY");
-        let master = File::from(pty.master);
+        let (master, slave) = open_transport_pty(None).expect("private pending-tail PTY");
+        let sleep =
+            crate::core::privilege::root_controlled_program_path("sleep").expect("system sleeper");
+        let mut unrelated = ReapChild(
+            std::process::Command::new(sleep)
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("owned unrelated child"),
+        );
         fcntl(&master, FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
             .expect("nonblocking pending-tail master");
         let master = register_file(master).expect("owned pending-tail master");
-        let mut slave = File::from(pty.slave);
+        let mut slave = slave;
         slave
             .write_all(b"before-")
             .expect("initial terminal output");
@@ -2901,6 +3129,14 @@ mod tests {
         .await
         .expect("terminal tail reaches EOF without hanging");
         drained.expect("complete terminal stream");
+        assert!(
+            unrelated
+                .0
+                .try_wait()
+                .expect("unrelated child state")
+                .is_none(),
+            "terminal EOF must not depend on unrelated child termination"
+        );
         assert_eq!(
             std::fs::read(owner.path().join("transcript")).expect("pending-tail transcript"),
             b"before-after",
@@ -2917,10 +3153,7 @@ mod tests {
             crate::core::privilege::root_controlled_program_path("printf").expect("system printf");
         let payload = "x".repeat(257);
         for attempt in 0..2000 {
-            let pty = nix::pty::openpty(None, None).expect("private tail PTY");
-            let master = File::from(pty.master);
-            fcntl(&master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-                .expect("tail master cannot leak to writer");
+            let (master, slave) = open_transport_pty(None).expect("private tail PTY");
             fcntl(&master, FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK))
                 .expect("nonblocking tail master");
             let master = register_file(master).expect("owned tail master");
@@ -2936,7 +3169,7 @@ mod tests {
                 .arg(&payload)
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
-                .stdout(Stdio::from(File::from(pty.slave)));
+                .stdout(Stdio::from(slave));
             let mut child = command.spawn().expect("private tail writer");
             drop(command);
             assert!(child.wait().expect("tail writer reap").success());
@@ -3420,10 +3653,7 @@ mod tests {
                 reason = "pass real descriptors to isolated startup fixture"
             )]
             unsafe {
-                command.pre_exec(move || {
-                    set_descriptor_inheritance(lock_fd, true)?;
-                    set_descriptor_inheritance(log_fd, true)
-                });
+                command.pre_exec(transport_inheritance_action(lock_fd, log_fd));
             }
             let output = tokio::time::timeout(Duration::from_secs(10), command.output())
                 .await

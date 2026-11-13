@@ -113,8 +113,14 @@ impl AlpmHarness {
             } else {
                 generate_desc(&pkg.name, &pkg.version).replace("A test package", &pkg.desc)
             };
-            let desc =
-                format!("%FILENAME%\n{filename}\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n{package_desc}");
+            let packager = if package_desc.contains("%PACKAGER%\n") {
+                ""
+            } else {
+                "%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n"
+            };
+            let desc = format!(
+                "%FILENAME%\n{filename}\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n{packager}{package_desc}"
+            );
             let mut file_header = Header::new_gnu();
             file_header.set_path(format!("{}desc", pkg_dir))?;
             file_header.set_size(desc.len() as u64);
@@ -152,7 +158,7 @@ impl AlpmHarness {
         let isize_ = csize + 4096;
 
         let desc = format!(
-            "%FILENAME%\n{filename}\n\n%NAME%\n{}\n\n%VERSION%\n{}\n\n%DESC%\n{}\n\n%ARCH%\nx86_64\n\n%CSIZE%\n{csize}\n\n%ISIZE%\n{isize_}\n\n",
+            "%FILENAME%\n{filename}\n\n%NAME%\n{}\n\n%VERSION%\n{}\n\n%DESC%\n{}\n\n%ARCH%\nx86_64\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n%CSIZE%\n{csize}\n\n%ISIZE%\n{isize_}\n\n",
             pkg.name, pkg.version, pkg.desc
         );
 
@@ -223,7 +229,7 @@ fn write_placeholder_package(path: &Path, name: &str, version: &str) -> std::io:
 
 pub fn generate_desc(name: &str, version: &str) -> String {
     format!(
-        "%NAME%\n{}\n\n%VERSION%\n{}\n\n%DESC%\nA test package\n\n%ARCH%\nx86_64\n\n",
+        "%NAME%\n{}\n\n%VERSION%\n{}\n\n%DESC%\nA test package\n\n%ARCH%\nx86_64\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n",
         name, version
     )
 }

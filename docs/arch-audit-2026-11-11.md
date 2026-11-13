@@ -973,3 +973,29 @@ updates. The workflow and transport checks pass. Full hosted instrumented
 execution, coverage comparison and optimized installation acceptance remain pending. New
 trust bootstrap is unsupported, and controlled helper fixtures do not certify all
 vendor migrations or maintainer hooks. No host system update was performed.
+
+### Native fixture and Omarchy state verification
+
+The native dependency-reason fixture exposed a positive repository record missing
+`PACKAGER`. Positive archive, repository and shared ALPM fixture builders now
+supply consistent maintainer metadata. The deliberately missing-metadata refusal
+remains unchanged. A prepared-admission regression failed with the same metadata
+error before correction; 42 related repository tests then passed.
+
+Omarchy package stages carry their native operation directly. Reboot inspection
+uses explicit filesystem, process and session inputs, with private-file tests for
+kernel ownership, reboot markers, replaced Hyprland executables, UID filtering,
+invalid releases and disappearing process data. The exact descriptor handoff
+callback is shared with its tests; parent coordination descriptors remain private.
+All four PTY fixture users now use the production atomic close-on-exec allocator.
+A deterministic regression reproduced terminal EOF being held open by an unrelated
+child, then passed while that child remained alive. Its timeout was unchanged.
+
+The local instrumented library run passed 2,407 tests with 13 ignored. After a
+closure-borrow lint cleanup, the same normal library suite, all three feature lint
+lanes and both normal binaries passed. The instrumented run used CI's pinned
+coverage tool and settings in a separately budgeted target. Full native guest
+fixture verification and the hosted coverage comparison remain pending; coverage
+thresholds, exclusions and counters were not relaxed. The existing verified
+optimized preview predates this refactor and remains separate from final build
+acceptance.

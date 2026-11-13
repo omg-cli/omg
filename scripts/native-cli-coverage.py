@@ -349,6 +349,10 @@ omarchy_security_require_source_root() {
 }
 case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
+case "$name:${OMARCHY_FIXTURE_SCENE:-none}" in
+  omarchy-snapshot:snapshot-unsupported) exit 127 ;;
+  omarchy-system:reboot-failure) exit 7 ;;
+esac
 case "$name" in
   omarchy-update-pkg-prune|omarchy-update-keyring|omarchy-update-system-pkgs|omarchy-update-orphan-pkgs|pacman|pacman-key|paccache|yay|aura|paru)
     printf 'external package helper must never run in the native fixture\n' >&2; exit 99 ;;

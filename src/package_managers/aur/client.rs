@@ -8158,7 +8158,9 @@ mod tests {
     /// Build an architecture-independent fixture so provenance tests exercise
     /// the selected identity/hook defect rather than missing architecture.
     fn write_pkg_archive(path: &Path, pkginfo: &str, install: Option<&str>) {
-        let pkginfo = format!("arch = any\n{pkginfo}");
+        let pkginfo = format!(
+            "arch = any\npackager = Fixture Maintainer <fixture@example.invalid>\n{pkginfo}"
+        );
         let field = |name: &str| {
             pkginfo
                 .lines()
@@ -8166,7 +8168,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("fixture is missing {name}"))
         };
         let buildinfo = format!(
-            "format = 2\npkgname = {}\npkgbase = {}\npkgver = {}\npkgarch = any\n",
+            "format = 2\npkgname = {}\npkgbase = {}\npkgver = {}\npkgarch = any\npackager = Fixture Maintainer <fixture@example.invalid>\n",
             field("pkgname"),
             field("pkgbase"),
             field("pkgver")
@@ -8526,7 +8528,9 @@ mod tests {
         std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         std::fs::write(cache_path, "matching-key").unwrap();
         let write_split_archive = |path: &Path, pkginfo: &str| {
-            let pkginfo = format!("arch = any\n{pkginfo}");
+            let pkginfo = format!(
+                "arch = any\npackager = Fixture Maintainer <fixture@example.invalid>\n{pkginfo}"
+            );
             let encoder = zstd::Encoder::new(std::fs::File::create(path).unwrap(), 0).unwrap();
             let mut archive = tar::Builder::new(encoder);
             let mut header = tar::Header::new_gnu();
@@ -10318,7 +10322,7 @@ finally:
         provided: &str,
     ) -> Result<()> {
         let desc = format!(
-            "%NAME%\nhelper\n\n%VERSION%\n{version}\n\n%DESC%\nreview fixture\n\n%ARCH%\nany\n\n%PROVIDES%\n{provided}\n\n"
+            "%NAME%\nhelper\n\n%VERSION%\n{version}\n\n%DESC%\nreview fixture\n\n%ARCH%\nany\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n%PROVIDES%\n{provided}\n\n"
         );
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut archive = tar::Builder::new(encoder);
@@ -10536,7 +10540,7 @@ finally:
         std::fs::create_dir_all(database.join("sync"))?;
         for (repository, version) in [("high", "1-1"), ("low", "2-1")] {
             let desc = format!(
-                "%NAME%\nhelper\n\n%VERSION%\n{version}\n\n%DESC%\nselected identity fixture\n\n%ARCH%\nany\n\n%PROVIDES%\nvirtual-helper={version}\n\n"
+                "%NAME%\nhelper\n\n%VERSION%\n{version}\n\n%DESC%\nselected identity fixture\n\n%ARCH%\nany\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n%PROVIDES%\nvirtual-helper={version}\n\n"
             );
             let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             let mut archive = tar::Builder::new(encoder);
@@ -10609,7 +10613,7 @@ finally:
         );
         let bytes = std::fs::read(&package)?;
         let desc = format!(
-            "%NAME%\nhelper\n\n%VERSION%\n2-1\n\n%DESC%\ninert automatic dependency fixture\n\n%ARCH%\nany\n\n%FILENAME%\n{filename}\n\n%CSIZE%\n{}\n\n%ISIZE%\n0\n\n%SHA256SUM%\n{}\n\n",
+            "%NAME%\nhelper\n\n%VERSION%\n2-1\n\n%DESC%\ninert automatic dependency fixture\n\n%ARCH%\nany\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n%FILENAME%\n{filename}\n\n%CSIZE%\n{}\n\n%ISIZE%\n0\n\n%SHA256SUM%\n{}\n\n",
             bytes.len(),
             hex::encode(Sha256::digest(&bytes))
         );

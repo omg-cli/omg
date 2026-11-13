@@ -268,6 +268,24 @@ class HostedProducer(unittest.TestCase):
                 self.assertEqual(trace.read_text().splitlines()[-1], name,
                                  'Forbidden execution must leave a real invocation record')
 
+    @unittest.skipIf(os.name == 'nt', 'Guest lifecycle helpers require POSIX Bash')
+    def test_lifecycle_helper_refusals_have_real_exit_statuses(self):
+        script = PRODUCER.omarchy_guest_script()
+        helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'bin').mkdir()
+            for name, scene, expected in [('omarchy-snapshot', 'snapshot-unsupported', 127),
+                                          ('omarchy-system', 'reboot-failure', 7)]:
+                program = root / 'bin' / name
+                program.write_text(helper)
+                result = subprocess.run([BASH, str(program)],
+                    env=dict(os.environ, OMARCHY_PATH=str(root), OMARCHY_FIXTURE_SCENE=scene,
+                             OMARCHY_FIXTURE_CASE='inert-lifecycle-control',
+                             OMARCHY_HELPER_TRACE=str(root / 'helpers.tsv')),
+                    capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, expected, result.stderr)
+
     @unittest.skipIf(os.name == 'nt', 'Inert guest helper scripts require POSIX Bash')
     def test_inert_omarchy_helpers_record_arguments_and_reject_external_aur(self):
         script = PRODUCER.omarchy_guest_script()

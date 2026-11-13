@@ -3263,7 +3263,7 @@ mod tests {
             ));
             for (name, version, extra) in packages {
                 let content = format!(
-                    "%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%FILENAME%\n{name}-{version}-any.pkg.tar.zst\n\n%ARCH%\nany\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n{extra}"
+                    "%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%FILENAME%\n{name}-{version}-any.pkg.tar.zst\n\n%ARCH%\nany\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n{extra}"
                 );
                 let mut header = tar::Header::new_gnu();
                 header.set_size(content.len() as u64);
@@ -4091,7 +4091,7 @@ mod tests {
 
         let sync_desc = "%NAME%\nfoo\n\n%VERSION%\n2.0-1\n\n%REPLACES%\nbar\n\n%ARCH%\nx86_64\n\n";
         let sync_content = format!(
-            "%FILENAME%\nfoo-2.0-1-x86_64.pkg.tar.zst\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n{sync_desc}"
+            "%FILENAME%\nfoo-2.0-1-x86_64.pkg.tar.zst\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n{sync_desc}"
         );
         let db_file = std::fs::File::create(db_path.join("sync/core.db")).expect("core.db");
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -4170,7 +4170,7 @@ mod tests {
                 "%NAME%\nfoo\n\n%VERSION%\n2.0-1\n\n%{relationship}%\nbar\n\n%ARCH%\nx86_64\n\n"
             );
             let sync_content = format!(
-                "%FILENAME%\nfoo-2.0-1-x86_64.pkg.tar.zst\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n{sync_desc}"
+                "%FILENAME%\nfoo-2.0-1-x86_64.pkg.tar.zst\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n{sync_desc}"
             );
             let db_file = std::fs::File::create(db_path.join("sync/core.db")).expect("core.db");
             let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -4472,6 +4472,32 @@ mod tests {
                 .to_string()
                 .starts_with("Package 'widget[' is protected by HoldPkg pattern 'widget['")
         );
+    }
+
+    #[test]
+    fn installable_repository_fixture_passes_native_metadata_admission() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync("core", &[("fixture", "1-1", "")])?;
+        let root = fixture.directory.path().join("root");
+        let mut alpm = super::open_alpm_at(&root, &fixture.database())?;
+        let repository = alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+        alpm.trans_init(alpm::TransFlag::NEEDED)?;
+        alpm.trans_add_pkg(repository.pkg("fixture")?)
+            .map_err(|error| anyhow::anyhow!("Cannot select fixture package: {error}"))?;
+        let prepared = super::prepared_advisory_packages(
+            &alpm,
+            TransactionKind::Install,
+            &crate::core::security::SecurityPolicy::default(),
+            &[],
+            None,
+        );
+        alpm.trans_release()?;
+        assert_eq!(
+            prepared?.len(),
+            1,
+            "installable fixtures satisfy signing metadata checks"
+        );
+        Ok(())
     }
 
     #[test]
