@@ -999,3 +999,26 @@ fixture verification and the hosted coverage comparison remain pending; coverage
 thresholds, exclusions and counters were not relaxed. The existing verified
 optimized preview predates this refactor and remains separate from final build
 acceptance.
+
+The d4726393 batch passed the current 22 native library fixtures in a disposable
+Arch KVM guest, including the repaired repository metadata fixture. The same
+commit passed the six-artifact supplemental producer, its 14 selected tests, and
+all seven original Omarchy scenarios. The merged local library and guest report
+reached 227/229 Omarchy functions and 3317/3441 lines; this is progress, not a
+passing source coverage comparison.
+
+A normal optimized CLI and daemon pair from d4726393 passed a separate disposable
+guest proof of a full signed native update, continuity through user-manager
+reexecution, and all six existing refusal controls. The verified local bundle is
+`omg-pr1057-d4726393-x86_64-arch.tar.gz`, SHA-256
+`0d72ecfffe96f534c9f4b156fdd6a8276f02c4b69970d0fa6181435345b7f2c9`.
+Hosted coverage and the PR checks remain pending. The host installation was not
+changed.
+
+The supplemental fixture now declares scenarios with named expected status,
+helper trace, optional scene, missing helper, and committed native state. The
+producer derives its execution list from that declaration. Three appended cases
+exercise missing and unsupported snapshot helpers and a missing required
+development helper. The original seven scenarios and all six artifact roles
+remain selected. Their real guest execution is required before claiming the
+expanded fixture has passed.

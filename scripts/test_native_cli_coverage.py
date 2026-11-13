@@ -232,6 +232,22 @@ class HostedProducer(unittest.TestCase):
         self.assertLess(native.index('--native-cli-coverage-dir'),
                         native.index('docker start --attach'))
 
+    def test_declared_optional_and_required_helper_cases_execute_the_real_cli(self):
+        required = {'omarchy-snapshot-missing', 'omarchy-snapshot-unsupported',
+                    'omarchy-required-helper-missing'}
+        self.assertTrue(required <= PRODUCER.OMARCHY_CASES.keys(),
+                        'Native lifecycle coverage omits missing/unsupported helper scenarios')
+        script = PRODUCER.omarchy_guest_script()
+        stages = script.split('for stage in ', 1)[1].split('; do', 1)[0].split()
+        self.assertEqual(stages, list(PRODUCER.OMARCHY_CASES),
+                         'Every declared scenario must execute once in declaration order')
+        for stage in required:
+            case = PRODUCER.OMARCHY_CASES[stage]
+            self.assertIn(stage + ')', script)
+            self.assertIn('OMARCHY_FIXTURE_SCENE="$scene"', script)
+            if case.absent_helper:
+                self.assertIn(case.absent_helper, script)
+
     def test_generated_omarchy_cases_use_the_real_cli_in_a_private_namespace(self):
         artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
         script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
@@ -414,20 +430,27 @@ def evidence_fixture(root):
         for name in ('why', 'why-reverse', 'size', 'size-tree', 'blame')))
     (evidence / 'daemon.log').write_text('[extra-daemon] startup_socket=ready uid=65534\n'
                                        '[extra-daemon] sigterm_exit=0 socket_removed=yes\n')
-    for stage, (status, helpers) in PRODUCER.OMARCHY_CASES.items():
+    for stage, case in PRODUCER.OMARCHY_CASES.items():
+        status, helpers = case.exit_status, case.helpers
         (evidence / f'{stage}-exit.txt').write_text(f'{status}\n')
         (evidence / f'{stage}-helpers.tsv').write_text(''.join(row + '\n' for row in helpers))
         if helpers:
             (evidence / f'{stage}-coordination.txt').write_text(
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
-        if stage in ('omarchy-success', 'omarchy-optional-failures'):
+        if case.native_committed:
             (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
+        if case.absent_helper:
+            (evidence / f'{stage}-layout.txt').write_text(
+                'absent helper restored after genuine CLI execution\n')
         if stage == 'omarchy-optional-failures':
             (evidence / f'{stage}-layout.txt').write_text(
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': '| System is up to date',
+            'omarchy-snapshot-missing': '| System is up to date',
+            'omarchy-snapshot-unsupported': '| System is up to date',
+            'omarchy-required-helper-missing': 'Omarchy update did not complete: omarchy-update-dev',
             'omarchy-optional-failures': '| System is up to date\n! Continuing without a snapshot\n! Some mise tools could not be updated',
             'omarchy-vendor-failure': 'Omarchy update did not complete',
             'omarchy-declined': 'declined',
@@ -446,7 +469,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 12)
+            self.assertEqual(len(receipt['process_checks']), 15)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -480,6 +503,9 @@ class SupplementalEvidence(unittest.TestCase):
             'omarchy-old-logger': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('Script started on fixture\nScript done on fixture\n'),
             'omarchy-no-cleanup': lambda e, p: (e / 'omarchy-success-coordination.txt').write_text('lock still held'),
             'omarchy-no-refusal': lambda e, p: (e / 'omarchy-migration-refusal.log').write_text('failed for another reason'),
+            'missing-helper-not-restored': lambda e, p: (e / 'omarchy-snapshot-missing-layout.txt').write_text('still absent'),
+            'unsupported-snapshot-skips-native': lambda e, p: (e / 'omarchy-snapshot-unsupported-native-state.json').write_text('{"status":"UNCOMMITTED"}'),
+            'required-helper-false-success': lambda e, p: (e / 'omarchy-required-helper-missing-exit.txt').write_text('0\n'),
             'omarchy-wrong-cli': lambda e, p: (p / 'omg-extra-omarchy-success-123-100_0.profraw').rename(
                 p / 'omg-extra-omarchy-success-123-200_0.profraw'),
         }

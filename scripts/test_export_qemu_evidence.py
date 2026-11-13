@@ -39,6 +39,19 @@ FEDORA_EXCLUSION_DIAGNOSTICS = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_native_optional_helper_diagnostics_stay_at_the_cli_root(self):
+        prefix = ('run-test', 'native-evidence', 'cli')
+        for stage in ('omarchy-snapshot-missing', 'omarchy-snapshot-unsupported',
+                      'omarchy-required-helper-missing'):
+            for suffix in ('.log', '-helpers.tsv', '-native-state.json', '-layout.txt', '-exit.txt'):
+                name = stage + suffix
+                with self.subTest(name=name):
+                    self.assertTrue(exporter.allowed_file((*prefix, name)))
+                    self.assertFalse(exporter.allowed_file((*prefix, 'private', name)))
+                    self.assertFalse(exporter.allowed_file((*prefix, name + '.bak')))
+                    self.assertFalse(exporter.allowed_file(('run-test', name)))
+        self.assertFalse(exporter.allowed_file((*prefix, 'omarchy-unknown.log')))
+
     def test_fedora_exclusion_controls_are_limited_to_the_advisory_root(self):
         prefix = ("run-test", "guest", "evidence", "fedora-advisory")
         for name in FEDORA_EXCLUSION_DIAGNOSTICS:

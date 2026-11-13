@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+from typing import NamedTuple
 import xml.etree.ElementTree as ET
 
 
@@ -297,24 +298,43 @@ OMARCHY_SUFFIX = (
     'omarchy-shell\t-q\tomarchy.system-update\tclear',
     'omarchy-update-restart\t--services-only', 'omarchy-hook\tpost-update',
     'omarchy-update-mise', 'omarchy-update-boot', 'omarchy-update-stay-awake\tstop')
+
+
+class OmarchyCase(NamedTuple):
+    exit_status: int
+    helpers: tuple[str, ...]
+    scene: str = 'none'
+    absent_helper: str | None = None
+    native_committed: bool = False
+
+
 OMARCHY_CASES = {
-    'omarchy-success': (0, OMARCHY_PREFIX + OMARCHY_SUFFIX),
-    'omarchy-vendor-failure': (1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',)),
-    'omarchy-declined': (0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
-    'omarchy-optional-failures': (0, tuple(
+    'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_committed=True),
+    'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',)),
+    'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
+    'omarchy-optional-failures': OmarchyCase(0, tuple(
         item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
-        if item.split('\t')[0] not in ('omarchy-snapshot', 'omarchy-restart-shell', 'omarchy-update-mise'))),
-    'omarchy-migration-refusal': (1, ()),
-    'omarchy-unsupported-mode': (1, ()),
-    'omarchy-invalid-transport': (1, ()),
+        if item.split('\t')[0] not in ('omarchy-snapshot', 'omarchy-restart-shell', 'omarchy-update-mise')),
+        native_committed=True),
+    'omarchy-migration-refusal': OmarchyCase(1, ()),
+    'omarchy-unsupported-mode': OmarchyCase(1, ()),
+    'omarchy-invalid-transport': OmarchyCase(1, ()),
+    'omarchy-snapshot-missing': OmarchyCase(0, tuple(
+        item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
+        if item != 'omarchy-snapshot\tcreate'), absent_helper='omarchy-snapshot', native_committed=True),
+    'omarchy-snapshot-unsupported': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='snapshot-unsupported', native_committed=True),
+    'omarchy-required-helper-missing': OmarchyCase(1, OMARCHY_PREFIX[:3] +
+        ('omarchy-update-stay-awake\tstop',), absent_helper='omarchy-update-dev'),
 }
+
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES)
 STAGES = tuple('registry-' + role for role in TESTS) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
 
 
 def omarchy_guest_script():
-    return r'''unshare --mount --net --fork bash -s <<'OMG_OMARCHY_NAMESPACE'
+    script = r'''unshare --mount --net --fork bash -s <<'OMG_OMARCHY_NAMESPACE'
 set -euo pipefail
 mount --make-rprivate /
 for tool in script flock tar mount mountpoint readlink runuser; do
@@ -408,8 +428,7 @@ for ((attempt=0; attempt<50; attempt++)); do
   kill -0 "$repository_server"
   sleep 0.1
 done
-for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-optional-failures \
-  omarchy-migration-refusal omarchy-unsupported-mode omarchy-invalid-transport; do
+for stage in OMARCHY_STAGE_NAMES; do
   case_dir="$case_root/$stage"
   install -d -m 700 -o nobody -g nobody "$case_dir" "$case_dir/config" "$case_dir/run" \
     "$case_dir/db" "$case_dir/db/local" "$case_dir/db/sync" "$case_dir/migrations" \
@@ -458,6 +477,16 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
       test "$(stat -c '%u:%a' "$fixture/foreign/bin/$name")" = 0:755
     done
   fi
+  scene=none
+  absent_helper=
+  case "$stage" in
+OMARCHY_CASE_SETUP
+  esac
+  if test -n "$absent_helper"; then
+    test -f "/usr/bin/$absent_helper" && test ! -L "/usr/bin/$absent_helper"
+    test ! -e "$fixture/saved/$absent_helper"
+    mv "/usr/bin/$absent_helper" "$fixture/saved/$absent_helper"
+  fi
   result=0
   timeout --signal=TERM --kill-after=3 40 runuser -u nobody -- env -i \
     PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
@@ -467,7 +496,7 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
     OMG_DAEMON_DATA_DIR="$case_dir/daemon" OMG_DISABLE_DAEMON=1 OMG_DISABLE_TELEMETRY=1 \
     OMG_PACMAN_CONF="$case_dir/pacman.conf" OMG_PACMAN_DB_DIR="$signed_owner/db" \
     OMARCHY_PATH="$case_dir/checkout" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
-    OMARCHY_FIXTURE_CASE="$stage" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
+    OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@"' \
     bash "${args[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
@@ -476,10 +505,17 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
     test "$(stat -c %u "$profile")" = 0
     mv "$profile" /profiles/
   done
-  if test "$stage" = omarchy-success || test "$stage" = omarchy-optional-failures; then
-    python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" \
-      > "/evidence/cli/$stage-native-state.json"
+  if test -n "$absent_helper"; then
+    test ! -e "/usr/bin/$absent_helper" && test ! -L "/usr/bin/$absent_helper"
+    mv "$fixture/saved/$absent_helper" "/usr/bin/$absent_helper"
+    cmp "$fixture/stage" "/usr/bin/$absent_helper"
+    printf 'absent helper restored after genuine CLI execution\n' > "/evidence/cli/$stage-layout.txt"
   fi
+  case "$stage" in
+    OMARCHY_COMMITTED_CASES)
+    python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" \
+      > "/evidence/cli/$stage-native-state.json" ;;
+  esac
   if test "$stage" = omarchy-optional-failures; then
     for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
       test -L "/usr/bin/$name"
@@ -506,6 +542,14 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
 done
 OMG_OMARCHY_NAMESPACE
 '''
+    setup = '\n'.join(
+        f'    {shlex.quote(stage)}) scene={shlex.quote(case.scene)}; '
+        f'absent_helper={shlex.quote(case.absent_helper or "")} ;;'
+        for stage, case in OMARCHY_CASES.items())
+    return (script.replace('OMARCHY_STAGE_NAMES', ' '.join(map(shlex.quote, OMARCHY_CASES)))
+            .replace('OMARCHY_CASE_SETUP', setup)
+            .replace('OMARCHY_COMMITTED_CASES', '|'.join(shlex.quote(stage)
+                     for stage, case in OMARCHY_CASES.items() if case.native_committed)))
 
 
 def guest_script(artifacts, compiled_cli):
@@ -708,7 +752,8 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                 and matches[0][-1] != 'unavailable', 'Missing/failed native inventory row: ' + name)
     daemon = (evidence / 'daemon.log').read_text()
     require('[extra-daemon] startup_socket=ready uid=' in daemon and '[extra-daemon] sigterm_exit=0 socket_removed=yes' in daemon, 'Daemon lifecycle incomplete')
-    for stage, (status, helpers) in OMARCHY_CASES.items():
+    for stage, case in OMARCHY_CASES.items():
+        status, helpers = case.exit_status, case.helpers
         require((evidence / f'{stage}-exit.txt').read_text() == f'{status}\n',
                 'Omarchy CLI exit status differs: ' + stage)
         require((evidence / f'{stage}-helpers.tsv').read_text().splitlines() == list(helpers),
@@ -724,11 +769,18 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require(transcript.startswith('OMG Omarchy update started\n')
                     and '\nOMG Omarchy update finished: ' in transcript,
                     'Omarchy has no complete genuine PTY transcript: ' + stage)
-        if stage in ('omarchy-success', 'omarchy-optional-failures'):
+        if case.native_committed:
             require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
                     == 'PASS_SIGNED_NATIVE_STATE', 'Missing committed native package state')
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if case.absent_helper:
+            require((evidence / f'{stage}-layout.txt').read_text()
+                    == 'absent helper restored after genuine CLI execution\n',
+                    'Missing helper was not restored: ' + stage)
+        if stage == 'omarchy-required-helper-missing':
+            require('omarchy-update-dev' in log and 'Omarchy update did not complete' in log,
+                    'Missing required helper was not reported')
         if stage == 'omarchy-optional-failures':
             require((evidence / f'{stage}-layout.txt').read_text()
                     == 'foreign optional helpers never executed; original helpers restored\n',

@@ -177,7 +177,7 @@ def allowed_file(parts):
         return name in {"tests.xml", "verification.json", "expected-tests.tsv", "passed.tsv",
                         "process-checks.tsv", "db-before.txt", "db-after.txt", "identity.txt",
                         "artifacts.sha256", "artifact-check.txt", "all-stages-pass.txt"} or re.fullmatch(
-            r"(?:omarchy-(?:success|vendor-failure|declined|optional-failures|migration-refusal|unsupported-mode|invalid-transport)"
+            r"(?:omarchy-(?:success|vendor-failure|declined|optional-failures|migration-refusal|unsupported-mode|invalid-transport|snapshot-missing|snapshot-unsupported|required-helper-missing)"
             r"(?:\.log|-helpers\.tsv|-native-state\.json|-transcript\.log|-coordination\.txt|-layout\.txt|-exit\.txt)"
             r"|test-[0-9]{2}\.log|daemon\.log|cli-(?:q|v|vv|vvv)\.log)", name
         ) is not None
