@@ -1103,3 +1103,26 @@ source checks and artifact roles remain required. Producer tests passed 32 cases
 45 ordinary-user exporter tests passed, and the root-only exporter case passed
 inside the disposable guest. The current hosted instrumented run passed, while
 its strict added-file coverage comparison still fails for the Omarchy module.
+
+The complete 0fa345e7 cancellation batch passed normal and instrumented library
+runs (2408 tests each, 13 existing ignores), all-target Clippy with warnings denied
+for default, minimal and Debian pure features, normal CLI/daemon builds, and the
+optimized release build. The protected six-role producer passed its 14 selected
+tests and all 19 Omarchy scenarios in 217.101 seconds, importing 309 genuine
+profiles only after validation and clean shutdown. Every scenario passed its
+expected native package-state check. The merged report reaches 234/234 Omarchy
+functions and 3417/3501 summary lines, with 65 uncovered mapped lines. Strict
+source coverage comparison remains open; neither metric is complete coverage.
+
+The optimized pair independently passed the full signed native update,
+user-manager reexecution, six refusal controls, and all 19 scenarios in 171.892
+seconds. Both cancellation receipts confirm the expected handled error, cleanup
+of the observed helper and descendant, survival of an unrelated process, and
+unchanged installed payload/database. Both guests preserved their pinned inputs,
+real system package databases and exact binary identities and shut down cleanly.
+The replacement local bundle is `omg-pr1057-0fa345e7-x86_64-arch.tar.gz`, SHA-256
+`4017d12f9e7e638ecca7d06a64fad0061e1d5429578ab132021e2e2d94826f27`.
+Its embedded receipt identifies the exact source, binary hashes and guest proof.
+It supersedes the 0584c726 candidate for the pipe-disconnection fix; the host
+installation remains unchanged. Exact-head hosted CI and coverage comparison
+still require acceptance before merging.
