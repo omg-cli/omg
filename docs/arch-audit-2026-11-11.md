@@ -1235,3 +1235,15 @@ missing shutdown events and a foreign monitor peer. The existing 30-second
 shutdown deadline and profile validation remain required. All 34 producer tests
 and 18 export-boundary tests pass; actual KVM verification of the new shutdown
 observer remains pending before publication.
+
+The new shutdown observer passed an actual KVM guest proof in 12.496 seconds.
+The monitor peer PID matched the owned QEMU process, QMP reported guest=true and
+reason=guest-shutdown, the process disappeared and its actual exit status was 0.
+The real SSH request returned 0 in this probe; the separate transport regression
+covers status 255 and preservation of producer status 17. The observer's fields
+follow the [QEMU shutdown event contract](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html).
+The root-owned exporter case also passed inside this guest. The 34 producer tests,
+18 export-boundary tests, 47 ordinary-user exporter tests, 37 process-isolation
+tests, 11 boot-budget tests and Bash parsing all passed. The existing native
+coverage admission, required artifacts/scenarios, counters and thresholds remain
+unchanged. Hosted acceptance of the combined fix remains pending.
