@@ -1049,3 +1049,20 @@ with the same real terminal protocol. The replacement local bundle is
 `b200517913e38b92cfb0d9632297beff1fe59f891fbb96c6097a4e067fa9e30a`.
 This replaces the d4726393 candidate, which predates the prompt-flush fix. The
 host installation remains unchanged, and hosted comparison is still pending.
+
+The next supplemental guest batch passed all 15 Omarchy scenarios, including
+actual authorization refresh and refusal after the unchanged 60-second interval.
+Root-owned sudo logs bind each initial authorization and timed refresh to the
+invoking user, root target, command, timestamp and exact log digest. The denied
+control records an explicit permission refusal and the CLI warning; it does not
+substitute a successful helper. Each scenario retains its native package-state,
+helper-trace and cleanup checks. The sudo policy changes exist only in the
+disposable guest. All original scenario deadlines and the production refresh
+interval are unchanged.
+
+The producer and exporter checks passed 29 and 16 tests respectively. The merged
+local Omarchy report reached 233/234 functions and 3407/3500 lines. The latest
+completed hosted Arch, workflow and full instrumented jobs passed; strict added
+file coverage comparison remains the outstanding gate. No coverage acceptance
+rule was relaxed. These fixture-only changes preserve every Rust and Cargo input
+of the verified 0584c726 install bundle.
