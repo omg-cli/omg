@@ -710,12 +710,8 @@ pub fn elevate_for_operation(operation: &str, args: &[String]) -> std::io::Resul
     elevate_if_needed(args).map_err(std::io::Error::other)
 }
 
-/// Run the current executable with sudo and specific arguments asynchronously
 /// Build a scrubbed sudo command that re-executes the current binary.
-///
-/// Note: We set `OMG_ELEVATED=1` as an environment variable for the child
-/// process. This prevents infinite recursion when the elevated process checks
-/// this flag.
+/// Authenticated elevation and history ownership travel as positional markers.
 ///
 /// CRITICAL: Remove CARGO_* environment variables to prevent the elevated
 /// process from writing to the user's target directory as root (causing
@@ -729,7 +725,7 @@ fn payload_command(
     exe: &std::path::Path,
     args: &[&str],
     non_interactive: bool,
-) -> tokio::process::Command {
+) -> anyhow::Result<tokio::process::Command> {
     let parent_records = args.last().copied() == Some(FLOW_PARENT_RECORDS);
     let payload_args = if parent_records {
         &args[..args.len() - 1]
@@ -749,13 +745,23 @@ fn payload_command(
         .env("OMG_ELEVATED", "1");
     scrub_privileged_env(&mut command);
     command
-        // Inherit terminal so output and any password prompt stay attached
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
-        .arg("--")
-        .arg(exe)
-        .arg(crate::core::privilege::ELEVATED_MARKER);
+        .arg("--");
+    let verb = payload_args
+        .first()
+        .copied()
+        .filter(|argument| !argument.starts_with(crate::core::security::policy::POLICY_MARKER))
+        .or_else(|| payload_args.get(1).copied());
+    if verb == Some("omarchy-native") {
+        // Package hooks can reexecute the user manager. Keep our worker in a
+        // system scope while retaining this invocation's namespaces and TTY.
+        command
+            .arg(root_controlled_program_path("systemd-run")?)
+            .args(["--scope", "--quiet", "--collect", "--"]);
+    }
+    command.arg(exe).arg(ELEVATED_MARKER);
     if parent_records {
         // Internal flow ownership is positional protocol metadata, never a
         // package-list token. The root child accepts it only immediately
@@ -763,7 +769,31 @@ fn payload_command(
         command.arg(FLOW_PARENT_RECORDS);
     }
     command.args(payload_args);
-    command
+    Ok(command)
+}
+
+/// Build a supervised, fixed native package stage after Omarchy authorization.
+#[cfg(feature = "arch")]
+pub(crate) fn native_omarchy_command(
+    operation: crate::package_managers::arch::NativeOmarchyOperation,
+    interaction: crate::package_managers::arch::NativeOmarchyInteraction,
+) -> anyhow::Result<tokio::process::Command> {
+    let policy = crate::core::security::policy::policy_handoff()?;
+    let mut arguments = vec![
+        "omarchy-native",
+        "--",
+        operation.argument(),
+        interaction.argument(),
+    ];
+    if let Some(policy) = &policy {
+        arguments.insert(0, policy);
+    }
+    payload_command(
+        &root_controlled_program_path("sudo")?,
+        &elevation_executable()?,
+        &arguments,
+        true,
+    )
 }
 
 /// Run the omg payload under sudo exactly once and return its exit status
@@ -803,8 +833,13 @@ async fn sudo_payload_status(args: &[&str]) -> anyhow::Result<std::process::Exit
 /// Privileged re-exec verbs that are not clap user commands. `update --fast`
 /// and `update --turbo` elevate as `fullupdate` / `turboupdate`; the elevated
 /// child also accepts `upgrade`. See `try_fast_elevated` in `src/bin/omg.rs`.
-const INTERNAL_PRIVILEGED_ENTRYPOINTS: &[&str] =
-    &["upgrade", "fullupdate", "turboupdate", "install-plan"];
+const INTERNAL_PRIVILEGED_ENTRYPOINTS: &[&str] = &[
+    "upgrade",
+    "fullupdate",
+    "turboupdate",
+    "install-plan",
+    "omarchy-native",
+];
 
 fn snapshot_install_inputs(
     args: &[String],
@@ -913,7 +948,7 @@ async fn sudo_payload_status_in(
         // terminal instead of spawning a GUI askpass dialog. The user can
         // Ctrl+C if needed. Runs exactly once.
         tracing::debug!("Password required, running interactive sudo");
-        return payload_command(sudo_program, &exe, args, false)
+        return payload_command(sudo_program, &exe, args, false)?
             .status()
             .await
             .map_err(|e| {
@@ -929,7 +964,7 @@ async fn sudo_payload_status_in(
     // Authenticated non-interactively: run the payload exactly once and
     // propagate its result. Never retried — a failing elevated command must
     // surface its own error, not trigger a second execution.
-    payload_command(sudo_program, &exe, args, true)
+    payload_command(sudo_program, &exe, args, true)?
         .status()
         .await
         .map_err(|e| {
@@ -1105,6 +1140,46 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "arch", target_os = "linux"))]
+    fn native_omarchy_payload_runs_our_binary_in_a_system_scope() {
+        let command = payload_command(
+            std::path::Path::new("sudo"),
+            std::path::Path::new("/usr/bin/omg"),
+            &[
+                "__omg_policy=fixture",
+                "omarchy-native",
+                "--",
+                "repository-upgrade",
+                "unattended",
+            ],
+            true,
+        )
+        .expect("construct privileged payload");
+        let args = command.as_std().get_args().collect::<Vec<_>>();
+        assert_eq!(args[2], std::ffi::OsStr::new("/usr/bin/systemd-run"));
+        let marker = args
+            .iter()
+            .position(|arg| *arg == ELEVATED_MARKER)
+            .expect("elevation marker");
+        assert_eq!(
+            &args[3..marker],
+            &["--scope", "--quiet", "--collect", "--", "/usr/bin/omg"]
+        );
+        assert_eq!(args[marker + 1], "__omg_policy=fixture");
+        assert_eq!(args[marker + 2], "omarchy-native");
+    }
+
+    #[test]
+    fn native_omarchy_operation_is_not_parsed_as_a_public_clap_command() {
+        let args = ["omarchy-native", "--", "repository-upgrade", "unattended"].map(str::to_owned);
+        assert!(
+            super::snapshot_install_inputs(&args)
+                .expect("closed private operation")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn payload_command_transmits_elevation_via_argv_marker() {
         // Regression: OMG_ELEVATED=1 in the child environment is stripped by
         // sudo's env_reset, which killed every fast-elevated path. The marker
@@ -1115,7 +1190,8 @@ mod tests {
             &exe,
             &["fullupdate", "--"],
             true,
-        );
+        )
+        .expect("construct privileged payload");
         let argv = command.as_std().get_args().collect::<Vec<_>>();
         let marker_pos = argv
             .iter()
@@ -1135,7 +1211,8 @@ mod tests {
             &exe,
             &["install", "--", "ripgrep", FLOW_PARENT_RECORDS],
             true,
-        );
+        )
+        .expect("construct privileged payload");
         let argv = command
             .as_std()
             .get_args()
@@ -1167,7 +1244,8 @@ mod tests {
             &exe,
             &["install", "--", "ripgrep"],
             true,
-        );
+        )
+        .expect("construct privileged payload");
         let removed: std::collections::HashSet<String> = command
             .as_std()
             .get_envs()

@@ -191,16 +191,12 @@ fn stage_command(stage: Stage) -> Option<(&'static str, &'static [&'static str])
         Stage::Preflight => ("omarchy-update-requires-free-space", &[]),
         Stage::Confirm => ("omarchy-update-confirm", &[]),
         Stage::Authorize => ("sudo", &["true"]),
-        Stage::Prune => ("omarchy-update-pkg-prune", &[]),
         Stage::Snapshot => ("omarchy-snapshot", &["create"]),
         Stage::InhibitSleep => ("omarchy-update-stay-awake", &["start"]),
         Stage::DevelopmentCheckout => ("omarchy-update-dev", &[]),
-        Stage::Keyrings => ("omarchy-update-keyring", &[]),
-        Stage::OfficialPackages => ("omarchy-update-system-pkgs", &[]),
         Stage::MigrationsPending => ("omarchy-migrate", &["--pending"]),
         Stage::RestartShell => ("omarchy-restart-shell", &[]),
         Stage::Migrations => ("omarchy-migrate", &[]),
-        Stage::Orphans => ("omarchy-update-orphan-pkgs", &["-y"]),
         Stage::AnalyzeLog => ("omarchy-update-analyze-logs", &[]),
         Stage::ClearIndicator => ("omarchy-shell", &["-q", "omarchy.system-update", "clear"]),
         Stage::RestartServices => ("omarchy-update-restart", &["--services-only"]),
@@ -208,8 +204,14 @@ fn stage_command(stage: Stage) -> Option<(&'static str, &'static [&'static str])
         Stage::Mise => ("omarchy-update-mise", &[]),
         Stage::VerifyBoot => ("omarchy-update-boot", &[]),
         Stage::ReleaseInhibitor => ("omarchy-update-stay-awake", &["stop"]),
-        Stage::RebootPrompt => ("omarchy-update-restart", &["--reboot-only"]),
-        Stage::MigrationPreflight | Stage::NativeAur | Stage::ReleaseAuthorization => return None,
+        Stage::Prune
+        | Stage::Keyrings
+        | Stage::OfficialPackages
+        | Stage::Orphans
+        | Stage::MigrationPreflight
+        | Stage::NativeAur
+        | Stage::ReleaseAuthorization
+        | Stage::RebootPrompt => return None,
     })
 }
 
@@ -299,21 +301,16 @@ impl OmarchyRuntime {
     fn validate_available_helpers(&self) -> Result<()> {
         for stage in [
             Stage::Preflight,
-            Stage::Prune,
             Stage::InhibitSleep,
             Stage::DevelopmentCheckout,
-            Stage::Keyrings,
-            Stage::OfficialPackages,
             Stage::MigrationsPending,
             Stage::Migrations,
-            Stage::Orphans,
             Stage::AnalyzeLog,
             Stage::ClearIndicator,
             Stage::RestartServices,
             Stage::PostUpdateHooks,
             Stage::VerifyBoot,
             Stage::ReleaseInhibitor,
-            Stage::RebootPrompt,
         ] {
             let (name, _) = stage_command(stage).context("Missing Omarchy helper mapping")?;
             if let Ok(program) = crate::core::privilege::root_controlled_program_path(name) {
@@ -404,9 +401,17 @@ impl Commands {
         if self.yes {
             command.env("OMARCHY_UPDATE_UNATTENDED", "1");
         }
+        self.run_command(command, &program.display().to_string())
+            .await
+    }
+
+    async fn run_command(&mut self, mut command: Command, label: &str) -> Result<ExitStatus> {
+        anyhow::ensure!(self.active.is_none(), "An Omarchy stage is already running");
+        command.kill_on_drop(true).process_group(0);
+        command.env_remove(LOCK_FD).env_remove(LOG_FD);
         self.start(&mut command)
             .await
-            .with_context(|| format!("Failed to start Omarchy stage {}", program.display()))?;
+            .with_context(|| format!("Failed to start Omarchy stage {label}"))?;
         let result = self
             .active
             .as_mut()
@@ -422,7 +427,7 @@ impl Commands {
             Err(error) => {
                 let cleanup = self.stop_active().await;
                 finish_cleanup(
-                    Err(error).with_context(|| format!("Failed to wait for {}", program.display())),
+                    Err(error).with_context(|| format!("Failed to wait for {label}")),
                     cleanup,
                 )
             }
@@ -536,6 +541,56 @@ impl Commands {
 impl StageExecutor for Commands {
     async fn execute(&mut self, stage: Stage) -> Result<Outcome> {
         match stage {
+            Stage::Prune | Stage::Keyrings | Stage::OfficialPackages | Stage::Orphans => {
+                use crate::package_managers::arch::{
+                    NativeOmarchyInteraction, NativeOmarchyOperation,
+                };
+                let operation = match stage {
+                    Stage::Prune => NativeOmarchyOperation::PruneCache,
+                    Stage::Keyrings => NativeOmarchyOperation::RefreshKeyrings,
+                    Stage::OfficialPackages => NativeOmarchyOperation::UpgradeRepositories,
+                    Stage::Orphans => NativeOmarchyOperation::RemoveOrphans,
+                    _ => unreachable!(),
+                };
+                let interaction = if self.yes {
+                    NativeOmarchyInteraction::Unattended
+                } else {
+                    NativeOmarchyInteraction::Attended
+                };
+                let command =
+                    crate::core::privilege::native_omarchy_command(operation, interaction)?;
+                let status = self.run_command(command, operation.argument()).await?;
+                crate::package_managers::arch::complete_native_omarchy_write(status.success())
+                    .await?;
+                anyhow::ensure!(
+                    status.success(),
+                    "Native Omarchy {operation:?} failed: {status}"
+                );
+                return Ok(Outcome::Success);
+            }
+            Stage::RebootPrompt => {
+                if let Some(reason) = native_reboot_reason()? {
+                    if self.yes || !console::user_attended() {
+                        println!("{reason} Run omarchy-system reboot when ready.");
+                    } else {
+                        let _quiesce = crate::cli::modern_ui::quiesce_terminal();
+                        if dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
+                            .with_prompt(format!("{reason} Reboot now?"))
+                            .default(false)
+                            .interact()?
+                        {
+                            let executable = crate::core::privilege::root_controlled_program_path(
+                                "omarchy-system",
+                            )?;
+                            self.runtime
+                                .check_helper_layout("omarchy-system", &executable)?;
+                            let status = self.run_program(&executable, &["reboot"]).await?;
+                            anyhow::ensure!(status.success(), "Omarchy reboot failed: {status}");
+                        }
+                    }
+                }
+                return Ok(Outcome::Success);
+            }
             Stage::NativeAur => {
                 super::arch::update_omarchy_aur(self.yes).await?;
                 return Ok(Outcome::Success);
@@ -563,9 +618,6 @@ impl StageExecutor for Commands {
         };
         if program.starts_with("omarchy-") {
             OmarchyRuntime::validate_root_directory(&self.runtime.root)?;
-            if stage == Stage::Prune {
-                self.runtime.validate_available_helpers()?;
-            }
             self.runtime.check_helper_layout(program, &executable)?;
         }
         if stage == Stage::InhibitSleep {
@@ -632,16 +684,89 @@ fn ensure_migrations_use_native_aur(migrations: &Path, state: &Path) -> Result<(
             path.display()
         );
         let contents = std::fs::read_to_string(&path)?;
-        let known_external_aur = ["omarchy-pkg-aur-", "yay ", "yay\n", "aura ", "paru "];
+        let known_external_aur = [
+            "omarchy-pkg-aur-",
+            "yay ",
+            "yay\n",
+            "aura ",
+            "paru ",
+            "pacman",
+            "paccache",
+            "omarchy-pkg-add",
+            "omarchy-pkg-drop",
+            "omarchy-pkg-present",
+            "omarchy-pkg-missing",
+        ];
         anyhow::ensure!(
             !known_external_aur
                 .iter()
                 .any(|command| contents.contains(command)),
-            "Native AUR integration refuses pending Omarchy migration {} because it invokes an external AUR helper. A native migration equivalent is required before continuing.",
+            "Native AUR integration refuses pending Omarchy migration {} because it references an external package helper. A native migration equivalent is required before continuing.",
             path.display()
         );
     }
     Ok(())
+}
+
+fn native_reboot_reason() -> Result<Option<&'static str>> {
+    let running = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .context("Cannot inspect the running kernel")?;
+    let running = running.trim();
+    anyhow::ensure!(
+        !running.is_empty() && !running.contains('/'),
+        "Invalid running kernel release"
+    );
+    let modules = format!("usr/lib/modules/{running}/modules.builtin");
+    let owned = crate::package_managers::alpm_direct::with_handle(|handle| {
+        Ok(handle.localdb().pkgs().iter().any(|package| {
+            package
+                .files()
+                .files()
+                .iter()
+                .any(|file| file.name() == modules.as_bytes())
+        }))
+    })?;
+    if !owned || !Path::new("/").join(&modules).is_file() {
+        return Ok(Some(
+            "The installed kernel differs from the running kernel.",
+        ));
+    }
+    if dirs::home_dir()
+        .is_some_and(|home| home.join(".local/state/omarchy/reboot-required").is_file())
+    {
+        return Ok(Some("Omarchy marked this update as requiring a reboot."));
+    }
+    let uid = rustix::process::getuid().as_raw();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_none_or(|name| name.parse::<u32>().is_err())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.uid() != uid {
+            continue;
+        }
+        if std::fs::read_to_string(path.join("comm")).is_ok_and(|name| name.trim() == "Hyprland")
+            && std::fs::read_link(path.join("exe")).is_ok_and(|executable| {
+                executable
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .ends_with(b" (deleted)")
+            })
+        {
+            return Ok(Some(
+                "The running Hyprland executable was replaced during the update.",
+            ));
+        }
+    }
+    Ok(None)
 }
 
 fn lock_path() -> PathBuf {
@@ -1347,10 +1472,18 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            stage_command(Stage::OfficialPackages),
-            Some(("omarchy-update-system-pkgs", &[][..]))
-        );
+        for stage in [
+            Stage::Prune,
+            Stage::Keyrings,
+            Stage::OfficialPackages,
+            Stage::Orphans,
+            Stage::RebootPrompt,
+        ] {
+            assert!(
+                stage_command(stage).is_none(),
+                "{stage:?} must execute native ALPM, never a package helper"
+            );
+        }
         assert!(stage_command(Stage::NativeAur).is_none());
     }
 
@@ -1525,7 +1658,7 @@ mod tests {
             .check_pending_migrations()
             .expect_err("Standard must refuse a known external AUR helper");
         assert!(
-            error.to_string().contains("external AUR helper"),
+            error.to_string().contains("external package helper"),
             "{error:#}"
         );
     }
@@ -1573,7 +1706,7 @@ mod tests {
             .check_pending_migrations()
             .expect_err("user checkout must still refuse external AUR migrations");
         assert!(
-            error.to_string().contains("external AUR helper"),
+            error.to_string().contains("external package helper"),
             "{error:#}"
         );
         assert!(
@@ -1698,6 +1831,13 @@ mod tests {
             "yay -Sua\n",
             "aura -Au\n",
             "paru -Sua\n",
+            "sudo pacman -Syu\n",
+            "pacman-key --populate\n",
+            "paccache -rk2\n",
+            "omarchy-pkg-add package\n",
+            "omarchy-pkg-drop package\n",
+            "omarchy-pkg-present package\n",
+            "omarchy-pkg-missing package\n",
         ] {
             std::fs::write(migrations.join("0002.sh"), command)
                 .expect("inert helper-bearing migration");
@@ -3525,7 +3665,7 @@ mod tests {
                 .check_pending_migrations()
                 .expect_err("selected runtime external AUR migration must refuse");
             assert!(
-                error.to_string().contains("external AUR helper"),
+                error.to_string().contains("external package helper"),
                 "{error:#}"
             );
             std::fs::write(

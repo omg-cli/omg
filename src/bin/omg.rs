@@ -198,6 +198,24 @@ fn try_fast_elevated(
                 ))
             })
         }
+        "omarchy-native" => Some((|| {
+            use omg_lib::package_managers::arch::{
+                NativeOmarchyInteraction, NativeOmarchyOperation,
+            };
+            let [operation, interaction] = packages.as_slice() else {
+                anyhow::bail!(
+                    "Native Omarchy stages require exactly one operation and interaction mode"
+                );
+            };
+            let operation = NativeOmarchyOperation::from_argument(operation)
+                .ok_or_else(|| anyhow::anyhow!("Unknown native Omarchy package operation"))?;
+            let interaction = NativeOmarchyInteraction::from_argument(interaction)
+                .ok_or_else(|| anyhow::anyhow!("Unknown native Omarchy interaction mode"))?;
+            omg_lib::package_managers::arch::execute_native_omarchy_operation(
+                operation,
+                interaction,
+            )
+        })()),
         "install" if !packages.is_empty() => {
             // Validate package names or local package files (security).
             omg_lib::core::security::validate_package_names_or_files(&packages).ok()?;

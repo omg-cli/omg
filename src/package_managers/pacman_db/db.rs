@@ -563,9 +563,8 @@ pub(crate) fn check_local_db_health(path: &Path) -> Result<(usize, Vec<Unsatisfi
     Ok((snapshot.packages.len(), missing))
 }
 
-/// Use pacman's documented offline -Dk operation for dependency, conflict and
-/// duplicate file ownership semantics. An explicit empty config and dbpath
-/// prevent an unrelated configured database or repository from being checked.
+/// Offline health results from the validated Rust snapshot and native ALPM.
+/// No sync databases, transactions, package hooks or external manager are used.
 pub(crate) struct NativeLocalDbHealth {
     pub packages: usize,
     pub missing: Vec<UnsatisfiedDependency>,
@@ -584,22 +583,7 @@ pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<NativeLo
     let snapshot = LocalHealthSnapshot::capture(path)?;
     validate_health_relations(&snapshot.packages)?;
     let missing = unsatisfied_dependencies(&snapshot.packages);
-    let mut command = crate::core::privilege::system_command("pacman")?;
-    command
-        .env_clear()
-        .env("PATH", crate::core::privilege::SYSTEM_PATH)
-        .env("LC_ALL", "C")
-        .args([
-            "--config",
-            "/dev/null",
-            "--color",
-            "never",
-            "-Dk",
-            "--dbpath",
-        ])
-        .arg(path.parent().context("ALPM local database has no parent")?);
-    let result =
-        bounded_native_check(command, std::time::Duration::from_secs(15), 1024 * 1024).await;
+    let result = inspect_native_local_database(path, &snapshot);
     snapshot.revalidate(path)?;
     Ok(NativeLocalDbHealth {
         packages: snapshot.packages.len(),
@@ -608,121 +592,144 @@ pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<NativeLo
     })
 }
 
-async fn bounded_native_check(
-    command: std::process::Command,
-    deadline: std::time::Duration,
-    max_output: u64,
-) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-    let mut command = tokio::process::Command::from(command);
-    let operation = async {
-        let mut child = command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("Could not start pacman -Dk")?;
-        let stdout = child.stdout.take().context("pacman stdout not captured")?;
-        let stderr = child.stderr.take().context("pacman stderr not captured")?;
-        async fn read_limited(
-            reader: impl tokio::io::AsyncRead + Unpin,
-            limit: u64,
-        ) -> Result<Vec<u8>> {
-            let mut bytes = Vec::new();
-            reader.take(limit + 1).read_to_end(&mut bytes).await?;
-            anyhow::ensure!(
-                bytes.len() as u64 <= limit,
-                "pacman -Dk output exceeds limit"
-            );
-            Ok(bytes)
-        }
-        let (stdout, stderr) = tokio::try_join!(
-            read_limited(stdout, max_output),
-            read_limited(stderr, max_output)
-        )?;
-        let status = child
-            .wait()
-            .await
-            .context("Could not wait for pacman -Dk")?;
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        let detail = String::from_utf8_lossy(&detail);
-        let detail = detail
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .take(8)
-            .map(|line| {
-                crate::cli::style::sanitize_terminal_text(line)
-                    .chars()
-                    .take(160)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
+fn inspect_native_local_database(path: &Path, snapshot: &LocalHealthSnapshot) -> Result<()> {
+    let database = path.parent().context("ALPM local database has no parent")?;
+    let handle = crate::package_managers::alpm_ops::open_alpm_at(Path::new("/"), database)?;
+    handle
+        .localdb()
+        .is_valid()
+        .context("Invalid native local database")?;
+    let packages = handle.localdb().pkgs();
+    anyhow::ensure!(
+        packages.len() == snapshot.packages.len(),
+        "Native local database inventory is incomplete"
+    );
+    for package in packages {
+        let observed = snapshot
+            .packages
+            .get(package.name())
+            .context("Native local database inventory differs from the validated snapshot")?;
         anyhow::ensure!(
-            status.success(),
-            "pacman -Dk rejected local database ({status}): {detail}"
+            package.version().as_str() == observed.version.to_string(),
+            "Native local database version differs for {}",
+            package.name()
         );
-        Ok(())
-    };
-    tokio::time::timeout(deadline, operation)
-        .await
-        .context("pacman -Dk timed out")?
+    }
+    let empty = std::iter::empty::<&alpm::Pkg>();
+    let missing = handle.check_deps(empty.clone(), empty, packages.iter(), false);
+    if let Some(dependency) = missing.iter().next() {
+        anyhow::bail!(
+            "Installed package {} requires {}",
+            crate::cli::style::sanitize_terminal_text(dependency.target()),
+            crate::cli::style::sanitize_terminal_text(&dependency.depend().to_string())
+        );
+    }
+    let conflicts = handle.check_conflicts(packages.iter());
+    if let Some(conflict) = conflicts.iter().next() {
+        anyhow::bail!(
+            "Installed package conflict: {} and {} ({})",
+            crate::cli::style::sanitize_terminal_text(conflict.package1().name()),
+            crate::cli::style::sanitize_terminal_text(conflict.package2().name()),
+            crate::cli::style::sanitize_terminal_text(&conflict.reason().to_string())
+        );
+    }
+    let mut owners = HashMap::new();
+    for package in packages {
+        for file in package.files().files() {
+            let name = file.name();
+            if name.ends_with(b"/") {
+                continue;
+            }
+            if let Some(previous) = owners.insert(name, package.name()) {
+                anyhow::ensure!(
+                    previous == package.name(),
+                    "Duplicate installed file ownership: {} and {} own {}",
+                    crate::cli::style::sanitize_terminal_text(previous),
+                    crate::cli::style::sanitize_terminal_text(package.name()),
+                    crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(name))
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod native_health_tests {
-    use super::bounded_native_check;
-    use std::time::Duration;
+    use super::check_native_local_db_health;
+    use std::path::Path;
 
-    #[tokio::test]
-    async fn native_check_propagates_failure_and_sanitizes_diagnostic() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", "printf 'missing dependency\\033[31m\\n' >&2; exit 1"]);
-        let error = bounded_native_check(command, Duration::from_secs(2), 1024)
-            .await
-            .unwrap_err();
-        let detail = error.to_string();
-        assert!(detail.contains("rejected local database"));
-        assert!(detail.contains("missing dependency"));
-        assert!(!detail.contains('\x1b'));
+    fn package(database: &Path, name: &str, extra: &str, files: &str) {
+        let directory = database.join("local").join(format!("{name}-1.0-1"));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("desc"),
+            format!("%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n0\n\n{extra}"),
+        )
+        .unwrap();
+        std::fs::write(directory.join("files"), format!("%FILES%\n{files}\n\n")).unwrap();
     }
 
     #[tokio::test]
-    async fn native_check_requires_success_and_bounds_elapsed_and_both_streams() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", "exit 0"]);
-        bounded_native_check(command, Duration::from_secs(2), 16)
+    async fn native_health_accepts_shared_directories_without_writes_or_repository_access() {
+        let owner = tempfile::tempdir().unwrap();
+        let database = owner.path();
+        package(
+            database,
+            "app",
+            "%DEPENDS%\nvirtual>=2\n\n",
+            "usr/\nusr/bin/app",
+        );
+        package(
+            database,
+            "provider",
+            "%PROVIDES%\nvirtual=2\n\n",
+            "usr/\nusr/lib/provider",
+        );
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n").unwrap();
+        let before = super::LocalHealthSnapshot::capture(&database.join("local")).unwrap();
+        let report = check_native_local_db_health(&database.join("local"))
             .await
             .unwrap();
-        for target in ["", " >&2"] {
-            let mut command = std::process::Command::new("/bin/sh");
-            command.args(["-c", &format!("printf '01234567890123456789'{target}")]);
-            let error = bounded_native_check(command, Duration::from_secs(2), 16)
+        assert_eq!(report.packages, 2);
+        assert!(report.missing.is_empty());
+        report.native.unwrap();
+        before.revalidate(&database.join("local")).unwrap();
+        assert!(!database.join("db.lck").exists());
+        assert!(!database.join("sync").exists());
+    }
+
+    #[tokio::test]
+    async fn native_health_refuses_missing_dependencies_conflicts_and_shared_files() {
+        for (extra, files, expected) in [
+            (
+                "%DEPENDS%\nabsent>=2\n\n",
+                "usr/bin/app",
+                "requires absent>=2",
+            ),
+            (
+                "%CONFLICTS%\nother\n\n",
+                "usr/bin/app",
+                "Installed package conflict",
+            ),
+            ("", "usr/bin/shared", "Duplicate installed file ownership"),
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            package(owner.path(), "app", extra, files);
+            package(owner.path(), "other", "", "usr/bin/shared");
+            std::fs::write(owner.path().join("local/ALPM_DB_VERSION"), "9\n").unwrap();
+            let before = super::LocalHealthSnapshot::capture(&owner.path().join("local")).unwrap();
+            let report = check_native_local_db_health(&owner.path().join("local"))
                 .await
-                .unwrap_err();
-            assert!(error.to_string().contains("output exceeds limit"));
+                .unwrap();
+            let error = report.native.expect_err("unhealthy native database");
+            assert!(
+                error.to_string().contains(expected),
+                "{expected}: {error:#}"
+            );
+            before.revalidate(&owner.path().join("local")).unwrap();
+            assert!(!owner.path().join("db.lck").exists());
         }
-        let fixture = tempfile::TempDir::new().unwrap();
-        let pid_file = fixture.path().join("pid");
-        let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 5", "_"]);
-        command.arg(&pid_file);
-        let started = std::time::Instant::now();
-        let error = bounded_native_check(command, Duration::from_millis(250), 16)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
-        let pid = nix::unistd::Pid::from_raw(pid);
-        for _ in 0..20 {
-            if nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("Timed-out native check child was not killed and reaped");
     }
 }
 

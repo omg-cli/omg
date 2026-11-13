@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 
 use super::alpm_ops::{
     collect_updates, configure_package_filters, configure_signature_policy, get_pkg_info_from_db,
-    register_configured_syncdbs,
+    open_default_alpm, register_configured_syncdbs,
 };
 use super::pacman_db::AlpmCatalogEpoch;
 use super::types::{PackageInfo, UpdateInfo};
@@ -37,14 +37,10 @@ fn request_channel() -> (
 }
 
 fn initialize_alpm_worker() -> Result<alpm::Alpm> {
-    let root = paths::pacman_root_result()?.to_string_lossy().into_owned();
-    let db_path = paths::pacman_db_dir_result()?
-        .to_string_lossy()
-        .into_owned();
-    let mut alpm = alpm::Alpm::new(root, db_path).context("Failed to initialize ALPM worker")?;
+    let mut alpm = open_default_alpm().context("Failed to initialize ALPM worker")?;
     let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load pacman.conf for ALPM worker")?;
-    configure_signature_policy(&alpm, &config)?;
+    configure_signature_policy(&mut alpm, &config)?;
     register_configured_syncdbs(&alpm, &config)?;
     configure_package_filters(&mut alpm, &config)?;
     Ok(alpm)
@@ -226,6 +222,94 @@ mod tests {
             ),
             "the worker queue must not grow beyond the daemon connection cap"
         );
+    }
+
+    #[test]
+    fn initialization_rejects_non_utf8_paths_instead_of_opening_lossy_aliases() -> anyhow::Result<()>
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        const NAME: &str = "package_managers::alpm_worker::tests::initialization_rejects_non_utf8_paths_instead_of_opening_lossy_aliases";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        assert!(!crate::core::is_root());
+        let owner = tempfile::tempdir()?;
+        let root = owner.path().join("root");
+        let database = owner.path().join("database");
+        let byte_root = owner
+            .path()
+            .join(std::ffi::OsString::from_vec(b"root-\xff".to_vec()));
+        let byte_database = owner
+            .path()
+            .join(std::ffi::OsString::from_vec(b"database-\xff".to_vec()));
+        let alias_root = owner.path().join("root-\u{fffd}");
+        let alias_database = owner.path().join("database-\u{fffd}");
+        for path in [&root, &byte_root, &alias_root] {
+            std::fs::create_dir(path)?;
+        }
+        for path in [&database, &byte_database, &alias_database] {
+            std::fs::create_dir_all(path.join("local"))?;
+            std::fs::create_dir(path.join("sync"))?;
+            std::fs::write(path.join("local/ALPM_DB_VERSION"), b"9\n")?;
+        }
+        let sentinel = alias_database.join("local/alias-only-99-1/desc");
+        std::fs::create_dir(sentinel.parent().expect("private sentinel parent"))?;
+        let sentinel_bytes = b"%NAME%\nalias-only\n\n%VERSION%\n99-1\n\n%REASON%\n0\n\n";
+        std::fs::write(&sentinel, sentinel_bytes)?;
+        let config = owner.path().join("pacman.conf");
+        std::fs::write(
+            &config,
+            "[options]\nSigLevel = Never\nArchitecture = x86_64\n",
+        )?;
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(owner.path().as_os_str())),
+                ("OMG_PACMAN_ROOT", Some(root.as_os_str())),
+                ("OMG_PACMAN_DB_DIR", Some(database.as_os_str())),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+            ],
+            || -> anyhow::Result<()> {
+                crate::core::paths::reset_test_overrides();
+                let valid = AlpmWorker::new()?;
+                assert!(futures::executor::block_on(valid.list_updates())?.is_empty());
+                drop(valid);
+                let mut outcomes = Vec::new();
+                for (field, selected_root, selected_database) in [
+                    ("root", &byte_root, &database),
+                    ("database", &root, &byte_database),
+                ] {
+                    let outcome = temp_env::with_vars(
+                        [
+                            ("OMG_PACMAN_ROOT", Some(selected_root.as_os_str())),
+                            ("OMG_PACMAN_DB_DIR", Some(selected_database.as_os_str())),
+                        ],
+                        || match AlpmWorker::new() {
+                            Ok(worker) => {
+                                drop(worker);
+                                None
+                            }
+                            Err(error) => Some(format!("{error:#}")),
+                        },
+                    );
+                    outcomes.push((field, outcome));
+                }
+                assert_eq!(std::fs::read(&sentinel)?, sentinel_bytes);
+                assert!(!alias_database.join("db.lck").exists());
+                for (field, outcome) in outcomes {
+                    let diagnostic = outcome.unwrap_or_else(|| panic!("native worker must refuse non-UTF8 {field} instead of opening a replacement-character alias"));
+                    assert!(
+                        diagnostic.to_ascii_lowercase().contains("utf-8"),
+                        "{field}: {diagnostic}"
+                    );
+                }
+                Ok(())
+            },
+        )
     }
 
     #[test]

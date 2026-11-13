@@ -921,3 +921,52 @@ the inverse migration-tree controls and optional foreign-helper refusal. The rea
 guest database and prepared disks remain unchanged, locks are released, and the
 VM shuts down cleanly. These are local product results, not a hosted CI or
 instrumented-coverage verdict.
+
+
+### Native Omarchy package stages and signed refusal controls
+
+The package stages now use OMG's own Rust/ALPM path instead of Omarchy's package
+helpers. A closed elevated protocol selects cache pruning, signing-key refresh,
+repository upgrade or orphan removal. Real sudo launches the same executable in
+a system scope so a user-manager restart does not kill the package worker.
+Native repository reads and the ALPM worker now configure the same GPGDir as
+transactions. Root/database/keyring paths reject NUL values before C-string
+conversion, and unsupported non-UTF-8 paths fail without opening lossy aliases.
+
+The signed-guest tests found a crash during keyring preparation when a repository
+record omitted PACKAGER. The crash left a database lock. Guest crash metadata
+confirmed SIGSEGV, but no core was stored, so no exact stack frame is claimed.
+The official Rust repository descriptor requires PACKAGER, and libalpm's keyring
+preparation duplicates that field. Prepared repository records now reject its
+absence before commit. The import callback also avoids the binding's UID getter,
+which assumes a non-null string, and records refused signing-key imports so a
+generic native error cannot hide the trust decision.
+
+A second control found that the vendor's absolute overwrite glob failed under a
+non-default RootDir. The native pattern is now relative to the package root and
+remains restricted to `usr/share/omarchy`. Signed collisions inside that subtree
+can be replaced; outside collisions are refused. Earlier signed keyring commits
+remain accounted for when the subsequent repository transaction fails.
+
+Doctor's local database check now uses the validated Rust snapshot and offline
+libalpm dependency/conflict checks, plus duplicate non-directory ownership
+checks. It does not invoke pacman, register sync databases, start transactions,
+run hooks or write the database. Cache pruning retains two distinct versions per
+canonical cache directory and architecture, including their archive copies and
+signatures.
+
+The current local verification passes 2,402 library tests with 13 ignored, all
+three all-target Clippy configurations with warnings denied, and normal CLI and
+daemon builds. A signed disposable guest completes the full coordinated update
+and all six controls: invalid database signature, unknown package signer, active
+database lock, allowed overwrite, refused outside overwrite and missing PACKAGER.
+The same native worker survives a real user-manager reexecution while a package
+response is held. AUR RPC occurs only after post-update hooks. Forbidden package
+helper execution remains zero, the real guest database and prepared images remain
+unchanged, and shutdown is clean.
+
+These are source-bound local results. CI's older fake-sudo/package-helper fixture
+still needs migration to real systemd execution before publication. Hosted
+coverage comparison and optimized installation acceptance remain pending. New
+trust bootstrap is unsupported, and controlled helper fixtures do not certify all
+vendor migrations or maintainer hooks. No host system update was performed.

@@ -9,6 +9,217 @@ use crate::package_managers::{
     types::VersionDisplay,
 };
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeOmarchyOperation {
+    PruneCache,
+    RefreshKeyrings,
+    UpgradeRepositories,
+    RemoveOrphans,
+}
+
+impl NativeOmarchyOperation {
+    #[must_use]
+    pub fn from_argument(value: &str) -> Option<Self> {
+        match value {
+            "cache-prune" => Some(Self::PruneCache),
+            "keyring-refresh" => Some(Self::RefreshKeyrings),
+            "repository-upgrade" => Some(Self::UpgradeRepositories),
+            "orphan-remove" => Some(Self::RemoveOrphans),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn argument(self) -> &'static str {
+        match self {
+            Self::PruneCache => "cache-prune",
+            Self::RefreshKeyrings => "keyring-refresh",
+            Self::UpgradeRepositories => "repository-upgrade",
+            Self::RemoveOrphans => "orphan-remove",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeOmarchyInteraction {
+    Attended,
+    Unattended,
+}
+
+impl NativeOmarchyInteraction {
+    #[must_use]
+    pub fn from_argument(value: &str) -> Option<Self> {
+        match value {
+            "attended" => Some(Self::Attended),
+            "unattended" => Some(Self::Unattended),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn argument(self) -> &'static str {
+        match self {
+            Self::Attended => "attended",
+            Self::Unattended => "unattended",
+        }
+    }
+}
+
+/// Execute one fixed, already elevated Omarchy package operation.
+///
+/// # Errors
+/// Refuses unprivileged calls, unsupported trust bootstrap and failed native operations.
+#[doc(hidden)]
+pub fn execute_native_omarchy_operation(
+    operation: NativeOmarchyOperation,
+    interaction: NativeOmarchyInteraction,
+) -> AnyhowResult<()> {
+    use crate::core::history::{HistoryManager, PackageChange, TransactionType};
+    use anyhow::Context;
+    anyhow::ensure!(
+        crate::core::is_root(),
+        "Native Omarchy package operations require elevation"
+    );
+    crate::core::privilege::set_yes_flag(interaction == NativeOmarchyInteraction::Unattended);
+    if operation == NativeOmarchyOperation::PruneCache {
+        let (files, bytes) = super::alpm_ops::clean_cache(2)?;
+        println!(
+            "Pruned {files} cache files ({bytes} bytes), retaining two versions per directory and architecture"
+        );
+        return Ok(());
+    }
+    if operation == NativeOmarchyOperation::RefreshKeyrings {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(super::sync_databases_parallel())?;
+    }
+    let targets = match operation {
+        NativeOmarchyOperation::RefreshKeyrings => {
+            let mut names = vec!["archlinux-keyring".to_owned(), "omarchy-keyring".to_owned()];
+            if std::env::consts::ARCH == "aarch64"
+                && super::is_installed_fast("archlinuxarm-keyring")?
+            {
+                names.push("archlinuxarm-keyring".to_owned());
+            }
+            let path = std::path::Path::new("/usr/share/omarchy-platform/keyrings");
+            use std::io::Read;
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => {
+                    let metadata = file.metadata()?;
+                    anyhow::ensure!(
+                        metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+                        "Platform keyring list must be a root-controlled regular file"
+                    );
+                    anyhow::ensure!(
+                        metadata.len() <= 65536,
+                        "Platform keyring list exceeds its limit"
+                    );
+                    let mut contents = String::new();
+                    file.take(65537).read_to_string(&mut contents)?;
+                    anyhow::ensure!(
+                        contents.len() <= 65536,
+                        "Platform keyring list exceeds its limit"
+                    );
+                    for line in contents.lines() {
+                        let name = line.trim();
+                        if name.is_empty() || name.starts_with('#') {
+                            continue;
+                        }
+                        if !name.ends_with("-keyring")
+                            || crate::core::security::validate_package_name(name).is_err()
+                        {
+                            tracing::warn!("Ignoring invalid platform keyring package name");
+                            continue;
+                        }
+                        if !names.iter().any(|existing| existing == name)
+                            && super::is_installed_fast(name)?
+                        {
+                            names.push(name.to_owned());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("Cannot read platform keyring packages"),
+            }
+            names
+        }
+        NativeOmarchyOperation::UpgradeRepositories => Vec::new(),
+        NativeOmarchyOperation::RemoveOrphans => super::list_orphans_direct()?,
+        NativeOmarchyOperation::PruneCache => unreachable!(),
+    };
+    if operation == NativeOmarchyOperation::RemoveOrphans && targets.is_empty() {
+        return Ok(());
+    }
+    let (kind, changes) = if operation == NativeOmarchyOperation::UpgradeRepositories {
+        (
+            TransactionType::Update,
+            super::get_update_list()?
+                .into_iter()
+                .map(|item| PackageChange {
+                    name: item.name,
+                    old_version: Some(item.old_version),
+                    new_version: Some(item.new_version),
+                    source: item.repo,
+                })
+                .collect(),
+        )
+    } else {
+        let mut changes = Vec::new();
+        for name in &targets {
+            let previous = super::get_package_info(name)?;
+            let next = if operation == NativeOmarchyOperation::RefreshKeyrings {
+                Some(super::alpm_direct::with_handle(|handle| {
+                    for database in handle.syncdbs() {
+                        if !database.usage()?.contains(alpm::Usage::INSTALL) {
+                            continue;
+                        }
+                        super::alpm_ops::validate_sync_database(handle, database)?;
+                        if let Ok(package) = database.pkg(name.as_str()) {
+                            return Ok((package.version().to_string(), database.name().to_owned()));
+                        }
+                    }
+                    anyhow::bail!(
+                        "Signing-key package {name} is unavailable from configured install repositories"
+                    )
+                })?)
+            } else {
+                None
+            };
+            changes.push(PackageChange {
+                name: name.clone(),
+                old_version: previous
+                    .as_ref()
+                    .filter(|item| item.installed)
+                    .map(|item| item.version.to_string()),
+                new_version: next.as_ref().map(|(version, _)| version.clone()),
+                source: next.map_or_else(|| "pacman".to_owned(), |(_, repository)| repository),
+            });
+        }
+        (
+            if operation == NativeOmarchyOperation::RemoveOrphans {
+                TransactionType::Remove
+            } else {
+                TransactionType::Install
+            },
+            changes,
+        )
+    };
+    let history = HistoryManager::new()?;
+    let result = super::alpm_ops::execute_omarchy_transaction(operation, targets);
+    history.finish_operation(kind, changes, result)?;
+    invalidate_caches()?;
+    println!("Native Omarchy {} completed", operation.argument());
+    Ok(())
+}
+
 /// Arch Linux package manager (ALPM) implementation
 pub struct ArchPackageManager {
     recursive_removal: bool,
@@ -121,6 +332,18 @@ fn combine_write_results(
         (Err(operation), Err(completion)) => {
             Err(operation.context(format!("Catalog completion also failed: {completion:#}")))
         }
+    }
+}
+
+pub(crate) async fn complete_native_omarchy_write(success: bool) -> AnyhowResult<()> {
+    let completion = after_privileged_alpm_write().await;
+    if success {
+        completion
+    } else {
+        if let Err(error) = completion {
+            tracing::warn!("Catalog refresh after failed native Omarchy stage: {error:#}");
+        }
+        Ok(())
     }
 }
 

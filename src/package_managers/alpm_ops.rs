@@ -80,14 +80,27 @@ pub(crate) fn load_local_package_metadata(path: &str) -> Result<LocalPackageMeta
 
 #[cfg(feature = "arch")]
 pub fn open_default_alpm() -> anyhow::Result<alpm::Alpm> {
-    use anyhow::Context as _;
+    let root = crate::core::paths::pacman_root_result()?;
+    let db_path = crate::core::paths::pacman_db_dir_result()?;
+    open_alpm_at(&root, &db_path)
+}
 
-    let root = crate::core::paths::pacman_root_result()?
-        .to_string_lossy()
-        .into_owned();
-    let db_path = crate::core::paths::pacman_db_dir_result()?
-        .to_string_lossy()
-        .into_owned();
+#[cfg(feature = "arch")]
+pub(crate) fn open_alpm_at(
+    root: &std::path::Path,
+    db_path: &std::path::Path,
+) -> anyhow::Result<alpm::Alpm> {
+    let root = root
+        .to_str()
+        .context("ALPM root path must be valid UTF-8")?;
+    let db_path = db_path
+        .to_str()
+        .context("ALPM database path must be valid UTF-8")?;
+    anyhow::ensure!(!root.contains('\0'), "ALPM root path contains a NUL byte");
+    anyhow::ensure!(
+        !db_path.contains('\0'),
+        "ALPM database path contains a NUL byte"
+    );
     alpm::Alpm::new(root, db_path).context("Failed to initialize ALPM")
 }
 
@@ -270,14 +283,14 @@ pub fn get_pkg_info_from_db(alpm: &alpm::Alpm, name: &str) -> Result<Option<Pack
     Ok(None)
 }
 
-/// Extract the package base name and full version from a pacman cache filename.
+/// Extract the package name, full version, and architecture from a cache filename.
 ///
 /// Cache files are named `{pkgname}-{version}-{release}-{arch}.pkg.tar.{zst,xz,gz,bz2}`.
 /// Neither `version` nor `release` may contain a dash (Arch packaging rules),
 /// so exactly the last three dash-separated components are stripped; any
 /// dashes inside the package name survive. Returns `None` for files without
 /// the expected shape.
-fn package_cache_info(filename: &str) -> Option<(&str, &str)> {
+fn package_cache_info(filename: &str) -> Option<(&str, &str, &str)> {
     let stem = filename
         .strip_suffix(".pkg.tar.zst")
         .or_else(|| filename.strip_suffix(".pkg.tar.xz"))
@@ -285,21 +298,21 @@ fn package_cache_info(filename: &str) -> Option<(&str, &str)> {
         .or_else(|| filename.strip_suffix(".pkg.tar.bz2"))?;
     // Strip exactly the trailing -arch, -release, -version components;
     // everything to the left (including any dashes in the pkgbase) stays.
-    let (rest, _arch) = stem.rsplit_once('-')?;
+    let (rest, architecture) = stem.rsplit_once('-')?;
     let (rest, release) = rest.rsplit_once('-')?;
     let (name, version) = rest.rsplit_once('-')?;
-    if name.is_empty() || version.is_empty() || release.is_empty() {
+    if name.is_empty() || version.is_empty() || release.is_empty() || architecture.is_empty() {
         return None;
     }
     let full_version_start = name.len() + 1;
     let full_version_end = full_version_start + version.len() + 1 + release.len();
     let full_version = &stem[full_version_start..full_version_end];
-    Some((name, full_version))
+    Some((name, full_version, architecture))
 }
 
 #[cfg(test)]
 fn package_base_name(filename: &str) -> Option<&str> {
-    package_cache_info(filename).map(|(name, _)| name)
+    package_cache_info(filename).map(|(name, _, _)| name)
 }
 
 /// Preview package cache cleaning without mutating the filesystem
@@ -309,14 +322,21 @@ pub fn clean_cache_preview(keep_versions: usize) -> Result<(usize, u64)> {
 
 /// Clean package cache using direct file system operations - FAST
 ///
-/// Following ALPM standards, package versions are compared using `alpm::vercmp`
-/// rather than filesystem modification time, with mtime used only to break ties.
+/// Retains distinct ALPM versions per cache directory and architecture,
+/// including every archive and signature belonging to a retained version.
 pub fn clean_cache(keep_versions: usize) -> Result<(usize, u64)> {
     clean_cache_internal(keep_versions, false)
 }
 
+#[derive(Hash, PartialEq, Eq)]
+struct CacheArchiveGroup {
+    directory: std::path::PathBuf,
+    name: String,
+    architecture: String,
+}
+
 fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u64)> {
-    let mut packages: ahash::AHashMap<String, Vec<(std::path::PathBuf, String)>> =
+    let mut packages: ahash::AHashMap<CacheArchiveGroup, Vec<(std::path::PathBuf, String)>> =
         ahash::AHashMap::new();
     let mut cache_dirs = std::collections::HashSet::new();
 
@@ -350,9 +370,13 @@ fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u
                 continue;
             };
 
-            if let Some((base, ver)) = package_cache_info(&filename) {
+            if let Some((base, ver, architecture)) = package_cache_info(&filename) {
                 packages
-                    .entry(base.to_string())
+                    .entry(CacheArchiveGroup {
+                        directory: cache_dir.clone(),
+                        name: base.to_owned(),
+                        architecture: architecture.to_owned(),
+                    })
                     .or_default()
                     .push((path, ver.to_string()));
             }
@@ -363,24 +387,19 @@ fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u
     let mut freed = 0u64;
 
     for (_, mut versions) in packages {
-        // Sort newest version first by ALPM vercmp, breaking ties by mtime
-        versions.sort_by(|(a_path, a_ver), (b_path, b_ver)| {
-            let cmp = alpm::vercmp(b_ver.as_str(), a_ver.as_str());
-            if cmp != std::cmp::Ordering::Equal {
-                return cmp;
+        versions.sort_by(|(_, a), (_, b)| alpm::vercmp(b.as_str(), a.as_str()));
+        let mut distinct_versions = 0;
+        let mut previous: Option<String> = None;
+        for (old, version) in versions {
+            if previous.as_ref().is_none_or(|previous| {
+                alpm::vercmp(previous.as_str(), version.as_str()) != std::cmp::Ordering::Equal
+            }) {
+                distinct_versions += 1;
             }
-            let a_time = a_path
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            let b_time = b_path
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            b_time.cmp(&a_time)
-        });
-
-        for (old, _) in versions.into_iter().skip(keep_versions) {
+            previous = Some(version);
+            if distinct_versions <= keep_versions {
+                continue;
+            }
             if dry_run {
                 removed += 1;
                 let archive_len = std::fs::metadata(&old).map_or(0, |metadata| metadata.len());
@@ -526,6 +545,27 @@ pub fn execute_transaction(
     execute_transaction_with_intents(packages, kind, handle, None, &[])
 }
 
+#[derive(Clone, Copy, Default)]
+enum TransactionPolicy {
+    #[default]
+    Standard,
+    Omarchy,
+}
+
+pub(crate) fn execute_omarchy_transaction(
+    operation: super::arch::NativeOmarchyOperation,
+    packages: Vec<String>,
+) -> Result<()> {
+    use super::arch::NativeOmarchyOperation;
+    let kind = match operation {
+        NativeOmarchyOperation::RefreshKeyrings => TransactionKind::Install,
+        NativeOmarchyOperation::UpgradeRepositories => TransactionKind::SystemUpgrade,
+        NativeOmarchyOperation::RemoveOrphans => TransactionKind::Remove { recursive: true },
+        NativeOmarchyOperation::PruneCache => anyhow::bail!("Cache pruning is not a transaction"),
+    };
+    execute_transaction_in(packages, kind, None, None, &[], TransactionPolicy::Omarchy)
+}
+
 pub(crate) fn execute_install_request(request: &super::arch_install::InstallRequest) -> Result<()> {
     let kind = request.kind();
     let packages = request
@@ -558,6 +598,24 @@ fn execute_transaction_with_intents(
     handle: Option<&mut alpm::Alpm>,
     intents: Option<&[super::arch_install::InstallIntent]>,
     selections: &[super::arch_install::OfficialTarget],
+) -> Result<()> {
+    execute_transaction_in(
+        packages,
+        kind,
+        handle,
+        intents,
+        selections,
+        TransactionPolicy::Standard,
+    )
+}
+
+fn execute_transaction_in(
+    packages: Vec<String>,
+    kind: TransactionKind,
+    handle: Option<&mut alpm::Alpm>,
+    intents: Option<&[super::arch_install::InstallIntent]>,
+    selections: &[super::arch_install::OfficialTarget],
+    policy: TransactionPolicy,
 ) -> Result<()> {
     validate_aur_artifact_handoffs(kind, &packages)?;
     let initial_policy = crate::core::security::SecurityPolicy::load_current()?;
@@ -593,11 +651,41 @@ fn execute_transaction_with_intents(
     };
 
     configure_mirrors(alpm)?;
+    if matches!(policy, TransactionPolicy::Omarchy) && kind == TransactionKind::Install {
+        for name in &packages {
+            let mut trusted_repository = None;
+            for database in alpm.syncdbs() {
+                if !database.usage()?.contains(alpm::Usage::INSTALL) {
+                    continue;
+                }
+                validate_sync_database(alpm, database)?;
+                if database.pkg(name.as_str()).is_ok() {
+                    trusted_repository = Some(database.siglevel());
+                    break;
+                }
+            }
+            let level = trusted_repository.context("Signing-key package is unavailable")?;
+            anyhow::ensure!(
+                level.contains(alpm::SigLevel::PACKAGE)
+                    && !level.intersects(
+                        alpm::SigLevel::PACKAGE_OPTIONAL
+                            | alpm::SigLevel::PACKAGE_UNKNOWN_OK
+                            | alpm::SigLevel::PACKAGE_MARGINAL_OK
+                    ),
+                "Native signing-key refresh requires mandatory trusted package signatures; trust bootstrap is unavailable"
+            );
+        }
+    }
+    if matches!(policy, TransactionPolicy::Omarchy) && kind == TransactionKind::SystemUpgrade {
+        alpm.add_overwrite_file("usr/share/omarchy/*")
+            .context("Cannot configure the Omarchy-owned overwrite scope")?;
+    }
 
     let refusals = Arc::new(Mutex::new(AlpmQuestionRefusals::default()));
-    let main_task = setup_alpm_callbacks(alpm, &refusals);
-    let mut tx_guard = prepare_alpm_transaction(alpm, packages.clone(), kind, &pacman_config)
-        .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
+    let main_task = setup_alpm_callbacks_in(alpm, &refusals, policy);
+    let mut tx_guard =
+        prepare_alpm_transaction_in(alpm, packages.clone(), kind, &pacman_config, policy)
+            .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
     let reasons = installation_reasons(tx_guard.0, &packages, intents)?;
     // Declined replacement questions make libalpm skip the replacement
     // silently, so a successful prepare can still hide a refused mutation.
@@ -837,11 +925,12 @@ struct AlpmQuestionRefusals {
     /// Declined removals: unresolvable packages libalpm offered to drop from
     /// the transaction.
     removals: Vec<String>,
+    key_import_refused: bool,
 }
 
 impl AlpmQuestionRefusals {
     fn is_empty(&self) -> bool {
-        self.replacements.is_empty() && self.removals.is_empty()
+        self.replacements.is_empty() && self.removals.is_empty() && !self.key_import_refused
     }
 
     fn record_refused_replacement(&mut self, oldpkg: &str, newdb: &str, newpkg: &str) {
@@ -851,6 +940,10 @@ impl AlpmQuestionRefusals {
 
     fn record_refused_removals(&mut self, packages: &[String]) {
         self.removals.push(packages.join(", "));
+    }
+
+    fn record_refused_key_import(&mut self) {
+        self.key_import_refused = true;
     }
 }
 
@@ -872,9 +965,12 @@ fn question_refusal_error(refusals: &Mutex<AlpmQuestionRefusals>) -> Option<anyh
             "drop unresolvable package(s) from the transaction: {removal}"
         ));
     }
+    if refusals.key_import_refused {
+        details.push("import an untrusted signing key".to_owned());
+    }
     Some(anyhow::anyhow!(
-        "ALPM transaction aborted: it requires an unconfirmed package mutation ({}) \
-         the question callback cannot prompt interactively, so resolve the conflict explicitly and retry",
+        "ALPM transaction aborted: it requires an unconfirmed package mutation or signing-key import ({}) \
+         the required consent was not granted; resolve the conflict explicitly and retry",
         details.join("; ")
     ))
 }
@@ -946,9 +1042,18 @@ const fn is_post_download_progress(op: alpm::Progress) -> bool {
 }
 
 /// Setup ALPM callbacks for progress lanes
+#[cfg(test)]
 fn setup_alpm_callbacks(
     alpm: &alpm::Alpm,
     refusals: &Arc<Mutex<AlpmQuestionRefusals>>,
+) -> ProgressTask {
+    setup_alpm_callbacks_in(alpm, refusals, TransactionPolicy::Standard)
+}
+
+fn setup_alpm_callbacks_in(
+    alpm: &alpm::Alpm,
+    refusals: &Arc<Mutex<AlpmQuestionRefusals>>,
+    policy: TransactionPolicy,
 ) -> ProgressTask {
     let main_task = ProgressTask::start(&TaskSpec {
         label: "Transaction".to_string(),
@@ -956,7 +1061,7 @@ fn setup_alpm_callbacks(
         accent: Accent::System,
     });
 
-    alpm.set_question_cb(Arc::clone(refusals), |question, refusals| {
+    alpm.set_question_cb((Arc::clone(refusals), policy), |question, (refusals, policy)| {
         let mut refusals = refusals
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -974,10 +1079,11 @@ fn setup_alpm_callbacks(
                 let description = q.oldpkg().name();
                 let newdb = q.newdb().name();
                 let newpkg = q.newpkg().name();
-                let auto_accept = crate::core::privilege::get_yes_flag();
+                let auto_accept = matches!(policy, TransactionPolicy::Omarchy)
+                    || crate::core::privilege::get_yes_flag();
                 let confirmed = if auto_accept {
                     true
-                } else if console::user_attended() {
+                } else if console::user_attended() && !crate::core::privilege::get_yes_flag() {
                     let _quiesce = crate::cli::modern_ui::quiesce_terminal();
                     dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
                         .with_prompt(format!("Replace {description} with {newdb}/{newpkg}?"))
@@ -1006,10 +1112,11 @@ fn setup_alpm_callbacks(
                 let pkg2 = conflict.package2().name();
                 let reason = conflict.reason().to_string();
 
-                let auto_accept = crate::core::privilege::get_yes_flag();
+                let auto_accept = matches!(policy, TransactionPolicy::Standard)
+                    && crate::core::privilege::get_yes_flag();
                 let confirmed = if auto_accept {
                     true
-                } else if console::user_attended() {
+                } else if console::user_attended() && !crate::core::privilege::get_yes_flag() {
                     let _quiesce = crate::cli::modern_ui::quiesce_terminal();
                     dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
                         .with_prompt(format!("{pkg1} conflicts with {pkg2} ({reason}). Remove {pkg2}?"))
@@ -1079,31 +1186,27 @@ fn setup_alpm_callbacks(
                 q.set_index(0);
             }
             alpm::Question::ImportKey(mut q) => {
-                let fingerprint = q.fingerprint();
-                let uid = q.uid();
-                tracing::info!("PGP key required: {fingerprint} ({uid})");
-
-                let confirmed =
-                    if console::user_attended() && !crate::core::privilege::get_yes_flag() {
-                        let _quiesce = crate::cli::modern_ui::quiesce_terminal();
-                        dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
-                            .with_prompt(format!("Import PGP key {fingerprint} ({uid})?"))
-                            .default(false)
-                            .interact()
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
-
-                if confirmed {
-                    tracing::info!("Importing PGP key: {fingerprint} ({uid})");
-                    q.set_import(true);
+                q.set_import(false);
+                if matches!(policy, TransactionPolicy::Standard)
+                    && console::user_attended()
+                    && !crate::core::privilege::get_yes_flag()
+                {
+                    let fingerprint = crate::cli::style::sanitize_terminal_text(q.fingerprint());
+                    let _quiesce = crate::cli::modern_ui::quiesce_terminal();
+                    let confirmed = dialoguer::Confirm::with_theme(&crate::cli::ui::prompt_theme())
+                        .with_prompt(format!("Import PGP key {fingerprint}?"))
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false);
+                    q.set_import(confirmed);
+                    if !confirmed { refusals.record_refused_key_import(); }
                 } else {
-                    tracing::warn!("PGP key not trusted: {fingerprint} ({uid})");
-                    tracing::info!(
-                        "Import key manually: pacman-key --recv-keys {fingerprint} && pacman-key --lsign-key {fingerprint}"
-                    );
-                    q.set_import(false);
+                    refusals.record_refused_key_import();
+                    if matches!(policy, TransactionPolicy::Omarchy) {
+                        tracing::error!("Native Omarchy updates require existing trusted signing keys; trust bootstrap is unavailable");
+                    } else {
+                        tracing::warn!("Unknown signing key refused; an attended trust decision is required");
+                    }
                 }
             }
             alpm::Question::Corrupted(mut q) => {
@@ -1386,7 +1489,7 @@ fn enforce_required_package_signature(mut level: alpm::SigLevel, required: bool)
 }
 
 pub(crate) fn configure_signature_policy(
-    alpm: &alpm::Alpm,
+    alpm: &mut alpm::Alpm,
     config: &crate::core::pacman_conf::PacmanConfig,
 ) -> Result<SignaturePolicy> {
     let mut signatures = signature_policy(config)?;
@@ -1401,6 +1504,17 @@ pub(crate) fn configure_signature_policy(
         .context("Failed to configure local package signature policy")?;
     alpm.set_remote_file_siglevel(signatures.remote_file)
         .context("Failed to configure remote package signature policy")?;
+    let root = paths::pacman_root_result()?;
+    let keyring = pacman_option_path(&root, config.gpg_dir.as_deref(), "etc/pacman.d/gnupg");
+    let keyring = keyring
+        .to_str()
+        .context("Pacman keyring path contains invalid UTF-8")?;
+    anyhow::ensure!(
+        !keyring.as_bytes().contains(&0),
+        "Pacman keyring path contains NUL"
+    );
+    alpm.set_gpgdir(keyring)
+        .context("Failed to configure pacman keyring")?;
     Ok(signatures)
 }
 
@@ -1510,11 +1624,28 @@ fn database_lock_has_open_holder_in_proc(
 }
 
 /// Prepare an ALPM transaction for execution
+#[cfg(test)]
 fn prepare_alpm_transaction<'a>(
     alpm: &'a mut alpm::Alpm,
     packages: Vec<String>,
     kind: TransactionKind,
     pacman_config: &crate::core::pacman_conf::PacmanConfig,
+) -> Result<AlpmTransaction<'a>> {
+    prepare_alpm_transaction_in(
+        alpm,
+        packages,
+        kind,
+        pacman_config,
+        TransactionPolicy::Standard,
+    )
+}
+
+fn prepare_alpm_transaction_in<'a>(
+    alpm: &'a mut alpm::Alpm,
+    packages: Vec<String>,
+    kind: TransactionKind,
+    pacman_config: &crate::core::pacman_conf::PacmanConfig,
+    policy: TransactionPolicy,
 ) -> Result<AlpmTransaction<'a>> {
     validate_transaction_targets(kind, &packages)?;
     let mut admissions = std::collections::BTreeMap::new();
@@ -1529,7 +1660,13 @@ fn prepare_alpm_transaction<'a>(
         }
     }
     check_database_lock(std::path::Path::new(alpm.dbpath().trim_end_matches('/')))?;
-    alpm.trans_init(transaction_flags(kind))
+    let mut flags = transaction_flags(kind);
+    if matches!(policy, TransactionPolicy::Omarchy)
+        && matches!(kind, TransactionKind::Remove { .. })
+    {
+        flags |= alpm::TransFlag::NO_SAVE;
+    }
+    alpm.trans_init(flags)
         .map_err(|e| match e {
             alpm::Error::HandleLock => {
                 anyhow::anyhow!(
@@ -1659,22 +1796,14 @@ pub(crate) fn configure_signature_verification(
     pacman_config: &crate::core::pacman_conf::PacmanConfig,
 ) -> Result<()> {
     configure_signature_policy(alpm, pacman_config)?;
-    let root = paths::pacman_root_result()?;
-    let gpg_dir = pacman_option_path(
-        &root,
-        pacman_config.gpg_dir.as_deref(),
-        "etc/pacman.d/gnupg",
-    );
+    let keyring = alpm
+        .gpgdir()
+        .context("Pacman keyring path is not configured")?;
     anyhow::ensure!(
-        gpg_dir.is_dir(),
-        "Pacman keyring is unavailable at {}. Initialize it before installing packages.",
-        gpg_dir.display()
+        std::path::Path::new(keyring).is_dir(),
+        "Pacman keyring is unavailable at {keyring}. Initialize it before installing packages."
     );
-    let gpg_dir = gpg_dir
-        .to_str()
-        .context("Pacman keyring path contains invalid UTF-8")?;
-    alpm.set_gpgdir(gpg_dir)
-        .context("Failed to configure pacman keyring")
+    Ok(())
 }
 
 fn configure_transaction_options(
@@ -1903,6 +2032,10 @@ fn prepared_advisory_packages(
                     .name()
                     .to_owned();
                 let origin = prepared_repository_origin(&repository, policy)?;
+                anyhow::ensure!(
+                    package.packager().is_some_and(|packager| !packager.trim().is_empty()),
+                    "Prepared repository package {display_name} lacks PACKAGER metadata required for native signing-key checks"
+                );
                 (origin, package.sha256sum().map(str::to_owned), None)
             } else {
                 let path = package
@@ -3900,6 +4033,22 @@ mod tests {
     }
 
     #[test]
+    fn refused_signing_key_import_is_reported_with_other_refused_changes() {
+        let refusals = Mutex::new(AlpmQuestionRefusals::default());
+        assert!(question_refusal_error(&refusals).is_none());
+        {
+            let mut recorded = refusals.lock().expect("unpoisoned");
+            recorded.record_refused_key_import();
+            recorded.record_refused_replacement("old", "core", "new");
+        }
+        let error = question_refusal_error(&refusals)
+            .expect("unconfirmed trust cannot disappear behind a generic native error");
+        let message = error.to_string();
+        assert!(message.contains("untrusted signing key"), "{message}");
+        assert!(message.contains("replace old with core/new"), "{message}");
+    }
+
+    #[test]
     fn refused_removals_fail_the_transaction_listing_the_packages() {
         let refusals = Mutex::new(AlpmQuestionRefusals::default());
         refusals
@@ -3990,70 +4139,116 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn replace_question_is_accepted_when_yes_flag_is_set() {
-        let temp = tempfile::tempdir().expect("temporary alpm root");
-        let root = temp.path().join("root");
-        let db_path = temp.path().join("db");
-        std::fs::create_dir_all(&root).expect("root dir");
-        std::fs::create_dir_all(db_path.join("local/bar-1.0-1")).expect("local pkg dir");
-        std::fs::create_dir_all(db_path.join("sync")).expect("sync db dir");
-        std::fs::write(db_path.join("local/ALPM_DB_VERSION"), "9\n")
-            .expect("write ALPM_DB_VERSION");
+    fn omarchy_replacements_keep_vendor_defaults_but_unattended_conflicts_refuse() {
+        for (policy, yes, relationship, accepted) in [
+            (super::TransactionPolicy::Standard, true, "REPLACES", true),
+            (super::TransactionPolicy::Omarchy, false, "REPLACES", true),
+            (super::TransactionPolicy::Omarchy, true, "CONFLICTS", false),
+        ] {
+            let temp = tempfile::tempdir().expect("temporary alpm root");
+            let root = temp.path().join("root");
+            let db_path = temp.path().join("db");
+            std::fs::create_dir_all(&root).expect("root dir");
+            std::fs::create_dir_all(db_path.join("local/bar-1.0-1")).expect("local pkg dir");
+            std::fs::create_dir_all(db_path.join("sync")).expect("sync db dir");
+            std::fs::write(db_path.join("local/ALPM_DB_VERSION"), "9\n")
+                .expect("write ALPM_DB_VERSION");
 
-        std::fs::write(
-            db_path.join("local/bar-1.0-1/desc"),
-            "%NAME%\nbar\n\n%VERSION%\n1.0-1\n\n",
-        )
-        .expect("write local desc");
+            std::fs::write(
+                db_path.join("local/bar-1.0-1/desc"),
+                "%NAME%\nbar\n\n%VERSION%\n1.0-1\n\n",
+            )
+            .expect("write local desc");
 
-        let sync_desc = "%NAME%\nfoo\n\n%VERSION%\n2.0-1\n\n%REPLACES%\nbar\n\n%ARCH%\nx86_64\n\n";
-        let sync_content = format!(
-            "%FILENAME%\nfoo-2.0-1-x86_64.pkg.tar.zst\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n{sync_desc}"
-        );
-        let db_file = std::fs::File::create(db_path.join("sync/core.db")).expect("core.db");
-        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-            db_file,
-            flate2::Compression::fast(),
-        ));
-        let mut header = tar::Header::new_gnu();
-        header.set_path("foo-2.0-1/desc").expect("header path");
-        header.set_size(sync_content.len() as u64);
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append(&header, sync_content.as_bytes())
-            .expect("append sync desc");
-        builder
-            .into_inner()
-            .expect("finish core.db")
-            .finish()
-            .expect("flush gzip");
+            std::fs::write(
+                db_path.join("local/bar-1.0-1/files"),
+                "%FILES%\nusr/bin/bar\n\n",
+            )
+            .expect("installed file inventory");
 
-        let alpm = alpm::Alpm::new(
-            root.to_str().expect("utf-8 root"),
-            db_path.to_str().expect("utf-8 db path"),
-        )
-        .expect("ALPM handle");
-        alpm.register_syncdb("core", alpm::SigLevel::NONE)
-            .expect("register core");
+            let sync_desc = format!(
+                "%NAME%\nfoo\n\n%VERSION%\n2.0-1\n\n%{relationship}%\nbar\n\n%ARCH%\nx86_64\n\n"
+            );
+            let sync_content = format!(
+                "%FILENAME%\nfoo-2.0-1-x86_64.pkg.tar.zst\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n{sync_desc}"
+            );
+            let db_file = std::fs::File::create(db_path.join("sync/core.db")).expect("core.db");
+            let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+                db_file,
+                flate2::Compression::fast(),
+            ));
+            let mut header = tar::Header::new_gnu();
+            header.set_path("foo-2.0-1/desc").expect("header path");
+            header.set_size(sync_content.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append(&header, sync_content.as_bytes())
+                .expect("append sync desc");
+            builder
+                .into_inner()
+                .expect("finish core.db")
+                .finish()
+                .expect("flush gzip");
 
-        let refusals = std::sync::Arc::new(Mutex::new(AlpmQuestionRefusals::default()));
-        let _progress = setup_alpm_callbacks(&alpm, &refusals);
+            let mut alpm = alpm::Alpm::new(
+                root.to_str().expect("utf-8 root"),
+                db_path.to_str().expect("utf-8 db path"),
+            )
+            .expect("ALPM handle");
+            alpm.register_syncdb("core", alpm::SigLevel::NONE)
+                .expect("register core");
 
-        crate::core::privilege::set_yes_flag(true);
-        let init_result = alpm.trans_init(alpm::TransFlag::NEEDED);
-        let upgrade_result = alpm.sync_sysupgrade(false);
-        let trans_add_len = alpm.trans_add().len();
-        crate::core::privilege::set_yes_flag(false);
+            let refusals = std::sync::Arc::new(Mutex::new(AlpmQuestionRefusals::default()));
+            let _progress = super::setup_alpm_callbacks_in(&alpm, &refusals, policy);
 
-        init_result.expect("init transaction");
-        upgrade_result.expect("compute sysupgrade");
-        assert_eq!(
-            trans_add_len, 1,
-            "accepted replacement must add replacing package to transaction"
-        );
-        assert!(question_refusal_error(&refusals).is_none());
+            crate::core::privilege::set_yes_flag(yes);
+            alpm.trans_init(alpm::TransFlag::NEEDED)
+                .expect("init transaction");
+            if relationship == "REPLACES" {
+                let result = alpm.sync_sysupgrade(false);
+                crate::core::privilege::set_yes_flag(false);
+                result.expect("compute sysupgrade");
+                assert_eq!(
+                    alpm.trans_add().len(),
+                    1,
+                    "accepted replacement is scheduled"
+                );
+                assert!(question_refusal_error(&refusals).is_none());
+            } else {
+                let package = alpm
+                    .syncdbs()
+                    .iter()
+                    .next()
+                    .expect("core")
+                    .pkg("foo")
+                    .expect("sync package");
+                assert!(
+                    package
+                        .conflicts()
+                        .iter()
+                        .any(|dependency| dependency.name() == "bar"),
+                    "fixture declares the real package conflict"
+                );
+                assert!(
+                    alpm.localdb().pkg("bar").is_ok(),
+                    "conflicting package is installed"
+                );
+                alpm.trans_add_pkg(package)
+                    .expect("add conflicting package");
+                let prepared = alpm.trans_prepare().is_ok();
+                crate::core::privilege::set_yes_flag(false);
+                assert_eq!(
+                    prepared, accepted,
+                    "unattended conflict must not remove an installed package"
+                );
+                assert!(
+                    alpm.trans_remove().is_empty(),
+                    "refused conflict preserves the installed package"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4225,8 +4420,8 @@ mod tests {
 
         let database_path = tempfile::tempdir().expect("temporary database path");
         let database_path = database_path.path().to_string_lossy();
-        let alpm = alpm::Alpm::new("/", database_path.as_ref()).expect("ALPM handle");
-        configure_signature_policy(&alpm, &config).expect("configure ALPM policy");
+        let mut alpm = alpm::Alpm::new("/", database_path.as_ref()).expect("ALPM handle");
+        configure_signature_policy(&mut alpm, &config).expect("configure ALPM policy");
         assert_eq!(alpm.default_siglevel(), policy.default);
         assert_eq!(alpm.local_file_siglevel(), policy.local_file);
         assert_eq!(alpm.remote_file_siglevel(), policy.remote_file);
@@ -4277,6 +4472,99 @@ mod tests {
                 .to_string()
                 .starts_with("Package 'widget[' is protected by HoldPkg pattern 'widget['")
         );
+    }
+
+    #[test]
+    fn prepared_repository_metadata_requires_a_packager_before_native_key_import()
+    -> anyhow::Result<()> {
+        for packager in [None, Some("Fixture Maintainer <fixture@example.invalid>")] {
+            let owner = tempfile::tempdir()?;
+            let root = owner.path().join("root");
+            let database = owner.path().join("db");
+            std::fs::create_dir(&root)?;
+            std::fs::create_dir_all(database.join("local"))?;
+            std::fs::create_dir(database.join("sync"))?;
+            std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
+            let mut content = "%NAME%\nfixture\n\n%VERSION%\n1-1\n\n%ARCH%\nany\n\n%FILENAME%\nfixture-1-1-any.pkg.tar.gz\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n".to_owned();
+            if let Some(packager) = packager {
+                content.push_str("%PACKAGER%\n");
+                content.push_str(packager);
+                content.push_str("\n\n");
+            }
+            let compressed = flate2::write::GzEncoder::new(
+                std::fs::File::create(database.join("sync/core.db"))?,
+                flate2::Compression::fast(),
+            );
+            let mut archive = tar::Builder::new(compressed);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, "fixture-1-1/desc", content.as_bytes())?;
+            archive.into_inner()?.finish()?;
+            let mut alpm = super::open_alpm_at(&root, &database)?;
+            let repository = alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+            alpm.trans_init(alpm::TransFlag::NEEDED)?;
+            alpm.trans_add_pkg(repository.pkg("fixture")?)
+                .map_err(|error| anyhow::anyhow!("Cannot add fixture package: {error}"))?;
+            let result = super::prepared_advisory_packages(
+                &alpm,
+                TransactionKind::Install,
+                &crate::core::security::SecurityPolicy::default(),
+                &[],
+                None,
+            );
+            alpm.trans_release()?;
+            if packager.is_some() {
+                assert_eq!(result?.len(), 1, "complete repository record is accepted");
+            } else {
+                let error =
+                    result.expect_err("Missing PACKAGER must fail before C key-import code");
+                assert!(error.to_string().contains("PACKAGER"), "{error:#}");
+            }
+            assert!(
+                !database.join("db.lck").exists(),
+                "validation releases the private transaction lock"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn signature_readers_use_the_configured_keyring() -> anyhow::Result<()> {
+        let owner = tempfile::tempdir()?;
+        let root = owner.path().join("root");
+        let database = owner.path().join("db");
+        let keyring = owner.path().join("configured-keys");
+        for path in [&root, &database, &keyring] {
+            std::fs::create_dir(path)?;
+        }
+        let mut alpm = super::open_alpm_at(&root, &database)?;
+        let config = crate::core::pacman_conf::PacmanConfig {
+            gpg_dir: Some(keyring.to_str().expect("fixture UTF-8").to_owned()),
+            ..Default::default()
+        };
+        configure_signature_policy(&mut alpm, &config)?;
+        assert_eq!(
+            alpm.gpgdir().map(std::path::Path::new),
+            Some(keyring.as_path()),
+            "Read-only validation must use the same configured trust store as transactions"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signature_readers_reject_nul_keyring_paths_without_panicking() -> anyhow::Result<()> {
+        let owner = tempfile::tempdir()?;
+        let mut alpm = super::open_alpm_at(owner.path(), owner.path())?;
+        let config = crate::core::pacman_conf::PacmanConfig {
+            gpg_dir: Some("/configured/keyring\0alias".to_owned()),
+            ..Default::default()
+        };
+        let error = configure_signature_policy(&mut alpm, &config)
+            .expect_err("NUL keyring paths cannot reach the C-string boundary");
+        assert!(error.to_string().contains("NUL"), "{error:#}");
+        Ok(())
     }
 
     #[test]
@@ -4349,6 +4637,280 @@ mod tests {
         assert_eq!(package_base_name("not-a-package-file.tar.zst"), None);
         assert_eq!(package_base_name("linux-6.7.0-1-x86_64.zip"), None);
         assert_eq!(package_base_name("-1-2-x86_64.pkg.tar.zst"), None);
+    }
+
+    #[test]
+    fn clean_cache_keeps_two_distinct_versions_per_architecture_across_cache_copies()
+    -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::clean_cache_keeps_two_distinct_versions_per_architecture_across_cache_copies";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        assert!(!crate::core::is_root());
+        let owner = tempfile::tempdir()?;
+        let first = owner.path().join("first");
+        let second = owner.path().join("second");
+        std::fs::create_dir(&first)?;
+        std::fs::create_dir(&second)?;
+        let alias = owner.path().join("first-alias");
+        std::os::unix::fs::symlink(&first, &alias)?;
+        let mut archives = Vec::new();
+        for architecture in ["x86_64", "aarch64", "any"] {
+            for (directory, version, suffix, group) in [
+                (&first, "1.10.0-1", "zst", "newest"),
+                (&first, "1.10.0-1", "xz", "newest"),
+                (&second, "1.10.0-1", "zst", "newest"),
+                (&second, "1.10.0-01", "bz2", "newest"),
+                (&first, "1.2.0-1", "gz", "spare"),
+                (&first, "1.0.0-1", "zst", "obsolete"),
+                (&second, "1.0.0-1", "xz", "spare"),
+                (&second, "0.9.0-1", "zst", "obsolete"),
+            ] {
+                let path =
+                    directory.join(format!("testpkg-{version}-{architecture}.pkg.tar.{suffix}"));
+                let data = format!("inert {architecture} {version} {suffix}").into_bytes();
+                let signature =
+                    format!("inert signature {architecture} {version} {suffix}").into_bytes();
+                std::fs::write(&path, &data)?;
+                std::fs::write(path.with_added_extension("sig"), &signature)?;
+                archives.push((path, architecture, group, data, signature));
+            }
+        }
+        assert_eq!(
+            alpm::vercmp("1.10.0-1", "1.10.0-01"),
+            std::cmp::Ordering::Equal
+        );
+        let config = owner.path().join("pacman.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "[options]\nCacheDir = {} {} {}\n",
+                first.display(),
+                second.display(),
+                alias.display()
+            ),
+        )?;
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_CACHE_DIR", None),
+                ("OMG_PACMAN_ROOT", None),
+            ],
+            || -> anyhow::Result<()> {
+                paths::reset_test_overrides();
+                let preview = clean_cache_preview(2)?;
+                for (path, _, _, data, signature) in &archives {
+                    assert_eq!(std::fs::read(path)?, *data, "preview changed archive bytes");
+                    assert_eq!(
+                        std::fs::read(path.with_added_extension("sig"))?,
+                        *signature,
+                        "preview changed signature bytes"
+                    );
+                }
+                let cleaned = clean_cache(2)?;
+                for architecture in ["x86_64", "aarch64", "any"] {
+                    let retained = archives
+                        .iter()
+                        .filter(|(path, arch, _, _, _)| *arch == architecture && path.is_file())
+                        .map(|(_, _, group, _, _)| *group)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    assert_eq!(
+                        retained,
+                        std::collections::BTreeSet::from(["newest", "spare"]),
+                        "keep=2 must retain two distinct ALPM versions for {architecture}, despite duplicate files/formats/cache directories"
+                    );
+                }
+                let mut removed = 0;
+                let mut freed = 0;
+                for (path, _, group, data, signature) in &archives {
+                    assert_eq!(
+                        path.is_file(),
+                        *group != "obsolete",
+                        "every archive of a retained version must survive: {}",
+                        path.display()
+                    );
+                    if path.is_file() {
+                        assert_ne!(*group, "obsolete");
+                        assert_eq!(std::fs::read(path)?, *data);
+                        assert_eq!(std::fs::read(path.with_added_extension("sig"))?, *signature);
+                    } else {
+                        assert!(
+                            !path.with_added_extension("sig").exists(),
+                            "removed archive left its signature"
+                        );
+                        removed += 1;
+                        freed += (data.len() + signature.len()) as u64;
+                    }
+                }
+                assert_eq!(preview, (removed, freed));
+                assert_eq!(
+                    cleaned,
+                    (removed * 2, freed),
+                    "cleanup counts archives and their signatures; preview counts archives"
+                );
+                assert_eq!(clean_cache_preview(2)?, (0, 0));
+                assert_eq!(clean_cache(2)?, (0, 0));
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn native_factory_rejects_non_utf8_paths_instead_of_opening_lossy_aliases() -> anyhow::Result<()>
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        const NAME: &str = "package_managers::alpm_ops::tests::native_factory_rejects_non_utf8_paths_instead_of_opening_lossy_aliases";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        assert!(!crate::core::is_root());
+        let owner = tempfile::tempdir()?;
+        let root = owner.path().join("root");
+        let database = owner.path().join("database");
+        let byte_root = owner
+            .path()
+            .join(std::ffi::OsString::from_vec(b"root-\xff".to_vec()));
+        let byte_database = owner
+            .path()
+            .join(std::ffi::OsString::from_vec(b"database-\xff".to_vec()));
+        let alias_root = owner.path().join("root-\u{fffd}");
+        let alias_database = owner.path().join("database-\u{fffd}");
+        for path in [&root, &byte_root, &alias_root] {
+            std::fs::create_dir(path)?;
+        }
+        for path in [&database, &byte_database, &alias_database] {
+            std::fs::create_dir_all(path.join("local"))?;
+            std::fs::create_dir(path.join("sync"))?;
+            std::fs::write(path.join("local/ALPM_DB_VERSION"), b"9\n")?;
+        }
+        let sentinel = alias_database.join("local/alias-only-99-1/desc");
+        std::fs::create_dir(sentinel.parent().expect("private sentinel parent"))?;
+        let sentinel_bytes = b"%NAME%\nalias-only\n\n%VERSION%\n99-1\n\n%REASON%\n0\n\n";
+        std::fs::write(&sentinel, sentinel_bytes)?;
+        let config = owner.path().join("pacman.conf");
+        std::fs::write(&config, "[options]\nSigLevel = Never\n")?;
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_ROOT", Some(root.as_os_str())),
+                ("OMG_PACMAN_DB_DIR", Some(database.as_os_str())),
+            ],
+            || -> anyhow::Result<()> {
+                paths::reset_test_overrides();
+                assert!(super::open_default_alpm()?.localdb().pkgs().is_empty());
+                let mut outcomes = Vec::new();
+                for (field, selected_root, selected_database) in [
+                    ("root", &byte_root, &database),
+                    ("database", &root, &byte_database),
+                ] {
+                    let outcome = temp_env::with_vars(
+                        [
+                            ("OMG_PACMAN_ROOT", Some(selected_root.as_os_str())),
+                            ("OMG_PACMAN_DB_DIR", Some(selected_database.as_os_str())),
+                        ],
+                        || match super::open_default_alpm() {
+                            Ok(handle) => Err(handle
+                                .localdb()
+                                .pkgs()
+                                .iter()
+                                .map(|package| package.name().to_owned())
+                                .collect::<Vec<_>>()),
+                            Err(error) => Ok(format!("{error:#}")),
+                        },
+                    );
+                    outcomes.push((field, outcome));
+                }
+                assert_eq!(std::fs::read(&sentinel)?, sentinel_bytes);
+                assert!(!alias_database.join("db.lck").exists());
+                for (field, outcome) in outcomes {
+                    let diagnostic = outcome.unwrap_or_else(|packages| panic!("non-UTF8 {field} must refuse instead of opening a replacement-character alias; native packages: {packages:?}"));
+                    assert!(
+                        diagnostic.to_ascii_lowercase().contains("utf-8"),
+                        "{field}: {diagnostic}"
+                    );
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn native_factory_rejects_nul_config_paths_without_unwinding() -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::native_factory_rejects_nul_config_paths_without_unwinding";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        assert!(!crate::core::is_root());
+        let owner = tempfile::tempdir()?;
+        let root = owner.path().join("root");
+        let database = owner.path().join("database");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir_all(database.join("local"))?;
+        std::fs::create_dir(database.join("sync"))?;
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), b"9\n")?;
+        let config = owner.path().join("pacman.conf");
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_ROOT", None),
+                ("OMG_PACMAN_DB_DIR", None),
+            ],
+            || -> anyhow::Result<()> {
+                paths::reset_test_overrides();
+                let valid = format!(
+                    "[options]\nRootDir = {}\nDBPath = {}\nSigLevel = Never\n",
+                    root.display(),
+                    database.display()
+                );
+                std::fs::write(&config, &valid)?;
+                assert!(super::open_default_alpm()?.localdb().pkgs().is_empty());
+                let mut outcomes = Vec::new();
+                for (field, bad) in [
+                    ("RootDir", format!("{}\0invalid", root.display())),
+                    ("DBPath", format!("{}\0invalid", database.display())),
+                ] {
+                    let contents = valid
+                        .lines()
+                        .map(|line| {
+                            if line.starts_with(field) {
+                                format!("{field} = {bad}")
+                            } else {
+                                line.to_owned()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n";
+                    std::fs::write(&config, contents)?;
+                    let result = std::panic::catch_unwind(super::open_default_alpm);
+                    let (panicked, diagnostic) = match result {
+                        Ok(Err(error)) => (false, Some(format!("{error:#}"))),
+                        Ok(Ok(_)) => (false, None),
+                        Err(_) => (true, None),
+                    };
+                    outcomes.push((field, panicked, diagnostic));
+                }
+                for (field, panicked, diagnostic) in outcomes {
+                    assert!(
+                        !panicked,
+                        "NUL-bearing {field} configuration must return an error instead of unwinding in the native constructor"
+                    );
+                    let diagnostic = diagnostic.expect("NUL-bearing configuration must refuse");
+                    assert!(
+                        diagnostic.to_ascii_lowercase().contains("nul"),
+                        "{field}: {diagnostic}"
+                    );
+                }
+                Ok(())
+            },
+        )
     }
 
     #[test]

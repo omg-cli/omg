@@ -38,10 +38,10 @@ fn cached_alpm_is_reusable(
 
 fn create_alpm_handle() -> Result<Alpm> {
     use crate::package_managers::alpm_ops::open_default_alpm;
-    let alpm = open_default_alpm().context("Failed to initialize ALPM handle")?;
+    let mut alpm = open_default_alpm().context("Failed to initialize ALPM handle")?;
     let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load repositories from pacman.conf")?;
-    crate::package_managers::alpm_ops::configure_signature_policy(&alpm, &config)?;
+    crate::package_managers::alpm_ops::configure_signature_policy(&mut alpm, &config)?;
     crate::package_managers::alpm_ops::register_configured_syncdbs(&alpm, &config)
         .context("Failed to register the complete pacman repository set")?;
 

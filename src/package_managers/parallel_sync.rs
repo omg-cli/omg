@@ -614,9 +614,8 @@ fn verify_staged_databases(
     staged_database_root: &Path,
     config: &crate::core::pacman_conf::PacmanConfig,
 ) -> Result<()> {
-    let root = paths::pacman_root_result()?.to_string_lossy().into_owned();
-    let database_root = staged_database_root.to_string_lossy().into_owned();
-    let mut alpm = alpm::Alpm::new(root, database_root)
+    let root = paths::pacman_root_result()?;
+    let mut alpm = crate::package_managers::alpm_ops::open_alpm_at(&root, staged_database_root)
         .context("Failed to initialize staged database verifier")?;
     crate::package_managers::alpm_ops::configure_signature_verification(&mut alpm, config)?;
     let policy = crate::package_managers::alpm_ops::signature_policy(config)?;
