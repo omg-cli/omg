@@ -1137,7 +1137,9 @@ async fn drain_completed_coordinator(
                 return Ok::<_, anyhow::Error>(());
             }
             transcript.write_all(&output[..count])?;
-            let _ = std::io::stdout().write_all(&output[..count]);
+            let _ = std::io::stdout()
+                .write_all(&output[..count])
+                .and_then(|()| std::io::stdout().flush());
             tokio::task::yield_now().await;
         }
     };
@@ -1247,7 +1249,9 @@ async fn execute_logged(
                         output_open = false;
                     } else {
                         transcript.write_all(&output[..count])?;
-                        if let Err(error) = std::io::stdout().write_all(&output[..count])
+                        if let Err(error) = std::io::stdout()
+                            .write_all(&output[..count])
+                            .and_then(|()| std::io::stdout().flush())
                             && cancellation.is_none()
                         {
                             cancellation = Some(anyhow::Error::new(error).context("Update output disconnected"));
@@ -2207,7 +2211,7 @@ mod tests {
             crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         execute_logged(
             &shell,
-            &["-c", "IFS= read -r value; printf 'received:<%s>\\n' \"$value\"; if IFS= read -r extra; then exit 19; fi"],
+            &["-c", "printf 'Enter value: '; IFS= read -r value; printf 'received:<%s>\\n' \"$value\"; if IFS= read -r extra; then exit 19; fi"],
             &lock,
             &log, &transport_runtime()).await.expect("pipe bytes and EOF reach the owned terminal");
         let transcript = std::fs::read_to_string(root.join("log")).expect("pipe transcript");
@@ -2219,6 +2223,68 @@ mod tests {
             transcript.contains("OMG Omarchy update finished: exit status: 0"),
             "{transcript}"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_prompt_is_visible_before_the_terminal_requires_input() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let owner = private_directory();
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::terminal_input_pipe_fixture",
+                "--nocapture",
+            ])
+            .env("OMG_OMARCHY_PIPE_FIXTURE", owner.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut output = child.stdout.take().context("fixture stdout")?;
+        let mut observed = Vec::new();
+        let prompt = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffer = [0_u8; 256];
+            loop {
+                let count = output.read(&mut buffer).await?;
+                anyhow::ensure!(count > 0, "fixture closed output before its prompt");
+                observed.extend_from_slice(&buffer[..count]);
+                anyhow::ensure!(
+                    observed.len() <= 16 * 1024,
+                    "fixture output exceeded budget"
+                );
+                if observed.ends_with(b"Enter value: ") {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await;
+        if !matches!(prompt, Ok(Ok(()))) {
+            child.kill().await?;
+            anyhow::bail!(
+                "partial prompt was not visible before input: {prompt:?}; observed {:?}",
+                String::from_utf8_lossy(&observed)
+            );
+        }
+        child
+            .stdin
+            .take()
+            .context("fixture stdin")?
+            .write_all(b"literal; $(not-a-command) \\tail\n")
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), output.read_to_end(&mut observed))
+            .await
+            .context("fixture output did not close after its answer")??;
+        let result = child.wait_with_output().await?;
+        anyhow::ensure!(
+            result.status.success(),
+            "fixture rejected its literal answer"
+        );
+        assert!(
+            String::from_utf8_lossy(&observed)
+                .contains("received:<literal; $(not-a-command) \\tail>")
+        );
+        Ok(())
     }
 
     #[tokio::test]

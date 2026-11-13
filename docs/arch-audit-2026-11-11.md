@@ -1022,3 +1022,18 @@ exercise missing and unsupported snapshot helpers and a missing required
 development helper. The original seven scenarios and all six artifact roles
 remain selected. Their real guest execution is required before claiming the
 expanded fixture has passed.
+
+The attended terminal fixture exposed a real relay defect. After a successful
+native update, the coordinator waited for reboot confirmation while the outer
+CLI buffered the prompt because it had no trailing newline. The focused
+`partial_prompt_is_visible_before_the_terminal_requires_input` regression first
+failed with `partial prompt was not visible before input: Err(Elapsed(()))`.
+Flushing each forwarded terminal packet made the same test pass in 0.01 seconds.
+The completed-coordinator drain also flushes its final packet. Existing output
+failure and cancellation handling remains in place.
+
+The batch passed 2408 library tests with 13 existing ignores, all-target Clippy
+with warnings denied for default, minimal and Debian pure features, and the
+normal CLI/daemon build. The three attended guest scenarios still require a
+fresh instrumented run and optimized-pair verification before an updated build
+can be offered. The earlier d4726393 bundle predates this prompt-flush fix.
