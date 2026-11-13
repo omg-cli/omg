@@ -3,7 +3,7 @@ use super::sbom::{
     Sbom, SbomComponent, SbomError, SbomLicense, SbomLicenseInfo, SbomMetadata, SbomProperty,
     SbomTool, SbomVulnAdvisory, SbomVulnAffects, SbomVulnRating, SbomVulnSource, SbomVulnerability,
 };
-use super::scan::{AdvisorySeverity, SecurityAuditResult};
+use super::scan::{AdvisorySeverity, AuditCoverage, SecurityAuditResult};
 use crate::core::env::distro::Distro;
 use crate::package_managers::types::SecurityPackage;
 use anyhow::Context;
@@ -108,6 +108,66 @@ pub(super) fn compose(
     };
     let mut components = Vec::new();
     let mut identities = std::collections::BTreeMap::new();
+    let mut coverage = std::collections::BTreeMap::new();
+    if let Some(SecurityAuditResult {
+        coverage:
+            AuditCoverage::Reported {
+                assessed,
+                unassessed,
+                ..
+            },
+        ..
+    }) = audit
+    {
+        for identity in assessed {
+            let key = (
+                identity.name.clone(),
+                identity.version.clone(),
+                identity.architecture.clone(),
+            );
+            anyhow::ensure!(
+                coverage
+                    .insert(
+                        key,
+                        vec![SbomProperty {
+                            name: "omg:advisory-coverage".into(),
+                            value: "assessed".into()
+                        }]
+                    )
+                    .is_none(),
+                "Duplicate audit coverage identity"
+            );
+        }
+        for package in unassessed {
+            let identity = &package.package;
+            let key = (
+                identity.name.clone(),
+                identity.version.clone(),
+                identity.architecture.clone(),
+            );
+            anyhow::ensure!(
+                coverage
+                    .insert(
+                        key,
+                        vec![
+                            SbomProperty {
+                                name: "omg:advisory-coverage".into(),
+                                value: "unknown".into()
+                            },
+                            SbomProperty {
+                                name: "omg:advisory-coverage-reason".into(),
+                                value: serde_json::to_value(package.reason)?
+                                    .as_str()
+                                    .context("Coverage reason must be a name")?
+                                    .to_owned()
+                            },
+                        ]
+                    )
+                    .is_none(),
+                "Duplicate audit coverage identity"
+            );
+        }
+    }
     for package in installed {
         let reference = purl(package, distro)?;
         let key = (
@@ -116,9 +176,42 @@ pub(super) fn compose(
             package.architecture.clone(),
         );
         anyhow::ensure!(
-            identities.insert(key, reference.clone()).is_none(),
+            identities.insert(key.clone(), reference.clone()).is_none(),
             "Duplicate installed SBOM identity"
         );
+        let mut properties = if audit
+            .is_some_and(|audit| matches!(&audit.coverage, AuditCoverage::Reported { .. }))
+        {
+            coverage
+                .remove(&key)
+                .context("Installed component lacks reported audit coverage")?
+        } else {
+            vec![SbomProperty {
+                name: "omg:advisory-coverage".into(),
+                value: if audit.is_some() {
+                    "unreported"
+                } else {
+                    "not-performed"
+                }
+                .into(),
+            }]
+        };
+        properties.push(SbomProperty {
+            name: "omg:package-origin".into(),
+            value: serde_json::to_string(&package.origin)?,
+        });
+        if let Some((name, version)) = &package.advisory_source {
+            properties.extend([
+                SbomProperty {
+                    name: "omg:advisory-source-name".into(),
+                    value: name.clone(),
+                },
+                SbomProperty {
+                    name: "omg:advisory-source-version".into(),
+                    value: version.clone(),
+                },
+            ]);
+        }
         components.push(SbomComponent {
             component_type: "library".into(),
             mime_type: None,
@@ -140,9 +233,13 @@ pub(super) fn compose(
                 .collect(),
             hashes: vec![],
             external_references: vec![],
-            properties: None,
+            properties: Some(properties),
         });
     }
+    anyhow::ensure!(
+        coverage.is_empty(),
+        "Audit coverage refers to an absent installed component"
+    );
     let mut vulnerabilities = Vec::new();
     if let Some(audit) = audit {
         for (name, findings) in &audit.vulnerabilities {
@@ -213,6 +310,34 @@ pub(super) fn compose(
                         finding.summary.clone(),
                     )
                 };
+                let mut properties = vec![SbomProperty {
+                    name: "omg:advisory-applicability".into(),
+                    value: match finding.applicability {
+                        super::scan::FindingApplicability::Applicable => "applicable",
+                        super::scan::FindingApplicability::Possible => "possible",
+                    }
+                    .into(),
+                }];
+                if let Some(native) = &finding.native_advisory {
+                    properties.extend(
+                        [
+                            SbomProperty {
+                                name: "omg:advisory:title".into(),
+                                value: finding.summary.clone(),
+                            },
+                            SbomProperty {
+                                name: "omg:advisory:nevra".into(),
+                                value: native.advisory_nevra.clone(),
+                            },
+                            SbomProperty {
+                                name: "omg:advisory:published-severity".into(),
+                                value: native.published_severity.clone(),
+                            },
+                        ]
+                        .into_iter()
+                        .filter(|property| !property.value.is_empty()),
+                    );
+                }
                 vulnerabilities.push(SbomVulnerability {
                     id: finding.id.clone(),
                     source: Some(source),
@@ -234,29 +359,7 @@ pub(super) fn compose(
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    properties: finding
-                        .native_advisory
-                        .as_ref()
-                        .map(|native| {
-                            vec![
-                                SbomProperty {
-                                    name: "omg:advisory:title".into(),
-                                    value: finding.summary.clone(),
-                                },
-                                SbomProperty {
-                                    name: "omg:advisory:nevra".into(),
-                                    value: native.advisory_nevra.clone(),
-                                },
-                                SbomProperty {
-                                    name: "omg:advisory:published-severity".into(),
-                                    value: native.published_severity.clone(),
-                                },
-                            ]
-                            .into_iter()
-                            .filter(|property| !property.value.is_empty())
-                            .collect()
-                        })
-                        .unwrap_or_default(),
+                    properties,
                 });
             }
         }
@@ -290,7 +393,38 @@ pub(super) fn compose(
                 licenses: vec![],
                 hashes: vec![],
                 external_references: vec![],
-                properties: None,
+                properties: Some(match audit.map(|audit| &audit.coverage) {
+                    Some(AuditCoverage::Reported {
+                        assessed,
+                        unassessed,
+                        sources,
+                    }) => vec![
+                        SbomProperty {
+                            name: "omg:advisory-coverage".into(),
+                            value: "reported".into(),
+                        },
+                        SbomProperty {
+                            name: "omg:advisory-assessed-count".into(),
+                            value: assessed.len().to_string(),
+                        },
+                        SbomProperty {
+                            name: "omg:advisory-unknown-count".into(),
+                            value: unassessed.len().to_string(),
+                        },
+                        SbomProperty {
+                            name: "omg:advisory-sources".into(),
+                            value: serde_json::to_string(sources)?,
+                        },
+                    ],
+                    Some(AuditCoverage::Unreported) => vec![SbomProperty {
+                        name: "omg:advisory-coverage".into(),
+                        value: "unreported".into(),
+                    }],
+                    None => vec![SbomProperty {
+                        name: "omg:advisory-coverage".into(),
+                        value: "not-performed".into(),
+                    }],
+                }),
             }),
             manufacture: None,
             supplier: None,
@@ -309,6 +443,7 @@ mod tests {
     #[test]
     fn exports_preserve_each_distribution_identity_and_native_version() {
         let package = SecurityPackage {
+            origin: crate::package_managers::types::SecurityOrigin::Unknown,
             name: "fixture+tools".into(),
             version: "2:1.0-3".into(),
             advisory_source: None,
@@ -370,6 +505,7 @@ mod tests {
     #[test]
     fn findings_bind_to_exact_components_and_missing_identity_is_an_error() {
         let old = SecurityPackage {
+            origin: crate::package_managers::types::SecurityOrigin::Unknown,
             name: "fixture".into(),
             version: "1:1.0-1".into(),
             advisory_source: None,
@@ -383,11 +519,13 @@ mod tests {
         other_arch.architecture = Some("i686".into());
         let installed = vec![old.clone(), patched.clone(), other_arch];
         let audit = SecurityAuditResult {
+            coverage: crate::core::security::scan::AuditCoverage::Unreported,
             total_vulnerabilities: 1,
             high_severity: 0,
             vulnerabilities: vec![(
                 old.name.clone(),
                 vec![Vulnerability {
+                    applicability: crate::core::security::scan::FindingApplicability::Possible,
                     id: "fixture-advisory".into(),
                     summary: "fixture".into(),
                     score: None,
@@ -440,6 +578,81 @@ mod tests {
             purl(&old, Distro::Ubuntu)
                 .unwrap()
                 .starts_with("pkg:deb/ubuntu/fixture@1%3A1.0-1")
+        );
+    }
+    #[test]
+    fn coverage17_sbom_exports_unknown_scope_and_possible_source_matches() {
+        use crate::core::security::scan::{
+            AdvisoryProvenance, FindingApplicability, UnassessedPackage,
+        };
+        let package = SecurityPackage {
+            origin: crate::package_managers::types::SecurityOrigin::Unknown,
+            name: "libacl1".into(),
+            version: "1:2.3-1".into(),
+            architecture: Some("amd64".into()),
+            advisory_source: Some(("acl".into(), "1:2.3-1".into())),
+            description: String::new(),
+            licenses: Vec::new(),
+        };
+        let identity = InstalledIdentity::from(&package);
+        let audit = SecurityAuditResult {
+            total_vulnerabilities: 1,
+            high_severity: 0,
+            coverage: AuditCoverage::Reported {
+                assessed: Vec::new(),
+                unassessed: vec![UnassessedPackage {
+                    package: identity.clone(),
+                    reason:
+                        crate::core::security::vulnerability::UnknownCoverage::OriginUnestablished,
+                }],
+                sources: vec![AdvisoryProvenance::Osv {
+                    ecosystem: "Debian".into(),
+                }],
+            },
+            vulnerabilities: vec![(
+                package.name.clone(),
+                vec![Vulnerability {
+                    id: "possible-source-match".into(),
+                    summary: "Review installed source".into(),
+                    score: None,
+                    advisory_severity: None,
+                    native_advisory: None,
+                    affected_installed: vec![identity],
+                    applicability: FindingApplicability::Possible,
+                }],
+            )],
+        };
+        let report = compose(std::slice::from_ref(&package), Some(&audit), Distro::Debian).unwrap();
+        let properties = report.components[0].properties.as_ref().unwrap();
+        assert!(properties.iter().any(
+            |property| property.name == "omg:advisory-coverage" && property.value == "unknown"
+        ));
+        assert!(
+            properties
+                .iter()
+                .any(|property| property.name == "omg:advisory-source-name"
+                    && property.value == "acl")
+        );
+        assert_eq!(
+            report.vulnerabilities[0].affects[0].affects_ref,
+            "pkg:deb/debian/libacl1@1%3A2.3-1?arch=amd64"
+        );
+        assert!(
+            report.vulnerabilities[0]
+                .properties
+                .iter()
+                .any(|property| property.name == "omg:advisory-applicability"
+                    && property.value == "possible")
+        );
+        let mut missing = audit;
+        missing.coverage = AuditCoverage::Reported {
+            assessed: Vec::new(),
+            unassessed: Vec::new(),
+            sources: Vec::new(),
+        };
+        assert!(
+            compose(&[package], Some(&missing), Distro::Debian).is_err(),
+            "reported coverage may not omit an installed identity"
         );
     }
 }

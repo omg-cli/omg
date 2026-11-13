@@ -150,7 +150,6 @@ pub async fn run() -> Result<()> {
             let explicit_str = status.explicit_packages.to_string();
             let orphan_str = status.orphan_packages.to_string();
             let updates_str = status.updates_available.to_string();
-            let vulns_str = status.security_vulnerabilities.to_string();
             println!("    Total packages:     {}", style::info(&total_str));
             println!("    Explicit packages:  {}", style::info(&explicit_str));
             println!(
@@ -169,14 +168,27 @@ pub async fn run() -> Result<()> {
                     style::success("0")
                 }
             );
-            println!(
-                "    Vulnerabilities:    {}",
-                match status.scanned_vulnerability_count() {
-                    Some(0) => style::success("0"),
-                    Some(_) => style::error(&vulns_str),
-                    None => style::dim("not scanned"),
+            match status.scanned_vulnerability_summary() {
+                Some((findings, unknown)) => {
+                    println!(
+                        "    Findings:           {}",
+                        if findings == 0 {
+                            style::info("0")
+                        } else {
+                            style::error(&findings.to_string())
+                        }
+                    );
+                    println!(
+                        "    Unassessed packages: {}",
+                        if unknown == 0 {
+                            style::info("0")
+                        } else {
+                            style::warning(&unknown.to_string())
+                        }
+                    );
                 }
-            );
+                None => println!("    Advisory coverage:  {}", style::dim("unreported")),
+            }
 
             if !status.runtime_versions.is_empty() {
                 println!();

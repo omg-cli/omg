@@ -1,19 +1,21 @@
 //! Status-publication policy for the daemon.
 //!
 //! These rules are domain policy, not wire format: a failed vulnerability
-//! scan must never invent a clean zero, and only completed scans may be
-//! cached or published. They live apart from [`super::protocol`] so the wire
+//! scan must never qualify a clean zero. Numeric last-known counts require
+//! scope invalidation after a failed refresh. These rules live apart from
+//! [`super::protocol`] so the wire
 //! types stay declarative and the invariants stay tested in one place.
 
 use super::protocol::StatusResult;
 
 /// Map a vulnerability scan onto a previously published count.
 ///
-/// A failed scan keeps the previous count and must not invent a clean zero.
+/// A failed scan keeps numeric last-known counts, not their freshness claim.
+/// Publication must invalidate the reported scope when retaining these after an error.
 pub fn vulnerability_count_from_scan<E>(
-    scan: &Result<usize, E>,
-    previous: Option<usize>,
-) -> Option<usize> {
+    scan: &Result<(usize, usize), E>,
+    previous: Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
     match scan {
         Ok(count) => Some(*count),
         Err(_) => previous,
@@ -27,7 +29,7 @@ pub fn status_snapshot(
     orphan_packages: usize,
     updates_available: usize,
     runtime_versions: Vec<(String, String)>,
-    scanned_vulnerabilities: Option<usize>,
+    scanned_vulnerabilities: Option<(usize, usize)>,
 ) -> (StatusResult, bool) {
     (
         StatusResult {
@@ -35,7 +37,8 @@ pub fn status_snapshot(
             explicit_packages,
             orphan_packages,
             updates_available,
-            security_vulnerabilities: scanned_vulnerabilities.unwrap_or(0),
+            security_vulnerabilities: scanned_vulnerabilities.map_or(0, |(count, _)| count),
+            security_unknown_packages: scanned_vulnerabilities.map(|(_, unknown)| unknown),
             vulnerabilities_scanned: scanned_vulnerabilities.is_some(),
             runtime_versions,
         },
@@ -50,16 +53,16 @@ mod tests {
     #[test]
     fn successful_scan_replaces_the_previous_count() {
         assert_eq!(
-            vulnerability_count_from_scan::<()>(&Ok(3), Some(5)),
-            Some(3)
+            vulnerability_count_from_scan::<()>(&Ok((3, 0)), Some((5, 0))),
+            Some((3, 0))
         );
     }
 
     #[test]
     fn failed_scan_keeps_the_previous_count() {
         assert_eq!(
-            vulnerability_count_from_scan(&Err("alsa unavailable"), Some(5)),
-            Some(5)
+            vulnerability_count_from_scan(&Err("alsa unavailable"), Some((5, 0))),
+            Some((5, 0))
         );
     }
 
@@ -83,7 +86,7 @@ mod tests {
 
     #[test]
     fn scanned_status_is_cacheable() {
-        let (status, cacheable) = status_snapshot(10, 4, 1, 2, vec![], Some(7));
+        let (status, cacheable) = status_snapshot(10, 4, 1, 2, vec![], Some((7, 0)));
         assert!(cacheable);
         assert!(status.vulnerabilities_scanned);
         assert_eq!(status.scanned_vulnerability_count(), Some(7));

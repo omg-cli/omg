@@ -7,10 +7,29 @@ pub struct RemovalPackage {
     pub version: String,
 }
 
+/// Advisory coordinate origin, independent of signing or publisher provenance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SecurityOrigin {
+    /// Prepared repository coordinates explicitly declared in the effective policy.
+    /// This is not evidence of publisher identity or historical installed origin.
+    ArchRepository {
+        repository: String,
+    },
+    OtherRepository {
+        repository: String,
+    },
+    AurArchive,
+    LocalArchive,
+    DistributionPackage,
+    Unknown,
+}
+
 /// Installed identity for security exports. Native versions are opaque strings;
 /// absent metadata remains absent rather than being inferred from the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurityPackage {
+    pub origin: SecurityOrigin,
     pub name: String,
     pub version: String,
     /// Debian/Ubuntu source identity used by OSV, when distinct from the

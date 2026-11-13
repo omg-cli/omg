@@ -479,9 +479,18 @@ pub fn display_pkg_info(info: &PackageInfo) {
     );
 }
 
+type PreparedArchiveInspections = std::collections::BTreeMap<
+    std::path::PathBuf,
+    crate::package_managers::aur::artifact_inspector::ArtifactInspection,
+>;
+
 /// RAII Guard for ALPM transactions to ensure release
 #[must_use]
-struct AlpmTransaction<'a>(&'a mut alpm::Alpm);
+struct AlpmTransaction<'a>(
+    &'a mut alpm::Alpm,
+    PreparedArchiveInspections,
+    Option<AdmissionSignals>,
+);
 
 impl Drop for AlpmTransaction<'_> {
     fn drop(&mut self) {
@@ -551,6 +560,7 @@ fn execute_transaction_with_intents(
     selections: &[super::arch_install::OfficialTarget],
 ) -> Result<()> {
     validate_aur_artifact_handoffs(kind, &packages)?;
+    let initial_policy = crate::core::security::SecurityPolicy::load_current()?;
     let staged = if matches!(
         kind,
         TransactionKind::Install | TransactionKind::InstallAurArtifact
@@ -586,7 +596,7 @@ fn execute_transaction_with_intents(
 
     let refusals = Arc::new(Mutex::new(AlpmQuestionRefusals::default()));
     let main_task = setup_alpm_callbacks(alpm, &refusals);
-    let tx_guard = prepare_alpm_transaction(alpm, packages.clone(), kind, &pacman_config)
+    let mut tx_guard = prepare_alpm_transaction(alpm, packages.clone(), kind, &pacman_config)
         .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
     let reasons = installation_reasons(tx_guard.0, &packages, intents)?;
     // Declined replacement questions make libalpm skip the replacement
@@ -601,6 +611,10 @@ fn execute_transaction_with_intents(
         &pacman_config.hold_pkg,
         &reasons,
         selections,
+        &packages,
+        &initial_policy,
+        &tx_guard.1,
+        &mut tx_guard.2,
     )
     .map_err(|error| question_refusal_error(&refusals).unwrap_or(error))?;
 
@@ -1503,6 +1517,17 @@ fn prepare_alpm_transaction<'a>(
     pacman_config: &crate::core::pacman_conf::PacmanConfig,
 ) -> Result<AlpmTransaction<'a>> {
     validate_transaction_targets(kind, &packages)?;
+    let mut admissions = std::collections::BTreeMap::new();
+    if kind == TransactionKind::InstallAurArtifact {
+        for target in &packages {
+            if crate::core::security::is_local_package_file(target) {
+                let path = crate::core::security::validate_local_package_file(target)?;
+                let admission =
+                    crate::package_managers::aur::artifact_inspector::inspect_archive(&path)?;
+                admissions.insert(path, admission);
+            }
+        }
+    }
     check_database_lock(std::path::Path::new(alpm.dbpath().trim_end_matches('/')))?;
     alpm.trans_init(transaction_flags(kind))
         .map_err(|e| match e {
@@ -1518,7 +1543,7 @@ fn prepare_alpm_transaction<'a>(
             _ => anyhow::anyhow!("Failed to initialize transaction: {e}"),
         })?;
 
-    let tx_guard = AlpmTransaction(alpm);
+    let mut tx_guard = AlpmTransaction(alpm, PreparedArchiveInspections::new(), None);
 
     if kind == TransactionKind::SystemUpgrade {
         tx_guard
@@ -1547,15 +1572,7 @@ fn prepare_alpm_transaction<'a>(
                         .to_str()
                         .context("Package path contains invalid UTF-8")?;
 
-                    let admission = if kind == TransactionKind::InstallAurArtifact {
-                        Some(
-                            crate::package_managers::aur::artifact_inspector::inspect_archive(
-                                &canonical_path,
-                            )?,
-                        )
-                    } else {
-                        None
-                    };
+                    let admission = admissions.remove(&canonical_path);
 
                     let pkg = tx_guard
                         .0
@@ -1572,6 +1589,9 @@ fn prepare_alpm_transaction<'a>(
                         })?;
                     if let Some(admission) = admission {
                         admission.verify_native_inventory(pkg.files())?;
+                        tx_guard
+                            .1
+                            .insert(canonical_path.clone(), admission.into_inspection());
                     }
                     tx_guard.0.trans_add_pkg(pkg).map_err(|e| {
                         anyhow::anyhow!(
@@ -1813,6 +1833,737 @@ impl MutationCompletion {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedAdvisoryPackage {
+    package: super::types::SecurityPackage,
+    sha256: Option<String>,
+    archive: Option<(std::path::PathBuf, u64, u64, u64)>,
+}
+
+fn prepared_repository_origin(
+    repository: &str,
+    policy: &crate::core::security::SecurityPolicy,
+) -> Result<super::types::SecurityOrigin> {
+    use crate::core::security::policy::AdvisoryRequirement;
+    if policy.arch_advisory_repositories.contains(repository) {
+        return Ok(super::types::SecurityOrigin::ArchRepository {
+            repository: repository.to_owned(),
+        });
+    }
+    anyhow::ensure!(
+        policy.advisory_requirement != AdvisoryRequirement::FreshSnapshot,
+        "FreshSnapshot has no declared Arch advisory coordinates for repository '{}'; configure arch_advisory_repositories or use Optional/Review deliberately",
+        crate::cli::style::sanitize_terminal_text(repository)
+    );
+    Ok(super::types::SecurityOrigin::OtherRepository {
+        repository: repository.to_owned(),
+    })
+}
+
+fn prepared_advisory_packages(
+    alpm: &alpm::Alpm,
+    kind: TransactionKind,
+    policy: &crate::core::security::SecurityPolicy,
+    staged_targets: &[String],
+    signals: Option<&AdmissionSignals>,
+) -> Result<Vec<PreparedAdvisoryPackage>> {
+    use super::types::{SecurityOrigin, SecurityPackage};
+    use std::os::unix::fs::MetadataExt;
+    let additions = alpm.trans_add();
+    anyhow::ensure!(
+        additions.len() <= 4096,
+        "Prepared advisory batch exceeds 4096 packages"
+    );
+    additions
+        .into_iter()
+        .map(|package| {
+            if let Some(signals) = signals {
+                signals.check()?;
+            }
+            let name = package.name().to_owned();
+            let version = package.version().as_str().to_owned();
+            let display_name = crate::cli::style::sanitize_terminal_text(&name);
+            super::parse_version(&version).context("Invalid prepared package version")?;
+            let architecture = package
+                .arch()
+                .context("Prepared package lacks architecture")?
+                .to_owned();
+            anyhow::ensure!(
+                !name.is_empty()
+                    && name.len() <= 256
+                    && version.len() <= 256
+                    && !architecture.is_empty()
+                    && architecture.len() <= 64,
+                "Prepared advisory identity exceeds limits"
+            );
+            let (origin, sha256, archive) = if package.origin() == alpm::PackageFrom::SyncDb {
+                let repository = package
+                    .db()
+                    .context("Prepared repository package lacks database")?
+                    .name()
+                    .to_owned();
+                let origin = prepared_repository_origin(&repository, policy)?;
+                (origin, package.sha256sum().map(str::to_owned), None)
+            } else {
+                let path = package
+                    .filename()
+                    .context("Prepared local archive lacks filename")?;
+                anyhow::ensure!(
+                    staged_targets
+                        .iter()
+                        .filter(|target| crate::core::security::is_local_package_file(target))
+                        .any(|target| std::fs::canonicalize(target)
+                            .is_ok_and(|candidate| candidate == std::path::Path::new(path))),
+                    "Prepared local archive is outside the private staged inputs"
+                );
+                let mut options = std::fs::OpenOptions::new();
+                use std::os::unix::fs::OpenOptionsExt;
+                options.read(true).custom_flags(
+                    nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK,
+                );
+                let file = options
+                    .open(path)
+                    .context("Cannot inspect prepared private archive")?;
+                let metadata = file.metadata()?;
+                anyhow::ensure!(
+                    metadata.is_file() && metadata.len() <= 8 * 1024 * 1024 * 1024,
+                    "Prepared archive is not a bounded regular file"
+                );
+                use sha2::{Digest, Sha256};
+                use std::io::Read;
+                let mut hash = Sha256::new();
+                let mut bytes = 0_u64;
+                let mut reader = file;
+                let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+                loop {
+                    if let Some(signals) = signals {
+                        signals.check()?;
+                    }
+                    let count = reader.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes += count as u64;
+                    anyhow::ensure!(
+                        bytes <= 8 * 1024 * 1024 * 1024,
+                        "Prepared archive exceeds its byte budget"
+                    );
+                    hash.update(&buffer[..count]);
+                }
+                anyhow::ensure!(
+                    bytes == metadata.len(),
+                    "Prepared archive changed while hashing"
+                );
+                let origin = if kind == TransactionKind::InstallAurArtifact {
+                    SecurityOrigin::AurArchive
+                } else {
+                    SecurityOrigin::LocalArchive
+                };
+                (
+                    origin,
+                    Some(hex::encode(hash.finalize())),
+                    Some((path.into(), metadata.dev(), metadata.ino(), metadata.len())),
+                )
+            };
+            if policy.advisory_requirement
+                == crate::core::security::policy::AdvisoryRequirement::FreshSnapshot
+            {
+                anyhow::ensure!(
+                    sha256.as_deref().is_some_and(|hash| hash.len() == 64
+                        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())),
+                    "FreshSnapshot requires a SHA-256 binding for prepared package '{display_name}'"
+                );
+            }
+            Ok(PreparedAdvisoryPackage {
+                package: SecurityPackage {
+                    name,
+                    version,
+                    architecture: Some(architecture),
+                    origin,
+                    advisory_source: None,
+                    description: String::new(),
+                    licenses: package.licenses().into_iter().map(str::to_owned).collect(),
+                },
+                sha256,
+                archive,
+            })
+        })
+        .collect()
+}
+
+fn advisory_batch_digest(
+    packages: &[PreparedAdvisoryPackage],
+    policy: &crate::core::security::SecurityPolicy,
+    profile: &[u8],
+    invoking_uid: u32,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let identities = packages
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "name": item.package.name, "version": item.package.version,
+                "architecture": item.package.architecture, "origin": item.package.origin,
+                "licenses": item.package.licenses, "sha256": item.sha256, "archive": item.archive,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
+        identities,
+        policy,
+        profile,
+        invoking_uid,
+    ))?)))
+}
+
+static ADMISSION_SIGNAL_OWNER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static ADMISSION_CANCELLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+extern "C" fn cancel_admission(_signal: nix::libc::c_int) {
+    ADMISSION_CANCELLED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_os = "linux")]
+fn admission_signal_action(
+    signal: i32,
+    replacement: Option<&nix::libc::sigaction>,
+) -> std::io::Result<nix::libc::sigaction> {
+    let mut previous = std::mem::MaybeUninit::uninit();
+    // SAFETY: sigaction reads the optional valid action and initializes the valid output buffer on success.
+    #[expect(
+        unsafe_code,
+        reason = "the native CLI must temporarily own only default signal dispositions"
+    )]
+    unsafe {
+        if nix::libc::sigaction(
+            signal,
+            replacement.map_or(std::ptr::null(), std::ptr::from_ref),
+            previous.as_mut_ptr(),
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(previous.assume_init())
+    }
+}
+
+struct AdmissionSignals {
+    #[cfg(target_os = "linux")]
+    previous: Vec<(i32, nix::libc::sigaction)>,
+    active: bool,
+}
+
+impl AdmissionSignals {
+    #[cfg(target_os = "linux")]
+    fn begin_in(owner: &mut Option<Self>) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        anyhow::ensure!(
+            owner.is_none(),
+            "Transaction already owns admission cancellation"
+        );
+        anyhow::ensure!(
+            ADMISSION_SIGNAL_OWNER
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "Another FreshSnapshot admission owns signal cancellation"
+        );
+        ADMISSION_CANCELLED.store(false, Ordering::Release);
+        let guard = owner.insert(Self {
+            previous: Vec::with_capacity(3),
+            active: true,
+        });
+        for signal in [nix::libc::SIGINT, nix::libc::SIGTERM, nix::libc::SIGHUP] {
+            let mut action = admission_signal_action(signal, None)?;
+            anyhow::ensure!(
+                action.sa_sigaction == nix::libc::SIG_DFL,
+                "FreshSnapshot cannot take signal ownership from an existing handler; use the ordinary native CLI in a fresh process"
+            );
+            action.sa_sigaction = cancel_admission as *const () as usize;
+            action.sa_flags = 0;
+            // SAFETY: action.sa_mask is an initialized sigset_t whose address remains valid for this call.
+            #[expect(
+                unsafe_code,
+                reason = "the scoped cancellation handler must not inherit unrelated signal masks"
+            )]
+            if unsafe { nix::libc::sigemptyset(&raw mut action.sa_mask) } == -1 {
+                return Err(std::io::Error::last_os_error())
+                    .context("Cannot configure admission signal mask");
+            }
+            let previous = admission_signal_action(signal, Some(&action))?;
+            let default = previous.sa_sigaction == nix::libc::SIG_DFL;
+            guard.previous.push((signal, previous));
+            anyhow::ensure!(
+                default,
+                "FreshSnapshot signal ownership changed during setup; transaction refused"
+            );
+        }
+        guard.check()
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn begin() -> Result<Self> {
+        let mut owner = None;
+        Self::begin_in(&mut owner)?;
+        owner.context("Admission signal owner was not acquired")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn begin_in(_owner: &mut Option<Self>) -> Result<()> {
+        anyhow::bail!("FreshSnapshot signal ownership requires the Linux native CLI")
+    }
+
+    fn check(&self) -> Result<()> {
+        anyhow::ensure!(
+            !ADMISSION_CANCELLED.load(std::sync::atomic::Ordering::Acquire),
+            "FreshSnapshot admission interrupted before commit"
+        );
+        #[cfg(target_os = "linux")]
+        for (signal, _) in &self.previous {
+            anyhow::ensure!(
+                admission_signal_action(*signal, None)?.sa_sigaction
+                    == cancel_admission as *const () as usize,
+                "FreshSnapshot lost signal-handler ownership; transaction refused"
+            );
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        let mut error: Option<anyhow::Error> = None;
+        #[cfg(target_os = "linux")]
+        for (signal, previous) in self.previous.drain(..).rev() {
+            let restored = (|| -> Result<()> {
+                let current = admission_signal_action(signal, None)?;
+                anyhow::ensure!(
+                    current.sa_sigaction == cancel_admission as *const () as usize,
+                    "FreshSnapshot lost signal-handler ownership; external handler was left unchanged"
+                );
+                let replaced = admission_signal_action(signal, Some(&previous))?;
+                anyhow::ensure!(
+                    replaced.sa_sigaction == cancel_admission as *const () as usize,
+                    "FreshSnapshot observed concurrent signal-handler replacement; this native CLI context is unsupported"
+                );
+                Ok(())
+            })();
+            if let Err(failure) = restored {
+                error.get_or_insert(failure);
+            }
+        }
+        let cancelled = ADMISSION_CANCELLED.load(std::sync::atomic::Ordering::Acquire);
+        self.active = false;
+        ADMISSION_SIGNAL_OWNER.store(false, std::sync::atomic::Ordering::Release);
+        if let Some(error) = error {
+            return Err(error);
+        }
+        anyhow::ensure!(
+            !cancelled,
+            "FreshSnapshot admission interrupted before commit"
+        );
+        Ok(())
+    }
+}
+
+impl Drop for AdmissionSignals {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.finish()
+        {
+            tracing::warn!("FreshSnapshot admission signal cleanup: {error:#}");
+        }
+    }
+}
+
+struct UnknownArchiveAcknowledgement {
+    batch_digest: String,
+    invoking_uid: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn confirm_unknown_archives(
+    packages: &[PreparedAdvisoryPackage],
+    digest: &str,
+    invoking_uid: u32,
+    signals: &AdmissionSignals,
+) -> Result<UnknownArchiveAcknowledgement> {
+    use std::fmt::Write as _;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    anyhow::ensure!(
+        crate::core::is_root(),
+        "FreshSnapshot archive acknowledgement requires the privileged transaction owner"
+    );
+    let unknown = packages
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.package.origin,
+                super::types::SecurityOrigin::AurArchive
+                    | super::types::SecurityOrigin::LocalArchive
+            )
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        unknown.len() <= 64,
+        "Split FreshSnapshot archive acknowledgements into batches of at most 64 archives"
+    );
+    let mut tty = std::fs::OpenOptions::new().read(true).write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+        .open("/dev/tty").context("FreshSnapshot unknown archives require an attended controlling terminal; --yes cannot acknowledge unknown coverage")?;
+    anyhow::ensure!(
+        nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
+        "FreshSnapshot acknowledgement must run in the terminal foreground"
+    );
+    let mut session: nix::libc::pid_t = 0;
+    // SAFETY: TIOCGSID writes one session identifier into this valid stack value.
+    #[expect(
+        unsafe_code,
+        reason = "the acknowledgement must use this process's controlling terminal session"
+    )]
+    let status =
+        unsafe { nix::libc::ioctl(tty.as_raw_fd(), nix::libc::TIOCGSID, &raw mut session) };
+    if status == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("Cannot establish acknowledgement terminal session");
+    }
+    anyhow::ensure!(
+        nix::unistd::getsid(None)?.as_raw() == session,
+        "FreshSnapshot acknowledgement terminal belongs to another session"
+    );
+    let mut device: nix::libc::c_uint = 0;
+    // SAFETY: TIOCGDEV writes one kernel device number into this valid stack value.
+    #[expect(
+        unsafe_code,
+        reason = "kernel terminal identity must be resolved independently of the /dev/tty alias"
+    )]
+    let status = unsafe { nix::libc::ioctl(tty.as_raw_fd(), nix::libc::TIOCGDEV, &raw mut device) };
+    if status == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("Cannot establish acknowledgement terminal identity");
+    }
+    let major = (device >> 8) & 0xfff;
+    let minor = (device & 0xff) | ((device >> 12) & 0xfff00);
+    let path = if (136..=143).contains(&major) {
+        format!("/dev/pts/{minor}")
+    } else if major == 4 && (1..=63).contains(&minor) {
+        format!("/dev/tty{minor}")
+    } else {
+        anyhow::bail!("Unsupported terminal identity for FreshSnapshot acknowledgement");
+    };
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_char_device()
+            && metadata.rdev() == u64::from(device)
+            && (metadata.uid() == invoking_uid || metadata.uid() == 0),
+        "FreshSnapshot acknowledgement terminal is not owned by root or the invoking user"
+    );
+    let mut prompt = format!(
+        "\nArch advisory applicability is UNKNOWN for these exact archives. This acknowledgement does not establish coverage.\nInvoking UID: {invoking_uid}\nFull prepared batch SHA-256: {digest}\n"
+    );
+    for item in unknown {
+        prompt.push_str(&serde_json::to_string(&(
+            &item.package.name,
+            &item.package.version,
+            &item.package.architecture,
+            &item.package.origin,
+            &item.sha256,
+        ))?);
+        prompt.push('\n');
+    }
+    write!(
+        prompt,
+        "Type accept {digest} within 60 seconds to continue: "
+    )?;
+    anyhow::ensure!(
+        prompt.len() <= 64 * 1024,
+        "FreshSnapshot acknowledgement display exceeds limit"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    fn ready(
+        tty: &std::fs::File,
+        events: rustix::event::PollFlags,
+        deadline: std::time::Instant,
+        signals: &AdmissionSignals,
+    ) -> Result<()> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        loop {
+            signals.check()?;
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .context("FreshSnapshot acknowledgement timed out")?;
+            let timeout = Timespec::try_from(remaining.min(std::time::Duration::from_millis(100)))
+                .context("Invalid acknowledgement timeout")?;
+            let mut items = [PollFd::new(tty, events)];
+            let result = poll(&mut items, Some(&timeout))
+                .context("FreshSnapshot acknowledgement interrupted")?;
+            signals.check()?;
+            if result == 0 {
+                continue;
+            }
+            anyhow::ensure!(
+                !items[0]
+                    .revents()
+                    .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
+                "FreshSnapshot acknowledgement terminal disconnected"
+            );
+            anyhow::ensure!(
+                items[0].revents().contains(events),
+                "FreshSnapshot acknowledgement terminal is not ready"
+            );
+            return Ok(());
+        }
+    }
+    let mut remaining = prompt.as_bytes();
+    while !remaining.is_empty() {
+        ready(&tty, rustix::event::PollFlags::OUT, deadline, signals)?;
+        match tty.write(remaining) {
+            Ok(0) => anyhow::bail!("FreshSnapshot acknowledgement terminal closed"),
+            Ok(count) => remaining = &remaining[count..],
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut answer = Vec::new();
+    loop {
+        ready(&tty, rustix::event::PollFlags::IN, deadline, signals)?;
+        let mut buffer = [0_u8; 128];
+        let count = match tty.read(&mut buffer) {
+            Ok(0) => anyhow::bail!("FreshSnapshot acknowledgement terminal closed"),
+            Ok(count) => count,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        answer.extend_from_slice(&buffer[..count]);
+        anyhow::ensure!(
+            answer.len() <= 96,
+            "FreshSnapshot acknowledgement input exceeds limit"
+        );
+        if answer.contains(&b'\n') {
+            break;
+        }
+    }
+    anyhow::ensure!(
+        nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
+        "FreshSnapshot terminal foreground changed during acknowledgement"
+    );
+    anyhow::ensure!(
+        answer == format!("accept {digest}\n").as_bytes()
+            || answer == format!("accept {digest}\r\n").as_bytes(),
+        "FreshSnapshot unknown-coverage acknowledgement declined"
+    );
+    signals.check()?;
+    Ok(UnknownArchiveAcknowledgement {
+        batch_digest: digest.to_owned(),
+        invoking_uid,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn confirm_unknown_archives(
+    _packages: &[PreparedAdvisoryPackage],
+    _digest: &str,
+    _invoking_uid: u32,
+    _signals: &AdmissionSignals,
+) -> Result<UnknownArchiveAcknowledgement> {
+    anyhow::bail!("FreshSnapshot archive acknowledgement requires Linux terminal ownership checks")
+}
+
+struct PreparedAdvisoryAdmission {
+    packages: Vec<PreparedAdvisoryPackage>,
+    policy: crate::core::security::SecurityPolicy,
+    profile: Vec<u8>,
+    invoking_uid: u32,
+    acknowledgement: Option<UnknownArchiveAcknowledgement>,
+    operation: Option<crate::core::security::vulnerability::ArchOperationAssessment>,
+}
+
+impl PreparedAdvisoryAdmission {
+    fn new(
+        alpm: &alpm::Alpm,
+        kind: TransactionKind,
+        staged_targets: &[String],
+        initial_policy: &crate::core::security::SecurityPolicy,
+        inspections: &PreparedArchiveInspections,
+        signals: &mut Option<AdmissionSignals>,
+    ) -> Result<Self> {
+        use crate::core::security::policy::{AdvisoryRequirement, SecurityPolicy};
+        use crate::core::security::vulnerability::{AssessmentUse, VulnerabilityScanner};
+        if initial_policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot
+            && !alpm.trans_add().is_empty()
+        {
+            AdmissionSignals::begin_in(signals)?;
+        }
+        let policy = SecurityPolicy::load_current()?;
+        anyhow::ensure!(
+            &policy == initial_policy,
+            "Security policy changed during native transaction preparation; retry the operation"
+        );
+        policy.validate_advisory_scope()?;
+        let settings = crate::config::Settings::load()?;
+        let profile = serde_json::to_vec(&settings.aur)?;
+        let invoking_uid = crate::core::privilege::invoking_uid()?;
+        let packages =
+            prepared_advisory_packages(alpm, kind, &policy, staged_targets, signals.as_ref())?;
+        for item in &packages {
+            if matches!(
+                item.package.origin,
+                super::types::SecurityOrigin::AurArchive
+            ) {
+                let path = &item
+                    .archive
+                    .as_ref()
+                    .context("AUR admission lacks an exact archive")?
+                    .0;
+                let inspection = inspections
+                    .get(path)
+                    .context("AUR admission lacks its pre-lock archive inspection")?;
+                anyhow::ensure!(
+                    item.sha256.as_deref() == Some(inspection.archive_sha256.as_str()),
+                    "AUR archive changed before current-profile inspection"
+                );
+                inspection.enforce_profile(settings.aur.security_profile)?;
+            }
+            let is_aur = matches!(
+                item.package.origin,
+                super::types::SecurityOrigin::AurArchive
+            );
+            let license = crate::core::security::policy::combined_license_expression(
+                item.package.licenses.iter().map(String::as_str),
+            );
+            policy.check_package(
+                &item.package.name,
+                is_aur,
+                license.as_deref(),
+                SecurityPolicy::source_grade(&item.package.origin),
+            )?;
+        }
+        let acknowledgement = if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot
+            && packages.iter().any(|item| item.archive.is_some())
+        {
+            Some(confirm_unknown_archives(
+                &packages,
+                &advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?,
+                invoking_uid,
+                signals
+                    .as_ref()
+                    .context("FreshSnapshot signal owner is missing")?,
+            )?)
+        } else {
+            None
+        };
+        let operation = if packages.is_empty()
+            || policy.advisory_requirement == AdvisoryRequirement::Optional
+        {
+            None
+        } else {
+            let subjects = packages
+                .iter()
+                .map(|item| item.package.clone())
+                .collect::<Vec<_>>();
+            let use_case = if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot {
+                AssessmentUse::Admission
+            } else {
+                AssessmentUse::Review
+            };
+            let operation = std::thread::spawn(move || -> Result<_> {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(
+                        VulnerabilityScanner::new().assess_arch_operation(&subjects, use_case),
+                    )
+                    .map_err(Into::into)
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("Prepared Arch advisory worker failed"))??;
+            anyhow::ensure!(
+                operation.assessments().len() == packages.len()
+                    && operation
+                        .assessments()
+                        .iter()
+                        .zip(&packages)
+                        .all(|(assessment, item)| assessment.package == item.package),
+                "Prepared Arch assessment identity mismatch"
+            );
+            policy.check_sources_and_findings(operation.assessments())?;
+            if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot {
+                for assessment in operation.assessments() {
+                    anyhow::ensure!(
+                        assessment.coverage.is_assessed()
+                            || matches!(
+                                assessment.package.origin,
+                                super::types::SecurityOrigin::AurArchive
+                                    | super::types::SecurityOrigin::LocalArchive
+                            ) && acknowledgement.is_some(),
+                        "FreshSnapshot requires assessed coordinates or an exact private archive acknowledgement"
+                    );
+                }
+            }
+            Some(operation)
+        };
+        if let Some(signals) = signals.as_ref() {
+            signals.check()?;
+        }
+        Ok(Self {
+            packages,
+            policy,
+            profile,
+            invoking_uid,
+            acknowledgement,
+            operation,
+        })
+    }
+
+    fn validate(
+        &self,
+        alpm: &alpm::Alpm,
+        kind: TransactionKind,
+        staged_targets: &[String],
+        signals: &mut Option<AdmissionSignals>,
+    ) -> Result<()> {
+        if let Some(signals) = signals.as_ref() {
+            signals.check()?;
+        }
+        let policy = crate::core::security::SecurityPolicy::load_current()?;
+        let profile = serde_json::to_vec(&crate::config::Settings::load()?.aur)?;
+        let invoking_uid = crate::core::privilege::invoking_uid()?;
+        anyhow::ensure!(
+            policy == self.policy && profile == self.profile && invoking_uid == self.invoking_uid,
+            "Effective policy, AUR profile or invoking identity changed before commit"
+        );
+        let current =
+            prepared_advisory_packages(alpm, kind, &policy, staged_targets, signals.as_ref())?;
+        anyhow::ensure!(
+            current == self.packages,
+            "Prepared package identity or archive changed after advisory admission"
+        );
+        if let Some(acknowledgement) = &self.acknowledgement {
+            anyhow::ensure!(
+                acknowledgement.invoking_uid == invoking_uid
+                    && acknowledgement.batch_digest
+                        == advisory_batch_digest(&current, &policy, &profile, invoking_uid)?,
+                "FreshSnapshot archive acknowledgement no longer matches the prepared batch"
+            );
+        }
+        if let Some(operation) = &self.operation {
+            operation.validate_now()?;
+        }
+        if let Some(signals) = signals.as_mut() {
+            signals.check()?;
+            signals.finish()?;
+        }
+        Ok(())
+    }
+}
+
 fn commit_alpm_transaction(
     alpm: &mut alpm::Alpm,
     main_task: &ProgressTask,
@@ -1820,6 +2571,10 @@ fn commit_alpm_transaction(
     hold_pkg: &[String],
     reasons: &[(String, alpm::PackageReason)],
     selections: &[super::arch_install::OfficialTarget],
+    staged_targets: &[String],
+    initial_policy: &crate::core::security::SecurityPolicy,
+    inspections: &PreparedArchiveInspections,
+    signals: &mut Option<AdmissionSignals>,
 ) -> Result<()> {
     main_task.set_message("Preparing transaction...");
 
@@ -1828,22 +2583,14 @@ fn commit_alpm_transaction(
 
     validate_prepared_selections(alpm, selections)?;
 
-    let candidates = alpm
-        .trans_add()
-        .into_iter()
-        .map(|package| {
-            Ok((
-                package.name().to_owned(),
-                crate::package_managers::parse_version(package.version().as_str())
-                    .context("Invalid prepared package version")?,
-                package.origin() != alpm::PackageFrom::SyncDb,
-                crate::core::security::policy::combined_license_expression(
-                    package.licenses().iter(),
-                ),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    crate::core::security::policy::check_prepared_packages(candidates)?;
+    let advisory_admission = PreparedAdvisoryAdmission::new(
+        alpm,
+        kind,
+        staged_targets,
+        initial_policy,
+        inspections,
+        signals,
+    )?;
 
     // RECURSE expands the removal set during preparation. Validate the final
     // set, not only the user's explicit targets, so dependencies protected by
@@ -1890,13 +2637,19 @@ fn commit_alpm_transaction(
         TransactionKind::SystemUpgrade => "upgrade",
     };
     crate::core::security::audit::record_operation(operation, &targets, "attempt")?;
-    let result = if no_package_changes {
-        Ok(())
-    } else {
-        alpm.trans_commit().map_err(|error| {
-            anyhow::anyhow!("Transaction failed to commit; package state may have changed: {error}")
-        })
-    };
+    let result = advisory_admission
+        .validate(alpm, kind, staged_targets, signals)
+        .and_then(|()| {
+            if no_package_changes {
+                Ok(())
+            } else {
+                alpm.trans_commit().map_err(|error| {
+                    anyhow::anyhow!(
+                        "Transaction failed to commit; package state may have changed: {error}"
+                    )
+                })
+            }
+        });
     let completion = match result {
         Ok(()) => MutationCompletion::Committed {
             reasons: persist_installation_reasons(alpm, reasons),
@@ -2021,6 +2774,204 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_admission_signal_ownership_is_scoped_and_refuses_handler_conflicts()
+    -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::fresh_admission_signal_ownership_is_scoped_and_refuses_handler_conflicts";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let mut guard = super::AdmissionSignals::begin()?;
+        assert!(super::AdmissionSignals::begin().is_err());
+        assert!(
+            !nix::sys::signal::SigSet::thread_get_mask()?
+                .contains(nix::sys::signal::Signal::SIGINT),
+            "the isolated signal fixture requires SIGINT unblocked on its receiving thread"
+        );
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGINT)?;
+        assert!(
+            guard.check().is_err(),
+            "synchronous current-thread SIGINT must cancel admission"
+        );
+        assert!(guard.finish().is_err());
+        for signal in [nix::libc::SIGINT, nix::libc::SIGTERM, nix::libc::SIGHUP] {
+            assert_eq!(
+                super::admission_signal_action(signal, None)?.sa_sigaction,
+                nix::libc::SIG_DFL
+            );
+        }
+        let default = super::admission_signal_action(nix::libc::SIGTERM, None)?;
+        let mut ignored = super::admission_signal_action(nix::libc::SIGTERM, None)?;
+        ignored.sa_sigaction = nix::libc::SIG_IGN;
+        super::admission_signal_action(nix::libc::SIGTERM, Some(&ignored))?;
+        assert!(super::AdmissionSignals::begin().is_err());
+        assert_eq!(
+            super::admission_signal_action(nix::libc::SIGINT, None)?.sa_sigaction,
+            nix::libc::SIG_DFL,
+            "partial acquisition rolls back the earlier default handler"
+        );
+        assert_eq!(
+            super::admission_signal_action(nix::libc::SIGTERM, None)?.sa_sigaction,
+            nix::libc::SIG_IGN,
+            "preexisting owner remains untouched"
+        );
+        super::admission_signal_action(nix::libc::SIGTERM, Some(&default))?;
+        let mut guard = super::AdmissionSignals::begin()?;
+        super::admission_signal_action(nix::libc::SIGTERM, Some(&ignored))?;
+        assert!(guard.check().is_err());
+        assert!(guard.finish().is_err());
+        assert_eq!(
+            super::admission_signal_action(nix::libc::SIGTERM, None)?.sa_sigaction,
+            nix::libc::SIG_IGN,
+            "new external owner remains untouched on cleanup"
+        );
+        super::admission_signal_action(nix::libc::SIGTERM, Some(&default))?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_admission_setup_error_keeps_signal_owner_until_transaction_release()
+    -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::native_admission_setup_error_keeps_signal_owner_until_transaction_release";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let fixture = RepositoryFixture::new()?;
+        let mut alpm = fixture.open();
+        alpm.trans_init(alpm::TransFlag::empty())?;
+        let lock = fixture.database().join("db.lck");
+        assert!(lock.exists(), "native transaction created its private lock");
+        let mut transaction =
+            super::AlpmTransaction(&mut alpm, super::PreparedArchiveInspections::new(), None);
+        let default = super::admission_signal_action(nix::libc::SIGTERM, None)?;
+        let mut ignored = default;
+        ignored.sa_sigaction = nix::libc::SIG_IGN;
+        super::admission_signal_action(nix::libc::SIGTERM, Some(&ignored))?;
+        assert!(super::AdmissionSignals::begin_in(&mut transaction.2).is_err());
+        assert!(
+            transaction.2.is_some(),
+            "partial acquisition belongs to the outer transaction even on error"
+        );
+        assert!(lock.exists());
+        assert_eq!(
+            super::admission_signal_action(nix::libc::SIGINT, None)?.sa_sigaction,
+            super::cancel_admission as *const () as usize
+        );
+        drop(transaction);
+        assert!(
+            !lock.exists(),
+            "native release removes the lock during error cleanup"
+        );
+        assert_eq!(
+            super::admission_signal_action(nix::libc::SIGINT, None)?.sa_sigaction,
+            nix::libc::SIG_DFL
+        );
+        assert_eq!(
+            super::admission_signal_action(nix::libc::SIGTERM, None)?.sa_sigaction,
+            nix::libc::SIG_IGN
+        );
+        super::admission_signal_action(nix::libc::SIGTERM, Some(&default))?;
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_admission_requires_declared_repository_coordinates_even_for_core() -> anyhow::Result<()>
+    {
+        use crate::core::security::policy::{AdvisoryRequirement, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+        let mut policy = SecurityPolicy::default();
+        assert!(matches!(
+            super::prepared_repository_origin("core", &policy)?,
+            SecurityOrigin::OtherRepository { .. }
+        ));
+        policy.advisory_requirement = AdvisoryRequirement::FreshSnapshot;
+        assert!(super::prepared_repository_origin("core", &policy).is_err());
+        policy.arch_advisory_repositories.insert("core".into());
+        assert!(
+            matches!(super::prepared_repository_origin("core", &policy)?, SecurityOrigin::ArchRepository { repository } if repository == "core")
+        );
+        assert!(super::prepared_repository_origin("new-custom-dependency", &policy).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn archive_acknowledgement_digest_binds_every_prepared_authority_axis() -> anyhow::Result<()> {
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        let package = super::PreparedAdvisoryPackage {
+            package: SecurityPackage {
+                name: "fixture".into(),
+                version: "1-1".into(),
+                architecture: Some("x86_64".into()),
+                origin: SecurityOrigin::AurArchive,
+                advisory_source: None,
+                description: String::new(),
+                licenses: vec!["MIT".into()],
+            },
+            sha256: Some("a".repeat(64)),
+            archive: Some(("/var/tmp/private/pkg.tar.zst".into(), 1, 2, 3)),
+        };
+        let policy = crate::core::security::SecurityPolicy::default();
+        let digest = super::advisory_batch_digest(
+            std::slice::from_ref(&package),
+            &policy,
+            b"profile",
+            1000,
+        )?;
+        let mut variants = Vec::new();
+        let mut changed = package.clone();
+        changed.package.name = "other".into();
+        variants.push(changed);
+        let mut changed = package.clone();
+        changed.package.version = "2-1".into();
+        variants.push(changed);
+        let mut changed = package.clone();
+        changed.package.architecture = Some("aarch64".into());
+        variants.push(changed);
+        let mut changed = package.clone();
+        changed.package.origin = SecurityOrigin::LocalArchive;
+        variants.push(changed);
+        let mut changed = package.clone();
+        changed.sha256 = Some("b".repeat(64));
+        variants.push(changed);
+        let mut changed = package.clone();
+        changed.archive.as_mut().expect("archive").2 = 4;
+        variants.push(changed);
+        for changed in variants {
+            assert_ne!(
+                super::advisory_batch_digest(&[changed], &policy, b"profile", 1000)?,
+                digest
+            );
+        }
+        let mut changed = policy.clone();
+        changed.advisory_requirement =
+            crate::core::security::policy::AdvisoryRequirement::FreshSnapshot;
+        assert_ne!(
+            super::advisory_batch_digest(
+                std::slice::from_ref(&package),
+                &changed,
+                b"profile",
+                1000
+            )?,
+            digest
+        );
+        assert_ne!(
+            super::advisory_batch_digest(
+                std::slice::from_ref(&package),
+                &policy,
+                b"changed-profile",
+                1000
+            )?,
+            digest
+        );
+        assert_ne!(
+            super::advisory_batch_digest(&[package], &policy, b"profile", 1001)?,
+            digest
+        );
+        Ok(())
+    }
+
     #[test]
     fn mutation_completion_preserves_outcomes_and_primary_causes() {
         use super::MutationCompletion::{CommitFailed, Committed};
@@ -2254,7 +3205,8 @@ mod tests {
             .expect("read a valid disposable fixture audit baseline")
             .len();
         alpm.trans_init(alpm::TransFlag::empty())?;
-        let transaction = super::AlpmTransaction(&mut alpm);
+        let mut transaction =
+            super::AlpmTransaction(&mut alpm, super::PreparedArchiveInspections::new(), None);
         let task = super::ProgressTask::start(&super::TaskSpec {
             label: "Reason persistence fixture".to_owned(),
             kind: super::TaskKind::Items { total: 1 },
@@ -2267,6 +3219,10 @@ mod tests {
             &[],
             &[(name.to_owned(), alpm::PackageReason::Explicit)],
             &[],
+            &[],
+            &crate::core::security::SecurityPolicy::load_current()?,
+            &super::PreparedArchiveInspections::new(),
+            &mut transaction.2,
         )
         .expect_err("a directory in place of desc must refuse durable reason persistence");
         drop(transaction);

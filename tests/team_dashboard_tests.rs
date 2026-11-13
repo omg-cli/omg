@@ -747,6 +747,7 @@ mod app_getter_tests {
             updates_available: 7,
             security_vulnerabilities: 2,
             vulnerabilities_scanned: true,
+            security_unknown_packages: Some(0),
             runtime_versions: vec![("node".to_string(), "22.4.0".to_string())],
         }
     }

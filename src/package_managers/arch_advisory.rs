@@ -2,22 +2,80 @@
 //! introduced-version boundary; installed packages remain candidates until
 //! the published fix is installed (the arch-audit comparison model).
 use anyhow::{Context, Result, ensure};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
-use super::types::{SecurityPackage, parse_version};
+use super::types::{SecurityOrigin, SecurityPackage, parse_version};
 
 use crate::core::security::scan::{
-    AdvisoryReference, AdvisorySeverity, InstalledIdentity, MinimumSeverity, NativeAdvisory,
-    SecurityAuditResult, Vulnerability,
+    AdvisoryProvenance, AdvisoryReference, AdvisorySeverity, FindingApplicability,
+    InstalledIdentity, NativeAdvisory, SecurityAuditResult, Vulnerability,
 };
-use crate::core::security::vulnerability::AlsaIssue;
+use crate::core::security::vulnerability::{
+    AlsaIssue, PackageAssessment, PackageCoverage, UnknownCoverage,
+};
 
 pub(crate) fn audit_result(
     installed: &[SecurityPackage],
     advisories: &[AlsaIssue],
 ) -> Result<SecurityAuditResult> {
+    Ok(SecurityAuditResult::from_assessments(assess_packages(
+        installed, advisories, None,
+    )?))
+}
+
+pub(crate) fn assess_packages(
+    installed: &[SecurityPackage],
+    advisories: &[AlsaIssue],
+    provenance: Option<&AdvisoryProvenance>,
+) -> Result<Vec<PackageAssessment>> {
     ensure!(!advisories.is_empty(), "Arch advisory feed is empty");
-    let mut groups: BTreeMap<String, Vec<Vulnerability>> = BTreeMap::new();
+    ensure!(
+        provenance.is_none_or(|source| matches!(source, AdvisoryProvenance::ArchSnapshot { .. })),
+        "Arch advisory applicability requires Arch snapshot provenance"
+    );
+    for package in installed {
+        ensure!(
+            !package.name.trim().is_empty() && parse_version(&package.version).is_some(),
+            "Incomplete or invalid Arch package advisory identity"
+        );
+        if let SecurityOrigin::ArchRepository { repository }
+        | SecurityOrigin::OtherRepository { repository } = &package.origin
+        {
+            ensure!(
+                !repository.trim().is_empty(),
+                "Empty advisory repository identity"
+            );
+        }
+    }
+    let mut assessments = installed
+        .iter()
+        .map(|package| {
+            let coverage = match (&package.origin, provenance) {
+                (SecurityOrigin::ArchRepository { .. }, Some(source)) => {
+                    PackageCoverage::Assessed {
+                        provenance: source.clone(),
+                    }
+                }
+                (SecurityOrigin::Unknown, _) => PackageCoverage::Unknown {
+                    reason: UnknownCoverage::OriginUnestablished,
+                    provenance: provenance.cloned(),
+                },
+                (SecurityOrigin::ArchRepository { .. }, None) => PackageCoverage::Unknown {
+                    reason: UnknownCoverage::EvidenceUnavailable,
+                    provenance: None,
+                },
+                _ => PackageCoverage::Unknown {
+                    reason: UnknownCoverage::SourceNotCovered,
+                    provenance: provenance.cloned(),
+                },
+            };
+            PackageAssessment {
+                package: package.clone(),
+                coverage,
+                findings: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
     let mut identities = HashSet::new();
     for advisory in advisories {
         ensure!(
@@ -60,10 +118,11 @@ pub(crate) fn audit_result(
             .filter(|value| !value.is_empty())
             .map(|value| parse_version(value).context("Invalid Arch advisory fixed version"))
             .transpose()?;
-        for package in installed
-            .iter()
-            .filter(|package| advisory.packages.contains(&package.name))
-        {
+        for assessment in &mut assessments {
+            let package = &assessment.package;
+            if !advisory.packages.contains(&package.name) {
+                continue;
+            }
             let version =
                 parse_version(&package.version).context("Invalid installed Arch version")?;
             if let Some(fixed) = &fixed
@@ -80,45 +139,87 @@ pub(crate) fn audit_result(
                     url: format!("https://security.archlinux.org/{}", urlencoding::encode(id)),
                 })
                 .collect();
-            groups
-                .entry(package.name.clone())
-                .or_default()
-                .push(Vulnerability {
-                    id: advisory.name.clone(),
-                    summary: format!("{}: {}", advisory.name, advisory.kind),
-                    score: None,
-                    advisory_severity: Some(severity),
-                    native_advisory: Some(NativeAdvisory {
-                        source: "Arch Linux Security Tracker".into(),
-                        // Arch has no RPM NEVRA. Empty means not applicable.
-                        advisory_nevra: String::new(),
-                        published_severity: advisory.severity.clone(),
-                        description: format!(
-                            "Status: {}; affected snapshot: {}; fixed: {}",
-                            advisory.status,
-                            advisory.affected,
-                            advisory.fixed.as_deref().unwrap_or("not published")
-                        ),
-                        references,
-                    }),
-                    affected_installed: vec![InstalledIdentity::from(package)],
-                });
+            assessment.findings.push(Vulnerability {
+                applicability: if assessment.coverage.is_assessed() {
+                    FindingApplicability::Applicable
+                } else {
+                    FindingApplicability::Possible
+                },
+                id: advisory.name.clone(),
+                summary: format!("{}: {}", advisory.name, advisory.kind),
+                score: None,
+                advisory_severity: Some(severity),
+                native_advisory: Some(NativeAdvisory {
+                    source: "Arch Linux Security Tracker".into(),
+                    // Arch has no RPM NEVRA. Empty means not applicable.
+                    advisory_nevra: String::new(),
+                    published_severity: advisory.severity.clone(),
+                    description: format!(
+                        "Status: {}; affected snapshot: {}; fixed: {}",
+                        advisory.status,
+                        advisory.affected,
+                        advisory.fixed.as_deref().unwrap_or("not published")
+                    ),
+                    references,
+                }),
+                affected_installed: vec![InstalledIdentity::from(package)],
+            });
         }
     }
-    Ok(SecurityAuditResult {
-        total_vulnerabilities: groups.values().map(Vec::len).sum(),
-        high_severity: groups
-            .values()
-            .flatten()
-            .filter(|finding| finding.meets_minimum(MinimumSeverity::High))
-            .count(),
-        vulnerabilities: groups.into_iter().collect(),
-    })
+    Ok(assessments)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage17_unknown_installed_origin_is_reported_even_without_matches() {
+        let package = SecurityPackage {
+            origin: SecurityOrigin::Unknown,
+            name: "omg-unmapped-audit-fixture".into(),
+            version: "1.0-1".into(),
+            advisory_source: None,
+            architecture: Some("any".into()),
+            description: String::new(),
+            licenses: vec![],
+        };
+        let advisory: AlsaIssue = serde_json::from_str(
+            r#"{"name":"AVG-fixture","packages":["other-package"],"status":"Not affected","severity":"Low","affected":"1.0-1","fixed":null,"issues":["CVE-fixture"]}"#,
+        )
+        .expect("complete unrelated advisory fixture");
+        let result = audit_result(&[package], &[advisory]).expect("valid native audit");
+        assert_eq!(result.total_vulnerabilities, 0);
+        let wire = serde_json::to_value(&result).expect("public audit result");
+        assert_eq!(wire["coverage"]["status"], "reported");
+        assert_eq!(wire["coverage"]["assessed"], serde_json::json!([]));
+        let unassessed = wire["coverage"]["unassessed"]
+            .as_array()
+            .expect("unassessed inventory must be explicit");
+        assert_eq!(unassessed.len(), 1);
+        assert_eq!(
+            unassessed[0]["package"]["name"],
+            "omg-unmapped-audit-fixture"
+        );
+        assert_eq!(unassessed[0]["package"]["version"], "1.0-1");
+        assert_eq!(unassessed[0]["package"]["architecture"], "any");
+    }
+
+    #[test]
+    fn another_distribution_cannot_supply_arch_applicability_provenance() {
+        let advisory: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-fixture","packages":["fixture"],"status":"Vulnerable","severity":"High","affected":"1-1","fixed":null,"issues":["CVE-fixture"]}"#).expect("complete advisory");
+        for source in [
+            AdvisoryProvenance::NativeDnf,
+            AdvisoryProvenance::Osv {
+                ecosystem: "Debian:12".into(),
+            },
+        ] {
+            assert!(
+                assess_packages(&[], std::slice::from_ref(&advisory), Some(&source)).is_err(),
+                "another source must not be relabelled as an Arch snapshot"
+            );
+        }
+    }
 
     #[test]
     fn blank_advisory_identifiers_cannot_be_admitted_as_clean_evidence() {
@@ -160,6 +261,7 @@ mod tests {
     fn unknown_severity_and_unpublished_fix_do_not_invent_safety_or_scores() {
         let mut advisory: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Unknown","severity":"Unknown","affected":"1.0-1","fixed":null,"issues":["CVE-test"]}"#).unwrap();
         let installed = [SecurityPackage {
+            origin: SecurityOrigin::Unknown,
             name: "fixture".into(),
             version: "3.0-1".into(),
             advisory_source: None,
@@ -203,6 +305,7 @@ mod tests {
     fn fixed_advisory_binds_only_older_installed_identity() {
         let advisory: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Fixed","severity":"High","affected":"2.0-1","fixed":"2.0-2","issues":["CVE-test"],"type":"code execution"}"#).unwrap();
         let package = |version: &str| SecurityPackage {
+            origin: SecurityOrigin::Unknown,
             name: "fixture".into(),
             version: version.into(),
             advisory_source: None,

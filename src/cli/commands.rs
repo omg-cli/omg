@@ -422,7 +422,7 @@ type StatusSnapshot = (
     usize,
     usize,
     usize,
-    Option<usize>,
+    Option<(usize, usize)>,
     Option<Vec<(String, String)>>,
 );
 
@@ -476,7 +476,7 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
             res.explicit_packages,
             res.orphan_packages,
             res.updates_available,
-            res.scanned_vulnerability_count(),
+            res.scanned_vulnerability_summary(),
             Some(res.runtime_versions),
         ));
     }
@@ -529,27 +529,30 @@ pub fn status_sync() -> Result<()> {
 
     // Security
     match security_vulnerabilities {
-        Some(0) => {
+        Some((findings, unknown)) => {
             println!(
                 "  {} {}",
                 style::emphasis("Security"),
-                style::positive("No known issues")
+                if findings == 0 {
+                    style::info("No reported findings")
+                } else {
+                    style::negative(&format!("{findings} findings"))
+                }
             );
+            if unknown > 0 {
+                println!(
+                    "    {}",
+                    style::warning(&format!(
+                        "{unknown} packages have unknown advisory applicability"
+                    ))
+                );
+            }
         }
-        Some(count) => {
-            println!(
-                "  {} {}",
-                style::emphasis("Security"),
-                style::negative(&format!("{count} vulnerabilities"))
-            );
-        }
-        None => {
-            println!(
-                "  {} {}",
-                style::emphasis("Security"),
-                style::dim("Not scanned")
-            );
-        }
+        None => println!(
+            "  {} {}",
+            style::emphasis("Security"),
+            style::dim("Advisory coverage unreported")
+        ),
     }
 
     // Daemon status: a stale socket node is not a running daemon.
@@ -589,7 +592,7 @@ pub fn status_sync() -> Result<()> {
         }
     }
 
-    if security_vulnerabilities != Some(0) {
+    if security_vulnerabilities != Some((0, 0)) {
         println!(
             "\n  Check vulnerabilities with {}",
             style::accent("omg audit")

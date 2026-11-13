@@ -411,7 +411,7 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
     let total_packages = app.get_total_packages();
     let updates = app.get_updates_available();
     let orphans = app.get_orphan_packages();
-    let vulns = app.get_security_vulnerabilities();
+    let vulns = app.get_security_findings_summary();
 
     // Packages card
     if let Some(c) = cards.first() {
@@ -474,20 +474,36 @@ fn draw_health_cards(f: &mut Frame, area: Rect, app: &App) {
 
     // Security card
     if let Some(c) = cards.get(3) {
-        let (color, status_icon, label) = match vulns {
-            Some(0) => (colors::ACCENT_GREEN, "󰒃", Cow::Borrowed("Secure")),
-            Some(count) => (colors::ACCENT_RED, "󰀦", Cow::Owned(format!("{count} CVEs"))),
-            None => (colors::FG_MUTED, "󰀦", Cow::Borrowed("Not scanned")),
+        let (color, status_icon, label, caption) = match vulns {
+            Some((0, 0)) => (
+                colors::ACCENT_GREEN,
+                "󰒃",
+                Cow::Borrowed("No matches"),
+                Cow::Borrowed("Reported coverage"),
+            ),
+            Some((count, unknown)) => (
+                if count > 0 {
+                    colors::ACCENT_RED
+                } else {
+                    colors::ACCENT_YELLOW
+                },
+                "󰀦",
+                Cow::Owned(format!("{count} findings")),
+                if unknown > 0 {
+                    Cow::Owned(format!("{unknown} unassessed"))
+                } else {
+                    Cow::Borrowed("Reported coverage")
+                },
+            ),
+            None => (
+                colors::FG_MUTED,
+                "󰀦",
+                Cow::Borrowed("Unreported"),
+                Cow::Borrowed("Advisory coverage"),
+            ),
         };
         f.render_widget(
-            stat_card(
-                "Security",
-                status_icon,
-                color,
-                label,
-                color,
-                "Compliance Status",
-            ),
+            stat_card("Security", status_icon, color, label, color, &caption),
             *c,
         );
     }
@@ -943,12 +959,15 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let vulnerabilities = app.get_security_vulnerabilities();
-    let (status_color, status_icon, status_text) = match vulnerabilities {
-        Some(0) => (colors::ACCENT_GREEN, "󰒃", "SECURE"),
-        Some(_) => (colors::ACCENT_RED, "󰀦", "VULNERABLE"),
-        None => (colors::FG_MUTED, "󰀦", "NOT SCANNED"),
+    let summary = app.get_security_findings_summary();
+    let vulnerabilities = summary.map(|(findings, _)| findings);
+    let (status_color, status_icon, status_text) = match summary {
+        Some((_, unknown)) if unknown > 0 => (colors::ACCENT_YELLOW, "󰀦", "PARTIAL COVERAGE"),
+        Some((0, 0)) => (colors::ACCENT_GREEN, "󰒃", "NO REPORTED MATCHES"),
+        Some(_) => (colors::ACCENT_RED, "󰀦", "FINDINGS"),
+        None => (colors::FG_MUTED, "󰀦", "UNREPORTED"),
     };
+    let defaults = crate::core::security::SecurityPolicy::default();
 
     // Security Overview
     let security_lines = vec![
@@ -968,7 +987,7 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("   CVEs Found: ", Style::default().fg(colors::FG_MUTED)),
+            Span::styled("   Findings: ", Style::default().fg(colors::FG_MUTED)),
             Span::styled(
                 match vulnerabilities {
                     Some(count) => count.to_string(),
@@ -983,8 +1002,15 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
             ),
         ]),
         Line::from(""),
+        Line::from(vec![
+            Span::styled("   Unassessed: ", Style::default().fg(colors::FG_MUTED)),
+            Span::styled(
+                summary.map_or_else(|| "n/a".to_owned(), |(_, count)| count.to_string()),
+                Style::default().fg(status_color),
+            ),
+        ]),
         Line::from(Span::styled(
-            "   Policy:",
+            "   Built-in defaults (not active policy):",
             Style::default()
                 .fg(colors::FG_PRIMARY)
                 .add_modifier(Modifier::BOLD),
@@ -994,17 +1020,31 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("   ├─ Min Grade: ", Style::default().fg(colors::FG_MUTED)),
             Span::styled(
-                "VERIFIED (default)",
-                Style::default().fg(colors::ACCENT_GREEN),
+                defaults.minimum_grade.to_string(),
+                Style::default().fg(colors::ACCENT_YELLOW),
             ),
         ]),
         Line::from(vec![
             Span::styled("   ├─ AUR: ", Style::default().fg(colors::FG_MUTED)),
-            Span::styled("Allowed", Style::default().fg(colors::ACCENT_YELLOW)),
+            Span::styled(
+                if defaults.allow_aur {
+                    "Allowed"
+                } else {
+                    "Disabled"
+                },
+                Style::default().fg(colors::ACCENT_YELLOW),
+            ),
         ]),
         Line::from(vec![
             Span::styled("   └─ PGP: ", Style::default().fg(colors::FG_MUTED)),
-            Span::styled("Required", Style::default().fg(colors::ACCENT_GREEN)),
+            Span::styled(
+                if defaults.require_pgp {
+                    "Required"
+                } else {
+                    "Not required"
+                },
+                Style::default().fg(colors::FG_MUTED),
+            ),
         ]),
     ];
 
@@ -1412,6 +1452,39 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    #[cfg(unix)]
+    #[test]
+    fn unknown_coverage_keeps_findings_visible_without_claiming_secure() {
+        let mut app = app_on(Tab::Security);
+        app.status = Some(crate::daemon::protocol::StatusResult {
+            total_packages: 1,
+            explicit_packages: 1,
+            orphan_packages: 0,
+            updates_available: 0,
+            security_vulnerabilities: 17,
+            vulnerabilities_scanned: true,
+            security_unknown_packages: Some(1),
+            runtime_versions: vec![],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &app))
+            .expect("security tab");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("PARTIAL COVERAGE"));
+        assert!(text.contains("Findings: 17"));
+        assert!(text.contains("Unassessed: 1"));
+        assert!(!text.contains("SECURE"));
+        assert!(text.contains("COMMUNITY"));
+        assert!(text.contains("PGP: Not required"));
+    }
+
     fn app_on(tab: Tab) -> App {
         App::new_detached().with_tab(tab)
     }
@@ -1743,7 +1816,7 @@ mod tests {
             (Tab::Dashboard, "Usage Stats"),
             (Tab::Packages, "Type / to search packages"),
             (Tab::Runtimes, "Runtimes"),
-            (Tab::Security, "NOT SCANNED"),
+            (Tab::Security, "UNREPORTED"),
             (Tab::Activity, "Activity Log"),
             (Tab::Team, "Not in a team workspace"),
         ] {

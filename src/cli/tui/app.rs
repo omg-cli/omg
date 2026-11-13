@@ -487,9 +487,14 @@ impl App {
     }
 
     pub async fn run_security_audit() -> Result<usize> {
-        Ok(crate::cli::security::security_audit_result()
-            .await?
-            .total_vulnerabilities)
+        let audit = crate::cli::security::security_audit_result().await?;
+        if let Some(warning) = crate::cli::security::audit_coverage_warning(&audit.coverage) {
+            anyhow::bail!(
+                "{warning} Reported findings: {}",
+                audit.total_vulnerabilities
+            );
+        }
+        Ok(audit.total_vulnerabilities)
     }
 
     /// Whether pressing Enter should open the install-confirmation popup.
@@ -687,6 +692,17 @@ impl App {
             .status
             .as_ref()
             .and_then(crate::daemon::protocol::StatusResult::scanned_vulnerability_count);
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Findings and uncovered package counts from a reported daemon scan.
+    pub fn get_security_findings_summary(&self) -> Option<(usize, usize)> {
+        #[cfg(unix)]
+        return self
+            .status
+            .as_ref()
+            .and_then(StatusResult::scanned_vulnerability_summary);
         #[cfg(not(unix))]
         None
     }

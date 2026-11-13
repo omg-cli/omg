@@ -81,7 +81,17 @@ pub async fn install(packages: &[String], yes: bool, replacement_hops: u32) -> R
                 &vulnerability_scanner,
                 pkg,
                 &info.version,
-                false,
+                if info.repo.is_empty() {
+                    crate::package_managers::types::SecurityOrigin::Unknown
+                } else if policy.arch_advisory_repositories.contains(&info.repo) {
+                    crate::package_managers::types::SecurityOrigin::ArchRepository {
+                        repository: info.repo.clone(),
+                    }
+                } else {
+                    crate::package_managers::types::SecurityOrigin::OtherRepository {
+                        repository: info.repo.clone(),
+                    }
+                },
                 crate::core::security::policy::combined_license_expression(
                     info.licenses.iter().map(String::as_str),
                 )
@@ -594,7 +604,7 @@ async fn handle_aur_package(aur_pkg: crate::core::Package, yes: bool) -> Result<
         &vulnerability_scanner,
         &aur_pkg.name,
         &aur_pkg.version,
-        true,
+        crate::package_managers::types::SecurityOrigin::AurArchive,
         None,
     )
     .await?;
@@ -728,34 +738,63 @@ mod tests {
     }
 
     impl crate::core::security::vulnerability::VulnerabilitySource for FixtureSource {
-        fn scan_package<'a>(
+        fn assess_packages<'a>(
             &'a self,
-            name: &'a str,
-            version: &'a crate::package_managers::types::Version,
+            packages: &'a [crate::package_managers::types::SecurityPackage],
+            evidence_use: crate::core::security::vulnerability::AssessmentUse,
         ) -> Pin<
             Box<
                 dyn Future<
                         Output = std::result::Result<
-                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
                             crate::core::security::vulnerability::VulnerabilityError,
                         >,
                     > + Send
                     + 'a,
             >,
         > {
-            assert_eq!(name, "example");
-            assert_eq!(version.to_string(), "1.0-1");
+            assert_eq!(packages.len(), 1);
+            assert_eq!(packages[0].name, "example");
+            assert_eq!(packages[0].version, "1.0-1");
+            assert_eq!(
+                evidence_use,
+                crate::core::security::vulnerability::AssessmentUse::Admission
+            );
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
-                Ok(if self.vulnerable {
-                    vec![crate::core::security::vulnerability::VulnerabilityReport {
-                        id: "CVE-test".to_string(),
-                        summary: "known vulnerability".to_string(),
-                        score: None,
-                    }]
-                } else {
-                    Vec::new()
-                })
+                Ok(packages
+                    .iter()
+                    .cloned()
+                    .map(|package| {
+                        let findings = if self.vulnerable {
+                            vec![crate::core::security::scan::Vulnerability {
+                                id: "CVE-test".into(),
+                                summary: "known vulnerability".into(),
+                                score: None,
+                                advisory_severity: None,
+                                native_advisory: None,
+                                applicability:
+                                    crate::core::security::scan::FindingApplicability::Applicable,
+                                affected_installed: vec![
+                                    crate::core::security::scan::InstalledIdentity::from(&package),
+                                ],
+                            }]
+                        } else {
+                            Vec::new()
+                        };
+                        crate::core::security::vulnerability::PackageAssessment {
+                            package,
+                            coverage:
+                                crate::core::security::vulnerability::PackageCoverage::Assessed {
+                                    provenance:
+                                        crate::core::security::scan::AdvisoryProvenance::Osv {
+                                            ecosystem: "fixture".into(),
+                                        },
+                                },
+                            findings,
+                        }
+                    })
+                    .collect())
             })
         }
     }
@@ -768,7 +807,10 @@ mod tests {
             return;
         }
         temp_env::with_var_unset("OMG_TEST_MODE", || {
-            let policy = crate::core::security::SecurityPolicy::default();
+            let policy = crate::core::security::SecurityPolicy {
+                advisory_requirement: crate::core::security::policy::AdvisoryRequirement::Review,
+                ..crate::core::security::SecurityPolicy::default()
+            };
             let version = crate::package_managers::parse_version_or_zero("1.0-1");
             let scanner = FixtureSource {
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -784,7 +826,9 @@ mod tests {
                     &scanner,
                     "example",
                     &version,
-                    false,
+                    crate::package_managers::types::SecurityOrigin::OtherRepository {
+                        repository: "fixture".into(),
+                    },
                     Some("MIT"),
                 ))
                 .expect_err("vulnerable packages must be below the default Community grade");
@@ -810,7 +854,9 @@ mod tests {
                     &clean_scanner,
                     "example",
                     &version,
-                    false,
+                    crate::package_managers::types::SecurityOrigin::OtherRepository {
+                        repository: "fixture".into(),
+                    },
                     Some("MIT"),
                 ))
                 .expect("clean official package must be accepted");

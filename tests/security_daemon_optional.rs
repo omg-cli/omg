@@ -20,6 +20,8 @@ fn audit_policy_reports_configuration_and_rejects_corruption_without_rewriting_i
         require_pgp: true,
         allowed_licenses: vec!["MIT".to_owned()],
         banned_packages: vec!["fixture-banned-package".to_owned()],
+        advisory_requirement: omg_lib::core::security::policy::AdvisoryRequirement::Review,
+        ..SecurityPolicy::default()
     };
     let original = toml::to_string(&policy)?;
     std::fs::write(&path, &original)?;

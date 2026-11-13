@@ -146,10 +146,15 @@ impl PackageManager for ArchPackageManager {
             use anyhow::Context;
             async {
                 let mut before = self.security_inventory().await?;
-                let advisories = crate::core::security::vulnerability::VulnerabilityScanner::new()
-                    .fetch_alsa_issues()
+                let operation = crate::core::security::vulnerability::VulnerabilityScanner::new()
+                    .assess_arch_operation(
+                        &before,
+                        crate::core::security::vulnerability::AssessmentUse::Admission,
+                    )
                     .await?;
-                let result = super::arch_advisory::audit_result(&before, &advisories)?;
+                let result = crate::core::security::scan::SecurityAuditResult::from_assessments(
+                    operation.assessments().to_vec(),
+                );
                 let mut after = self.security_inventory().await?;
                 let identity = |package: &super::types::SecurityPackage| {
                     (
@@ -164,6 +169,7 @@ impl PackageManager for ArchPackageManager {
                     before == after,
                     "Installed packages changed during native security audit"
                 );
+                operation.validate_now()?;
                 Ok(result)
             }
             .await

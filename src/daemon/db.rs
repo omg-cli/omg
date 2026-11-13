@@ -138,6 +138,7 @@ mod tests {
             updates_available: 2,
             security_vulnerabilities: 3,
             vulnerabilities_scanned: true,
+            security_unknown_packages: Some(0),
             runtime_versions: Vec::new(),
         }
     }

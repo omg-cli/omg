@@ -43,6 +43,7 @@ pub trait PackageManager: Send + Sync {
                 .await?
                 .into_iter()
                 .map(|package| super::types::SecurityPackage {
+                    origin: crate::package_managers::types::SecurityOrigin::Unknown,
                     name: package.name,
                     version: package.version.to_string(),
                     advisory_source: None,

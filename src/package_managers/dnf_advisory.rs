@@ -125,6 +125,7 @@ pub(super) fn audit_result(
             _ => AdvisorySeverity::Unspecified,
         };
         let finding = Vulnerability {
+            applicability: crate::core::security::scan::FindingApplicability::Applicable,
             affected_installed: Vec::new(),
             id: row.name,
             summary: detail.title,
@@ -154,6 +155,7 @@ pub(super) fn audit_result(
         findings.sort_by(|left, right| left.id.cmp(&right.id));
     }
     Ok(SecurityAuditResult {
+        coverage: crate::core::security::scan::AuditCoverage::Unreported,
         total_vulnerabilities,
         high_severity,
         vulnerabilities: packages.into_iter().collect(),

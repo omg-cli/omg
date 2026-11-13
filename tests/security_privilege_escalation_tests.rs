@@ -1927,6 +1927,8 @@ mod attack_scenarios {
             require_pgp: true,
             allowed_licenses: vec!["MIT".to_string(), "Apache-2.0".to_string()],
             banned_packages: vec!["telnet".to_string(), "ftp".to_string()],
+            advisory_requirement: omg_lib::core::security::policy::AdvisoryRequirement::Review,
+            ..SecurityPolicy::default()
         };
 
         // Banned package

@@ -4,7 +4,7 @@ use crate::core::security::{
     SecurityPolicy,
     vulnerability::{VulnerabilityScanner, VulnerabilitySource},
 };
-use crate::package_managers::types::UpdateInfo;
+use crate::package_managers::types::{SecurityOrigin, SecurityPackage, UpdateInfo};
 use crate::package_managers::{PackageManager, VersionDisplay};
 use anyhow::Context;
 use anyhow::Result;
@@ -39,6 +39,61 @@ impl PackageService {
         Ok(())
     }
 
+    async fn check_candidate(
+        &self,
+        policy: &SecurityPolicy,
+        package: SecurityPackage,
+    ) -> Result<()> {
+        use crate::core::security::policy::AdvisoryRequirement;
+        use crate::core::security::vulnerability::{
+            AssessmentUse, PackageAssessment, UnknownCoverage, validate_assessment_inventory,
+        };
+        let packages = [package];
+        let prepared_arch_admission = policy.advisory_requirement
+            == AdvisoryRequirement::FreshSnapshot
+            && cfg!(feature = "arch")
+            && self.backend.name() == "pacman";
+        let assessments = if policy.advisory_requirement == AdvisoryRequirement::Optional
+            || prepared_arch_admission
+        {
+            vec![PackageAssessment::unknown(
+                packages[0].clone(),
+                UnknownCoverage::NotRequested,
+            )]
+        } else {
+            self.vulnerability_source
+                .assess_packages(&packages, AssessmentUse::Admission)
+                .await?
+        };
+        validate_assessment_inventory(&packages, &assessments)?;
+        if prepared_arch_admission {
+            policy.check_sources_and_findings(&assessments)?;
+        } else {
+            policy.check_assessments(&assessments)?;
+        }
+        Ok(())
+    }
+
+    fn repository_origin(&self, repository: &str) -> SecurityOrigin {
+        if repository.eq_ignore_ascii_case("aur") {
+            SecurityOrigin::AurArchive
+        } else if repository.is_empty() {
+            SecurityOrigin::Unknown
+        } else if self.backend.name() == "pacman" {
+            if self.policy.arch_advisory_repositories.contains(repository) {
+                SecurityOrigin::ArchRepository {
+                    repository: repository.to_owned(),
+                }
+            } else {
+                SecurityOrigin::OtherRepository {
+                    repository: repository.to_owned(),
+                }
+            }
+        } else {
+            SecurityOrigin::DistributionPackage
+        }
+    }
+
     /// Search for packages
     pub async fn search(&self, query: &str) -> Result<Vec<Package>> {
         let results = self.backend.search(query).await?;
@@ -69,17 +124,19 @@ impl PackageService {
                     crate::package_managers::alpm_ops::load_local_package_metadata(&path)
                 })
                 .await??;
-                let grade = self
-                    .policy
-                    .assign_grade(
-                        self.vulnerability_source.as_ref(),
-                        &local.name,
-                        &local.version,
-                        false,
-                    )
-                    .await?;
-                self.policy
-                    .check_package(&local.name, false, local.license.as_deref(), grade)?;
+                self.check_candidate(
+                    &self.policy,
+                    SecurityPackage {
+                        origin: SecurityOrigin::LocalArchive,
+                        name: local.name.clone(),
+                        version: local.version.version_string(),
+                        advisory_source: None,
+                        architecture: None,
+                        description: String::new(),
+                        licenses: local.license.iter().cloned().collect(),
+                    },
+                )
+                .await?;
                 metadata.insert(package.clone(), local);
             }
             metadata
@@ -105,16 +162,19 @@ impl PackageService {
                 // Check if it's in official repos. Repository lookup errors
                 // are distinct from a package not being present.
                 if let Some(info) = self.backend.info(pkg).await? {
-                    let grade = self
-                        .policy
-                        .assign_grade(
-                            self.vulnerability_source.as_ref(),
-                            &info.name,
-                            &info.version,
-                            true,
-                        )
-                        .await?;
-                    self.policy.check_package(&info.name, false, None, grade)?;
+                    self.check_candidate(
+                        &self.policy,
+                        SecurityPackage {
+                            origin: SecurityOrigin::Unknown,
+                            name: info.name.clone(),
+                            version: info.version.version_string(),
+                            advisory_source: None,
+                            architecture: None,
+                            description: info.description.clone(),
+                            licenses: Vec::new(),
+                        },
+                    )
+                    .await?;
 
                     official.push(pkg.clone());
                     changes.push(PackageChange {
@@ -124,16 +184,19 @@ impl PackageService {
                         source: "official".to_string(),
                     });
                 } else if let Some(info) = aur.info(pkg).await? {
-                    let grade = self
-                        .policy
-                        .assign_grade(
-                            self.vulnerability_source.as_ref(),
-                            &info.name,
-                            &info.version,
-                            false,
-                        )
-                        .await?;
-                    self.policy.check_package(&info.name, true, None, grade)?;
+                    self.check_candidate(
+                        &self.policy,
+                        SecurityPackage {
+                            origin: SecurityOrigin::AurArchive,
+                            name: info.name.clone(),
+                            version: info.version.version_string(),
+                            advisory_source: None,
+                            architecture: None,
+                            description: info.description.clone(),
+                            licenses: Vec::new(),
+                        },
+                    )
+                    .await?;
 
                     aur_pkgs.push(pkg.clone());
                     changes.push(PackageChange {
@@ -177,16 +240,25 @@ impl PackageService {
             let Some(info) = self.backend.info(pkg).await? else {
                 anyhow::bail!("Package not found: {pkg}");
             };
-            let grade = self
-                .policy
-                .assign_grade(
-                    self.vulnerability_source.as_ref(),
-                    &info.name,
-                    &info.version,
-                    true,
-                )
-                .await?;
-            self.policy.check_package(&info.name, false, None, grade)?;
+            self.check_candidate(
+                &self.policy,
+                SecurityPackage {
+                    origin: if info.source == crate::core::PackageSource::Aur {
+                        SecurityOrigin::AurArchive
+                    } else if matches!(self.backend.name(), "apt" | "apt-pure" | "dnf" | "dnf5") {
+                        SecurityOrigin::DistributionPackage
+                    } else {
+                        SecurityOrigin::Unknown
+                    },
+                    name: info.name.clone(),
+                    version: info.version.version_string(),
+                    advisory_source: None,
+                    architecture: None,
+                    description: info.description.clone(),
+                    licenses: Vec::new(),
+                },
+            )
+            .await?;
 
             changes.push(PackageChange {
                 name: info.name,
@@ -252,29 +324,24 @@ impl PackageService {
         self.backend.sync().await?;
         let updates = self.list_updates().await?;
         for up in &updates {
-            let community = up.repo.eq_ignore_ascii_case("aur");
             let version = crate::package_managers::parse_version(&up.new_version)
                 .context("Invalid update version")?;
-            // Grades need vulnerability evidence only when an explicit policy
-            // can act on them; the default policy allows every grade, so the
-            // optional OSV source must never gate a plain update.
-            let grade = if crate::core::security::policy::explicit_policy_exists() {
-                self.policy
-                    .assign_grade(
-                        self.vulnerability_source.as_ref(),
-                        &up.name,
-                        &version,
-                        !community,
-                    )
-                    .await?
-            } else {
-                crate::core::security::SecurityGrade::Verified
-            };
-            // UpdateInfo has no licenses. Enforce those using the actual
-            // prepared packages in the privileged backend, including dependencies.
+            // License metadata is checked on the prepared transaction.
             let mut candidate_policy = self.policy.clone();
             candidate_policy.allowed_licenses.clear();
-            candidate_policy.check_package(&up.name, community, None, grade)?;
+            self.check_candidate(
+                &candidate_policy,
+                SecurityPackage {
+                    origin: self.repository_origin(&up.repo),
+                    name: up.name.clone(),
+                    version: version.version_string(),
+                    advisory_source: None,
+                    architecture: None,
+                    description: String::new(),
+                    licenses: Vec::new(),
+                },
+            )
+            .await?;
 
             changes.push(PackageChange {
                 name: up.name.clone(),
@@ -486,22 +553,40 @@ mod tests {
     struct CleanVulnerabilitySource;
 
     impl VulnerabilitySource for CleanVulnerabilitySource {
-        fn scan_package<'a>(
+        fn assess_packages<'a>(
             &'a self,
-            _name: &'a str,
-            _version: &'a crate::package_managers::types::Version,
+            packages: &'a [SecurityPackage],
+            _evidence_use: crate::core::security::vulnerability::AssessmentUse,
         ) -> Pin<
             Box<
                 dyn Future<
                         Output = Result<
-                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
                             crate::core::security::vulnerability::VulnerabilityError,
                         >,
                     > + Send
                     + 'a,
             >,
         > {
-            Box::pin(async { Ok(Vec::new()) })
+            Box::pin(async move {
+                Ok(packages
+                    .iter()
+                    .cloned()
+                    .map(
+                        |package| crate::core::security::vulnerability::PackageAssessment {
+                            package,
+                            coverage:
+                                crate::core::security::vulnerability::PackageCoverage::Assessed {
+                                    provenance:
+                                        crate::core::security::scan::AdvisoryProvenance::Osv {
+                                            ecosystem: "fixture".into(),
+                                        },
+                                },
+                            findings: Vec::new(),
+                        },
+                    )
+                    .collect())
+            })
         }
     }
 
@@ -765,6 +850,62 @@ mod tests {
             .await
             .expect_err("history persistence failure must be returned");
         assert!(error.to_string().contains("history"));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn coverage17_optional_policy_never_queries_and_review_rejects_missing_subjects()
+    -> Result<()> {
+        struct MissingSubjects;
+        impl VulnerabilitySource for MissingSubjects {
+            fn assess_packages<'a>(
+                &'a self,
+                _packages: &'a [SecurityPackage],
+                _evidence_use: crate::core::security::vulnerability::AssessmentUse,
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<
+                                Vec<crate::core::security::vulnerability::PackageAssessment>,
+                                crate::core::security::vulnerability::VulnerabilityError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+        let backend = Arc::new(crate::core::testing::TestPackageManager::new());
+        let service = PackageService::builder(backend)
+            .policy(SecurityPolicy::default())
+            .vulnerability_source(Arc::new(MissingSubjects))
+            .without_history()
+            .build()?;
+        let package = SecurityPackage {
+            origin: SecurityOrigin::Unknown,
+            name: "fixture".into(),
+            version: "1".into(),
+            advisory_source: None,
+            architecture: None,
+            description: String::new(),
+            licenses: Vec::new(),
+        };
+        service
+            .check_candidate(&service.policy, package.clone())
+            .await?;
+        let mut review = service.policy.clone();
+        review.advisory_requirement = crate::core::security::policy::AdvisoryRequirement::Review;
+        let error = service
+            .check_candidate(&review, package.clone())
+            .await
+            .expect_err("review requires an assessment for every subject");
+        assert!(error.to_string().contains("inventory differs"), "{error:#}");
+        let mut verified = service.policy.clone();
+        verified.minimum_grade = crate::core::security::SecurityGrade::Verified;
+        assert!(
+            service.check_candidate(&verified, package).await.is_err(),
+            "unknown advisory origin cannot fabricate a Verified source grade"
+        );
         Ok(())
     }
 }

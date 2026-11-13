@@ -119,6 +119,15 @@ govern packages installed through yay, Aura or direct pacman commands. To refuse
 AUR entirely, set `allow_aur = false` in your OMG `policy.toml`; see
 [security](./security.md).
 
+Advisory admission is a separate policy control. The hardened build profile does
+not silently enable network access or change its offline build contract. To add
+fresh final Arch advisory checks, select `advisory_requirement = "fresh_snapshot"`
+and declare the applicable repository scopes in `policy.toml`; see
+[security policy](./security.md#security-policy). AUR artifacts still have Unknown
+distribution-advisory applicability. The privileged operation requires attended
+confirmation of that gap for the exact final archive batch. That confirmation
+is an exception to missing coverage, not a claim that the recipe was vetted.
+
 Both profiles check each built archive against its MTREE inventory using the
 official Rust ALPM parser. Paths, file types, permissions, regular-file sizes
 and symlink targets must agree with the archive. Before installation, OMG checks
