@@ -1066,3 +1066,14 @@ completed hosted Arch, workflow and full instrumented jobs passed; strict added
 file coverage comparison remains the outstanding gate. No coverage acceptance
 rule was relaxed. These fixture-only changes preserve every Rust and Cargo input
 of the verified 0584c726 install bundle.
+
+The missing-runtime-directory batch passed all 17 Omarchy guest scenarios. With
+`XDG_RUNTIME_DIR` absent, the actual CLI completed the signed update using a
+private `/tmp` coordination lock. A foreign-owned writable lock was refused
+without changing its inode, ownership, mode, payload or the preceding transcript.
+The fixture checks released leases through a read-only descriptor, preserving
+Linux sticky-directory protections. The producer and exporter checks passed 30
+and 16 tests. The current merged local report reaches all 234 instrumented
+Omarchy functions and 3408/3500 lines; this does not establish full branch or
+line coverage, and strict source comparison remains open. Rust and Cargo inputs
+still match the verified 0584c726 bundle.
