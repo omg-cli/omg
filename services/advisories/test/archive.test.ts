@@ -1,4 +1,5 @@
 import { test, expect } from "bun:test";
+import { crc32, deflateRawSync } from "node:zlib";
 import { parseBatch } from "../src/ingestion";
 import { scanArchive, fileHash, type ArchiveState } from "../scripts/archive";
 const encodeBatch = (records: string[]) => JSON.stringify({source: "cve", records});
@@ -123,28 +124,34 @@ test("archive mutation after verification cannot change the bytes being parsed",
     }
 });
 function storedZip(records: string[]): Buffer {
+    return zipEntries(records.map((raw, index) => ({name: `cves/2026/1xxx/CVE-2026-${1234 + index}.json`, data: Buffer.from(raw)})));
+}
+function zipEntries(entries: {name: string; data: Buffer; deflate?: boolean; checksum?: number; declaredSize?: number}[]): Buffer {
     const files: Buffer[] = [];
     const directory: Buffer[] = [];
     let offset = 0;
-    for (const [index, raw] of records.entries()) {
-        const name = Buffer.from(`cves/2026/1xxx/CVE-2026-${1234 + index}.json`);
-        const data = Buffer.from(raw);
-        const checksum = Bun.hash.crc32(data);
+    for (const entry of entries) {
+        const name = Buffer.from(entry.name);
+        const data = entry.deflate ? deflateRawSync(entry.data) : entry.data;
+        const checksum = entry.checksum ?? crc32(entry.data);
+        const method = entry.deflate ? 8 : 0;
         const local = Buffer.alloc(30);
         local.writeUInt32LE(0x04034b50, 0);
         local.writeUInt16LE(20, 4);
+        local.writeUInt16LE(method, 8);
         local.writeUInt32LE(checksum, 14);
         local.writeUInt32LE(data.length, 18);
-        local.writeUInt32LE(data.length, 22);
+        local.writeUInt32LE(entry.declaredSize ?? entry.data.length, 22);
         local.writeUInt16LE(name.length, 26);
         files.push(local, name, data);
         const central = Buffer.alloc(46);
         central.writeUInt32LE(0x02014b50, 0);
         central.writeUInt16LE(20, 4);
         central.writeUInt16LE(20, 6);
+        central.writeUInt16LE(method, 10);
         central.writeUInt32LE(checksum, 16);
         central.writeUInt32LE(data.length, 20);
-        central.writeUInt32LE(data.length, 24);
+        central.writeUInt32LE(entry.declaredSize ?? entry.data.length, 24);
         central.writeUInt16LE(name.length, 28);
         central.writeUInt32LE(offset, 42);
         directory.push(central, name);
@@ -153,8 +160,8 @@ function storedZip(records: string[]): Buffer {
     const central = Buffer.concat(directory);
     const end = Buffer.alloc(22);
     end.writeUInt32LE(0x06054b50, 0);
-    end.writeUInt16LE(records.length, 8);
-    end.writeUInt16LE(records.length, 10);
+    end.writeUInt16LE(entries.length, 8);
+    end.writeUInt16LE(entries.length, 10);
     end.writeUInt32LE(central.length, 12);
     end.writeUInt32LE(offset, 16);
     return Buffer.concat([...files, central, end]);
@@ -201,4 +208,71 @@ test("archive batches budget the complete bound POST envelope at the byte limit"
     } finally {
         await rm(directory, {recursive: true, force: true});
     }
+});
+
+
+test("publisher cves.zip wrapper resumes the inner corpus under the outer digest", async () => {
+    const {mkdtemp, readFile, writeFile, rm} = await import("node:fs/promises");
+    const {tmpdir} = await import("node:os");
+    const {join} = await import("node:path");
+    const directory = await mkdtemp(join(tmpdir(), "advisory-nested-test-"));
+    try {
+        const inner = await readFile(path);
+        for (const deflate of [false, true]) {
+            const archive = join(directory, "publisher.zip.zip");
+            await writeFile(archive, zipEntries([{name: "cves.zip", data: inner, deflate}]));
+            const digest = await fileHash(archive);
+            const state: ArchiveState = {digest, next_entry: 0, accepted: 0, exhausted: false, finished_at: null};
+            const received: string[] = [];
+            const options = {path: archive, digest, state, maxRecords: 1, encodeBatch,
+                send: async (body: string) => { received.push(...parseBatch(JSON.parse(body))); }, save: async () => {},
+        };
+        expect(await scanArchive(options)).toEqual({sent: 1, exhausted: false});
+        expect(state.digest).toBe(digest);
+        expect(await scanArchive({...options, maxRecords: 4})).toEqual({sent: 2, exhausted: true});
+        expect(state.accepted).toBe(3);
+        expect(new Set(received).size).toBe(3);
+        expect(await scanArchive({...options, maxRecords: 4})).toEqual({sent: 0, exhausted: true});
+        }
+    } finally { await rm(directory, {recursive: true, force: true}); }
+});
+
+test("archive wrappers reject corrupt, mixed, recursive and empty corpora without completion", async () => {
+    const {mkdtemp, readFile, writeFile, rm} = await import("node:fs/promises");
+    const {tmpdir} = await import("node:os");
+    const {join} = await import("node:path");
+    const directory = await mkdtemp(join(tmpdir(), "advisory-invalid-wrapper-test-"));
+    try {
+        const inner = await readFile(path);
+        const validWrapper = zipEntries([{name: "cves.zip", data: inner, deflate: true}]);
+        const cases = [
+            {name: "crc", data: zipEntries([{name: "cves.zip", data: inner, deflate: true, checksum: (crc32(inner) ^ 1) >>> 0}]), error: "checksum"},
+            {name: "mixed", data: zipEntries([{name: "cves.zip", data: inner}, {name: "README", data: Buffer.from("mixed")}]), error: "wrapper"},
+            {name: "recursive", data: zipEntries([{name: "cves.zip", data: validWrapper, deflate: true}]), error: "wrapper"},
+            {name: "oversize", data: zipEntries([{name: "cves.zip", data: inner, deflate: true, declaredSize: 2 * 1024 ** 3}]), error: "oversize"},
+            {name: "ratio", data: zipEntries([{name: "cves.zip", data: Buffer.alloc(512 * 1024), deflate: true}]), error: "oversize"},
+            {name: "empty", data: zipEntries([{name: "README", data: Buffer.from("no records")}]), error: "no CVE records"},
+        ];
+        for (const fixture of cases) {
+            const archive = join(directory, fixture.name + ".zip");
+            await writeFile(archive, fixture.data);
+            const digest = await fileHash(archive);
+            const state: ArchiveState = {digest, next_entry: 0, accepted: 0, exhausted: false, finished_at: null};
+            let sends = 0;
+            await expect(scanArchive({path: archive, digest, state, maxRecords: 10, encodeBatch,
+                send: async () => { sends++; }, save: async () => {},
+            })).rejects.toThrow(fixture.error);
+            expect(sends).toBe(0);
+            expect(state.exhausted).toBe(false);
+            expect(state.finished_at).toBeNull();
+            if (fixture.name === "mixed") {
+                state.next_entry = 2;
+                state.accepted = 1;
+                await expect(scanArchive({path: archive, digest, state, maxRecords: 10, encodeBatch,
+                    send: async () => { sends++; }, save: async () => {},
+                })).rejects.toThrow("wrapper");
+                expect(sends).toBe(0);
+            }
+        }
+    } finally { await rm(directory, {recursive: true, force: true}); }
 });

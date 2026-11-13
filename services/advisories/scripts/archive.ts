@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { createHash } from "node:crypto";
+import { crc32 } from "node:zlib";
 import { stat, mkdtemp, open, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +26,43 @@ export async function fileHash(path: string) {
         hash.update(chunk);
     }
     return hash.digest("hex");
+}
+async function corpusArchive(snapshot: string, directory: string): Promise<string> {
+    const outer = await openPromise(snapshot, {
+        lazyEntries: true, autoClose: false, strictFileNames: true, validateEntrySizes: true,
+    });
+    try {
+        if (outer.entryCount !== 1) return snapshot;
+        for await (const entry of outer.eachEntry()) {
+            if (entry.fileName !== "cves.zip") return snapshot;
+            if (
+                entry.uncompressedSize > 1024 ** 3 ||
+                entry.uncompressedSize / Math.max(1, entry.compressedSize) > 500 ||
+                (entry.generalPurposeBitFlag & 1) !== 0 ||
+                ![0, 8].includes(entry.compressionMethod)
+            ) throw new Error("invalid or oversize CVE archive wrapper");
+            const inner = join(directory, "corpus.zip");
+            const output = await open(inner, "wx", 0o600);
+            try {
+                const stream = await outer.openReadStreamPromise(entry);
+                let bytes = 0;
+                let checksum = 0;
+                try {
+                    for await (const chunk of stream) {
+                        const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                        bytes += data.length;
+                        if (bytes > 1024 ** 3) throw new Error("archive wrapper expansion exceeds budget");
+                        checksum = crc32(data, checksum);
+                        await output.writeFile(data);
+                    }
+                } finally { stream.destroy(); }
+                if (bytes !== entry.uncompressedSize || checksum !== entry.crc32)
+                    throw new Error("archive wrapper size or checksum mismatch");
+            } finally { await output.close(); }
+            return inner;
+        }
+        return snapshot;
+    } finally { outer.close(); }
 }
 export async function scanArchive(options: {
     path: string;
@@ -55,13 +93,14 @@ export async function scanArchive(options: {
             await output.close();
         }
         if (await fileHash(snapshot) !== options.digest) throw new Error("archive digest mismatch");
-        const zip = await openPromise(snapshot, {
+        const zip = await openPromise(await corpusArchive(snapshot, directory), {
             lazyEntries: true,
             strictFileNames: true,
             validateEntrySizes: true,
         });
         let index = 0;
         let scanned = 0;
+        let corpusRecords = 0;
         let expanded = 0;
         let sent = 0;
         let pending: string[] = [];
@@ -86,7 +125,8 @@ export async function scanArchive(options: {
                 scanned++;
                 if (scanned > 1_000_000)
                     throw new Error("too many archive entries");
-                if (current < options.state.next_entry) continue;
+                if (entry.fileName === "cves.zip")
+                    throw new Error("CVE archive wrapper must be sole and single-level");
                 if (entry.fileName.endsWith("/")) continue;
                 const match =
                     /(?:^|\/)cves\/(\d{4})\/([0-9]+xxx)\/(CVE-\d{4}-\d{4,19})\.json$/.exec(
@@ -97,6 +137,8 @@ export async function scanArchive(options: {
                         throw new Error("unexpected CVE record path");
                     continue;
                 }
+                corpusRecords++;
+                if (current < options.state.next_entry) continue;
                 if (sent + pending.length >= options.maxRecords) {
                     stop = true;
                     break;
@@ -152,6 +194,7 @@ export async function scanArchive(options: {
             }
             await flush();
             if (!stop) {
+                if (corpusRecords === 0) throw new Error("archive contains no CVE records");
                 options.state.next_entry = index;
                 options.state.exhausted = true;
                 options.state.finished_at = new Date().toISOString();

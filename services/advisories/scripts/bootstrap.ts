@@ -146,6 +146,7 @@ async function run() {
             Number(saved.next_entry) < 0 || Number(saved.next_entry) > 1_000_000 ||
             Number(saved.accepted) < 0 || Number(saved.accepted) > 1_000_000 ||
             typeof saved.exhausted !== "boolean" ||
+            (saved.exhausted && saved.accepted === 0) ||
             !(
                 saved.finished_at === null ||
                 typeof saved.finished_at === "string"
