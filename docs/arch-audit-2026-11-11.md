@@ -1286,6 +1286,24 @@ and disposable-guest verification of this new runtime remain pending.
 Final normal verification passed the same 2414 library tests, 32 CLI tests,
 three Clippy lanes and binary builds after the source-absence correction.
 The exact-source receipt is `omarchy-native27-coherent-green2-receipt.json`.
-All 46 executed checks on published head 1b1bd6f0 pass except the separate
-strict comparison gate (one failure; 27 intentional skips). Release and actual
+Published head 1b1bd6f0 has 46 successful checks, one failing strict
+comparison gate and 27 intentional skips. Release and actual
 guest acceptance of this new Rust runtime are still required.
+
+The exact committed 10e61a6e runtime also passed the normal optimized pair build
+and actual KVM acceptance in 171.782 seconds: full signed native update and
+user-manager reexecution, all six refusal controls, 25 Omarchy scenarios, three
+attended terminal interactions and both normal Arch read-only commands. No
+forbidden package helper executed; the protected guest database, prepared
+images and compiled source hashes were unchanged, and shutdown was clean.
+The signed guest receipt SHA-256 is
+`17ceca3fca921e25e4c1fe957329ccb028e886fbbe3f3632cd34b6249ff234e5`.
+
+The replacement local candidate bundle is
+`omg-pr1057-10e61a6e-x86_64-arch.tar.gz` (19,614,899 bytes), SHA-256
+`637d66331f70abfe13c2accb1c77c9f57a6dbe36187dffb56aa4ca7ea6004843`.
+It contains CLI/daemon together, binary checksums and an exact-source
+verification receipt. Both archived binary hashes were independently checked
+against the optimized build and guest receipts. Host installation was not
+changed. This proves the candidate runtime, not full coverage or completion of
+the broader Arch/AUR/Cloudflare security audit.
