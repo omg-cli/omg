@@ -221,6 +221,8 @@ pub struct LocalDbPackage {
     pub version: Version,
     pub desc: String,
     pub install_date: String,
+    pub url: Option<String>,
+    pub size: u64,
     pub licenses: Vec<String>,
     #[serde(default)]
     pub groups: Vec<String>,
@@ -246,6 +248,8 @@ impl Default for LocalDbPackage {
             version: super::super::types::zero_version(),
             desc: String::new(),
             install_date: String::new(),
+            url: None,
+            size: 0,
             licenses: Vec::new(),
             groups: Vec::new(),
             explicit: false,
@@ -994,6 +998,8 @@ fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
         version: require_package_version(&desc.version.to_string())?,
         desc: desc.description.to_string(),
         install_date: desc.installdate.to_string(),
+        url: desc.url.as_ref().map(ToString::to_string),
+        size: desc.size,
         licenses: desc.license.iter().map(ToString::to_string).collect(),
         groups: desc.groups.iter().map(ToString::to_string).collect(),
         explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
@@ -1008,6 +1014,8 @@ fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
     let mut version = String::new();
     let mut desc = String::new();
     let mut install_date = String::new();
+    let mut url = None;
+    let mut size = 0;
     let mut reason = String::new();
     let mut licenses = Vec::new();
     let mut groups = Vec::new();
@@ -1033,6 +1041,10 @@ fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
             Some("%VERSION%") => version = line.to_string(),
             Some("%DESC%") => desc = line.to_string(),
             Some("%INSTALLDATE%") => install_date = line.to_string(),
+            Some("%URL%") => url = Some(line.to_string()),
+            Some("%SIZE%") => {
+                size = line.parse().context("Invalid %SIZE% value in local desc")?;
+            }
             Some("%REASON%") => reason = line.to_string(),
             Some("%LICENSE%") => licenses.push(line.to_string()),
             Some("%GROUPS%") => groups.push(line.to_string()),
@@ -1060,6 +1072,8 @@ fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
         version: require_package_version(&version)?,
         desc,
         install_date,
+        url,
+        size,
         licenses,
         groups,
         explicit,
@@ -1331,8 +1345,8 @@ fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
 /// Ensure local cache is loaded (fast if already loaded)
 fn ensure_local_cache_loaded(local_dir: &Path) -> Result<()> {
     let current_epoch = LocalDbEpoch::from_local_dir(local_dir)?;
-    // v3 retains installed groups for IgnoreGroup filtering.
-    ensure_cache_loaded(&LOCAL_DB_CACHE, "local_db_source_v3", current_epoch, || {
+    // v4 also retains URL and installed size for Rust package-info queries.
+    ensure_cache_loaded(&LOCAL_DB_CACHE, "local_db_source_v4", current_epoch, || {
         let packages = parse_local_db(local_dir)?;
         #[cfg(test)]
         AFTER_LOCAL_PARSE.with(|hook| {
@@ -1576,6 +1590,7 @@ fn invalidate_derived_cache_files(cache_dir: &Path) -> Result<()> {
     for name in [
         "sync_db_source_v3",
         "sync_db_source_v2",
+        "local_db_source_v4",
         "local_db_source_v3",
         "local_db_source_v2",
         "sync_db_source_v1",
@@ -1738,6 +1753,47 @@ fn package_is_ignored(
     ignored_groups: &PacmanPatterns,
 ) -> bool {
     ignored_packages.is_match(name) || groups.iter().any(|group| ignored_groups.is_match(group))
+}
+
+/// Read installed package-info from its source, without trusting derived caches.
+pub(crate) fn read_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
+    let local_dir = paths::pacman_local_dir_result()?;
+    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
+    let entries = match fs::read_dir(&local_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("Failed to read local package database"),
+    };
+    let prefix = format!("{name}-");
+    let mut package = None;
+    for entry in entries.into_iter().flatten() {
+        let entry = entry.context("Failed to enumerate local package database")?;
+        if !entry.file_name().as_bytes().starts_with(prefix.as_bytes()) {
+            continue;
+        }
+        let metadata = entry
+            .file_type()
+            .context("Failed to inspect local package entry")?;
+        anyhow::ensure!(
+            !metadata.is_symlink(),
+            "Local package entry must not be a symlink"
+        );
+        if !metadata.is_dir() {
+            continue;
+        }
+        let desc = entry.path().join("desc");
+        let parsed = parse_local_desc(&desc)
+            .with_context(|| format!("Incomplete local package entry {}", desc.display()))?;
+        if parsed.name == name {
+            anyhow::ensure!(package.is_none(), "Duplicate local package name {name}");
+            package = Some(parsed);
+        }
+    }
+    anyhow::ensure!(
+        epoch == LocalDbEpoch::from_local_dir(&local_dir)?,
+        "Local package database changed while querying; retry the operation"
+    );
+    Ok(package)
 }
 
 /// Get a specific local package - FAST (<1ms)
@@ -2395,6 +2451,45 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn installed_info_uses_source_metadata_instead_of_derived_cache() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::installed_info_uses_source_metadata_instead_of_derived_cache",
+            "",
+            |db| {
+                fs::write(
+                    db.join("local/widget-1/desc"),
+                    "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%DESC%\nsource description\n\n",
+                )
+                .unwrap();
+                assert_eq!(
+                    get_local_package("widget").unwrap().unwrap().desc,
+                    "source description"
+                );
+                write_lock(&LOCAL_DB_CACHE)
+                    .packages
+                    .get_mut("widget")
+                    .unwrap()
+                    .desc = "untrusted derived metadata".to_owned();
+                let info = crate::package_managers::alpm_direct::get_package_info("widget")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(info.description, "source description");
+                save_cache_to_disk(&*read_lock(&LOCAL_DB_CACHE), "local_db_source_v4").unwrap();
+                *write_lock(&LOCAL_DB_CACHE) = LocalDbCache::default();
+                assert_eq!(
+                    get_local_package("widget").unwrap().unwrap().desc,
+                    "untrusted derived metadata"
+                );
+                let info = crate::package_managers::alpm_direct::get_package_info("widget")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(info.description, "source description");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn cached_updates_preserve_installed_ignore_groups_across_disk_reuse() {
         batch2_catalog_fixture(
             "package_managers::pacman_db::db::tests::cached_updates_preserve_installed_ignore_groups_across_disk_reuse",
@@ -2460,7 +2555,7 @@ mod tests {
                     "old cache must not erase installed IgnoreGroup membership"
                 );
                 assert_eq!(fs::read(&old_path).unwrap(), bytes);
-                assert!(cache_dir.join("local_db_source_v3.bin").is_file());
+                assert!(cache_dir.join("local_db_source_v4.bin").is_file());
             },
         );
     }
@@ -3387,6 +3482,8 @@ mod tests {
             assert_eq!(parsed.groups, ["pinned", "other"]);
             assert_eq!(parsed.explicit, is_explicit);
             assert_eq!(parsed.install_date, "2");
+            assert_eq!(parsed.url.as_deref(), Some("https://example.org/widget"));
+            assert_eq!(parsed.size, 123);
             assert_eq!(parsed.licenses, ["MIT"]);
             assert_eq!(parsed.depends, ["glibc>=2"]);
             assert_eq!(parsed.provides, ["virtual-widget=1"]);
@@ -3675,9 +3772,9 @@ mod tests {
                 )]),
                 ..LocalDbCache::default()
             };
-            save_cache_to_disk_in(&local, directory.path(), "local_db_source_v3")?;
+            save_cache_to_disk_in(&local, directory.path(), "local_db_source_v4")?;
             let loaded_local: Result<LocalDbCache> =
-                load_cache_from_disk_in(directory.path(), "local_db_source_v3");
+                load_cache_from_disk_in(directory.path(), "local_db_source_v4");
             assert_eq!(
                 loaded_local.is_ok(),
                 !raw.contains('\0'),
@@ -3714,6 +3811,7 @@ mod tests {
         for name in [
             "sync_db_source_v3.bin",
             "sync_db_source_v2.bin",
+            "local_db_source_v4.bin",
             "local_db_source_v3.bin",
             "local_db_source_v2.bin",
             "sync_db_source_v1.bin",
@@ -3729,6 +3827,7 @@ mod tests {
         for name in [
             "sync_db_source_v3.bin",
             "sync_db_source_v2.bin",
+            "local_db_source_v4.bin",
             "local_db_source_v3.bin",
             "local_db_source_v2.bin",
             "sync_db_source_v1.bin",
@@ -4896,9 +4995,9 @@ mod tests {
         };
 
         fs::write(temp.path().join("local_db_rdeps.bin"), b"legacy cache").unwrap();
-        save_cache_to_disk_in(&cache, temp.path(), "local_db_source_v3").unwrap();
+        save_cache_to_disk_in(&cache, temp.path(), "local_db_source_v4").unwrap();
         let loaded: LocalDbCache =
-            load_cache_from_disk_in(temp.path(), "local_db_source_v3").unwrap();
+            load_cache_from_disk_in(temp.path(), "local_db_source_v4").unwrap();
         assert!(loaded.packages.contains_key("firefox"));
         assert_eq!(loaded.last_modified, cache.last_modified);
         assert_eq!(

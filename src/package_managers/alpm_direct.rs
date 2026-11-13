@@ -1,7 +1,7 @@
 //! Direct ALPM (Arch Linux Package Manager) integration.
 //!
-//! Queries libalpm through a cached per-thread handle instead of spawning a
-//! pacman subprocess for each query.
+//! Reads installed package-info through the Rust ALPM database parser. Other
+//! queries and repository signature checks use cached per-thread libalpm handles.
 
 use alpm::{Alpm, PackageReason};
 use anyhow::{Context, Result};
@@ -166,37 +166,27 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
     })
 }
 
-/// Get package info - INSTANT (<1ms)
+/// Read installed metadata through Rust, retaining native sync signature checks.
 pub fn get_package_info(name: &str) -> Result<Option<PackageInfo>> {
-    with_handle(|handle| {
-        // Try local first
-        if let Ok(pkg) = handle.localdb().pkg(name) {
-            let Some(version) = parse_version(pkg.version()) else {
-                tracing::warn!(
-                    "Ignoring local package '{name}' with unparseable version '{}'",
-                    pkg.version()
-                );
-                return Ok(None);
-            };
-            return Ok(Some(PackageInfo {
-                name: pkg.name().to_string(),
-                version,
-                description: pkg.desc().unwrap_or("").to_string(),
-                url: pkg.url().map(std::string::ToString::to_string),
-                size: pkg.isize().try_into().unwrap_or(0),
-                install_size: Some(pkg.isize()),
-                download_size: None,
-                repo: "local".to_string(),
-                depends: pkg.depends().iter().map(ToString::to_string).collect(),
-                licenses: pkg
-                    .licenses()
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect(),
-                installed: true,
-            }));
-        }
+    if let Some(pkg) = pacman_db::read_local_package(name)? {
+        let install_size = i64::try_from(pkg.size)
+            .context("Installed package size exceeds the supported range")?;
+        return Ok(Some(PackageInfo {
+            name: pkg.name,
+            version: pkg.version,
+            description: pkg.desc,
+            url: pkg.url,
+            size: pkg.size,
+            install_size: Some(install_size),
+            download_size: None,
+            repo: "local".to_owned(),
+            depends: pkg.depends,
+            licenses: pkg.licenses,
+            installed: true,
+        }));
+    }
 
+    with_handle(|handle| {
         // Try sync databases
         for db in handle.syncdbs() {
             if !db.usage()?.contains(alpm::Usage::SEARCH) {
@@ -665,6 +655,106 @@ mod tests {
                 ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
             ],
             run,
+        );
+    }
+
+    #[test]
+    fn installed_info_reads_rust_metadata_when_sync_configuration_is_unavailable() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(
+                    installed_info_reads_rust_metadata_when_sync_configuration_is_unavailable
+                )
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().expect("private database");
+                let desc = database.join("local/pacman-1.0-1/desc");
+                let original = std::fs::read_to_string(&desc).unwrap();
+                std::fs::write(
+                    &desc,
+                    original + "%URL%\nhttps://example.invalid/pacman\n\n%SIZE%\n65536\n\n",
+                )
+                .unwrap();
+                std::fs::remove_file(paths::pacman_conf_path()).unwrap();
+                let info = get_package_info("pacman")
+                    .expect("installed metadata must not require synchronization configuration")
+                    .expect("installed package");
+                assert_eq!(info.repo, "local");
+                assert!(info.installed);
+                assert_eq!(info.url.as_deref(), Some("https://example.invalid/pacman"));
+                assert_eq!(
+                    (info.size, info.install_size, info.download_size),
+                    (65536, Some(65536), None)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn installed_info_rejects_invalid_utf8_metadata_without_panicking() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(installed_info_rejects_invalid_utf8_metadata_without_panicking)
+            ),
+            || {
+                let desc = paths::pacman_db_dir_result()
+                    .unwrap()
+                    .join("local/pacman-1.0-1/desc");
+                let original = std::fs::read_to_string(&desc).unwrap();
+                let content = original
+                    .replace("fixture package manager", "invalid-description")
+                    .into_bytes();
+                let offset = content
+                    .windows(b"invalid-description".len())
+                    .position(|part| part == b"invalid-description")
+                    .unwrap();
+                let mut invalid = content;
+                invalid[offset] = 0xff;
+                std::fs::write(&desc, invalid).unwrap();
+                let error = get_package_info("pacman")
+                    .expect_err("invalid metadata must be returned as an error");
+                assert!(format!("{error:#}").contains("desc"));
+            },
+        );
+    }
+
+    #[test]
+    fn installed_info_refuses_invalid_sizes_and_ambiguous_sources() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(installed_info_refuses_invalid_sizes_and_ambiguous_sources)
+            ),
+            || {
+                let local = paths::pacman_db_dir_result().unwrap().join("local");
+                let desc = local.join("pacman-1.0-1/desc");
+                let original = std::fs::read_to_string(&desc).unwrap();
+                for size in ["-1", "18446744073709551616", "9223372036854775808"] {
+                    std::fs::write(&desc, format!("{original}\n%SIZE%\n{size}\n\n")).unwrap();
+                    let error = get_package_info("pacman").expect_err("invalid installed size");
+                    assert!(format!("{error:#}").to_ascii_lowercase().contains("size"));
+                }
+                std::fs::write(&desc, &original).unwrap();
+                let other = local.join("pacman-tools-1.0-1");
+                std::fs::create_dir(&other).unwrap();
+                std::fs::write(
+                    other.join("desc"),
+                    original.replace("pacman", "pacman-tools"),
+                )
+                .unwrap();
+                assert_eq!(get_package_info("pacman").unwrap().unwrap().name, "pacman");
+                let duplicate = local.join("pacman-2.0-1");
+                std::fs::create_dir(&duplicate).unwrap();
+                std::fs::write(duplicate.join("desc"), &original).unwrap();
+                let error = get_package_info("pacman").expect_err("ambiguous installed identity");
+                assert!(format!("{error:#}").contains("Duplicate local package name"));
+                std::fs::remove_dir_all(&duplicate).unwrap();
+                std::os::unix::fs::symlink(&other, &duplicate).unwrap();
+                let error = get_package_info("pacman").expect_err("redirected local entry");
+                assert!(format!("{error:#}").contains("symlink"));
+            },
         );
     }
 

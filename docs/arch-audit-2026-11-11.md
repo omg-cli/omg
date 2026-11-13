@@ -1247,3 +1247,45 @@ The root-owned exporter case also passed inside this guest. The 34 producer test
 tests, 11 boot-budget tests and Bash parsing all passed. The existing native
 coverage admission, required artifacts/scenarios, counters and thresholds remain
 unchanged. Hosted acceptance of the combined fix remains pending.
+
+
+The 1b1bd6f0 hosted producer now passes, including observed guest shutdown.
+Its strict comparison executes and still rejects incomplete coverage in
+`src/cli/packages/update/omarchy.rs`: 234/234 functions, 3421/3501 summary
+lines and 61 uncovered mapped lines. The downloaded comparison artifact
+14084739961 is retained locally with verified SHA-256
+`7ef159d6fbd61b53a5a182281fe263eb913f9f2957299eb61b56ed9b67161c96`.
+No threshold, exclusion or coverage counter changed.
+
+The next Rust ALPM batch reproduced two installed-info defects before changing
+production code: missing pacman.conf produced “Failed to observe ALPM catalog
+epoch”, and invalid UTF-8 descriptions panicked inside alpm 5.0.2 with
+`Utf8Error { valid_up_to: 0, error_len: Some(1) }`. Installed-info now reads
+the local source through the existing Rust descriptor parser without requiring
+sync configuration or initializing a C handle. Both official V1/V2 and tolerant
+local parsing retain URL and installed size; the derived local cache namespace
+advances to v4 and invalidation retains legacy names.
+
+The Model the Domain principle kept this metadata in the existing
+`LocalDbPackage` record. Prove It Works required inspecting the failure causes
+and running real queries, rather than treating compilation as evidence.
+A third regression rejected the first implementation's use of derived cached
+metadata: “untrusted derived metadata” was returned instead of “source
+description”. Installed-info now bypasses both memory and disk caches and
+checks the source epoch around its read. Tests cover both cache substitutions,
+invalid or overflowing sizes, similarly prefixed package names, duplicate
+identities and symlinked package entries. Repository-info signature checks,
+configured Search usage and priority, explicit native-handle APIs and raw
+security inventory remain native; this batch does not claim their migration.
+
+The first broad check passed all three Clippy lanes, 2414 library tests
+(13 existing ignores), all 32 CLI unit tests and normal binaries. Final checks
+also cover the corrected absence/race path before publication. Release build
+and disposable-guest verification of this new runtime remain pending.
+
+Final normal verification passed the same 2414 library tests, 32 CLI tests,
+three Clippy lanes and binary builds after the source-absence correction.
+The exact-source receipt is `omarchy-native27-coherent-green2-receipt.json`.
+All 46 executed checks on published head 1b1bd6f0 pass except the separate
+strict comparison gate (one failure; 27 intentional skips). Release and actual
+guest acceptance of this new Rust runtime are still required.

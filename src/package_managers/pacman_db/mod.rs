@@ -5,7 +5,9 @@
 
 mod db;
 
-pub(crate) use db::{compile_package_patterns, get_potential_aur_package_records};
+pub(crate) use db::{
+    compile_package_patterns, get_potential_aur_package_records, read_local_package,
+};
 
 #[cfg(test)]
 pub(crate) use db::check_local_db_health;
