@@ -306,6 +306,7 @@ class OmarchyCase(NamedTuple):
     scene: str = 'none'
     absent_helper: str | None = None
     native_committed: bool = False
+    reboot_answer: str | None = None
 
 
 OMARCHY_CASES = {
@@ -326,6 +327,15 @@ OMARCHY_CASES = {
         scene='snapshot-unsupported', native_committed=True),
     'omarchy-required-helper-missing': OmarchyCase(1, OMARCHY_PREFIX[:3] +
         ('omarchy-update-stay-awake\tstop',), absent_helper='omarchy-update-dev'),
+    'omarchy-reboot-decline': OmarchyCase(0, OMARCHY_PREFIX[:1] +
+        ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX,
+        native_committed=True, reboot_answer='n'),
+    'omarchy-reboot-accept': OmarchyCase(0, OMARCHY_PREFIX[:1] +
+        ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
+        native_committed=True, reboot_answer='y'),
+    'omarchy-reboot-failure': OmarchyCase(1, OMARCHY_PREFIX[:1] +
+        ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
+        scene='reboot-failure', native_committed=True, reboot_answer='y'),
 }
 
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES)
@@ -393,6 +403,76 @@ for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-u
   chmod 755 "$fixture/foreign/bin/$name"
 done
 chmod 755 "$fixture/stage"
+cat > "$fixture/attended.py" <<'OMG_ATTENDED_OMARCHY_DRIVER'
+import errno, fcntl, json, os, pty, select, signal, struct, sys, termios, time
+from pathlib import Path
+
+answer = sys.argv[1]
+assert answer in ('y', 'n')
+child, terminal = pty.fork()
+if child == 0:
+    os.execv('/omg-extra-bin/cli', ['/omg-extra-bin/cli', 'update'])
+status = None
+responded = False
+output = bytearray()
+deadline = time.monotonic() + 30
+try:
+    fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
+    while time.monotonic() < deadline:
+        if select.select([terminal], [], [], 0.1)[0]:
+            try:
+                chunk = os.read(terminal, 4096)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                chunk = b''
+            if chunk:
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+                output.extend(chunk)
+                assert len(output) <= 1024 * 1024, 'Attended transcript budget exceeded'
+                if not responded and b'Reboot now?' in output:
+                    fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 100, 0, 0))
+                    os.kill(child, signal.SIGWINCH)
+                    os.write(terminal, (answer + '\n').encode())
+                    responded = True
+        observed, value = os.waitpid(child, os.WNOHANG)
+        if observed:
+            status = value
+            break
+    assert status is not None, 'Attended CLI deadline exceeded'
+    assert responded, 'Genuine reboot prompt was not observed'
+    while select.select([terminal], [], [], 0)[0]:
+        try:
+            chunk = os.read(terminal, 4096)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            break
+        if not chunk:
+            break
+        output.extend(chunk)
+        assert len(output) <= 1024 * 1024, 'Attended transcript budget exceeded'
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+finally:
+    if status is None:
+        os.kill(child, signal.SIGTERM)
+        for _ in range(30):
+            observed, status = os.waitpid(child, os.WNOHANG)
+            if observed:
+                break
+            status = None
+            time.sleep(0.1)
+        if status is None:
+            os.kill(child, signal.SIGKILL)
+            _, status = os.waitpid(child, 0)
+    os.close(terminal)
+code = os.waitstatus_to_exitcode(status)
+receipt = dict(prompt_observed=responded, answer=answer, resize_sent=1, cli_exit_code=code)
+Path(os.environ['OMARCHY_HELPER_TRACE']).with_name('interaction.json').write_text(json.dumps(receipt)+'\n')
+sys.exit(code)
+OMG_ATTENDED_OMARCHY_DRIVER
 test -u /usr/bin/sudo
 runuser -u nobody -- sudo -n /usr/bin/true
 for name in pacman pacman-key paccache; do
@@ -412,7 +492,7 @@ for name in omarchy-update-requires-free-space omarchy-update-confirm omarchy-up
   omarchy-snapshot omarchy-update-stay-awake omarchy-update-dev omarchy-update-keyring \
   omarchy-update-system-pkgs omarchy-migrate omarchy-restart-shell omarchy-update-orphan-pkgs \
   omarchy-update-analyze-logs omarchy-shell omarchy-update-restart omarchy-hook \
-  omarchy-update-mise omarchy-update-boot yay aura paru; do
+  omarchy-update-mise omarchy-update-boot omarchy-system yay aura paru; do
   test ! -e "/usr/bin/$name" && test ! -L "/usr/bin/$name"
   install -m 755 "$fixture/stage" "/usr/bin/$name"
   created+=("/usr/bin/$name")
@@ -478,6 +558,7 @@ for stage in OMARCHY_STAGE_NAMES; do
     done
   fi
   scene=none
+  reboot_answer=
   absent_helper=
   case "$stage" in
 OMARCHY_CASE_SETUP
@@ -486,6 +567,13 @@ OMARCHY_CASE_SETUP
     test -f "/usr/bin/$absent_helper" && test ! -L "/usr/bin/$absent_helper"
     test ! -e "$fixture/saved/$absent_helper"
     mv "/usr/bin/$absent_helper" "$fixture/saved/$absent_helper"
+  fi
+  launch=(bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@"' bash "${args[@]}")
+  if test -n "$reboot_answer"; then
+    install -d -m 700 -o nobody -g nobody "$case_dir/.local/state/omarchy"
+    touch "$case_dir/.local/state/omarchy/reboot-required"
+    chown nobody:nobody "$case_dir/.local/state/omarchy/reboot-required"
+    launch=(python3 "$fixture/attended.py" "$reboot_answer")
   fi
   result=0
   timeout --signal=TERM --kill-after=3 40 runuser -u nobody -- env -i \
@@ -498,8 +586,7 @@ OMARCHY_CASE_SETUP
     OMARCHY_PATH="$case_dir/checkout" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
-    bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@"' \
-    bash "${args[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+    "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
   for profile in /profiles/native-root/omg-extra-*.profraw; do
     test -f "$profile" || continue
     test "$(stat -c %u "$profile")" = 0
@@ -528,6 +615,9 @@ OMARCHY_CASE_SETUP
     test ! -e "$case_dir/helpers.tsv.unexpected"
     printf 'foreign optional helpers never executed; original helpers restored\n' > "/evidence/cli/$stage-layout.txt"
   fi
+  if test -n "$reboot_answer"; then
+    cp "$case_dir/interaction.json" "/evidence/cli/$stage-interaction.json"
+  fi
   printf '%s\n' "$result" > "/evidence/cli/$stage-exit.txt"
   cp "$case_dir/helpers.tsv" "/evidence/cli/$stage-helpers.tsv"
   if test -f "$case_dir/run/omarchy-update.lock"; then
@@ -544,7 +634,8 @@ OMG_OMARCHY_NAMESPACE
 '''
     setup = '\n'.join(
         f'    {shlex.quote(stage)}) scene={shlex.quote(case.scene)}; '
-        f'absent_helper={shlex.quote(case.absent_helper or "")} ;;'
+        f'absent_helper={shlex.quote(case.absent_helper or "")}; '
+        f'reboot_answer={shlex.quote(case.reboot_answer or "")} ;;'
         for stage, case in OMARCHY_CASES.items())
     return (script.replace('OMARCHY_STAGE_NAMES', ' '.join(map(shlex.quote, OMARCHY_CASES)))
             .replace('OMARCHY_CASE_SETUP', setup)
@@ -774,6 +865,14 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     == 'PASS_SIGNED_NATIVE_STATE', 'Missing committed native package state')
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if case.reboot_answer:
+            interaction = json.loads((evidence / f'{stage}-interaction.json').read_text())
+            require(interaction == dict(prompt_observed=True, answer=case.reboot_answer,
+                                        resize_sent=1, cli_exit_code=case.exit_status),
+                    'Attended reboot interaction differs: ' + stage)
+            require('Reboot now?' in log, 'Attended CLI did not show its reboot prompt')
+            if case.scene == 'reboot-failure':
+                require('Omarchy reboot failed' in log, 'Reboot helper failure was hidden')
         if case.absent_helper:
             require((evidence / f'{stage}-layout.txt').read_text()
                     == 'absent helper restored after genuine CLI execution\n',

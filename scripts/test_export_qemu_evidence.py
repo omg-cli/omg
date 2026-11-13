@@ -42,8 +42,9 @@ class AllowlistTests(unittest.TestCase):
     def test_native_optional_helper_diagnostics_stay_at_the_cli_root(self):
         prefix = ('run-test', 'native-evidence', 'cli')
         for stage in ('omarchy-snapshot-missing', 'omarchy-snapshot-unsupported',
-                      'omarchy-required-helper-missing'):
-            for suffix in ('.log', '-helpers.tsv', '-native-state.json', '-layout.txt', '-exit.txt'):
+                      'omarchy-required-helper-missing', 'omarchy-reboot-decline',
+                      'omarchy-reboot-accept', 'omarchy-reboot-failure'):
+            for suffix in ('.log', '-helpers.tsv', '-native-state.json', '-layout.txt', '-interaction.json', '-exit.txt'):
                 name = stage + suffix
                 with self.subTest(name=name):
                     self.assertTrue(exporter.allowed_file((*prefix, name)))

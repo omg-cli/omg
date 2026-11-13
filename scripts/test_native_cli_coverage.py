@@ -232,6 +232,19 @@ class HostedProducer(unittest.TestCase):
         self.assertLess(native.index('--native-cli-coverage-dir'),
                         native.index('docker start --attach'))
 
+    def test_attended_reboot_cases_require_prompt_and_terminal_receipts(self):
+        names = {'omarchy-reboot-decline', 'omarchy-reboot-accept', 'omarchy-reboot-failure'}
+        self.assertTrue(names <= PRODUCER.OMARCHY_CASES.keys(),
+                        'Native coverage does not exercise the attended reboot prompt')
+        for stage in names:
+            case = PRODUCER.OMARCHY_CASES[stage]
+            self.assertIn(case.reboot_answer, ('y', 'n'))
+            self.assertTrue(case.native_committed)
+        script = PRODUCER.omarchy_guest_script()
+        self.assertIn('pty.fork()', script)
+        self.assertIn('signal.SIGWINCH', script)
+        self.assertIn("b'Reboot now?'", script)
+
     def test_declared_optional_and_required_helper_cases_execute_the_real_cli(self):
         required = {'omarchy-snapshot-missing', 'omarchy-snapshot-unsupported',
                     'omarchy-required-helper-missing'}
@@ -440,6 +453,10 @@ def evidence_fixture(root):
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         if case.native_committed:
             (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
+        if case.reboot_answer:
+            (evidence / f'{stage}-interaction.json').write_text(json.dumps(dict(
+                prompt_observed=True, answer=case.reboot_answer, resize_sent=1,
+                cli_exit_code=case.exit_status)))
         if case.absent_helper:
             (evidence / f'{stage}-layout.txt').write_text(
                 'absent helper restored after genuine CLI execution\n')
@@ -448,6 +465,9 @@ def evidence_fixture(root):
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': '| System is up to date',
+            'omarchy-reboot-decline': '| System is up to date\nReboot now?',
+            'omarchy-reboot-accept': '| System is up to date\nReboot now?',
+            'omarchy-reboot-failure': '| System is up to date\nReboot now?\nOmarchy reboot failed',
             'omarchy-snapshot-missing': '| System is up to date',
             'omarchy-snapshot-unsupported': '| System is up to date',
             'omarchy-required-helper-missing': 'Omarchy update did not complete: omarchy-update-dev',
@@ -469,7 +489,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 15)
+            self.assertEqual(len(receipt['process_checks']), 18)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -503,6 +523,8 @@ class SupplementalEvidence(unittest.TestCase):
             'omarchy-old-logger': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('Script started on fixture\nScript done on fixture\n'),
             'omarchy-no-cleanup': lambda e, p: (e / 'omarchy-success-coordination.txt').write_text('lock still held'),
             'omarchy-no-refusal': lambda e, p: (e / 'omarchy-migration-refusal.log').write_text('failed for another reason'),
+            'no-attended-reboot-prompt': lambda e, p: (e / 'omarchy-reboot-accept-interaction.json').write_text('{}'),
+            'reboot-failure-hidden': lambda e, p: (e / 'omarchy-reboot-failure.log').write_text('System is up to date\nReboot now?'),
             'missing-helper-not-restored': lambda e, p: (e / 'omarchy-snapshot-missing-layout.txt').write_text('still absent'),
             'unsupported-snapshot-skips-native': lambda e, p: (e / 'omarchy-snapshot-unsupported-native-state.json').write_text('{"status":"UNCOMMITTED"}'),
             'required-helper-false-success': lambda e, p: (e / 'omarchy-required-helper-missing-exit.txt').write_text('0\n'),
