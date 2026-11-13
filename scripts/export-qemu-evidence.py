@@ -23,7 +23,7 @@ HOST_FILES = {
     "results.json", "sentry-results.json", "backend-mismatch-results.json",
     "backend-mismatch.json", "backend-mismatch.log", "metadata.txt", "host-metadata.txt",
     "cleanup.log", "reporting.log", "reporting-status.json", "kvm-probe.log", "engine-preflight.log",
-    "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "boot.diagnostics.log", "guest-check.log",
+    "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "boot.diagnostics.log", "guest-check.log", "native-coverage.log",
     "evidence-copy.log", "benchmark-validation.log", "transactions.log",
     "transaction-validation.log", "inventory.log",
     "guest-health.json", "guest-boot-id.txt", "controller-health.json", "controller-final-state.json", "health-validation.log",

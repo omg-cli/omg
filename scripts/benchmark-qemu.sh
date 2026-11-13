@@ -326,7 +326,7 @@ cleanup() {
     printf 'Inventory telemetry projection failed; reporting lifecycle result only\n' >> "$work/cleanup.log"
   fi
   reporting_rc=0
-  if [[ -z "$native_cli_coverage_dir" ]]; then
+  if [[ -z "${native_cli_coverage_dir:-}" ]]; then
     timeout --kill-after=2s 12s env OMG_SMOKE_RELEASE="$tag" OMG_SMOKE_ENVIRONMENT=qemu-matrix "$repo_root/scripts/report-smoke-sentry.sh" "$report_input" > "$work/reporting.log" 2>&1 || reporting_rc=$?
   fi
   jq -n --argjson exit_code "$reporting_rc" '{exit_code:$exit_code}' > "$work/reporting-status.json"
@@ -969,7 +969,7 @@ boot_rc=0
 timeout --kill-after=5s "$boot_timeout" docker exec "$controller" bash /work/boot.sh "$firmware" "$ssh_service" "$firmware_code" "$firmware_vars_src" "$qemu_bin" "$qemu_machine" "$qemu_accel" "$qemu_cpu" > "$work/boot.log" 2>&1 || boot_rc=$?
 timeout --kill-after=2s 3s docker exec "$controller" bash /work/qemu-boot-diagnostics.sh > "$work/boot.diagnostics.log" 2>&1 || printf 'Boot diagnostics unavailable\n' >> "$work/boot.diagnostics.log"
 [[ "$boot_rc" == 0 ]] || exit "$boot_rc"
-if [[ -n "$native_cli_coverage_dir" ]]; then
+if [[ -n "${native_cli_coverage_dir:-}" ]]; then
   mkdir "$work/native-cli"
   cp -a "$native_cli_coverage_dir/bin" "$work/native-cli/bin"
   cp "$native_cli_coverage_dir/native-cli-manifest.json" "$work/native-cli/native-cli-manifest.json"

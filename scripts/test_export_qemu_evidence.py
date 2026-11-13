@@ -506,6 +506,17 @@ class DescriptorTests(unittest.TestCase):
         for name in excluded:
             self.assertFalse((self.destination / name).exists())
 
+    def test_native_coverage_failure_exports_logs_without_inputs_or_profile_data(self):
+        content = b'actual native guest failure diagnostic\n'
+        self.fixture('run-test/native-coverage.log', content)
+        self.fixture('run-test/native-cli/bin/cli', b'private executable')
+        self.fixture('run-test/native-profiles/raw.profraw', b'private profile')
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual((self.destination / 'run-test/native-coverage.log').read_bytes(), content)
+        self.assertFalse((self.destination / 'run-test/native-cli').exists())
+        self.assertFalse((self.destination / 'run-test/native-profiles').exists())
+
     def test_private_state_is_never_opened_and_results_remain_readable(self):
         self.fixture("run-test/results.json", b"[]")
         state = self.fixture("run-test/guest/evidence/benchmarks/data/usage.json", b"private")

@@ -415,17 +415,20 @@ jobs:
           (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
           PY
 
+      - name: Export bounded native VM diagnostics
+        if: ${{ !cancelled() && (steps.native_fixture_tests.outcome == 'success' || steps.native_fixture_tests.outcome == 'failure') }}
+        run: |
+          if test -d "$RUNNER_TEMP/native-cli-qemu"; then
+            python3 scripts/export-qemu-evidence.py --source "$RUNNER_TEMP/native-cli-qemu" \
+              --destination "$RUNNER_TEMP/native-coverage-evidence/qemu" --uid "$(id -u)" --gid "$(id -g)"
+          fi
+
       - name: Preserve native fixture coverage evidence
         if: ${{ !cancelled() && (steps.native_fixture_tests.outcome == 'success' || steps.native_fixture_tests.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: coverage-native-fixtures
-          path: |
-            ${{ runner.temp }}/native-coverage-evidence/
-            ${{ runner.temp }}/native-cli-qemu/**/native-coverage.log
-            ${{ runner.temp }}/native-cli-qemu/**/native-evidence/
-            ${{ runner.temp }}/native-cli-qemu/**/boot*.log
-            ${{ runner.temp }}/native-cli-qemu/**/results.json
+          path: ${{ runner.temp }}/native-coverage-evidence/
           if-no-files-found: error
           retention-days: 14
 
