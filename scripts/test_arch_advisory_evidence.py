@@ -45,7 +45,9 @@ class ArchEvidenceTests(unittest.TestCase):
         self.receipt["original_system_files"]["/etc/nsswitch.conf"] = hashlib.sha256(original_nss.encode()).hexdigest()
         self.put("private-nss.conf", "passwd: files systemd\nhosts: files\n")
         self.put("dns-isolation.json", json.dumps({"hostname": checker.oracle.ARCH_HOST, "resolved_addresses": ["127.0.0.1"]}))
-        output = "Found 1 vulnerabilities (1 high severity)\n  glibc (1 issues):\n    → AVG-OMG-QEMU-616 - AVG-OMG-QEMU-616: synthetic fixture [Advisory severity: Critical]\n"
+        output = ("  ⚠ Advisory scope: 0 assessed package(s), 2 package(s) with unknown coverage; absence of findings does not establish safety.\n"
+                  "Found 1 vulnerabilities (1 high severity)\n  glibc (1 issues):\n"
+                  "    → AVG-OMG-QEMU-616 - AVG-OMG-QEMU-616: synthetic fixture [Advisory severity: Critical] [possible match; applicability unverified]\n")
         for phase in ("direct-plain", "direct-findings", "daemon-plain", "daemon-findings", "untrusted-tls", "daemon-before", "daemon-after"):
             finding = phase.endswith("findings"); metrics = phase in ("daemon-before", "daemon-after")
             self.receipt["product_results"][phase] = {"argv": ["metrics"] if metrics else ["audit", "scan"] + (["--fail-on-findings"] if finding else []), "exit_code": int(finding or phase == "untrusted-tls")}
@@ -78,6 +80,27 @@ class ArchEvidenceTests(unittest.TestCase):
 
     def test_complete_bound_native_arch_evidence_is_admitted(self):
         self.assertEqual(self.admit(), self.receipt)
+
+    def test_captured_installed_unknown_scope_retains_possible_finding_contract(self):
+        captured = "\n\n Secure  Vulnerability Scan\n  ⚠ Advisory scope: 0 assessed package(s), 203 package(s) with unknown coverage; absence of findings does not establish safety.\n  ⚠ Found 1 vulnerabilities (1 high severity)\n\n  glibc (1 issues):\n    → AVG-OMG-QEMU-616 - AVG-OMG-QEMU-616: synthetic fixture [Advisory severity: Critical] [possible match; applicability unverified]\n\n\n  Tip: Run 'omg audit sbom' to generate a full security report.\n\n"
+        for phase in ("direct-plain", "direct-findings", "daemon-plain", "daemon-findings"):
+            self.put(phase + ".stdout", captured)
+        self.assertEqual(self.admit(), self.receipt)
+        malformed = {
+            "missing_possible_marker": captured.replace(" [possible match; applicability unverified]", ""),
+            "missing_unknown_warning": "\n".join(line for line in captured.split("\n") if "Advisory scope:" not in line),
+            "false_assessed_scope": captured.replace("0 assessed package(s)", "203 assessed package(s)"),
+            "false_complete_scope": captured.replace("203 package(s) with unknown coverage", "0 package(s) with unknown coverage"),
+            "wrong_severity": captured.replace("[Advisory severity: Critical]", "[Advisory severity: High]"),
+            "wrong_id": captured.replace("AVG-OMG-QEMU-616", "AVG-OMG-QEMU-OTHER"),
+            "fabricated_score": captured + " [Score: 9.8]\n",
+            "excluded_fixed_advisory": captured + "AVG-OMG-QEMU-FIXED\n",
+        }
+        for label, output in malformed.items():
+            self.put("daemon-findings.stdout", output)
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.admit()
+            self.put("daemon-findings.stdout", captured)
 
     def test_native_database_format_marker_is_bound_without_admitting_arbitrary_files(self):
         self.receipt["native_state_before"]["database_sha256"]["ALPM_DB_VERSION"] = "9" * 64

@@ -62,7 +62,9 @@ OMARCHY_CASES = {
     'omarchy-success': (0, OMARCHY_PREFIX + OMARCHY_SUFFIX),
     'omarchy-vendor-failure': (1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',)),
     'omarchy-declined': (0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
-    'omarchy-optional-failures': (0, OMARCHY_PREFIX + OMARCHY_SUFFIX),
+    'omarchy-optional-failures': (0, tuple(
+        item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
+        if item.split('\t')[0] not in ('omarchy-snapshot', 'omarchy-restart-shell', 'omarchy-update-mise'))),
     'omarchy-migration-refusal': (1, ()),
     'omarchy-unsupported-mode': (1, ()),
     'omarchy-invalid-transport': (1, ()),
@@ -76,7 +78,7 @@ def omarchy_guest_script():
     return r'''unshare --mount --net --fork bash -s <<'OMG_OMARCHY_NAMESPACE'
 set -euo pipefail
 mount --make-rprivate /
-for tool in script flock tar mount readlink runuser; do
+for tool in script flock tar mount mountpoint readlink runuser; do
   command -v "$tool" > /dev/null || { printf 'Missing Omarchy fixture command: %s\n' "$tool" >&2; exit 1; }
 done
 fixture=/opt/omg-omarchy-coverage
@@ -85,10 +87,28 @@ install -d -m 755 "$fixture"
 printf 'ID=omarchy\nID_LIKE=arch\n' > "$fixture/release"
 mount --bind "$fixture/release" /etc/os-release
 mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
+install -d -m 755 "$fixture/runtime" "$fixture/runtime/migrations" /usr/share/omarchy
+mount --bind "$fixture/runtime" /usr/share/omarchy
+test "$(stat -c '%u:%a' /usr/share/omarchy)" = 0:755
+test "$(stat -c '%u:%a' /usr/share/omarchy/migrations)" = 0:755
 cat > "$fixture/stage" <<'OMG_INERT_OMARCHY_STAGE'
 #!/bin/bash
 set -euo pipefail
 name=${0##*/}
+omarchy_security_require_source_root() {
+  local command_source command_name=${1##*/}
+  command_source=$(/usr/bin/readlink -e -- "$1") || return 1
+
+  # A runtime root selects the code used by this invocation. Accept the
+  # canonical checkout containing the entrypoint or the package's bin links.
+  if [[ ${OMARCHY_PATH:-} != /* || $(/usr/bin/realpath -e -- "$OMARCHY_PATH") != "$OMARCHY_PATH" ]] ||
+    ! { [[ $command_source == "$OMARCHY_PATH/bin/$command_name" ]] ||
+      [[ $OMARCHY_PATH == "/usr/share/omarchy" && $command_source == "/usr/bin/$command_name" ]]; }; then
+    echo "OMARCHY_PATH does not match this Omarchy command." >&2
+    return 1
+  fi
+}
+case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
 case "$name" in
   yay|aura|paru) printf 'external AUR helper must never run\n' >&2; exit 99 ;;
@@ -104,6 +124,17 @@ set -euo pipefail
 case "$*" in true|'-n true') ;; *) printf 'unexpected fixture sudo request\n' >&2; exit 99 ;; esac
 { printf sudo; printf '\t%s' "$@"; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
 OMG_INERT_SUDO
+cat > "$fixture/foreign-stage-prefix" <<'OMG_FOREIGN_OMARCHY_STAGE_PREFIX'
+#!/bin/bash
+set -euo pipefail
+printf 'foreign helper executed: %s\n' "$0" >> "$OMARCHY_HELPER_TRACE.unexpected"
+OMG_FOREIGN_OMARCHY_STAGE_PREFIX
+install -d -m 755 "$fixture/foreign" "$fixture/foreign/bin" "$fixture/saved"
+for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
+  cat "$fixture/foreign-stage-prefix" > "$fixture/foreign/bin/$name"
+  tail -n +2 "$fixture/stage" >> "$fixture/foreign/bin/$name"
+  chmod 755 "$fixture/foreign/bin/$name"
+done
 chmod 755 "$fixture/stage" "$fixture/sudo"
 mount --bind "$fixture/sudo" "$(readlink -f /usr/bin/sudo)"
 created=()
@@ -133,11 +164,15 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
   printf '#!/bin/bash\nexit 88\n' > "$case_dir/checkout/bin/omarchy-migrate"
   chmod 755 "$case_dir/checkout/bin/omarchy-migrate"
   chown -R nobody:nobody "$case_dir"
-  if test "$stage" = omarchy-migration-refusal; then
-    printf 'omarchy-pkg-aur-add forbidden-fixture\n' > "$case_dir/checkout/migrations/1.sh"
-  else
-    rm -f "$case_dir/checkout/migrations/1.sh"
-  fi
+  rm -f "$fixture/runtime/migrations/1.sh"
+  case "$stage" in
+    omarchy-success)
+      printf 'omarchy-pkg-aur-add forbidden-home-fixture\n' > "$case_dir/checkout/migrations/1.sh"
+      ;;
+    omarchy-migration-refusal)
+      printf 'omarchy-pkg-aur-add forbidden-installed-fixture\n' > "$fixture/runtime/migrations/1.sh"
+      ;;
+  esac
   args=(--yes)
   extra=()
   case "$stage" in
@@ -145,6 +180,19 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
     omarchy-unsupported-mode) args=(--fast) ;;
     omarchy-invalid-transport) extra=(OMG_OMARCHY_LOCK_FD=999999) ;;
   esac
+  if test "$stage" = omarchy-optional-failures; then
+    for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
+      test -f "/usr/bin/$name" && test ! -L "/usr/bin/$name"
+      if mountpoint -q "/usr/bin/$name"; then
+        printf 'Refusing mounted optional fixture helper: %s\n' "$name" >&2
+        exit 1
+      fi
+      mv "/usr/bin/$name" "$fixture/saved/$name"
+      ln -s "$fixture/foreign/bin/$name" "/usr/bin/$name"
+      test "$(readlink -e "/usr/bin/$name")" = "$fixture/foreign/bin/$name"
+      test "$(stat -c '%u:%a' "$fixture/foreign/bin/$name")" = 0:755
+    done
+  fi
   result=0
   timeout --signal=TERM --kill-after=3 40 runuser -u nobody -- env -i \
     PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
@@ -158,6 +206,18 @@ for stage in omarchy-success omarchy-vendor-failure omarchy-declined omarchy-opt
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@"' \
     bash "${args[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  if test "$stage" = omarchy-optional-failures; then
+    for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
+      test -L "/usr/bin/$name"
+      test "$(readlink -e "/usr/bin/$name")" = "$fixture/foreign/bin/$name"
+      rm -- "/usr/bin/$name"
+      mv "$fixture/saved/$name" "/usr/bin/$name"
+      test -f "/usr/bin/$name" && test ! -L "/usr/bin/$name"
+      cmp "$fixture/stage" "/usr/bin/$name"
+    done
+    test ! -e "$case_dir/helpers.tsv.unexpected"
+    printf 'foreign optional helpers never executed; original helpers restored\n' > "/evidence/cli/$stage-layout.txt"
+  fi
   printf '%s\n' "$result" > "/evidence/cli/$stage-exit.txt"
   cp "$case_dir/helpers.tsv" "/evidence/cli/$stage-helpers.tsv"
   if test -f "$case_dir/run/omarchy-update.lock"; then
@@ -394,6 +454,9 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
         if stage == 'omarchy-optional-failures':
+            require((evidence / f'{stage}-layout.txt').read_text()
+                    == 'foreign optional helpers never executed; original helpers restored\n',
+                    'Optional Omarchy helper layout exclusion differs')
             require('snapshot' in log.lower() and 'mise' in log.lower(),
                     'Optional Omarchy update failures were not visible: ' + stage)
         elif stage == 'omarchy-vendor-failure':

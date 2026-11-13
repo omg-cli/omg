@@ -276,3 +276,109 @@ test("archive wrappers reject corrupt, mixed, recursive and empty corpora withou
         }
     } finally { await rm(directory, {recursive: true, force: true}); }
 });
+
+function largeCveFixture(id = "CVE-2026-1234", bytes = 2_402_038): string {
+    const description = {lang: "en", value: "Generated structured CNA/ADP fixture; preserve UTF8 é and raw whitespace."};
+    const payload = {
+        dataType: "CVE_RECORD", dataVersion: "5.2",
+        cveMetadata: {cveId: id, state: "PUBLISHED", dateUpdated: "2026-11-13T02:00:00.000Z", datePublished: "2026-11-11T00:00:00Z"},
+        containers: {
+            cna: {
+                providerMetadata: {orgId: "00000000-0000-4000-8000-000000000001", shortName: "fixture-CNA"},
+                descriptions: [description],
+                affected: [{vendor: "fixture-vendor", product: "fixture-product", defaultStatus: "unaffected",
+                    versions: Array.from({length: 11_000}, (_, index) => ({version: `${index}.0.0`, status: "affected", lessThan: `${index + 1}.0.0`, versionType: "semver"}))}],
+            },
+            adp: [{providerMetadata: {orgId: "00000000-0000-4000-8000-000000000002", shortName: "fixture-ADP"},
+                affected: Array.from({length: 1_600}, (_, index) => ({vendor: `vendor-${index}`, product: `product-${index}`, versions: [{version: `${index}.1`, status: "affected"}]}))}],
+        },
+    };
+    const encode = () => `\n${JSON.stringify(payload, null, 2)}\n`;
+    const padding = bytes - Buffer.byteLength(encode());
+    if (padding < 0) throw new Error("large CVE fixture structure exceeds requested byte size");
+    description.value += "x".repeat(padding);
+    const raw = encode();
+    if (Buffer.byteLength(raw) !== bytes) throw new Error("large CVE fixture byte size mismatch");
+    return raw;
+}
+
+test("large structured CVE records preserve exact raw bytes while complete envelopes split below four MiB", async () => {
+    const {mkdtemp, writeFile, rm} = await import("node:fs/promises");
+    const {tmpdir} = await import("node:os");
+    const {join} = await import("node:path");
+    const {LIMITS} = await import("../src/domain");
+    const directory = await mkdtemp(join(tmpdir(), "advisory-large-cve-"));
+    const archive = join(directory, "archive.zip");
+    const records = [largeCveFixture(), largeCveFixture("CVE-2026-1235")];
+    const baseline = {digest: "a".repeat(64), instance_id: "a".repeat(32), session_id: "a".repeat(36), endpoint: "https://advisories.example"};
+    const encode = (batch: string[]) => JSON.stringify({source: "cve", records: batch, baseline});
+    expect(Buffer.byteLength(encode(records))).toBeGreaterThan(LIMITS.batch);
+    const received: string[] = [];
+    const bodies: string[] = [];
+    try {
+        await writeFile(archive, storedZip(records));
+        const digest = await fileHash(archive);
+        const state: ArchiveState = {digest, next_entry: 0, accepted: 0, exhausted: false, finished_at: null};
+        await scanArchive({path: archive, digest, state, maxRecords: 2, encodeBatch: encode,
+            send: async (body) => {
+                expect(Buffer.byteLength(body)).toBeLessThanOrEqual(4 * 1024 ** 2);
+                bodies.push(body);
+                received.push(...parseBatch(JSON.parse(body)));
+            }, save: async () => {}});
+        expect(received).toEqual(records);
+        expect(bodies.length).toBe(2);
+        expect(state.accepted).toBe(2);
+        expect(state.exhausted).toBe(true);
+    } finally {
+        await rm(directory, {recursive: true, force: true});
+    }
+});
+
+test("CVE raw allowance does not admit a single escaped envelope above four MiB", async () => {
+    const {mkdtemp, writeFile, rm} = await import("node:fs/promises");
+    const {tmpdir} = await import("node:os");
+    const {join} = await import("node:path");
+    const raw = JSON.stringify({dataType: "CVE_RECORD", dataVersion: "5.2",
+        cveMetadata: {cveId: "CVE-2026-1234", state: "PUBLISHED", dateUpdated: "2026-11-13T02:00:00.000Z", datePublished: "2026-11-11T00:00:00Z"},
+        containers: {cna: {descriptions: [{lang: "en", value: '"'.repeat(1_100_000)}]}}});
+    expect(Buffer.byteLength(raw)).toBeLessThan(3 * 1024 ** 2);
+    expect(Buffer.byteLength(encodeBatch([raw]))).toBeGreaterThan(4 * 1024 ** 2);
+    const directory = await mkdtemp(join(tmpdir(), "advisory-escaped-cve-"));
+    const archive = join(directory, "archive.zip");
+    let sends = 0;
+    try {
+        await writeFile(archive, storedZip([raw]));
+        const digest = await fileHash(archive);
+        const state: ArchiveState = {digest, next_entry: 0, accepted: 0, exhausted: false, finished_at: null};
+        await expect(scanArchive({path: archive, digest, state, maxRecords: 1, encodeBatch,
+            send: async () => { sends++; }, save: async () => {}})).rejects.toThrow("encoded ingest batch exceeds limit");
+        expect(sends).toBe(0);
+        expect(state.accepted).toBe(0);
+        expect(state.next_entry).toBe(0);
+        expect(state.exhausted).toBe(false);
+    } finally {
+        await rm(directory, {recursive: true, force: true});
+    }
+});
+
+test("archive raw CVE records above three MiB fail before send or checkpoint advancement", async () => {
+    const {mkdtemp, writeFile, rm} = await import("node:fs/promises");
+    const {tmpdir} = await import("node:os");
+    const {join} = await import("node:path");
+    const directory = await mkdtemp(join(tmpdir(), "advisory-oversize-cve-"));
+    const archive = join(directory, "archive.zip");
+    let sends = 0;
+    try {
+        await writeFile(archive, storedZip([largeCveFixture("CVE-2026-1234", 3 * 1024 ** 2 + 1)]));
+        const digest = await fileHash(archive);
+        const state: ArchiveState = {digest, next_entry: 0, accepted: 0, exhausted: false, finished_at: null};
+        await expect(scanArchive({path: archive, digest, state, maxRecords: 1, encodeBatch,
+            send: async () => {sends++;}, save: async () => {}})).rejects.toThrow("oversize");
+        expect(sends).toBe(0);
+        expect(state.accepted).toBe(0);
+        expect(state.next_entry).toBe(0);
+        expect(state.exhausted).toBe(false);
+    } finally {
+        await rm(directory, {recursive: true, force: true});
+    }
+});

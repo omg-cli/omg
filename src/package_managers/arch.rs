@@ -146,6 +146,17 @@ impl PackageManager for ArchPackageManager {
             use anyhow::Context;
             async {
                 let mut before = self.security_inventory().await?;
+                if before.is_empty() {
+                    anyhow::ensure!(
+                        self.security_inventory().await?.is_empty(),
+                        "Installed packages changed during native security audit"
+                    );
+                    return Ok(
+                        crate::core::security::scan::SecurityAuditResult::from_assessments(
+                            Vec::new(),
+                        ),
+                    );
+                }
                 let operation = crate::core::security::vulnerability::VulnerabilityScanner::new()
                     .assess_arch_operation(
                         &before,
@@ -512,6 +523,94 @@ pub async fn is_installed(package: &str) -> AnyhowResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn empty_native_audit_reports_exact_scope_and_preserves_inventory_failures() -> AnyhowResult<()>
+    {
+        const NAME: &str = "package_managers::arch::tests::empty_native_audit_reports_exact_scope_and_preserves_inventory_failures";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        assert!(!crate::core::is_root());
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = root.join("var/lib/pacman");
+        let local = database.join("local");
+        std::fs::create_dir_all(&local)?;
+        std::fs::create_dir_all(database.join("sync"))?;
+        let version_file = local.join("ALPM_DB_VERSION");
+        std::fs::write(&version_file, "9\n")?;
+        let config = directory.path().join("pacman.conf");
+        let config_bytes = "[options]\nSigLevel = Never\n";
+        std::fs::write(&config, config_bytes)?;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+                crate::package_managers::alpm_direct::clear_alpm_cache();
+            }
+        }
+        let _restore = Restore;
+        crate::core::paths::set_test_overrides(Some(root), Some(database));
+        crate::package_managers::alpm_direct::clear_alpm_cache();
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
+            ],
+            || -> AnyhowResult<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let manager = ArchPackageManager::new();
+                    assert!(manager.security_inventory().await?.is_empty());
+                    for round in 0..2 {
+                        let result = manager
+                            .security_audit()
+                            .expect("native audit owner")
+                            .await?;
+                        assert_eq!(result.total_vulnerabilities, 0);
+                        assert_eq!(result.high_severity, 0);
+                        assert!(result.vulnerabilities.is_empty());
+                        assert!(matches!(result.coverage,
+                            crate::core::security::scan::AuditCoverage::Reported {
+                                assessed, unassessed, sources,
+                            } if assessed.is_empty() && unassessed.is_empty() && sources.is_empty()
+                        ));
+                        assert_eq!(std::fs::read(&version_file)?, b"9\n");
+                        assert_eq!(std::fs::read_dir(&local)?.count(), 1);
+                        assert_eq!(std::fs::read(&config)?, config_bytes.as_bytes());
+                        if round == 0 {
+                            std::fs::remove_file(&config)?;
+                            crate::package_managers::alpm_direct::clear_alpm_cache();
+                            let error = manager
+                                .security_audit()
+                                .expect("native audit owner")
+                                .await
+                                .expect_err("empty database cannot hide an inventory-source error");
+                            let message = format!("{error:#}");
+                            assert!(
+                                message.contains("Failed to query native security advisories"),
+                                "{message}"
+                            );
+                            assert!(message.contains("pacman.conf"), "{message}");
+                            std::fs::write(&config, config_bytes)?;
+                            crate::package_managers::alpm_direct::clear_alpm_cache();
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        )
+    }
 
     #[tokio::test]
     async fn failed_write_still_completes_once() {

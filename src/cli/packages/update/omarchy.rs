@@ -213,8 +213,143 @@ fn stage_command(stage: Stage) -> Option<(&'static str, &'static [&'static str])
     })
 }
 
+#[derive(Clone, Debug)]
+struct OmarchyRuntime {
+    root: PathBuf,
+    migration_state: PathBuf,
+}
+
+impl OmarchyRuntime {
+    fn discover() -> Result<Self> {
+        if let Some(requested) = std::env::var_os("OMARCHY_PATH") {
+            anyhow::ensure!(!requested.is_empty(), "OMARCHY_PATH must be non-empty");
+        }
+        let migration_state = Self::migration_state()?;
+        let migrate = crate::core::privilege::root_controlled_program_path("omarchy-migrate")?;
+        let root = Self::root_for_migrate(&migrate)?;
+        Self::validate_root_directory(&root)?;
+        let runtime = Self {
+            root,
+            migration_state,
+        };
+        runtime.validate_available_helpers()?;
+        Ok(runtime)
+    }
+
+    fn root_for_migrate(program: &Path) -> Result<PathBuf> {
+        if program == Path::new("/usr/bin/omarchy-migrate") {
+            return Ok(PathBuf::from("/usr/share/omarchy"));
+        }
+        let bin = program
+            .parent()
+            .context("Omarchy migration helper lacks parent")?;
+        anyhow::ensure!(
+            program.is_absolute()
+                && program
+                    .file_name()
+                    .is_some_and(|name| name == "omarchy-migrate")
+                && bin.file_name().is_some_and(|name| name == "bin"),
+            "Trusted Omarchy migration helper has an unsupported runtime layout"
+        );
+        Ok(bin
+            .parent()
+            .context("Omarchy runtime root is missing")?
+            .to_owned())
+    }
+
+    fn validate_root_directory(root: &Path) -> Result<()> {
+        anyhow::ensure!(
+            std::fs::canonicalize(root).context("Cannot resolve selected Omarchy runtime")? == root,
+            "Selected Omarchy runtime must be canonical"
+        );
+        for path in root.ancestors() {
+            let metadata = std::fs::metadata(path)?;
+            anyhow::ensure!(
+                metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+                "Selected Omarchy runtime directory is not root-controlled"
+            );
+        }
+        Ok(())
+    }
+
+    fn migration_state() -> Result<PathBuf> {
+        let state = match std::env::var_os("OMARCHY_MIGRATION_STATE") {
+            Some(path) => PathBuf::from(path),
+            None => dirs::home_dir()
+                .context("Omarchy update requires the session user's home")?
+                .join(".local/state/omarchy/migrations"),
+        };
+        anyhow::ensure!(
+            !state.as_os_str().is_empty(),
+            "OMARCHY_MIGRATION_STATE must be non-empty"
+        );
+        std::path::absolute(state).context("Cannot resolve Omarchy migration state")
+    }
+
+    fn check_helper_layout(&self, name: &str, program: &Path) -> Result<()> {
+        let packaged = self.root == Path::new("/usr/share/omarchy")
+            && program == Path::new("/usr/bin").join(name);
+        anyhow::ensure!(
+            packaged || program == self.root.join("bin").join(name),
+            "Trusted Omarchy helper {name} does not match the selected runtime"
+        );
+        Ok(())
+    }
+
+    fn validate_available_helpers(&self) -> Result<()> {
+        for stage in [
+            Stage::Preflight,
+            Stage::Prune,
+            Stage::InhibitSleep,
+            Stage::DevelopmentCheckout,
+            Stage::Keyrings,
+            Stage::OfficialPackages,
+            Stage::MigrationsPending,
+            Stage::Migrations,
+            Stage::Orphans,
+            Stage::AnalyzeLog,
+            Stage::ClearIndicator,
+            Stage::RestartServices,
+            Stage::PostUpdateHooks,
+            Stage::VerifyBoot,
+            Stage::ReleaseInhibitor,
+            Stage::RebootPrompt,
+        ] {
+            let (name, _) = stage_command(stage).context("Missing Omarchy helper mapping")?;
+            if let Ok(program) = crate::core::privilege::root_controlled_program_path(name) {
+                self.check_helper_layout(name, &program)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_pending_migrations(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.root.as_os_str().is_empty(),
+            "OMARCHY_PATH must be non-empty"
+        );
+        anyhow::ensure!(
+            !self.migration_state.as_os_str().is_empty(),
+            "OMARCHY_MIGRATION_STATE must be non-empty"
+        );
+        ensure_migrations_use_native_aur(&self.root.join("migrations"), &self.migration_state)
+    }
+
+    fn notice_normalization(&self) {
+        if std::env::var_os("OMARCHY_PATH")
+            .is_some_and(|requested| Path::new(&requested) != self.root)
+        {
+            crate::cli::modern_ui::print_info(&format!(
+                "Using Omarchy runtime {} selected by trusted system helpers.",
+                crate::cli::style::sanitize_terminal_text(&self.root.display().to_string())
+            ));
+        }
+    }
+}
+
 struct Commands {
     yes: bool,
+    runtime: OmarchyRuntime,
     authorization: Option<tokio::task::JoinHandle<()>>,
     inhibitor_attempted: bool,
     active: Option<tokio::process::Child>,
@@ -245,9 +380,10 @@ fn set_foreground(group: nix::unistd::Pid) -> Result<()> {
 }
 
 impl Commands {
-    const fn new(yes: bool) -> Self {
+    const fn new(yes: bool, runtime: OmarchyRuntime) -> Self {
         Self {
             yes,
+            runtime,
             authorization: None,
             inhibitor_attempted: false,
             active: None,
@@ -258,10 +394,12 @@ impl Commands {
     async fn run_program(&mut self, program: &Path, args: &[&str]) -> Result<ExitStatus> {
         anyhow::ensure!(self.active.is_none(), "An Omarchy stage is already running");
         let mut command = Command::new(program);
-        command.args(args).kill_on_drop(true).process_group(0).env(
-            "OMARCHY_PATH",
-            std::env::var_os("OMARCHY_PATH").unwrap_or_else(|| "/usr/share/omarchy".into()),
-        );
+        command
+            .args(args)
+            .kill_on_drop(true)
+            .process_group(0)
+            .env("OMARCHY_PATH", &self.runtime.root)
+            .env("OMARCHY_MIGRATION_STATE", &self.runtime.migration_state);
         command.env_remove(LOCK_FD).env_remove(LOG_FD);
         if self.yes {
             command.env("OMARCHY_UPDATE_UNATTENDED", "1");
@@ -403,7 +541,9 @@ impl StageExecutor for Commands {
                 return Ok(Outcome::Success);
             }
             Stage::MigrationPreflight => {
-                check_pending_migrations()?;
+                OmarchyRuntime::validate_root_directory(&self.runtime.root)?;
+                self.runtime.validate_available_helpers()?;
+                self.runtime.check_pending_migrations()?;
                 return Ok(Outcome::Success);
             }
             Stage::ReleaseAuthorization => {
@@ -421,6 +561,13 @@ impl StageExecutor for Commands {
             }
             Err(error) => return Err(error),
         };
+        if program.starts_with("omarchy-") {
+            OmarchyRuntime::validate_root_directory(&self.runtime.root)?;
+            if stage == Stage::Prune {
+                self.runtime.validate_available_helpers()?;
+            }
+            self.runtime.check_helper_layout(program, &executable)?;
+        }
         if stage == Stage::InhibitSleep {
             self.inhibitor_attempted = true;
         }
@@ -457,27 +604,6 @@ impl StageExecutor for Commands {
         }
         anyhow::bail!("Omarchy stage {program} did not complete: {status}")
     }
-}
-
-fn check_pending_migrations() -> Result<()> {
-    let root = std::env::var_os("OMARCHY_PATH")
-        .map_or_else(|| PathBuf::from("/usr/share/omarchy"), PathBuf::from);
-    let state = match std::env::var_os("OMARCHY_MIGRATION_STATE") {
-        Some(path) => PathBuf::from(path),
-        None => dirs::home_dir()
-            .context("Omarchy update requires the session user's home")?
-            .join(".local/state/omarchy/migrations"),
-    };
-    anyhow::ensure!(
-        !root.as_os_str().is_empty(),
-        "OMARCHY_PATH must be non-empty"
-    );
-    anyhow::ensure!(
-        !state.as_os_str().is_empty(),
-        "OMARCHY_MIGRATION_STATE must be non-empty"
-    );
-    ensure_migrations_use_native_aur(&root.join("migrations"), &state)?;
-    Ok(())
 }
 
 fn ensure_migrations_use_native_aur(migrations: &Path, state: &Path) -> Result<()> {
@@ -884,7 +1010,13 @@ fn open_transport_pty(_saved: Option<&nix::sys::termios::Termios>) -> Result<(Fi
     anyhow::bail!("Omarchy update terminals require Linux")
 }
 
-async fn execute_logged(program: &Path, args: &[&str], lock: &File, log: &File) -> Result<()> {
+async fn execute_logged(
+    program: &Path,
+    args: &[&str],
+    lock: &File,
+    log: &File,
+    runtime: &OmarchyRuntime,
+) -> Result<()> {
     use std::io::Write;
     let mut interruptions = Interruptions::new()?;
     let (mut input, terminal) = terminal_input()?;
@@ -921,10 +1053,8 @@ async fn execute_logged(program: &Path, args: &[&str], lock: &File, log: &File) 
         .stderr(Stdio::from(slave))
         .env(LOCK_FD, lock_fd.to_string())
         .env(LOG_FD, log_fd.to_string())
-        .env(
-            "OMARCHY_PATH",
-            std::env::var_os("OMARCHY_PATH").unwrap_or_else(|| "/usr/share/omarchy".into()),
-        )
+        .env("OMARCHY_PATH", &runtime.root)
+        .env("OMARCHY_MIGRATION_STATE", &runtime.migration_state)
         .kill_on_drop(true);
     // SAFETY: only integer descriptor operations run after fork. The local
     // handoff Files remain open through spawn, their clones are above stdio,
@@ -1058,11 +1188,13 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
         return Ok(false);
     };
     ensure_mutation_context()?;
-    check_pending_migrations()?;
+    let runtime = OmarchyRuntime::discover()?;
+    runtime.check_pending_migrations()?;
     let lock_transport = std::env::var(LOCK_FD).ok();
     let inherited_log = std::env::var(LOG_FD).ok();
     match (lock_transport, inherited_log) {
         (None, None) => {
+            runtime.notice_normalization();
             let lock = open_owned_file(&lock_path())?;
             lock.try_lock()
                 .context("An Omarchy update is already running")?;
@@ -1081,9 +1213,16 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
             if settings.aur.review_pkgbuild {
                 arguments.push("--review");
             }
-            execute_logged(&executable, &arguments, &lock, &log).await?;
+            execute_logged(&executable, &arguments, &lock, &log, &runtime).await?;
         }
         (Some(lock_descriptor), Some(log_descriptor)) => {
+            anyhow::ensure!(
+                std::env::var_os("OMARCHY_PATH")
+                    .is_some_and(|path| Path::new(&path) == runtime.root)
+                    && std::env::var_os("OMARCHY_MIGRATION_STATE")
+                        .is_some_and(|path| Path::new(&path) == runtime.migration_state),
+                "Omarchy runtime changed during coordinator handoff"
+            );
             anyhow::ensure!(
                 lock_descriptor != log_descriptor,
                 "Omarchy transport descriptors overlap"
@@ -1097,7 +1236,7 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
                     && log.metadata()?.len() > 0,
                 "Omarchy update transport has no active PTY transcript"
             );
-            let mut executor = Commands::new(yes);
+            let mut executor = Commands::new(yes, runtime);
             let result = tokio::select! {
                 result = workflow(&mut executor, yes) => result,
                 signal = interrupt() => {
@@ -1124,6 +1263,14 @@ mod tests {
             .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
             .expect("private Omarchy fixture")
+    }
+
+    fn transport_runtime() -> OmarchyRuntime {
+        OmarchyRuntime {
+            root: PathBuf::from("/usr/share/omarchy"),
+            migration_state: std::path::absolute("markers")
+                .expect("private transport migration state"),
+        }
     }
 
     #[derive(Default)]
@@ -1368,7 +1515,14 @@ mod tests {
                 .security_profile,
             crate::config::AurSecurityProfile::Standard
         );
-        let error = check_pending_migrations()
+        let runtime = OmarchyRuntime {
+            root: PathBuf::from(std::env::var_os("OMARCHY_PATH").expect("private migration root")),
+            migration_state: PathBuf::from(
+                std::env::var_os("OMARCHY_MIGRATION_STATE").expect("private migration state"),
+            ),
+        };
+        let error = runtime
+            .check_pending_migrations()
             .expect_err("Standard must refuse a known external AUR helper");
         assert!(
             error.to_string().contains("external AUR helper"),
@@ -1382,11 +1536,17 @@ mod tests {
             return;
         };
         let root = PathBuf::from(root);
-        let mut commands = Commands::new(false);
+        let runtime = OmarchyRuntime {
+            root: PathBuf::from(std::env::var_os("OMARCHY_PATH").expect("private checkout root")),
+            migration_state: PathBuf::from(
+                std::env::var_os("OMARCHY_MIGRATION_STATE").expect("private checkout state"),
+            ),
+        };
+        let commands = Commands::new(false, runtime);
         if let Ok(variable) = std::env::var("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE") {
             let error = commands
-                .execute(Stage::MigrationPreflight)
-                .await
+                .runtime
+                .check_pending_migrations()
                 .expect_err("explicitly empty migration paths must fail preflight");
             let diagnostic = error.to_string();
             assert!(
@@ -1399,21 +1559,18 @@ mod tests {
             );
             return;
         }
-        assert_eq!(
-            commands
-                .execute(Stage::MigrationPreflight)
-                .await
-                .expect("user checkout migration data must pass preflight"),
-            Outcome::Success
-        );
+        commands
+            .runtime
+            .check_pending_migrations()
+            .expect("user checkout migration data must pass preflight");
         std::fs::write(
             root.join("migrations/0002.sh"),
             "omarchy-pkg-aur-add brave-origin-bin\n",
         )
         .expect("inert external helper migration");
         let error = commands
-            .execute(Stage::MigrationPreflight)
-            .await
+            .runtime
+            .check_pending_migrations()
             .expect_err("user checkout must still refuse external AUR migrations");
         assert!(
             error.to_string().contains("external AUR helper"),
@@ -1652,7 +1809,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_worker_failure_does_not_prevent_cleanup_or_reuse() {
-        let mut commands = Commands::new(false);
+        let mut commands = Commands::new(false, transport_runtime());
         let worker = tokio::spawn(async { panic!("isolated authorization worker failure") });
         tokio::time::timeout(Duration::from_secs(5), async {
             while !worker.is_finished() {
@@ -1725,7 +1882,7 @@ mod tests {
             sigaction(Signal::SIGCHLD, &autoreap).expect("enable kernel auto-reaping");
             previous
         };
-        let mut commands = Commands::new(false);
+        let mut commands = Commands::new(false, transport_runtime());
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             commands.run_program(
@@ -1824,7 +1981,7 @@ mod tests {
         let owner = private_directory();
         let shell =
             crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
-        let mut commands = Commands::new(false);
+        let mut commands = Commands::new(false, transport_runtime());
         let mut first = Command::new(&shell);
         first
             .args(["-c", "exec sleep 30"])
@@ -1883,8 +2040,7 @@ mod tests {
             &shell,
             &["-c", "IFS= read -r value; printf 'received:<%s>\\n' \"$value\"; if IFS= read -r extra; then exit 19; fi"],
             &lock,
-            &log,
-        ).await.expect("pipe bytes and EOF reach the owned terminal");
+            &log, &transport_runtime()).await.expect("pipe bytes and EOF reach the owned terminal");
         let transcript = std::fs::read_to_string(root.join("log")).expect("pipe transcript");
         assert!(
             transcript.contains("received:<literal; $(not-a-command) \\tail>"),
@@ -2003,7 +2159,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_commands_preserve_status_and_cancelled_children_are_reaped() {
-        let mut commands = Commands::new(false);
+        let mut commands = Commands::new(false, transport_runtime());
         let program =
             crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
         assert_eq!(
@@ -2077,7 +2233,7 @@ mod tests {
         let ready = owner.path().join("descendant");
         let program =
             crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
-        let mut commands = Commands::new(false);
+        let mut commands = Commands::new(false, transport_runtime());
         let arguments = [
             "-c",
             r#"sh -c 'trap "" TERM; printf %s "$$" > "$1"; exec sleep 30' fixture "$1" & wait"#,
@@ -2129,7 +2285,7 @@ mod tests {
         if std::env::var_os("OMG_OMARCHY_HANGUP_FIXTURE").is_none() {
             return;
         }
-        let mut commands = Commands::new(false);
+        let mut commands = Commands::new(false, transport_runtime());
         commands.authorization = Some(tokio::spawn(std::future::pending()));
         let mut interrupted = Box::pin(interrupt());
         tokio::select! {
@@ -2155,7 +2311,7 @@ mod tests {
             return;
         };
         let root = PathBuf::from(root);
-        let mut commands = Commands::new(false);
+        let mut commands = Commands::new(false, transport_runtime());
         commands.foreground = Some(
             foreground_group()
                 .expect("attached fixture terminal")
@@ -2337,7 +2493,13 @@ mod tests {
         ];
         let result = tokio::time::timeout(
             Duration::from_secs(8),
-            assert_send(execute_logged(&env, &arguments, &lock, &log)),
+            assert_send(execute_logged(
+                &env,
+                &arguments,
+                &lock,
+                &log,
+                &transport_runtime(),
+            )),
         )
         .await
         .expect("transcript failure must drain and reap inner cleanup");
@@ -2419,6 +2581,7 @@ mod tests {
             ],
             &lock,
             &log,
+            &transport_runtime(),
         )
         .await;
         trigger.await.expect("isolated signal trigger");
@@ -2561,6 +2724,7 @@ mod tests {
             ],
             &lock,
             &log,
+            &transport_runtime(),
         )
         .await
         .expect("PTY hangup fixture completes graceful cleanup");
@@ -2717,8 +2881,7 @@ mod tests {
                         "test -t 0 && test -t 1 && test -f \"/proc/self/fd/$OMG_OMARCHY_LOCK_FD\" && test -f \"/proc/self/fd/$OMG_OMARCHY_LOG_FD\"",
                     ],
                     &lock,
-                    &log,
-                )
+                    &log, &transport_runtime())
                 .await?;
                 launches += 1;
             }
@@ -2772,6 +2935,7 @@ mod tests {
             ],
             &lock,
             &log,
+            &transport_runtime(),
         )
         .await
         .expect("inert PTY child");
@@ -2790,6 +2954,7 @@ mod tests {
             &["-c", "printf failed-stage; exit 7"],
             &lock,
             &log,
+            &transport_runtime(),
         )
         .await
         .expect_err("failed PTY command");
@@ -2811,7 +2976,7 @@ mod tests {
             .expect("PTY foreground");
         let program =
             crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
-        let mut commands = Commands::new(false);
+        let mut commands = Commands::new(false, transport_runtime());
         let status = commands
             .run_program(
                 &program,
@@ -2868,6 +3033,7 @@ mod tests {
             ],
             &lock,
             &log,
+            &transport_runtime(),
         )
         .await
         .expect("inert foreground PTY workflow");
@@ -3165,5 +3331,307 @@ mod tests {
             saved,
             "new slave receives saved terminal settings"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_environment_fixture() -> Result<()> {
+        let Some(mode) = std::env::var_os("OMG_OMARCHY_RUNTIME_ENV_FIXTURE") else {
+            return Ok(());
+        };
+        let directory = std::env::current_dir()?;
+        let observed = directory.join("observed-environment");
+        let shell = crate::core::privilege::root_controlled_program_path("sh")?;
+        let runtime = OmarchyRuntime {
+            root: PathBuf::from("/usr/share/omarchy"),
+            migration_state: OmarchyRuntime::migration_state()?,
+        };
+        let args = [
+            "-c",
+            "printf '%s\\n%s\\n' \"$OMARCHY_PATH\" \"$OMARCHY_MIGRATION_STATE\" > \"$1\"",
+            "runtime-fixture",
+            observed
+                .to_str()
+                .context("private runtime observation path is UTF8")?,
+        ];
+        if mode == "stage" {
+            let mut commands = Commands::new(false, runtime.clone());
+            let status =
+                tokio::time::timeout(Duration::from_secs(10), commands.run_program(&shell, &args))
+                    .await
+                    .context("inert stage environment observation timed out")??;
+            anyhow::ensure!(status.success(), "inert stage observation failed");
+        } else {
+            anyhow::ensure!(mode == "coordinator", "unknown runtime environment fixture");
+            let lock = open_owned_file(&directory.join("lock"))?;
+            lock.try_lock()?;
+            let log = open_owned_file(&directory.join("log"))?;
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                execute_logged(&shell, &args, &lock, &log, &runtime),
+            )
+            .await
+            .context("inert coordinator environment observation timed out")??;
+        }
+        assert_eq!(
+            std::fs::read_to_string(observed)?,
+            format!(
+                "/usr/share/omarchy\n{}\n",
+                directory.join("markers").display()
+            ),
+            "selected installed runtime and resolved migration state must reach the actual child instead of caller checkout/relative environment"
+        );
+        Ok(())
+    }
+
+    fn check_runtime_environment(mode: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = private_directory();
+        let checkout = owner.path().join("caller-checkout");
+        std::fs::create_dir_all(checkout.join("bin")).expect("private caller checkout");
+        std::fs::create_dir(owner.path().join("markers")).expect("private migration markers");
+        let sentinel = checkout.join("bin/omarchy-migrate");
+        std::fs::write(
+            &sentinel,
+            "#!/bin/sh\nprintf executed > \"$OMARCHY_PATH/executed\"\nexit 88\n",
+        )
+        .expect("caller checkout executable sentinel");
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o700))
+            .expect("caller sentinel mode");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "cli::packages::update::omarchy::tests::runtime_environment_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(owner.path())
+            .env("OMG_OMARCHY_RUNTIME_ENV_FIXTURE", mode)
+            .env("OMARCHY_PATH", &checkout)
+            .env("OMARCHY_MIGRATION_STATE", "markers")
+            .stdin(Stdio::null())
+            .output()
+            .expect("isolated inert runtime observation");
+        assert!(
+            !checkout.join("executed").exists(),
+            "caller checkout executable must never run"
+        );
+        assert!(
+            output.status.success(),
+            "{mode} runtime environment observation failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn stage_children_receive_selected_runtime_instead_of_caller_checkout() {
+        check_runtime_environment("stage");
+    }
+
+    #[test]
+    fn coordinator_child_receives_selected_runtime_instead_of_caller_checkout() {
+        check_runtime_environment("coordinator");
+    }
+
+    #[test]
+    fn runtime_layout_binds_packaged_and_trusted_checkout_helpers_without_mixing_roots() {
+        let packaged = OmarchyRuntime::root_for_migrate(Path::new("/usr/bin/omarchy-migrate"))
+            .expect("packaged migration layout");
+        assert_eq!(packaged, Path::new("/usr/share/omarchy"));
+        let runtime = OmarchyRuntime {
+            root: packaged,
+            migration_state: PathBuf::from("/private/markers"),
+        };
+        runtime
+            .check_helper_layout(
+                "omarchy-update-stay-awake",
+                Path::new("/usr/bin/omarchy-update-stay-awake"),
+            )
+            .expect("packaged protected helper layout");
+        assert!(
+            runtime
+                .check_helper_layout(
+                    "omarchy-update-stay-awake",
+                    Path::new("/opt/other/bin/omarchy-update-stay-awake")
+                )
+                .is_err()
+        );
+        let checkout =
+            OmarchyRuntime::root_for_migrate(Path::new("/opt/trusted-omarchy/bin/omarchy-migrate"))
+                .expect("trusted selected executable can define its own checkout layout");
+        assert_eq!(checkout, Path::new("/opt/trusted-omarchy"));
+        let runtime = OmarchyRuntime {
+            root: checkout,
+            migration_state: PathBuf::from("/private/markers"),
+        };
+        runtime
+            .check_helper_layout(
+                "omarchy-update-stay-awake",
+                Path::new("/opt/trusted-omarchy/bin/omarchy-update-stay-awake"),
+            )
+            .expect("same selected checkout layout");
+        assert!(
+            runtime
+                .check_helper_layout(
+                    "omarchy-update-stay-awake",
+                    Path::new("/usr/bin/omarchy-update-stay-awake")
+                )
+                .is_err()
+        );
+        for invalid in [
+            "omarchy-migrate",
+            "/opt/omarchy/tools/omarchy-migrate",
+            "/opt/omarchy/bin/other",
+        ] {
+            assert!(
+                OmarchyRuntime::root_for_migrate(Path::new(invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        let private = private_directory();
+        assert!(
+            OmarchyRuntime::validate_root_directory(private.path()).is_err(),
+            "a user-writable ancestor cannot become a trusted runtime root"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_migration_runtime_fixture() -> Result<()> {
+        let Some(selected) = std::env::var_os("OMG_OMARCHY_SELECTED_RUNTIME_FIXTURE") else {
+            return Ok(());
+        };
+        if let Ok(variable) = std::env::var("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE") {
+            let error = OmarchyRuntime::discover()
+                .expect_err("explicit empty runtime variables refuse before helper discovery");
+            assert!(
+                error.to_string().contains(&variable) && error.to_string().contains("non-empty"),
+                "{error:#}"
+            );
+            return Ok(());
+        }
+        let selected = PathBuf::from(selected);
+        let runtime = OmarchyRuntime {
+            root: selected.clone(),
+            migration_state: OmarchyRuntime::migration_state()?,
+        };
+        assert_eq!(
+            runtime.migration_state,
+            std::env::current_dir()?.join("markers")
+        );
+        let mut commands = Commands::new(false, runtime);
+        if std::env::var_os("OMG_OMARCHY_SELECTED_FORBIDDEN_FIXTURE").is_some() {
+            let error = commands
+                .runtime
+                .check_pending_migrations()
+                .expect_err("selected runtime external AUR migration must refuse");
+            assert!(
+                error.to_string().contains("external AUR helper"),
+                "{error:#}"
+            );
+            std::fs::write(
+                commands.runtime.migration_state.join("0001.sh"),
+                b"complete",
+            )?;
+            commands.runtime.check_pending_migrations()?;
+        } else {
+            commands.runtime.check_pending_migrations()?;
+        }
+        let shell = crate::core::privilege::root_controlled_program_path("sh")?;
+        let output = std::env::current_dir()?.join("selected-runtime-observed");
+        let status = commands
+            .run_program(
+                &shell,
+                &[
+                    "-c",
+                    "printf '%s' \"$OMARCHY_PATH\" > \"$1\"",
+                    "runtime-fixture",
+                    output.to_str().context("private output UTF8")?,
+                ],
+            )
+            .await?;
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(output)?,
+            selected.to_str().context("selected root UTF8")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_runtime_migrations_are_scanned_instead_of_the_caller_checkout() {
+        for (selected_forbidden, empty) in [
+            (false, None),
+            (true, None),
+            (false, Some("OMARCHY_PATH")),
+            (false, Some("OMARCHY_MIGRATION_STATE")),
+        ] {
+            let owner = private_directory();
+            let selected = owner.path().join("selected-runtime");
+            let caller = owner.path().join("caller-checkout");
+            for path in [
+                selected.join("migrations"),
+                caller.join("migrations"),
+                caller.join("bin"),
+                owner.path().join("markers"),
+            ] {
+                std::fs::create_dir_all(path).expect("private split-runtime directory");
+            }
+            let (selected_text, caller_text) = if selected_forbidden {
+                (
+                    "omarchy-pkg-aur-add forbidden-fixture\n",
+                    "echo inert migration\n",
+                )
+            } else {
+                (
+                    "echo inert migration\n",
+                    "omarchy-pkg-aur-add forbidden-caller-fixture\n",
+                )
+            };
+            std::fs::write(selected.join("migrations/0001.sh"), selected_text)
+                .expect("selected runtime migration");
+            std::fs::write(caller.join("migrations/0001.sh"), caller_text)
+                .expect("caller migration");
+            std::fs::write(
+                caller.join("bin/omarchy-migrate"),
+                "#!/bin/sh\nprintf executed > \"$OMARCHY_PATH/executed\"\nexit 88\n",
+            )
+            .expect("caller executable sentinel");
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test executable"));
+            command
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::selected_migration_runtime_fixture",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .current_dir(owner.path())
+                .env("OMG_OMARCHY_SELECTED_RUNTIME_FIXTURE", &selected)
+                .env("OMARCHY_PATH", &caller)
+                .env("OMARCHY_MIGRATION_STATE", "markers")
+                .env_remove("OMG_OMARCHY_SELECTED_FORBIDDEN_FIXTURE")
+                .env_remove("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE");
+            if selected_forbidden {
+                command.env("OMG_OMARCHY_SELECTED_FORBIDDEN_FIXTURE", "1");
+            }
+            if let Some(variable) = empty {
+                command
+                    .env("OMG_OMARCHY_EMPTY_VARIABLE_FIXTURE", variable)
+                    .env(variable, "");
+            }
+            let output = command
+                .output()
+                .expect("isolated split-runtime migration data check");
+            assert!(
+                output.status.success(),
+                "selected_forbidden={selected_forbidden}, empty={empty:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !caller.join("executed").exists(),
+                "caller checkout program must never execute"
+            );
+        }
     }
 }

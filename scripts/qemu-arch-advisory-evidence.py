@@ -98,7 +98,7 @@ def validate_evidence(directory, archive, fixture):
             if phases[phase] != {"argv": argv, "exit_code": code}:
                 raise ValueError("native audit actual exit/command mismatch")
             if phase in {"direct-plain", "direct-findings", "daemon-plain", "daemon-findings"}:
-                oracle.verify_native_result(SimpleNamespace(returncode=code, stdout=text(phase + ".stdout"), stderr=text(phase + ".stderr")), finding)
+                oracle.verify_native_result(SimpleNamespace(returncode=code, stdout=text(phase + ".stdout"), stderr=text(phase + ".stderr")), finding, expected_possible=True)
         if ("Failed to query native security advisories" not in text("untrusted-tls.stderr")
                 or "Vulnerability scan found" in text("untrusted-tls.stderr") or "No vulnerabilities found" in text("untrusted-tls.stdout")):
             raise ValueError("native untrusted TLS did not fail closed")

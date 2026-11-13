@@ -125,7 +125,7 @@ export async function refreshCves(
     for (const { item } of batch) {
         const record = await upstream(item.url, null, fetcher);
         await store.cve(
-            await boundedBody(record.body, LIMITS.record),
+            await boundedBody(record.body, LIMITS.cveRecord),
             now,
             item.id,
         );

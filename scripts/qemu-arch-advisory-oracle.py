@@ -27,12 +27,21 @@ def arch_feed(version):
             dict(common, name="AVG-OMG-QEMU-NOT-AFFECTED", status="Not affected", fixed=None)]
 
 
-def verify_native_result(result, fail=False):
+def verify_native_result(result, fail=False, *, expected_possible=False):
+    assert type(expected_possible) is bool, "expected applicability mode must be boolean"
     assert result.returncode == int(fail), "wrong actual native audit exit"
     text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
     assert re.findall(r"^  (\S+) \(1 issues\):$", text, re.M) == ["glibc"]
     assert "Found 1 vulnerabilities (1 high severity)" in text
-    assert re.findall(r"^    → (\S+) - .*\[Advisory severity: (\S+)\]$", text, re.M) == [("AVG-OMG-QEMU-616", "Critical")]
+    suffix = r" \[possible match; applicability unverified\]" if expected_possible else ""
+    assert re.findall(r"^    → (\S+) - .*\[Advisory severity: (\S+)\]" + suffix + r"$", text, re.M) == [("AVG-OMG-QEMU-616", "Critical")]
+    if expected_possible:
+        scopes = re.findall(r"^  ⚠ Advisory scope: 0 assessed package\(s\), ([1-9][0-9]*) package\(s\) with unknown coverage; absence of findings does not establish safety\.$", text, re.M)
+        assert len(scopes) == 1, "installed Unknown inventory requires its explicit incomplete coverage warning"
+        assert text.count("Advisory scope:") == 1, "ambiguous advisory scope warning"
+    else:
+        assert "[possible match; applicability unverified]" not in text, "unexpected possible applicability"
+        assert "Advisory scope:" not in text, "unexpected incomplete advisory scope"
     assert "[Score:" not in text and "AVG-OMG-QEMU-FIXED" not in text and "AVG-OMG-QEMU-NOT-AFFECTED" not in text
     assert result.stderr.strip() == ("Error: Vulnerability scan found 1 finding(s)" if fail else "")
 
@@ -281,7 +290,7 @@ def main():
         for label, args, expected in [('direct-plain', ['audit', 'scan'], 0), ('direct-findings', ['audit', 'scan', '--fail-on-findings'], 1)]:
             start = len(events)
             result = run(label, args, expected=expected)
-            verify_native_result(result, expected == 1)
+            verify_native_result(result, expected == 1, expected_possible=True)
             receipt[label + '_requests'] = verify_arch_requests(events[start:], version, 1, 1)
         daemon_env = dict(env)
         daemon_env.pop('OMG_DISABLE_DAEMON')
@@ -308,7 +317,7 @@ def main():
             initial = counter('daemon-before')
             for label, args, expected in [('daemon-plain', ['audit', 'scan'], 0), ('daemon-findings', ['audit', 'scan', '--fail-on-findings'], 1)]:
                 result = run(label, args, environment=daemon_env, expected=expected)
-                verify_native_result(result, expected == 1)
+                verify_native_result(result, expected == 1, expected_possible=True)
             final = counter('daemon-after')
             assert final - initial == 2
             receipt['daemon_requests_delta'] = final - initial

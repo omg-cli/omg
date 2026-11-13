@@ -87,9 +87,11 @@ class HostedProducer(unittest.TestCase):
         helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
         sudo = script.split("<<'OMG_INERT_SUDO'\n", 1)[1].split('\nOMG_INERT_SUDO', 1)[0]
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
+            (root / 'bin').mkdir()
             trace = root / 'helpers.tsv'
-            env = dict(os.environ, OMARCHY_FIXTURE_CASE='omarchy-success', OMARCHY_HELPER_TRACE=str(trace))
+            env = dict(os.environ, OMARCHY_FIXTURE_CASE='omarchy-success',
+                       OMARCHY_HELPER_TRACE=str(trace), OMARCHY_PATH=str(root))
             for name, args, source, status in (
                     ('omarchy-update-dev', [], helper, 0),
                     ('omarchy-shell', ['-q', 'omarchy.system-update', 'clear'], helper, 0),
@@ -97,13 +99,61 @@ class HostedProducer(unittest.TestCase):
                     ('sudo', ['-n', 'true'], sudo, 0),
                     ('yay', ['-Sua'], helper, 99),
                     ('sudo', ['pacman', '-Syu'], sudo, 99)):
-                path = root / name
+                path = root / 'bin' / name
                 path.write_text(source)
                 result = subprocess.run([BASH, str(path), *args], env=env, text=True, capture_output=True)
                 self.assertEqual(result.returncode, status, result.stderr)
             self.assertEqual(trace.read_text().splitlines(), [
                 'omarchy-update-dev', 'omarchy-shell\t-q\tomarchy.system-update\tclear',
                 'sudo\ttrue', 'sudo\t-n\ttrue', 'yay\t-Sua'])
+
+    @unittest.skipIf(os.name == 'nt', 'Inert guest helper scripts require POSIX Bash')
+    def test_inert_omarchy_helper_rejects_mismatched_runtime_before_trace(self):
+        script = PRODUCER.omarchy_guest_script()
+        helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            checkout = root / 'checkout'
+            (checkout / 'bin').mkdir(parents=True)
+            other = root / 'other-checkout'
+            other.mkdir()
+            path = checkout / 'bin/omarchy-update-dev'
+            path.write_text(helper)
+            trace = root / 'helpers.tsv'
+            env = dict(os.environ, OMARCHY_FIXTURE_CASE='omarchy-success',
+                       OMARCHY_HELPER_TRACE=str(trace), OMARCHY_PATH=str(checkout))
+            accepted = subprocess.run([BASH, str(path)], env=env, text=True, capture_output=True)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertEqual(trace.read_text(), 'omarchy-update-dev\n')
+            trace.unlink()
+            env['OMARCHY_PATH'] = str(other)
+            refused = subprocess.run([BASH, str(path)], env=env, text=True, capture_output=True)
+            self.assertEqual(refused.returncode, 1, refused.stderr)
+            self.assertIn('OMARCHY_PATH does not match this Omarchy command.', refused.stderr)
+            self.assertFalse(trace.exists(), 'Rejected runtime must not execute a stage')
+
+    @unittest.skipIf(os.name == 'nt', 'Inert guest helper scripts require POSIX Bash')
+    def test_foreign_optional_helper_marks_execution_before_source_guard(self):
+        script = PRODUCER.omarchy_guest_script()
+        stage = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
+        prefix = script.split("<<'OMG_FOREIGN_OMARCHY_STAGE_PREFIX'\n", 1)[1].split(
+            '\nOMG_FOREIGN_OMARCHY_STAGE_PREFIX', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'installed').mkdir()
+            (root / 'foreign/bin').mkdir(parents=True)
+            helper = root / 'foreign/bin/omarchy-snapshot'
+            helper.write_text(prefix + '\n' + stage.split('\n', 1)[1])
+            trace = root / 'helpers.tsv'
+            env = dict(os.environ, OMARCHY_FIXTURE_CASE='omarchy-optional-failures',
+                       OMARCHY_HELPER_TRACE=str(trace), OMARCHY_PATH=str(root / 'installed'))
+            result = subprocess.run([BASH, str(helper), 'create'], env=env,
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('OMARCHY_PATH does not match this Omarchy command.', result.stderr)
+            self.assertEqual(Path(str(trace) + '.unexpected').read_text(),
+                             'foreign helper executed: ' + str(helper) + '\n')
+            self.assertFalse(trace.exists(), 'Foreign helper must fail before normal stage trace')
 
     @unittest.skipIf(os.name == 'nt', 'Native sync archive fixture requires POSIX tar')
     def test_omarchy_fixture_database_uses_supported_compression(self):
@@ -176,6 +226,9 @@ def evidence_fixture(root):
             (evidence / f'{stage}-coordination.txt').write_text(
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
+        if stage == 'omarchy-optional-failures':
+            (evidence / f'{stage}-layout.txt').write_text(
+                'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': '| System is up to date',
             'omarchy-optional-failures': '| System is up to date\n! Continuing without a snapshot\n! Some mise tools could not be updated',
@@ -225,6 +278,7 @@ class SupplementalEvidence(unittest.TestCase):
             'omarchy-skipped-aur': lambda e, p: (e / 'omarchy-success.log').write_text('only vendor commands ran'),
             'omarchy-false-transcript': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('fake output'),
             'omarchy-no-update-result': lambda e, p: (e / 'omarchy-success.log').write_text('No update result was emitted'),
+            'omarchy-foreign-helper-executed': lambda e, p: (e / 'omarchy-optional-failures-layout.txt').write_text('foreign helper executed'),
             'omarchy-hidden-optional-warnings': lambda e, p: (e / 'omarchy-optional-failures.log').write_text('| System is up to date'),
             'omarchy-old-logger': lambda e, p: (e / 'omarchy-success-transcript.log').write_text('Script started on fixture\nScript done on fixture\n'),
             'omarchy-no-cleanup': lambda e, p: (e / 'omarchy-success-coordination.txt').write_text('lock still held'),

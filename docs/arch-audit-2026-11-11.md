@@ -839,3 +839,85 @@ A separate Ubuntu QEMU trial completed its remove operation but failed final hea
 A disposable Arch KVM control reproduced disabled-handler refusal, ran the real vendor helper twice with identical configuration and capability evidence, and passed strict boot/serial health validation. Its prepared disks remained unchanged and it shut down cleanly. This verifies the helper lifecycle correction, not a full Ubuntu transaction replay; fresh hosted verification remains necessary.
 
 The official November 13 midnight CVE archive was also downloaded and matched its published 661,998,144-byte size and SHA-256. The unchanged production parser accepted 43,080 records before its 1 MiB record bound refused further processing; exhaustion remains false. Separate bounded metadata enumeration found 424,926 CVE members, including ten larger than that bound, with a maximum declared size of 2,402,038 bytes. No CVE member triggered encryption or compression-ratio bounds. Metadata enumeration is not full payload validation. Production limits and Cloudflare data remain unchanged; no import or server archive certification follows from this local evidence.
+
+
+### Empty inventory and complete local CVE parsing
+
+Hosted coverage found that six empty-inventory CLI operations still fetched the Arch
+advisory snapshot. A loopback failure test reproduced the unnecessary request before the
+fix. Empty Review now returns an empty assessment without source I/O. Native audit still
+performs a second inventory read and propagates inventory errors or changes. Admission
+and nonempty Review retain their evidence requirements.
+
+The source-bound checks pass 2,386 library tests with 13 ignored, the hermetic CLI
+inventory, three feature configurations of all-target Clippy with warnings denied, and
+normal CLI/daemon builds. A disposable Arch guest passes the existing 16 admission
+cases, six exact empty-offline commands, and 14 additional controls. Empty commands make
+no TCP connection or HTTP request; nonempty Unknown inventory still refuses an
+unavailable advisory source. Invalid inventory and recovery controls retain their real
+native database checks. The first guest attempt failed because its new harness
+incorrectly expected exit zero from an empty `pacman -Q`; that failure is retained, and
+the corrected helper requires the exact empty tuple of exit one and empty stdout/stderr.
+
+Five failing service tests reproduced the CVE size limit through archive scanning, delta
+fetching, parsing and the actual local Worker entrypoint. CVE raw records now have a
+separate 3 MiB bound. The complete encoded 4 MiB request limit, eight-record operator
+limit, 16 MiB Arch/KEV feed limit and archive safeguards remain unchanged. All 39 service
+tests pass. A structured 2,402,038-byte record roundtrips byte-for-byte through local
+R2; its D1 metadata occupies 344 scalar bytes. This test does not measure production
+isolate CPU or memory.
+
+The production scanner then exhaustively parsed the retained official archive: 424,926
+distinct CVEs, comprising 405,756 PUBLISHED and 19,170 REJECTED records, without
+duplicates or unsupported exclusions. The exact raw-record hash manifest is 42,343,545
+bytes with SHA-256 `5ba309e089829386cfe73115c1b9b64cb5a1cda1267fac50c3144a34e1b6f1cf`.
+The input hash and original failure evidence remain intact. The private scan harness
+received a retry-guard edit after launch; the exact original harness and preparation
+file were recovered against their previously frozen hashes, and the event is recorded
+separately. Production parser and dependency hashes remained unchanged throughout the
+run. This is local parsing evidence, not immutable full-harness execution evidence, a
+Cloudflare import, server archive certification or package applicability proof.
+
+The Arch QEMU oracle also required the old finding-line suffix. Its regression replays
+actual captured installed-inventory output before the correction. Live direct and daemon
+callers now require both the exact Possible-match marker and an explicit scope warning
+with zero assessed packages and a positive Unknown count. Applicable synthetic unit
+controls retain their separate strict contract. All 17 focused oracle and evidence tests
+pass, including malformed output, fabricated scores, wrong identities and missing scope
+warnings.
+
+
+### Omarchy helper runtime and migration tree
+
+A subsequent user-triggered update passed the original preflight fix but failed
+Omarchy's newer source-root guard after pruning and snapshot stages. OMG selected
+trusted packaged helpers while passing the caller's checkout in `OMARCHY_PATH`.
+Two actual child-environment tests failed before the fix, including the PTY
+coordinator path. The reported host log is retained privately; the agent did not
+rerun the host update.
+
+One private runtime now derives its root from the selected trusted migration
+helper. Packaged `/usr/bin` helpers select `/usr/share/omarchy`; compatible trusted
+checkout helpers select their own canonical root. Child environments, cleanup and
+both migration preflights use that same root and resolved migration-state path.
+Directory ownership and selected helper layout are rechecked after package
+updates. Empty explicit paths still fail, and user-owned checkout programs never
+execute. Migration checks inspect the selected runtime rather than an unrelated
+checkout.
+
+Independent review found that early validation also made optional helper layout
+errors fatal. A protected guest reproduced that failure with a trusted helper
+from a different root. Optional snapshot, shell-restart and mise errors now reach
+the existing warning policy; confirmation remains skipped under `--yes`. Strict
+validation still applies when a helper actually runs. Foreign fixture helpers
+write an execution marker before their vendor guard, and the guest requires that
+marker to remain absent.
+
+Final verification passes 2,392 library tests with 13 ignored, all 55 Omarchy
+tests, the hermetic CLI inventory, three all-target Clippy configurations with
+warnings denied, and normal CLI/daemon builds. This final native wave inherited
+`no_new_privs`. All seven actual protected Omarchy guest scenarios pass, including
+the inverse migration-tree controls and optional foreign-helper refusal. The real
+guest database and prepared disks remain unchanged, locks are released, and the
+VM shuts down cleanly. These are local product results, not a hosted CI or
+instrumented-coverage verdict.

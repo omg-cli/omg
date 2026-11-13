@@ -666,3 +666,88 @@ test("baseline finalization rejects a maintained counter that differs from actua
         db.close();
     }
 });
+
+function largeCveFixture(id = "CVE-2026-1234", bytes = 2_402_038): string {
+    const description = {lang: "en", value: "Generated structured CNA/ADP fixture; preserve UTF8 é and raw whitespace."};
+    const payload = {
+        dataType: "CVE_RECORD", dataVersion: "5.2",
+        cveMetadata: {cveId: id, state: "PUBLISHED", dateUpdated: "2026-11-13T02:00:00.000Z", datePublished: "2026-11-11T00:00:00Z"},
+        containers: {
+            cna: {
+                providerMetadata: {orgId: "00000000-0000-4000-8000-000000000001", shortName: "fixture-CNA"},
+                descriptions: [description],
+                affected: [{vendor: "fixture-vendor", product: "fixture-product", defaultStatus: "unaffected",
+                    versions: Array.from({length: 11_000}, (_, index) => ({version: `${index}.0.0`, status: "affected", lessThan: `${index + 1}.0.0`, versionType: "semver"}))}],
+            },
+            adp: [{providerMetadata: {orgId: "00000000-0000-4000-8000-000000000002", shortName: "fixture-ADP"},
+                affected: Array.from({length: 1_600}, (_, index) => ({vendor: `vendor-${index}`, product: `product-${index}`, versions: [{version: `${index}.1`, status: "affected"}]}))}],
+        },
+    };
+    const encode = () => `\n${JSON.stringify(payload, null, 2)}\n`;
+    const padding = bytes - Buffer.byteLength(encode());
+    if (padding < 0) throw new Error("large CVE fixture structure exceeds requested byte size");
+    description.value += "x".repeat(padding);
+    const raw = encode();
+    if (Buffer.byteLength(raw) !== bytes) throw new Error("large CVE fixture byte size mismatch");
+    return raw;
+}
+
+test("CVE raw allowance and caller-supplied body bounds remain independent of encoded request limits", async () => {
+    const {LIMITS} = await import("../src/domain");
+    const raw = largeCveFixture("CVE-2026-1234", 3 * 1024 ** 2);
+    expect(parseCve(raw).supported).toBe(true);
+    expect(() => parseCve(`${raw} `)).toThrow("record exceeds limit");
+    expect(LIMITS.batch).toBe(4 * 1024 ** 2);
+    expect(LIMITS.records).toBe(8);
+    await expect(boundedBody(new Response("x".repeat(1024 ** 2 + 1)).body, 1024 ** 2)).rejects.toThrow("exceeds");
+    const {store, db, objects} = setup();
+    try {
+        const body = JSON.stringify({source: "cve", records: [largeCveFixture()], padding: "x".repeat(2 * 1024 ** 2)});
+        expect(Buffer.byteLength(body)).toBeGreaterThan(LIMITS.batch);
+        const response = await handle(req("/internal/ingest", "POST", body, token), store, token, now);
+        expect(response.status).toBe(400);
+        expect(await store.sql.first("SELECT * FROM source_record")).toBe(null);
+        expect(objects.size).toBe(0);
+    } finally {
+        db.close();
+    }
+});
+
+test("official delta fetching accepts large CVE records and preserves checkpoint and pointer safety on failures", async () => {
+    const raw = largeCveFixture();
+    const oversized = largeCveFixture("CVE-2026-1234", 3 * 1024 ** 2 + 1);
+    const delta = JSON.stringify([{fetchTime: now, numberOfChanges: 1,
+        new: [{cveId: "CVE-2026-1234", githubLink: cveUrl("CVE-2026-1234"), dateUpdated: now}], updated: [], error: []}]);
+    const {store, db, objects} = setup();
+    try {
+        const before = await store.checkpoint("cve");
+        await expect(refreshCves(store, async (url) => new Response(url === SOURCES.cve ? delta : oversized), now)).rejects.toThrow("exceeds");
+        expect(await store.checkpoint("cve")).toEqual(before);
+        expect(await store.sql.first("SELECT * FROM cve")).toBe(null);
+        expect(objects.size).toBe(0);
+        await refreshCves(store, async (url) => new Response(url === SOURCES.cve ? delta : raw), now);
+        const response = await handle(req("/v1/cves/CVE-2026-1234"), store, undefined, now);
+        expect(response.status).toBe(200);
+        const body = await json(response);
+        expect(body.payload_json).toBe(raw);
+        expect(object(body.provenance).payload_sha256).toBe(await sha256(raw));
+        expect((await store.checkpoint("cve"))?.complete).toBe(1);
+        const rejected = setup();
+        try {
+            const broken = new Store(rejected.store.sql, {get: rejected.store.raw.get, put: async () => {throw new Error("R2 large-record failure");}});
+            await expect(broken.cve(raw, now)).rejects.toThrow("R2 large-record failure");
+            expect(await rejected.store.sql.first("SELECT * FROM source_record")).toBe(null);
+            expect(await rejected.store.sql.first("SELECT * FROM cve")).toBe(null);
+            const failedSql: Sql = {...rejected.store.sql, batch: async () => {throw new Error("D1 large-record failure");}};
+            const failedIndex = new Store(failedSql, rejected.store.raw);
+            await expect(failedIndex.cve(raw, now)).rejects.toThrow("D1 large-record failure");
+            expect(await rejected.store.sql.first("SELECT * FROM source_record")).toBe(null);
+            expect(await rejected.store.sql.first("SELECT * FROM cve")).toBe(null);
+            expect([...rejected.objects.values()]).toEqual([raw]);
+        } finally {
+            rejected.db.close();
+        }
+    } finally {
+        db.close();
+    }
+});

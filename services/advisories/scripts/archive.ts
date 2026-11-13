@@ -144,7 +144,7 @@ export async function scanArchive(options: {
                     break;
                 }
                 if (
-                    entry.uncompressedSize > LIMITS.record ||
+                    entry.uncompressedSize > LIMITS.cveRecord ||
                     entry.uncompressedSize / Math.max(1, entry.compressedSize) >
                         500 ||
                     (entry.generalPurposeBitFlag & 1) !== 0
@@ -163,7 +163,7 @@ export async function scanArchive(options: {
                         ? chunk
                         : Buffer.from(chunk);
                     bytes += data.length;
-                    if (bytes > LIMITS.record) {
+                    if (bytes > LIMITS.cveRecord) {
                         stream.destroy();
                         throw new Error("record exceeds limit");
                     }

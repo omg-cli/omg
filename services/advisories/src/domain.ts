@@ -1,5 +1,5 @@
 export const LIMITS = {
-    record: 1024 * 1024,
+    cveRecord: 3 * 1024 * 1024,
     batch: 4 * 1024 * 1024,
     records: 8,
     feed: 16 * 1024 * 1024,
@@ -102,7 +102,7 @@ export function decodeUtf8(bytes: Uint8Array): string {
     return text;
 }
 export function parseCve(raw: string, expectedId?: string) {
-    if (new TextEncoder().encode(raw).length > LIMITS.record)
+    if (new TextEncoder().encode(raw).length > LIMITS.cveRecord)
         throw new Error("record exceeds limit");
     const payload = object(JSON.parse(raw));
     const metadata = object(payload.cveMetadata);
