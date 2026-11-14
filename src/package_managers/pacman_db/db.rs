@@ -316,6 +316,8 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
     let mut archive = tar::Archive::new(reader);
     let mut packages = HashMap::new();
     let mut entry_count = 0usize;
+    let mut descriptions = Vec::new();
+    let mut description_bytes = 0usize;
 
     for entry in archive.entries().with_context(|| {
         format!(
@@ -352,57 +354,16 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
                 raw.len() as u64 <= MAX_DESC_BYTES,
                 "Pacman sync database desc exceeds the {MAX_DESC_BYTES}-byte limit"
             );
-            let content = String::from_utf8(raw).with_context(|| {
-                format!(
-                    "Invalid UTF-8 in {} from repository {repo_name}",
-                    entry_path.display()
-                )
-            })?;
-            let pkg = parse_desc_content(&content, repo_name).with_context(|| {
-                format!(
-                    "Malformed desc {} from repository {repo_name}",
-                    entry_path.display()
-                )
-            })?;
-            anyhow::ensure!(
-                !pkg.name.is_empty(),
-                "Missing package name in {} from repository {repo_name}",
-                entry_path.display()
-            );
-            let directory = entry_path
-                .parent()
-                .and_then(Path::to_str)
-                .context("Invalid sync package directory identity")?;
-            anyhow::ensure!(
-                !directory.contains('/'),
-                "Nested sync package directory identity in {} from repository {repo_name}",
-                entry_path.display()
-            );
-            alpm_types::Name::from_str(&pkg.name).with_context(|| {
-                format!(
-                    "Invalid package name in {} from repository {repo_name}",
-                    entry_path.display()
-                )
-            })?;
-            let (before_release, _) = directory
-                .rsplit_once('-')
-                .context("Missing sync package release in directory identity")?;
-            let (native_name, _) = before_release
-                .rsplit_once('-')
-                .context("Missing sync package version in directory identity")?;
-            let native_version = require_package_version(&directory[native_name.len() + 1..])?;
-            anyhow::ensure!(
-                native_name == pkg.name && native_version.to_string() == pkg.version.to_string(),
-                "Inconsistent package identity in {} from repository {repo_name}",
-                entry_path.display()
-            );
-            anyhow::ensure!(
-                packages.insert(pkg.name.clone(), pkg).is_none(),
-                "Duplicate package identity in {} from repository {repo_name}",
-                entry_path.display()
-            );
+            description_bytes += raw.len();
+            descriptions.push((entry_path, raw));
+            if descriptions.len() == 512 || description_bytes >= 1024 * 1024 {
+                merge_sync_descriptions(&mut packages, &mut descriptions, repo_name)?;
+                description_bytes = 0;
+            }
         }
     }
+
+    merge_sync_descriptions(&mut packages, &mut descriptions, repo_name)?;
 
     std::io::copy(&mut archive.into_inner(), &mut std::io::sink()).with_context(|| {
         format!(
@@ -411,6 +372,102 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
         )
     })?;
     Ok(packages)
+}
+
+fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<SyncDbPackage> {
+    let content = String::from_utf8(raw).with_context(|| {
+        format!(
+            "Invalid UTF-8 in {} from repository {repo_name}",
+            entry_path.display()
+        )
+    })?;
+    let pkg = parse_desc_content(&content, repo_name).with_context(|| {
+        format!(
+            "Malformed desc {} from repository {repo_name}",
+            entry_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !pkg.name.is_empty(),
+        "Missing package name in {} from repository {repo_name}",
+        entry_path.display()
+    );
+    let directory = entry_path
+        .parent()
+        .and_then(Path::to_str)
+        .context("Invalid sync package directory identity")?;
+    anyhow::ensure!(
+        !directory.contains('/'),
+        "Nested sync package directory identity in {} from repository {repo_name}",
+        entry_path.display()
+    );
+    alpm_types::Name::from_str(&pkg.name).with_context(|| {
+        format!(
+            "Invalid package name in {} from repository {repo_name}",
+            entry_path.display()
+        )
+    })?;
+    let (before_release, _) = directory
+        .rsplit_once('-')
+        .context("Missing sync package release in directory identity")?;
+    let (native_name, _) = before_release
+        .rsplit_once('-')
+        .context("Missing sync package version in directory identity")?;
+    let native_version = require_package_version(&directory[native_name.len() + 1..])?;
+    anyhow::ensure!(
+        native_name == pkg.name && native_version.to_string() == pkg.version.to_string(),
+        "Inconsistent package identity in {} from repository {repo_name}",
+        entry_path.display()
+    );
+    Ok(pkg)
+}
+
+fn merge_sync_descriptions(
+    packages: &mut HashMap<String, SyncDbPackage>,
+    descriptions: &mut Vec<(PathBuf, Vec<u8>)>,
+    repo_name: &str,
+) -> Result<()> {
+    static POOL: std::sync::LazyLock<Option<rayon::ThreadPool>> = std::sync::LazyLock::new(|| {
+        let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
+        match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                tracing::warn!(
+                    "Cannot start repository parsing workers; parsing serially: {error}"
+                );
+                None
+            }
+        }
+    });
+    if descriptions.is_empty() {
+        return Ok(());
+    }
+    // At most four parsing tasks per bounded batch. Archive I/O stays serial.
+    let minimum_records = descriptions.len().div_ceil(4).max(16);
+    let entries = std::mem::take(descriptions);
+    let parse = |(path, raw): (PathBuf, Vec<u8>)| {
+        let package = parse_sync_desc(&path, raw, repo_name);
+        (path, package)
+    };
+    let parsed: Vec<_> = match &*POOL {
+        Some(pool) => pool.install(|| {
+            entries
+                .into_par_iter()
+                .with_min_len(minimum_records)
+                .map(parse)
+                .collect()
+        }),
+        None => entries.into_iter().map(parse).collect(),
+    };
+    for (path, package) in parsed {
+        let package = package?;
+        anyhow::ensure!(
+            packages.insert(package.name.clone(), package).is_none(),
+            "Duplicate package identity in {} from repository {repo_name}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Extract a human-readable message from a `catch_unwind` panic payload.
@@ -2775,6 +2832,111 @@ mod tests {
                 .unwrap();
         }
         fs::write(path, archive.into_inner().unwrap().finish().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sync_catalog_remains_readable_when_worker_creation_is_refused() {
+        const TEST: &str = "package_managers::pacman_db::db::tests::sync_catalog_remains_readable_when_worker_creation_is_refused";
+        if crate::config::Settings::rerun_test_unprivileged(TEST) {
+            return;
+        }
+        if std::env::var_os("OMG_SYNC_THREAD_LIMIT_FIXTURE").is_some() {
+            use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+            assert!(
+                !nix::unistd::Uid::current().is_root(),
+                "run resource-limit checks with the unprivileged fixture runner"
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("core.db");
+            write_sync_identity_fixture(
+                &path,
+                &[("helper-1-1/desc", "%NAME%\nhelper\n\n%VERSION%\n1-1\n")],
+            );
+            let saved = getrlimit(Resource::Nproc);
+            setrlimit(
+                Resource::Nproc,
+                Rlimit {
+                    current: Some(0),
+                    maximum: saved.maximum,
+                },
+            )
+            .expect("restrict only the fixture process's worker creation");
+            let parsed = std::panic::catch_unwind(|| parse_sync_db(&path, "core"));
+            setrlimit(Resource::Nproc, saved).expect("restore fixture process limit");
+            let packages = parsed
+                .expect("worker creation failure must not panic")
+                .expect("metadata must remain readable without workers");
+            assert_eq!(packages["helper"].version.to_string(), "1-1");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "package_managers::pacman_db::db::tests::sync_catalog_remains_readable_when_worker_creation_is_refused",
+                "--nocapture",
+            ])
+            .env("OMG_SYNC_THREAD_LIMIT_FIXTURE", "1")
+            .output()
+            .expect("isolated resource-limit fixture");
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn large_sync_catalog_preserves_all_records_and_rejects_late_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("core.db");
+        let entries: Vec<_> = (0..129)
+            .map(|index| {
+                let name = format!("package-{index}");
+                (
+                    format!("{name}-1-1/desc"),
+                    format!(
+                        "%NAME%\n{name}\n\n%VERSION%\n1-1\n\n%DESC%\n{}\n\n",
+                        "catalog description ".repeat(900)
+                    ),
+                )
+            })
+            .collect();
+        let write = |records: &[(String, String)]| {
+            write_sync_identity_fixture(
+                &path,
+                &records
+                    .iter()
+                    .map(|(path, desc)| (path.as_str(), desc.as_str()))
+                    .collect::<Vec<_>>(),
+            );
+        };
+        write(&entries);
+        let packages = parse_sync_db(&path, "core").expect("complete large catalog");
+        assert_eq!(packages.len(), entries.len());
+        for index in 0..entries.len() {
+            assert_eq!(
+                packages[&format!("package-{index}")].version.to_string(),
+                "1-1"
+            );
+        }
+
+        for (replacement, diagnostic) in [
+            (entries[0].clone(), "Duplicate package identity"),
+            (
+                (
+                    "package-128-1-1/desc".into(),
+                    "%NAME%\npackage-128\n".into(),
+                ),
+                "Missing package version",
+            ),
+            (
+                ("nested/package-128-1-1/desc".into(), entries[128].1.clone()),
+                "Nested sync package directory identity",
+            ),
+        ] {
+            let mut corrupted = entries.clone();
+            corrupted[128] = replacement;
+            write(&corrupted);
+            let error = parse_sync_db(&path, "core")
+                .expect_err("late corruption must reject the entire catalog");
+            assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+        }
     }
 
     #[test]

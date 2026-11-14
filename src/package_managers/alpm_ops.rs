@@ -104,7 +104,7 @@ pub(crate) fn open_alpm_at(
     alpm::Alpm::new(root, db_path).context("Failed to initialize ALPM")
 }
 
-pub(crate) fn validate_sync_database(alpm: &alpm::Alpm, database: &alpm::Db) -> Result<()> {
+fn validate_sync_signature(alpm: &alpm::Alpm, database: &alpm::Db) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let path = std::path::Path::new(alpm.dbpath())
         .join("sync")
@@ -125,6 +125,13 @@ pub(crate) fn validate_sync_database(alpm: &alpm::Alpm, database: &alpm::Db) -> 
         "Repository '{}' is not a regular database",
         database.name()
     );
+    database
+        .is_valid()
+        .with_context(|| format!("Repository '{}' failed native validation", database.name()))
+}
+
+pub(crate) fn validate_sync_database(alpm: &alpm::Alpm, database: &alpm::Db) -> Result<()> {
+    validate_sync_signature(alpm, database)?;
     // libalpm loads catalogs lazily. A parse failure invalidates the database,
     // while pkgs() alone represents both failure and a valid empty catalog as [].
     let _ = database.pkgs();
@@ -265,9 +272,13 @@ pub fn get_pkg_info_from_db(alpm: &alpm::Alpm, name: &str) -> Result<Option<Pack
             continue;
         }
         let verified = verifier.register_syncdb(db.name(), db.siglevel())?;
-        validate_sync_database(&verifier, verified)?;
+        validate_sync_signature(&verifier, verified)?;
         let path = sync_dir.join(format!("{}.db", db.name()));
-        if let Some(pkg) = super::pacman_db::parse_sync_db(&path, db.name())?.remove(name) {
+        let mut packages =
+            super::pacman_db::parse_sync_db(&path, db.name()).with_context(|| {
+                format!("Repository '{}' failed Rust metadata validation", db.name())
+            })?;
+        if let Some(pkg) = packages.remove(name) {
             let installed = super::pacman_db::read_local_package_at(
                 &std::path::Path::new(alpm.dbpath()).join("local"),
                 &pkg.name,
@@ -3651,14 +3662,16 @@ mod tests {
             });
             let message = error.to_string();
             assert!(message.contains("Repository 'unavailable'"), "{error:#}");
-            assert!(
-                message.contains(if corrupt {
-                    "failed native validation"
-                } else {
-                    "is unavailable"
-                }),
-                "{error:#}"
-            );
+            if corrupt {
+                assert!(
+                    error.chain().any(|cause| cause
+                        .to_string()
+                        .contains("Unsupported pacman database compression")),
+                    "Rust metadata validation must explain the rejected source: {error:#}"
+                );
+            } else {
+                assert!(message.contains("is unavailable"), "{error:#}");
+            }
         }
         Ok(())
     }
