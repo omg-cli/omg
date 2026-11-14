@@ -1559,3 +1559,41 @@ the accepted fresh run. A saved AST comparison proves that all code outside
 executable, working directory and parent chain when available, without changing
 the compiler predicate. Neither rejected attempt supplies accepted evidence;
 all receipts, logs and failure disks remain retained.
+
+
+## Audit queue lifecycle batch, November 14
+
+The `91fd5203` instrumented run passed its test and native producers, including
+28 Omarchy scenarios, but evidence validation rejected a saturated region in
+`tracing_safe_audit_text`. The captured original raw profile
+`omg-20145-4200068001239582021_0.profraw` identifies
+`daemon_integration_tests::test_state_recovery_after_error` as its executed test.
+Its six audit-text counters are `[2, 33, 32, 0, 0, 0]`: the character loop was
+unfinished when the process recorded its profile. The diagnostic capture is
+incomplete; this attribution does not certify every other profile.
+
+A separate process-level regression reproduced actual audit loss before the
+fix: `success: accepted audit event was lost at exit`. It holds the real audit
+file lock while the child accepts an event, then verifies that successful and
+failed command exits wait for the writer and leave one intact, hash-valid
+record. The CLI now drains its accepted events before normal exit, including
+the successful sudo handoff path. Queue initialization uses `OnceLock` so idle
+commands do not start an audit thread just to flush it. The existing ten-second
+barrier bound remains; barrier failure marks the collection incomplete and
+fails command completion while retaining an existing operation error.
+
+Daemon integration and security tests drain before deleting their collections;
+the IPC fixture does the same during teardown. The input-validation test now
+uses the writer barrier rather than polling for a partially written file.
+Additional checks cover OS release value parsing and refusal of an unsupported
+Arch OSV ecosystem. They do not claim OSV coverage for Arch or replace the
+native Arch advisory source.
+
+The final unchanged-source run passed 34 CLI tests, 248 security unit tests,
+28 daemon/security/IPC tests, rustfmt and scoped Clippy with warnings denied.
+Its receipt is `audit-lifecycle-batch41-final-receipt.json` under the existing
+native build owner. Coverage counters, exclusions, thresholds and producer
+requirements are unchanged. A fresh complete hosted coverage verdict and a
+new optimized native build remain required for this batch. The previous
+`91fd5203` optimized bundle remains the latest verified installable artifact;
+it does not contain this audit-exit fix.

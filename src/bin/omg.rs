@@ -914,6 +914,15 @@ fn main() {
 /// whose anyhow `Termination` impl printed errors but could never show
 /// suggestions or differentiate exit codes.
 fn finish(result: Result<()>) -> ! {
+    let result = match omg_lib::core::security::audit::flush_pending_audit_events() {
+        Ok(()) => result,
+        Err(audit_error) => match result {
+            Ok(()) => Err(audit_error.context("Failed to flush audit events before exit")),
+            Err(error) => Err(error.context(format!(
+                "Failed to flush audit events before exit: {audit_error:#}"
+            ))),
+        },
+    };
     match result {
         Ok(()) => {
             omg_lib::cli::update_notice::after_command();
@@ -1004,7 +1013,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         // runtime which panics with "Cannot start a runtime from within a runtime"
         let args_refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
         omg_lib::core::privilege::run_self_sudo(&args_refs).await?;
-        std::process::exit(0);
+        return Ok(());
     }
 
     let ctx = omg_lib::cli::CliContext { json: cli.json };
@@ -2174,6 +2183,121 @@ mod fast_path_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit_exit_fixture() -> anyhow::Result<()> {
+        use omg_lib::core::security::audit::{
+            AuditEventType, AuditSeverity, audit_log_nonblocking, init_audit_logger,
+        };
+        use std::io::{Read, Write};
+
+        let Some(outcome) = std::env::var_os("OMG_AUDIT_EXIT_FIXTURE") else {
+            return Ok(());
+        };
+        init_audit_logger()?;
+        println!("audit-ready");
+        std::io::stdout().flush()?;
+        std::io::stdin().read_exact(&mut [0])?;
+        audit_log_nonblocking(
+            AuditEventType::SecurityAudit,
+            AuditSeverity::Info,
+            "exit-fixture",
+            "accepted before exit\nretained intact",
+        );
+        super::finish(if outcome == "success" {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("inert audit exit failure"))
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exit_persists_pending_audit_on_success_and_failure() -> anyhow::Result<()> {
+        use omg_lib::core::security::audit::AuditEntry;
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        for (outcome, code) in [("success", 0), ("failure", 1)] {
+            let directory = tempfile::tempdir()?;
+            let mut child = Command::new(std::env::current_exe()?)
+                .args(["--exact", "tests::audit_exit_fixture", "--nocapture"])
+                .env("OMG_AUDIT_EXIT_FIXTURE", outcome)
+                .env("OMG_DATA_DIR", directory.path())
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
+                .env("OMG_NO_UPDATE_CHECK", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let stdout = child.stdout.take().unwrap();
+            let (ready, received) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if matches!(line.as_deref(), Ok("audit-ready")) {
+                        let _ = ready.send(());
+                        break;
+                    }
+                }
+            });
+            if received.recv_timeout(Duration::from_secs(5)).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                reader.join().unwrap();
+                anyhow::bail!("audit child did not initialize ({outcome})");
+            }
+            reader.join().unwrap();
+            let log = directory.path().join("audit/audit.jsonl");
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(log.with_extension("lock"))?;
+            lock.lock()?;
+            child.stdin.take().unwrap().write_all(b"1")?;
+            std::thread::sleep(Duration::from_millis(200));
+            let exited_before_unlock = child.try_wait()?.is_some();
+            lock.unlock()?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!("audit child did not finish ({outcome})");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let body = match std::fs::read_to_string(log) {
+                Ok(body) => body,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error.into()),
+            };
+            assert!(
+                !body.is_empty(),
+                "{outcome}: accepted audit event was lost at exit"
+            );
+            assert!(
+                !exited_before_unlock,
+                "{outcome}: exited before audit writer drained"
+            );
+            assert_eq!(status.code(), Some(code), "{outcome}");
+            let entries = body
+                .lines()
+                .map(serde_json::from_str::<AuditEntry>)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(entries.len(), 1, "{outcome}");
+            assert_eq!(entries[0].resource, "exit-fixture");
+            assert_eq!(
+                entries[0].description,
+                "accepted before exit\nretained intact"
+            );
+            assert!(entries[0].verify(), "{outcome}: audit integrity");
+        }
+        Ok(())
+    }
+
     #[test]
     fn error_reporting_fixture() {
         if std::env::var_os("OMG_ERROR_REPORTING_FIXTURE").is_some() {

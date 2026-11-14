@@ -961,8 +961,11 @@ enum AuditQueueMessage {
 /// Daemon callers enqueue owned events so filesystem locking, serialization,
 /// and durability syncs run on one dedicated blocking writer thread rather
 /// than a Tokio executor thread.
-static AUDIT_QUEUE: std::sync::LazyLock<std::sync::mpsc::SyncSender<AuditQueueMessage>> =
-    std::sync::LazyLock::new(|| {
+static AUDIT_QUEUE: std::sync::OnceLock<std::sync::mpsc::SyncSender<AuditQueueMessage>> =
+    std::sync::OnceLock::new();
+
+fn audit_queue() -> &'static std::sync::mpsc::SyncSender<AuditQueueMessage> {
+    AUDIT_QUEUE.get_or_init(|| {
         let (sender, receiver) =
             std::sync::mpsc::sync_channel::<AuditQueueMessage>(AUDIT_QUEUE_CAPACITY);
         if let Err(error) = std::thread::Builder::new()
@@ -987,7 +990,8 @@ static AUDIT_QUEUE: std::sync::LazyLock<std::sync::mpsc::SyncSender<AuditQueueMe
             tracing::error!("Failed to start audit writer thread: {error}");
         }
         sender
-    });
+    })
+}
 
 /// Diagnose and recover under the cooperating appenders' exclusive lock.
 /// A live writer may be between JSONL writes; only inspect its tail after it
@@ -1154,7 +1158,7 @@ pub fn audit_log_nonblocking(
     resource: &str,
     description: &str,
 ) {
-    enqueue_audit_event(&AUDIT_QUEUE, event, severity, resource, description);
+    enqueue_audit_event(audit_queue(), event, severity, resource, description);
 }
 
 fn enqueue_audit_event(
@@ -1196,21 +1200,36 @@ fn enqueue_audit_event(
 /// marked incomplete. A stopped daemon must not leave its audit writer using
 /// a collection after the daemon's state has been torn down.
 pub(crate) async fn drain_audit_queue() -> anyhow::Result<()> {
-    let result = tokio::task::spawn_blocking(|| {
-        wait_for_audit_drain(&AUDIT_QUEUE, std::time::Duration::from_secs(10))
-    })
-    .await;
+    if AUDIT_QUEUE.get().is_none() {
+        return Ok(());
+    }
+    let result = tokio::task::spawn_blocking(flush_pending_audit_events).await;
     match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            mark_audit_incomplete();
-            Err(error)
-        }
+        Ok(result) => result,
         Err(error) => {
             mark_audit_incomplete();
             Err(error.into())
         }
     }
+}
+
+/// Flush accepted audit events before a synchronous process or collection exits.
+///
+/// An unused queue remains uninitialized. Callers must stop submitting events
+/// before flushing; the barrier covers events accepted before this call.
+///
+/// # Errors
+/// Returns an error and marks the collection incomplete if the writer is
+/// unavailable or fails to acknowledge the barrier within ten seconds.
+pub fn flush_pending_audit_events() -> anyhow::Result<()> {
+    let Some(sender) = AUDIT_QUEUE.get() else {
+        return Ok(());
+    };
+    let result = wait_for_audit_drain(sender, std::time::Duration::from_secs(10));
+    if result.is_err() {
+        mark_audit_incomplete();
+    }
+    result
 }
 
 fn wait_for_audit_drain(
