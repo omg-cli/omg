@@ -3250,16 +3250,19 @@ mod tests {
             home: Some(&home),
             uid: rustix::process::getuid().as_raw(),
         };
+        let owns_running_modules = std::cell::Cell::new(false);
+        let owns_modules = |_: &str| Ok(owns_running_modules.get());
         assert_eq!(
-            reboot_reason_at(&paths, |_| Ok(false))?,
+            reboot_reason_at(&paths, owns_modules)?,
             Some("The installed kernel differs from the running kernel.")
         );
-        assert_eq!(reboot_reason_at(&paths, |_| Ok(true))?, None);
+        owns_running_modules.set(true);
+        assert_eq!(reboot_reason_at(&paths, owns_modules)?, None);
         let marker = home.join(".local/state/omarchy/reboot-required");
         std::fs::create_dir_all(marker.parent().expect("marker directory"))?;
         std::fs::write(&marker, "reboot requested\n")?;
         assert_eq!(
-            reboot_reason_at(&paths, |_| Ok(true))?,
+            reboot_reason_at(&paths, owns_modules)?,
             Some("Omarchy marked this update as requiring a reboot.")
         );
         std::fs::remove_file(marker)?;
@@ -3267,21 +3270,21 @@ mod tests {
         std::fs::create_dir(&hyprland)?;
         std::fs::write(hyprland.join("comm"), "Hyprland\n")?;
         std::os::unix::fs::symlink("/inert/Hyprland", hyprland.join("exe"))?;
-        assert_eq!(reboot_reason_at(&paths, |_| Ok(true))?, None);
+        assert_eq!(reboot_reason_at(&paths, owns_modules)?, None);
         std::fs::remove_file(hyprland.join("exe"))?;
         std::os::unix::fs::symlink("/inert/Hyprland (deleted)", hyprland.join("exe"))?;
         assert_eq!(
-            reboot_reason_at(&paths, |_| Ok(true))?,
+            reboot_reason_at(&paths, owns_modules)?,
             Some("The running Hyprland executable was replaced during the update.")
         );
         let other_user = RebootInspection {
             uid: paths.uid.checked_add(1).expect("test uid fits"),
             ..paths
         };
-        assert_eq!(reboot_reason_at(&other_user, |_| Ok(true))?, None);
+        assert_eq!(reboot_reason_at(&other_user, owns_modules)?, None);
         std::fs::remove_file(modules)?;
         assert_eq!(
-            reboot_reason_at(&paths, |_| Ok(true))?,
+            reboot_reason_at(&paths, owns_modules)?,
             Some("The installed kernel differs from the running kernel.")
         );
         Ok(())
