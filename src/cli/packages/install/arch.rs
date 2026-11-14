@@ -800,6 +800,74 @@ mod tests {
     }
 
     #[test]
+    fn install_source_denials_precede_advisory_lookups() {
+        use crate::core::security::{PolicyError, SecurityGrade, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+        let cases = [
+            (
+                SecurityPolicy {
+                    banned_packages: vec!["example".into()],
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::OtherRepository {
+                    repository: "fixture".into(),
+                },
+                Some("MIT"),
+            ),
+            (
+                SecurityPolicy {
+                    allow_aur: false,
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::AurArchive,
+                None,
+            ),
+            (
+                SecurityPolicy {
+                    minimum_grade: SecurityGrade::Verified,
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::Unknown,
+                Some("MIT"),
+            ),
+            (
+                SecurityPolicy {
+                    allowed_licenses: vec!["MIT".into()],
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::OtherRepository {
+                    repository: "fixture".into(),
+                },
+                None,
+            ),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let version = crate::package_managers::parse_version_or_zero("1.0-1");
+        for (mut policy, origin, license) in cases {
+            policy.advisory_requirement =
+                crate::core::security::policy::AdvisoryRequirement::Review;
+            let scanner = FixtureSource {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                vulnerable: false,
+            };
+            let error = runtime
+                .block_on(enforce_install_policy(
+                    &policy, &scanner, "example", &version, origin, license,
+                ))
+                .expect_err("source policy must reject the package");
+            assert!(error.downcast_ref::<PolicyError>().is_some(), "{error:#}");
+            assert_eq!(
+                scanner.calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "source policy denial contacted the advisory provider"
+            );
+        }
+    }
+
+    #[test]
     fn install_policy_rejects_known_vulnerabilities() {
         const NAME: &str =
             "cli::packages::install::arch::tests::install_policy_rejects_known_vulnerabilities";

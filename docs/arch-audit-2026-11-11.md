@@ -1703,3 +1703,40 @@ fatal, and the existing per-command twenty-minute bound remains. No threshold,
 exclusion, raw counter or retry condition was relaxed. Fresh full current-source
 coverage and native acceptance remain outstanding before the consolidated push.
 The latest installable verified pair remains c43517d8.
+
+
+## Full-suite failure batch, November 14
+
+The complete instrumented run at `641ae35d` compiled 98 suites and listed
+4,035 tests. It ran 3,983: 3,979 passed, four failed, and 52 were skipped by
+existing selection rules. This is failed-run evidence, not accepted coverage.
+Its logs, profiles and receipt remain under the coverage owner; no counters
+from this failed epoch have been accepted into a comparison.
+
+The four failures were handled together. Two install tests exposed a real
+ordering bug: an advisory service timeout could mask a deterministic banned
+package rejection. `enforce_install_policy` now checks the existing source,
+package and license policy before contacting the advisory provider, retaining
+all later inventory and advisory checks. The new four-case regression first
+failed with `source policy denial contacted the advisory provider`, calls
+one versus zero, then passed after the ordering fix. The initial Optional
+policy fixture passed without reproducing the bug; it was corrected to Review
+before changing production code.
+
+One security test expected the former “Not scanned” label. It now expects
+“Advisory coverage unreported” and retains its assertions against false clean
+or healthy claims. The final failure required zsh for a real shell quoting
+contract. A task-local zsh was extracted only after its package SHA-256 matched
+the root-controlled repository metadata and its detached signature verified
+against the installed Arch keyring. No host package was installed. The local
+ASCII-armored keyring was dearmored into the task-owned verification directory
+before verification; the initial direct gpgv invocation correctly failed.
+
+Normal verification passes all 15 nearby policy tests and 142 integration,
+security and real shell tests, with two existing integration tests ignored.
+All four formerly failing tests execute and pass. The guard receipts are
+`install-policy-batch44-red-receipt.json` and
+`install-policy-batch44-green-receipt.json` in the normal target owner; tool
+provenance is `native43-tools/zsh-receipt.json` in the proof owner.
+A fresh complete instrumented run and strict comparison are still required;
+these focused passing checks do not clear PR #1057 or certify a new release.

@@ -25,6 +25,15 @@ pub(crate) async fn enforce_install_policy(
         AssessmentUse, PackageAssessment, UnknownCoverage, validate_assessment_inventory,
     };
     use crate::package_managers::VersionDisplay;
+    policy.check_package(
+        name,
+        matches!(
+            &origin,
+            crate::package_managers::types::SecurityOrigin::AurArchive
+        ),
+        license,
+        crate::core::security::SecurityPolicy::source_grade(&origin),
+    )?;
     let packages = [crate::package_managers::types::SecurityPackage {
         origin,
         name: name.to_owned(),
