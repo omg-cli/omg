@@ -1473,3 +1473,89 @@ That sample does not establish the release time share of each stage, so the
 causal assessment remains inconclusive. The candidate keeps full catalog
 validation and current-source signature checks. Its verification metadata
 records the latency observations and leaves performance acceptance false.
+
+The next consolidated runtime, `004080e5`, removes duplicate native metadata
+loading from the three sync-info routes. A regression first returned the C
+backend's misleading signature error for an unsigned malformed archive. Rust
+now supplies the archive diagnostic while native verification remains
+responsible for the caller's signature policy. Native catalog loading remains
+required in transaction and raw inventory paths. All-record UTF-8, identity,
+size, duplicate and compressed-footer checks still run for package-info queries.
+
+Description batches flush after 512 records or at least 1 MiB of owned path
+and payload bytes. A final entry can exceed the byte target; the existing
+16 MiB description limit and 2 GiB decoded-stream budget remain unchanged. A shared
+pool uses at most four workers. The first parallel implementation reproduced
+a real panic when an isolated ordinary-user child lowered its own process
+limit: `ThreadPoolBuildError` reported OS error 11, `Resource temporarily
+unavailable`. Pool creation failure now selects serial parsing. The child
+restores its process limit before checking the result. A separate large-catalog
+control preserves every record and rejects duplicates, missing versions and
+nested identities near the end of the archive.
+
+
+Final resource review also caught uncounted buffered path bytes. Before the
+fix, a regression with a 1 MiB GNU long name consumed a later damaged header
+before rejecting the first inconsistent identity. The buffer now accounts for
+both owned paths and payloads and reports the first invalid identity before
+reading that later header. The intermediate `21e9b765` bundle was withheld
+before publication; the complete normal, instrumented and native proofs were
+repeated for the corrected `004080e5` source.
+
+Hosted `ce6ad19d` completed with 45 successful checks, 27 skips and two failures:
+the existing coverage comparison and the new decoder's unregistered license.
+The license check was reproduced locally before the fix. The reviewed
+`bzip2-1.0.6` allowance is restricted to `libbz2-rs-sys@0.2.6`; an unmatched
+version still fails the real checker. Its upstream notice is included in
+`THIRD-PARTY-LICENSES.md`. All four local supply-chain checks pass, with no
+advisory ignore or global license allowance added.
+
+The same committed Rust inputs passed normal and instrumented runs of 2431
+library tests and 32 CLI unit tests, three all-target Clippy configurations,
+normal binaries and the standard optimized release build. The protected
+six-artifact guest passed in 218.909 seconds and imported 330 genuine profiles
+after clean shutdown. Its fresh report still has 244/244 Omarchy functions,
+3612/3687 summary lines and 54 uncovered mapped lines. The strict coverage gate
+remains open. Prior objects and profiles were retained outside this collection.
+
+The optimized pair independently passed the signed native update, user-manager
+reexecution, six refusal controls, 25 Omarchy scenarios, three terminal
+interactions and two normal Arch checks in 170.887 seconds. No forbidden helper
+executed; real guest package state, source inputs, binary hashes and prepared
+pins remained unchanged. Receipt `omarchy-native20-positive27/receipt.json` has
+SHA-256 `3c8d4732cddc52baf9ca65bea024957c66757ada2b9ff2a1c344c8a07da0e6b8`.
+
+Five alternating optimized samples per side compared the published `00c79e2a`
+candidate with `004080e5` on unchanged real catalogs, with daemon bypass,
+identical JSON and no failures. The `info firefox` median fell from 0.519 to
+0.236 seconds; ranges were 0.517–0.538 and 0.234–0.244 seconds. Separate release
+tracing confirms that package-info no longer calls `alpm_db_get_pkgcache`.
+A final debug sample shows four workers in typed parsing, metadata conversion
+and allocation while the caller waits. These diagnostics do not establish
+optimized time shares. The older C-heavy comparison still measured 0.152
+seconds against 0.245 seconds for this candidate, so the local target of no
+more than 50 ms additional latency remains unmet. Performance acceptance stays
+false, despite the measured improvement over the previous Rust candidate.
+
+The replacement test bundle is
+`native31-release/omg-pr1057-004080e5-x86_64-arch.tar.gz`, SHA-256
+`5eb2697e7ff5e8c1f28307a2e14f51ca9f272b268d50089ce639ea9b0e046470`.
+It contains the CLI, daemon, verification metadata, checksums, `LICENSE` and
+`THIRD-PARTY-LICENSES.md`; packaging reopens the archive and verifies all four
+payload hashes. The CLI hash is
+`404cb718ebc895bb88a45936e7a32d0fa956ef35173edc7abda0cc0d89e41454`;
+the daemon hash is
+`796ff2b0aae662ad24533d4eebbd0e70999cea428959f902e22a46ed7342949e`.
+The verification metadata names the coverage and performance limits. No host
+installation, service, account, sudo-policy or package change was made.
+
+The first optimized attempt for this corrected source was rejected when the
+isolation watcher observed host `cc1plus` PID 1655573. That process was gone by
+inspection; its origin is unproven. A diagnostic-helper edit then accidentally
+removed the compiler-free admission check. Diff review caught the omission,
+the attempt was cancelled, and the original requirement was restored before
+the accepted fresh run. A saved AST comparison proves that all code outside
+`native_jobs` is identical to the original driver. Diagnostics now retain the
+executable, working directory and parent chain when available, without changing
+the compiler predicate. Neither rejected attempt supplies accepted evidence;
+all receipts, logs and failure disks remain retained.
