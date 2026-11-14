@@ -1440,12 +1440,38 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 all_children.add(id(child))
             result.append(children)
         return result, all_children
-    def tokenless_without_regions(code, number, compiled, source):
+    def source_syntax_without_regions(code, number, compiled, source, unmapped=False):
         _construct_charge(work, 2 * (len(code.words).bit_length() + 1))
         low = code.offsets[number - 1]
         high = code.offsets[number] if number < len(code.offsets) else len(code.text)
         token = bisect.bisect_right(code.ends, low)
         if token < len(code.starts) and code.starts[token] < high:
+            last = bisect.bisect_left(code.starts, high)
+            _construct_charge(work, last - token)
+            if (not unmapped or any(word not in ('{', '}', '(', ')', '[', ']', ',', ';', 'else')
+                                    for word in code.words[token:last])):
+                return False
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in compiled[0]))
+        span = (number, 1), (number, len(source[number - 1].encode()) + 1)
+        return not any(tuple(region[:2]) < span[1] and span[0] < tuple(region[2:4])
+                       for owner in compiled[0] for region in owner['regions'])
+    def constant_record_field_without_regions(descriptor, code, number, compiled, source):
+        _construct_charge(work, 2 * (len(code.words).bit_length() + 1))
+        low = code.offsets[number - 1]
+        high = code.offsets[number] if number < len(code.offsets) else len(code.text)
+        first = bisect.bisect_right(code.ends, low)
+        last = bisect.bisect_left(code.starts, high)
+        words = code.words[first:last]
+        if (len(words) != 4 or re.fullmatch(r'[A-Za-z_]\w*', words[0]) is None
+                or words[1] != ':' or words[3] != ','
+                or words[2] not in ('true', 'false')
+                    and re.fullmatch(r'(?:0|[1-9][0-9]{0,19})', words[2]) is None):
+            return False
+        opening = code.parents[first]
+        record = descriptor['constructs'].get(opening)
+        if (record is None or record['header'] != ('Self',) or not record['supported']
+                or code.parents[opening] != descriptor['row']['opening']
+                or any(code.parents[index] != opening for index in range(first, last))):
             return False
         _construct_charge(work, sum(len(owner['regions']) + 1 for owner in compiled[0]))
         span = (number, 1), (number, len(source[number - 1].encode()) + 1)
@@ -1670,13 +1696,17 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         if not mapped:
             continue
         _construct_charge(work, len(mapped) * (len(mapped).bit_length() + 3))
-        tokenless = {line: target for line, target in mapped.items() if all(
-            tokenless_without_regions(inventory[0], number, compiled, source)
-            for inventory, number, compiled, source in zip(inventories, (line, target), grouped, (old, new)))}
+        non_executable = {line: target for line, target in mapped.items() if all(
+            source_syntax_without_regions(inventory[0], number, compiled, source,
+                                      line not in before and target not in after)
+            or line not in before and target not in after
+                and constant_record_field_without_regions(descriptor, inventory[0], number, compiled, source)
+            for descriptor, inventory, number, compiled, source in zip(
+                (left, right), inventories, (line, target), grouped, (old, new)))}
         macro_paint = {}; macro_bindings = {}
         mapped_sides = set(mapped), set(mapped.values())
         for line, target in mapped.items():
-            if line in tokenless:
+            if line in non_executable:
                 continue
             proofs = [macro_literal_paint(descriptor, inventory, compiled, source, number, mapped_sides[side])
                       for side, (descriptor, inventory, compiled, source, number) in enumerate(
@@ -1692,8 +1722,8 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     macro_paint[line] = target
         if failed:
             continue
-        tokenless.update(macro_paint)
-        ordered = sorted((line, target) for line, target in mapped.items() if line not in tokenless)
+        non_executable.update(macro_paint)
+        ordered = sorted((line, target) for line, target in mapped.items() if line not in non_executable)
         if not ordered:
             continue
         callbacks = [attached_callbacks(descriptor, inventory[0], compiled, ordered, side, source)
@@ -1787,7 +1817,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         _construct_charge(work, sum(len(repr(binding)) for binding in macro_bindings.values()))
         receipt = dict(file=name, pairs=[[line, target] for line, target in mapped.items()
                                               if line in before and target in after],
-            non_executable_rows=[[line, target] for line, target in tokenless.items()],
+            non_executable_rows=[[line, target] for line, target in non_executable.items()],
             macro_literal_rows=[[line, target] for line, target in macro_paint.items()],
             macro_literal_bindings=[dict(base_head_line=base_head, head_head_line=head_head,
                 path=list(binding[0]), captures=list(binding[1]),

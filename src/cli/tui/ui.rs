@@ -1487,6 +1487,9 @@ mod tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
         let directory = tempfile::tempdir().expect("private policy directory");
         let path = directory.path().to_str().expect("UTF-8 fixture path");
         temp_env::with_vars(
@@ -1497,7 +1500,7 @@ mod tests {
             ],
             || {
                 let policy_path = directory.path().join("policy.toml");
-                let policy = crate::core::security::SecurityPolicy {
+                let mut policy = crate::core::security::SecurityPolicy {
                     allow_aur: false,
                     require_pgp: true,
                     minimum_grade: crate::core::security::SecurityGrade::Verified,
@@ -1530,6 +1533,11 @@ mod tests {
                     "{text}"
                 );
                 assert!(!text.contains("COMMUNITY"), "{text}");
+                policy.advisory_requirement =
+                    crate::core::security::policy::AdvisoryRequirement::Review;
+                std::fs::write(&policy_path, toml::to_string(&policy).unwrap()).unwrap();
+                app.refresh().unwrap();
+                assert!(render(&app).contains("Advisories: Review required"));
                 std::fs::write(&policy_path, "allow_aur = [broken").unwrap();
                 app.refresh()
                     .expect("invalid policy remains visible without closing the UI");

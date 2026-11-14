@@ -395,7 +395,7 @@ with socket.socket(socket.AF_UNIX) as server:
         native = workflow.split('      - name: Cover sandbox descendant cancellation\n', 1)[1]
         native = native.split('\n      - name:', 1)[0]
         self.assertIn('python3 scripts/native-cli-coverage.py prepare', native,
-                      'Hosted native coverage omits the six-artifact supplemental CLI producer')
+                      'Hosted native coverage omits the protected supplemental CLI producer')
         self.assertIn('--native-cli-coverage-dir', native)
         self.assertNotIn('python /native-cli-coverage.py run', native)
         self.assertIn('python3 scripts/native-cli-coverage.py verify', native)
@@ -658,8 +658,13 @@ def evidence_fixture(root):
         (profiles / f'omg-extra-{stage}-123-100_0.profraw').write_bytes(bytes.fromhex('8172666f72706cff') + b'fixture')
     for stage, role, name in PRODUCER.CASES:
         log = f'test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n'
-        if role == 'cli-unit':
+        if role in ('cli-unit', 'lib-unit'):
             log += '[extra-root-test] uid=0\n'
+            if role == 'lib-unit':
+                log += (f"[omg-unprivileged-fixture] test={name} parent_uid=0 executable_sha256={artifacts[role]['sha256']}\n"
+                        f"[omg-unprivileged-fixture-child] test={name} uid=65534 executable_sha256={artifacts[role]['sha256']}\n"
+                        f'test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n')
+                (profiles / f'omg-extra-{stage}-124-100_0.profraw').write_bytes(bytes.fromhex('8172666f72706cff') + b'fixture')
         else:
             log += '[native-arch-fixture] uid=65534 actual_id=arch\n'
             (profiles / f'omg-extra-{stage}-124-200_0.profraw').write_bytes(bytes.fromhex('8172666f72706cff') + b'fixture')
@@ -760,6 +765,36 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_root_policy_ui_fixture_requires_an_unprivileged_child_witness(self):
+        role = 'lib-unit'
+        name = 'cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy'
+        self.assertIn(role, PRODUCER.TESTS,
+                      'Native coverage must verify the policy fixture from an actual root harness')
+        self.assertIn(name, PRODUCER.TESTS[role])
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            stage = next(stage for stage, selected_role, test in PRODUCER.CASES
+                         if selected_role == role and test == name)
+            path = evidence / f'{stage}.log'
+            original = path.read_text()
+            mutations = {
+                'missing-child': original.replace('[omg-unprivileged-fixture-child]', '[missing-child]'),
+                'root-child': original.replace('uid=65534 executable_sha256=', 'uid=0 executable_sha256='),
+                'wrong-artifact': original.replace('executable_sha256=' + 'a' * 64,
+                                                   'executable_sha256=' + 'c' * 64),
+                'missing-parent': original.replace('parent_uid=0', 'parent_uid=65534'),
+                'extra-execution': original + 'test result: ok. 1 passed; 0 failed; 0 ignored;\n',
+            }
+            for mutation, value in mutations.items():
+                with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                    path.write_text(value)
+                    PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            path.write_text(original)
+            next(profiles.glob(f'omg-extra-{stage}-124-*.profraw')).unlink()
+            with self.assertRaisesRegex(ValueError, 'child profiles'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_turbo_scope_refusal_has_its_own_native_case_and_diagnostic(self):
         stage = 'omarchy-unsupported-turbo-mode'
         self.assertIn(stage, PRODUCER.OMARCHY_CASES,
@@ -904,7 +939,7 @@ class SupplementalEvidence(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
-            self.assertEqual(len(receipt['tests']), 16)
+            self.assertEqual(len(receipt['tests']), 17)
             self.assertEqual(len(receipt['process_checks']), 38)
             self.assertEqual(len(files), len(receipt['profiles']))
 
@@ -971,7 +1006,7 @@ class ArtifactAdmission(unittest.TestCase):
         deps = root / 'debug/deps'
         deps.mkdir(parents=True)
         paths = ['debug/omg', 'debug/omgd'] + [f'debug/deps/{prefix}-' + '1' * 16
-                 for prefix in ('coverage_14', 'arch_cli_contracts', 'cli_comprehensive', 'omg')]
+                 for prefix in ('coverage_14', 'arch_cli_contracts', 'cli_comprehensive', 'omg', 'omg_lib')]
         for name in paths:
             path = root / name
             path.write_bytes(name.encode())

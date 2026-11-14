@@ -683,6 +683,48 @@ class SourceAwareCoverageTests(unittest.TestCase):
         return self.attribution_obligations(old, new, excluded=(3, 4, 5), painted=(3, 4, 5),
             parent_states=((1, 0), (1, 0)), mutation=mutate)
 
+    def unmapped_record_field_obligations(self, field='enabled: false,', **kwargs):
+        old = ('impl Model {\n    fn retained() -> Self {\n        old();\n        Self {\n'
+               '            enabled: false,\n            value: checked(),\n        }\n    }\n}\n')
+        old = old.replace('enabled: false,', field)
+        new = old.replace('old();', 'replacement();')
+        return self.attribution_obligations(old, new, excluded=(1, 5, 9), **kwargs)
+
+    def test_unmapped_literal_record_field_preserves_covered_neighbors(self):
+        for literal in ('false', 'true', '0', '91'):
+            with self.subTest(literal=literal):
+                pairs, receipts, _ = self.unmapped_record_field_obligations(f'enabled: {literal},')
+                self.assertIn((6, 6), pairs.items())
+                self.assertTrue(receipts)
+                self.assertNotIn(5, pairs, 'an unmapped literal cannot earn mapped coverage credit')
+                self.assertIn([5, 5], receipts[0]['non_executable_rows'])
+
+    def test_unmapped_record_field_requires_a_bare_literal_and_no_mapping(self):
+        for field in ('enabled: checked(),', 'enabled: enabled,', 'enabled: None,',
+                      'enabled: { false },', 'enabled: false || true,'):
+            with self.subTest(field=field):
+                self.assertFalse(self.unmapped_record_field_obligations(field)[0])
+        self.assertFalse(self.unmapped_record_field_obligations(painted=(5,))[0])
+
+    def test_unmapped_record_field_refuses_foreign_ir_and_lost_neighbor_regions(self):
+        def foreign(owners, sources):
+            owners[1].append(dict(name='foreign', filenames=['/src/example.rs'],
+                regions=[[5, 13, 5, 27, 0, 0, 0, 0]]))
+        def missing(owners, sources):
+            owners[1][0]['regions'] = [row for row in owners[1][0]['regions'] if row[0] != 6]
+        def added(owners, sources):
+            owners[1][0]['regions'].append([5, 13, 5, 27, 0, 0, 0, 0])
+        for mutation in (foreign, missing, added):
+            with self.subTest(mutation=mutation.__name__):
+                self.assertFalse(self.unmapped_record_field_obligations(mutation=mutation)[0])
+        def cold(owners, sources):
+            for row in owners[1][0]['regions']:
+                if row[0] == 6:
+                    row[4] = 0
+        with self.assertRaisesRegex(ValueError, 'lost compiled-copy coverage'):
+            self.unmapped_record_field_obligations(mutation=cold)
+
+
     def test_qualified_macro_retains_head_and_associated_literal_paint(self):
         for capture in (False, True):
             with self.subTest(capture=capture):
@@ -782,6 +824,22 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 before = old.replace('// unchanged security explanation', token)
                 result = self.attribution_obligations(before, before.replace('old();', 'new();'), excluded=(2,))
                 self.assertEqual(result[0], {})
+
+    def test_unmapped_else_separator_preserves_both_branch_obligations(self):
+        old = ('fn retained(flag: bool) {\n    old();\n    if flag {\n        first();\n'
+               '    } else {\n        second();\n    }\n    finish();\n}\n')
+        new = old.replace('old();', 'replacement();')
+        pairs, receipts, _ = self.attribution_obligations(old, new, excluded=(5,))
+        self.assertIn((4, 4), pairs.items())
+        self.assertIn((6, 6), pairs.items())
+        self.assertNotIn(5, pairs)
+        self.assertIn([5, 5], receipts[0]['non_executable_rows'])
+        def cold(owners, sources):
+            for row in owners[1][0]['regions']:
+                if row[0] == 6:
+                    row[4] = 0
+        with self.assertRaisesRegex(ValueError, 'lost compiled-copy coverage'):
+            self.attribution_obligations(old, new, excluded=(5,), mutation=cold)
 
     def test_replacement_obligations_attach_unchanged_callbacks_to_each_parent_copy(self):
         old = 'fn retained() {\n    old();\n    consume(|| verify_archive_signature());\n    finish();\n}\n'

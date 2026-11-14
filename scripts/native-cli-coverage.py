@@ -402,6 +402,7 @@ TESTS = {
     ),
     'comprehensive': ('behavior_inventory_runs_in_hermetic_state',),
     'cli-unit': ('fast_path_tests::private_install_plan_rejects_missing_or_invalid_descriptors',),
+    'lib-unit': ('cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy',),
 }
 ROLES = ('cli', 'daemon', *TESTS)
 CASES = tuple((f'test-{index:02}', role, name)
@@ -1055,7 +1056,7 @@ test "$(stat -c '%u:%a' /omg-extra-bin)" = 0:755
 printf '%s' ARTIFACTS > /evidence/cli/artifacts.sha256
 sha256sum -c /evidence/cli/artifacts.sha256 > /evidence/cli/artifact-check.txt
 printf '%s' SELECTION > /evidence/cli/expected-tests.tsv
-for role in cli daemon coverage14 arch-contracts comprehensive cli-unit; do
+for role in cli daemon coverage14 arch-contracts comprehensive cli-unit lib-unit; do
   test "$(stat -c '%u:%a' "/omg-extra-bin/$role")" = 0:755
   ldd "/omg-extra-bin/$role" > "/evidence/cli/abi-$role.txt" 2>&1
   ! grep -F 'not found' "/evidence/cli/abi-$role.txt"
@@ -1098,7 +1099,7 @@ ordinary() {
 }
 ordinary bash -c 'test "$(id -u)" -ne 0; umask 077; mkdir -p "$HOME/work" "$XDG_RUNTIME_DIR" "$OMG_CONFIG_DIR"; printf "telemetry_enabled = false\n" > "$OMG_CONFIG_DIR/config.toml"'
 ordinary bash -c 'missing=0; for tool in git make jq cmp; do if ! command -v "$tool"; then printf "Missing native fixture command: %s\n" "$tool" >&2; missing=1; fi; done; exit "$missing"' > /evidence/cli/prerequisites.txt
-for role in coverage14 arch-contracts comprehensive cli-unit; do
+for role in coverage14 arch-contracts comprehensive cli-unit lib-unit; do
   LLVM_PROFILE_FILE="/profiles/omg-extra-registry-$role-%p-%m.profraw" \
     /omg-extra-bin/"$role" --list --format terse > /evidence/cli/registry-"$role".txt 2>&1
 done
@@ -1106,10 +1107,13 @@ while IFS=$'\t' read -r stage role name; do
   registry=/evidence/cli/registry-$role.txt
   test "$(grep -Fxc "$name: test" "$registry")" = 1
   log=/evidence/cli/$stage.log
-  if test "$role" = cli-unit; then
+  if test "$role" = cli-unit || test "$role" = lib-unit; then
+    fixture_env=()
+    if test "$role" = lib-unit; then fixture_env=("OMG_ISOLATED_FIXTURE_TEST=$name"); fi
     timeout --signal=TERM --kill-after=3 45 env -i PATH=/usr/bin:/bin LANG=C.UTF-8 \
       HOME=/var/tmp/omg-extra-root OMG_DATA_DIR=/var/tmp/omg-extra-root/data OMG_NATIVE_TEST_DATA_DIR=1 \
       OMG_DISABLE_TELEMETRY=1 LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
+      "${fixture_env[@]}" \
       bash -c 'cd "$HOME"; test "$(id -u)" = 0; printf "[extra-root-test] uid=%s\n" "$(id -u)"; exec "$@"' \
       bash /omg-extra-bin/"$role" "$name" --exact --nocapture --test-threads=1 < /dev/null > "$log" 2>&1
   else
@@ -1121,7 +1125,7 @@ while IFS=$'\t' read -r stage role name; do
   fi
   grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
   ! grep -E '\[omg-skip\]|\[native-arch-fixture-skip\]|\[native-inventory-unavailable\]|LLVM Profile (Error|Warning)' "$log"
-  if test "$role" != cli-unit; then
+  if test "$role" != cli-unit && test "$role" != lib-unit; then
     grep -Eq '\[native-arch-fixture\] uid=[1-9][0-9]* actual_id=arch' "$log"
   fi
   printf '%s\t%s\t%s\tPASS\n' "$stage" "$role" "$name" >> /evidence/cli/passed.tsv
@@ -1242,15 +1246,25 @@ def validate_evidence(evidence, profiles, artifacts, commit):
     for stage, role, name in CASES:
         require((evidence / f'registry-{role}.txt').read_text().splitlines().count(name + ': test') == 1, 'Test registry mismatch')
         log = (evidence / f'{stage}.log').read_text()
-        require(len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', log, re.M)) == 1, 'Test not exactly one PASS')
-        require(len(re.findall(r'^test ' + re.escape(name) + r' \.\.\.', log, re.M)) == 1, 'Selected test execution missing/duplicated')
+        executions = 2 if role == 'lib-unit' else 1
+        require(len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', log, re.M)) == executions, 'Test execution count differs')
+        require(len(re.findall(r'^test ' + re.escape(name) + r' \.\.\.', log, re.M)) == executions, 'Selected test execution missing/duplicated')
         require(not re.search(r'\[omg-skip\]|\[native-arch-fixture-skip\]|\[native-inventory-unavailable\]|LLVM Profile (Error|Warning)', log), 'Skip/LLVM diagnostic')
         modules = {PROFILE.fullmatch(p.name)[3] for p in grouped[stage]}
-        if role != 'cli-unit':
+        if role not in ('cli-unit', 'lib-unit'):
             require(re.search(r'\[native-arch-fixture\] uid=[1-9][0-9]* actual_id=arch', log), 'Missing native ordinary admission')
             require(cli_modules <= modules and len(modules) >= 2, 'Missing matching child CLI/harness raw profiles')
         else:
             require('[extra-root-test] uid=0' in log, 'Root receiver branch not admitted')
+            if role == 'lib-unit':
+                uid = re.search(r'ordinary_uid=([1-9][0-9]*)', (evidence / 'identity.txt').read_text())[1]
+                digest = artifacts[role]['sha256']
+                parent = f'[omg-unprivileged-fixture] test={name} parent_uid=0 executable_sha256={digest}'
+                child = f'[omg-unprivileged-fixture-child] test={name} uid={uid} executable_sha256={digest}'
+                require(log.count(parent) == log.count(child) == 1,
+                        'Missing or invalid unprivileged policy fixture witness')
+                require(len({PROFILE.fullmatch(p.name)[2] for p in grouped[stage]}) >= 2,
+                        'Missing unprivileged policy fixture child profiles')
         ET.SubElement(suite, 'testcase', name=name, classname=role)
         tests.append(dict(stage=stage, role=role, name=name, result='PASS'))
     inventory_stages = [stage for stage, role, name in CASES
@@ -1433,7 +1447,7 @@ def prepare(target, commit):
     require(target.is_dir(), 'Coverage target is absent')
     paths = {'cli': target / 'debug/omg', 'daemon': target / 'debug/omgd'}
     for role, prefix in (('coverage14', 'coverage_14'), ('arch-contracts', 'arch_cli_contracts'),
-                         ('comprehensive', 'cli_comprehensive'), ('cli-unit', 'omg')):
+                         ('comprehensive', 'cli_comprehensive'), ('cli-unit', 'omg'), ('lib-unit', 'omg_lib')):
         matches = [path for path in (target / 'debug/deps').glob(prefix + '-*')
                    if re.fullmatch(re.escape(prefix) + r'-[0-9a-f]{16}', path.name)
                    and path.is_file() and not path.is_symlink() and os.access(path, os.X_OK)
