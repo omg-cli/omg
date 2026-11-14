@@ -1427,8 +1427,49 @@ The broad normal check passed 2428 library tests (13 existing ignores), all
 denied and normal binaries. After the final startup control-flow simplification,
 all 63 Omarchy tests, applicable Clippy and normal binaries passed again; the
 receipt proves every other Rust/Cargo input matches the preceding broad run.
-Fresh instrumented, optimized query-cost and native guest verification of this
-consolidated runtime remain pending before publication. Published cdf08b68 has
-46 successful checks and one executed failure: the strict added-file coverage
-comparison (job 132268029539, run 43534884430). That gate remains unresolved;
-none of its source, counter, exclusion or acceptance rules changed.
+The exact committed runtime `00c79e2a` also passed all 2428 library tests and
+32 CLI unit tests under instrumentation. The protected six-artifact KVM
+producer passed its 14 selected tests, 25 Omarchy scenarios and two normal Arch
+read-only commands in 212.490 seconds. Its 330 genuine profiles were imported
+after clean shutdown and verification that the prepared guest inputs were
+unchanged. Earlier profiles and objects remain outside the active collection;
+their split debug companions remain at the paths referenced by those objects.
+
+The fresh report reaches 244/244 functions and 3612/3687 summary lines in
+Omarchy, with 54 uncovered mapped lines. The preceding runtime had 59 uncovered
+mapped lines. The report therefore does not satisfy the strict added-file
+coverage comparison. Operating-system failure paths and cold fixture
+diagnostics still need work. No source, counter, exclusion or acceptance rule
+changed. Published `cdf08b68` has 46 successful checks and one executed failure,
+the [coverage comparison](https://github.com/omg-cli/omg/actions/runs/43534884430/job/132268029539).
+New-head hosted checks remain required after this batch is published.
+
+The optimized `00c79e2a` CLI and daemon independently passed the full signed
+native update, user-manager reexecution, six refusal controls, 25 Omarchy
+scenarios, three terminal interactions and two normal Arch read-only commands.
+The run completed in 173.818 seconds with no forbidden helper execution,
+unchanged real guest package state and clean shutdown. Binary hashes, compiled
+source inputs and prepared guest pins remained unchanged. Its receipt is
+`omarchy-native20-positive23/receipt.json`, SHA-256
+`4e6d4bc6bf126a0e487f879e8e1977173507a931f00da8463088b7055ac994c5`.
+
+The local test bundle is
+`native29-release/omg-pr1057-00c79e2a-x86_64-arch.tar.gz`, SHA-256
+`a3de47463fb4013b88bb33b83e57b54afda98da5656895ecd40d9de196e54145`.
+It contains both binaries, `SHA256SUMS` and `verification.json`. Packaging
+reopened the archive and verified both executable hashes. The CLI hash is
+`0dcc7cf7d0c6b84908cf03734437c951fbcca92f1bb36b9cadec80182885e05b`;
+the daemon hash is
+`1c18186bb4bc6d90f5532107c24b62fdacce41edda1ef031950456a4837c6545`.
+This is a runtime-verified candidate, not a cleared release. Host binaries,
+package state, services, accounts and sudo policy were not changed.
+
+Query performance also remains open. Five alternating optimized samples per
+side used unchanged real catalogs, daemon bypass and identical JSON results,
+with no failures. The observed median for `info firefox` rose from 0.139 to
+0.499 seconds; ranges were 0.134–0.153 and 0.498–0.502 seconds. A separate debug
+stack sample stopped inside the official Rust shared-object dependency parser.
+That sample does not establish the release time share of each stage, so the
+causal assessment remains inconclusive. The candidate keeps full catalog
+validation and current-source signature checks. Its verification metadata
+records the latency observations and leaves performance acceptance false.
