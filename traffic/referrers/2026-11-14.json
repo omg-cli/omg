@@ -1,0 +1,20 @@
+{
+  "data": [
+    {
+      "count": 4,
+      "referrer": "github.com",
+      "uniques": 3
+    },
+    {
+      "count": 2,
+      "referrer": "alternativeto.net",
+      "uniques": 2
+    },
+    {
+      "count": 2,
+      "referrer": "aocr.org",
+      "uniques": 2
+    }
+  ],
+  "date": "2026-11-14"
+}
