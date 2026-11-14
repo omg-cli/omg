@@ -1062,19 +1062,143 @@ def _compiled_function_groups(name, owners, files, source, work=None):
     return inventory, valid, names
 
 
-def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files, fragments):
+@dataclass(frozen=True)
+class AsyncCompiledCopy:
+    constructor: dict
+    body: dict
+
+
+@dataclass(frozen=True)
+class AsyncFunctionGroup:
+    declaration: str
+    span: tuple[int, int]
+    copies: tuple[AsyncCompiledCopy, ...]
+    closing_kinds: dict[int, str]
+
+
+def compiled_async_function_groups(name, owners, files, source, work=None, inventory=None):
+    """Bind separate v0 constructor/body owners without merging their counters."""
+    work = [20_000_000] if work is None else work
+    inventory = _construct_inventory(source, work) if inventory is None else inventory
+    if inventory is None:
+        return {}
+    code = inventory[0]
+    counts = Counter(owner['name'] for owner in owners)
+    eligible = [owner for owner in owners
+                if source_owner_span(owner, name, files, source) is not None]
+    result = {}; declarations = []
+    closing_kinds = {}
+    for line, rows in inventory[2].items():
+        if len(rows) == 1 and rows[0]['supported']:
+            row = rows[0]
+            if code.words[row['opening'] - 1] == 'else':
+                closing_kinds[line] = 'else'
+            elif row['kind'] in ('if', 'for', 'while', 'loop', 'match', 'fn'):
+                closing_kinds[line] = row['kind']
+    for row in inventory[1]:
+        header = row.get('header', ())
+        if (row['kind'] != 'fn' or not row['supported'] or 'async' not in header
+                or code.parents[row['opening']] is not None or 'fn' not in header):
+            continue
+        declaration = header[header.index('fn') + 1]
+        first = code.position(code.starts[row['first']])
+        opening = code.position(code.starts[row['opening']])
+        closing = code.position(code.ends[row['end']])
+        span = first[0], closing[0]
+        declarations.append((declaration, first, opening, closing, span))
+    prefixes = source_function_prefixes(source, [row[-1] for row in declarations], work)
+    for declaration, first, opening, closing, span in declarations:
+        if span not in prefixes:
+            continue
+        parents = []
+        for owner in eligible:
+            _construct_charge(work, len(owner['name']) + len(owner['regions']))
+            shape = plain_rust_function_symbol(owner['name'])
+            if (shape is not None and shape[1][-1] == declaration
+                    and len(owner['regions']) == 1
+                    and tuple(owner['regions'][0][:4]) == (*first, opening[0], opening[1] - 1)):
+                parents.append((owner, shape))
+        if not parents or len({tuple(shape[1]) for _, shape in parents}) != 1:
+            continue
+        copies = []
+        for parent, shape in parents:
+            children = []
+            for owner in eligible:
+                _construct_charge(work, len(owner['name']) + len(owner['regions']))
+                if not direct_rust_callback_symbol(owner['name'], parent['name'], shape[0]):
+                    continue
+                regions = owner['regions']
+                if (min(tuple(region[:2]) for region in regions) == opening
+                        and max(tuple(region[2:4]) for region in regions) == closing
+                        and sum(tuple(region[:4]) == (*opening, opening[0], opening[1] + 1)
+                                for region in regions) == 1):
+                    children.append(owner)
+            if len(children) != 1 or counts[parent['name']] != 1 or counts[children[0]['name']] != 1:
+                copies = []
+                break
+            copies.append(AsyncCompiledCopy(parent, children[0]))
+        if not copies:
+            continue
+        geometry = {tuple(sorted(tuple(region[:4] + region[5:]) for region in copy.body['regions']))
+                    for copy in copies}
+        if len(geometry) != 1:
+            continue
+        key = 'async:' + '::'.join(parents[0][1][1])
+        if key in result:
+            return {}
+        result[key] = AsyncFunctionGroup(prefixes[span], span, tuple(copies), closing_kinds)
+    return result
+
+
+def fragment_region_states(owner, first, last, source, work):
+    """Clip raw regions to identical source bytes, preserving every region state."""
+    low, high = (first, 1), (last, len(source[last - 1].encode()) + 1)
+    regions = owner['regions']
+    _construct_charge(work, len(regions) * (len(regions).bit_length() + 3))
+    pieces = []
+    for region in regions:
+        start, end = max(tuple(region[:2]), low), min(tuple(region[2:4]), high)
+        if start < end:
+            pieces.append(((start[0] - first, start[1], end[0] - first, end[1], *region[5:]),
+                           int(region[4] > 0)))
+    pieces.sort()
+    return tuple(shape for shape, _ in pieces), tuple(state for _, state in pieces)
+
+
+def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
+                              fragments, work=None, construct_inventories=None, compiled_groups=None):
     """Prove positive head pairs, retaining every base state, copy and candidate."""
     if not fragments:
         return {}, []
+    work = [20_000_000] if work is None else work
     def refuse():
         a, b, c, d, _ = fragments[0]
         raise ValueError(f"Ambiguous unchanged source correspondence: {name}:{a + 1}-{b} -> {c + 1}-{d}")
-    inventories = []; groups = []; inventory_names = []
-    for owners, files, source in ((base, base_files, old), (head, head_files, new)):
-        grouped = _compiled_function_groups(name, owners, files, source)
+    inventories = []; groups = []; inventory_names = []; async_groups = []
+    for side, (owners, files, source) in enumerate(((base, base_files, old), (head, head_files, new))):
+        grouped = (_compiled_function_groups(name, owners, files, source, work)
+                   if compiled_groups is None else compiled_groups[side])
         if grouped is None:
             refuse()
         inventory, valid, names = grouped
+        if compiled_groups is not None:
+            _construct_charge(work, len(owners) + sum(len(owner['filenames']) for owner in owners))
+            expected_inventory = [owner for owner in owners if any(
+                files.get(path) == name or path.endswith('/' + name) for path in owner['filenames'])]
+            if {id(owner) for owner in inventory} != {id(owner) for owner in expected_inventory}:
+                refuse()
+            names = Counter(owner['name'] for owner in owners)
+            valid = {prefix: group for prefix, group in valid.items()
+                     if all(names[owner['name']] == 1 for owner in group[2])}
+        valid = dict(valid)
+        phases = compiled_async_function_groups(name, owners, files, source, work,
+                    None if construct_inventories is None else construct_inventories[side])
+        claimed_bodies = {id(owner) for group in valid.values() for owner in group[2]}
+        phases = {key: group for key, group in phases.items()
+                  if not any(id(copy.body) in claimed_bodies for copy in group.copies)}
+        valid.update({key: (*group.span, tuple(copy.body for copy in group.copies))
+                      for key, group in phases.items()})
+        async_groups.append(phases)
         inventories.append(inventory); groups.append(valid); inventory_names.append(names)
     forwarders = transparent_forwarder_groups(old, new, groups, fragments)
     for prefix, (group, _) in forwarders.items():
@@ -1096,18 +1220,53 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             "file": name, "base_range": list(bg[:2]), "head_range": list(hg[:2]),
             "instances": len(bg[2]), "pairs": [], "candidates": [],
             "source_prefix_sha256": hashlib.sha256(prefix.encode()).hexdigest()})
+        if prefix in async_groups[0] or prefix in async_groups[1]:
+            if prefix not in async_groups[0] or prefix not in async_groups[1]:
+                refuse()
+            if 'async_copies' not in entry:
+                entry.pop('source_prefix_sha256')
+                entry['async_owner_namespace_sha256'] = hashlib.sha256(prefix.encode()).hexdigest()
+                entry['async_declarations_sha256'] = [hashlib.sha256(
+                    side[prefix].declaration.encode()).hexdigest() for side in async_groups]
+                entry['async_copies'] = {}
+                for side, label in enumerate(('base', 'head')):
+                    phase = async_groups[side][prefix]
+                    rows = []
+                    for state, copy in zip(entry['states'][side], phase.copies):
+                        constructor = int(copy.constructor['regions'][0][4] > 0)
+                        start = min(tuple(region[:2]) for region in copy.body['regions'])
+                        body = int(any(region[4] > 0
+                                       and tuple(region[:4]) == (*start, start[0], start[1] + 1)
+                                       for region in copy.body['regions']))
+                        state.extend((constructor, body))
+                        rows.append(dict(constructor=copy.constructor['name'], body=copy.body['name'],
+                                         constructor_state=constructor, body_state=body))
+                    entry['async_copies'][label] = rows
         if prefix in forwarders:
             entry['forwarder'] = forwarders[prefix][1]
             start, end = entry['forwarder']['wrapper_range']
             excerpts[1, start, end] = ('\n'.join(new[start - 1:end]) + '\n').encode()
-        occurrences = []; callback_signature = None; callback_mode = None
+        endpoint_kind = None
+        if prefix in async_groups[0] and b == a + 1 and old[a].strip() == '}':
+            endpoint_kind = async_groups[0][prefix].closing_kinds.get(a + 1)
+            if endpoint_kind is None or endpoint_kind != async_groups[1][prefix].closing_kinds.get(c + 1):
+                refuse()
+        occurrences = []; callback_signature = None; callback_mode = None; precise_signature = None
         for side, source, counts, group, proposed in ((0, old, before, bg, a), (1, new, after, hg, c)):
             start, end, members = group
             starts = [offset for offset in range(start - 1, end - (b - a) + 1)
                       if source[offset:offset + b - a] == old[a:b]]
+            if endpoint_kind is not None:
+                kinds = async_groups[side][prefix].closing_kinds
+                if any(offset + 1 not in kinds for offset in starts):
+                    refuse()
+                entry.setdefault('async_endpoint_contexts', []).append(dict(
+                    side=side, kind=endpoint_kind,
+                    candidates=[[offset + 1, kinds[offset + 1]] for offset in starts]))
+                starts = [offset for offset in starts if kinds[offset + 1] == endpoint_kind]
             if proposed not in starts:
                 refuse()
-            observed = None
+            observed = None; precise_observed = None
             for offset in starts:
                 lines = [offset + line - a for line in pending]
                 if (any(line not in counts or (side == 1 and counts[line] <= 0)
@@ -1146,9 +1305,28 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                         or observed is not None and observed != states):
                     refuse()
                 observed = states
+                if prefix in async_groups[side]:
+                    pieces = [fragment_region_states(owner, offset + 1, offset + b - a, source, work)
+                              for owner in members]
+                    geometry = pieces[0][0]
+                    if (not geometry or any(piece[0] != geometry for piece in pieces)
+                            or precise_signature is not None and precise_signature != geometry):
+                        refuse()
+                    precise_signature = geometry
+                    precise = tuple(piece[1] for piece in pieces)
+                    if precise_observed is not None and precise_observed != precise:
+                        refuse()
+                    precise_observed = precise
             for row, states in zip(entry["states"][side], observed):
                 row.extend(states)
+            if precise_observed is not None:
+                for row, states in zip(entry['states'][side], precise_observed):
+                    row.extend(states)
             occurrences.append([[offset + 1, offset + b - a] for offset in starts])
+        if precise_signature is not None:
+            entry.setdefault('async_fragment_regions', []).append(dict(
+                base_range=[a + 1, b], head_range=[c + 1, d],
+                geometry=[list(shape) for shape in precise_signature]))
         entry["candidates"].append({"base": occurrences[0], "head": occurrences[1]})
         for line in pending:
             target = c + line - a
@@ -3865,7 +4043,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             _construct_charge(construct_work, end - start + 1)
             gone.difference_update(range(start, end + 1))
         positive, receipts = positive_source_fragments(
-            name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments)
+            name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments,
+            construct_work, inventories, grouped)
         retained.update(positive)
         positive_receipts.extend(receipts)
         gone.difference_update(anchored)

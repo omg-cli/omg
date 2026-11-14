@@ -242,6 +242,127 @@ class SourceConstructCapacityTests(unittest.TestCase):
 
 
 class SourceAwareCoverageTests(unittest.TestCase):
+    def async_positive_fragment_compare(self, mutation=None, joint=False):
+        old = ['async fn checked(', '    old: bool,', ') {',
+               '    verify();', '    finish();', '}']
+        new = [line.replace('old:', 'new:') for line in old]
+        documents = []
+        for side, source in enumerate((old, new)):
+            owners = []
+            for copy_number in range(2):
+                parent = f'_RNvCs{copy_number + 1}_7example7checked'
+                owners.extend([
+                    dict(name=parent, count=1, filenames=['/src/example.rs'],
+                         regions=[[1, 1, 3, 2, 1, 0, 0, 0]]),
+                    dict(name='_RNC' + parent[2:] + '0B3_', count=1,
+                         filenames=['/src/example.rs'], regions=[
+                             [3, 3, 3, 4, 1, 0, 0, 0],
+                             [4, 5, 4, 14, int(not joint or copy_number == 0), 0, 0, 0],
+                             [5, 5, 5, 14, int(not joint or copy_number == 0), 0, 0, 0],
+                             [6, 1, 6, 2, 1, 0, 0, 0]])])
+            documents.append(owners)
+        if mutation:
+            mutation(documents)
+        fragments = [(3, 4, 3, 4, (4,))]
+        if joint:
+            fragments.append((4, 5, 4, 5, (5,)))
+        original = copy.deepcopy(documents)
+        try:
+            return coverage.positive_source_fragments('example.rs', old, new,
+                {4: 1 if joint else 2, 5: 1 if joint else 2},
+                {4: 1 if joint else 2, 5: 1 if joint else 2}, *documents,
+                {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'}, fragments)
+        finally:
+            self.assertEqual(documents, original, 'phase proof must preserve the raw producer evidence')
+
+    def test_async_positive_fragment_preserves_distinct_constructor_and_body_copies(self):
+        pairs, receipts = self.async_positive_fragment_compare()
+        self.assertEqual(pairs, {4: 4})
+        self.assertEqual(receipts[0]['instances'], 2)
+        self.assertEqual(len(receipts[0]['async_copies']['base']), 2)
+        self.assertEqual(len(receipts[0]['async_copies']['head']), 2)
+
+    def test_async_positive_fragment_refuses_incomplete_or_cold_phase_evidence(self):
+        def mutate(owners, mode):
+            head = owners[1]
+            if mode == 'cold-constructor': head[0]['regions'][0][4] = 0
+            elif mode == 'cold-body': head[1]['regions'][1][4] = 0
+            elif mode == 'cold-poll-entry-with-hot-enclosing-region':
+                head[1]['regions'][0][4] = 0
+                for owner in (head[1], head[3]):
+                    owner['regions'].append([3, 3, 6, 2, 1, 0, 0, 0])
+            elif mode == 'cold-fragment-subexpression':
+                for owner in (head[1], head[3]):
+                    owner['regions'].append([4, 5, 4, 11, 0, 0, 0, 0])
+            elif mode == 'missing-constructor': head.pop(0)
+            elif mode == 'missing-body': head.pop(1)
+            elif mode == 'foreign-file': head[1]['filenames'] = ['/src/elsewhere.rs']
+            elif mode == 'multi-file': head[1]['filenames'].append('/src/elsewhere.rs')
+            elif mode == 'unlinked-body': head[1]['name'] += 'x'
+            elif mode == 'duplicate-body': head.append(copy.deepcopy(head[1]))
+            elif mode == 'different-namespace':
+                for owner in head: owner['name'] = owner['name'].replace('7example', '7another')
+        for mode in ('cold-constructor', 'cold-body', 'cold-poll-entry-with-hot-enclosing-region',
+                     'cold-fragment-subexpression',
+                     'missing-constructor', 'missing-body',
+                     'foreign-file', 'multi-file', 'unlinked-body', 'duplicate-body', 'different-namespace'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.async_positive_fragment_compare(lambda owners: mutate(owners, mode))
+
+    def test_async_positive_fragments_require_one_joint_copy_matching(self):
+        pairs, _ = self.async_positive_fragment_compare(joint=True)
+        self.assertEqual(pairs, {4: 4, 5: 5})
+        def split_hits(owners):
+            owners[1][1]['regions'][2][4] = 0
+            owners[1][3]['regions'][2][4] = 1
+        with self.assertRaises(ValueError):
+            self.async_positive_fragment_compare(split_hits, joint=True)
+
+    def async_endpoint_compare(self, alternative_kind='else'):
+        old = ['async fn checked(', '    old: bool,', ') {', '    if old {',
+               '        verify();', '    }', '    finish();', '}']
+        new = ['async fn checked(', '    new: bool,', ') {', '    if new {',
+               '        verify();', '    }',
+               '    {' if alternative_kind == 'block' else '    if new {', '        finish();',
+               '    } else {' if alternative_kind == 'else' else '        // separate block',
+               '        finish();', '    }', '}']
+        owners = []
+        for side, source in enumerate((old, new)):
+            rows = []
+            for copy_number in range(2):
+                parent = f'_RNvCs{copy_number + 1}_7example7checked'
+                rows.extend([
+                    dict(name=parent, count=1, filenames=['/src/example.rs'],
+                         regions=[[1, 1, 3, 2, 1, 0, 0, 0]]),
+                    dict(name='_RNC' + parent[2:] + '0B3_', count=1,
+                         filenames=['/src/example.rs'], regions=[
+                             [3, 3, 3, 4, 1, 0, 0, 0],
+                             *[[number, 1, number, len(text) + 1, 1, 0, 0, 0]
+                               for number, text in enumerate(source, 1)
+                               if number > 3 and not (side == 1 and number == 11)]])])
+            owners.append(rows)
+        return coverage.positive_source_fragments('example.rs', old, new, {6: 2}, {6: 2},
+            *owners, {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'},
+            [(5, 6, 5, 6, (6,))])
+
+    def test_async_endpoint_uses_its_lexical_control_owner(self):
+        pairs, receipts = self.async_endpoint_compare()
+        self.assertEqual(pairs, {6: 6})
+        self.assertTrue(receipts[0]['async_endpoint_contexts'])
+
+    def test_async_endpoint_keeps_unmapped_candidates_of_the_same_control_kind(self):
+        with self.assertRaises(ValueError):
+            self.async_endpoint_compare(alternative_kind='if')
+
+    def test_async_endpoint_refuses_an_unclassified_alternative_owner(self):
+        with self.assertRaises(ValueError):
+            self.async_endpoint_compare(alternative_kind='block')
+
+    def test_async_phase_discovery_obeys_the_existing_shared_work_bound(self):
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage.compiled_async_function_groups('example.rs', [], {},
+                ['async fn checked() {', '    verify();', '}'], work=[0])
+
     def retained_record_field_compare(self, head_counts=(1, 1), ancestor_counts=None,
                                       refinement_counts=None, base_refinement_counts=None):
         old = b'struct Config { name: String }\nimpl Config {\n    pub fn make(section: &str) -> Self {\n        Self {\n            name: section.to_string(),\n        }\n    }\n}\n'
