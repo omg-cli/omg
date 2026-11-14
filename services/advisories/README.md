@@ -66,7 +66,7 @@ The private JSON secret file contains `INGEST_TOKEN` and must be owned by the op
 
 `secret put` creates a deployed Worker version. The bucket is private and has no configured public access. The public API is read only; its private write routes still require the operator secret. Do not store a Cloudflare account/API token in OMG or in this ingest secret.
 
-The five-minute Cron reads only fixed official Arch, CISA and CVEProject URLs. The CVE rolling log is parsed incrementally with pinned `@streamparser/json` 0.0.26. It retains one event and the next bounded batch, validates the whole response before advancing the cursor, and rejects redirects. Event timestamp plus sorted position permits large events to span invocations. Failed batches replay idempotently. An expired ten-minute lease permits recovery. Falling behind the oldest retained delta requires a fresh archive reconciliation.
+The five-minute Cron reads only fixed official Arch, CISA and CVEProject URLs. The CVE rolling log is parsed incrementally with pinned `@streamparser/json` 0.0.26. It retains one event and the next bounded batch, validates the whole response before advancing the cursor, and rejects redirects. Event timestamp plus sorted position permits large events to span invocations. Scheduled refreshes and operator imports share a bounded ingestion routine: at most four distinct CVE IDs run concurrently, revisions of one ID remain serial, and all started work settles before a failure releases the writer lease. The delta cursor advances only after the entire selected batch succeeds. Failed batches replay idempotently. An expired ten-minute lease permits recovery. Falling behind the oldest retained delta requires a fresh archive reconciliation.
 
 `CVE_BATCH_SIZE` is configured to 32, the validated ceiling, with a five-minute Cron and a 30,000 ms CPU cap. That admits at most 9,216 record changes per day; it does not establish zero backlog or immediate publication coverage. The upstream rolling log is about 39 MB, so both processing capacity and arrival rate matter. This configuration was accepted and exercised on the existing account without a subscription upgrade. Regenerate binding types and verify runtime limits when changing it or deploying elsewhere.
 
@@ -83,7 +83,7 @@ bun run bootstrap --help
 bun run bootstrap \
   --archive /absolute/operator-data/2026-11-13_all_CVEs_at_midnight.zip.zip \
   --asset 2026-11-13_all_CVEs_at_midnight.zip.zip \
-  --release-tag cve_2026-11-13_0100Z \
+  --release-tag cve_2026-11-13_0600Z \
   --state /absolute/operator-data/advisories.bootstrap-state.json \
   --max-records 1000 --dry-run
 ```

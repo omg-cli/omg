@@ -327,7 +327,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertEqual([receipt[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
                                                  'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
         proofs = receipt['retained_replacement_obligations']
-        self.assertTrue(any(row.get('fully_covered_trait_owners') for row in proofs))
+        self.assertTrue(any(row.get('fully_covered_replacement_owners') for row in proofs))
 
     def test_trait_async_proof_refuses_incomplete_cold_or_foreign_owner_trees(self):
         def mutate(base, head, mode):
@@ -1392,8 +1392,10 @@ class SourceAwareCoverageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.attribution_obligations(old, new, mutation=swapped_rows)
 
-    def renamed_capsule_compare(self, copy_states=None, mutate=None, new_source=None):
+    def renamed_capsule_compare(self, copy_states=None, mutate=None, new_source=None, async_base=False):
         old = b'#[test]\nfn obsolete() -> Result<()> {\n    assert_eq!(old(), false);\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\n'
+        if async_base:
+            old = old.replace(b'#[test]\nfn', b'#[tokio::test]\nasync fn')
         new = new_source or b'#[test]\nfn replacement() -> Result<()> {\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\n'
         copy_states = copy_states or (((1, 1),), ((1, 1),))
         def owners(base, head):
@@ -1408,10 +1410,18 @@ class SourceAwareCoverageTests(unittest.TestCase):
                             for line in range(3, end + 1)]
                     for number, state in zip((5 - side, 6 - side), states):
                         rows[number - 3][4] = state
-                    document['data'][0]['functions'].append(dict(name=symbol,
-                        filenames=['/src/example.rs'], regions=[
-                            [2, lines[1].index('{') + 1, end, 2, 1, 0, 0, 0], *rows,
-                            [zero, len(lines[zero - 1]), zero, len(lines[zero - 1]) + 1, 0, 0, 0, 0]]))
+                    tail = [] if async_base else [
+                        [zero, len(lines[zero - 1]), zero, len(lines[zero - 1]) + 1, 0, 0, 0, 0]]
+                    owner = dict(name=symbol, filenames=['/src/example.rs'], regions=[
+                        [2, lines[1].index('{') + 1, end, 2, 1, 0, 0, 0], *rows, *tail])
+                    if async_base:
+                        owner['count'] = 1
+                    document['data'][0]['functions'].append(owner)
+                    if async_base and side == 0:
+                        document['data'][0]['functions'].append(dict(name='_RNC' + symbol[2:] + '0B5_',
+                            count=1, filenames=['/src/example.rs'], regions=[
+                                [2, lines[1].index('{') + 1, 2, lines[1].index('{') + 2, 1, 0, 0, 0],
+                                *copy.deepcopy(rows[:-1])]))
             if mutate:
                 mutate(base, head)
         return self.compare(before=[(line, len(copy_states[0])) for line in range(2, 10)],
@@ -1427,6 +1437,48 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertTrue(all([line, line - 1] in pairs for line in range(4, 10)))
         self.assertIn(0, proofs[0]['base_instance_states'][0])
         self.assertEqual(proofs[0]['base_instance_states'], proofs[0]['head_instance_states'])
+
+    def test_fully_covered_async_test_migration_retains_all_owner_trees(self):
+        new = b'#[test]\nfn replacement() -> Result<()> {\n    use support::Value;\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\n'
+        receipt = self.renamed_capsule_compare(new_source=new, async_base=True)
+        self.assertEqual([receipt[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        self.assertTrue(any(row.get('fully_covered_replacement_owners')
+                            for row in receipt['retained_replacement_obligations']))
+
+    def test_fully_covered_test_migration_refuses_missing_future_body(self):
+        def missing(base, head):
+            base['data'][0]['functions'].pop()
+        new = b'#[test]\nfn replacement() -> Result<()> {\n    use support::Value;\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\n'
+        with self.assertRaises(ValueError):
+            self.renamed_capsule_compare(new_source=new, async_base=True, mutate=missing)
+
+    def test_fully_covered_test_migration_refuses_cold_or_foreign_copies(self):
+        new = b'#[test]\nfn replacement() -> Result<()> {\n    use support::Value;\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\n'
+        def mutate(base, head, mode):
+            future = base['data'][0]['functions'][1]
+            current = head['data'][0]['functions'][0]
+            if mode == 'cold-future-entry':
+                future['count'] = 0
+            elif mode == 'cold-future-region':
+                future['regions'][-1][4] = 0
+            elif mode == 'cold-head-entry':
+                current['count'] = 0
+            elif mode == 'cold-head-region':
+                current['regions'][-1][4] = 0
+            elif mode == 'foreign-item':
+                future['name'] = future['name'].replace('s_8obsolete', 's0_8obsolete')
+            elif mode == 'foreign-namespace':
+                future['name'] = future['name'].replace('5tests', '5other')
+            elif mode == 'foreign-crate-copy':
+                future['name'] = future['name'].replace('Cs1_', 'Cs99_')
+            elif mode == 'duplicate-future':
+                base['data'][0]['functions'].append(copy.deepcopy(future))
+        for mode in ('cold-future-entry', 'cold-future-region', 'cold-head-entry', 'cold-head-region',
+                     'foreign-item', 'foreign-namespace', 'foreign-crate-copy', 'duplicate-future'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.renamed_capsule_compare(new_source=new, async_base=True,
+                    mutate=lambda base, head: mutate(base, head, mode))
 
     def test_replacement_residuals_cannot_swap_matching_copies_per_row(self):
         with self.assertRaisesRegex(ValueError, 'Replacement residual lost compiled-copy coverage'):

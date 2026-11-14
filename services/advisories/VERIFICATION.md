@@ -1,5 +1,11 @@
 # Local verification receipt
 
+## Shared scheduled and operator ingestion, November 14
+
+The scheduled-delta concurrency regression first observed one started fetch where four were required. Both ingestion paths now use the same bounded routine. Tests verify the four-ID limit, same-ID serialization, rejection protection, cursor retention through partial failure, and idempotent replay. The scheduled failure test holds a second fetch open while another fails and verifies that another writer cannot acquire the CVE lease until started work settles. This is a requirement on the new concurrent path, not a claim that the previous serial path released a lease around active parallel work.
+
+All 46 tests and 346 assertions pass, including the real workerd/D1/R2 boundary tests. Type checking passes. The existing record, body, concurrency, retry, timeout, CPU and bootstrap acceptance limits remain unchanged. The example release tag now matches the archive used by the validated operator run. Production deployment and corpus completeness require separate receipts.
+
 ## Bounded concurrent imports, November 14
 
 The new gated import test first failed with one started write where four were required. The route now groups records by CVE ID and runs at most four groups concurrently. Each group's revisions remain serial. All started promises settle before the lease is released, preserving fenced writes when another group fails. New tests check the concurrency bound, lease retention through failure, rejected-version ordering and conflicting equal revisions.

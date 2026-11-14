@@ -846,14 +846,15 @@ def plain_rust_function_symbol(symbol):
     return RustFunctionPath(modules, tuple(identifiers), tuple(disambiguators))
 
 
-def direct_rust_callback_symbol(child, parent, modules):
-    if type(child) is not str or len(child) > 4096:
+def direct_rust_callback_symbol(child, parent, modules, depth=1):
+    if type(child) is not str or len(child) > 4096 or not 1 <= depth <= 8:
         return False
-    # v0 NC + Nv + Nt* places the crate at offset 4 + 2*modules after _R; base62 encodes offset-1.
+    # Each NC adds two bytes; the crate backreference encodes its offset minus one.
     # https://doc.rust-lang.org/stable/rustc/symbol-mangling/v0.html#backref
-    backref = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'[3 + 2 * modules]
-    return re.fullmatch(re.escape('_RNC' + parent[2:])
-                        + r'(?:s[0-9A-Za-z]{0,32}_)?0(?:B' + backref + r'_)?', child) is not None
+    backref = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'[1 + 2 * depth + 2 * modules]
+    return re.fullmatch(re.escape('_R' + 'NC' * depth + parent[2:])
+                        + r'(?:(?:s[0-9A-Za-z]{0,32}_)?0){' + str(depth) + '}'
+                        + r'(?:B' + backref + r'_)?', child) is not None
 
 
 @lru_cache(maxsize=64)
@@ -1751,8 +1752,8 @@ def replacement_raw_parent(symbol, declaration=None):
     return ('_RNv' + prefix[1] + 'C' + scope + (terminal[0] if terminal else ''), scope)
 
 
-def fully_covered_trait_migration(name, old, new, before, after, descriptors, grouped,
-                                 selected, equal_rows, work):
+def fully_covered_replacement(name, old, new, before, after, descriptors, grouped,
+                              selected, equal_rows, work):
     """Certify correspondence only when every region in both owner trees is covered."""
     witnesses = []
     for counts, descriptor, compiled in zip((before, after), descriptors, grouped):
@@ -1761,21 +1762,31 @@ def fully_covered_trait_migration(name, old, new, before, after, descriptors, gr
         if any(count <= 0 for line, count in counts.items() if first <= line <= last):
             return None
         parent_names = {owner['name'] for owner in parents}
-        parent_shapes = [trait_method_path(parent) for parent in parent_names]
-        if any(shape is None or shape.callbacks for shape in parent_shapes):
+        trait_shapes = {parent: trait_method_path(parent) for parent in parent_names}
+        plain_shapes = {parent: plain_rust_function_symbol(parent) for parent in parent_names}
+        if any((trait is None or trait.callbacks) and plain_shapes[parent] is None
+               for parent, trait in trait_shapes.items()):
             return None
-        parent_paths = {shape.copy_identity for shape in parent_shapes}
+        parent_paths = {shape.copy_identity for shape in trait_shapes.values() if shape is not None}
+        async_bodies = {parent: [] for parent in parent_names}
         owners = []; regions = []
         for owner in compiled[0]:
-            _construct_charge(work, len(owner['name']) + len(owner['regions']))
+            _construct_charge(work, len(owner['name']) * (1 + 8 * len(parent_names)) + len(owner['regions']))
             span = min(row[0] for row in owner['regions']), max(row[2] for row in owner['regions'])
             if span[1] < first or span[0] > last:
                 continue
             shape = trait_method_path(owner['name'])
+            child = (shape is not None and shape.callbacks and shape.copy_identity in parent_paths
+                     or any(plain is not None and any(direct_rust_callback_symbol(
+                         owner['name'], parent, plain.modules, depth) for depth in range(1, 9))
+                            for parent, plain in plain_shapes.items()))
+            if span[0] == first:
+                for parent, plain in plain_shapes.items():
+                    if plain is not None and direct_rust_callback_symbol(owner['name'], parent, plain.modules):
+                        async_bodies[parent].append(owner['name'])
             if (not first <= span[0] <= span[1] <= last
                     or compiled[2][owner['name']] != 1
-                    or owner['name'] not in parent_names
-                       and (shape is None or not shape.callbacks or shape.copy_identity not in parent_paths)
+                    or owner['name'] not in parent_names and not child
                     or type(owner.get('count')) is not int or not 0 < owner['count'] < COUNTER_LIMIT
                     or any(not 0 < row[4] < COUNTER_LIMIT for row in owner['regions'])):
                 return None
@@ -1783,6 +1794,9 @@ def fully_covered_trait_migration(name, old, new, before, after, descriptors, gr
                 regions_sha256=hashlib.sha256(repr(owner['regions']).encode()).hexdigest()))
             regions.extend(owner['regions'])
         if not parent_names.issubset({owner['name'] for owner in owners}):
+            return None
+        if (descriptor['attributes'] == ['#', '[', 'tokio', '::', 'test', ']', 'async']
+                and any(len(bodies) != 1 for bodies in async_bodies.values())):
             return None
         _construct_charge(work, (last - first + 1) * len(regions))
         if any(not owner_covers_lines(regions, line, line)
@@ -1806,7 +1820,7 @@ def fully_covered_trait_migration(name, old, new, before, after, descriptors, gr
     if not pairs or len(set(pairs.values())) != len(pairs):
         return None
     return pairs, dict(file=name, pairs=[list(pair) for pair in sorted(pairs.items())],
-        fully_covered_trait_owners=witnesses,
+        fully_covered_replacement_owners=witnesses,
         base_range=list(descriptors[0]['group'][:2]), head_range=list(descriptors[1]['group'][:2]),
         claim='Every raw region and owner entry is positive on both sides; no deletion or semantic-equivalence claim',
         summary_credit=[0, 0], mapped_credit=[0, 0])
@@ -2115,13 +2129,20 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
             trait_migration = (left_prefix != right_prefix
                 and all(trait_method_parent(owner['name'], descriptor['declaration']) is not None
                         for descriptor in (left, right) for owner in descriptor['group'][2]))
-            if (left['context'] != right['context'] or left['attributes'] != right['attributes']
-                    or left['signature'] != right['signature'] and not trait_migration):
+            test_attributes = (['#', '[', 'test', ']'], ['#', '[', 'tokio', '::', 'test', ']', 'async'])
+            complete_test_rewrite = (left_prefix != right_prefix
+                and left['attributes'] in test_attributes and right['attributes'] in test_attributes
+                and left['context'][0] == right['context'][0]
+                and (left['context'] != right['context'] or left['attributes'] != right['attributes']
+                     or left['signature'] != right['signature']))
+            if (not complete_test_rewrite and (left['context'] != right['context']
+                    or left['attributes'] != right['attributes']
+                    or left['signature'] != right['signature'] and not trait_migration)):
                 continue
             seeds = []; parent = None
             renamed = left_prefix != right_prefix
             if renamed:
-                if left['attributes'] not in ([], ['#', '[', 'test', ']']):
+                if left['attributes'] not in ([], ['#', '[', 'test', ']']) and not complete_test_rewrite:
                     continue
                 if left_prefix in descriptors[1] or right_prefix in descriptors[0]:
                     continue
@@ -2145,7 +2166,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                         seeds.append((rows[0], targets[0]))
                 if not seeds or parent_files is not None and parent_files(parent) != {name}:
                     continue
-            candidates.append((left_prefix, right_prefix, left, right, seeds, parent))
+            candidates.append((left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite))
     left_counts = Counter(row[0] for row in candidates); right_counts = Counter(row[1] for row in candidates)
     pairs = {}; receipts = []; proved_functions = set(); excerpts = []
     _construct_charge(work, 3 * (len(old) + len(new)))
@@ -2153,7 +2174,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                   for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
                   if tag == 'equal' for line in range(a, b)]
     equal_positions = [row[0] for row in equal_rows]
-    for left_prefix, right_prefix, left, right, seeds, parent in candidates:
+    for left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite in candidates:
         if left_counts[left_prefix] != 1 or right_counts[right_prefix] != 1:
             continue
         groups = left['group'], right['group']
@@ -2165,17 +2186,19 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     and groups[1][0] <= row['head_line'] <= groups[1][1]]
         if not selected:
             continue
-        if parent is not None and parent[0].startswith('trait:') and left['signature'] != right['signature']:
-            covered = fully_covered_trait_migration(name, old, new, before, after, (left, right),
+        if complete_test_rewrite or parent is not None and parent[0].startswith('trait:') and left['signature'] != right['signature']:
+            covered = fully_covered_replacement(name, old, new, before, after, (left, right),
                 grouped, selected, equal_rows, work)
             if covered is not None:
                 mapped, receipt = covered
                 if any(line in pairs and pairs[line] != target for line, target in mapped.items()):
-                    raise ValueError('Ambiguous fully covered trait correspondence')
+                    raise ValueError('Ambiguous fully covered replacement correspondence')
                 pairs.update(mapped); receipts.append(receipt)
                 proved_functions.add(groups[0][:2])
                 excerpts.extend(('\n'.join(source[group[0] - 1:group[1]]) + '\n').encode()
                                 for source, group in zip((old, new), groups))
+                continue
+            if complete_test_rewrite:
                 continue
         mapped = {}; spans = []; needed = set(); failed = False
         for old_row, new_row in seeds:

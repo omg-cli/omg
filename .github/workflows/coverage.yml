@@ -306,7 +306,8 @@ jobs:
                       "$test_name" == package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff ||
                       "$test_name" == package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff ||
                       "$test_name" == package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason ||
-                      "$test_name" == package_managers::aur::utils::tests::native_lifecycle_original_user_ownership ]]; then
+                      "$test_name" == package_managers::aur::utils::tests::native_lifecycle_original_user_ownership ||
+                      "$test_name" == cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build ]]; then
                   runner=(env OMG_ARCH_INSTALL_FIXTURE=isolated-container)
                 elif [[ "$test_name" == package_managers::aur::client::tests::native_isolated_* ]]; then
                   runner=(runuser -u nobody -- env HOME=/home/omg-fixture

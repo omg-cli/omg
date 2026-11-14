@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
 import { handle } from "../src/service";
 import { Store, type Sql, type Command, type Checkpoint } from "../src/storage";
-import { refreshCves, refreshSnapshot } from "../src/ingestion";
+import { refresh, refreshCves, refreshSnapshot } from "../src/ingestion";
 import {
     SOURCES,
     cveUrl,
@@ -401,6 +401,128 @@ test("Arch envelope retains upstream issues and 304 revalidation updates freshne
     expect(body.fetched_at).toBe(now);
     db.close();
 });
+test("delta ingestion bounds independent downloads and writes to four CVEs", async () => {
+    const { store, db } = setup();
+    const started = gate(), finish = gate();
+    const ids = Array.from({ length: 8 }, (_, index) => `CVE-2026-${3000 + index}`);
+    const payloads = new Map(ids.map((id) => [cveUrl(id), cve("PUBLISHED", now, "5.2", id)]));
+    const delta = JSON.stringify([{ fetchTime: now, numberOfChanges: ids.length,
+        new: ids.map((id) => ({ cveId: id, githubLink: cveUrl(id), dateUpdated: now })),
+        updated: [], error: [] }]);
+    let active = 0, peak = 0, launched = 0;
+    const pending = refreshCves(store, async (url) => {
+        if (url === SOURCES.cve) return new Response(delta);
+        const payload = payloads.get(url);
+        if (payload === undefined) throw new Error("unexpected CVE URL");
+        launched++; active++; peak = Math.max(peak, active); started.release();
+        try {
+            await finish.blocked;
+            return new Response(payload);
+        } finally { active--; }
+    }, now, 8);
+    try {
+        await started.blocked;
+        expect(launched).toBe(4);
+        expect((await store.checkpoint("cve"))?.cursor).toBe(null);
+        finish.release();
+        await pending;
+        expect(peak).toBe(4);
+        expect(launched).toBe(8);
+        expect(db.query("SELECT COUNT(*) AS count FROM source_record").get()).toEqual({ count: 8 });
+        expect((await store.checkpoint("cve"))?.cursor).toBe(JSON.stringify({ event: now, offset: 8 }));
+    } finally {
+        finish.release();
+        await Promise.allSettled([pending]);
+        db.close();
+    }
+});
+
+test("failed scheduled delta groups drain before releasing the writer lease or advancing the cursor", async () => {
+    const { store, db } = setup();
+    const started = gate(), fail = gate(), finish = gate();
+    const ids = ["CVE-2026-3000", "CVE-2026-3001"];
+    const delta = JSON.stringify([{ fetchTime: now, numberOfChanges: ids.length,
+        new: ids.map((id) => ({ cveId: id, githubLink: cveUrl(id), dateUpdated: now })),
+        updated: [], error: [] }]);
+    const pending = refresh(store, async (url) => {
+        if (url === SOURCES.arch) return new Response("[]");
+        if (url === SOURCES.kev) return new Response(JSON.stringify({ catalogVersion: "2026.11.13", dateReleased: now, count: 0, vulnerabilities: [] }));
+        if (url === SOURCES.cve) return new Response(delta);
+        if (url === cveUrl("CVE-2026-3000")) {
+            started.release();
+            await fail.blocked;
+            return new Response("unavailable", { status: 503 });
+        }
+        if (url !== cveUrl("CVE-2026-3001")) throw new Error("unexpected CVE URL");
+        await finish.blocked;
+        return new Response(cve("PUBLISHED", now, "5.2", "CVE-2026-3001"));
+    }, now, 8);
+    try {
+        await started.blocked;
+        fail.release();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(await store.lease("cve", "probe", now)).toBe(false);
+        expect((await store.checkpoint("cve"))?.cursor).toBe(null);
+        finish.release();
+        await pending;
+        expect(db.query("SELECT id FROM source_record").all()).toEqual([{ id: "CVE-2026-3001" }]);
+        expect((await store.checkpoint("cve"))?.cursor).toBe(null);
+        expect((await store.checkpoint("cve"))?.error).toContain("503");
+        expect(db.query("SELECT COUNT(*) AS count FROM ingestion_lease").get()).toEqual({ count: 0 });
+        await refresh(store, async (url) => {
+            if (url === SOURCES.arch) return new Response("[]");
+            if (url === SOURCES.kev) return new Response(JSON.stringify({ catalogVersion: "2026.11.13", dateReleased: now, count: 0, vulnerabilities: [] }));
+            if (url === SOURCES.cve) return new Response(delta);
+            const id = ids.find((candidate) => cveUrl(candidate) === url);
+            if (id === undefined) throw new Error("unexpected CVE URL");
+            return new Response(cve("PUBLISHED", now, "5.2", id));
+        }, now, 8);
+        expect(db.query("SELECT COUNT(*) AS count FROM source_record").get()).toEqual({ count: 2 });
+        expect((await store.checkpoint("cve"))?.cursor).toBe(JSON.stringify({ event: now, offset: 2 }));
+        expect((await store.checkpoint("cve"))?.error).toBe(null);
+    } finally {
+        fail.release(); finish.release();
+        await Promise.allSettled([pending]);
+        await store.release("cve", "probe");
+        db.close();
+    }
+});
+
+test("repeated delta CVEs remain serial and an older publication cannot resurrect a rejection", async () => {
+    const { store, db } = setup();
+    const started = gate(), finish = gate();
+    const id = "CVE-2026-3000";
+    const delta = JSON.stringify(["2026-11-13T01:59:00.000Z", now].map((event) => ({
+        fetchTime: event, numberOfChanges: 1,
+        new: [], updated: [{ cveId: id, githubLink: cveUrl(id), dateUpdated: event }], error: [],
+    })));
+    let launched = 0;
+    const pending = refreshCves(store, async (url) => {
+        if (url === SOURCES.cve) return new Response(delta);
+        if (url !== cveUrl(id)) throw new Error("unexpected CVE URL");
+        launched++;
+        if (launched === 1) {
+            started.release();
+            await finish.blocked;
+            return new Response(cve("REJECTED", now, "5.2", id));
+        }
+        return new Response(cve("PUBLISHED", "2026-11-12T00:00:00.000Z", "5.2", id));
+    }, now, 8);
+    try {
+        await started.blocked;
+        expect(launched).toBe(1);
+        finish.release();
+        await pending;
+        expect(launched).toBe(2);
+        expect(db.query("SELECT id,state FROM source_record").all()).toEqual([{ id, state: "REJECTED" }]);
+        expect((await store.checkpoint("cve"))?.cursor).toBe(JSON.stringify({ event: now, offset: 1 }));
+    } finally {
+        finish.release();
+        await Promise.allSettled([pending]);
+        db.close();
+    }
+});
+
 test("delta checkpoint stays unchanged after a bounded batch fails and succeeds on replay", async () => {
     const { store, db } = setup();
     const delta = JSON.stringify([

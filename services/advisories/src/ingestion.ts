@@ -13,6 +13,27 @@ import {
 import { Store, type Command } from "./storage";
 import { deltaBatch } from "./delta";
 export type Fetcher = (url: string, init?: RequestInit) => Promise<Response>;
+export async function ingestCveGroups<T extends { id: string }>(
+    records: readonly T[],
+    ingest: (record: T) => Promise<void>,
+) {
+    const byId = new Map<string, T[]>();
+    for (const record of records) {
+        const group = byId.get(record.id);
+        if (group) group.push(record);
+        else byId.set(record.id, [record]);
+    }
+    const groups = [...byId.values()];
+    for (let start = 0; start < groups.length; start += 4) {
+        const outcomes = await Promise.allSettled(
+            groups.slice(start, start + 4).map(async (group) => {
+                for (const record of group) await ingest(record);
+            }),
+        );
+        const failed = outcomes.find((outcome) => outcome.status === "rejected");
+        if (failed) throw failed.reason;
+    }
+}
 export async function upstream(
     url: string,
     etag: string | null,
@@ -122,14 +143,14 @@ export async function refreshCves(
         cursor,
         batchSize,
     );
-    for (const { item } of batch) {
+    await ingestCveGroups(batch.map(({ item }) => item), async (item) => {
         const record = await upstream(item.url, null, fetcher);
         await store.cve(
             await boundedBody(record.body, LIMITS.cveRecord),
             now,
             item.id,
         );
-    }
+    });
     const last = batch.at(-1);
     const nextCursor = last
         ? JSON.stringify({ event: last.item.event, offset: last.offset })
