@@ -842,7 +842,7 @@ class SupplementalEvidence(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
-            self.assertEqual(len(receipt['tests']), 14)
+            self.assertEqual(len(receipt['tests']), 15)
             self.assertEqual(len(receipt['process_checks']), 35)
             self.assertEqual(len(files), len(receipt['profiles']))
 

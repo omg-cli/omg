@@ -2626,6 +2626,24 @@ fn mark_audit_incomplete_at(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod completeness_tests {
     #[test]
+    fn disconnected_global_writer_marks_collection_incomplete() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::audit::completeness_tests::disconnected_global_writer_marks_collection_incomplete";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let log = directory.path().join("audit/audit.jsonl");
+        super::init_audit_logger_in(&log)?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(super::AUDIT_QUEUE_CAPACITY);
+        drop(receiver);
+        assert!(super::AUDIT_QUEUE.set(sender).is_ok());
+        let error = super::flush_pending_audit_events().expect_err("a stopped writer cannot drain");
+        assert!(error.to_string().contains("audit writer is unavailable"));
+        assert!(super::ensure_complete_collection(&log.with_file_name("incomplete")).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn drain_timeout_does_not_leave_a_blocked_sender() {
         let (sender, _receiver) = std::sync::mpsc::sync_channel(0);
         let start = std::time::Instant::now();

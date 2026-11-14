@@ -1641,3 +1641,65 @@ replaced-construct failures have positive counters on both sides. These are
 not automatically classified as test losses or accepted correspondences.
 The diagnostic skips aggregate acceptance and cannot supply a passing verdict.
 No checker, source rule, coverage threshold, counter or exclusion was changed.
+
+
+## Status, audit failures and coverage correspondence batch, November 14
+
+A new private-socket contract exercised the real CLI with reported findings,
+unknown applicability and unreported scan coverage. Its stronger assertion
+reproduced contradictory output: two Security rows reported both Not scanned
+and No reported findings. The shared status model now carries the optional
+reported finding/unknown counts and renders one authoritative row. Sync,
+async and TUI text paths preserve this distinction. A second failing check
+showed that daemon runtime names and versions could emit terminal controls;
+the sync status path now applies the existing terminal sanitizer to both.
+The private package database fingerprint remains unchanged through all cases.
+
+Local native fixture admission now recognizes this host's actual Omarchy ID
+for unprivileged read-only checks. An explicitly admitted coverage run still
+requires actual ID=arch; its UID and identity witnesses are unchanged. The new
+status contract is included in the protected CLI selection, raising that
+selection from 14 to 15 tests. The validator's hardcoded test-13 inventory log
+was replaced by a unique comprehensive-test identity lookup. Four existing
+producer tests failed before this correction and pass afterward.
+
+The unavailable-audit-writer regression uses an isolated, disconnected queue
+and verifies the incomplete marker. Exit-result tests preserve both the
+operation failure and durability failure. The subprocess exit regression now
+uses Tokio child cleanup and bounded asynchronous waits. Temporarily removing
+the production drain still made it fail with exited before accepted audit
+event was persisted; the exact source was restored afterward. No failed test
+profile supplies accepted coverage.
+
+The comparator gained a bounded proof for equivalent retained-source slices
+whose LLVM decomposition changed. Repeated identical intervals are collapsed
+only when their states agree; further interval refinement requires every
+contributing state on the retained row to agree. Existing mixed hot/cold
+subexpressions retain their separate obligations. Compiled owners, callback
+geometry, source identity and one-to-one instance matching remain required.
+The receipt retains the original geometry and instance states. Six regression
+cases cover the valid refinements and refusal of lost copies or cold-region
+painting. All 263 comparator tests pass. On the immutable c43517d8 reports,
+the diagnostic resolves the pacman-config and archive-staging failures; the
+full comparison still fails elsewhere and is not represented as accepted.
+
+Normal verification passes 16 Arch CLI contracts on this Omarchy host, 35 CLI
+unit tests, the status-model tests, the 249 security tests, rustfmt and scoped
+Clippy with warnings denied. Coverage/CI tooling passes 425 tests; another
+61 native-artifact and contract tests pass. The producer itself still needs a
+fresh protected guest run with its new selection.
+
+Before a full instrumented suite, two older successful coverage epochs were
+retired using their manifest hashes and newer complete hosted evidence. This
+freed 5,859,266,560 allocated bytes; receipts, reports and all 3,463 split-debug
+companions were preserved. The hosted producer checkout 22dc926d has the exact
+same Git tree as c43517d8. The active older local source epoch was moved outside
+collection before recompilation. The full wave includes 95 integration targets,
+so its temporary coverage owner is budgeted up to 40 GiB, with 24 GiB admitted
+growth, a physical 20 GiB host reserve and a 4 GiB available-memory floor.
+The host is native Omarchy, not WSL. Coverage/debug flags remain unchanged;
+local builds and test execution use two workers, first-attempt failures remain
+fatal, and the existing per-command twenty-minute bound remains. No threshold,
+exclusion, raw counter or retry condition was relaxed. Fresh full current-source
+coverage and native acceptance remain outstanding before the consolidated push.
+The latest installable verified pair remains c43517d8.

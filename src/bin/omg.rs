@@ -914,15 +914,10 @@ fn main() {
 /// whose anyhow `Termination` impl printed errors but could never show
 /// suggestions or differentiate exit codes.
 fn finish(result: Result<()>) -> ! {
-    let result = match omg_lib::core::security::audit::flush_pending_audit_events() {
-        Ok(()) => result,
-        Err(audit_error) => match result {
-            Ok(()) => Err(audit_error.context("Failed to flush audit events before exit")),
-            Err(error) => Err(error.context(format!(
-                "Failed to flush audit events before exit: {audit_error:#}"
-            ))),
-        },
-    };
+    let result = complete_audit(
+        result,
+        omg_lib::core::security::audit::flush_pending_audit_events(),
+    );
     match result {
         Ok(()) => {
             omg_lib::cli::update_notice::after_command();
@@ -937,6 +932,16 @@ fn finish(result: Result<()>) -> ! {
             }
             std::process::exit(1);
         }
+    }
+}
+
+fn complete_audit(operation: Result<()>, audit: Result<()>) -> Result<()> {
+    match (operation, audit) {
+        (result, Ok(())) => result,
+        (Ok(()), Err(error)) => Err(error.context("Failed to flush audit events before exit")),
+        (Err(error), Err(audit_error)) => Err(error.context(format!(
+            "Failed to flush audit events before exit: {audit_error:#}"
+        ))),
     }
 }
 
@@ -1012,8 +1017,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         // Use run_self_sudo directly — elevate_if_needed creates a nested tokio
         // runtime which panics with "Cannot start a runtime from within a runtime"
         let args_refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-        omg_lib::core::privilege::run_self_sudo(&args_refs).await?;
-        return Ok(());
+        return omg_lib::core::privilege::run_self_sudo(&args_refs).await;
     }
 
     let ctx = omg_lib::cli::CliContext { json: cli.json };
@@ -2223,16 +2227,18 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn process_exit_persists_pending_audit_on_success_and_failure() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn process_exit_persists_pending_audit_on_success_and_failure() -> anyhow::Result<()> {
+        use anyhow::Context as _;
         use omg_lib::core::security::audit::AuditEntry;
-        use std::io::{BufRead, Write};
-        use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
+        use std::process::Stdio;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::time::{sleep, timeout};
 
         for (outcome, code) in [("success", 0), ("failure", 1)] {
             let directory = tempfile::tempdir()?;
-            let mut child = Command::new(std::env::current_exe()?)
+            let mut child = tokio::process::Command::new(std::env::current_exe()?)
                 .args(["--exact", "tests::audit_exit_fixture", "--nocapture"])
                 .env("OMG_AUDIT_EXIT_FIXTURE", outcome)
                 .env("OMG_DATA_DIR", directory.path())
@@ -2241,58 +2247,40 @@ mod tests {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
+                .kill_on_drop(true)
                 .spawn()?;
-            let stdout = child.stdout.take().unwrap();
-            let (ready, received) = std::sync::mpsc::channel();
-            let reader = std::thread::spawn(move || {
-                for line in std::io::BufReader::new(stdout).lines() {
-                    if matches!(line.as_deref(), Ok("audit-ready")) {
-                        let _ = ready.send(());
-                        break;
+            let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let line = lines
+                        .next_line()
+                        .await?
+                        .context("audit child exited before readiness")?;
+                    if line == "audit-ready" {
+                        break Ok::<(), anyhow::Error>(());
                     }
                 }
-            });
-            if received.recv_timeout(Duration::from_secs(5)).is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
-                reader.join().unwrap();
-                anyhow::bail!("audit child did not initialize ({outcome})");
-            }
-            reader.join().unwrap();
+            })
+            .await??;
             let log = directory.path().join("audit/audit.jsonl");
             let lock = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(log.with_extension("lock"))?;
             lock.lock()?;
-            child.stdin.take().unwrap().write_all(b"1")?;
-            std::thread::sleep(Duration::from_millis(200));
+            child.stdin.take().unwrap().write_all(b"1").await?;
+            sleep(Duration::from_millis(200)).await;
             let exited_before_unlock = child.try_wait()?.is_some();
             lock.unlock()?;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let status = loop {
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    anyhow::bail!("audit child did not finish ({outcome})");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
-            let body = match std::fs::read_to_string(log) {
-                Ok(body) => body,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(error) => return Err(error.into()),
-            };
+            let status = timeout(Duration::from_secs(5), child.wait()).await??;
+            assert!(
+                !exited_before_unlock,
+                "{outcome}: exited before accepted audit event was persisted"
+            );
+            let body = std::fs::read_to_string(log)?;
             assert!(
                 !body.is_empty(),
                 "{outcome}: accepted audit event was lost at exit"
-            );
-            assert!(
-                !exited_before_unlock,
-                "{outcome}: exited before audit writer drained"
             );
             assert_eq!(status.code(), Some(code), "{outcome}");
             let entries = body
@@ -2308,6 +2296,29 @@ mod tests {
             assert!(entries[0].verify(), "{outcome}: audit integrity");
         }
         Ok(())
+    }
+
+    #[test]
+    fn audit_completion_keeps_operation_and_durability_failures() {
+        assert!(super::complete_audit(Ok(()), Ok(())).is_ok());
+        let error =
+            super::complete_audit(Err(anyhow::anyhow!("operation failed")), Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "operation failed");
+        let error =
+            super::complete_audit(Ok(()), Err(anyhow::anyhow!("writer unavailable"))).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Failed to flush audit events before exit: writer unavailable"
+        );
+        let error = super::complete_audit(
+            Err(anyhow::anyhow!("operation failed")),
+            Err(anyhow::anyhow!("writer unavailable")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Failed to flush audit events before exit: writer unavailable: operation failed"
+        );
     }
 
     #[test]

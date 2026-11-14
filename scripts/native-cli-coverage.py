@@ -391,6 +391,7 @@ TESTS = {
         'why_contracts::reverse_without_dependents_is_safe',
     ),
     'arch-contracts': (
+        'native_status_preserves_daemon_advisory_coverage',
         'dependency_reports_bound_large_reverse_dependency_lists',
         'native_size_tree_includes_installed_virtual_provider',
         'native_size_tree_counts_one_provider_for_multiple_virtual_requirements',
@@ -1216,7 +1217,10 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require('[extra-root-test] uid=0' in log, 'Root receiver branch not admitted')
         ET.SubElement(suite, 'testcase', name=name, classname=role)
         tests.append(dict(stage=stage, role=role, name=name, result='PASS'))
-    inventory = (evidence / 'test-13.log').read_text()
+    inventory_stages = [stage for stage, role, name in CASES
+                        if role == 'comprehensive' and name == 'behavior_inventory_runs_in_hermetic_state']
+    require(len(inventory_stages) == 1, 'Exactly one native inventory test required')
+    inventory = (evidence / f'{inventory_stages[0]}.log').read_text()
     require('[native-inventory-coverage] unavailable_rows=0;' in inventory, 'Inventory native rows unavailable')
     rows = (evidence / 'inventory/index.tsv').read_text().splitlines()
     for name in ('why', 'why-reverse', 'size', 'size-tree', 'blame'):

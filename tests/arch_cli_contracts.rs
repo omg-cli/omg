@@ -31,6 +31,133 @@ fn output_text(output: &CommandResult) -> String {
     output.combined_output()
 }
 
+#[cfg(unix)]
+#[test]
+fn native_status_preserves_daemon_advisory_coverage() -> Result<()> {
+    use omg_lib::daemon::protocol::{
+        Request, Response, ResponseResult, StatusResult, encode_frame, read_frame, split_frame,
+        write_frame,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    if !common::native_arch_fixture_available() {
+        return Ok(());
+    }
+    let project = common::TestProject::new();
+    prepare_native_size_fixture(&project, &[], &[])?;
+    let before = private_fixture_state(project.pacman_root.path())?;
+    for (findings, unknown, scanned, message) in [
+        (0, Some(0), true, "No reported findings"),
+        (2, Some(0), true, "2 findings"),
+        (0, Some(3), true, "No reported findings"),
+        (2, None, true, "Advisory coverage unreported"),
+        (2, Some(0), false, "Advisory coverage unreported"),
+    ] {
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let socket = directory.path().join("daemon.sock");
+        omg_lib::core::client::validate_socket_with_context(&socket)?;
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        let server = std::thread::spawn(move || -> Result<()> {
+            for expect_status in [true, false] {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            anyhow::ensure!(
+                                Instant::now() < deadline,
+                                "native status did not contact its private daemon (status={expect_status})"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                let body = read_frame(&mut stream)?;
+                let (_, payload) = split_frame(&body)?;
+                let request: Request = bitcode::deserialize(payload)?;
+                let result = match &request {
+                    Request::Status { .. } if expect_status => {
+                        ResponseResult::Status(StatusResult {
+                            total_packages: 9,
+                            explicit_packages: 5,
+                            orphan_packages: 0,
+                            updates_available: 2,
+                            security_vulnerabilities: findings,
+                            vulnerabilities_scanned: scanned,
+                            security_unknown_packages: unknown,
+                            runtime_versions: vec![
+                                ("node".into(), "v99.fixture\u{1b}[2J\nFORGED\r".into()),
+                                ("foreign\r\nFORGED".into(), "\u{202e}fixture".into()),
+                            ],
+                        })
+                    }
+                    Request::Ping { .. } if !expect_status => ResponseResult::Ping("pong".into()),
+                    other => anyhow::bail!("unexpected private status request: {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &encode_frame(&Response::Success {
+                        id: request.id(),
+                        result,
+                    })?,
+                )?;
+            }
+            Ok(())
+        });
+        let output = project.run_native_arch_status(&socket);
+        let served = server.join().expect("private status server panicked");
+        assert!(output.success, "{}", output_text(&output));
+        served.with_context(|| format!("native status output: {}", output_text(&output)))?;
+        let text = output_text(&output);
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\r') && !text.contains('\u{202e}'),
+            "runtime metadata reached the terminal with control characters: {text:?}"
+        );
+        assert!(
+            !text.lines().any(|line| line == "FORGED"),
+            "runtime metadata forged a status row: {text:?}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.split_whitespace().next() == Some("Security"))
+                .count(),
+            1,
+            "security status must render exactly one authoritative row: {text}"
+        );
+        if scanned && unknown.is_some() {
+            assert!(
+                !text.contains("Not scanned"),
+                "reported scan was presented as unscanned: {text}"
+            );
+        }
+        assert!(text.contains(message), "{text}");
+        assert!(
+            text.contains("Running") && text.contains("v99.fixture"),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("3 packages have unknown advisory applicability"),
+            unknown == Some(3),
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("Check vulnerabilities"),
+            !(scanned && findings == 0 && unknown == Some(0)),
+            "{text}"
+        );
+    }
+    assert_eq!(private_fixture_state(project.pacman_root.path())?, before);
+    Ok(())
+}
+
 #[test]
 fn explicit_absolute_paths_work_for_portable_files() -> Result<()> {
     let root = TempDir::new()?;

@@ -523,37 +523,10 @@ pub fn status_sync() -> Result<()> {
         explicit_packages: explicit,
         orphan_packages: orphans,
         updates_available: updates,
+        advisory_coverage: security_vulnerabilities,
         ..crate::cli::tea::StatusData::default()
     };
     print!("{}", report.render());
-
-    // Security
-    match security_vulnerabilities {
-        Some((findings, unknown)) => {
-            println!(
-                "  {} {}",
-                style::emphasis("Security"),
-                if findings == 0 {
-                    style::info("No reported findings")
-                } else {
-                    style::negative(&format!("{findings} findings"))
-                }
-            );
-            if unknown > 0 {
-                println!(
-                    "    {}",
-                    style::warning(&format!(
-                        "{unknown} packages have unknown advisory applicability"
-                    ))
-                );
-            }
-        }
-        None => println!(
-            "  {} {}",
-            style::emphasis("Security"),
-            style::dim("Advisory coverage unreported")
-        ),
-    }
 
     // Daemon status: a stale socket node is not a running daemon.
     #[cfg(unix)]
@@ -587,7 +560,11 @@ pub fn status_sync() -> Result<()> {
         if !versions.is_empty() {
             println!("\n  {}", style::emphasis("Runtimes"));
             for (name, version) in &versions {
-                println!("    {} {}", runtime_display_name(name), version);
+                println!(
+                    "    {} {}",
+                    style::sanitize_terminal_text(runtime_display_name(name)),
+                    style::sanitize_terminal_text(version)
+                );
             }
         }
     }

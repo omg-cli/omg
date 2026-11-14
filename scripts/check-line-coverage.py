@@ -1747,8 +1747,17 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     for region in owner['regions'] for row_pair in ordered) for owner in compiled[0]):
                 valid = False
             vectors.append(states); geometries.append(shapes)
-        if not valid or any(shape != geometries[0][0] for side in geometries for shape in side):
+        if not valid:
             continue
+        redundant_regions = None
+        if any(shape != geometries[0][0] for side in geometries for shape in side):
+            normalized = homogeneous_clipped_regions(geometries, vectors, work)
+            if normalized is None:
+                continue
+            redundant_regions = dict(geometry=geometries, instance_states=vectors)
+            geometries, vectors = normalized
+            if any(shape != geometries[0][0] for side in geometries for shape in side):
+                continue
         _construct_charge(work, (len(vectors[0]) * len(vectors[1]) + 1) * len(vectors[0][0]))
         matching = compiled_hit_state_matching(*vectors)
         if matching is None:
@@ -1772,7 +1781,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         _construct_charge(work, sum(4 * len(word) + 8 for key in callback_keys
                                    for part in ((key[0],), key[1], *key[2]) for word in part))
         _construct_charge(work, sum(len(repr(binding)) for binding in macro_bindings.values()))
-        receipts.append(dict(file=name, pairs=[[line, target] for line, target in mapped.items()
+        receipt = dict(file=name, pairs=[[line, target] for line, target in mapped.items()
                                               if line in before and target in after],
             non_executable_rows=[[line, target] for line, target in tokenless.items()],
             macro_literal_rows=[[line, target] for line, target in macro_paint.items()],
@@ -1789,10 +1798,75 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 head_uniqueness='global complete-statement inventory' if head_counts is not None and parent else 'same function prefix'),
             geometry=[list(shape) for shape in geometries[0][0]],
             base_instance_states=vectors[0], head_instance_states=vectors[1], instance_matching=matching,
-            claim='Complete-copy residual execution only; no unchanged-owner or deletion claim'))
+            claim='Complete-copy residual execution only; no unchanged-owner or deletion claim')
+        if redundant_regions is not None:
+            receipt['homogeneous_clipped_regions'] = redundant_regions
+        receipts.append(receipt)
     if receipts:
         require_rustfmt_syntax(excerpts)
     return pairs, receipts, proved_functions
+
+
+def homogeneous_clipped_regions(geometries, vectors, work):
+    """Merge equivalent intervals only when every contributing state agrees.
+
+    This operates inside each compiled owner after clipping to retained source.
+    Added ancestry or subdivision does not change a completely hot or cold
+    source slice. Mixed hot/cold slices cannot establish this equivalence.
+    Nested callback regions retain their original geometry and states.
+    """
+    collapsed_shapes = []; collapsed_states = []
+    for side_shapes, side_states in zip(geometries, vectors):
+        shapes = []; states = []
+        for geometry, vector in zip(side_shapes, side_states):
+            _construct_charge(work, 2 * len(geometry) + 1)
+            if len(geometry) != len(vector):
+                return None
+            projected = []; index = 0
+            while index < len(geometry):
+                end = index + 1
+                while end < len(geometry) and geometry[end] == geometry[index]:
+                    end += 1
+                if len(geometry[index]) == 6 and all(state == vector[index] for state in vector[index:end]):
+                    projected.append((geometry[index], vector[index]))
+                else:
+                    projected.extend(zip(geometry[index:end], vector[index:end]))
+                index = end
+            shapes.append(tuple(shape for shape, state in projected))
+            states.append([state for shape, state in projected])
+        collapsed_shapes.append(shapes); collapsed_states.append(states)
+    if all(shape == collapsed_shapes[0][0] for side in collapsed_shapes for shape in side):
+        return collapsed_shapes, collapsed_states
+    geometries, vectors = collapsed_shapes, collapsed_states
+    result_shapes = []; result_states = []
+    for side_shapes, side_states in zip(geometries, vectors):
+        shapes = []; states = []
+        for geometry, vector in zip(side_shapes, side_states):
+            _construct_charge(work, len(geometry) * (len(geometry).bit_length() + 5) + 1)
+            if len(geometry) != len(vector):
+                return None
+            intervals = {}; projected = []
+            for shape, state in zip(geometry, vector):
+                if len(shape) == 6:
+                    intervals.setdefault((shape[0], *shape[3:]), []).append((shape[1], shape[2], state))
+                else:
+                    projected.append((shape, state))
+            for key, parts in intervals.items():
+                state = parts[0][2]
+                if any(part[2] != state for part in parts):
+                    return None
+                merged = []
+                for first, last, _ in sorted(parts):
+                    if merged and first <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(last, merged[-1][1]))
+                    else:
+                        merged.append((first, last))
+                projected.extend(((key[0], first, last, *key[1:]), state) for first, last in merged)
+            projected.sort()
+            shapes.append(tuple(shape for shape, state in projected))
+            states.append([state for shape, state in projected])
+        result_shapes.append(shapes); result_states.append(states)
+    return result_shapes, result_states
 
 
 def _construct_replacements(old, new, work, head_inventory=None, compatible=None, inventories=None, deferred=False):

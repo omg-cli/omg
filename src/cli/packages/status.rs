@@ -124,6 +124,7 @@ async fn status_fallback(fast: bool) -> Result<()> {
             status.updates_available,
             start.elapsed(),
             fast,
+            status.scanned_vulnerability_summary(),
         )?;
         return Ok(());
     }
@@ -131,7 +132,15 @@ async fn status_fallback(fast: bool) -> Result<()> {
     // 2. Fallback to direct path (Cold Path)
     let pm = get_package_manager()?;
     let (total, explicit, orphans, updates) = pm.get_status(fast).await?;
-    display_status_report(total, explicit, orphans, updates, start.elapsed(), fast)
+    display_status_report(
+        total,
+        explicit,
+        orphans,
+        updates,
+        start.elapsed(),
+        fast,
+        None,
+    )
 }
 
 fn display_status_report(
@@ -141,6 +150,7 @@ fn display_status_report(
     updates: usize,
     duration: std::time::Duration,
     fast: bool,
+    advisory_coverage: Option<(usize, usize)>,
 ) -> Result<()> {
     let mut stdout = std::io::BufWriter::new(std::io::stdout());
 
@@ -151,6 +161,7 @@ fn display_status_report(
         updates_available: updates,
         duration_ms: duration.as_secs_f64() * 1000.0,
         fast_mode: fast,
+        advisory_coverage,
     };
     stdout.write_all(report.render().as_bytes())?;
 

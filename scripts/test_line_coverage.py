@@ -242,6 +242,58 @@ class SourceConstructCapacityTests(unittest.TestCase):
 
 
 class SourceAwareCoverageTests(unittest.TestCase):
+    def retained_record_field_compare(self, head_counts=(1, 1), ancestor_counts=None,
+                                      refinement_counts=None, base_refinement_counts=None):
+        old = b'struct Config { name: String }\nimpl Config {\n    pub fn make(section: &str) -> Self {\n        Self {\n            name: section.to_string(),\n        }\n    }\n}\n'
+        new = b'struct Config { name: String, enabled: bool }\nimpl Config {\n    pub fn make(section: &str) -> Self {\n        Self {\n            name: section.to_string(),\n            enabled: true,\n        }\n    }\n}\n'
+        def owners(base, head):
+            for document, source, last, counts in ((base, old, 7, (1, 1)),
+                                                   (head, new, 8, head_counts)):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(
+                    name=f'make_{instance}', filenames=['/src/example.rs'],
+                    regions=[[3, lines[2].index('{') + 1, last, 6, count, 0, 0, 0]])
+                    for instance, count in enumerate(counts)]
+                if document is base and base_refinement_counts is not None:
+                    for instance, function in enumerate(document['data'][0]['functions']):
+                        function['regions'].append([5, 19, 5, 26,
+                            base_refinement_counts[instance], 0, 0, 0])
+                if document is head:
+                    for instance, function in enumerate(document['data'][0]['functions']):
+                        count = (counts if ancestor_counts is None else ancestor_counts)[instance]
+                        function['regions'].append([4, 9, 7, 10, count, 0, 0, 0])
+                        if refinement_counts is not None:
+                            function['regions'].append([5, 19, 5, 26,
+                                refinement_counts[instance], 0, 0, 0])
+        return self.compare(before=[(line, 2) for line in range(3, 8)],
+            after=[(line, sum(head_counts)) for line in range(3, 9)], mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_retained_record_field_preserves_execution_in_every_compiled_copy(self):
+        receipt = self.retained_record_field_compare()
+        self.assertEqual(receipt['deleted_mapped_hit'], 0)
+
+    def test_retained_record_field_cannot_borrow_another_compiled_copy(self):
+        with self.assertRaises(ValueError):
+            self.retained_record_field_compare((2, 0))
+
+    def test_retained_record_field_cannot_paint_a_cold_nested_region(self):
+        with self.assertRaises(ValueError):
+            self.retained_record_field_compare(ancestor_counts=(0, 2))
+
+    def test_retained_record_field_permits_uniform_region_refinement(self):
+        receipt = self.retained_record_field_compare(refinement_counts=(1, 1))
+        self.assertEqual(receipt['deleted_mapped_hit'], 0)
+
+    def test_retained_record_field_refinement_cannot_paint_a_cold_subexpression(self):
+        with self.assertRaises(ValueError):
+            self.retained_record_field_compare(refinement_counts=(0, 2))
+
+    def test_retained_record_field_keeps_existing_cold_subexpression_obligations(self):
+        receipt = self.retained_record_field_compare(refinement_counts=(0, 2),
+                                                     base_refinement_counts=(0, 2))
+        self.assertEqual(receipt['deleted_mapped_hit'], 0)
+
     old_source = b"fn obsolete() {\n}\nfn retained() {\n  exercised();\n  untested();\n}\n"
     new_source = b"fn retained() {\n  exercised();\n  untested();\n}\n"
 
