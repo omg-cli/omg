@@ -317,7 +317,7 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
     let mut packages = HashMap::new();
     let mut entry_count = 0usize;
     let mut descriptions = Vec::new();
-    let mut description_bytes = 0usize;
+    let mut buffered_bytes = 0usize;
 
     for entry in archive.entries().with_context(|| {
         format!(
@@ -354,11 +354,11 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
                 raw.len() as u64 <= MAX_DESC_BYTES,
                 "Pacman sync database desc exceeds the {MAX_DESC_BYTES}-byte limit"
             );
-            description_bytes += raw.len();
+            buffered_bytes += raw.len() + entry_path.as_os_str().len();
             descriptions.push((entry_path, raw));
-            if descriptions.len() == 512 || description_bytes >= 1024 * 1024 {
+            if descriptions.len() == 512 || buffered_bytes >= 1024 * 1024 {
                 merge_sync_descriptions(&mut packages, &mut descriptions, repo_name)?;
-                description_bytes = 0;
+                buffered_bytes = 0;
             }
         }
     }
@@ -2879,6 +2879,40 @@ mod tests {
             .output()
             .expect("isolated resource-limit fixture");
         assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn long_sync_paths_preserve_early_identity_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("core.db");
+        let long_path = format!("{}-1-1/desc", "a".repeat(1024 * 1024));
+        let desc = b"%NAME%\nhelper\n\n%VERSION%\n1-1\n";
+        let mut archive = tar::Builder::new(Vec::new());
+        for name in [long_path.as_str(), "later-1-1/desc"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(desc.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, desc.as_slice())
+                .unwrap();
+        }
+        let mut raw = archive.into_inner().unwrap();
+        let later_header = tar::Archive::new(Cursor::new(&raw))
+            .entries()
+            .unwrap()
+            .nth(1)
+            .unwrap()
+            .unwrap()
+            .raw_header_position();
+        raw[usize::try_from(later_header).unwrap() + 148] ^= 1;
+        fs::write(&path, raw).unwrap();
+        let error = parse_sync_db(&path, "core")
+            .expect_err("an oversized path must be validated before buffering later records");
+        assert!(
+            format!("{error:#}").contains("Inconsistent package identity"),
+            "long path buffering consumed the damaged later header first: {error:#}"
+        );
     }
 
     #[test]
