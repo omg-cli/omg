@@ -714,6 +714,7 @@ def evidence_fixture(root):
         log = {
             'omarchy-success': '| System is up to date',
             'omarchy-current-kernel': '| System is up to date',
+            'omarchy-runtime-unset': 'caller_runtime_hint=unset\n| System is up to date',
             'omarchy-interrupted': 'Omarchy update interrupted',
             'omarchy-output-closed': 'Update output disconnected',
             'omarchy-runtime-fallback': '| System is up to date',
@@ -748,6 +749,41 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_unset_runtime_hint_completes_native_update_and_requires_a_witness(self):
+        stage = 'omarchy-runtime-unset'
+        self.assertIn(stage, PRODUCER.OMARCHY_CASES,
+                      'Native updates must also exercise trusted discovery without OMARCHY_PATH')
+        case = PRODUCER.OMARCHY_CASES[stage]
+        self.assertEqual((case.exit_status, case.native_phase), (0, 'complete'))
+        self.assertEqual(case.helpers, PRODUCER.OMARCHY_PREFIX + PRODUCER.OMARCHY_SUFFIX)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            log = evidence / f'{stage}.log'
+            log.write_text('System is up to date\n')
+            with self.assertRaisesRegex(ValueError, 'runtime hint'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
+    @unittest.skipIf(os.name == 'nt', 'Native caller environment requires POSIX Bash')
+    def test_native_runtime_environment_preserves_and_omits_the_hint_by_case(self):
+        self.assertIn('omarchy-runtime-unset', PRODUCER.OMARCHY_CASES,
+                      'Missing native unset-hint scenario')
+        script = PRODUCER.omarchy_guest_script()
+        start = script.index('  omarchy_environment=(')
+        end = script.index('  runtime_environment=(', start)
+        environment_setup = script[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            for stage, expected in [('omarchy-success', str(Path(directory) / 'checkout')),
+                                    ('omarchy-runtime-unset', None)]:
+                with self.subTest(stage=stage):
+                    command = environment_setup + '\nenv -i "${omarchy_environment[@]}" ' + shlex.quote(sys.executable)
+                    command += ' -c ' + shlex.quote('import json,os;print(json.dumps(os.environ.get("OMARCHY_PATH")))')
+                    result = subprocess.run([BASH, '-euo', 'pipefail', '-c', command],
+                                            env=dict(os.environ, stage=stage, case_dir=directory),
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout), expected)
+
     def test_current_kernel_requires_ownership_evidence_and_no_reboot_reason(self):
         self.assertTrue('omarchy-current-kernel' in PRODUCER.OMARCHY_CASES, 'Missing current-kernel update scenario')
         with tempfile.TemporaryDirectory() as directory:
@@ -807,7 +843,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 34)
+            self.assertEqual(len(receipt['process_checks']), 35)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):

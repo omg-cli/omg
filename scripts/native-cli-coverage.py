@@ -433,6 +433,7 @@ class OmarchyCase(NamedTuple):
 OMARCHY_CASES = {
     'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-runtime-unset': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
     'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
     'omarchy-optional-failures': OmarchyCase(0, tuple(
@@ -852,6 +853,10 @@ OMARCHY_CASE_SETUP
     test ! -e "$fixture/saved/$absent_helper"
     mv "/usr/bin/$absent_helper" "$fixture/saved/$absent_helper"
   fi
+  omarchy_environment=(OMARCHY_PATH="$case_dir/checkout")
+  if test "$stage" = omarchy-runtime-unset; then
+    omarchy_environment=()
+  fi
   runtime_environment=(XDG_RUNTIME_DIR="$case_dir/run")
   coordination_lock="$case_dir/run/omarchy-update.lock"
   if test "$lock_location" != session; then
@@ -870,7 +875,7 @@ OMARCHY_CASE_SETUP
     foreign_identity=$(stat -c '%d:%i:%u:%a' "$coordination_lock")
     foreign_log=$(sha256sum /tmp/omarchy-update.log | cut -d ' ' -f 1)
   fi
-  launch=(bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@"' bash "${args[@]}")
+  launch=(bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; if test "$OMARCHY_FIXTURE_CASE" = omarchy-runtime-unset; then test -z "${OMARCHY_PATH+x}"; echo caller_runtime_hint=unset; fi; exec /omg-extra-bin/cli update "$@"' bash "${args[@]}")
   if test -n "$reboot_answer"; then
     install -d -m 700 -o nobody -g nobody "$case_dir/.local/state/omarchy"
     touch "$case_dir/.local/state/omarchy/reboot-required"
@@ -902,7 +907,7 @@ OMARCHY_CASE_SETUP
     OMG_CONFIG_DIR="$case_dir/config" OMG_CACHE_DIR="$case_dir/cache" OMG_DATA_DIR="$case_dir/data" \
     OMG_DAEMON_DATA_DIR="$case_dir/daemon" OMG_DISABLE_DAEMON=1 OMG_DISABLE_TELEMETRY=1 \
     OMG_PACMAN_CONF="$case_dir/pacman.conf" OMG_PACMAN_DB_DIR="$signed_owner/db" \
-    OMARCHY_PATH="$case_dir/checkout" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
+    "${omarchy_environment[@]}" OMARCHY_MIGRATION_STATE="$case_dir/migrations" \
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
@@ -1229,6 +1234,9 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         modules = {PROFILE.fullmatch(p.name)[3] for p in grouped[stage]}
         require(modules == cli_modules, 'Omarchy profiles do not match the actual CLI: ' + stage)
         log = (evidence / f'{stage}.log').read_text()
+        if stage == 'omarchy-runtime-unset':
+            require(log.splitlines().count('caller_runtime_hint=unset') == 1,
+                    'Native caller runtime hint absence was not witnessed')
         if helpers:
             require((evidence / f'{stage}-coordination.txt').read_text()
                     == 'released private lock; owned transcript mode=600\n',
