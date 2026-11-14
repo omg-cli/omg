@@ -105,6 +105,12 @@ pub struct App {
     pub search_query: String,
     pub search_mode: bool,
     pub daemon_connected: bool,
+    pub(crate) security_policy: Option<
+        std::result::Result<
+            crate::core::security::SecurityPolicy,
+            crate::core::security::PolicyError,
+        >,
+    >,
 
     // Search results
     pub search_results: Vec<crate::package_managers::SyncPackage>,
@@ -161,6 +167,7 @@ impl App {
             search_query: String::new(),
             search_mode: false,
             daemon_connected: false,
+            security_policy: None,
             search_results: Vec::new(),
             search_error: None,
             action_error: None,
@@ -201,6 +208,8 @@ impl App {
         if !self.external_refresh_enabled {
             return Ok(());
         }
+
+        self.security_policy = Some(crate::core::security::SecurityPolicy::load_default());
 
         // 1. Fetch history. Daemon I/O is scheduled separately by the event
         // loop so its request timeout can never freeze input or rendering.

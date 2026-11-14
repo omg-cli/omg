@@ -392,6 +392,7 @@ TESTS = {
     ),
     'arch-contracts': (
         'native_status_preserves_daemon_advisory_coverage',
+        'native_status_without_daemon_preserves_unknown_security',
         'dependency_reports_bound_large_reverse_dependency_lists',
         'native_size_tree_includes_installed_virtual_provider',
         'native_size_tree_counts_one_provider_for_multiple_virtual_requirements',
@@ -443,6 +444,7 @@ OMARCHY_CASES = {
         native_phase='complete'),
     'omarchy-migration-refusal': OmarchyCase(1, ()),
     'omarchy-unsupported-mode': OmarchyCase(1, ()),
+    'omarchy-unsupported-turbo-mode': OmarchyCase(1, ()),
     'omarchy-invalid-transport': OmarchyCase(1, ()),
     'omarchy-snapshot-missing': OmarchyCase(0, tuple(
         item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
@@ -826,6 +828,7 @@ for stage in OMARCHY_STAGE_NAMES; do
   case "$stage" in
     omarchy-declined|omarchy-confirmation-failure) args=() ;;
     omarchy-unsupported-mode) args=(--fast) ;;
+    omarchy-unsupported-turbo-mode) args=(--turbo) ;;
     omarchy-invalid-transport) extra=(OMG_OMARCHY_LOCK_FD=999999) ;;
   esac
   if test "$stage" = omarchy-optional-failures; then
@@ -1398,7 +1401,7 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require('Omarchy update did not complete' in log, 'Missing vendor failure diagnostic')
         elif stage == 'omarchy-migration-refusal':
             require('external package helper' in log, 'Missing native package migration refusal')
-        elif stage == 'omarchy-unsupported-mode':
+        elif stage in ('omarchy-unsupported-mode', 'omarchy-unsupported-turbo-mode'):
             require('complete update lifecycle' in log, 'Unsupported Omarchy scope accepted')
         elif stage == 'omarchy-invalid-transport':
             require('Incomplete Omarchy update transport' in log, 'Incomplete transport accepted')

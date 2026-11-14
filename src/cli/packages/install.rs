@@ -35,8 +35,12 @@ pub(crate) async fn enforce_install_policy(
         description: String::new(),
         licenses: license.into_iter().map(str::to_owned).collect(),
     }];
-    let prepared_arch_admission = policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot
-        && crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Arch;
+    let prepared_arch_admission = policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot;
+    if prepared_arch_admission
+        && crate::package_managers::resolve_backend()? != crate::package_managers::Backend::Arch
+    {
+        return Err(crate::core::security::PolicyError::PreparedAdmissionRequired.into());
+    }
     let assessments = if policy.advisory_requirement == AdvisoryRequirement::Optional
         || prepared_arch_admission
     {

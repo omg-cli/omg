@@ -967,10 +967,9 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
         Some(_) => (colors::ACCENT_RED, "󰀦", "FINDINGS"),
         None => (colors::FG_MUTED, "󰀦", "UNREPORTED"),
     };
-    let defaults = crate::core::security::SecurityPolicy::default();
 
     // Security Overview
-    let security_lines = vec![
+    let mut security_lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -1009,44 +1008,73 @@ fn draw_security(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(status_color),
             ),
         ]),
-        Line::from(Span::styled(
-            "   Built-in defaults (not active policy):",
-            Style::default()
-                .fg(colors::FG_PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        )),
-        // These are the built-in DEFAULTS, not live configuration; label them
-        // as such so they cannot be mistaken for actual policy state.
-        Line::from(vec![
-            Span::styled("   ├─ Min Grade: ", Style::default().fg(colors::FG_MUTED)),
-            Span::styled(
-                defaults.minimum_grade.to_string(),
-                Style::default().fg(colors::ACCENT_YELLOW),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("   ├─ AUR: ", Style::default().fg(colors::FG_MUTED)),
-            Span::styled(
-                if defaults.allow_aur {
-                    "Allowed"
-                } else {
-                    "Disabled"
-                },
-                Style::default().fg(colors::ACCENT_YELLOW),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("   └─ PGP: ", Style::default().fg(colors::FG_MUTED)),
-            Span::styled(
-                if defaults.require_pgp {
-                    "Required"
-                } else {
-                    "Not required"
-                },
-                Style::default().fg(colors::FG_MUTED),
-            ),
-        ]),
     ];
+    match &app.security_policy {
+        Some(Ok(policy)) => {
+            security_lines.push(Line::from(Span::styled(
+                "   Configured policy snapshot:",
+                Style::default()
+                    .fg(colors::FG_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for (label, value) in [
+                ("Min Grade", policy.minimum_grade.to_string()),
+                (
+                    "AUR",
+                    if policy.allow_aur {
+                        "Allowed"
+                    } else {
+                        "Disabled"
+                    }
+                    .to_owned(),
+                ),
+                (
+                    "PGP",
+                    if policy.require_pgp {
+                        "Required"
+                    } else {
+                        "Not required"
+                    }
+                    .to_owned(),
+                ),
+                (
+                    "Advisories",
+                    match policy.advisory_requirement {
+                        crate::core::security::policy::AdvisoryRequirement::Optional => "Optional",
+                        crate::core::security::policy::AdvisoryRequirement::Review => {
+                            "Review required"
+                        }
+                        crate::core::security::policy::AdvisoryRequirement::FreshSnapshot => {
+                            "Fresh snapshot required"
+                        }
+                    }
+                    .to_owned(),
+                ),
+            ] {
+                security_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("   {label}: "),
+                        Style::default().fg(colors::FG_MUTED),
+                    ),
+                    Span::styled(value, Style::default().fg(colors::ACCENT_YELLOW)),
+                ]));
+            }
+        }
+        Some(Err(error)) => {
+            security_lines.push(Line::from(Span::styled(
+                "   Policy unavailable",
+                Style::default().fg(colors::ACCENT_RED),
+            )));
+            security_lines.push(Line::from(format!(
+                "   {}",
+                truncate_width(
+                    &error.to_string(),
+                    usize::from(left.width.saturating_sub(6))
+                )
+            )));
+        }
+        None => security_lines.push(Line::from("   Policy not loaded")),
+    }
 
     let security_widget = Paragraph::new(security_lines)
         .block(styled_block("󰒃 Security Status"))
@@ -1452,6 +1480,76 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    #[test]
+    fn security_tab_tracks_configured_policy_and_reports_invalid_policy() {
+        const NAME: &str =
+            "cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("private policy directory");
+        let path = directory.path().to_str().expect("UTF-8 fixture path");
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(path)),
+                ("OMG_DATA_DIR", Some(path)),
+                ("OMG_TEST_MODE", Some("1")),
+            ],
+            || {
+                let policy_path = directory.path().join("policy.toml");
+                let policy = crate::core::security::SecurityPolicy {
+                    allow_aur: false,
+                    require_pgp: true,
+                    minimum_grade: crate::core::security::SecurityGrade::Verified,
+                    advisory_requirement:
+                        crate::core::security::policy::AdvisoryRequirement::FreshSnapshot,
+                    ..Default::default()
+                };
+                std::fs::write(&policy_path, toml::to_string(&policy).unwrap()).unwrap();
+                let mut app = App::new()
+                    .expect("private app state")
+                    .with_tab(Tab::Security);
+                let render = |app: &App| {
+                    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+                    terminal.draw(|frame| draw(frame, app)).unwrap();
+                    terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                };
+                let text = render(&app);
+                assert!(text.contains("Configured policy snapshot"), "{text}");
+                assert!(text.contains("AUR: Disabled"), "{text}");
+                assert!(text.contains("PGP: Required"), "{text}");
+                assert!(text.contains("VERIFIED"), "{text}");
+                assert!(
+                    text.contains("Advisories: Fresh snapshot required"),
+                    "{text}"
+                );
+                assert!(!text.contains("COMMUNITY"), "{text}");
+                std::fs::write(&policy_path, "allow_aur = [broken").unwrap();
+                app.refresh()
+                    .expect("invalid policy remains visible without closing the UI");
+                let text = render(&app);
+                assert!(text.contains("Policy unavailable"), "{text}");
+                assert!(
+                    !text.contains("AUR: Allowed") && !text.contains("AUR: Disabled"),
+                    "{text}"
+                );
+                std::fs::remove_file(&policy_path).unwrap();
+                app.refresh().unwrap();
+                let text = render(&app);
+                assert!(
+                    text.contains("AUR: Allowed") && text.contains("PGP: Not required"),
+                    "{text}"
+                );
+            },
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unknown_coverage_keeps_findings_visible_without_claiming_secure() {
@@ -1481,8 +1579,8 @@ mod tests {
         assert!(text.contains("Findings: 17"));
         assert!(text.contains("Unassessed: 1"));
         assert!(!text.contains("SECURE"));
-        assert!(text.contains("COMMUNITY"));
-        assert!(text.contains("PGP: Not required"));
+        assert!(text.contains("Policy not loaded"));
+        assert!(!text.contains("COMMUNITY"));
     }
 
     #[cfg(unix)]

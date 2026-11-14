@@ -33,6 +33,48 @@ fn output_text(output: &CommandResult) -> String {
 
 #[cfg(unix)]
 #[test]
+fn native_status_without_daemon_preserves_unknown_security() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !common::native_arch_fixture_available() {
+        return Ok(());
+    }
+    let project = common::TestProject::new();
+    prepare_native_size_fixture(&project, &[], &[])?;
+    let before = private_fixture_state(project.pacman_root.path())?;
+    let directory = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")?;
+    let socket = directory.path().join("absent.sock");
+    for args in [&["status"][..], &["status", "--fast"][..]] {
+        let output = project.run_native_arch_status(&socket, args);
+        assert!(output.success, "{}", output_text(&output));
+        let text = output_text(&output);
+        assert!(text.contains("Advisory coverage unreported"), "{text}");
+        assert!(!text.contains("No reported findings"), "{text}");
+        assert!(text.contains("2 packages installed · 1 explicit"), "{text}");
+        if args == ["status"] {
+            for expected in [["Updates", "0"], ["Orphans", "1"]] {
+                assert!(
+                    text.lines()
+                        .any(|line| line.split_whitespace().eq(expected)),
+                    "missing native inventory row {expected:?}: {text}"
+                );
+            }
+        } else {
+            assert!(text.contains("Updates and orphans not checked"), "{text}");
+        }
+        assert!(
+            !socket.exists(),
+            "status unexpectedly created a daemon socket"
+        );
+        assert_eq!(private_fixture_state(project.pacman_root.path())?, before);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn native_status_preserves_daemon_advisory_coverage() -> Result<()> {
     use omg_lib::daemon::protocol::{
         Request, Response, ResponseResult, StatusResult, encode_frame, read_frame, split_frame,

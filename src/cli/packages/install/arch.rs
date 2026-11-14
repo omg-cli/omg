@@ -868,6 +868,127 @@ mod tests {
     }
 
     #[test]
+    fn fresh_snapshot_preflight_requires_prepared_native_admission() {
+        use crate::core::security::policy::AdvisoryRequirement;
+        use crate::core::security::{PolicyError, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+
+        const NAME: &str = "cli::packages::install::arch::tests::fresh_snapshot_preflight_requires_prepared_native_admission";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("private admission runtime");
+        let policy = SecurityPolicy {
+            advisory_requirement: AdvisoryRequirement::FreshSnapshot,
+            ..SecurityPolicy::default()
+        };
+        let version = crate::package_managers::parse_version_or_zero("1.0-1");
+        let scanner = FixtureSource {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            vulnerable: false,
+        };
+        temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+            let error = runtime
+                .block_on(enforce_install_policy(
+                    &policy,
+                    &scanner,
+                    "example",
+                    &version,
+                    SecurityOrigin::ArchRepository {
+                        repository: "core".into(),
+                    },
+                    Some("MIT"),
+                ))
+                .expect_err("mock backend cannot own fresh native admission");
+            assert!(
+                matches!(
+                    error.downcast_ref::<PolicyError>(),
+                    Some(PolicyError::PreparedAdmissionRequired)
+                ),
+                "{error:#}"
+            );
+            assert_eq!(
+                scanner.calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "unsupported fresh admission must refuse before contacting a provider"
+            );
+        });
+    }
+
+    #[test]
+    fn native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy() {
+        use crate::core::security::policy::AdvisoryRequirement;
+        use crate::core::security::{PolicyError, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+
+        const NAME: &str = "cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        temp_env::with_vars(
+            [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
+            || {
+                if crate::core::env::distro::detect_distro()
+                    != crate::core::env::distro::Distro::Arch
+                {
+                    eprintln!("[omg-skip] fresh snapshot preflight requires native Arch");
+                    return;
+                }
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("private native admission runtime");
+                let mut policy = SecurityPolicy {
+                    advisory_requirement: AdvisoryRequirement::FreshSnapshot,
+                    ..SecurityPolicy::default()
+                };
+                let scanner = FixtureSource {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    vulnerable: false,
+                };
+                let version = crate::package_managers::parse_version_or_zero("1.0-1");
+                let origin = SecurityOrigin::ArchRepository {
+                    repository: "core".into(),
+                };
+                runtime
+                    .block_on(enforce_install_policy(
+                        &policy,
+                        &scanner,
+                        "example",
+                        &version,
+                        origin.clone(),
+                        Some("MIT"),
+                    ))
+                    .expect("preflight must defer evidence to the prepared native transaction");
+                assert_eq!(
+                    scanner.calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "preflight must not substitute an OSV lookup for fresh transaction evidence"
+                );
+                policy.allowed_licenses = vec!["Apache-2.0".into()];
+                let error = runtime
+                    .block_on(enforce_install_policy(
+                        &policy,
+                        &scanner,
+                        "example",
+                        &version,
+                        origin,
+                        Some("MIT"),
+                    ))
+                    .expect_err("deferred advisory evidence must not bypass license policy");
+                assert!(
+                    matches!(error.downcast_ref::<PolicyError>(), Some(PolicyError::LicenseNotAllowed { name, license }) if name == "example" && license == "MIT"),
+                    "{error:#}"
+                );
+                assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            },
+        );
+    }
+
+    #[test]
     fn install_policy_rejects_known_vulnerabilities() {
         const NAME: &str =
             "cli::packages::install::arch::tests::install_policy_rejects_known_vulnerabilities";

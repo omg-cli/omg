@@ -1882,9 +1882,17 @@ def _construct_replacements(old, new, work, head_inventory=None, compatible=None
     if global_head is None:
         return {}, inventories
     all_bodies, all_statements = global_head
-    functions = []
+    functions = []; control_owners = []; control_excerpts = {}
     for inventory in inventories:
         rows = {}
+        code = inventory[0]
+        _construct_charge(work, 3 * len(inventory[1]) + sum(len(row['header'])
+                          for row in inventory[1] if row['kind'] == 'fn'))
+        by_opening = {row['opening']: row for row in inventory[1] if row['opening'] is not None}
+        declarations = Counter(row['header'][row['header'].index('fn') + 1]
+            for row in inventory[1] if row['kind'] == 'fn' and 'fn' in row['header']
+            and row['header'].index('fn') + 1 < len(row['header']))
+        identities = {}
         _construct_charge(work, len(inventory[1]))
         for row in inventory[1]:
             if row['kind'] == 'fn':
@@ -1893,7 +1901,31 @@ def _construct_replacements(old, new, work, head_inventory=None, compatible=None
                 _construct_charge(work, last - first + 1)
                 for number in range(first, last + 1):
                     rows.setdefault(number, []).append(row)
+                header = row['header']
+                if not row['supported'] or 'fn' not in header:
+                    continue
+                at = header.index('fn')
+                if at + 2 >= len(header):
+                    continue
+                declaration = header[at + 1]
+                parameter_start = row['first'] + at + 2
+                parameter_end = code.pairs.get(parameter_start)
+                _construct_charge(work, row['end'] - row['first'] + 1)
+                if (code.words[parameter_start] != '(' or parameter_end is None
+                        or parameter_end >= row['opening']
+                        or code.starts[row['opening']] - code.starts[row['first']] > 4096
+                        or 'mod' in code.words[row['opening']:row['end']]):
+                    continue
+                parents = [by_opening.get(index) for index in _construct_ancestors(code, row['opening'], work)]
+                _construct_charge(work, sum(4 * len(word) + 8 for parent in parents
+                                           if parent is not None for word in parent['header']))
+                if (declarations[declaration] == 1 and re.fullmatch(r'[A-Za-z_]\w*', declaration)
+                        and all(parent is not None and parent['supported']
+                                and parent['kind'] in ('mod', 'impl') for parent in parents)):
+                    identities[id(row)] = (tuple(parent['header'] for parent in parents), header[:at], declaration,
+                        tuple(code.words[parameter_start:parameter_end + 1]))
         functions.append(rows)
+        control_owners.append(identities)
     _construct_charge(work, 3 * len(inventories[0][1]))
     statements = sorted((row for row in inventories[0][1] if row['kind'] == 'statement'), key=lambda row: row['first'])
     starts = [row['first'] for row in statements]
@@ -1931,11 +1963,21 @@ def _construct_replacements(old, new, work, head_inventory=None, compatible=None
                 continue
             before, after = (rows[0] for rows in pairs)
             record = before.get('header') == after.get('header') == ('Self',)
+            control = (stripped == '}' and before['kind'] in ('if', 'for', 'while', 'loop', 'match')
+                and after['kind'] in ('if', 'for', 'while', 'loop', 'match')
+                and before['header'] != after['header'] and before['body'] not in all_bodies
+                and compatible is not None and compatible(line, target, 'control-endpoint'))
+            control_functions = [rows.get(number, []) for rows, number in zip(functions, (line, target))]
+            if control:
+                keys = [identities.get(id(rows[0])) if len(rows) == 1 else None
+                        for identities, rows in zip(control_owners, control_functions)]
+                control = (keys[0] is not None and keys[1] is not None
+                    and keys[0][:3] == keys[1][:3] and keys[0][3] != keys[1][3])
             if (not owner_replacement and (not before['supported']
                     or not after['supported'] and after['kind'] != 'struct')
                     or (before['kind'] == 'expression' or after['kind'] == 'expression') and not record
                     or before['digest'] == after['digest']
-                    or (before['kind'] == after['kind'] and before['kind'] not in ('statement', 'fn') and not record)
+                    or (before['kind'] == after['kind'] and before['kind'] not in ('statement', 'fn') and not record and not control)
                     or before['kind'] == after['kind'] == 'fn'
                        and after['digest'] in base_digests):
                 continue
@@ -1950,12 +1992,24 @@ def _construct_replacements(old, new, work, head_inventory=None, compatible=None
                     if statements[index]['end'] <= before['end'] and statements[index]['digest'] in all_statements}
                 _construct_charge(work, len(kept) * (len(kept).bit_length() + 1))
                 nested_cache[key] = tuple(sorted(kept))
+            if control and nested_cache[key]:
+                continue
             if nested_cache[key] and not deferred:
                 if owner_replacement:
                     raise ValueError('Ambiguous unchanged work in replaced compiler owner')
                 continue
-            if compatible is not None and not owner_replacement and not compatible(line, target, before['kind']):
+            if compatible is not None and not owner_replacement and not control and not compatible(line, target, before['kind']):
                 continue
+            if control:
+                for side, rows in enumerate(control_functions):
+                    row = rows[0]; code = inventories[side][0]
+                    start = code.position(code.starts[row['first']])[0]
+                    end = code.position(code.starts[row['end']])[0]
+                    excerpt_key = side, start, end
+                    if excerpt_key not in control_excerpts:
+                        source = (old, new)[side]
+                        _construct_charge(work, sum(len(text) + 1 for text in source[start - 1:end]))
+                        control_excerpts[excerpt_key] = ('\n'.join(source[start - 1:end]) + '\n').encode()
             proposals[line] = dict(base_line=line, head_line=target,
                 base_construct=before['kind'], head_construct=after['kind'],
                 base_construct_sha256=before['digest'], head_construct_sha256=after['digest'],
@@ -1966,6 +2020,12 @@ def _construct_replacements(old, new, work, head_inventory=None, compatible=None
                 residual=bool(re.search(r'\w', stripped)), retained_statements=nested_cache[key],
                 claim='complete source replacement only; old counts remain in strict base ratios',
                 summary_credit=[0, 0], mapped_credit=[0, 0])
+            if control:
+                proposals[line]['control_replacement'] = 'Same lexical function; complete old body and statements absent from head inventory'
+                proposals[line]['control_owner_sha256'] = hashlib.sha256(repr(keys[0][:3]).encode()).hexdigest()
+                proposals[line]['parameter_signatures_sha256'] = [hashlib.sha256(repr(key[3]).encode()).hexdigest() for key in keys]
+    if control_excerpts:
+        require_rustfmt_syntax(control_excerpts.values())
     return proposals, inventories
 
 
@@ -3645,6 +3705,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     rows[number] = (prefix, group) if number not in rows else None
             partitions.append(rows)
         def compatible_replacement(line, target, kind):
+            if kind == 'control-endpoint':
+                return before.get(line, 0) > 0 and target not in after
             left, right = partitions[0].get(line), partitions[1].get(target)
             if kind == 'owner':
                 return (left is not None and right is not None and left[0] in removed_prefixes

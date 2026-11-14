@@ -297,6 +297,102 @@ class SourceAwareCoverageTests(unittest.TestCase):
     old_source = b"fn obsolete() {\n}\nfn retained() {\n  exercised();\n  untested();\n}\n"
     new_source = b"fn retained() {\n  exercised();\n  untested();\n}\n"
 
+    def control_endpoint_compare(self, *, cold=False, rewrite=None, extra_head=None):
+        old = ('async fn checked(\n    old: bool,\n) {\n'
+               '    if old {\n        old_work();\n    }\n    old_tail();\n}\n')
+        new = ('async fn checked(\n    new: bool,\n) {\n    new_head();\n'
+               '    if new {\n        new_work();\n    } else {\n'
+               '        replacement();\n    }\n    new_tail();\n}\n')
+        if rewrite:
+            old, new = rewrite(old, new)
+        sources = [source.splitlines() for source in (old, new)]
+        target = next(n for n, text in enumerate(sources[1], 1) if text == '    }')
+        counts = [[(n, 2 * int(not (side == 1 and cold and n == target)))
+                   for n in range(1, len(source) + 1) if side == 0 or cold or n != target]
+                  for side, source in enumerate(sources)]
+        def owners(base, head):
+            for side, document in enumerate((base, head)):
+                source = sources[side]
+                document['data'][0]['functions'] = []
+                for copy in range(2):
+                    constructor = f'_RNvCs{copy + 1}_7example7checked'
+                    document['data'][0]['functions'].extend([
+                        dict(name=constructor, count=1, filenames=['/src/example.rs'],
+                             regions=[[1, 1, 3, 2, 1, 0, 0, 0]]),
+                        dict(name='_RNC' + constructor[2:] + '0B3_', count=1,
+                             filenames=['/src/example.rs'], regions=[
+                                [3, 3, 3, 4, 1, 0, 0, 0],
+                                *[[n, 1, n, len(source[n - 1]) + 1, count // 2, 0, 0, 0]
+                                  for n, count in counts[side] if n > 3]])])
+        head_sources = {'example.rs': new.encode()}
+        if extra_head is not None:
+            head_sources['elsewhere.rs'] = extra_head
+        return self.compare(before=counts[0], after=counts[1], mutate=owners,
+            sources=({'example.rs': old.encode()}, head_sources))
+
+    def test_replaced_control_endpoint_keeps_old_counts_without_deletion_credit(self):
+        result = self.control_endpoint_compare()
+        self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                         'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        self.assertTrue(any(row['base_construct'] == row['head_construct'] == 'if'
+                            for row in result['source_replacements']))
+        self.assertTrue(all(row['summary_credit'] == row['mapped_credit'] == [0, 0]
+                            for row in result['source_replacements']))
+
+    def test_replaced_control_endpoint_cannot_retain_a_new_cold_mapping(self):
+        with self.assertRaisesRegex(ValueError, r'(Retained covered line lost coverage|Ambiguous unchanged source)'):
+            self.control_endpoint_compare(cold=True)
+
+    def test_control_replacement_cannot_hide_retained_work_in_another_file(self):
+        with self.assertRaises(ValueError):
+            self.control_endpoint_compare(extra_head=b'fn elsewhere() { old_work(); }\n')
+
+    def test_control_replacement_does_not_bypass_an_unchanged_parameter_scope(self):
+        def rewrite(old, new):
+            return (old.replace('old: bool', 'state: bool').replace('if old', 'if state'),
+                    new.replace('new: bool', 'state: bool').replace('if new', 'if !state'))
+        with self.assertRaises(ValueError):
+            self.control_endpoint_compare(rewrite=rewrite)
+
+    def test_replaced_iterative_and_match_endpoints_keep_old_counts(self):
+        for kind in ('while', 'for', 'match'):
+            def rewrite(old, new):
+                new = new.replace('    } else {\n        replacement();\n    }', '    }')
+                if kind == 'for':
+                    return (old.replace('old: bool', 'old: Vec<usize>').replace('if old', 'for item in old'),
+                            new.replace('new: bool', 'new: Vec<u64>').replace('if new', 'for item in new'))
+                if kind == 'match':
+                    return (old.replace('if old', 'match old').replace('old_work();', '_ => old_work(),'),
+                            new.replace('if new', 'match new').replace('new_work();', '_ => new_work(),'))
+                return old.replace('if old', 'while old'), new.replace('if new', 'while new')
+            with self.subTest(kind=kind):
+                result = self.control_endpoint_compare(rewrite=rewrite)
+                self.assertEqual(result['deleted_summary_found'], 0)
+                self.assertEqual(result['deleted_mapped'], 0)
+
+    def test_control_replacement_blocks_module_tokens_before_syntax_parser(self):
+        for statement in ('mod external;', '#[path = "/do-not-read.rs"] mod external;',
+                          'mod nested { fn helper() {} }'):
+            def rewrite(old, new):
+                return old, new.replace('    new_head();', '    ' + statement + '\n    new_head();')
+            with self.subTest(statement=statement), patch.object(
+                    coverage.subprocess, 'run', side_effect=AssertionError('module reached syntax parser')):
+                with self.assertRaises(ValueError):
+                    self.control_endpoint_compare(rewrite=rewrite)
+
+    def test_control_replacement_refuses_retained_work_changed_owners_and_invalid_syntax(self):
+        rewrites = {
+            'retained_body': lambda old, new: (old, new.replace('new_work();', 'old_work();')),
+            'retained_statement': lambda old, new: (old, new.replace('new_work();', 'if nested { old_work(); }')),
+            'retained_elsewhere': lambda old, new: (old, new + 'fn elsewhere() { old_work(); }\n'),
+            'different_function': lambda old, new: (old, new.replace('fn checked(', 'fn unrelated(')),
+            'duplicate_function': lambda old, new: (old, new + 'mod nested { async fn checked() {} }\n'),
+            'invalid_signature': lambda old, new: (old, new.replace('new: bool', 'new: @')),
+        }
+        for label, rewrite in rewrites.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.control_endpoint_compare(rewrite=rewrite)
+
     def test_alignment_does_not_retain_a_function_endpoint_as_a_struct_endpoint(self):
         old = ['fn obsolete() {', '    old();', '}',
                'fn retained() {', '    same();', '}']

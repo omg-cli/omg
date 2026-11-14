@@ -743,6 +743,7 @@ def evidence_fixture(root):
             'omarchy-declined': 'declined',
             'omarchy-migration-refusal': 'external package helper',
             'omarchy-unsupported-mode': 'complete update lifecycle',
+            'omarchy-unsupported-turbo-mode': 'complete update lifecycle',
             'omarchy-invalid-transport': 'Incomplete Omarchy update transport',
         }.get(stage, '')
         if case.failure_command:
@@ -759,6 +760,21 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_turbo_scope_refusal_has_its_own_native_case_and_diagnostic(self):
+        stage = 'omarchy-unsupported-turbo-mode'
+        self.assertIn(stage, PRODUCER.OMARCHY_CASES,
+                      'Turbo must independently refuse an incomplete Omarchy update')
+        case = PRODUCER.OMARCHY_CASES[stage]
+        self.assertEqual(case.exit_status, 1)
+        self.assertEqual(case.helpers, ())
+        self.assertIn(stage + ') args=(--turbo)', PRODUCER.omarchy_guest_script())
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            (evidence / f'{stage}.log').write_text('unrelated refusal\n')
+            with self.assertRaisesRegex(ValueError, 'Unsupported Omarchy scope'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_elevation_refusal_requires_identity_exit_diagnostic_and_cli_profiles(self):
         stage = 'cli-elevation-denied'
         self.assertIn(stage, PRODUCER.PROCESS_STAGES,
@@ -888,8 +904,8 @@ class SupplementalEvidence(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
-            self.assertEqual(len(receipt['tests']), 15)
-            self.assertEqual(len(receipt['process_checks']), 37)
+            self.assertEqual(len(receipt['tests']), 16)
+            self.assertEqual(len(receipt['process_checks']), 38)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
