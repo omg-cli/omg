@@ -1803,3 +1803,20 @@ still required for this batch. Coverage correspondence work remains open;
 tracing confirms that changed grouped imports and unsupported retained
 fragments can prevent matching even when aggregate counts are positive.
 No comparator acceptance rule was changed in this batch.
+
+
+The first native45 CLI attempt passes all 15 selected tests, then correctly
+fails producer admission because its sudo-refusal fixture expected the wrong
+boundary. sudo -n -v accepts credential validation under the NOPASSWD deny
+entry, but the actual payload is denied by command policy. No profiles from
+that failed producer are imported; its stopped trial, logs and receipt remain.
+The producer now distinguishes authentication refusal from payload
+authorization refusal. The first guest-local deny policy explicitly requires
+validation authentication with no timestamp; the second reproduces the real
+NOPASSWD command denial. Both retain the exact nonzero exit, ordinary UID,
+matching CLI profile and boundary-specific diagnostic requirements. A second
+regression first fails because the authorization case is absent. The complete
+producer boundary suite now passes 104 tests. The total process checks are 37.
+Only producer Python and this evidence note change after 01c2c09f; fresh full
+source-identity and native verification will still be collected rather than
+relabeling the prior binary's compilation epoch.

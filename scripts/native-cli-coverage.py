@@ -489,7 +489,7 @@ OMARCHY_CASES = {
 }
 
 ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
-PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'cli-elevation-denied',
+PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'cli-elevation-denied', 'cli-authorization-denied',
                   'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES)
 STAGES = tuple('registry-' + role for role in TESTS) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
@@ -1131,24 +1131,36 @@ for flags in q v vv vvv; do
 done
 denial_policy=/etc/sudoers.d/zzzz-omg-elevation-denied
 test ! -e "$denial_policy"
-printf 'nobody ALL=(root) NOPASSWD: !ALL\n' > "$denial_policy"
-chmod 440 "$denial_policy"
-visudo -cf "$denial_policy" > /evidence/cli/cli-elevation-policy.txt 2>&1
-ordinary sudo -k
-if ordinary env LLVM_PROFILE_FILE='/profiles/omg-extra-cli-elevation-denied-%p-%m.profraw' \
-  timeout --signal=TERM --kill-after=3 40 /omg-extra-bin/cli clean --cache --yes \
-  < /dev/null > /evidence/cli/cli-elevation-denied.log 2>&1; then
-  elevation_status=0
-else
-  elevation_status=$?
-fi
-rm -- "$denial_policy"
-test "$elevation_status" = 1
-grep -F 'Privilege elevation failed (--yes flag prevents password prompt)' /evidence/cli/cli-elevation-denied.log
-printf '%s\n' "$elevation_status" > /evidence/cli/cli-elevation-denied-exit.txt
-ordinary bash -c 'printf "actual_uid=%s operation=clean-cache authorization=denied\n" "$(id -u)"' \
-  > /evidence/cli/cli-elevation-denied-identity.txt
-printf 'cli-elevation-denied\t0\n' >> /evidence/cli/process-checks.tsv
+for stage in cli-elevation-denied cli-authorization-denied; do
+  if test "$stage" = cli-elevation-denied; then
+    printf 'Defaults:nobody authenticate, verifypw=always, timestamp_timeout=0\nnobody ALL=(root) PASSWD: !ALL\n' > "$denial_policy"
+    refused=authentication
+  else
+    printf 'nobody ALL=(root) NOPASSWD: !ALL\n' > "$denial_policy"
+    refused=authorization
+  fi
+  chmod 440 "$denial_policy"
+  visudo -cf "$denial_policy" > "/evidence/cli/$stage-policy.txt" 2>&1
+  ordinary sudo -k
+  if ordinary env LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
+    timeout --signal=TERM --kill-after=3 40 /omg-extra-bin/cli clean --cache --yes \
+    < /dev/null > "/evidence/cli/$stage.log" 2>&1; then
+    elevation_status=0
+  else
+    elevation_status=$?
+  fi
+  rm -- "$denial_policy"
+  test "$elevation_status" = 1
+  if test "$refused" = authentication; then
+    grep -F 'Privilege elevation failed (--yes flag prevents password prompt)' "/evidence/cli/$stage.log"
+  else
+    grep -F "nobody is not allowed to execute '/omg-extra-bin/cli __omg_elevated clean --cache --yes' as root" "/evidence/cli/$stage.log"
+  fi
+  printf '%s\n' "$elevation_status" > "/evidence/cli/$stage-exit.txt"
+  ordinary bash -c 'printf "actual_uid=%s operation=clean-cache %s=denied\n" "$(id -u)" "$1"' bash "$refused" \
+    > "/evidence/cli/$stage-identity.txt"
+  printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
+done
 ordinary env LLVM_PROFILE_FILE='/profiles/omg-extra-daemon-%p-%m.profraw' RUST_LOG='[' \
   timeout --signal=TERM --kill-after=3 40 bash -c '
     set -euo pipefail
@@ -1254,13 +1266,24 @@ def validate_evidence(evidence, profiles, artifacts, commit):
     require((evidence / f'{elevation}-exit.txt').read_text() == '1\n',
             'CLI elevation refusal exit status differs')
     require((evidence / f'{elevation}-identity.txt').read_text()
-            == 'actual_uid=65534 operation=clean-cache authorization=denied\n',
+            == 'actual_uid=65534 operation=clean-cache authentication=denied\n',
             'CLI elevation refusal did not run as the ordinary fixture user')
     require('Privilege elevation failed (--yes flag prevents password prompt)'
             in (evidence / f'{elevation}.log').read_text(),
             'CLI elevation refusal lacks the real authentication diagnostic')
     require({PROFILE.fullmatch(p.name)[3] for p in grouped[elevation]} == cli_modules,
             'CLI elevation profiles do not match the actual CLI')
+    authorization = 'cli-authorization-denied'
+    require((evidence / f'{authorization}-exit.txt').read_text() == '1\n',
+            'CLI authorization refusal exit status differs')
+    require((evidence / f'{authorization}-identity.txt').read_text()
+            == 'actual_uid=65534 operation=clean-cache authorization=denied\n',
+            'CLI authorization refusal did not run as the ordinary fixture user')
+    require("nobody is not allowed to execute '/omg-extra-bin/cli __omg_elevated clean --cache --yes' as root"
+            in (evidence / f'{authorization}.log').read_text(),
+            'CLI authorization refusal lacks the real command denial')
+    require({PROFILE.fullmatch(p.name)[3] for p in grouped[authorization]} == cli_modules,
+            'CLI authorization profiles do not match the actual CLI')
     for stage, case in OMARCHY_CASES.items():
         status, helpers = case.exit_status, case.helpers
         require((evidence / f'{stage}-exit.txt').read_text() == f'{status}\n',
