@@ -509,6 +509,12 @@ timeout 30 docker exec -w /work/guest "$controller" bash -c '"$1" --version; qem
 cp "$here/qemu-boot-budget.sh" "$work/qemu-boot-budget.sh"
 cp "$here/qemu-boot-diagnostics.sh" "$work/qemu-boot-diagnostics.sh"
 source "$work/qemu-boot-budget.sh"
+if [[ -n "${native_cli_coverage_dir:-}" ]]; then
+  mkdir "$work/native-cli"
+  cp -a "$native_cli_coverage_dir/bin" "$work/native-cli/bin"
+  cp "$native_cli_coverage_dir/native-cli-manifest.json" "$work/native-cli/native-cli-manifest.json"
+  cp "$here/native-cli-coverage.py" "$work/native-cli/native-cli-coverage.py"
+fi
 cat > "$work/boot.sh" <<'BOOT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -597,6 +603,12 @@ write_files:
       [Install]
       WantedBy=timers.target
 CLOCK
+if [[ -d /work/native-cli ]]; then
+  cat <<'NATIVE_PACKAGES'
+runcmd:
+  - ["pacman", "-Syu", "--noconfirm", "--needed", "python", "sudo", "bubblewrap", "fakeroot", "debugedit", "git", "make", "jq", "diffutils", "gnupg", "openssl", "iproute2", "util-linux"]
+NATIVE_PACKAGES
+fi
 } > user-data
 chmod 600 user-data
 printf 'instance-id: omg-qemu-fresh\n' > meta-data
@@ -977,10 +989,6 @@ timeout --kill-after=5s "$boot_timeout" docker exec "$controller" bash /work/boo
 timeout --kill-after=2s 3s docker exec "$controller" bash /work/qemu-boot-diagnostics.sh > "$work/boot.diagnostics.log" 2>&1 || printf 'Boot diagnostics unavailable\n' >> "$work/boot.diagnostics.log"
 [[ "$boot_rc" == 0 ]] || exit "$boot_rc"
 if [[ -n "${native_cli_coverage_dir:-}" ]]; then
-  mkdir "$work/native-cli"
-  cp -a "$native_cli_coverage_dir/bin" "$work/native-cli/bin"
-  cp "$native_cli_coverage_dir/native-cli-manifest.json" "$work/native-cli/native-cli-manifest.json"
-  cp "$here/native-cli-coverage.py" "$work/native-cli/native-cli-coverage.py"
   cat > "$work/native-coverage.sh" <<'NATIVE_COVERAGE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -992,7 +1000,6 @@ set -euo pipefail
 test "$(id -u)" = 0
 test "$(. /etc/os-release; printf %s "$ID")" = arch
 test "$(cat /proc/1/comm)" = systemd
-pacman -Syu --noconfirm --needed python sudo bubblewrap fakeroot debugedit git make jq diffutils gnupg openssl iproute2 util-linux
 chage -E -1 nobody
 install -d -m 1777 /profiles
 install -d -m 755 /evidence /omg-extra-bin

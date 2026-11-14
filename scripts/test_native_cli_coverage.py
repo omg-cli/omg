@@ -24,6 +24,41 @@ SPEC.loader.exec_module(PRODUCER)
 
 
 class HostedProducer(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Native cloud-init preparation requires POSIX Bash')
+    def test_native_dependencies_are_queued_before_the_existing_boot_reboot(self):
+        driver = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
+        bootstrap = driver[driver.index('cp "$here/qemu-boot-budget.sh"'):driver.index('cat > "$work/boot.sh"')]
+        boot = driver.split("<<'BOOT'\n", 1)[1].split('\nBOOT\n', 1)[0]
+        seed = boot[boot.index('{\n  # Guest identity'):boot.index('\nchmod 600 user-data')]
+        seed = seed.replace('/work/native-cli', '"$work/native-cli"')
+        for native in (False, True):
+            with self.subTest(native=native), tempfile.TemporaryDirectory() as directory:
+                owner = Path(directory)
+                inputs = owner / 'inputs'
+                (inputs / 'bin').mkdir(parents=True)
+                (inputs / 'native-cli-manifest.json').write_text('{}\n')
+                (owner / 'client-key.pub').write_text('ssh-ed25519 fixture-client\n')
+                (owner / 'guest-host-key').write_text('fixture-private-key\n')
+                (owner / 'guest-host-key.pub').write_text('ssh-ed25519 fixture-host\n')
+                prefix = 'set -euo pipefail\nwork=$PWD\nhere=$PRODUCER_DIRECTORY\nnative_cli_coverage_dir=$NATIVE_INPUTS\n'
+                result = subprocess.run([BASH, '-c', prefix + bootstrap + seed], cwd=owner,
+                                        env=dict(os.environ, PRODUCER_DIRECTORY=str(ROOT / 'scripts'),
+                                                 NATIVE_INPUTS=str(inputs) if native else ''),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                document = (owner / 'user-data').read_text()
+                if not native:
+                    self.assertNotIn('\nruncmd:\n', document)
+                    continue
+                self.assertIn('\nruncmd:\n', document,
+                              'Native dependency upgrades must finish during cloud-init before the existing reboot')
+                commands = [json.loads(line.strip()[2:]) for line in document.split('\nruncmd:\n', 1)[1].splitlines()
+                            if line.strip().startswith('- ')]
+                self.assertEqual(commands, [['pacman', '-Syu', '--noconfirm', '--needed',
+                                            'python', 'sudo', 'bubblewrap', 'fakeroot', 'debugedit',
+                                            'git', 'make', 'jq', 'diffutils', 'gnupg', 'openssl',
+                                            'iproute2', 'util-linux']])
+
     @unittest.skipUnless(sys.platform == 'linux', 'Native QMP identity requires Linux peer credentials')
     def test_poweroff_ssh_disconnect_preserves_producer_status_after_observed_guest_shutdown(self):
         import threading
