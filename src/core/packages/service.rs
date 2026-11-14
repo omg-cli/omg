@@ -80,15 +80,7 @@ impl PackageService {
         } else if repository.is_empty() {
             SecurityOrigin::Unknown
         } else if self.backend.name() == "pacman" {
-            if self.policy.arch_advisory_repositories.contains(repository) {
-                SecurityOrigin::ArchRepository {
-                    repository: repository.to_owned(),
-                }
-            } else {
-                SecurityOrigin::OtherRepository {
-                    repository: repository.to_owned(),
-                }
-            }
+            self.policy.arch_repository_origin(repository)
         } else {
             SecurityOrigin::DistributionPackage
         }

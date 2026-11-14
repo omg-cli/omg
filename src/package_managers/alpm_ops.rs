@@ -2000,19 +2000,14 @@ fn prepared_repository_origin(
     policy: &crate::core::security::SecurityPolicy,
 ) -> Result<super::types::SecurityOrigin> {
     use crate::core::security::policy::AdvisoryRequirement;
-    if policy.arch_advisory_repositories.contains(repository) {
-        return Ok(super::types::SecurityOrigin::ArchRepository {
-            repository: repository.to_owned(),
-        });
-    }
+    let origin = policy.arch_repository_origin(repository);
     anyhow::ensure!(
-        policy.advisory_requirement != AdvisoryRequirement::FreshSnapshot,
+        matches!(origin, super::types::SecurityOrigin::ArchRepository { .. })
+            || policy.advisory_requirement != AdvisoryRequirement::FreshSnapshot,
         "FreshSnapshot has no declared Arch advisory coordinates for repository '{}'; configure arch_advisory_repositories or use Optional/Review deliberately",
         crate::cli::style::sanitize_terminal_text(repository)
     );
-    Ok(super::types::SecurityOrigin::OtherRepository {
-        repository: repository.to_owned(),
-    })
+    Ok(origin)
 }
 
 fn prepared_advisory_packages(
@@ -3032,6 +3027,26 @@ mod tests {
             nix::libc::SIG_IGN
         );
         super::admission_signal_action(nix::libc::SIGTERM, Some(&default))?;
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_repository_without_coordinates_does_not_gain_verified_grade() -> anyhow::Result<()>
+    {
+        use crate::core::security::policy::{AdvisoryRequirement, SecurityGrade, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+        let mut policy = SecurityPolicy {
+            minimum_grade: SecurityGrade::Verified,
+            ..SecurityPolicy::default()
+        };
+        for requirement in [AdvisoryRequirement::Optional, AdvisoryRequirement::Review] {
+            policy.advisory_requirement = requirement;
+            let origin = super::prepared_repository_origin("", &policy)?;
+            assert_eq!(origin, SecurityOrigin::Unknown);
+            assert!(policy.check_source("fixture", &origin, None).is_err());
+        }
+        policy.advisory_requirement = AdvisoryRequirement::FreshSnapshot;
+        assert!(super::prepared_repository_origin("", &policy).is_err());
         Ok(())
     }
 

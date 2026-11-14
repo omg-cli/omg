@@ -81,17 +81,7 @@ pub async fn install(packages: &[String], yes: bool, replacement_hops: u32) -> R
                 &vulnerability_scanner,
                 pkg,
                 &info.version,
-                if info.repo.is_empty() {
-                    crate::package_managers::types::SecurityOrigin::Unknown
-                } else if policy.arch_advisory_repositories.contains(&info.repo) {
-                    crate::package_managers::types::SecurityOrigin::ArchRepository {
-                        repository: info.repo.clone(),
-                    }
-                } else {
-                    crate::package_managers::types::SecurityOrigin::OtherRepository {
-                        repository: info.repo.clone(),
-                    }
-                },
+                policy.arch_repository_origin(&info.repo),
                 crate::core::security::policy::combined_license_expression(
                     info.licenses.iter().map(String::as_str),
                 )

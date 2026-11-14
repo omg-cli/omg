@@ -332,6 +332,21 @@ impl SecurityPolicy {
     }
 
     #[must_use]
+    pub(crate) fn arch_repository_origin(&self, repository: &str) -> SecurityOrigin {
+        match repository {
+            "" => SecurityOrigin::Unknown,
+            repository if self.arch_advisory_repositories.contains(repository) => {
+                SecurityOrigin::ArchRepository {
+                    repository: repository.to_owned(),
+                }
+            }
+            repository => SecurityOrigin::OtherRepository {
+                repository: repository.to_owned(),
+            },
+        }
+    }
+
+    #[must_use]
     pub fn source_grade(origin: &crate::package_managers::types::SecurityOrigin) -> SecurityGrade {
         use crate::package_managers::types::SecurityOrigin;
         match origin {
@@ -1561,6 +1576,46 @@ mod tests {
         assert!(SecurityGrade::Locked > SecurityGrade::Verified);
         assert!(SecurityGrade::Verified > SecurityGrade::Community);
         assert!(SecurityGrade::Community > SecurityGrade::Risk);
+    }
+
+    #[test]
+    fn arch_repository_origin_uses_exact_declared_coordinates_and_preserves_unknown() {
+        let policy = SecurityPolicy {
+            arch_advisory_repositories: ["core".to_owned()].into(),
+            ..SecurityPolicy::default()
+        };
+        for (repository, expected) in [
+            ("", SecurityOrigin::Unknown),
+            (
+                "core",
+                SecurityOrigin::ArchRepository {
+                    repository: "core".into(),
+                },
+            ),
+            (
+                "Core",
+                SecurityOrigin::OtherRepository {
+                    repository: "Core".into(),
+                },
+            ),
+            (
+                "extra",
+                SecurityOrigin::OtherRepository {
+                    repository: "extra".into(),
+                },
+            ),
+        ] {
+            assert_eq!(policy.arch_repository_origin(repository), expected);
+        }
+        let invalid_empty_scope = SecurityPolicy {
+            arch_advisory_repositories: [String::new()].into(),
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            invalid_empty_scope.arch_repository_origin(""),
+            SecurityOrigin::Unknown
+        );
+        assert!(invalid_empty_scope.validate_advisory_scope().is_err());
     }
 
     #[test]
