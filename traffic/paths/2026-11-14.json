@@ -1,0 +1,65 @@
+{
+  "data": [
+    {
+      "count": 7,
+      "path": "/omg-cli/omg",
+      "title": "Overview",
+      "uniques": 6
+    },
+    {
+      "count": 2,
+      "path": "/omg-cli/omg/actions/workflows/ci.yml",
+      "title": "/actions/workflows/ci.yml",
+      "uniques": 1
+    },
+    {
+      "count": 2,
+      "path": "/omg-cli/omg/issues/450",
+      "title": "/issues/450",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/PyRo1121/omg/blob/main/README.md",
+      "title": "g/blob/main/README.md",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/actions/runs/42920226022",
+      "title": "/actions/runs/42920226022",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/actions/runs/42934882536",
+      "title": "/actions/runs/42934882536",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/blob/main/docs/faq.md",
+      "title": "/blob/main/docs/faq.md",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/blob/main/src/core/telemetry.rs",
+      "title": "/blob/main/src/core/telemetry.rs",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/discussions",
+      "title": "/discussions",
+      "uniques": 1
+    },
+    {
+      "count": 1,
+      "path": "/omg-cli/omg/issues/611",
+      "title": "/issues/611",
+      "uniques": 1
+    }
+  ],
+  "date": "2026-11-14"
+}
