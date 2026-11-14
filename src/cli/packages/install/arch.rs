@@ -1099,6 +1099,52 @@ mod tests {
     }
 
     #[test]
+    fn aur_source_denial_precedes_confirmation_history_and_build() -> Result<()> {
+        const NAME: &str = "cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("policy.toml"), "allow_aur = false\n")?;
+        let data = directory.path().join("data");
+        let cache = directory.path().join("cache");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+            ],
+            || {
+                for yes in [false, true] {
+                    let error = runtime
+                        .block_on(handle_aur_package(aur_package("policy-denied-aur"), yes))
+                        .expect_err("source policy must refuse before confirmation or build");
+                    assert!(
+                        matches!(
+                            error.downcast_ref::<crate::core::security::PolicyError>(),
+                            Some(crate::core::security::PolicyError::AurDisabled { name })
+                                if name == "policy-denied-aur"
+                        ),
+                        "unexpected AUR admission error: {error:#}"
+                    );
+                }
+            },
+        );
+        assert!(
+            !data.exists(),
+            "a denied install must not record a transaction"
+        );
+        assert!(!cache.exists(), "a denied install must not prepare a build");
+        Ok(())
+    }
+
+    #[test]
     fn aur_not_found_classification_is_typed() {
         let not_found = anyhow::Error::new(AurLookupError::NotFound);
         assert!(is_aur_not_found(&not_found));

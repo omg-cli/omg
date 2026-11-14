@@ -356,8 +356,9 @@ git() { printf '%040d\\n' 1; }
         selected = [line.strip() for line in cases.group(1).splitlines() if line.strip()]
         self.assertIn('package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason', selected)
         self.assertIn('package_managers::aur::utils::tests::native_lifecycle_original_user_ownership', selected)
+        self.assertIn('cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build', selected)
         self.assertEqual(len(selected), len(set(selected)))
-        self.assertEqual(len(selected), 24)
+        self.assertEqual(len(selected), 25)
         for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
             name = 'package_managers::arch_install::native_tests::' + test
             self.assertIn(name, selected)

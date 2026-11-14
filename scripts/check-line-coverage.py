@@ -629,6 +629,7 @@ def source_function_prefixes(source, spans, work=None):
             _construct_charge(work, limit - at + 1)
         header = re.match(
             r"([ \t]*(?:(?:pub(?:\([^()]*\))?|async|unsafe|const)\s+)*fn\s+([A-Za-z_]\w*)\s*"
+            r"(?:<\s*'[A-Za-z_]\w*(?:\s*,\s*'[A-Za-z_]\w*)*\s*,?\s*>\s*)?"
             r"\([^(){}]*\))\s*(?:->\s*[^{}]+?)?\{", text[at:limit])
         if (header is None or len(header[0]) > 4096 or names[header[2]] != 1
                 or bisect.bisect_left(modules, offsets[start - 1]) != bisect.bisect_left(modules, offsets[end])
@@ -1601,12 +1602,128 @@ def _construct_inventory(source, work):
     return code, constructs, endings, statements, bodies, statement_hashes
 
 
+@dataclass(frozen=True)
+class RustTraitMethodPath:
+    impl_scope: str
+    namespace: tuple
+    self_type: tuple
+    trait: tuple
+    method: tuple[str, str]
+    crate: tuple[str, str]
+    callbacks: tuple[str, ...]
+
+    @property
+    def parent_scope(self):
+        return self.impl_scope, self.namespace, self.self_type, self.trait
+
+    @property
+    def copy_identity(self):
+        return self.parent_scope, self.method, self.crate
+
+
+@lru_cache(maxsize=4096)
+def trait_method_path(symbol, *, inventory=False):
+    """Decode only non-instantiated ASCII v0 trait methods within one crate.
+
+    Replacement identity omits the defining crate's disambiguator; callback
+    ownership retains it. Backreferences require a complete earlier path.
+    Inventory mode includes suffixes conservatively, never for execution proof.
+    """
+    if type(symbol) is not str or len(symbol) > 4096:
+        return None
+    prefix = re.match(r'_R((?:NC){0,8})NvX', symbol)
+    if prefix is None:
+        return None
+    depth = len(prefix[1]) // 2
+    at = prefix.end(); paths = {}; work = 256; crate = None
+    def disambiguator():
+        nonlocal at
+        match = re.match(r's[0-9A-Za-z]{0,32}_', symbol[at:])
+        if match:
+            at += len(match[0])
+        return match[0] if match else ''
+    def identifier():
+        nonlocal at
+        scope = disambiguator()
+        length = re.match(r'[1-9][0-9]{0,3}', symbol[at:])
+        if length is None:
+            raise ValueError('missing identifier length')
+        size = int(length[0]); at += len(length[0])
+        if size > 1024:
+            raise ValueError('identifier exceeds bound')
+        if symbol[at:at + 1] == '_':
+            at += 1
+        value = symbol[at:at + size]; at += size
+        if len(value) != size or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value) is None:
+            raise ValueError('unsupported identifier')
+        return value, scope
+    def path(depth=0):
+        nonlocal at, work, crate
+        work -= 1
+        if depth > 16 or work < 0 or at >= len(symbol):
+            raise ValueError('path exceeds bound')
+        first = at; tag = symbol[at]; at += 1
+        if tag == 'C':
+            value, scope = identifier()
+            if crate is None:
+                crate = value, scope
+            elif crate != (value, scope):
+                raise ValueError('external crate identity is unsupported')
+            result = ('crate', value)
+        elif tag == 'N' and symbol[at:at + 1] == 't':
+            at += 1
+            parent = path(depth + 1)
+            result = ('type', parent, identifier())
+        elif tag == 'B':
+            encoded = re.match(r'([0-9A-Za-z]{0,4})_', symbol[at:])
+            if encoded is None:
+                raise ValueError('invalid backreference')
+            offset = 0
+            for digit in encoded[1]:
+                offset = offset * 62 + '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'.index(digit)
+            offset = (offset + 1 if encoded[1] else 0) + 2
+            at += len(encoded[0])
+            if offset >= first or offset not in paths:
+                raise ValueError('backreference is not a complete earlier path')
+            result = paths[offset]
+        else:
+            raise ValueError('unsupported nominal path')
+        paths[first] = result
+        return result
+    try:
+        impl_scope = disambiguator()
+        namespace = path(); self_type = path(); trait = path()
+        method, item_scope = identifier()
+        callbacks = []
+        for _ in range(depth):
+            callbacks.append(disambiguator())
+            if symbol[at:at + 1] != '0':
+                return None
+            at += 1
+        if depth and symbol[at:at + 1] == 'B' and path() != ('crate', crate[0]):
+            return None
+        if not inventory and at != len(symbol):
+            return None
+        return RustTraitMethodPath(impl_scope, namespace, self_type, trait,
+                                   (method, item_scope), crate, tuple(callbacks))
+    except ValueError:
+        return None
+
+
+def trait_method_parent(symbol, declaration=None, *, inventory=False):
+    shape = trait_method_path(symbol, inventory=inventory)
+    if (shape is None or not inventory and shape.callbacks
+            or declaration is not None and shape.method[0] != declaration):
+        return None
+    return ('trait:' + repr((*shape.parent_scope, shape.method[1])), 'trait:' + repr(shape.parent_scope))
+
+
 def replacement_raw_parent(symbol, declaration=None):
     if type(symbol) is not str or len(symbol) > 4096:
         return None
     prefix = re.match(r'_RNv((?:Nt){0,16})C(?:s[0-9A-Za-z]{0,32}_)?', symbol)
     if prefix is None:
-        return None
+        return trait_method_parent(symbol, declaration)
     at = prefix.end(); parts = []
     for index in range(len(prefix[1]) // 2 + 2):
         first = at
@@ -1632,6 +1749,67 @@ def replacement_raw_parent(symbol, declaration=None):
     terminal = re.match(r's[0-9A-Za-z]{0,32}_', final)
     scope = ''.join(part[0] for part in parts[:-1])
     return ('_RNv' + prefix[1] + 'C' + scope + (terminal[0] if terminal else ''), scope)
+
+
+def fully_covered_trait_migration(name, old, new, before, after, descriptors, grouped,
+                                 selected, equal_rows, work):
+    """Certify correspondence only when every region in both owner trees is covered."""
+    witnesses = []
+    for counts, descriptor, compiled in zip((before, after), descriptors, grouped):
+        first, last, parents = descriptor['group']
+        _construct_charge(work, last - first + len(compiled[0]) + len(counts))
+        if any(count <= 0 for line, count in counts.items() if first <= line <= last):
+            return None
+        parent_names = {owner['name'] for owner in parents}
+        parent_shapes = [trait_method_path(parent) for parent in parent_names]
+        if any(shape is None or shape.callbacks for shape in parent_shapes):
+            return None
+        parent_paths = {shape.copy_identity for shape in parent_shapes}
+        owners = []; regions = []
+        for owner in compiled[0]:
+            _construct_charge(work, len(owner['name']) + len(owner['regions']))
+            span = min(row[0] for row in owner['regions']), max(row[2] for row in owner['regions'])
+            if span[1] < first or span[0] > last:
+                continue
+            shape = trait_method_path(owner['name'])
+            if (not first <= span[0] <= span[1] <= last
+                    or compiled[2][owner['name']] != 1
+                    or owner['name'] not in parent_names
+                       and (shape is None or not shape.callbacks or shape.copy_identity not in parent_paths)
+                    or type(owner.get('count')) is not int or not 0 < owner['count'] < COUNTER_LIMIT
+                    or any(not 0 < row[4] < COUNTER_LIMIT for row in owner['regions'])):
+                return None
+            owners.append(dict(name=owner['name'], count=owner['count'], range=list(span),
+                regions_sha256=hashlib.sha256(repr(owner['regions']).encode()).hexdigest()))
+            regions.extend(owner['regions'])
+        if not parent_names.issubset({owner['name'] for owner in owners}):
+            return None
+        _construct_charge(work, (last - first + 1) * len(regions))
+        if any(not owner_covers_lines(regions, line, line)
+               for line in counts if first <= line <= last):
+            return None
+        witnesses.append(owners)
+    pairs = {}
+    _construct_charge(work, len(equal_rows) + len(selected))
+    for line, target in equal_rows:
+        if (descriptors[0]['group'][0] <= line <= descriptors[0]['group'][1]
+                and descriptors[1]['group'][0] <= target <= descriptors[1]['group'][1]
+                and line in before and target in after):
+            pairs[line] = target
+    for row in selected:
+        line, target = row['base_line'], row['head_line']
+        if (row.get('residual') and line in before and target in after
+                and old[line - 1] == new[target - 1]):
+            if line in pairs and pairs[line] != target:
+                return None
+            pairs[line] = target
+    if not pairs or len(set(pairs.values())) != len(pairs):
+        return None
+    return pairs, dict(file=name, pairs=[list(pair) for pair in sorted(pairs.items())],
+        fully_covered_trait_owners=witnesses,
+        base_range=list(descriptors[0]['group'][:2]), head_range=list(descriptors[1]['group'][:2]),
+        claim='Every raw region and owner entry is positive on both sides; no deletion or semantic-equivalence claim',
+        summary_credit=[0, 0], mapped_credit=[0, 0])
 
 
 def retained_replacement_obligations(name, old, new, before, after, inventories, grouped,
@@ -1934,7 +2112,11 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     for left_prefix, left in descriptors[0].items():
         for right_prefix, right in descriptors[1].items():
             _construct_charge(work, 1)
-            if left['signature'] != right['signature'] or left['context'] != right['context']:
+            trait_migration = (left_prefix != right_prefix
+                and all(trait_method_parent(owner['name'], descriptor['declaration']) is not None
+                        for descriptor in (left, right) for owner in descriptor['group'][2]))
+            if (left['context'] != right['context'] or left['attributes'] != right['attributes']
+                    or left['signature'] != right['signature'] and not trait_migration):
                 continue
             seeds = []; parent = None
             renamed = left_prefix != right_prefix
@@ -1983,6 +2165,18 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     and groups[1][0] <= row['head_line'] <= groups[1][1]]
         if not selected:
             continue
+        if parent is not None and parent[0].startswith('trait:') and left['signature'] != right['signature']:
+            covered = fully_covered_trait_migration(name, old, new, before, after, (left, right),
+                grouped, selected, equal_rows, work)
+            if covered is not None:
+                mapped, receipt = covered
+                if any(line in pairs and pairs[line] != target for line, target in mapped.items()):
+                    raise ValueError('Ambiguous fully covered trait correspondence')
+                pairs.update(mapped); receipts.append(receipt)
+                proved_functions.add(groups[0][:2])
+                excerpts.extend(('\n'.join(source[group[0] - 1:group[1]]) + '\n').encode()
+                                for source, group in zip((old, new), groups))
+                continue
         mapped = {}; spans = []; needed = set(); failed = False
         for old_row, new_row in seeds:
             needed.add(old_row['digest'])
@@ -3942,7 +4136,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             _construct_charge(construct_work, len(bf))
             for owner in bf:
                 _construct_charge(construct_work, len(owner['name']) + 1)
-                if parent[1] in owner['name'] or not owner['name'].startswith(('_R', '_ZN')):
+                trait_scope = parent[0].startswith('trait:')
+                decoded = trait_method_parent(owner['name'], inventory=True) if trait_scope else None
+                matches = (decoded is not None and decoded[1] == parent[1]) if trait_scope else parent[1] in owner['name']
+                if matches or not owner['name'].startswith(('_R', '_ZN')):
                     _construct_charge(construct_work, len(owner['filenames']))
                     locations.update(base_files.get(path, '<unattributed source>') for path in owner['filenames'])
             parent_file_cache[parent[1]] = locations

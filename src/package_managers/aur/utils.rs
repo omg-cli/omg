@@ -423,7 +423,8 @@ mod tests {
                 assert_eq!(std::fs::metadata(&path)?.uid(), 0);
                 Ok(())
             },
-        )?;
+        )
+        .expect("original-user lifecycle ownership checks must succeed");
 
         let missing = format!(
             "omg-missing-{}",

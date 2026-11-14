@@ -242,6 +242,133 @@ class SourceConstructCapacityTests(unittest.TestCase):
 
 
 class SourceAwareCoverageTests(unittest.TestCase):
+    def test_lifetime_method_prefixes_bind_the_complete_lexical_body(self):
+        source = ["impl Source for Fixture {", "    fn assess<'a>(",
+                  "        &'a self, packages: &'a [Package],", ") -> Result<Value> {",
+                  "        checked();", "    }", "}"]
+        prefixes = coverage.source_function_prefixes(source, [(2, 6)])
+        self.assertEqual(prefixes, {(2, 6): "\n".join(source[1:4]).split(" ->")[0]})
+        for header in ("    fn assess<T>(", "    fn assess<'a: 'b>("):
+            with self.subTest(header=header):
+                self.assertEqual(coverage.source_function_prefixes(
+                    [source[0], header, *source[2:]], [(2, 6)]), {})
+
+    def test_trait_replacement_parents_preserve_impl_type_trait_and_item_scope(self):
+        original = '_RNvXNtNtNtNtNtCs40j12eeWnis_7omg_lib3cli8packages7install4arch5testsNtB2_13FixtureSourceNtNtNtNtBc_4core8security13vulnerability19VulnerabilitySource12scan_package'
+        current = original.replace('s40j12eeWnis_', 'sjVdvAHsNP8N_').replace('12scan_package', '15assess_packages')
+        parent = coverage.replacement_raw_parent(original, 'scan_package')
+        self.assertIsNotNone(parent)
+        self.assertEqual(parent, coverage.replacement_raw_parent(current, 'assess_packages'))
+        for different in (original.replace('13FixtureSource', '13AnotherSource'),
+                          original.replace('19VulnerabilitySource', '19VulnerabilityOther'),
+                          original.replace('_RNvX', '_RNvXs_'),
+                          original.replace('5tests', 's_5tests')):
+            with self.subTest(symbol=different):
+                self.assertNotEqual(parent, coverage.replacement_raw_parent(different, 'scan_package'))
+        for invalid in (original + 'C3foo', original + '.llvm.1',
+                        original.replace('B2_', 'Bz_'), original[:-1],
+                        original.replace('NtNtNtNtBc_', 'NtNtNtNtCs123_7omg_lib')):
+            with self.subTest(symbol=invalid):
+                self.assertIsNone(coverage.replacement_raw_parent(invalid, 'scan_package'))
+
+    def test_trait_closure_paths_rebase_backreferences_and_preserve_crate_copies(self):
+        parent = '_RNvXNtNtNtNtNtCs40j12eeWnis_7omg_lib3cli8packages7install4arch5testsNtB2_13FixtureSourceNtNtNtNtBc_4core8security13vulnerability19VulnerabilitySource12scan_package'
+        path = coverage.trait_method_path(parent)
+        for prefix, self_ref, trait_ref, suffix, depth in (
+                ('_RNC', 'B4_', 'Be_', '0Be_', 1),
+                ('_RNCNC', 'B6_', 'Bg_', '00Bg_', 2)):
+            raw = prefix + parent[2:].replace('B2_', self_ref).replace('Bc_', trait_ref) + suffix
+            child = coverage.trait_method_path(raw)
+            self.assertIsNotNone(child)
+            self.assertEqual(child.copy_identity, path.copy_identity)
+            self.assertEqual(child.callbacks, ('',) * depth)
+            other = coverage.trait_method_path(raw.replace('s40j12eeWnis_', 's99_'))
+            self.assertNotEqual(other.copy_identity, path.copy_identity)
+            self.assertIsNone(coverage.trait_method_parent(raw))
+            self.assertIsNone(coverage.trait_method_path(raw.replace(self_ref, 'B2_')))
+
+    def migrated_trait_compare(self, mutation=None, callback=False):
+        old = b"impl Source for FixtureSource {\n    fn scan_package<'a>(\n        &'a self,\n        name: &'a str,\n    ) -> Result<Value> {\n        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n        old_step();\n    }\n}\n"
+        if callback:
+            old = old.replace(b'        old_step();', b'        Box::pin(async move {\n            old_step();\n        })')
+        new = old.replace(b'scan_package', b'assess_packages').replace(
+            b"name: &'a str", b"packages: &'a [Package]").replace(b'Result<Value>', b'Result<Assessment>').replace(b'old_step()', b'new_step()')
+        original = '_RNvXNtNtNtNtNtCs40j12eeWnis_7omg_lib3cli8packages7install4arch5testsNtB2_13FixtureSourceNtNtNtNtBc_4core8security13vulnerability19VulnerabilitySource12scan_package'
+        current = original.replace('s40j12eeWnis_', 'sjVdvAHsNP8N_').replace('12scan_package', '15assess_packages')
+        def owners(base, head):
+            for document, source, symbol in ((base, old, original), (head, new, current)):
+                lines = source.decode().splitlines()
+                end = len(lines) - 1
+                document['data'][0]['functions'] = [dict(name=symbol, count=1,
+                    filenames=['/src/example.rs'], regions=[
+                        [2, 5, 5, len(lines[4]), 1, 0, 0, 0],
+                        *[[line, 9 if line < end else 5, line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
+                          for line in ([6, 7, end] if callback else range(6, end + 1))]])]
+                if callback:
+                    rebased = symbol[2:].replace('B2_', 'B4_').replace('Bc_', 'Be_')
+                    document['data'][0]['functions'].append(dict(name='_RNC' + rebased + '0Be_',
+                        count=1, filenames=['/src/example.rs'], regions=[
+                            [7, lines[6].index('{') + 1, 9, 10, 1, 0, 0, 0],
+                            [8, 13, 8, len(lines[7]) + 1, 1, 0, 0, 0]]))
+            if mutation:
+                mutation(base, head)
+        return self.compare(before=[(line, 1) for line in range(2, len(old.splitlines()))],
+            after=[(line, 1) for line in range(2, len(new.splitlines()))], mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_migrated_trait_retains_seed_and_header_without_deletion_credit(self):
+        receipt = self.migrated_trait_compare()
+        self.assertEqual([receipt[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        self.assertTrue(receipt['retained_replacement_obligations'])
+
+    def test_fully_covered_trait_migration_keeps_complete_async_owner_inventory(self):
+        receipt = self.migrated_trait_compare(callback=True)
+        self.assertEqual([receipt[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        proofs = receipt['retained_replacement_obligations']
+        self.assertTrue(any(row.get('fully_covered_trait_owners') for row in proofs))
+
+    def test_trait_async_proof_refuses_incomplete_cold_or_foreign_owner_trees(self):
+        def mutate(base, head, mode):
+            owners = head['data'][0]['functions']
+            child = owners[1]
+            if mode == 'cold-region':
+                child['regions'][1][4] = 0
+            elif mode == 'cold-entry':
+                child['count'] = 0
+            elif mode == 'missing-child':
+                owners.pop()
+            elif mode == 'duplicate-child':
+                owners.append(copy.deepcopy(child))
+            elif mode == 'foreign-copy':
+                child['name'] = child['name'].replace('sjVdvAHsNP8N_', 's99_')
+            elif mode == 'foreign-method':
+                child['name'] = child['name'].replace('15assess_packages', '15foreign_methodx')
+            elif mode == 'crossing-boundary':
+                child['regions'][0][2:4] = [11, 2]
+            elif mode == 'unrebased-reference':
+                child['name'] = child['name'].replace('B4_', 'B2_')
+        for mode in ('cold-region', 'cold-entry', 'missing-child', 'duplicate-child',
+                     'foreign-copy', 'foreign-method', 'crossing-boundary', 'unrebased-reference'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.migrated_trait_compare(lambda base, head: mutate(base, head, mode), callback=True)
+
+    def test_migrated_trait_refuses_changed_identity_and_cold_retained_work(self):
+        def mutate(base, head, mode):
+            owner = head['data'][0]['functions'][0]
+            if mode == 'type':
+                owner['name'] = owner['name'].replace('13FixtureSource', '13AnotherSource')
+            elif mode == 'impl':
+                owner['name'] = owner['name'].replace('_RNvX', '_RNvXs_')
+            elif mode == 'seed':
+                owner['regions'][1][4] = 0
+            elif mode == 'header':
+                owner['regions'][0][4] = 0
+        for mode in ('type', 'impl', 'seed', 'header'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.migrated_trait_compare(lambda base, head: mutate(base, head, mode))
+
     def changed_callback_compare(self, mutation=None, context_change=False, joint=False, callback_form='||',
                                  header_end='brace'):
         def function(name, operation, setup='setup'):

@@ -353,6 +353,7 @@ jobs:
                 package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff
                 package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason
                 package_managers::aur::utils::tests::native_lifecycle_original_user_ownership
+                cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build
                 core::usage::tests::elevated_state_roundtrip_preserves_caller_files
               )
               printf "%s\n" "${cases[@]}" > /evidence/expected-tests.txt
