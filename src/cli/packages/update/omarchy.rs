@@ -3258,6 +3258,8 @@ mod tests {
         );
         owns_running_modules.set(true);
         assert_eq!(reboot_reason_at(&paths, owns_modules)?, None);
+        std::os::unix::fs::symlink(owner.path().join("exited-process"), processes.join("124"))?;
+        assert_eq!(reboot_reason_at(&paths, owns_modules)?, None);
         let marker = home.join(".local/state/omarchy/reboot-required");
         std::fs::create_dir_all(marker.parent().expect("marker directory"))?;
         std::fs::write(&marker, "reboot requested\n")?;
