@@ -880,23 +880,20 @@ fn transport_descriptor(value: &str) -> Result<i32> {
     Ok(raw)
 }
 
-/// Restrict update transport inheritance before CLI initialization can launch helpers.
-#[doc(hidden)]
-pub fn contain_inherited_transport(args: &[String]) -> Result<()> {
-    use clap::Parser;
-    let lock = std::env::var_os(LOCK_FD);
-    let log = std::env::var_os(LOG_FD);
-    if lock.is_none() && log.is_none() {
-        return Ok(());
-    }
-    if args.get(1).map(String::as_str) != Some("update")
-        && !crate::cli::Cli::try_parse_from(args)
-            .is_ok_and(|cli| matches!(cli.command, crate::cli::Commands::Update { .. }))
-    {
-        return Ok(());
-    }
-    let (Some(lock), Some(log)) = (lock, log) else {
-        anyhow::bail!("Incomplete Omarchy update transport");
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InheritedTransport {
+    lock: i32,
+    log: i32,
+}
+
+fn inherited_transport(
+    lock: Option<std::ffi::OsString>,
+    log: Option<std::ffi::OsString>,
+) -> Result<Option<InheritedTransport>> {
+    let (lock, log) = match (lock, log) {
+        (None, None) => return Ok(None),
+        (Some(lock), Some(log)) => (lock, log),
+        _ => anyhow::bail!("Incomplete Omarchy update transport"),
     };
     let lock = transport_descriptor(
         lock.to_str()
@@ -907,13 +904,29 @@ pub fn contain_inherited_transport(args: &[String]) -> Result<()> {
             .context("Invalid Omarchy log descriptor encoding")?,
     )?;
     anyhow::ensure!(lock != log, "Omarchy transport descriptors overlap");
-    set_descriptor_inheritance(lock, false).context("Cannot contain inherited Omarchy lock")?;
-    set_descriptor_inheritance(log, false).context("Cannot contain inherited Omarchy log")?;
+    Ok(Some(InheritedTransport { lock, log }))
+}
+
+/// Restrict update transport inheritance before CLI initialization can launch helpers.
+#[doc(hidden)]
+pub fn contain_inherited_transport(args: &[String]) -> Result<()> {
+    use clap::Parser;
+    let lock = std::env::var_os(LOCK_FD);
+    let log = std::env::var_os(LOG_FD);
+    let update = args.get(1).map(String::as_str) == Some("update")
+        || ((lock.is_some() || log.is_some())
+            && crate::cli::Cli::try_parse_from(args)
+                .is_ok_and(|cli| matches!(cli.command, crate::cli::Commands::Update { .. })));
+    if update && let Some(transport) = inherited_transport(lock, log)? {
+        set_descriptor_inheritance(transport.lock, false)
+            .context("Cannot contain inherited Omarchy lock")?;
+        set_descriptor_inheritance(transport.log, false)
+            .context("Cannot contain inherited Omarchy log")?;
+    }
     Ok(())
 }
 
-fn duplicate_inherited(value: &str, expected: &Path) -> Result<File> {
-    let raw = transport_descriptor(value)?;
+fn duplicate_inherited(raw: i32, expected: &Path) -> Result<File> {
     let proc_path = PathBuf::from(format!("/proc/self/fd/{raw}"));
     let metadata =
         std::fs::metadata(&proc_path).context("Omarchy transport descriptor is closed")?;
@@ -940,8 +953,8 @@ fn duplicate_inherited(value: &str, expected: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn inherited_lock(value: &str, path: &Path) -> Result<File> {
-    let inherited = duplicate_inherited(value, path)?;
+fn inherited_lock(raw: i32, path: &Path) -> Result<File> {
+    let inherited = duplicate_inherited(raw, path)?;
     let independent = open_owned_file(path)?;
     match independent.try_lock() {
         Err(std::fs::TryLockError::WouldBlock) => {}
@@ -1358,12 +1371,11 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
         return Ok(false);
     };
     ensure_mutation_context()?;
+    let transport = inherited_transport(std::env::var_os(LOCK_FD), std::env::var_os(LOG_FD))?;
     let runtime = OmarchyRuntime::discover()?;
     runtime.check_pending_migrations()?;
-    let lock_transport = std::env::var(LOCK_FD).ok();
-    let inherited_log = std::env::var(LOG_FD).ok();
-    match (lock_transport, inherited_log) {
-        (None, None) => {
+    match transport {
+        None => {
             runtime.notice_normalization();
             let lock = open_owned_file(&lock_path())?;
             lock.try_lock()
@@ -1385,7 +1397,7 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
             }
             execute_logged(&executable, &arguments, &lock, &log, &runtime).await?;
         }
-        (Some(lock_descriptor), Some(log_descriptor)) => {
+        Some(transport) => {
             anyhow::ensure!(
                 std::env::var_os("OMARCHY_PATH")
                     .is_some_and(|path| Path::new(&path) == runtime.root)
@@ -1393,12 +1405,8 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
                         .is_some_and(|path| Path::new(&path) == runtime.migration_state),
                 "Omarchy runtime changed during coordinator handoff"
             );
-            anyhow::ensure!(
-                lock_descriptor != log_descriptor,
-                "Omarchy transport descriptors overlap"
-            );
-            let lock = inherited_lock(&lock_descriptor, &lock_path())?;
-            let log = duplicate_inherited(&log_descriptor, Path::new(LOG_PATH))?;
+            let lock = inherited_lock(transport.lock, &lock_path())?;
+            let log = duplicate_inherited(transport.log, Path::new(LOG_PATH))?;
             use std::io::IsTerminal;
             anyhow::ensure!(
                 std::io::stdin().is_terminal()
@@ -1418,7 +1426,6 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
             finish_cleanup(result, cleanup)?;
             drop((lock, log));
         }
-        _ => anyhow::bail!("Incomplete Omarchy update transport"),
     }
     Ok(true)
 }
@@ -2626,15 +2633,50 @@ mod tests {
     }
 
     #[test]
+    fn inherited_transport_has_one_validated_pair_or_no_handoff() -> Result<()> {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        assert_eq!(inherited_transport(None, None)?, None);
+        assert_eq!(
+            inherited_transport(Some("3".into()), Some("4".into()))?,
+            Some(InheritedTransport { lock: 3, log: 4 })
+        );
+        for (lock, log) in [
+            (Some("3"), None),
+            (None, Some("4")),
+            (Some("3"), Some("03")),
+            (Some("garbage"), Some("4")),
+            (Some("3"), Some("2147483648")),
+            (Some("0"), Some("4")),
+            (Some("3"), Some("-1")),
+        ] {
+            assert!(
+                inherited_transport(lock.map(OsString::from), log.map(OsString::from)).is_err()
+            );
+        }
+        for (lock, log) in [
+            (OsString::from_vec(vec![0xff]), "4".into()),
+            ("3".into(), OsString::from_vec(vec![0xff])),
+            (
+                OsString::from_vec(vec![0xff]),
+                OsString::from_vec(vec![0xff]),
+            ),
+        ] {
+            assert!(inherited_transport(Some(lock), Some(log)).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn inherited_descriptors_are_bound_to_their_owned_inodes() {
         let owner = private_directory();
         let path = owner.path().join("handoff");
         let file = open_owned_file(&path).expect("owned handoff");
-        let raw = file.as_raw_fd().to_string();
-        assert!(inherited_lock(&raw, &path).is_err());
+        let raw = file.as_raw_fd();
+        assert!(inherited_lock(raw, &path).is_err());
         file.try_lock().expect("original inherited lease");
-        inherited_lock(&raw, &path).expect("verified existing lock lease");
-        let duplicate = duplicate_inherited(&raw, &path).expect("matching inherited inode");
+        inherited_lock(raw, &path).expect("verified existing lock lease");
+        let duplicate = duplicate_inherited(raw, &path).expect("matching inherited inode");
         duplicate
             .try_lock()
             .expect("duplicated open description owns the same lock");
@@ -2645,11 +2687,16 @@ mod tests {
             .contains(FdFlag::FD_CLOEXEC)
         );
         for invalid in ["garbage", "-1", "0", "1", "2", "2147483647"] {
-            assert!(duplicate_inherited(invalid, &path).is_err(), "{invalid}");
+            assert!(
+                transport_descriptor(invalid)
+                    .and_then(|raw| duplicate_inherited(raw, &path))
+                    .is_err(),
+                "{invalid}"
+            );
         }
         let different = owner.path().join("different");
         drop(open_owned_file(&different).expect("different inode"));
-        assert!(duplicate_inherited(&raw, &different).is_err());
+        assert!(duplicate_inherited(raw, &different).is_err());
     }
 
     #[tokio::test]
@@ -2936,6 +2983,66 @@ mod tests {
             .write_all(&vec![b'x'; 1024 * 1024])
             .expect("cleanup output drains before coordinator reaping");
         std::fs::write(root.join("complete"), b"cleaned").expect("output cleanup completed");
+    }
+
+    #[tokio::test]
+    async fn terminal_read_failure_reaps_owned_coordinator_before_returning() -> Result<()> {
+        use std::os::fd::OwnedFd;
+        use tokio::io::AsyncReadExt;
+
+        let owner = private_directory();
+        let listener = std::os::unix::net::UnixListener::bind(owner.path().join("read-error"))?;
+        listener.set_nonblocking(true)?;
+        let peer = std::os::unix::net::UnixStream::connect(owner.path().join("read-error"))?;
+        peer.set_nonblocking(true)?;
+        let mut peer = tokio::net::UnixStream::from_std(peer)?;
+        let descriptor: OwnedFd = listener.into();
+        let master = register_file(File::from(descriptor))?;
+        let ready = owner.path().join("ready");
+        let release = owner.path().join("release");
+        let complete = owner.path().join("complete");
+        let shell = crate::core::privilege::root_controlled_program_path("sh")?;
+        let mut child = Command::new(shell)
+            .args(["-c", "trap '' TERM; printf ready > \"$1\"; while test ! -f \"$2\"; do sleep 0.01; done; printf cleaned > \"$3\"", "fixture"])
+            .arg(&ready).arg(&release).arg(&complete)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .process_group(0).kill_on_drop(true).spawn()?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.is_file() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("owned coordinator must register its signal handling")?;
+        let finish = tokio::spawn(async move {
+            let reset = peer
+                .read(&mut [0_u8; 1])
+                .await
+                .expect_err("failed terminal closes before reaping");
+            assert_eq!(reset.kind(), std::io::ErrorKind::ConnectionReset);
+            std::fs::write(release, b"release")
+        });
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            drain_interrupted_coordinator(&mut child, master),
+        )
+        .await
+        .context("terminal read failure must still reap the owned child")?
+        .expect_err("listening socket cannot serve as terminal input");
+        finish.await??;
+        assert!(format!("{error:#}").contains("Cannot drain interrupted Omarchy terminal"));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(nix::libc::EINVAL)
+        );
+        assert_eq!(std::fs::read(complete)?, b"cleaned");
+        assert!(
+            child.id().is_none(),
+            "the owned coordinator has been reaped"
+        );
+        Ok(())
     }
 
     #[tokio::test]

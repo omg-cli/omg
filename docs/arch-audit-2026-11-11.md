@@ -1368,3 +1368,67 @@ is unchanged. Published head f663af7e's instrumented producer passed, but its
 executed hosted comparison still rejects incomplete Omarchy file coverage:
 job 132255381521, run 43530896096. No coverage, isolation, profile, deadline or
 retry-acceptance requirement was relaxed.
+
+
+The next defensive batch consolidates Omarchy transport validation and migrates
+sync package-info fields onto the Rust ALPM readers. A new real I/O-failure
+control confirmed the existing terminal drain path closes a failed reader,
+waits for its owned coordinator to finish cleanup and reaps it before returning
+the original EINVAL. This control already passed before refactoring; it is not
+claimed as a newly repaired runtime defect. The validated descriptor-pair model
+now serves startup and the coordinator, replacing duplicate parsing and the
+coordinator's lossy `.ok()` environment conversion. Partial, overlapping,
+standard-stream and non-UTF-8 handoffs fail before runtime discovery. The final
+startup selection preserves the no-transport fast path while allowing the
+absent canonical-update case to exercise the shared optional state.
+
+Before changing the sync readers, regressions reproduced three C-binding
+panics on description bytes: `Utf8Error { valid_up_to: 8, error_len: Some(1) }`.
+A negative archive size was accepted as a plausible package with download size
+zero. A held native handle returned version `1-1` after its source changed to
+`2-1`, retained its earlier validation result after an invalid signature was
+introduced, and retained a missing-package result after local installation.
+The raw Rust reader also blocked opening a FIFO before it could inspect type.
+All these failures are retained in the native29 red receipts and logs.
+
+All three sync-info paths now obtain metadata from the existing Rust parser,
+including the async worker's caller-supplied handle scope. Current local
+installed state is read from that handle's explicit database path through the
+same Rust source reader used by direct installed-info. A fresh native verifier
+copies the caller's root, DB path, keyring and signature policy; each Search
+repository is authenticated before its source is decoded. Priority, signature
+requirements and native error causes remain required, and source epochs are
+rechecked. User-owned derived caches do not supply these info records. Native
+signature validation, transaction services and raw security inventory remain
+C-backed; no general package-manager executable wrapper was introduced.
+
+The migration's compatibility control first proved native libalpm could read
+a bzip2 catalog that the Rust path rejected as unsupported. Optional Arch-only
+`bzip2` 0.6.1 with `libbz2-rs-sys` 0.2.6 now preserves that format using the Rust
+allocator backend; locked metadata contains no `bzip2-sys` C implementation.
+The [published crate manifest](https://docs.rs/crate/bzip2/0.6.1/source/Cargo.toml.orig)
+documents that backend selection. The historical
+[RUSTSEC-2023-0004](https://rustsec.org/advisories/RUSTSEC-2023-0004.html)
+DoS advisory is patched from 0.4.4; this dependency selection is not a claim that
+all unknown vulnerabilities are absent. The lockfile adds only these two
+packages and retains the existing compatible Windows dependency edge.
+
+A separate corruption test showed a valid tar terminator hid a damaged gzip
+checksum. Database readers now finish the bounded decoded stream before
+returning records; tests also cover truncated and concatenated bzip2 members.
+An additional regression proved persisted v3 metadata could bypass that new
+footer check for unchanged source identities. Sync caches now use v4; legacy
+files are not reused, and invalidation includes current and legacy namespaces.
+Valid descriptor schemas, archive limits and native signature policy remain
+required. No fallback admits malformed metadata.
+
+The broad normal check passed 2428 library tests (13 existing ignores), all
+32 CLI unit tests, default/minimal/Debian-pure all-target Clippy with warnings
+denied and normal binaries. After the final startup control-flow simplification,
+all 63 Omarchy tests, applicable Clippy and normal binaries passed again; the
+receipt proves every other Rust/Cargo input matches the preceding broad run.
+Fresh instrumented, optimized query-cost and native guest verification of this
+consolidated runtime remain pending before publication. Published cdf08b68 has
+46 successful checks and one executed failure: the strict added-file coverage
+comparison (job 132268029539, run 43534884430). That gate remains unresolved;
+none of its source, counter, exclusion or acceptance rules changed.

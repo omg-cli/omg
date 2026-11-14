@@ -1,6 +1,6 @@
 //! Direct libalpm operations.
 //!
-//! Pure libalpm queries and transactions without spawning a pacman subprocess.
+//! Rust metadata queries with native signature validation and transactions.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -210,7 +210,7 @@ pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> Result<Vec<UpdateInfo>> {
     Ok(updates)
 }
 
-/// Get package info from sync DBs - INSTANT (<1ms)
+/// Read sync package-info under the configured native repository policy.
 pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
     if paths::test_mode() {
         let manager = crate::package_managers::get_package_manager()?;
@@ -237,50 +237,65 @@ pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
         return Ok(None);
     }
 
-    crate::package_managers::alpm_direct::with_handle(|alpm| get_pkg_info_from_db(alpm, name))
+    let epoch = super::pacman_db::SyncDbEpoch::observe()?;
+    let package =
+        crate::package_managers::alpm_direct::with_handle(|alpm| get_pkg_info_from_db(alpm, name))?;
+    anyhow::ensure!(
+        epoch == super::pacman_db::SyncDbEpoch::observe()?,
+        "Package databases or configuration changed while querying; retry the operation"
+    );
+    Ok(package)
 }
 
-/// Get package info using an existing ALPM handle - ULTRA FAST
+/// Read Rust metadata within a caller-supplied native handle's repository scope.
 pub fn get_pkg_info_from_db(alpm: &alpm::Alpm, name: &str) -> Result<Option<PackageInfo>> {
+    let sync_dir = std::path::Path::new(alpm.dbpath()).join("sync");
+    let epoch = super::pacman_db::SyncDbEpoch::from_sync_dir(&sync_dir)?;
+    // A fresh verifier binds current source reads to current signature checks,
+    // rather than trusting package/validation caches in the caller's handle.
+    let mut verifier = alpm::Alpm::new(alpm.root(), alpm.dbpath())
+        .context("Failed to initialize scoped repository signature verification")?;
+    verifier.set_default_siglevel(alpm.default_siglevel())?;
+    if let Some(gpgdir) = alpm.gpgdir() {
+        verifier.set_gpgdir(gpgdir)?;
+    }
+    let mut selected = None;
     for db in alpm.syncdbs() {
         if !db.usage()?.contains(alpm::Usage::SEARCH) {
             continue;
         }
-        validate_sync_database(alpm, db)?;
-        if let Ok(pkg) = db.pkg(name) {
-            // A version that fails the strict parser must not compare as a
-            // fabricated 0 (ARCH-R14); skip the entry visibly.
-            let Some(version) = crate::package_managers::parse_version(pkg.version()) else {
-                tracing::warn!(
-                    "Ignoring sync package '{name}' with unparseable version '{}'",
-                    pkg.version()
-                );
-                return Ok(None);
-            };
-            return Ok(Some(PackageInfo {
-                name: pkg.name().to_string(),
-                version,
-                description: pkg.desc().unwrap_or("").to_string(),
-                url: pkg.url().map(std::string::ToString::to_string),
-                // libalpm's size fields are i64; negative values from a
-                // corrupt database must not wrap into huge u64 values.
-                // https://doc.rust-lang.org/reference/expressions/operator-expr.html#numeric-cast
-                size: u64::try_from(pkg.isize()).unwrap_or(0),
-                install_size: Some(pkg.isize()),
-                download_size: Some(u64::try_from(pkg.size()).unwrap_or(0)),
-                repo: db.name().to_string(),
-                depends: pkg.depends().iter().map(ToString::to_string).collect(),
-                licenses: pkg
-                    .licenses()
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect(),
-                installed: alpm.localdb().pkg(pkg.name()).is_ok(),
-            }));
+        let verified = verifier.register_syncdb(db.name(), db.siglevel())?;
+        validate_sync_database(&verifier, verified)?;
+        let path = sync_dir.join(format!("{}.db", db.name()));
+        if let Some(pkg) = super::pacman_db::parse_sync_db(&path, db.name())?.remove(name) {
+            let installed = super::pacman_db::read_local_package_at(
+                &std::path::Path::new(alpm.dbpath()).join("local"),
+                &pkg.name,
+            )?
+            .is_some();
+            let install_size = i64::try_from(pkg.isize)
+                .context("Repository package size exceeds the supported range")?;
+            selected = Some(PackageInfo {
+                name: pkg.name,
+                version: pkg.version,
+                description: pkg.desc,
+                url: (!pkg.url.is_empty()).then_some(pkg.url),
+                size: pkg.isize,
+                install_size: Some(install_size),
+                download_size: Some(pkg.csize),
+                repo: pkg.repo,
+                depends: pkg.depends,
+                licenses: pkg.licenses,
+                installed,
+            });
+            break;
         }
     }
-
-    Ok(None)
+    anyhow::ensure!(
+        epoch == super::pacman_db::SyncDbEpoch::from_sync_dir(&sync_dir)?,
+        "Repository sources changed while querying; retry the operation"
+    );
+    Ok(selected)
 }
 
 /// Extract the package name, full version, and architecture from a cache filename.
@@ -3532,6 +3547,84 @@ mod tests {
             updates.is_empty(),
             "updates must match native sysupgrade instead of selecting the lower repository: {updates:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_info_reads_current_metadata_after_native_cache_is_primed() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync("core", &[("helper", "1-1", "")])?;
+        let alpm = fixture.open();
+        alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+        assert_eq!(
+            super::get_pkg_info_from_db(&alpm, "helper")?
+                .unwrap()
+                .version
+                .to_string(),
+            "1-1"
+        );
+        fixture.write_sync("core", &[("helper", "2-1", "")])?;
+        assert_eq!(
+            super::get_pkg_info_from_db(&alpm, "helper")?
+                .unwrap()
+                .version
+                .to_string(),
+            "2-1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_info_reads_current_installed_state_after_native_cache_is_primed() -> anyhow::Result<()>
+    {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync("core", &[("helper", "2-1", "")])?;
+        let alpm = fixture.open();
+        alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+        assert!(
+            !super::get_pkg_info_from_db(&alpm, "helper")?
+                .unwrap()
+                .installed
+        );
+        fixture.write_local("helper", "1-1")?;
+        assert!(
+            super::get_pkg_info_from_db(&alpm, "helper")?
+                .unwrap()
+                .installed,
+            "newly installed package must not retain an earlier missing-package cache result"
+        );
+        std::fs::remove_dir_all(fixture.database().join("local/helper-1-1"))?;
+        assert!(
+            !super::get_pkg_info_from_db(&alpm, "helper")?
+                .unwrap()
+                .installed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_info_revalidates_present_signatures_after_native_cache_is_primed()
+    -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        let keyring = fixture.directory.path().join("keyring");
+        std::fs::create_dir(&keyring)?;
+        fixture.write_sync("core", &[("helper", "1-1", "")])?;
+        let mut alpm = fixture.open();
+        alpm.set_gpgdir(keyring.to_str().unwrap())?;
+        alpm.register_syncdb(
+            "core",
+            alpm::SigLevel::DATABASE | alpm::SigLevel::DATABASE_OPTIONAL,
+        )?;
+        assert!(super::get_pkg_info_from_db(&alpm, "helper")?.is_some());
+        fixture.write_sync("core", &[("helper", "2-1", "")])?;
+        std::fs::write(
+            fixture.database().join("sync/core.db.sig"),
+            b"invalid signature",
+        )?;
+        let error = super::get_pkg_info_from_db(&alpm, "helper").expect_err(
+            "current metadata must not reuse an earlier native signature-validation result",
+        );
+        assert!(error.downcast_ref::<alpm::Error>().is_some());
         Ok(())
     }
 

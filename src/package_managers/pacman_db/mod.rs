@@ -6,7 +6,8 @@
 mod db;
 
 pub(crate) use db::{
-    compile_package_patterns, get_potential_aur_package_records, read_local_package,
+    compile_package_patterns, get_potential_aur_package_records, parse_sync_db, read_local_package,
+    read_local_package_at,
 };
 
 #[cfg(test)]

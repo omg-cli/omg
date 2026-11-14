@@ -152,6 +152,7 @@ tokio-util = { version = "0.7.18", features = ["io", "codec", "rt"] }
 
 # Archives + compression (zlib-rs = pure Rust SIMD-accelerated zlib, ~2x faster than miniz_oxide)
 tar = "0.4.46"
+bzip2 = { version = "0.6.1", optional = true }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 lz4_flex = { version = "0.14.0", default-features = false, features = [
   "frame",
@@ -377,6 +378,7 @@ split-debuginfo = "unpacked" # Faster linking on Linux
 [features]
 default = ["arch", "license", "pgp"]
 arch = [
+  "dep:bzip2",
   "alpm",
   "alpm-types",
   "alpm-srcinfo",

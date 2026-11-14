@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::os::unix::{
     ffi::OsStrExt,
@@ -263,8 +263,16 @@ impl Default for LocalDbPackage {
 /// Parse a sync database file (core.db, extra.db, multilib.db)
 /// Returns a `HashMap` of package name -> `SyncDbPackage`
 pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, SyncDbPackage>> {
-    let mut file =
-        File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "Pacman sync database is not a regular file: {}",
+        path.display()
+    );
 
     let reader: Box<dyn Read> = {
         let mut probe = [0u8; 263];
@@ -274,6 +282,11 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
         if probe.starts_with(&[0x1f, 0x8b]) {
             Box::new(BudgetedReader::new(
                 GzDecoder::new(file),
+                BudgetedSink::max_budget(),
+            ))
+        } else if probe.starts_with(b"BZh") {
+            Box::new(BudgetedReader::new(
+                bzip2::read::MultiBzDecoder::new(file),
                 BudgetedSink::max_budget(),
             ))
         } else if probe.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
@@ -391,6 +404,12 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
         }
     }
 
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink()).with_context(|| {
+        format!(
+            "Failed to finish decoding repository database {}",
+            path.display()
+        )
+    })?;
     Ok(packages)
 }
 
@@ -1323,9 +1342,9 @@ fn ensure_cache_loaded<C: PackageCache>(
 /// Ensure sync cache is loaded (fast if already loaded)
 fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
     let current_epoch = SyncDbEpoch::from_configured_sync_dir(sync_dir)?;
-    // Configuration participates in the source identity, so persisted entries
-    // produced before a repository-order change cannot be reused.
-    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v3", current_epoch, || {
+    // v4 also requires complete compressed-stream validation. Older cache
+    // records may have been derived without checking their source footer.
+    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v4", current_epoch, || {
         let packages = load_sync_packages(sync_dir)?;
         anyhow::ensure!(
             current_epoch == SyncDbEpoch::from_configured_sync_dir(sync_dir)?,
@@ -1588,6 +1607,7 @@ pub fn invalidate_caches() -> Result<()> {
 
 fn invalidate_derived_cache_files(cache_dir: &Path) -> Result<()> {
     for name in [
+        "sync_db_source_v4",
         "sync_db_source_v3",
         "sync_db_source_v2",
         "local_db_source_v4",
@@ -1757,9 +1777,16 @@ fn package_is_ignored(
 
 /// Read installed package-info from its source, without trusting derived caches.
 pub(crate) fn read_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
-    let local_dir = paths::pacman_local_dir_result()?;
-    let epoch = LocalDbEpoch::from_local_dir(&local_dir)?;
-    let entries = match fs::read_dir(&local_dir) {
+    read_local_package_at(&paths::pacman_local_dir_result()?, name)
+}
+
+/// Read an installed record within an explicit local database scope.
+pub(crate) fn read_local_package_at(
+    local_dir: &Path,
+    name: &str,
+) -> Result<Option<LocalDbPackage>> {
+    let epoch = LocalDbEpoch::from_local_dir(local_dir)?;
+    let entries = match fs::read_dir(local_dir) {
         Ok(entries) => Some(entries),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error).context("Failed to read local package database"),
@@ -1790,7 +1817,7 @@ pub(crate) fn read_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
         }
     }
     anyhow::ensure!(
-        epoch == LocalDbEpoch::from_local_dir(&local_dir)?,
+        epoch == LocalDbEpoch::from_local_dir(local_dir)?,
         "Local package database changed while querying; retry the operation"
     );
     Ok(package)
@@ -2125,6 +2152,7 @@ pub fn get_explicit_count() -> Result<usize> {
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
     use super::*;
+    use std::fs::File;
 
     fn batch2_write_sync(path: &Path, version: &str) {
         let content = format!("%NAME%\nwidget\n\n%VERSION%\n{version}\n\n");
@@ -2444,6 +2472,52 @@ mod tests {
                         .version
                         .to_string(),
                     "22-1"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sync_cache_cannot_reuse_metadata_from_before_complete_stream_validation() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::sync_cache_cannot_reuse_metadata_from_before_complete_stream_validation",
+            "[core]\n",
+            |db| {
+                let source = db.join("sync/core.db");
+                batch2_write_sync(&source, "2-1");
+                let mut damaged = fs::read(&source).unwrap();
+                let checksum = damaged.len() - 8;
+                damaged[checksum] ^= 1;
+                fs::write(&source, damaged).unwrap();
+                let old = DbCache {
+                    packages: vec![RepositoryPackages {
+                        name: "core".to_owned(),
+                        usage: RepoUsage::all(),
+                        packages: Ok(HashMap::from([(
+                            "widget".to_owned(),
+                            SyncDbPackage {
+                                name: "widget".to_owned(),
+                                version: require_package_version("2-1").unwrap(),
+                                repo: "core".to_owned(),
+                                ..SyncDbPackage::default()
+                            },
+                        )])),
+                    }],
+                    last_modified: Some(
+                        SyncDbEpoch::from_configured_sync_dir(&db.join("sync")).unwrap(),
+                    ),
+                    ..DbCache::default()
+                };
+                let original = bitcode::serialize(&old).unwrap();
+                save_cache_to_disk(&old, "sync_db_source_v3").unwrap();
+                assert!(
+                    check_updates_cached().is_err(),
+                    "an older derived cache must not bless a source whose compression checksum has never been checked"
+                );
+                assert_eq!(
+                    fs::read(paths::cache_dir().join("sync_db_source_v3.bin")).unwrap(),
+                    original
                 );
             },
         );
@@ -2799,6 +2873,136 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sync_database_fifo_is_refused_without_waiting_for_a_writer() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("core.db");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let (send, receive) = channel();
+        let read_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            send.send(parse_sync_db(&read_path, "core")).unwrap();
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(1));
+        let blocked = matches!(observed, Err(RecvTimeoutError::Timeout));
+        if blocked {
+            drop(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+        }
+        let parsed = observed.unwrap_or_else(|_| {
+            receive
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        });
+        reader.join().unwrap();
+        assert!(
+            !blocked,
+            "sync database parser blocked waiting for a FIFO writer before rejecting the file type"
+        );
+        let error = parsed.expect_err("a FIFO is not a regular repository database");
+        assert!(format!("{error:#}").contains("regular"));
+    }
+
+    #[test]
+    fn rust_sync_metadata_preserves_native_bzip2_repository_support() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = directory.path().join("db");
+        fs::create_dir(&root)?;
+        fs::create_dir_all(database.join("local"))?;
+        fs::create_dir(database.join("sync"))?;
+        fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
+        let compressed = [
+            66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 55, 125, 43, 15, 0, 0, 177, 95, 128, 204, 144,
+            66, 3, 255, 3, 47, 103, 221, 16, 127, 173, 94, 114, 4, 8, 48, 0, 185, 33, 170, 102,
+            166, 147, 212, 211, 212, 0, 61, 65, 163, 65, 181, 27, 77, 70, 77, 27, 72, 208, 195, 67,
+            64, 0, 0, 104, 0, 0, 0, 1, 37, 33, 161, 26, 100, 104, 208, 3, 65, 160, 0, 13, 3, 77,
+            177, 85, 11, 1, 4, 45, 16, 33, 235, 80, 12, 172, 235, 200, 16, 192, 109, 20, 252, 130,
+            94, 87, 6, 64, 5, 164, 18, 83, 97, 250, 39, 89, 231, 112, 219, 93, 42, 153, 28, 99, 21,
+            158, 209, 187, 38, 73, 146, 91, 165, 67, 113, 196, 192, 107, 142, 231, 245, 150, 84,
+            44, 96, 228, 184, 213, 206, 93, 163, 114, 216, 210, 130, 23, 4, 52, 55, 95, 25, 220,
+            107, 228, 138, 19, 10, 78, 20, 84, 13, 78, 46, 176, 35, 57, 226, 50, 141, 147, 46, 43,
+            193, 38, 9, 143, 131, 5, 100, 255, 84, 204, 5, 108, 136, 93, 97, 223, 117, 160, 78,
+            235, 70, 55, 156, 126, 3, 188, 46, 91, 27, 80, 76, 31, 171, 5, 69, 231, 240, 36, 131,
+            248, 187, 146, 41, 194, 132, 129, 187, 233, 88, 120,
+        ];
+        let source = database.join("sync/core.db");
+        fs::write(&source, compressed)?;
+        let native = alpm::Alpm::new(root.to_str().unwrap(), database.to_str().unwrap())?;
+        let repository = native.register_syncdb("core", alpm::SigLevel::NONE)?;
+        assert_eq!(repository.pkg("fixture")?.version().to_string(), "1-1");
+        let parsed = parse_sync_db(&source, "core")
+            .expect("Rust metadata must preserve native bzip2 database support");
+        let package = parsed.get("fixture").unwrap();
+        assert_eq!((package.csize, package.isize), (12, 34));
+        assert_eq!(package.depends, ["glibc>=2"]);
+        let info =
+            crate::package_managers::alpm_ops::get_pkg_info_from_db(&native, "fixture")?.unwrap();
+        assert_eq!(info.version.to_string(), "1-1");
+        assert_eq!(
+            (info.download_size, info.install_size),
+            (Some(12), Some(34))
+        );
+        fs::write(&source, &compressed[..compressed.len() - 4])?;
+        parse_sync_db(&source, "core")
+            .expect_err("truncated bzip2 footer must not hide behind tar EOF");
+        let mut raw = Vec::new();
+        bzip2::read::MultiBzDecoder::new(compressed.as_slice()).read_to_end(&mut raw)?;
+        let mut joined = Vec::new();
+        for segment in [&raw[..512], &raw[512..]] {
+            let mut member = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+            member.write_all(segment)?;
+            joined.extend(member.finish()?);
+        }
+        fs::write(&source, &joined)?;
+        assert_eq!(
+            parse_sync_db(&source, "core")?
+                .get("fixture")
+                .unwrap()
+                .csize,
+            12
+        );
+        joined.truncate(joined.len() - 4);
+        fs::write(&source, joined)?;
+        parse_sync_db(&source, "core")
+            .expect_err("each concatenated bzip2 member must finish validation");
+        Ok(())
+    }
+
+    #[test]
+    fn sync_database_checks_compression_footer_after_tar_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut archive = tar::Builder::new(Vec::new());
+        let desc = b"%NAME%\nfixture\n\n%VERSION%\n1-1\n\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "fixture-1-1/desc", desc.as_slice())
+            .unwrap();
+        let raw = archive.into_inner().unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&raw).unwrap();
+        let mut compressed = gzip.finish().unwrap();
+        let path = directory.path().join("core.db");
+        fs::write(&path, &compressed).unwrap();
+        assert!(
+            parse_sync_db(&path, "core")
+                .unwrap()
+                .contains_key("fixture")
+        );
+        let crc = compressed.len() - 8;
+        compressed[crc] ^= 1;
+        fs::write(&path, compressed).unwrap();
+        parse_sync_db(&path, "core")
+            .expect_err("a valid tar terminator must not hide a corrupted compression checksum");
+    }
+
     /// Regression: the compression-format probe must rewind the stream before
     /// handing it to a decoder. It previously consumed the first 4 bytes, so
     /// every real sync database failed to parse ("invalid gzip header" /
@@ -2853,8 +3057,12 @@ mod tests {
         let mut lz4_encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
         lz4_encoder.write_all(&raw).unwrap();
         let lz4_bytes = lz4_encoder.finish().unwrap();
+        let mut bzip2 = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        bzip2.write_all(&raw).unwrap();
+        let bzip2_bytes = bzip2.finish().unwrap();
 
         for (name, bytes) in [
+            ("bzip2", bzip2_bytes),
             ("zstd", zstd_bytes),
             ("xz", xz_bytes),
             ("lz4", lz4_bytes),
@@ -3752,9 +3960,9 @@ mod tests {
                 }],
                 ..DbCache::default()
             };
-            save_cache_to_disk_in(&sync, directory.path(), "sync_db_source_v3")?;
+            save_cache_to_disk_in(&sync, directory.path(), "sync_db_source_v4")?;
             let loaded_sync: Result<DbCache> =
-                load_cache_from_disk_in(directory.path(), "sync_db_source_v3");
+                load_cache_from_disk_in(directory.path(), "sync_db_source_v4");
             assert_eq!(
                 loaded_sync.is_ok(),
                 !raw.contains('\0'),
@@ -3793,10 +4001,10 @@ mod tests {
         };
         fs::write(directory.path().join("sync_db.bin"), b"legacy cache")?;
         fs::write(
-            directory.path().join("sync_db_source_v3.bin"),
+            directory.path().join("sync_db_source_v4.bin"),
             bitcode::serialize(&cache)?,
         )?;
-        let decoded: DbCache = load_cache_from_disk_in(directory.path(), "sync_db_source_v3")?;
+        let decoded: DbCache = load_cache_from_disk_in(directory.path(), "sync_db_source_v4")?;
         assert_eq!(decoded.last_modified, cache.last_modified);
         assert_eq!(
             fs::read(directory.path().join("sync_db.bin"))?,
@@ -3809,6 +4017,7 @@ mod tests {
     fn invalidate_derived_cache_files_removes_live_and_legacy_names() -> Result<()> {
         let directory = tempfile::tempdir()?;
         for name in [
+            "sync_db_source_v4.bin",
             "sync_db_source_v3.bin",
             "sync_db_source_v2.bin",
             "local_db_source_v4.bin",
@@ -3825,6 +4034,7 @@ mod tests {
         }
         invalidate_derived_cache_files(directory.path())?;
         for name in [
+            "sync_db_source_v4.bin",
             "sync_db_source_v3.bin",
             "sync_db_source_v2.bin",
             "local_db_source_v4.bin",
