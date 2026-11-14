@@ -171,65 +171,7 @@ async fn scan_with_options(_ctx: &CliContext, fail_on_findings: bool) -> Result<
     #[cfg(unix)]
     {
         let res = security_audit_result().await?;
-        let total_findings = res.total_vulnerabilities;
-        let coverage_warning = audit_coverage_warning(&res.coverage);
-        if let Some(warning) = &coverage_warning {
-            ui::print_warning(warning);
-        }
-        if total_findings == 0 {
-            if coverage_warning.is_some() {
-                crate::cli::modern_ui::print_info(
-                    "No findings were reported; advisory coverage is incomplete.",
-                );
-            } else {
-                ui::print_success("No vulnerabilities found in assessed packages.");
-            }
-        } else {
-            ui::print_warning(format!(
-                "Found {} vulnerabilities ({} high severity)",
-                res.total_vulnerabilities, res.high_severity
-            ));
-            println!();
-            for (pkg, vulns) in res.vulnerabilities {
-                println!(
-                    "  {} ({} issues):",
-                    style::maybe_color(&style::sanitize_terminal_text(&pkg), |t| t
-                        .white()
-                        .bold()
-                        .to_string()),
-                    vulns.len()
-                );
-                for vuln in vulns {
-                    let score = vuln.score.map_or_else(
-                        || {
-                            vuln.advisory_severity
-                                .map(|severity| format!(" [Advisory severity: {severity:?}]"))
-                                .unwrap_or_default()
-                        },
-                        |s| format!(" [Score: {}]", style::sanitize_terminal_text(&s)),
-                    );
-                    println!(
-                        "    {} {} - {}{}{}",
-                        style::maybe_color("→", |t| t.red().to_string()),
-                        style::maybe_color(&style::sanitize_terminal_text(&vuln.id), |t| t
-                            .yellow()
-                            .to_string()),
-                        style::sanitize_terminal_text(&vuln.summary),
-                        style::dim(&score),
-                        if vuln.applicability
-                            == crate::core::security::scan::FindingApplicability::Possible
-                        {
-                            " [possible match; applicability unverified]"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-                println!();
-            }
-            ui::print_tip("Run 'omg audit sbom' to generate a full security report.");
-        }
-        enforce_scan_findings(total_findings, fail_on_findings)
+        display_security_audit(res, fail_on_findings)
     }
 
     #[cfg(not(unix))]
@@ -238,6 +180,72 @@ async fn scan_with_options(_ctx: &CliContext, fail_on_findings: bool) -> Result<
             "Security audit requires the daemon, which is only available on Unix systems."
         );
     }
+}
+
+#[cfg(unix)]
+fn display_security_audit(
+    res: crate::core::security::scan::SecurityAuditResult,
+    fail_on_findings: bool,
+) -> Result<()> {
+    let total_findings = res.total_vulnerabilities;
+    let coverage_warning = audit_coverage_warning(&res.coverage);
+    if let Some(warning) = &coverage_warning {
+        ui::print_warning(warning);
+    }
+    if total_findings == 0 {
+        if coverage_warning.is_some() {
+            crate::cli::modern_ui::print_info(
+                "No findings were reported; advisory coverage is incomplete.",
+            );
+        } else {
+            ui::print_success("No vulnerabilities found in assessed packages.");
+        }
+    } else {
+        ui::print_warning(format!(
+            "Found {} vulnerabilities ({} high severity)",
+            res.total_vulnerabilities, res.high_severity
+        ));
+        println!();
+        for (pkg, vulns) in res.vulnerabilities {
+            println!(
+                "  {} ({} issues):",
+                style::maybe_color(&style::sanitize_terminal_text(&pkg), |t| t
+                    .white()
+                    .bold()
+                    .to_string()),
+                vulns.len()
+            );
+            for vuln in vulns {
+                let score = vuln.score.map_or_else(
+                    || {
+                        vuln.advisory_severity
+                            .map(|severity| format!(" [Advisory severity: {severity:?}]"))
+                            .unwrap_or_default()
+                    },
+                    |s| format!(" [Score: {}]", style::sanitize_terminal_text(&s)),
+                );
+                println!(
+                    "    {} {} - {}{}{}",
+                    style::maybe_color("→", |t| t.red().to_string()),
+                    style::maybe_color(&style::sanitize_terminal_text(&vuln.id), |t| t
+                        .yellow()
+                        .to_string()),
+                    style::sanitize_terminal_text(&vuln.summary),
+                    style::dim(&score),
+                    if vuln.applicability
+                        == crate::core::security::scan::FindingApplicability::Possible
+                    {
+                        " [possible match; applicability unverified]"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            println!();
+        }
+        ui::print_tip("Run 'omg audit sbom' to generate a full security report.");
+    }
+    enforce_scan_findings(total_findings, fail_on_findings)
 }
 
 fn enforce_scan_findings(total_findings: usize, fail_on_findings: bool) -> Result<()> {
@@ -1680,6 +1688,157 @@ pub fn check_eol(_ctx: &CliContext) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn audit_report_preserves_unknown_scope_and_sanitizes_findings_in_both_color_modes()
+    -> Result<()> {
+        const NAME: &str = "cli::security::tests::audit_report_preserves_unknown_scope_and_sanitizes_findings_in_both_color_modes";
+        const MARKER: &str = "OMG_AUDIT_REPORT_FIXTURE";
+        if std::env::var_os(MARKER).is_none() {
+            for colors in ["never", "always"] {
+                let mut command = tokio::process::Command::new(std::env::current_exe()?);
+                command
+                    .args(["--exact", NAME, "--nocapture", "--color", "never"])
+                    .env(MARKER, "1")
+                    .env("OMG_COLORS", colors)
+                    .env_remove("NO_COLOR")
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                let output =
+                    tokio::time::timeout(std::time::Duration::from_secs(20), command.output())
+                        .await??;
+                let stdout = String::from_utf8(output.stdout)?;
+                let stderr = String::from_utf8(output.stderr)?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "audit report fixture failed: {stdout}\n{stderr}"
+                );
+                let text = console::strip_ansi_codes(&stdout);
+                assert_eq!(
+                    text.matches("No vulnerabilities found in assessed packages.")
+                        .count(),
+                    1
+                );
+                assert!(
+                    text.contains("Advisory coverage was not reported; package safety is unknown.")
+                );
+                assert!(text.contains("1 package(s) with unknown coverage"));
+                assert_eq!(
+                    text.matches("No findings were reported; advisory coverage is incomplete.")
+                        .count(),
+                    2
+                );
+                assert!(text.contains("Found 3 vulnerabilities (2 high severity)"));
+                assert!(text.contains("[Score: 9.8]"));
+                assert!(text.contains("[Advisory severity: Important]"));
+                assert_eq!(
+                    text.matches("[possible match; applicability unverified]")
+                        .count(),
+                    2
+                );
+                for injected in ["PKG-INJECT", "ID-INJECT", "SUMMARY-INJECT", "SCORE-INJECT"] {
+                    assert!(
+                        text.contains(injected),
+                        "printable metadata must remain visible: {injected}"
+                    );
+                }
+                assert!(
+                    !stdout.contains("\u{1b}]"),
+                    "remote text must not emit an OSC control"
+                );
+                assert!(
+                    !stdout.contains('\u{7}'),
+                    "remote text must not ring the terminal bell"
+                );
+                assert_eq!(stdout.contains('\u{1b}'), colors == "always");
+            }
+            return Ok(());
+        }
+        use crate::core::security::scan::{
+            AdvisorySeverity, AuditCoverage, FindingApplicability, InstalledIdentity,
+            SecurityAuditResult, UnassessedPackage, Vulnerability,
+        };
+        let identity = InstalledIdentity {
+            name: "fixture".into(),
+            version: "1-1".into(),
+            architecture: None,
+        };
+        let partial = AuditCoverage::Reported {
+            assessed: vec![identity.clone()],
+            unassessed: vec![UnassessedPackage {
+                package: InstalledIdentity {
+                    name: "custom".into(),
+                    ..identity.clone()
+                },
+                reason: crate::core::security::vulnerability::UnknownCoverage::OriginUnestablished,
+            }],
+            sources: Vec::new(),
+        };
+        for coverage in [
+            AuditCoverage::Unreported,
+            partial.clone(),
+            AuditCoverage::Reported {
+                assessed: vec![identity],
+                unassessed: Vec::new(),
+                sources: Vec::new(),
+            },
+        ] {
+            display_security_audit(
+                SecurityAuditResult {
+                    coverage,
+                    total_vulnerabilities: 0,
+                    high_severity: 0,
+                    vulnerabilities: Vec::new(),
+                },
+                true,
+            )?;
+        }
+        let finding =
+            |id: &str, score: Option<&str>, advisory_severity, applicability| Vulnerability {
+                id: id.to_owned(),
+                summary: "fixture summary\u{1b}]52;c;SUMMARY-INJECT\u{7}".into(),
+                score: score.map(str::to_owned),
+                advisory_severity,
+                applicability,
+                native_advisory: None,
+                affected_installed: Vec::new(),
+            };
+        let result = SecurityAuditResult {
+            coverage: partial,
+            total_vulnerabilities: 3,
+            high_severity: 2,
+            vulnerabilities: vec![(
+                "fixture\u{1b}]52;c;PKG-INJECT\u{7}".into(),
+                vec![
+                    finding(
+                        "CVE-2026-1234\u{1b}]52;c;ID-INJECT\u{7}",
+                        Some("9.8\u{1b}]52;c;SCORE-INJECT\u{7}"),
+                        Some(AdvisorySeverity::Important),
+                        FindingApplicability::Applicable,
+                    ),
+                    finding(
+                        "CVE-2026-1235",
+                        None,
+                        Some(AdvisorySeverity::Important),
+                        FindingApplicability::Possible,
+                    ),
+                    finding(
+                        "CVE-2026-1236",
+                        None,
+                        None,
+                        FindingApplicability::Applicable,
+                    ),
+                ],
+            )],
+        };
+        result.validate_counts()?;
+        display_security_audit(result.clone(), false)?;
+        let error = display_security_audit(result, true)
+            .expect_err("findings must fail only when requested");
+        assert_eq!(error.to_string(), "Vulnerability scan found 3 finding(s)");
+        Ok(())
+    }
 
     #[tokio::test]
     #[serial_test::serial(history_ownership)]

@@ -182,6 +182,30 @@ pub(crate) async fn scan_installed_in(
 }
 
 impl SecurityAuditResult {
+    pub(crate) fn validate_counts(&self) -> Result<()> {
+        let (total, high) = self
+            .vulnerabilities
+            .iter()
+            .flat_map(|(_, findings)| findings)
+            .fold((0_usize, 0_usize), |(total, high), finding| {
+                (
+                    total + 1,
+                    high + usize::from(finding.meets_minimum(MinimumSeverity::High)),
+                )
+            });
+        anyhow::ensure!(
+            self.total_vulnerabilities == total,
+            "Audit finding total mismatch: reported {}, actual {total}",
+            self.total_vulnerabilities
+        );
+        anyhow::ensure!(
+            self.high_severity == high,
+            "Audit high-severity total mismatch: reported {}, actual {high}",
+            self.high_severity
+        );
+        Ok(())
+    }
+
     pub(crate) fn from_assessments(assessments: Vec<PackageAssessment>) -> Self {
         let mut assessed = Vec::new();
         let mut unassessed = Vec::new();
@@ -242,6 +266,7 @@ async fn scan_inventory_in(
 }
 
 async fn log_completed_scan(result: &SecurityAuditResult, path: &std::path::Path) -> Result<()> {
+    result.validate_counts()?;
     // A successful CLI/TUI/daemon scan must not outlive its completion record.
     // Capture the destination now and keep filesystem locking/fsync off Tokio.
     let path = path.to_path_buf();
@@ -278,6 +303,27 @@ async fn log_completed_scan(result: &SecurityAuditResult, path: &std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn inconsistent_audit_totals_are_not_logged_as_a_completed_scan() -> Result<()> {
+        for (total, high) in [(0, 0), (2, 1), (1, 0), (1, 2)] {
+            let result = serde_json::from_value(serde_json::json!({
+                "total_vulnerabilities": total, "high_severity": high,
+                "vulnerabilities": [["fixture", [{ "id": "CVE-2026-1234", "summary": "known issue", "score": "9.8" }]]]
+            }))?;
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("audit.jsonl");
+            let error = log_completed_scan(&result, &path)
+                .await
+                .expect_err("inconsistent totals must not be persisted as a completed audit");
+            assert!(format!("{error:#}").contains("mismatch"), "{error:#}");
+            assert!(
+                !path.exists(),
+                "refusing a malformed scan must not write a completed event"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn coverage17_legacy_audit_payload_does_not_imply_complete_coverage() {

@@ -401,6 +401,43 @@ fn async_ping_roundtrip_pins_framing_ids_and_payloads() {
     );
 }
 
+#[test]
+#[serial]
+fn security_audit_rejects_false_clean_totals_without_losing_the_connection() {
+    let mut daemon = MockDaemon::spawn(Box::new(|request| {
+        assert!(matches!(request, Request::SecurityAudit { .. }));
+        let count = u64::from(request.id() == 2);
+        let audit = serde_json::from_value(serde_json::json!({
+            "coverage": { "status": "reported", "assessed": [], "unassessed": [], "sources": [] },
+            "total_vulnerabilities": count, "high_severity": count,
+            "vulnerabilities": [["fixture", [{ "id": "CVE-2026-1234", "summary": "known issue", "score": "9.8" }]]]
+        })).expect("valid audit wire shape");
+        Some(echo_frame(request, &ResponseResult::SecurityAudit(audit)))
+    }));
+    let sock = daemon.socket_path.clone();
+    with_client_env(None, None, Some(&sock), || {
+        block(async {
+            let mut client = DaemonClient::connect_to(sock.clone())
+                .await
+                .expect("connect to audit fixture");
+            let error = client
+                .security_audit()
+                .await
+                .expect_err("false clean totals");
+            assert!(format!("{error:#}").contains("mismatch"), "{error:#}");
+            let audit = client.security_audit().await.expect("next valid audit");
+            assert_eq!(audit.total_vulnerabilities, 1);
+            assert_eq!(audit.high_severity, 1);
+            assert_eq!(audit.vulnerabilities[0].1[0].id, "CVE-2026-1234");
+            drop(client);
+        });
+    });
+    let requests = daemon.take_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].id(), 1);
+    assert_eq!(requests[1].id(), 2);
+}
+
 /// Contract: a Success response carrying a foreign id is rejected with the
 /// exact message naming both ids.
 #[test]
