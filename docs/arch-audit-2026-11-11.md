@@ -1336,3 +1336,35 @@ ignores), all 32 CLI unit tests, default/minimal/Debian-pure all-target Clippy
 with warnings denied and normal binaries. Instrumented, guest and optimized
 verification of this new runtime remain required before publication. Coverage
 thresholds, exclusions, source identity and counters remain unchanged.
+
+The exact 4e930a7e runtime passed instrumented library/CLI checks with the same
+2415/32 successes. Its six-role native producer passed 14 selected tests, all
+25 Omarchy scenarios and both normal Arch boundaries in 209.075 seconds;
+330 genuine profiles were imported after validation and clean shutdown. The
+fresh source-isolated report reaches 237/237 functions and 3520/3600 summary
+lines, with 59 uncovered mapped lines. Both newly reproduced paths now execute;
+remaining OS-fault guards and cold fixture diagnostics keep strict acceptance
+unresolved. This report does not establish a passing hosted comparison.
+
+The first optimized guest attempt was stopped by the unchanged isolation guard
+at 61.323 seconds after detecting a concurrent native job. Its failure artifacts
+remain at `omarchy-native20-positive21`; no result from that attempt is accepted.
+The process was no longer present at inspection, so its origin is unproven.
+The local driver now retains PID/name details when this guard fires and checks
+the binary pair against its completed build receipt before launch. The pair's
+hashes still matched. A separately admitted clean attempt passed in 221.320
+seconds: full signed native update and user-manager reexecution, six refusal
+controls, 25 Omarchy scenarios, three attended terminal interactions and both
+normal Arch read-only commands, with no forbidden helper execution. Protected
+guest package state and compiled sources remained unchanged and shutdown was
+clean. Its receipt SHA-256 is
+`0b63dfcaacbfdfd4dff419230653dfc1feeb0477399b001649d0c4cd4df05410`.
+
+The new local bundle is `omg-pr1057-4e930a7e-x86_64-arch.tar.gz`
+(19,615,189 bytes), SHA-256
+`1cb851efa5f5ea70e78e45a219d3b9c27b3face9815b1ff55fb6489ce97997a7`.
+Both archived binaries match the build and guest receipts. The host installation
+is unchanged. Published head f663af7e's instrumented producer passed, but its
+executed hosted comparison still rejects incomplete Omarchy file coverage:
+job 132255381521, run 43530896096. No coverage, isolation, profile, deadline or
+retry-acceptance requirement was relaxed.
