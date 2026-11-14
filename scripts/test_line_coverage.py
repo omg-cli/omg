@@ -396,7 +396,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 document['data'][0]['functions'] = [dict(name=name, filenames=['/src/example.rs'],
                     regions=[[line, 1, line, len(text) + 1, 1, 0, 0, 0]
                              for line, text in enumerate(lines, 1)])]
-        with self.assertRaisesRegex(ValueError, 'Unproved retained execution'):
+        with self.assertRaisesRegex(ValueError, r'Unproved retained execution.*example\.rs:\d+ -> \d+; base_count=1 head_count=1'):
             self.compare(before=[(line, 1) for line in range(1, 10)],
                 after=[(line, 1) for line in range(1, 7)], mutate=owners,
                 sources=({'example.rs': old}, {'example.rs': new}))
@@ -420,7 +420,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertIn([3, 4], [pair for witness in receipt['retained_function_completions']
                               for pair in witness['pairs']])
         lose_copy[0] = True
-        with self.assertRaisesRegex(ValueError, 'Function completion lost compiled-copy coverage'):
+        with self.assertRaisesRegex(ValueError, r'Function completion lost compiled-copy coverage.*example\.rs:3 -> 4; base_states=\[\[1\], \[1\]\] head_states=\[\[0\], \[1\]\]'):
             self.compare(before=[(3, 2), (5, 2), (6, 2)],
                 after=[(4, 1), (9, 1), (10, 1)], mutate=owners,
                 sources=({'example.rs': old}, {'example.rs': new}))
@@ -2008,6 +2008,58 @@ class SourceAwareCoverageTests(unittest.TestCase):
             with self.subTest(label=label), self.assertRaises(ValueError):
                 self.transparent_forwarder_compare(mutate=mutate)
 
+    def cold_fragment_compare(self, mutate=None):
+        old = ['fn retained() {', '    if ready {', '        if permitted {',
+               '            if extra { old();', '        }', '    }', '    }', '    finish();', '}']
+        new = [line.replace('old();', 'new();') for line in old]
+        value = {}
+        for side, source in (('base', old), ('head', new)):
+            value[side] = dict(source=source, counts={5: int(side == 'head'), 6: 1, 8: 1},
+                owners=[dict(name=f'{side}_copy_{instance}', filenames=['/src/example.rs'],
+                    regions=[[n, 1, n, len(source[n - 1]) + 1,
+                              int(instance == 0 and (n != 5 or side == 'head')), 0, 0, 0]
+                             for n in range(1, 10) if n != 7]) for instance in range(2)])
+        if mutate:
+            mutate(value)
+        return coverage.positive_source_fragments('example.rs', old, new,
+            value['base']['counts'], value['head']['counts'],
+            value['base']['owners'], value['head']['owners'],
+            {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'},
+            [(4, 7, 4, 7, [5, 6]), (7, 8, 7, 8, [8])])
+
+    def test_fragment_preserves_cold_rows_when_every_head_candidate_is_covered(self):
+        pairs, receipts = self.cold_fragment_compare()
+        self.assertEqual(pairs, {5: 5, 6: 6, 8: 8})
+        self.assertEqual(receipts[0]['instance_states'], [[0, 0, 0], [0, 1, 1]])
+        self.assertEqual(receipts[0]['head_instance_states'], [[0, 0, 0], [1, 1, 1]])
+
+    def test_cold_fragment_requires_complete_consistent_counters_and_owners(self):
+        def foreign(value):
+            value['head']['owners'].append(dict(name='foreign', filenames=['/src/example.rs'],
+                regions=[[5, 1, 5, 10, 1, 0, 0, 0]]))
+        def lost(value):
+            value['head']['owners'][0]['regions'][5][4] = 0
+            value['head']['owners'][1]['regions'][5][4] = 1
+        def foreign_unmapped(value):
+            foreign(value)
+            value['head']['owners'][-1]['regions'] = [[7, 1, 7, 6, 1, 0, 0, 0]]
+        mutations = {
+            'base_mapping_missing': lambda v: v['base']['counts'].pop(5),
+            'head_mapping_missing': lambda v: v['head']['counts'].pop(5),
+            'head_still_cold': lambda v: v['head']['counts'].__setitem__(5, 0),
+            'base_hot_region': lambda v: v['base']['owners'][0]['regions'][4].__setitem__(4, 1),
+            'base_cold_region': lambda v: v['base']['owners'][0]['regions'][5].__setitem__(4, 0),
+            'head_cold_regions': lambda v: v['head']['owners'][0]['regions'][4].__setitem__(4, 0),
+            'lost_correlated_copy': lost,
+            'missing_copy': lambda v: v['head']['owners'].pop(),
+            'foreign_owner': foreign,
+            'foreign_unmapped_owner': foreign_unmapped,
+            'new_cold_mapping': lambda v: v['head']['counts'].__setitem__(7, 0),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, 'Ambiguous unchanged source'):
+                self.cold_fragment_compare(mutate)
+
     def test_multiline_return_change_preserves_covered_fragments_in_every_compiled_copy(self):
         result = self.multiline_copies_compare()
         self.assertEqual([result[key] for key in ("deleted_summary_found", "deleted_summary_hit",
@@ -2160,7 +2212,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
             self.multiline_copies_compare(mutate=new_zero)
         with self.assertRaisesRegex(ValueError, "New uncovered instrumented line: example.rs:6"):
             self.multiline_copies_compare(mutate=lambda v: v["head"]["counts"].__setitem__(6, 0))
-        with self.assertRaisesRegex(ValueError, "Retained covered line lost coverage"):
+        with self.assertRaisesRegex(ValueError, r'Retained covered line lost coverage.*example\.rs:14 -> 15; base_count=1 head_count=0'):
             self.multiline_copies_compare(mutate=lambda v: v["head"]["counts"].__setitem__(15, 0))
 
     def test_multiline_fragment_proof_requires_the_actual_body_boundary(self):

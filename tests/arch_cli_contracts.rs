@@ -74,7 +74,7 @@ fn native_status_preserves_daemon_advisory_coverage() -> Result<()> {
             };
             let directory = tempfile::Builder::new()
                 .permissions(std::fs::Permissions::from_mode(0o700))
-                .tempdir()?;
+                .tempdir_in("/tmp")?;
             let socket = directory.path().join("daemon.sock");
             omg_lib::core::client::validate_socket_with_context(&socket)?;
             let listener = UnixListener::bind(&socket)?;
@@ -336,6 +336,85 @@ fn advertised_json_outputs_are_valid_json() -> Result<()> {
             "{command} emitted non-error diagnostics in JSON mode: {}",
             output.stderr
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn outdated_reports_empty_and_populated_arch_inventory_in_both_formats() -> Result<()> {
+    let project = common::TestProject::new();
+    let root = project.pacman_root.path();
+    let db = root.join("var/lib/pacman");
+    let local = db.join("local");
+    let sync = db.join("sync");
+    std::fs::create_dir_all(&local)?;
+    std::fs::create_dir_all(&sync)?;
+    std::fs::write(local.join("ALPM_DB_VERSION"), b"9\n")?;
+    let configuration = project.config_dir.path().join("pacman.conf");
+    std::fs::write(
+        &configuration,
+        format!(
+            "[options]\nRootDir = {}\nDBPath = {}\nArchitecture = auto\n",
+            root.display(),
+            db.display()
+        ),
+    )?;
+    project.mock_install("git", "2.43.0")?;
+    project.mock_available("git", "2.43.0")?;
+    let args: [&[&str]; 2] = [&["outdated"], &["--json", "outdated"]];
+    for populated in [false, true] {
+        if populated {
+            project.mock_available("git", "2.44.0")?;
+        }
+        for args in args {
+            let output = project.run_with_env(
+                args,
+                &[
+                    ("OMG_TEST_DISTRO", "arch"),
+                    ("NO_COLOR", "1"),
+                    (
+                        "OMG_PACMAN_CONF",
+                        configuration.to_str().context("UTF-8 private config")?,
+                    ),
+                    (
+                        "OMG_PACMAN_DB_DIR",
+                        db.to_str().context("UTF-8 private database")?,
+                    ),
+                    (
+                        "OMG_PACMAN_LOCAL_DIR",
+                        local.to_str().context("UTF-8 private local database")?,
+                    ),
+                    (
+                        "OMG_PACMAN_SYNC_DIR",
+                        sync.to_str().context("UTF-8 private sync database")?,
+                    ),
+                ],
+            );
+            assert!(output.success, "{}", output_text(&output));
+            if args[0] == "--json" {
+                let rows: Vec<serde_json::Value> = serde_json::from_str(&output.stdout)?;
+                assert_eq!(rows.len(), usize::from(populated));
+                if populated {
+                    assert_eq!(rows[0]["name"], "git");
+                    assert_eq!(rows[0]["current_version"], "2.43.0");
+                    assert_eq!(rows[0]["new_version"], "2.44.0");
+                    assert_eq!(rows[0]["repo"], "extra");
+                }
+            } else {
+                let text = output_text(&output);
+                assert!(
+                    text.contains(if populated {
+                        "Available Updates"
+                    } else {
+                        "up to date"
+                    }),
+                    "{text}"
+                );
+                if populated {
+                    assert!(text.contains("git") && text.contains("2.44.0"), "{text}");
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -22,6 +22,7 @@ const AUTHORIZATION_INTERVAL: Duration = Duration::from_mins(1);
 const TERMINATION_GRACE: Duration = Duration::from_secs(10);
 const MAX_MIGRATIONS: usize = 4096;
 const MAX_MIGRATION_BYTES: u64 = 1024 * 1024;
+const INCOMPLETE_UPDATE_SCOPE: &str = "Omarchy requires its complete update lifecycle; --fast, --turbo and mutating --no-sync cannot preserve that scope. Use omg update, or --check/--dry-run/--aur-only for a scoped operation.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArchFlavor {
@@ -35,8 +36,6 @@ pub(super) enum UpdateIntent {
     DryRun,
     AurOnly,
     Standard { yes: bool, no_sync: bool },
-    Fast,
-    Turbo,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,10 +58,28 @@ fn plan(flavor: ArchFlavor, intent: UpdateIntent) -> Result<UpdatePlan> {
             yes,
             no_sync: false,
         } => Ok(UpdatePlan::Omarchy { yes }),
-        _ => anyhow::bail!(
-            "Omarchy requires its complete update lifecycle; --fast, --turbo and mutating --no-sync cannot preserve that scope. Use omg update, or --check/--dry-run/--aur-only for a scoped operation."
-        ),
+        _ => anyhow::bail!(INCOMPLETE_UPDATE_SCOPE),
     }
+}
+
+fn require_native_scope(flavor: ArchFlavor) -> Result<()> {
+    anyhow::ensure!(flavor == ArchFlavor::Arch, INCOMPLETE_UPDATE_SCOPE);
+    Ok(())
+}
+
+pub(super) fn ensure_native_update_scope() -> Result<()> {
+    require_native_scope(update_flavor()?)
+}
+
+fn update_flavor() -> Result<ArchFlavor> {
+    if cfg!(test) || crate::core::paths::test_mode() || crate::cli::packages::mock_arch_backend()? {
+        return Ok(ArchFlavor::Arch);
+    }
+    Ok(if crate::core::env::distro::is_omarchy() {
+        ArchFlavor::Omarchy
+    } else {
+        ArchFlavor::Arch
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1368,15 +1385,7 @@ fn ensure_mutation_context() -> Result<()> {
 }
 
 pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
-    if cfg!(test) || crate::core::paths::test_mode() || crate::cli::packages::mock_arch_backend()? {
-        return Ok(false);
-    }
-    let flavor = if crate::core::env::distro::is_omarchy() {
-        ArchFlavor::Omarchy
-    } else {
-        ArchFlavor::Arch
-    };
-    let UpdatePlan::Omarchy { yes } = plan(flavor, intent)? else {
+    let UpdatePlan::Omarchy { yes } = plan(update_flavor()?, intent)? else {
         return Ok(false);
     };
     ensure_mutation_context()?;
@@ -3954,9 +3963,12 @@ mod tests {
     #[tokio::test]
     async fn terminal_read_failure_reaps_owned_coordinator_before_returning() -> Result<()> {
         use std::os::fd::OwnedFd;
+        use std::os::unix::fs::PermissionsExt;
         use tokio::io::AsyncReadExt;
 
-        let owner = private_directory();
+        let owner = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")?;
         let listener = std::os::unix::net::UnixListener::bind(owner.path().join("read-error"))?;
         listener.set_nonblocking(true)?;
         let peer = std::os::unix::net::UnixStream::connect(owner.path().join("read-error"))?;
@@ -4635,8 +4647,6 @@ mod tests {
                 yes: true,
                 no_sync: true,
             },
-            UpdateIntent::Fast,
-            UpdateIntent::Turbo,
         ] {
             assert_eq!(
                 plan(ArchFlavor::Arch, intent).expect("native Arch update mode"),
@@ -4644,6 +4654,8 @@ mod tests {
                 "normal Arch must retain its existing behavior for {intent:?}"
             );
         }
+        require_native_scope(ArchFlavor::Arch)
+            .expect("fast and turbo stay native on ordinary Arch");
     }
 
     #[test]
@@ -4663,19 +4675,18 @@ mod tests {
 
     #[test]
     fn omarchy_refuses_cached_and_official_only_modes_before_mutation() {
-        for intent in [
-            UpdateIntent::Standard {
-                yes: false,
-                no_sync: true,
-            },
-            UpdateIntent::Fast,
-            UpdateIntent::Turbo,
-        ] {
-            assert!(
-                plan(ArchFlavor::Omarchy, intent).is_err(),
-                "{intent:?} cannot silently widen into a refreshing full Omarchy update"
-            );
-        }
+        let intent = UpdateIntent::Standard {
+            yes: false,
+            no_sync: true,
+        };
+        assert!(
+            plan(ArchFlavor::Omarchy, intent).is_err(),
+            "{intent:?} cannot silently widen into a refreshing full Omarchy update"
+        );
+        assert!(
+            require_native_scope(ArchFlavor::Omarchy).is_err(),
+            "fast and turbo cannot omit Omarchy system stages"
+        );
     }
 
     #[test]

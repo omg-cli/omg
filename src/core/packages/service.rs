@@ -550,46 +550,6 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
 
-    struct CleanVulnerabilitySource;
-
-    impl VulnerabilitySource for CleanVulnerabilitySource {
-        fn assess_packages<'a>(
-            &'a self,
-            packages: &'a [SecurityPackage],
-            _evidence_use: crate::core::security::vulnerability::AssessmentUse,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            Vec<crate::core::security::vulnerability::PackageAssessment>,
-                            crate::core::security::vulnerability::VulnerabilityError,
-                        >,
-                    > + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async move {
-                Ok(packages
-                    .iter()
-                    .cloned()
-                    .map(
-                        |package| crate::core::security::vulnerability::PackageAssessment {
-                            package,
-                            coverage:
-                                crate::core::security::vulnerability::PackageCoverage::Assessed {
-                                    provenance:
-                                        crate::core::security::scan::AdvisoryProvenance::Osv {
-                                            ecosystem: "fixture".into(),
-                                        },
-                                },
-                            findings: Vec::new(),
-                        },
-                    )
-                    .collect())
-            })
-        }
-    }
-
     #[tokio::test]
     #[serial_test::serial(history_ownership)]
     async fn removal_history_records_installed_not_candidate_version() -> Result<()> {
@@ -732,7 +692,6 @@ mod tests {
         let backend = Arc::new(crate::core::testing::TestPackageManager::new());
         let service = PackageService::builder(backend.clone())
             .policy(policy)
-            .vulnerability_source(Arc::new(CleanVulnerabilitySource))
             .without_history()
             .build()?;
 
@@ -842,7 +801,7 @@ mod tests {
         backend.add_package("example", "1.0.0", "Example package");
         let service = PackageService::builder(backend)
             .history(history)
-            .vulnerability_source(Arc::new(CleanVulnerabilitySource))
+            .policy(SecurityPolicy::default())
             .build()?;
 
         let error = service

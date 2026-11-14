@@ -2236,8 +2236,18 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         use tokio::time::{sleep, timeout};
 
-        for (outcome, code) in [("success", 0), ("failure", 1)] {
+        for (outcome, code, corrupt) in [
+            ("success", 0, false),
+            ("failure", 1, false),
+            ("success", 0, true),
+            ("failure", 1, true),
+        ] {
             let directory = tempfile::tempdir()?;
+            let log = directory.path().join("audit/audit.jsonl");
+            if corrupt {
+                std::fs::create_dir_all(log.parent().context("audit directory")?)?;
+                std::fs::write(&log, b"{truncated historical event\n")?;
+            }
             let mut child = tokio::process::Command::new(std::env::current_exe()?)
                 .args(["--exact", "tests::audit_exit_fixture", "--nocapture"])
                 .env("OMG_AUDIT_EXIT_FIXTURE", outcome)
@@ -2262,7 +2272,6 @@ mod tests {
                 }
             })
             .await??;
-            let log = directory.path().join("audit/audit.jsonl");
             let lock = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -2277,7 +2286,7 @@ mod tests {
                 !exited_before_unlock,
                 "{outcome}: exited before accepted audit event was persisted"
             );
-            let body = std::fs::read_to_string(log)?;
+            let body = std::fs::read_to_string(&log)?;
             assert!(
                 !body.is_empty(),
                 "{outcome}: accepted audit event was lost at exit"
@@ -2294,6 +2303,38 @@ mod tests {
                 "accepted before exit\nretained intact"
             );
             assert!(entries[0].verify(), "{outcome}: audit integrity");
+            let marker = log.with_file_name("incomplete");
+            assert_eq!(
+                marker.exists(),
+                corrupt,
+                "{outcome}: recovery must preserve history loss"
+            );
+            let logger = omg_lib::core::security::audit::AuditLogger::new_in(&log)?;
+            assert!(logger.verify_integrity()?.chain_valid, "{outcome}");
+            if corrupt {
+                let error = omg_lib::core::security::audit::ensure_complete_collection(&marker)
+                    .expect_err("recovered history remains incomplete");
+                assert!(error.to_string().contains("incomplete"), "{error}");
+                let quarantined = std::fs::read_dir(log.parent().context("audit directory")?)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with("audit.jsonl.corrupt-")
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    quarantined.len(),
+                    1,
+                    "{outcome}: original corrupt history retained"
+                );
+                assert_eq!(
+                    std::fs::read(&quarantined[0])?,
+                    b"{truncated historical event\n"
+                );
+            }
         }
         Ok(())
     }

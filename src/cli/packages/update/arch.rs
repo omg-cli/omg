@@ -139,9 +139,7 @@ const fn should_sync(no_sync: bool, check_only: bool, dry_run: bool) -> bool {
 }
 
 pub async fn update_fast() -> Result<()> {
-    if super::omarchy::maybe_coordinate(super::omarchy::UpdateIntent::Fast).await? {
-        return Ok(());
-    }
+    super::omarchy::ensure_native_update_scope()?;
     modern_ui::print_phase_header("⚡", "Fast System Update", "sync + upgrade");
     crate::package_managers::arch::run_privileged_operation(
         "fullupdate",
@@ -185,9 +183,7 @@ async fn run_sysupgrade() -> anyhow::Result<()> {
 }
 
 pub async fn update_turbo() -> Result<()> {
-    if super::omarchy::maybe_coordinate(super::omarchy::UpdateIntent::Turbo).await? {
-        return Ok(());
-    }
+    super::omarchy::ensure_native_update_scope()?;
     modern_ui::print_phase_header("🚀", "TURBO System Update", "cached, no sync");
     println!(
         "  {} Checking for updates (cached, no sync)...",

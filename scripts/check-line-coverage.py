@@ -1063,7 +1063,7 @@ def _compiled_function_groups(name, owners, files, source, work=None):
 
 
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files, fragments):
-    """Prove only positive pairs, retaining every compiled copy and candidate."""
+    """Prove positive head pairs, retaining every base state, copy and candidate."""
     if not fragments:
         return {}, []
     def refuse():
@@ -1085,7 +1085,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
                       and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
         if (len(candidates) != 1 or old[a:b] != new[c:d]
-                or any(before.get(line, 0) <= 0 for line in pending)):
+                or any(line not in before for line in pending)):
             refuse()
         prefix, bg, hg = candidates[0]
         if len(bg[2]) != len(hg[2]):
@@ -1110,9 +1110,12 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             observed = None
             for offset in starts:
                 lines = [offset + line - a for line in pending]
-                if (any(counts.get(line, 0) <= 0 for line in lines)
-                        or any(not owner_covers_lines(owner["regions"], offset + 1, offset + b - a)
-                               for owner in members)):
+                if (any(line not in counts or (side == 1 and counts[line] <= 0)
+                        or (side == 0 and (counts[line] > 0) != (before[original] > 0))
+                        for original, line in zip(pending, lines))
+                        or any(not owner_covers_lines(owner["regions"], line, line)
+                               for owner in members for line in range(offset + 1, offset + b - a + 1)
+                               if line in counts)):
                     refuse()
                 touched = {id(owner) for owner in inventories[side] if any(
                     owner_covers_lines([region], line, line) for region in owner["regions"]
@@ -1138,7 +1141,8 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 states = tuple(tuple(int(any(region[4] > 0 and owner_covers_lines([region], line, line)
                                              for region in owner["regions"])) for line in lines) + tuple(child)
                                for owner, child in zip(members, children))
-                if (any(not any(row[column] for row in states) for column in range(len(lines)))
+                if (any(bool(counts[line]) != any(row[column] for row in states)
+                        for column, line in enumerate(lines))
                         or observed is not None and observed != states):
                     refuse()
                 observed = states
@@ -3611,7 +3615,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     states = [sorted(rows) for rows in states]
                     matching = compiled_hit_state_matching(*states)
                     if matching is None:
-                        raise ValueError('Function completion lost compiled-copy coverage')
+                        raise ValueError(f'Function completion lost compiled-copy coverage: '
+                            f'{name}:{group[1]} -> {target[1]}; '
+                            f'base_states={states[0]} head_states={states[1]}')
                     anchored[group[1]] = target[1]
                     completion_receipts.append(dict(file=name, pairs=[[group[1], target[1]]],
                         source_prefix_sha256=hashlib.sha256(prefix.encode()).hexdigest(),
@@ -3744,7 +3750,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if (line, target) in proved_eager_pairs:
                     retained[line] = target
                 elif line not in anchored:
-                    raise ValueError('Unproved retained execution in replaced construct')
+                    raise ValueError(f'Unproved retained execution in replaced construct: '
+                        f'{name}:{line} -> {target}; '
+                        f'base_count={before.get(line)} head_count={after.get(target)}')
             elif tag == 'replace-construct':
                 if (block.get('retained_statements') and not any(
                         start <= block['base_line'] <= end for start, end in proved_functions)
@@ -3822,13 +3830,17 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             gone.add(oldline)
                             del retained[oldline]
                             continue
-                raise ValueError("Retained covered line lost coverage or mapping")
+                raise ValueError(f'Retained covered line lost coverage or mapping: '
+                    f'{name}:{oldline} -> {newline}; '
+                    f'base_count={before.get(oldline)} head_count={after.get(newline)}')
         retained.update(anchored)
         if len(set(retained.values())) != len(retained):
             raise ValueError("Ambiguous retained source correspondence")
         for oldline, newline in retained.items():
             if before.get(oldline, 0) > 0 and after.get(newline, 0) == 0 and (oldline, newline) not in painted:
-                raise ValueError("Retained covered line lost coverage or mapping")
+                raise ValueError(f'Retained covered line lost coverage or mapping: '
+                    f'{name}:{oldline} -> {newline}; '
+                    f'base_count={before.get(oldline)} head_count={after.get(newline)}')
         retained_new = set(retained.values())
         uncovered = next((line for line, count in after.items()
                           if count == 0 and line not in retained_new), None)
