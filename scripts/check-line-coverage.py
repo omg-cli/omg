@@ -1193,9 +1193,9 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         valid = dict(valid)
         phases = compiled_async_function_groups(name, owners, files, source, work,
                     None if construct_inventories is None else construct_inventories[side])
-        claimed_bodies = {id(owner) for group in valid.values() for owner in group[2]}
-        phases = {key: group for key, group in phases.items()
-                  if not any(id(copy.body) in claimed_bodies for copy in group.copies)}
+        phase_bodies = {id(copy.body) for group in phases.values() for copy in group.copies}
+        valid = {key: group for key, group in valid.items()
+                 if not any(id(owner) in phase_bodies for owner in group[2])}
         valid.update({key: (*group.span, tuple(copy.body for copy in group.copies))
                       for key, group in phases.items()})
         async_groups.append(phases)
@@ -3894,7 +3894,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         construct_pairs, witnesses = retained_construct_anchors(name, old, new, before, after,
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
-        retained = {}; gone = set(); unresolved_fragments = []
+        retained = {}; gone = set(); unresolved_fragments = []; deferred_async = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
         _construct_charge(construct_work, sum(len(line) + 1 for line in new) if old != new else 0)
         head_text = '\n'.join(new) if old != new else ''
@@ -4020,13 +4020,23 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if (line, target) in proved_eager_pairs:
                     retained[line] = target
                 elif line not in anchored:
-                    raise ValueError(f'Unproved retained execution in replaced construct: '
-                        f'{name}:{line} -> {target}; '
-                        f'base_count={before.get(line)} head_count={after.get(target)}')
+                    scopes = [prefix for prefix, group in base_groups.items()
+                              if prefix in head_groups and re.search(r'\basync\s+fn\b', prefix)
+                              and group[0] <= line <= group[1]
+                              and head_groups[prefix][0] <= target <= head_groups[prefix][1]]
+                    if (len(scopes) == 1 and after.get(target, 0) > 0
+                            and old[line - 1] == new[target - 1]):
+                        deferred_async[line] = target
+                        unresolved_fragments.append((line - 1, line, target - 1, target, [line]))
+                    else:
+                        raise ValueError(f'Unproved retained execution in replaced construct: '
+                            f'{name}:{line} -> {target}; '
+                            f'base_count={before.get(line)} head_count={after.get(target)}')
             elif tag == 'replace-construct':
                 if (block.get('retained_statements') and not any(
                         start <= block['base_line'] <= end for start, end in proved_functions)
-                        and any(line not in anchored for line in retained_statement_lines(block))):
+                        and any(line not in anchored and line not in deferred_async
+                                for line in retained_statement_lines(block))):
                     raise ValueError('Ambiguous unchanged work in replaced compiler owner')
                 replacement_receipts.append(dict(file=name, **block))
             # Replacement is not proven deletion. Its old counts stay in the
@@ -4045,6 +4055,11 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         positive, receipts = positive_source_fragments(
             name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments,
             construct_work, inventories, grouped)
+        phase_pairs = {tuple(pair) for receipt in receipts
+                       if 'async_copies' in receipt and 'async_fragment_regions' in receipt
+                       for pair in receipt['pairs']}
+        if any((line, target) not in phase_pairs for line, target in deferred_async.items()):
+            raise ValueError('Unproved retained async execution: complete phase/region evidence required')
         retained.update(positive)
         positive_receipts.extend(receipts)
         gone.difference_update(anchored)

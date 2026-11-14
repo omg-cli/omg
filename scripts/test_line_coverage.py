@@ -242,6 +242,67 @@ class SourceConstructCapacityTests(unittest.TestCase):
 
 
 class SourceAwareCoverageTests(unittest.TestCase):
+    def changed_async_arguments_compare(self, mutation=None, base_called=True):
+        old = (b'async fn checked() {\n    enforce(\n        old_argument(),\n    );\n}\n'
+               b'async fn retained() {\n    enforce(\n        old_argument(),\n    );\n}\n')
+        new = old.replace(b'old_argument()', b'new_argument()', 1)
+        def owners(base, head):
+            for document, source in ((base, old), (head, new)):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = []
+                for name, first in (('checked', 1), ('retained', 6)):
+                    opening = lines[first - 1].index('{') + 1
+                    for number in range(2):
+                        parent = f'_RNvCs{number + 1}_7example{len(name)}{name}'
+                        document['data'][0]['functions'].extend([
+                            dict(name=parent, count=1, filenames=['/src/example.rs'],
+                                 regions=[[first, 1, first, opening - 1, 1, 0, 0, 0]]),
+                            dict(name='_RNC' + parent[2:] + '0B3_', count=1,
+                                 filenames=['/src/example.rs'], regions=[
+                                     [first, opening, first, opening + 1, 1, 0, 0, 0],
+                                     *[[line, 1, line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
+                                       for line in range(first + 1, first + 5)]])])
+            if mutation:
+                mutation(head['data'][0]['functions'])
+            if not base_called:
+                for owner in base['data'][0]['functions'][:4]:
+                    owner['count'] = 0
+                    for region in owner['regions']:
+                        region[4] = 0
+        return self.compare(before=[(line, 2 if base_called or line > 5 else 0) for line in range(1, 11)],
+            after=[(line, 2) for line in range(1, 11)], mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_changed_async_arguments_keep_the_covered_call_obligation(self):
+        result = self.changed_async_arguments_compare()
+        self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        self.assertTrue(result['positive_source_fragments'])
+
+    def test_changed_async_arguments_preserve_previously_unexecuted_copies(self):
+        result = self.changed_async_arguments_compare(base_called=False)
+        self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        self.assertTrue(result['positive_source_fragments'])
+
+    def test_changed_async_arguments_cannot_borrow_phase_or_subexpression_hits(self):
+        def mutate(owners, mode):
+            if mode == 'cold-constructor': owners[0]['regions'][0][4] = 0
+            elif mode == 'cold-call': owners[1]['regions'][1][4] = 0
+            elif mode == 'cold-subexpression':
+                for owner in (owners[1], owners[3]):
+                    owner['regions'].append([2, 5, 2, 8, 0, 0, 0, 0])
+            elif mode == 'missing-constructor': owners.pop(0)
+            elif mode == 'missing-all-constructors':
+                owners.pop(2); owners.pop(0)
+            elif mode == 'unsupported-symbols':
+                for number, owner in enumerate(owners[:4]):
+                    owner['name'] = f'unsupported_owner_{number}'
+        for mode in ('cold-constructor', 'cold-call', 'cold-subexpression', 'missing-constructor',
+                     'missing-all-constructors', 'unsupported-symbols'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.changed_async_arguments_compare(lambda owners: mutate(owners, mode))
+
     def async_positive_fragment_compare(self, mutation=None, joint=False):
         old = ['async fn checked(', '    old: bool,', ') {',
                '    verify();', '    finish();', '}']
