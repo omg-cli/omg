@@ -989,18 +989,19 @@ impl Interruptions {
         })
     }
 
-    async fn receive(&mut self) -> Result<()> {
-        let received = tokio::select! {
-            value = self.interrupt.recv() => value,
-            value = self.terminate.recv() => value,
-            value = self.hangup.recv() => value,
-        };
-        received.context("Update interruption stream closed")
+    async fn receive(&mut self) {
+        // Tokio's Unix signal streams never close.
+        tokio::select! {
+            _ = self.interrupt.recv() => {},
+            _ = self.terminate.recv() => {},
+            _ = self.hangup.recv() => {},
+        }
     }
 }
 
 async fn interrupt() -> Result<()> {
-    Interruptions::new()?.receive().await
+    Interruptions::new()?.receive().await;
+    Ok(())
 }
 
 struct TerminalMode {
@@ -1300,11 +1301,8 @@ async fn execute_logged(
                 result = write_pty(&master, &queued[pending.0..pending.1]), if pending.0 < pending.1 && output_open => {
                     pending.0 += result?;
                 }
-                signal = interruptions.receive(), if cancellation.is_none() => {
-                    cancellation = Some(match signal {
-                        Ok(()) => anyhow::anyhow!("Omarchy update interrupted; inspect the update log before retrying"),
-                        Err(error) => error,
-                    });
+                () = interruptions.receive(), if cancellation.is_none() => {
+                    cancellation = Some(anyhow::anyhow!("Omarchy update interrupted; inspect the update log before retrying"));
                     interrupt_coordinator(&child)?;
                 }
                 _ = resized.recv(), if resize_terminal.is_some() => {
@@ -1433,6 +1431,91 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FixtureGroup(Option<nix::unistd::Pid>);
+
+    impl Drop for FixtureGroup {
+        fn drop(&mut self) {
+            if let Some(group) = self.0 {
+                let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct DescriptorObservation {
+        samples: u64,
+        inherited: [u64; 2],
+        inspection_error: Option<(usize, nix::errno::Errno)>,
+        expired: bool,
+    }
+
+    fn observe_coordination_descriptors(
+        files: &[std::sync::Arc<File>; 2],
+        ready: &std::sync::Barrier,
+        done: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> DescriptorObservation {
+        let mut observed = DescriptorObservation::default();
+        loop {
+            for (index, file) in files.iter().enumerate() {
+                match fcntl(file.as_ref(), FcntlArg::F_GETFD) {
+                    Ok(flags) => {
+                        if !FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC) {
+                            observed.inherited[index] += 1;
+                        }
+                    }
+                    Err(error) => {
+                        observed.inspection_error.get_or_insert((index, error));
+                    }
+                }
+            }
+            observed.samples += 1;
+            if observed.samples == 1 {
+                ready.wait();
+            }
+            if done.load(std::sync::atomic::Ordering::Acquire) {
+                return observed;
+            }
+            if std::time::Instant::now() >= deadline {
+                observed.expired = true;
+                return observed;
+            }
+        }
+    }
+
+    #[test]
+    fn descriptor_observer_detects_inheritable_files_and_deadline_expiry() {
+        use std::sync::{Arc, Barrier, atomic::AtomicBool};
+        let owner = private_directory();
+        let lock = Arc::new(open_owned_file(&owner.path().join("probe-lock")).unwrap());
+        let log = Arc::new(open_owned_file(&owner.path().join("probe-log")).unwrap());
+        for (flags, finished, expected) in [
+            (FdFlag::empty(), false, [1, 0]),
+            (FdFlag::FD_CLOEXEC, true, [0, 0]),
+        ] {
+            fcntl(lock.as_ref(), FcntlArg::F_SETFD(flags)).unwrap();
+            let ready = Arc::new(Barrier::new(2));
+            let observer = std::thread::spawn({
+                let files = [Arc::clone(&lock), Arc::clone(&log)];
+                let ready = Arc::clone(&ready);
+                move || {
+                    observe_coordination_descriptors(
+                        &files,
+                        &ready,
+                        &AtomicBool::new(finished),
+                        std::time::Instant::now(),
+                    )
+                }
+            });
+            ready.wait();
+            let observed = observer.join().unwrap();
+            assert_eq!(observed.samples, 1);
+            assert_eq!(observed.inherited, expected);
+            assert_eq!(observed.inspection_error, None);
+            assert_eq!(observed.expired, !finished);
+        }
+    }
 
     fn private_directory() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
@@ -2700,6 +2783,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_reader_recovers_from_stale_readiness() {
+        use std::io::Write;
+        use tokio::io::AsyncWriteExt;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            peer.set_nonblocking(true).unwrap();
+            peer.write_all(b"old").unwrap();
+            let reader = register_file(File::from(std::os::fd::OwnedFd::from(socket))).unwrap();
+            reader.readable().await.unwrap().retain_ready();
+            let mut old = [0_u8; 3];
+            assert_eq!(nix::unistd::read(reader.get_ref(), &mut old).unwrap(), 3);
+            assert_eq!(&old, b"old");
+            let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
+            let supply = tokio::spawn(async move { peer.write_all(b"new").await.unwrap() });
+            let mut received = [0_u8; 3];
+            assert_eq!(read_pty(&reader, &mut received).await.unwrap(), 3);
+            assert_eq!(&received, b"new");
+            supply.await.unwrap();
+        })
+        .await
+        .expect("stale readability must clear and await new input");
+    }
+
+    #[tokio::test]
+    async fn terminal_writer_recovers_from_stale_readiness() {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let writer = register_file(File::from(std::os::fd::OwnedFd::from(socket))).unwrap();
+            writer.writable().await.unwrap().retain_ready();
+            let mut queued = 0usize;
+            let stopped = loop {
+                match nix::unistd::write(writer.get_ref(), &[b'x'; 8192]) {
+                    Ok(count) => {
+                        assert!(count > 0);
+                        queued += count;
+                        assert!(queued < 4 * 1024 * 1024, "private socket fill budget");
+                    }
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(stopped, nix::errno::Errno::EAGAIN);
+            let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
+            let drain = tokio::spawn(async move {
+                let mut received = Vec::new();
+                peer.read_to_end(&mut received).await.unwrap();
+                received
+            });
+            assert_eq!(write_pty(&writer, b"!").await.unwrap(), 1);
+            drop(writer);
+            let received = drain.await.unwrap();
+            assert_eq!(received.len(), queued + 1);
+            assert_eq!(&received[..queued], vec![b'x'; queued]);
+            assert_eq!(received.last(), Some(&b'!'));
+        })
+        .await
+        .expect("stale writability must clear and resume after peer drain");
+    }
+
+    #[tokio::test]
+    async fn reaped_coordinator_and_stage_cleanup_are_idempotent() {
+        let program = crate::core::privilege::root_controlled_program_path("true").unwrap();
+        let mut child = Command::new(program).kill_on_drop(true).spawn().unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert!(child.id().is_none());
+        interrupt_coordinator(&child).expect("reaped coordinator needs no signal");
+        let mut commands = Commands::new(false, transport_runtime());
+        commands.active = Some(child);
+        commands
+            .stop_active()
+            .await
+            .expect("reap already completed stage");
+        assert!(commands.active.is_none());
+        commands.stop_active().await.expect("repeat empty cleanup");
+    }
+
+    #[tokio::test]
+    async fn fixture_group_guard_stops_only_its_owned_group_and_can_disarm() {
+        let program = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+        let spawn = || {
+            Command::new(&program)
+                .arg("30")
+                .process_group(0)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        let mut owned = spawn();
+        let mut unrelated = spawn();
+        let group = nix::unistd::Pid::from_raw(i32::try_from(owned.id().unwrap()).unwrap());
+        drop(FixtureGroup(Some(group)));
+        let status = tokio::time::timeout(Duration::from_secs(3), owned.wait())
+            .await
+            .expect("owned group is stopped promptly")
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
+        assert!(unrelated.try_wait().unwrap().is_none());
+
+        let mut guard = FixtureGroup(Some(nix::unistd::Pid::from_raw(
+            i32::try_from(unrelated.id().unwrap()).unwrap(),
+        )));
+        guard.0 = None;
+        drop(guard);
+        assert!(unrelated.try_wait().unwrap().is_none());
+        unrelated.kill().await.expect("reap private control child");
+    }
+
+    #[tokio::test]
     async fn private_commands_preserve_status_and_cancelled_children_are_reaped() {
         let mut commands = Commands::new(false, transport_runtime());
         let program =
@@ -2765,12 +2960,6 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_terminates_surviving_descendants() {
-        struct KillGroup(nix::unistd::Pid);
-        impl Drop for KillGroup {
-            fn drop(&mut self) {
-                let _ = nix::sys::signal::killpg(self.0, nix::sys::signal::Signal::SIGKILL);
-            }
-        }
         let owner = private_directory();
         let ready = owner.path().join("descendant");
         let program =
@@ -2799,9 +2988,9 @@ mod tests {
             .as_ref()
             .and_then(tokio::process::Child::id)
             .expect("owned leader");
-        let _cleanup = KillGroup(nix::unistd::Pid::from_raw(
+        let mut cleanup = FixtureGroup(Some(nix::unistd::Pid::from_raw(
             i32::try_from(leader).expect("leader PID"),
-        ));
+        )));
         let descendant: i32 = std::fs::read_to_string(&ready)
             .expect("descendant identity")
             .parse()
@@ -2820,6 +3009,7 @@ mod tests {
         })
         .await
         .expect("TERM-ignoring stage descendant must stop after cleanup");
+        cleanup.0 = None;
     }
 
     #[tokio::test]
@@ -2893,14 +3083,6 @@ mod tests {
 
     #[tokio::test]
     async fn real_pty_master_disconnect_preserves_cleanup() {
-        struct KillGroup(Option<nix::unistd::Pid>);
-        impl Drop for KillGroup {
-            fn drop(&mut self) {
-                if let Some(group) = self.0 {
-                    let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
-                }
-            }
-        }
         let owner = private_directory();
         let (master, slave) = open_transport_pty(None).expect("private PTY pair");
         let program =
@@ -2920,7 +3102,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("private controlling-terminal fixture");
-        let mut group = KillGroup(None);
+        let mut group = FixtureGroup(None);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(value) = std::fs::read_to_string(owner.path().join("ready"))
@@ -3456,34 +3638,12 @@ mod tests {
             let ready = Arc::clone(&ready);
             let done = Arc::clone(&done);
             std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(20);
-                let mut samples = 0_u64;
-                let mut inherited = [0_u64; 2];
-                let mut inspection_error = None;
-                loop {
-                    for (index, file) in [&lock, &log].into_iter().enumerate() {
-                        match fcntl(file.as_ref(), FcntlArg::F_GETFD) {
-                            Ok(flags) => {
-                                if !FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC) {
-                                    inherited[index] += 1;
-                                }
-                            }
-                            Err(error) => {
-                                inspection_error.get_or_insert((index, error));
-                            }
-                        }
-                    }
-                    samples += 1;
-                    if samples == 1 {
-                        ready.wait();
-                    }
-                    if done.load(Ordering::Acquire) {
-                        return (samples, inherited, inspection_error, false);
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return (samples, inherited, inspection_error, true);
-                    }
-                }
+                observe_coordination_descriptors(
+                    &[lock, log],
+                    &ready,
+                    &done,
+                    std::time::Instant::now() + Duration::from_secs(20),
+                )
             })
         };
         ready.wait();
@@ -3507,8 +3667,12 @@ mod tests {
         done.store(true, Ordering::Release);
         let observation = observer.join();
 
-        let (samples, inherited, inspection_error, expired) =
-            observation.expect("descriptor observer joins before checking launch results");
+        let DescriptorObservation {
+            samples,
+            inherited,
+            inspection_error,
+            expired,
+        } = observation.expect("descriptor observer joins before checking launch results");
         assert!(
             !expired,
             "descriptor observer exceeded its independent deadline"
