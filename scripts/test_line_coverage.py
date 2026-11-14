@@ -242,7 +242,131 @@ class SourceConstructCapacityTests(unittest.TestCase):
 
 
 class SourceAwareCoverageTests(unittest.TestCase):
-    def changed_async_arguments_compare(self, mutation=None, base_called=True):
+    def changed_callback_compare(self, mutation=None, context_change=False, joint=False, callback_form='||',
+                                 header_end='brace'):
+        def function(name, operation, setup='setup'):
+            return (f'#[test]\nfn {name}() {{\n    {setup}();\n    isolate("MODE", {callback_form} {{\n'
+                    f'        {operation}();\n        verify();\n        finish();\n    }});\n}}\n')
+        old = (function('checked', 'old_step') + function('retained', 'old_step')).encode()
+        new = (function('checked', 'new_step', 'different_setup' if context_change else 'setup')
+               + function('retained', 'old_step')).encode()
+        def owners(base, head):
+            for document, source in ((base, old), (head, new)):
+                lines = source.decode().splitlines(); members = []
+                for name, first in (('checked', 2), ('retained', 11)):
+                    opening = lines[first - 1].index('{') + 1
+                    call = first + 2; body = lines[call - 1].index('{') + 1
+                    for number in range(2):
+                        parent = f'_RNvCs{number + 1}_7examples_{len(name)}{name}'
+                        members.extend([
+                            dict(name=parent, count=1, filenames=['/src/example.rs'], regions=[
+                                [first, 1, first, opening - int(header_end == 'token'), 1, 0, 0, 0],
+                                [first + 1, 5, first + 1, len(lines[first]) + 1, 1, 0, 0, 0],
+                                [call, 5, call, 12, 1, 0, 0, 0],
+                                [first + 7, 1, first + 7, 2, 1, 0, 0, 0]]),
+                            dict(name='_RNC' + parent[2:] + '0B3_', count=1,
+                                 filenames=['/src/example.rs'], regions=[
+                                     [call, body, call, body + 1, 1, 0, 0, 0],
+                                     [call + 1, 9, call + 1, len(lines[call]) + 1, 1, 0, 0, 0],
+                                     [call + 2, 9, call + 2, len(lines[call + 1]) + 1, 1, 0, 0, 0],
+                                     [call + 3, 9, call + 3, len(lines[call + 2]) + 1, 1, 0, 0, 0],
+                                     [call + 4, 5, call + 4, 6, 1, 0, 0, 0]])])
+                if joint:
+                    for number in (1, 3):
+                        for index in (2, 3):
+                            members[number]['regions'][index][4] = int(number == 1)
+                document['data'][0]['functions'] = members
+            if mutation:
+                mutation(head['data'][0]['functions'])
+        counts = [(line, 2) for line in range(1, 19) if line not in (1, 10)]
+        return self.compare(before=counts, after=counts, mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_changed_callback_body_keeps_precise_parent_and_child_obligations(self):
+        result = self.changed_callback_compare()
+        self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        proofs = result['positive_source_fragments']
+        self.assertTrue(any(row.get('callback_fragments') for row in proofs))
+
+    def test_changed_callback_accepts_move_closure(self):
+        self.changed_callback_compare(callback_form='move ||')
+
+    def test_changed_callback_accepts_header_region_ending_at_its_last_token(self):
+        self.changed_callback_compare(header_end='token')
+
+    def test_changed_callback_refuses_partial_duplicate_or_changed_header_regions(self):
+        def mutate(owners, mode):
+            for owner in (owners[0], owners[2]):
+                if mode == 'duplicate':
+                    owner['regions'].append(copy.deepcopy(owner['regions'][0]))
+                else:
+                    owner['regions'][0][3] -= 2 if mode == 'partial' else 1
+        for mode in ('partial', 'duplicate', 'changed-geometry'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.changed_callback_compare(lambda owners: mutate(owners, mode))
+
+    def test_changed_callback_refuses_boolean_or_and_async_closure(self):
+        for form in ('ready ||', 'async ||', 'async move ||'):
+            with self.subTest(form=form), self.assertRaises(ValueError):
+                self.changed_callback_compare(callback_form=form)
+
+    def test_changed_callback_body_refuses_cold_missing_or_aliased_owners(self):
+        def mutate(owners, mode):
+            if mode == 'cold-parent':
+                owners[0]['count'] = owners[0]['regions'][0][4] = 0
+            elif mode == 'cold-child':
+                owners[1]['count'] = owners[1]['regions'][0][4] = 0
+            elif mode == 'cold-call-prefix': owners[0]['regions'][2][4] = 0
+            elif mode == 'cold-parent-setup': owners[0]['regions'][1][4] = 0
+            elif mode == 'cold-child-work': owners[1]['regions'][2][4] = 0
+            elif mode == 'missing-child': owners.pop(1)
+            elif mode == 'duplicate-ordinal':
+                extra = copy.deepcopy(owners[1])
+                extra['name'] = extra['name'].replace('checked0B3_', 'checkeds_0B3_')
+                owners.append(extra)
+            elif mode == 'different-item':
+                for owner in owners[:4]: owner['name'] = owner['name'].replace('s_7checked', 's0_7checked')
+        for mode in ('cold-parent', 'cold-child', 'cold-call-prefix', 'cold-parent-setup', 'cold-child-work',
+                     'missing-child', 'duplicate-ordinal', 'different-item'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.changed_callback_compare(lambda owners: mutate(owners, mode))
+        with self.assertRaises(ValueError):
+            self.changed_callback_compare(context_change=True)
+
+    def test_changed_callback_fragments_require_one_joint_parent_child_matching(self):
+        self.changed_callback_compare(joint=True)
+        def split(owners):
+            owners[1]['regions'][3][4] = 0
+            owners[3]['regions'][3][4] = 1
+        with self.assertRaises(ValueError):
+            self.changed_callback_compare(mutation=split, joint=True)
+
+    def test_rust_function_paths_preserve_identifier_disambiguators(self):
+        symbol = '_RNvNtCs1_7example5testss_7checked'
+        path = coverage.plain_rust_function_symbol(symbol)
+        self.assertIsNotNone(path)
+        self.assertEqual(path.identifiers, ('example', 'tests', 'checked'))
+        self.assertEqual(path.disambiguators, ('', '', 's_'))
+        self.assertEqual(path.identity, (('example', ''), ('tests', ''), ('checked', 's_')))
+        other = coverage.plain_rust_function_symbol('_RNvNtCs2_7examples_5testss0_7checked')
+        self.assertEqual(other.identifiers, path.identifiers)
+        self.assertNotEqual(other.identity, path.identity)
+
+    def test_rust_function_paths_keep_crate_copies_separate_from_item_identity(self):
+        paths = [coverage.plain_rust_function_symbol(f'_RNvNtCs{number}_7example5testss_7checked')
+                 for number in (1, 2)]
+        self.assertTrue(all(path is not None for path in paths))
+        self.assertEqual(paths[0].identity, paths[1].identity)
+
+    def test_rust_function_paths_refuse_incomplete_or_instantiated_identifiers(self):
+        for symbol in ('_RNvNtCs1_7example5testss7checked',
+                       '_RNvNtCs1_7example5testss_7checkedC3foo',
+                       '_RNvNtCs1_7example5testss_8checked'):
+            with self.subTest(symbol=symbol):
+                self.assertIsNone(coverage.plain_rust_function_symbol(symbol))
+
+    def changed_async_arguments_compare(self, mutation=None, base_called=True, base_mutation=None):
         old = (b'async fn checked() {\n    enforce(\n        old_argument(),\n    );\n}\n'
                b'async fn retained() {\n    enforce(\n        old_argument(),\n    );\n}\n')
         new = old.replace(b'old_argument()', b'new_argument()', 1)
@@ -269,6 +393,8 @@ class SourceAwareCoverageTests(unittest.TestCase):
                     owner['count'] = 0
                     for region in owner['regions']:
                         region[4] = 0
+            if base_mutation:
+                base_mutation(base['data'][0]['functions'])
         return self.compare(before=[(line, 2 if base_called or line > 5 else 0) for line in range(1, 11)],
             after=[(line, 2) for line in range(1, 11)], mutate=owners,
             sources=({'example.rs': old}, {'example.rs': new}))
@@ -284,6 +410,33 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
                                                  'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
         self.assertTrue(result['positive_source_fragments'])
+
+    def test_async_call_head_keeps_different_raw_annotations_distinct(self):
+        def original(owners):
+            for owner in (owners[1], owners[3]):
+                owner['regions'].append([2, 5, 2, 12, 1, 0, 0, 0])
+        def current(owners):
+            for owner in (owners[1], owners[3]):
+                owner['regions'][1][1:4] = [5, 2, 12]
+        # Equal observed hit counts do not prove that two compiler counters
+        # represent the same work. Preserve the refusal until identity is proved.
+        with self.assertRaisesRegex(ValueError, r'example\.rs:2-2 -> 2-2'):
+            self.changed_async_arguments_compare(current, base_mutation=original)
+
+    def test_async_call_head_refuses_mixed_partial_or_punctuation_only_contributors(self):
+        def extra(owners, mode):
+            for owner in (owners[1], owners[3]):
+                row = {'mixed': [2, 5, 2, 12, 0, 0, 0, 0],
+                       'partial': [2, 6, 2, 12, 1, 0, 0, 0],
+                       'punctuation': [2, 12, 2, 13, 1, 0, 0, 0]}[mode]
+                owner['regions'].append(row)
+        def current(owners):
+            for owner in (owners[1], owners[3]):
+                owner['regions'][1][1:4] = [5, 2, 12]
+        for mode in ('mixed', 'partial', 'punctuation'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.changed_async_arguments_compare(current,
+                    base_mutation=lambda owners: extra(owners, mode))
 
     def test_changed_async_arguments_cannot_borrow_phase_or_subexpression_hits(self):
         def mutate(owners, mode):
@@ -378,6 +531,13 @@ class SourceAwareCoverageTests(unittest.TestCase):
             owners[1][3]['regions'][2][4] = 1
         with self.assertRaises(ValueError):
             self.async_positive_fragment_compare(split_hits, joint=True)
+
+    def test_async_fragment_failure_identifies_the_fragment_being_checked(self):
+        def change_second_fragment(owners):
+            for owner in (owners[1][1], owners[1][3]):
+                owner['regions'].append([5, 5, 5, 11, 0, 0, 0, 0])
+        with self.assertRaisesRegex(ValueError, r'example\.rs:5-5 -> 5-5'):
+            self.async_positive_fragment_compare(change_second_fragment, joint=True)
 
     def async_endpoint_compare(self, alternative_kind='else'):
         old = ['async fn checked(', '    old: bool,', ') {', '    if old {',
@@ -1044,15 +1204,43 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 parent_states=((1, 0), (1, 0)), child_states=((1, 0), (0, 1)))
         def duplicate(owners, sources):
             owners[1].append(dict(owners[1][1]))
+        def duplicate_ordinal(owners, sources):
+            extra = copy.deepcopy(owners[1][1])
+            extra['name'] = extra['name'].replace('retained0B3_', 'retaineds_0B3_')
+            owners[1].append(extra)
         def wrong_parent(owners, sources):
             owners[1][1]['name'] = '_RNCNvCs9_7example8retained0B3_'
         duplicate_source = old.replace('    consume(|| verify_archive_signature());',
             '    consume(|| verify_archive_signature());\n    consume(|| verify_archive_signature());')
         self.assertEqual(self.attribution_obligations(duplicate_source,
             duplicate_source.replace('old();', 'new();'), callbacks=True)[0], {})
-        for mutate in (duplicate, wrong_parent):
+        for mutate in (duplicate, duplicate_ordinal, wrong_parent):
             with self.subTest(mutation=mutate.__name__):
                 result = self.attribution_obligations(old, new, callbacks=True, mutation=mutate)
+                self.assertEqual(result[0], {})
+
+    def test_callback_capsules_preserve_item_disambiguators_and_namespace(self):
+        old = 'fn retained() {\n    old();\n    consume(|| verify_archive_signature());\n    finish();\n}\n'
+        new = old.replace('old();', 'new();')
+        def identity(owners, sources, mode):
+            for side, members in enumerate(owners):
+                for owner in members:
+                    if mode in ('stable', 'different-function'):
+                        discriminator = 's0_' if mode == 'different-function' and side == 1 else 's_'
+                        owner['name'] = owner['name'].replace('8retained', discriminator + '8retained')
+                    else:
+                        discriminator = 's_' if side == 1 else ''
+                        owner['name'] = (owner['name'].replace('NvCs', 'NvNtCs')
+                            .replace('_7example8retained', '_7example' + discriminator + '5tests8retained')
+                            .replace('B3_', 'B5_'))
+        pairs, receipts, _ = self.attribution_obligations(old, new, callbacks=True,
+            mutation=lambda owners, sources: identity(owners, sources, 'stable'))
+        self.assertIn((3, 3), pairs.items())
+        self.assertTrue(receipts)
+        for mode in ('different-function', 'different-module'):
+            with self.subTest(mode=mode):
+                result = self.attribution_obligations(old, new, callbacks=True,
+                    mutation=lambda owners, sources: identity(owners, sources, mode))
                 self.assertEqual(result[0], {})
 
     def test_repeated_statements_require_unique_ancestor_source_context(self):

@@ -794,6 +794,26 @@ def compiled_hit_state_matching(before, after):
     return matching
 
 
+@dataclass(frozen=True)
+class RustFunctionPath:
+    modules: int
+    identifiers: tuple[str, ...]
+    disambiguators: tuple[str, ...]
+
+    @property
+    def identity(self):
+        return tuple(zip(self.identifiers, self.disambiguators))
+
+
+@dataclass(frozen=True)
+class CallbackCapsule:
+    preceding: str
+    tokens: tuple[str, ...]
+    context: tuple
+    namespace: tuple
+    function_disambiguator: str
+
+
 def plain_rust_function_symbol(symbol):
     """Recognize only complete ASCII v0 free-function paths without instantiating suffixes."""
     if type(symbol) is not str or len(symbol) > 4096:
@@ -802,8 +822,12 @@ def plain_rust_function_symbol(symbol):
     if prefix is None:
         return None
     modules = len(prefix[1]) // 2
-    at = prefix.end(); identifiers = []
-    for _ in range(modules + 2):
+    at = prefix.end(); identifiers = []; disambiguators = []
+    for index in range(modules + 2):
+        discriminator = re.match(r's[0-9A-Za-z]{0,32}_', symbol[at:]) if index else None
+        disambiguators.append(discriminator[0] if discriminator else '')
+        if discriminator:
+            at += len(discriminator[0])
         length = re.match(r'[1-9][0-9]{0,3}', symbol[at:])
         if length is None:
             return None
@@ -818,7 +842,7 @@ def plain_rust_function_symbol(symbol):
         identifiers.append(value); at += size
     if at != len(symbol):
         return None
-    return modules, identifiers
+    return RustFunctionPath(modules, tuple(identifiers), tuple(disambiguators))
 
 
 def direct_rust_callback_symbol(child, parent, modules):
@@ -841,7 +865,7 @@ def demangle_plain_rust_callbacks(symbols):
     parents = {symbol: plain_rust_function_symbol(symbol) for symbol in symbols}
     parents = {symbol: shape for symbol, shape in parents.items() if shape is not None}
     if not parents or any(symbol not in parents and sum(
-            direct_rust_callback_symbol(symbol, parent, shape[0])
+            direct_rust_callback_symbol(symbol, parent, shape.modules)
             for parent, shape in parents.items()) != 1 for symbol in symbols):
         raise ValueError('Unsupported raw Rust callback context')
     payload = ('\n'.join(symbols) + '\n').encode('ascii')
@@ -989,13 +1013,13 @@ def nested_map_err_states(source, group, inventory, name_counts, first, last, co
     for owner in members:
         shape = plain_rust_function_symbol(owner['name'])
         declaration = re.search(r'\bfn\s+([A-Za-z_]\w*)', source[group[0] - 1])
-        if shape is None or declaration is None or shape[1][-1] != declaration[1]:
+        if shape is None or declaration is None or shape.identifiers[-1] != declaration[1]:
             return None
         parents.append(shape)
     linked = []
     for owner, shape in zip(members, parents):
         children = [child for child in extras
-                    if direct_rust_callback_symbol(child['name'], owner['name'], shape[0])]
+                    if direct_rust_callback_symbol(child['name'], owner['name'], shape.modules)]
         if len(children) != 1 or name_counts[children[0]['name']] != 1:
             return None
         child = children[0]
@@ -1016,7 +1040,7 @@ def nested_map_err_states(source, group, inventory, name_counts, first, last, co
     for owner, child, shape in zip(members, linked, parents):
         parts = decoded[owner['name']].split('::')
         crate = re.fullmatch(r'([A-Za-z_]\w*)(?:\[[0-9a-f]+\])?', parts[0])
-        if crate is None or [crate[1], *parts[1:]] != shape[1]:
+        if crate is None or (crate[1], *parts[1:]) != shape.identifiers:
             return None
         if re.fullmatch(re.escape(decoded[owner['name']]) + r'::\{closure#[0-9]+\}', decoded[child['name']]) is None:
             return None
@@ -1032,7 +1056,11 @@ def nested_map_err_states(source, group, inventory, name_counts, first, last, co
         owners=[dict(parent=owner['name'], child=child['name'], parent_identity=decoded[owner['name']],
                      child_identity=decoded[child['name']]) for owner, child in zip(members, linked)],
         decoder=tool, limitation='Structural callback ownership and construction syntax only; no value or runtime-role equivalence')
-    return states, (tuple(body), bindings[0], geometry[0]), proof
+    disambiguators = {parent.disambiguators for parent in parents}
+    if len(disambiguators) != 1:
+        return None
+    proof['parent_disambiguators'] = list(parents[0].disambiguators)
+    return states, (tuple(body), bindings[0], geometry[0], parents[0].disambiguators), proof
 
 
 def _compiled_function_groups(name, owners, files, source, work=None):
@@ -1114,18 +1142,18 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
         for owner in eligible:
             _construct_charge(work, len(owner['name']) + len(owner['regions']))
             shape = plain_rust_function_symbol(owner['name'])
-            if (shape is not None and shape[1][-1] == declaration
+            if (shape is not None and shape.identifiers[-1] == declaration
                     and len(owner['regions']) == 1
                     and tuple(owner['regions'][0][:4]) == (*first, opening[0], opening[1] - 1)):
                 parents.append((owner, shape))
-        if not parents or len({tuple(shape[1]) for _, shape in parents}) != 1:
+        if not parents or len({shape.identity for _, shape in parents}) != 1:
             continue
         copies = []
         for parent, shape in parents:
             children = []
             for owner in eligible:
                 _construct_charge(work, len(owner['name']) + len(owner['regions']))
-                if not direct_rust_callback_symbol(owner['name'], parent['name'], shape[0]):
+                if not direct_rust_callback_symbol(owner['name'], parent['name'], shape.modules):
                     continue
                 regions = owner['regions']
                 if (min(tuple(region[:2]) for region in regions) == opening
@@ -1143,7 +1171,7 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
                     for copy in copies}
         if len(geometry) != 1:
             continue
-        key = 'async:' + '::'.join(parents[0][1][1])
+        key = 'async:' + repr(parents[0][1].identity)
         if key in result:
             return {}
         result[key] = AsyncFunctionGroup(prefixes[span], span, tuple(copies), closing_kinds)
@@ -1165,14 +1193,133 @@ def fragment_region_states(owner, first, last, source, work):
     return tuple(shape for shape, _ in pieces), tuple(state for _, state in pieces)
 
 
+@dataclass(frozen=True)
+class CallbackFragmentEvidence:
+    states: tuple
+    line_states: tuple
+    signature: tuple
+    witness: dict
+
+
+@dataclass(frozen=True)
+class DeferredSourceFragment:
+    target: int
+    kind: str
+    function_prefix: str
+
+
+def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, inventory, work):
+    """Prove fragment execution through a uniquely source-bound direct callback."""
+    if inventory is None:
+        return None
+    code = inventory[0]
+    _construct_charge(work, len(inventory[1]) + len(owners))
+    functions = [row for row in inventory[1] if row['kind'] == 'fn' and 'fn' in row['header']
+                 and code.position(code.starts[row['first'] + row['header'].index('fn')])[0] == group[0]
+                 and code.position(code.ends[row['end']])[0] == group[1]]
+    if len(functions) != 1:
+        return None
+    function = functions[0]; header = function['header']; fn = header.index('fn')
+    if list(header[:fn]) not in ([], ['pub'], ['pub', '(', 'crate', ')'], ['#', '[', 'test', ']']):
+        return None
+    candidates = [row for row in inventory[1] if row['opening'] is not None
+                  and function['opening'] < row['opening'] < row['end'] < function['end']
+                  and code.words[row['opening'] - 1] == '||'
+                  and code.parents[row['opening']] is not None
+                  and code.words[code.parents[row['opening']]] == '('
+                  and code.position(code.starts[row['opening']])[0] <= first <= last
+                      <= code.position(code.ends[row['end']])[0]]
+    if len(candidates) != 1:
+        return None
+    callback = candidates[0]
+    argument = callback['opening'] - 1
+    if argument > 0 and code.words[argument - 1] == 'move':
+        argument -= 1
+    # A zero-argument closure starts an argument; boolean OR does not.
+    if argument == 0 or code.words[argument - 1] not in ('(', ','):
+        return None
+    if code.parents[argument] != code.parents[callback['opening']]:
+        return None
+    prefix = tuple(code.words[function['opening'] + 1:callback['opening']])
+    _construct_charge(work, len(prefix) + len(header))
+    if any(word in ('!', '#') for word in prefix):
+        return None
+    opening = code.position(code.starts[callback['opening']])
+    closing = code.position(code.ends[callback['end']])
+    body_opening = code.position(code.starts[function['opening']])
+    header_end = code.position(code.ends[function['opening'] - 1])
+    leading = len(source[group[0] - 1]) - len(source[group[0] - 1].lstrip()) + 1
+    function_start = group[0], leading
+    states = []; line_states = []; identities = []; geometries = []; witnesses = []
+    bound = {id(parent) for parent in group[2]}; children_bound = set()
+    for parent in group[2]:
+        shape = plain_rust_function_symbol(parent['name'])
+        if shape is None or shape.identifiers[-1] != header[fn + 1] or name_counts[parent['name']] != 1:
+            return None
+        parent_entries = [row for row in parent['regions']
+                          if tuple(row[:2]) == function_start
+                          and tuple(row[2:4]) in (header_end, body_opening)]
+        if (type(parent.get('count')) is not int or not 0 <= parent['count'] < COUNTER_LIMIT
+                or len(parent_entries) != 1 or parent_entries[0][4] != parent['count']):
+            return None
+        children = []
+        for owner in owners:
+            _construct_charge(work, len(owner['name']) + len(owner['regions']))
+            if (direct_rust_callback_symbol(owner['name'], parent['name'], shape.modules)
+                    and min(tuple(row[:2]) for row in owner['regions']) == opening
+                    and max(tuple(row[2:4]) for row in owner['regions']) == closing):
+                children.append(owner)
+        if len(children) != 1:
+            return None
+        child = children[0]
+        entries = [row for row in child['regions']
+                   if tuple(row[:4]) == (*opening, opening[0], opening[1] + 1)]
+        if (child['filenames'] != parent['filenames'] or name_counts[child['name']] != 1
+                or id(child) in children_bound or type(child.get('count')) is not int
+                or not 0 <= child['count'] < COUNTER_LIMIT
+                or len(entries) != 1 or entries[0][4] != child['count']):
+            return None
+        children_bound.add(id(child)); bound.add(id(child)); identities.append(shape.identity)
+        parent_geometry, parent_states = fragment_region_states(parent, first, last, source, work)
+        child_geometry, child_states = fragment_region_states(child, first, last, source, work)
+        context_geometry, context_states = fragment_region_states(parent, group[0], opening[0], source, work)
+        if not child_geometry:
+            return None
+        geometries.append((parent_geometry, child_geometry, context_geometry))
+        states.append((int(parent['count'] > 0), int(child['count'] > 0),
+                       *context_states, *parent_states, *child_states))
+        _construct_charge(work, (last - first + 1) * (len(parent['regions']) + len(child['regions'])))
+        line_states.append(tuple(int(any(row[4] > 0 and owner_covers_lines([row], line, line)
+            for owner in (parent, child) for row in owner['regions'])) for line in range(first, last + 1)))
+        witnesses.append(dict(parent=parent['name'], child=child['name'],
+                              parent_entry=int(parent['count'] > 0), child_entry=int(child['count'] > 0)))
+    if len(set(identities)) != 1 or len(set(geometries)) != 1:
+        return None
+    _construct_charge(work, sum(len(owner['regions']) for owner in owners) * (last - first + 1))
+    if any(id(owner) not in bound and any(owner_covers_lines([row], line, line)
+           for row in owner['regions'] for line in range(first, last + 1)) for owner in owners):
+        return None
+    signature = ('zero-arg-callback-fragment', identities[0], tuple(header), prefix, geometries[0])
+    witness = dict(kind='zero-arg-callback-fragment', owners=witnesses,
+        callback_span=[list(opening), list(closing)],
+        context_sha256=hashlib.sha256(repr(signature[:-1]).encode()).hexdigest(),
+        parent_geometry=[list(row) for row in geometries[0][0]],
+        child_geometry=[list(row) for row in geometries[0][1]],
+        parent_context_geometry=[list(row) for row in geometries[0][2]],
+        limitation='Fragment execution only; no argument-value or callee-semantic equivalence')
+    return CallbackFragmentEvidence(tuple(states), tuple(line_states), signature, witness)
+
+
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
-                              fragments, work=None, construct_inventories=None, compiled_groups=None):
+                              fragments, work=None, construct_inventories=None, compiled_groups=None,
+                              callback_functions=()):
     """Prove positive head pairs, retaining every base state, copy and candidate."""
     if not fragments:
         return {}, []
     work = [20_000_000] if work is None else work
+    current_fragment = fragments[0]
     def refuse():
-        a, b, c, d, _ = fragments[0]
+        a, b, c, d, _ = current_fragment
         raise ValueError(f"Ambiguous unchanged source correspondence: {name}:{a + 1}-{b} -> {c + 1}-{d}")
     inventories = []; groups = []; inventory_names = []; async_groups = []
     for side, (owners, files, source) in enumerate(((base, base_files, old), (head, head_files, new))):
@@ -1203,8 +1350,9 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
     forwarders = transparent_forwarder_groups(old, new, groups, fragments)
     for prefix, (group, _) in forwarders.items():
         groups[1][prefix] = group
-    claimed = {}; pairs = {}; excerpts = {}; callback_sources = {}; callback_work = 20_000_000
+    claimed = {}; pairs = {}; excerpts = {}; callback_sources = {}; callback_inventories = {}; callback_work = 20_000_000
     for a, b, c, d, pending in fragments:
+        current_fragment = (a, b, c, d, pending)
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
                       and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
@@ -1251,7 +1399,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             endpoint_kind = async_groups[0][prefix].closing_kinds.get(a + 1)
             if endpoint_kind is None or endpoint_kind != async_groups[1][prefix].closing_kinds.get(c + 1):
                 refuse()
-        occurrences = []; callback_signature = None; callback_mode = None; precise_signature = None
+        occurrences = []; callback_signature = None; callback_mode = None; precise_signature = None; scoped_callback = False
         for side, source, counts, group, proposed in ((0, old, before, bg, a), (1, new, after, hg, c)):
             start, end, members = group
             starts = [offset for offset in range(start - 1, end - (b - a) + 1)
@@ -1271,11 +1419,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 lines = [offset + line - a for line in pending]
                 if (any(line not in counts or (side == 1 and counts[line] <= 0)
                         or (side == 0 and (counts[line] > 0) != (before[original] > 0))
-                        for original, line in zip(pending, lines))
-                        or any(not owner_covers_lines(owner["regions"], line, line)
-                               for owner in members for line in range(offset + 1, offset + b - a + 1)
-                               if line in counts)):
+                        for original, line in zip(pending, lines))):
                     refuse()
+                parents_cover = all(owner_covers_lines(owner['regions'], line, line)
+                                    for owner in members for line in range(offset + 1, offset + b - a + 1)
+                                    if line in counts)
                 touched = {id(owner) for owner in inventories[side] if any(
                     owner_covers_lines([region], line, line) for region in owner["regions"]
                     for line in range(offset + 1, offset + b - a + 1))}
@@ -1283,7 +1431,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 if callback_mode is not None and callback_mode != nested:
                     refuse()
                 callback_mode = nested
-                children = [()] * len(members)
+                children = [()] * len(members); callback_lines = None
                 if nested:
                     if side not in callback_sources:
                         callback_sources[side] = _boolean_source(source)
@@ -1291,15 +1439,34 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     callback_work -= 8 * len(code.words) if code is not None else 0
                     if callback_work < 0:
                         refuse()
-                    callback = nested_map_err_states(source, group, inventories[side],
-                        inventory_names[side], offset + 1, offset + b - a, code)
-                    if callback is None or callback_signature is not None and callback_signature != callback[1]:
-                        refuse()
-                    children, callback_signature, witness = callback
-                    entry.setdefault('nested_callbacks', []).append(dict(side=side, candidate=offset + 1, **witness))
-                states = tuple(tuple(int(any(region[4] > 0 and owner_covers_lines([region], line, line)
+                    callback = (nested_map_err_states(source, group, inventories[side],
+                        inventory_names[side], offset + 1, offset + b - a, code) if parents_cover else None)
+                    if callback is not None:
+                        if callback_signature is not None and callback_signature != callback[1]:
+                            refuse()
+                        children, callback_signature, witness = callback
+                        entry.setdefault('nested_callbacks', []).append(dict(side=side, candidate=offset + 1, **witness))
+                    else:
+                        if prefix not in callback_functions:
+                            refuse()
+                        if side not in callback_inventories:
+                            callback_inventories[side] = (_construct_inventory(source, work)
+                                if construct_inventories is None else construct_inventories[side])
+                        callback = zero_arg_callback_fragment(source, group, inventories[side],
+                            inventory_names[side], offset + 1, offset + b - a, callback_inventories[side], work)
+                        if callback is None or callback_signature is not None and callback_signature != callback.signature:
+                            refuse()
+                        children = callback.states; callback_lines = callback.line_states
+                        callback_signature = callback.signature; scoped_callback = True
+                        entry.setdefault('callback_owners', []).append(dict(side=side, candidate=offset + 1, **callback.witness))
+                elif not parents_cover:
+                    refuse()
+                parent_lines = tuple(tuple(int(any(region[4] > 0 and owner_covers_lines([region], line, line)
                                              for region in owner["regions"])) for line in lines) + tuple(child)
                                for owner, child in zip(members, children))
+                states = (parent_lines if callback_lines is None else tuple(
+                    tuple(row[line - offset - 1] for line in lines) + tuple(child)
+                    for row, child in zip(callback_lines, children)))
                 if (any(bool(counts[line]) != any(row[column] for row in states)
                         for column, line in enumerate(lines))
                         or observed is not None and observed != states):
@@ -1323,6 +1490,10 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 for row, states in zip(entry['states'][side], precise_observed):
                     row.extend(states)
             occurrences.append([[offset + 1, offset + b - a] for offset in starts])
+        if scoped_callback:
+            entry.setdefault('callback_fragments', []).append(dict(
+                pairs=[[line, c + line - a] for line in pending],
+                base_range=[a + 1, b], head_range=[c + 1, d]))
         if precise_signature is not None:
             entry.setdefault('async_fragment_regions', []).append(dict(
                 base_range=[a + 1, b], head_range=[c + 1, d],
@@ -1596,7 +1767,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                            and tuple(region[2:4]) > (pair[side], 1)
                            for region in child['regions'] for pair in ordered):
                     continue
-                if shape is None or not direct_rust_callback_symbol(child['name'], parent['name'], shape[0]):
+                if shape is None or not direct_rust_callback_symbol(child['name'], parent['name'], shape.modules):
                     continue
                 if compiled[2][child['name']] != 1 or len(child['filenames']) != 1:
                     return None
@@ -1611,10 +1782,12 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 if not enclosing:
                     return None
                 opening, closing, value = min(enclosing, key=lambda row: row[1] - row[0])
-                if (counts[value] != 1 or value in children or value[0] in ('!', '#')
+                identity = CallbackCapsule(value[0], value[1], value[2],
+                                          shape.identity[:-1], shape.disambiguators[-1])
+                if (counts[value] != 1 or identity in children or value[0] in ('!', '#')
                         or any(word in ('!', '#') for word in value[1])):
                     return None
-                children[value] = (child, opening, closing)
+                children[identity] = (child, opening, closing)
                 all_children.add(id(child))
             result.append(children)
         return result, all_children
@@ -1991,7 +2164,9 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
             for parent, children in zip(group[2], callbacks[side][0])]
             for side, group in enumerate(groups)]
         _construct_charge(work, sum(4 * len(word) + 8 for key in callback_keys
-                                   for part in ((key[0],), key[1], *key[2]) for word in part))
+                                   for part in ((key.preceding,), key.tokens, *key.context,
+                                                *(tuple(value) for value in key.namespace),
+                                                (key.function_disambiguator,)) for word in part))
         _construct_charge(work, sum(len(repr(binding)) for binding in macro_bindings.values()))
         receipt = dict(file=name, pairs=[[line, target] for line, target in mapped.items()
                                               if line in before and target in after],
@@ -2344,9 +2519,12 @@ def retained_construct_anchors(name, old, new, before, after, base, head, base_f
                     candidates = [parent] if any(owner_covers_lines([row], bounds[1], bounds[1])
                                                 for row in inside(parent)) else []
                     shape = plain_rust_function_symbol(parent['name'])
+                    # This formatting-closure proof does not model disambiguated items.
+                    if shape is not None and any(shape.disambiguators):
+                        shape = None
                     _construct_charge(work, len(grouped[side][0]))
                     child_candidates = [] if shape is None else [owner for owner in grouped[side][0]
-                        if direct_rust_callback_symbol(owner['name'], parent['name'], shape[0])
+                        if direct_rust_callback_symbol(owner['name'], parent['name'], shape.modules)
                         and any(owner_covers_lines([row], bounds[1], bounds[1]) for row in inside(owner))]
                     if len(candidates + child_candidates) != 1:
                         failed = True; break
@@ -3894,7 +4072,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         construct_pairs, witnesses = retained_construct_anchors(name, old, new, before, after,
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
-        retained = {}; gone = set(); unresolved_fragments = []; deferred_async = {}
+        retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
         _construct_charge(construct_work, sum(len(line) + 1 for line in new) if old != new else 0)
         head_text = '\n'.join(new) if old != new else ''
@@ -4021,12 +4199,13 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     retained[line] = target
                 elif line not in anchored:
                     scopes = [prefix for prefix, group in base_groups.items()
-                              if prefix in head_groups and re.search(r'\basync\s+fn\b', prefix)
+                              if prefix in head_groups
                               and group[0] <= line <= group[1]
                               and head_groups[prefix][0] <= target <= head_groups[prefix][1]]
                     if (len(scopes) == 1 and after.get(target, 0) > 0
                             and old[line - 1] == new[target - 1]):
-                        deferred_async[line] = target
+                        kind = 'async' if re.search(r'\basync\s+fn\b', scopes[0]) else 'callback'
+                        deferred_fragments[line] = DeferredSourceFragment(target, kind, scopes[0])
                         unresolved_fragments.append((line - 1, line, target - 1, target, [line]))
                     else:
                         raise ValueError(f'Unproved retained execution in replaced construct: '
@@ -4035,7 +4214,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             elif tag == 'replace-construct':
                 if (block.get('retained_statements') and not any(
                         start <= block['base_line'] <= end for start, end in proved_functions)
-                        and any(line not in anchored and line not in deferred_async
+                        and any(line not in anchored and line not in deferred_fragments
                                 for line in retained_statement_lines(block))):
                     raise ValueError('Ambiguous unchanged work in replaced compiler owner')
                 replacement_receipts.append(dict(file=name, **block))
@@ -4052,14 +4231,71 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for start, end in replaced_functions:
             _construct_charge(construct_work, end - start + 1)
             gone.difference_update(range(start, end + 1))
+        callback_scopes = []
+        callback_functions = {fragment.function_prefix for fragment in deferred_fragments.values()
+                              if fragment.kind == 'callback'}
+        if unresolved_fragments and inventories is not None and all(value is not None for value in inventories):
+            _construct_charge(construct_work, len(base_groups) * (len(unresolved_fragments) + 1))
+            for prefix, group in base_groups.items():
+                current = head_groups.get(prefix)
+                if current is None or prefix not in callback_functions:
+                    continue
+                if not any(group[0] <= a + 1 <= b <= group[1]
+                           and current[0] <= c + 1 <= d <= current[1]
+                           for a, b, c, d, _ in unresolved_fragments):
+                    continue
+                ranges = []
+                for inventory, bounds in zip(inventories, (group, current)):
+                    code = inventory[0]; _construct_charge(construct_work, len(inventory[1]))
+                    ranges.append([(code.position(code.starts[row['opening']])[0],
+                                    code.position(code.ends[row['end']])[0])
+                        for row in inventory[1] if row['opening'] is not None
+                        and code.words[row['opening'] - 1] == '||'
+                        and code.parents[row['opening']] is not None
+                        and code.words[code.parents[row['opening']]] == '('
+                        and bounds[0] < code.position(code.starts[row['opening']])[0]
+                            <= code.position(code.ends[row['end']])[0] < bounds[1]])
+                if all(ranges):
+                    callback_scopes.append((group, current, *ranges))
+        if callback_scopes:
+            proposals = []; seen_pairs = set()
+            _construct_charge(construct_work, len(unresolved_fragments) * (len(callback_scopes) + 1)
+                              + sum(len(pending) for _, _, _, _, pending in unresolved_fragments))
+            for a, b, c, d, pending in unresolved_fragments:
+                if any(bg[0] <= a + 1 <= b <= bg[1] and hg[0] <= c + 1 <= d <= hg[1]
+                       for bg, hg, _, _ in callback_scopes):
+                    for line in pending:
+                        target = c + line - a
+                        if (line, target) not in seen_pairs:
+                            proposals.append((line - 1, line, target - 1, target, [line]))
+                            seen_pairs.add((line, target))
+                else:
+                    proposals.append((a, b, c, d, pending))
+            _construct_charge(construct_work, len(retained) * (len(callback_scopes) + 1))
+            for line, target in retained.items():
+                if (line in anchored or line not in before or after.get(target, 0) <= 0
+                        or old[line - 1] != new[target - 1] or (line, target) in seen_pairs):
+                    continue
+                if any(bg[0] <= line <= bg[1] and hg[0] <= target <= hg[1]
+                       and any(first <= line <= last for first, last in left)
+                       and any(first <= target <= last for first, last in right)
+                       for bg, hg, left, right in callback_scopes):
+                    proposals.append((line - 1, line, target - 1, target, [line]))
+                    seen_pairs.add((line, target))
+            unresolved_fragments = proposals
         positive, receipts = positive_source_fragments(
             name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments,
-            construct_work, inventories, grouped)
-        phase_pairs = {tuple(pair) for receipt in receipts
-                       if 'async_copies' in receipt and 'async_fragment_regions' in receipt
-                       for pair in receipt['pairs']}
-        if any((line, target) not in phase_pairs for line, target in deferred_async.items()):
-            raise ValueError('Unproved retained async execution: complete phase/region evidence required')
+            construct_work, inventories, grouped, callback_functions)
+        proof_pairs = {
+            'async': {tuple(pair) for receipt in receipts
+                      if 'async_copies' in receipt and 'async_fragment_regions' in receipt
+                      for pair in receipt['pairs']},
+            'callback': {tuple(pair) for receipt in receipts
+                         for fragment in receipt.get('callback_fragments', []) for pair in fragment['pairs']},
+        }
+        if any((line, fragment.target) not in proof_pairs[fragment.kind]
+               for line, fragment in deferred_fragments.items()):
+            raise ValueError('Unproved retained execution: complete callback/phase evidence required')
         retained.update(positive)
         positive_receipts.extend(receipts)
         gone.difference_update(anchored)
