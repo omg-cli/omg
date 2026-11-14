@@ -10,6 +10,84 @@ SOURCE = Path(__file__).with_name("qemu-transactions.sh")
 PREVIOUS = b'{"previous":"good"}\n'
 
 
+class TransactionClone(unittest.TestCase):
+    def run_clone(self, *, activation_exit=0, boot_exit=0):
+        source = SOURCE.read_text()
+        function = source[source.index("start_clone() {"):source.index("freeze_base() {")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = r'''set -euo pipefail
+cd "$1"
+activation_exit=$2
+boot_exit=$3
+clone_boot_timeout=30
+boot_args=()
+timeout() {
+  case "$*" in
+    *'/work/boot.sh '*)
+      printf 'boot\n' >> events
+      printf '|/bin/false' > channel
+      return "$boot_exit" ;;
+    *'/work/qemu-boot-diagnostics.sh') return 0 ;;
+    *) printf 'unexpected fixture command: %s\n' "$*" >&2; return 91 ;;
+  esac
+}
+remote_argv() {
+  case "$*" in
+    'timeout --kill-after=5s 90s sudo -n python3 /home/bench/provision-qemu-crash-channel.py') ;;
+    *) printf 'unexpected remote command: %s\n' "$*" >&2; return 92 ;;
+  esac
+  printf 'activate\n' >> events
+  if [[ "$activation_exit" != 0 ]]; then
+    printf 'vendor crash collector activation refused\n' >&2
+    return "$activation_exit"
+  fi
+  printf 'vendor' > channel
+  printf '{"crash_channel":{"kind":"systemd-coredump-pipe"}}\n'
+}
+''' + function + r'''
+for round in 1 2; do
+  start_clone disk vars serial "clone-$round.log"
+  if [[ $(cat channel) != vendor ]]; then
+    printf 'measurement refused: clone crash handler is %s\n' "$(cat channel)" >&2
+    exit 93
+  fi
+  printf 'measurement\n' >> events
+done
+'''
+            result = subprocess.run(
+                ["bash", "-c", script, "clone-test", str(root),
+                 str(activation_exit), str(boot_exit)],
+                capture_output=True, text=True, timeout=10, check=False)
+            events = (root / "events").read_text().splitlines()
+            logs = {path.name: path.read_text() for path in root.glob("*.log")}
+            receipts = {path.name: json.loads(path.read_text())
+                        for path in root.glob("*.crash-channel.json")
+                        if path.stat().st_size}
+            return result, events, logs, receipts
+
+    def test_every_boot_activates_vendor_crash_collector_before_measurement(self):
+        result, events, _, receipts = self.run_clone()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(events, ["boot", "activate", "measurement"] * 2)
+        self.assertEqual(len(receipts), 2)
+        self.assertTrue(all(row["crash_channel"]["kind"] == "systemd-coredump-pipe"
+                            for row in receipts.values()))
+
+    def test_activation_refusal_prevents_measurement(self):
+        result, events, logs, _ = self.run_clone(activation_exit=37)
+        self.assertEqual(result.returncode, 37, result.stderr)
+        self.assertEqual(events, ["boot", "activate"])
+        self.assertIn("vendor crash collector activation refused",
+                      "".join(logs.values()))
+
+    def test_failed_boot_is_not_activated_or_measured(self):
+        result, events, _, receipts = self.run_clone(boot_exit=19)
+        self.assertEqual(result.returncode, 19, result.stderr)
+        self.assertEqual(events, ["boot"])
+        self.assertEqual(receipts, {})
+
+
 class TransactionSummary(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

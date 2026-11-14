@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -18,7 +20,7 @@ from test_ci_gates import job_block
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / '.github/workflows'
-BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
+BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else (shutil.which('bash') or 'bash')
 
 
 def step_script(workflow, name):
@@ -28,6 +30,226 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "The hosted service workflow uses POSIX executable scripts")
+    def test_advisory_service_is_verified_without_remote_deployment(self):
+        workflow = job_block((WORKFLOWS / 'ci.yml').read_text(), 'workflow-checks')
+        steps = dict(re.findall(r'^      - name: ([^\n]+)\n(.*?)(?=^      - (?:name:|uses:)|\Z)',
+                                workflow, re.MULTILINE | re.DOTALL))
+        scripts = [textwrap.dedent(block.split('        run: |\n', 1)[1])
+                   for name, block in steps.items() if name == 'Verify Arch advisory service']
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'commands.jsonl'
+            commands.touch()
+            recorder = root / 'bun'
+            recorder.write_text('#!' + sys.executable + '\nimport json,os,sys\n'
+                                'with open(os.environ["BUN_COMMANDS"], "a") as stream: '
+                                'stream.write(json.dumps(sys.argv[1:])+"\\n")\n')
+            recorder.chmod(0o755)
+            for script in scripts:
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', script],
+                    env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ.get('PATH', ''),
+                             BUN_COMMANDS=str(commands)), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            calls = [json.loads(line) for line in commands.read_text().splitlines()]
+            self.assertEqual(calls, [
+                ['install', '--cwd', 'services/advisories', '--frozen-lockfile', '--ignore-scripts'],
+                ['run', '--cwd', 'services/advisories', 'test'],
+                ['run', '--cwd', 'services/advisories', 'check'],
+                ['run', '--cwd', 'services/advisories', 'dry-run'],
+            ], 'The advisory service must have frozen dependencies, behavioral tests, types and a non-deploying build')
+
+    @unittest.skipIf(os.name == 'nt', 'Native Arch input permissions require POSIX mode bits')
+    def test_native_coverage_stages_protected_inputs_from_writable_sources(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        start = script.index('docker cp "$binary"')
+        end = script.index('\nbash scripts/benchmark-qemu.sh', start)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts, evidence, runner = root / 'scripts', root / 'evidence', root / 'runner'
+            for path in (scripts, evidence, runner):
+                path.mkdir()
+            producer = scripts / 'native-cli-coverage.py'
+            producer.write_bytes(b'print("fixture producer")\n')
+            producer.chmod(0o666)
+            artifacts = {}
+            for role in ('coverage14', 'arch-contracts', 'comprehensive', 'cli-unit', 'cli', 'daemon'):
+                artifact = root / (role + ' source')
+                artifact.write_bytes(('fixture executable ' + role).encode())
+                artifact.chmod(0o666)
+                artifacts[role] = {'path': str(artifact)}
+            manifest = evidence / 'cli-manifest.json'
+            manifest.write_text(json.dumps({'artifacts': artifacts}))
+            manifest.chmod(0o666)
+            originals = {path: (stat.S_IMODE(path.stat().st_mode), path.read_bytes())
+                         for path in (producer, manifest, *(Path(a['path']) for a in artifacts.values()))}
+            fixture = root / 'fixture'
+            fixture.write_bytes(b'native fixture')
+            fixture.chmod(0o755)
+            capture = root / 'copy-arguments'
+            rows = root / 'manifest-rows.py'
+            rows.write_text('import json,sys\n'
+                            'with open(sys.argv[1]) as stream: artifacts=json.load(stream)["artifacts"]\n'
+                            'for role, artifact in artifacts.items(): print(role+"\\t"+artifact["path"])\n')
+            driver = '''umask 000
+docker() { test "$1" = cp; printf '%s\\0%s\\0' "$2" "$3" >> "$COPY_CAPTURE"; }
+jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
+''' + script[start:end]
+            result = subprocess.run([BASH, '-euo', 'pipefail', '-c', driver], cwd=root,
+                env=dict(os.environ, COPY_CAPTURE=str(capture), TEST_PYTHON=sys.executable,
+                         MANIFEST_ROWS=str(rows), binary=str(fixture), container='fixture-container',
+                         RUNNER_TEMP=str(runner), evidence_dir=str(evidence)),
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            arguments = capture.read_bytes().split(b'\0')[:-1]
+            copied = {target.decode(): (root / source.decode()).resolve()
+                      for source, target in zip(arguments[::2], arguments[1::2])}
+            self.assertEqual(copied, {'fixture-container:/fixture': fixture})
+            for original, name in ((producer, 'native-cli-coverage.py'),
+                                   (manifest, 'native-cli-manifest.json')):
+                staged = runner / 'native-cli-inputs' / name
+                self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o644,
+                                 'Supplemental input must be staged without group/other write permissions')
+                self.assertNotEqual(staged, original)
+                self.assertTrue(staged.is_relative_to(runner))
+                self.assertEqual(staged.read_bytes(), original.read_bytes())
+            binaries = runner / 'native-cli-inputs/bin'
+            self.assertEqual(stat.S_IMODE(binaries.stat().st_mode), 0o755)
+            self.assertEqual({p.name for p in binaries.iterdir()}, set(artifacts))
+            for role, artifact in artifacts.items():
+                self.assertEqual(stat.S_IMODE((binaries / role).stat().st_mode), 0o755)
+                self.assertEqual((binaries / role).read_bytes(), Path(artifact['path']).read_bytes())
+            for path, identity in originals.items():
+                self.assertEqual((stat.S_IMODE(path.stat().st_mode), path.read_bytes()), identity)
+
+    def test_native_coverage_passes_one_complete_guest_script_to_docker(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        start = script.index('container=$(docker create')
+        end = script.index("\ndocker cp", start)
+        command = script[start:end]
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / 'docker-arguments'
+            driver = (
+                'docker() { printf \'%s\\0\' "$@" > "$ARGV_CAPTURE"; '
+                'printf \'%s\' fixture-container; }\nfixture_apparmor=test-profile\n' + command
+            )
+            result = subprocess.run(
+                [BASH, '-eu', '-c', driver],
+                env=dict(os.environ, ARGV_CAPTURE=capture.as_posix()),
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            arguments = capture.read_bytes().split(b'\0')[:-1]
+            guest = arguments[arguments.index(b'-c') + 1:]
+            self.assertEqual(len(guest), 1, 'Docker must receive the entire guest program as one argument')
+            syntax = subprocess.run([BASH, '-n'], input=guest[0], capture_output=True)
+            self.assertEqual(syntax.returncode, 0, syntax.stderr.decode())
+
+    def test_fixture_profile_lifecycle_is_bounded_and_cleans_up(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        script = script.split('python3 scripts/native-cli-coverage.py verify', 1)[0]
+        script = script.split('python3 - "$binary"', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'target/llvm-cov-target/debug/deps/omg_lib-test'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('fixture')
+            binary.chmod(0o755)
+            (root / 'scripts').mkdir()
+            (root / 'scripts/native-cli-coverage.py').write_bytes(
+                (ROOT / 'scripts/native-cli-coverage.py').read_bytes())
+            for name in ('debug/omg', 'debug/omgd',
+                         'debug/deps/coverage_14-1111111111111111',
+                         'debug/deps/arch_cli_contracts-1111111111111111',
+                         'debug/deps/cli_comprehensive-1111111111111111',
+                         'debug/deps/omg-1111111111111111'):
+                artifact = root / 'target/llvm-cov-target' / name
+                artifact.write_text('fixture executable')
+                artifact.chmod(0o755)
+            benchmark = root / 'scripts/benchmark-qemu.sh'
+            benchmark.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+test "$1" = --distro && test "$2" = arch
+while test "$#" -gt 0; do
+  if test "$1" = --evidence-dir; then
+    mkdir -p "$2/unit-transport/native-evidence/cli" "$2/unit-transport/native-profiles"
+    exit 0
+  fi
+  shift
+done
+exit 2
+''')
+            readelf = root / 'readelf'
+            readelf.write_text('#!/bin/sh\nprintf "__llvm_covmap __llvm_prf_cnts\\n"\n')
+            readelf.chmod(0o755)
+            sysctl = root / 'restriction'
+            sysctl.write_text('1\n')
+            script = script.replace('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', str(sysctl))
+            for name in ('coverage-seccomp.json', 'coverage-sandbox-seccomp.json'):
+                script = script.replace('/tmp/' + name, str(root / name))
+            docker = root / 'docker'
+            docker.write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+data = sys.stdin.read() if args and args[0] == 'run' and '--interactive' in args else ''
+with open(os.environ['TRACE'], 'a') as trace:
+    trace.write(json.dumps([args, data]) + '\\n')
+if args and args[0] == 'create': print('fixture-container')
+if args[:2] == ['start', '--attach']: sys.exit(int(os.environ['START_STATUS']))
+if args and args[0] == 'rm': sys.exit(int(os.environ.get('REMOVE_STATUS', '0')))
+if '--remove' in args: sys.exit(int(os.environ.get('UNLOAD_STATUS', '0')))
+''')
+            docker.chmod(0o755)
+            launcher = '''curl() { :; }
+sha256sum() { if [ "$1" = --check ]; then cat >/dev/null; else command sha256sum "$@"; fi; }
+jq() { :; }
+git() { printf '%040d\\n' 1; }
+'''
+            for run_id, attempt, status, remove, unload, expected in [
+                    ('123', '1', 0, 0, 0, 0), ('123', '2', 23, 0, 0, 23),
+                    ('123', '3', 23, 7, 9, 23), ('123', '4', 0, 7, 0, 7),
+                    ('123', '5', 0, 0, 9, 9)]:
+                trace = root / f'trace-{attempt}'
+                runner_temp = root / ('runner-' + attempt)
+                runner_temp.mkdir()
+                result = subprocess.run([BASH, '-e', '-c', launcher + script], cwd=root,
+                    env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
+                             TRACE=str(trace), START_STATUS=str(status), REMOVE_STATUS=str(remove),
+                             UNLOAD_STATUS=str(unload), GITHUB_RUN_ID=run_id,
+                             GITHUB_RUN_ATTEMPT=attempt, GITHUB_WORKSPACE=str(root), RUNNER_TEMP=str(runner_temp)),
+                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in trace.read_text().splitlines()]
+                loaders = [(args, data) for args, data in calls if '--entrypoint' in args]
+                self.assertEqual(len(loaders), 1 if remove else 2)
+                name = f'omg-coverage-{run_id}-{attempt}'
+                for (args, data), operation in zip(loaders, ('--replace', '--remove')):
+                    self.assertIn(operation, args)
+                    self.assertIn('--network=none', args)
+                    self.assertIn('--cap-drop=ALL', args)
+                    self.assertIn('--cap-add=MAC_ADMIN', args)
+                    self.assertIn('--security-opt=apparmor=unconfined', args)
+                    self.assertIn('--pids-limit=32', args)
+                    self.assertIn('--memory=256m', args)
+                    self.assertIn('--cpus=1', args)
+                    self.assertIn('--read-only', args)
+                    self.assertEqual([arg for arg in args if arg.startswith(('--volume=', '--mount='))],
+                                     ['--mount=type=bind,src=/sys/kernel/security,dst=/sys/kernel/security'])
+                    self.assertTrue(data.startswith('abi <abi/4.0>,\n'))
+                    self.assertIn('profile ' + name + ' flags=(unconfined)', data)
+                    self.assertIn('userns,', data)
+                create = next(args for args, _ in calls if args[0] == 'create')
+                self.assertIn('apparmor=' + name, create)
+                self.assertIn('--network', create)
+                removal = next(i for i, (args, _) in enumerate(calls) if args[:2] == ['rm', '--force'])
+                unloads = [i for i, (args, _) in enumerate(calls) if '--remove' in args]
+                if remove:
+                    self.assertEqual(unloads, [])
+                    self.assertIn('retaining AppArmor profile', result.stderr)
+                else:
+                    self.assertEqual(len(unloads), 1)
+                    self.assertLess(removal, unloads[0])
+
     def test_privileged_coverage_case_requires_real_execution_and_profiles(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
         self.assertIn('run_case() {', script)
@@ -85,12 +307,29 @@ class OptimizationContracts(unittest.TestCase):
         cases = re.search(r'(?ms)^ +cases=\(\n(.*?)^ +\)', script)
         self.assertIsNotNone(cases, 'coverage must select its required fixture cases explicitly')
         selected = [line.strip() for line in cases.group(1).splitlines() if line.strip()]
+        self.assertIn('package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason', selected)
+        self.assertIn('package_managers::aur::utils::tests::native_lifecycle_original_user_ownership', selected)
         self.assertEqual(len(selected), len(set(selected)))
-        self.assertEqual(len(selected), 14)
+        self.assertEqual(len(selected), 24)
+        for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
+            name = 'package_managers::arch_install::native_tests::' + test
+            self.assertIn(name, selected)
+            self.assertIn('"$test_name" == ' + name, script)
+
+        self.assertIn("package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents", selected)
+        self.assertIn('package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes', selected)
+        self.assertIn('package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing', selected)
+        self.assertIn('package_managers::aur::client::tests::native_isolated_history_requires_hardened_review', selected)
+        self.assertIn('runner=(runuser -u nobody -- env HOME=/home/omg-fixture', script)
+        self.assertIn('NOPASSWD: /usr/bin/true', script)
+        self.assertNotIn('NOPASSWD: ALL', script)
+        self.assertIn('config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options', selected)
+        self.assertIn('grep -F "parent_uid=0"', script)
+        self.assertIn('grep -F "uid=65534 "', script)
         self.assertEqual(selected[0], 'package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman')
         self.assertEqual(selected[-1], 'core::usage::tests::elevated_state_roundtrip_preserves_caller_files')
         self.assertIn('mkdir -m 1777 /profiles', script)
-        self.assertIn('--network none --pids-limit 128 --memory 1g --cpus 2', script)
+        self.assertIn('--network none --add-host aur.archlinux.org:127.0.0.1 --pids-limit 128 --memory 1g --cpus 2', script)
         self.assertIn('mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib', script)
         self.assertNotIn('--env GH_TOKEN', script)
         self.assertNotIn('--env GITHUB_TOKEN', script)
@@ -129,12 +368,14 @@ class OptimizationContracts(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(receipt.exists())
 
-    def test_continuous_profiles_require_the_verified_coverage_toolchain(self):
+    def test_exit_flush_and_native_continuous_profiles_require_the_verified_coverage_toolchain(self):
         workflow = (WORKFLOWS / 'coverage.yml').read_text()
         self.assertNotIn('runtime-counter-relocation', workflow.split('jobs:', 1)[0])
         coverage = workflow.split('  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
         self.assertIn('RUSTFLAGS: -C llvm-args=-runtime-counter-relocation', coverage)
-        self.assertIn('LLVM_PROFILE_FILE_NAME: omg-%p-%m%c.profraw', coverage)
+        self.assertIn('LLVM_PROFILE_FILE_NAME: omg-%p-%m.profraw', coverage)
+        self.assertIn('LLVM_PROFILE_FILE="$fixture_profiles/omg-fixture-$case_id-%p-%m%c.profraw"', coverage)
+        self.assertIn('--default-toolchain 1.95.0', coverage)
         self.assertIn('tool: cargo-llvm-cov@0.9.0,nextest', coverage)
 
     def test_sandbox_coverage_requires_one_existing_instrumented_binary(self):
@@ -485,13 +726,388 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Unsupported region schema', result.stderr)
 
-    def collect(self):
-        result = self.run_shell(step_script('coverage.yml', 'Collect invalid coverage diagnostics'))
+    def collect(self, member_calls=None, input_budget=None, projection_budget=None):
+        script = step_script('coverage.yml', 'Collect invalid coverage diagnostics')
+        if member_calls is not None:
+            script = script.replace("members = {'calls_left': 8192,", "members = {'calls_left': " + str(member_calls) + ",")
+        if input_budget is not None:
+            script = script.replace('budget = 128 * 1024 * 1024', 'budget = ' + str(input_budget))
+        if projection_budget is not None:
+            script = script.replace('projection_budget = 16 * 1024 * 1024', 'projection_budget = ' + str(projection_budget))
+        result = self.run_shell(script)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        output = self.directory / 'coverage-diagnostics'
+        output = Path(self.environment['RUNNER_TEMP']) / 'coverage-diagnostics'
         return json.loads((output / 'receipt.json').read_text()), output / 'profiles.tar.gz'
 
+    def without_diagnostic_tools(self):
+        tools = self.directory / 'empty-tool-path'
+        tools.mkdir()
+        self.environment['PATH'] = tools.as_posix()
+
+    def diagnostic_tools(self):
+        tools = self.directory / 'toolchain/bin'
+        tools.mkdir(parents=True)
+        script = f'#!{sys.executable}\n' + textwrap.dedent('''
+            import json, os, pathlib, sys, time
+            name = pathlib.Path(sys.argv[0]).name
+            if '--version' in sys.argv or '-vV' in sys.argv:
+                print('fixture tool version')
+            elif name == 'rustc':
+                print(pathlib.Path(__file__).parent.parent / 'lib')
+            elif name == 'llvm-cov':
+                assert sys.argv[1] == 'convert-for-testing'
+                if os.environ.get('TEST_LARGE_MAP'):
+                    with pathlib.Path(sys.argv[2]).open('rb') as source:
+                        size = 9 * 1024 * 1024 if source.read(3) == b'BIG' else 3 * 1024 * 1024
+                    with pathlib.Path(sys.argv[4]).open('wb') as output:
+                        output.truncate(size)
+                else:
+                    pathlib.Path(sys.argv[4]).write_bytes(b'coverage map only')
+                for projection in pathlib.Path(os.environ['RUNNER_TEMP']).glob('coverage-diagnostics/*.proftext'):
+                    behavior = os.environ.get('TEST_PROJECTION_TAMPER')
+                    if behavior == 'alter': projection.write_bytes(b'corrupted')
+                    if behavior == 'oversize': projection.write_bytes(b'x' * 65537)
+                    if behavior == 'symlink':
+                        projection.unlink()
+                        projection.symlink_to(pathlib.Path(os.environ['RUNNER_TEMP']) / 'outside')
+            elif name == 'llvm-profdata':
+                assert sys.argv[1:3] == ['show', '--text']
+                wanted = sys.argv[3].split('=', 1)[1]
+                with pathlib.Path(sys.argv[4]).open('rb') as stream:
+                    values = json.loads(stream.read(64).rstrip(b'\\0').strip())
+                if os.environ.get('TEST_RAW_TAMPER') == 'mmap':
+                    marker = pathlib.Path(os.environ['RUNNER_TEMP']) / 'probe-started'
+                    marker.touch()
+                    until = time.monotonic() + 3
+                    while not marker.with_name('raw-mutated').exists() and time.monotonic() < until:
+                        time.sleep(0.005)
+                elif os.environ.get('TEST_RAW_TAMPER'):
+                    pathlib.Path(os.readlink(sys.argv[4])).write_text('{"a": 20}')
+                for function, count in values.items():
+                    if wanted in function:
+                        print(function + '\\n# Func Hash:\\n1\\n# Num Counters:\\n1\\n# Counter Values:\\n' + str(count))
+                if os.environ.get('TEST_CORRUPT_RECORD'):
+                    print(wanted + '\\n# Func Hash:\\n1\\n# Num Counters:\\n2\\n# Counter Values:\\n1')
+                if os.environ.get('TEST_PROBE_OVERSIZE'):
+                    print('x' * 65537)
+        ''')
+        for name in ('rustc', 'cargo', 'llvm-cov', 'llvm-profdata'):
+            path = tools / name
+            path.write_text(script)
+            path.chmod(0o755)
+        self.environment['PATH'] = tools.as_posix() + os.pathsep + self.environment['PATH']
+
+    def test_diagnostics_prioritize_saturated_function_and_retain_only_coverage_map(self):
+        self.diagnostic_tools()
+        runner = tempfile.TemporaryDirectory()
+        self.addCleanup(runner.cleanup)
+        self.environment['RUNNER_TEMP'] = runner.name
+        self.reports(2**64 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        (target / (self.directory.name + '.profdata')).write_bytes(b'merged')
+        (target / (self.directory.name + '-profraw-list')).write_text('raw inventory\n')
+        filler = target / 'omg-100-111_0.profraw'
+        with filler.open('wb') as stream:
+            stream.write(b'{"a_suffix": 1}')
+            stream.truncate(128 * 1024 * 1024 - 1024)
+        (target / 'omg-200-222_0.profraw').write_text('{"a": 0}')
+        relevant = target / 'omg-999-222_0.profraw'
+        relevant.write_text('{"a": 19}' + ' ' * 2048)
+        executable = target / 'fixture-object'
+        executable.write_bytes(b'ELF executable must never be archived or executed')
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(executable.as_posix()) + '`\n')
+        receipt, archive = self.collect()
+        with tarfile.open(archive) as bundle:
+            self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
+            maps = [name for name in bundle.getnames() if name.endswith('.covmap')]
+            self.assertEqual(len(maps), 1)
+            self.assertEqual(bundle.extractfile(maps[0]).read(), b'coverage map only')
+            self.assertNotIn(executable.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertEqual(receipt['objects'][0]['sha256'], hashlib.sha256(executable.read_bytes()).hexdigest())
+        self.assertLessEqual(receipt['captured_input_bytes'], 128 * 1024 * 1024)
+
+    def projection_fixture(self):
+        self.diagnostic_tools()
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        raw = target / 'omg-200-222_0.profraw'
+        with raw.open('wb') as stream:
+            stream.write(b'{"a": 19}')
+            stream.truncate(2048)
+        executable = target / 'fixture-object'
+        executable.write_bytes(b'ELF fixture')
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(executable.as_posix()) + '`\n')
+        return raw
+
+    def test_diagnostics_keep_exact_projection_when_whole_raw_exceeds_archive_budget(self):
+        raw = self.projection_fixture()
+        expected = b'a\n# Func Hash:\n1\n# Num Counters:\n1\n# Counter Values:\n19\n'
+        receipt, archive = self.collect(input_budget=1024)
+        probes = receipt['targeting']['probes']
+        self.assertEqual(len(probes), 1)
+        self.assertIn('projection', probes[0], 'nonzero counter record was lost with the oversized whole raw')
+        probe = probes[0]
+        self.assertEqual(probe['raw_sha256'], hashlib.sha256(raw.read_bytes()).hexdigest())
+        self.assertEqual(probe['raw_identity']['inode'], raw.stat().st_ino)
+        self.assertFalse(probe['changed_during_collection'])
+        self.assertTrue(probe['projection'].startswith('profile-projections/'))
+        self.assertEqual(Path(probe['projection']).name, '0.proftext')
+        self.assertEqual(probe['projection_sha256'], hashlib.sha256(expected).hexdigest())
+        self.assertTrue(receipt['targeting']['projection_diagnostic_only'])
+        with tarfile.open(archive) as bundle:
+            self.assertEqual(bundle.getnames()[0], probe['projection'])
+            self.assertEqual(bundle.extractfile(probe['projection']).read(), expected)
+            self.assertNotIn(raw.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertFalse(receipt['complete'])
+
+    def test_diagnostics_refuse_changed_unsafe_or_oversize_projection(self):
+        import shutil
+        for behavior in ('alter', 'oversize', 'symlink'):
+            with self.subTest(behavior=behavior):
+                self.projection_fixture()
+                (self.directory / 'outside').write_bytes(b'private')
+                self.environment['TEST_PROJECTION_TAMPER'] = behavior
+                receipt, archive = self.collect(input_budget=1024 * 1024)
+                projection = receipt['targeting']['probes'][0]['projection']
+                entry = next(entry for entry in receipt['files'] if entry['path'] == projection)
+                self.assertIn('omitted', entry)
+                self.assertIn('symlinks' if behavior == 'symlink' else 'projection changed', entry['omitted'])
+                with tarfile.open(archive) as bundle:
+                    self.assertNotIn(projection, bundle.getnames())
+                shutil.rmtree(self.directory / 'coverage-diagnostics')
+                shutil.rmtree(self.directory / 'target')
+                shutil.rmtree(self.directory / 'toolchain')
+
+    def test_diagnostics_refuse_changed_raw_snapshot(self):
+        self.projection_fixture()
+        self.environment['TEST_RAW_TAMPER'] = '1'
+        receipt, archive = self.collect(input_budget=1024)
+        probe = receipt['targeting']['probes'][0]
+        self.assertTrue(probe['changed_during_collection'])
+        self.assertIn('profile shrank', probe['error'])
+        self.assertEqual(probe['raw_final_identity']['bytes'], len(b'{"a": 20}'))
+        self.assertNotIn('projection', probe)
+        with tarfile.open(archive) as bundle:
+            self.assertFalse(any(name.endswith('.proftext') for name in bundle.getnames()))
+
+    def test_diagnostics_refuse_mmap_counter_change_without_metadata_change(self):
+        import mmap
+        import threading
+        import time
+        raw = self.projection_fixture()
+        self.environment['TEST_RAW_TAMPER'] = 'mmap'
+        # Freeze observed metadata to isolate content-change detection.
+        observer = self.directory / 'frozen-metadata-python'
+        observer.write_text(f'#!{sys.executable}\n' + f'raw = {str(raw)!r}\n' + textwrap.dedent('''
+            import os, sys
+            original = os.stat(raw)
+            identity = (original.st_dev, original.st_ino)
+            def frozen(info):
+                return original if (info.st_dev, info.st_ino) == identity else info
+            real_fstat, real_stat, real_lstat = os.fstat, os.stat, os.lstat
+            os.fstat = lambda *args, **kwargs: frozen(real_fstat(*args, **kwargs))
+            os.stat = lambda *args, **kwargs: frozen(real_stat(*args, **kwargs))
+            os.lstat = lambda *args, **kwargs: frozen(real_lstat(*args, **kwargs))
+            sys.argv = sys.argv[1:]
+            assert sys.argv == ['-']
+            exec(compile(sys.stdin.read(), '<stdin>', 'exec'))
+        '''))
+        observer.chmod(0o755)
+        self.environment['TEST_PYTHON'] = str(observer)
+        with raw.open('r+b') as stream, mmap.mmap(stream.fileno(), 0) as counters:
+            counters[6:8] = b'19'
+            counters.flush()
+            mutated = []
+            def mutate_live_counters():
+                until = time.monotonic() + 5
+                while not (self.directory / 'probe-started').exists() and time.monotonic() < until:
+                    time.sleep(0.005)
+                counters[6:8] = b'20'
+                counters.flush()
+                mutated.append(True)
+                (self.directory / 'raw-mutated').touch()
+            writer = threading.Thread(target=mutate_live_counters)
+            writer.start()
+            try:
+                receipt, archive = self.collect(input_budget=1024)
+            finally:
+                writer.join(timeout=6)
+        self.assertEqual(mutated, [True])
+        self.assertEqual(raw.read_bytes()[6:8], b'20')
+        probe = receipt['targeting']['probes'][0]
+        self.assertTrue(probe['changed_during_collection'],
+                        'live mmap counters changed while observed metadata stayed identical')
+        self.assertEqual(probe['raw_identity'], probe['raw_final_identity'])
+        self.assertEqual(probe['raw_identity'], probe['raw_path_final_identity'])
+        self.assertNotIn('projection', probe)
+        with tarfile.open(archive) as bundle:
+            self.assertFalse(any(name.endswith('.proftext') for name in bundle.getnames()))
+
+    def test_diagnostics_refuse_corrupt_counter_record(self):
+        self.projection_fixture()
+        self.environment['TEST_CORRUPT_RECORD'] = '1'
+        receipt, _ = self.collect(input_budget=1024)
+        probe = receipt['targeting']['probes'][0]
+        self.assertIn('invalid counter record', probe['error'])
+        self.assertNotIn('projection', probe)
+
+    def test_diagnostics_bound_projection_total_and_probe_output(self):
+        import shutil
+        for behavior in ('total', 'output'):
+            with self.subTest(behavior=behavior):
+                self.projection_fixture()
+                if behavior == 'output': self.environment['TEST_PROBE_OVERSIZE'] = '1'
+                receipt, archive = self.collect(input_budget=1024,
+                    projection_budget=1 if behavior == 'total' else None)
+                self.assertTrue(receipt['targeting']['errors'])
+                self.assertNotIn('projection', receipt['targeting']['probes'][0])
+                with tarfile.open(archive) as bundle:
+                    self.assertFalse(any(name.endswith('.proftext') for name in bundle.getnames()))
+                shutil.rmtree(self.directory / 'coverage-diagnostics')
+                shutil.rmtree(self.directory / 'target')
+                shutil.rmtree(self.directory / 'toolchain')
+
+    def test_diagnostics_keep_large_main_map_before_smaller_object_maps(self):
+        self.diagnostic_tools()
+        self.environment['TEST_LARGE_MAP'] = '1'
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        smaller, larger = target / 'aaa-small', target / 'zzz-large'
+        smaller.write_bytes(b'small')
+        larger.write_bytes(b'BIG' + b'x' * 100)
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(smaller.as_posix())
+            + ' -object ' + shlex.quote(larger.as_posix()) + '`\n')
+        receipt, archive = self.collect(input_budget=10 * 1024 * 1024)
+        objects = {entry['path']: entry for entry in receipt['objects']}
+        with tarfile.open(archive) as bundle:
+            self.assertIn(objects[larger.as_posix()]['coverage_map'], bundle.getnames())
+            self.assertNotIn(objects[smaller.as_posix()]['coverage_map'], bundle.getnames())
+            self.assertEqual(bundle.getmember(objects[larger.as_posix()]['coverage_map']).size,
+                             9 * 1024 * 1024)
+
+    def test_diagnostics_report_missing_targeting_tools(self):
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        receipt, _ = self.collect()
+        self.assertFalse(receipt['complete'])
+        self.assertTrue(receipt['targeting']['errors'])
+
+    def test_diagnostics_keep_observed_nonzero_when_discovery_is_incomplete(self):
+        self.diagnostic_tools()
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        filler = target / 'omg-100-0_0.profraw'
+        with filler.open('wb') as stream:
+            stream.write(b'{"a_suffix": 1}')
+            stream.truncate(128 * 1024 * 1024 - 1024)
+        relevant = target / 'omg-200-1_0.profraw'
+        relevant.write_text('{"a": 19}' + ' ' * 2048)
+        for signature in range(2, 256):
+            (target / f'omg-{signature + 300}-{signature}_0.profraw').write_text('{"a_suffix": 1}')
+        receipt, archive = self.collect()
+        with tarfile.open(archive) as bundle:
+            self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertFalse(receipt['complete'])
+        self.assertTrue(any('budget exhausted' in error for error in receipt['targeting']['errors']))
+        probes = receipt['targeting']['probes']
+        self.assertLessEqual(len(probes), 256)
+        self.assertEqual(sum(probe['path'] == relevant.relative_to(self.directory).as_posix()
+                             for probe in probes), 1)
+
+    def test_diagnostics_share_member_budget_across_matching_groups(self):
+        self.diagnostic_tools()
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        filler = target / 'omg-100-0_0.profraw'
+        with filler.open('wb') as stream:
+            stream.write(b'{"a_suffix": 1}')
+            stream.truncate(128 * 1024 * 1024 - 1024)
+        for process in range(200, 456):
+            (target / f'omg-{process}-1_0.profraw').write_text('{"a": 0}')
+        (target / 'omg-500-2_0.profraw').write_text('{"a": 0}')
+        relevant = target / 'omg-999-2_0.profraw'
+        relevant.write_text('{"a": 19}' + ' ' * 2048)
+        receipt, archive = self.collect(member_calls=128)
+        with tarfile.open(archive) as bundle:
+            self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertFalse(receipt['complete'])
+        self.assertLessEqual(len(receipt['targeting']['probes']), 256)
+
+    def test_diagnostics_prioritize_native_fixture_profile_names(self):
+        self.diagnostic_tools()
+        self.reports(2**63 - 1)
+        with gzip.open(self.directory / 'coverage-regions.json.gz', 'wb') as stream:
+            stream.write((self.directory / 'export.json').read_bytes())
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        filler = target / 'omg-100-0_0.profraw'
+        with filler.open('wb') as stream:
+            stream.write(b'{"a_suffix": 1}')
+            stream.truncate(128 * 1024 * 1024 - 1024)
+        (target / 'omg-200-2_0.profraw').write_text('{"a": 0}')
+        relevant = target / 'omg-fixture-package_managers_alpm_direct_tests_native_inventory_and_search_match_pacman-49-2_0.profraw'
+        relevant.write_text('{"a": 19}' + ' ' * 2048)
+        receipt, archive = self.collect()
+        with tarfile.open(archive) as bundle:
+            self.assertIn(relevant.relative_to(self.directory).as_posix(), bundle.getnames())
+        self.assertTrue(any(probe['path'] == relevant.relative_to(self.directory).as_posix()
+                            and probe['nonzero'] for probe in receipt['targeting']['probes']))
+
+    def assert_bad_region_report_preserves_diagnostics(self, report):
+        self.diagnostic_tools()
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        merged = target / (self.directory.name + '.profdata')
+        merged.write_bytes(b'merged')
+        raw = target / 'one.profraw'
+        raw.write_bytes(b'raw')
+        executable = target / 'fixture-object'
+        executable.write_bytes(b'ELF fixture')
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(executable.as_posix()) + '`\n')
+        (self.directory / 'coverage-regions.json.gz').write_bytes(report)
+        receipt, archive = self.collect()
+        self.assertFalse(receipt['complete'])
+        self.assertTrue(receipt['targeting']['errors'])
+        self.assertEqual(receipt['objects'][0]['sha256'], hashlib.sha256(executable.read_bytes()).hexdigest())
+        with tarfile.open(archive) as bundle:
+            self.assertEqual(bundle.extractfile(merged.relative_to(self.directory).as_posix()).read(), b'merged')
+            self.assertEqual(bundle.extractfile(raw.relative_to(self.directory).as_posix()).read(), b'raw')
+            self.assertEqual(bundle.extractfile('coverage-maps/0.covmap').read(), b'coverage map only')
+
+    def test_diagnostics_preserve_evidence_after_corrupt_deflate(self):
+        self.assert_bad_region_report_preserves_diagnostics(
+            b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff\x06')
+
+    def test_diagnostics_preserve_evidence_after_malformed_region_unit(self):
+        self.assert_bad_region_report_preserves_diagnostics(gzip.compress(b'{"data": [null]}'))
+
+    def test_diagnostics_preserve_evidence_after_malformed_region_function(self):
+        self.assert_bad_region_report_preserves_diagnostics(
+            gzip.compress(b'{"data": [{"functions": [null]}]}'))
+
+    def test_diagnostics_preserve_evidence_after_excessive_json_nesting(self):
+        self.assert_bad_region_report_preserves_diagnostics(
+            gzip.compress(b'[' * 100000 + b'0' + b']' * 100000))
+
     def test_failure_diagnostics_capture_profiles_and_object_identity_without_executable(self):
+        self.without_diagnostic_tools()
         target = self.directory / 'target/llvm-cov-target'
         target.mkdir(parents=True)
         (target / (self.directory.name + '.profdata')).write_bytes(b'merged')
@@ -519,8 +1135,10 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
             self.assertEqual(files['target/llvm-cov-target/one.profraw']['sha256'], hashlib.sha256(raw).hexdigest())
             self.assertFalse(any('fixture-object' in name for name in bundle.getnames()))
         self.assertIn('rustc', receipt['tools'])
+        self.assertIn('error', receipt['tools']['rustc'])
 
     def test_diagnostics_read_colored_export_commands(self):
+        self.without_diagnostic_tools()
         target = self.directory / 'target/llvm-cov-target'
         target.mkdir(parents=True)
         executable = target / 'fixture object'
@@ -532,6 +1150,7 @@ class CoverageProducerDiagnosticsTests(unittest.TestCase):
         self.assertEqual(receipt['objects'], [{'path': executable.as_posix(),
             'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
             'bytes': executable.stat().st_size, 'changed_during_collection': False}])
+        self.assertIn('error', receipt['tools']['rustc'])
 
     def test_diagnostics_bound_input_and_report_missing_and_symlink_profiles(self):
         target = self.directory / 'target/llvm-cov-target'

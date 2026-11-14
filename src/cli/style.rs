@@ -247,23 +247,44 @@ pub fn command(cmd: &str) -> String {
 #[must_use]
 pub fn sanitize_terminal_text(text: &str) -> String {
     text.chars()
-        .filter(|character| {
-            !character.is_control()
-                && !matches!(
-                    character,
-                    // Bidi embedding/override/isolate (Trojan Source class)
-                    '\u{202a}'..='\u{202e}'
-                        | '\u{2066}'..='\u{2069}'
-                        // Zero-width + invisible formatting (LRM/RLM/ZWJ/WJ)
-                        | '\u{200b}'..='\u{200f}'
-                        | '\u{2060}'..='\u{2064}'
-                        // Unicode line/paragraph separator (breaks single-line layout)
-                        | '\u{2028}' | '\u{2029}'
-                        // Zero-width no-break space / BOM in the middle of text
-                        | '\u{feff}'
-                )
-        })
+        .filter(|character| terminal_character_allowed(*character))
         .collect()
+}
+
+fn terminal_character_allowed(character: char) -> bool {
+    !character.is_control()
+        && !matches!(
+            character,
+            // Bidi embedding/override/isolate (Trojan Source class)
+            '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                // Zero-width + invisible formatting (LRM/RLM/ZWJ/WJ)
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2060}'..='\u{2064}'
+                // Unicode line/paragraph separator (breaks single-line layout)
+                | '\u{2028}' | '\u{2029}'
+                // Zero-width no-break space / BOM in the middle of text
+                | '\u{feff}'
+        )
+}
+
+#[must_use]
+#[cfg(any(feature = "arch", test))]
+pub(crate) fn display_terminal_text(text: &str) -> impl std::fmt::Display + '_ {
+    struct TerminalText<'a>(&'a str);
+
+    impl std::fmt::Display for TerminalText<'_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            use std::fmt::Write as _;
+
+            for character in self.0.chars().filter(|c| terminal_character_allowed(*c)) {
+                formatter.write_char(character)?;
+            }
+            Ok(())
+        }
+    }
+
+    TerminalText(text)
 }
 
 /// URL formatting (underlined blue)
@@ -463,6 +484,22 @@ mod tests {
                 assert_eq!(rendered.matches("OK").count(), 1, "{rendered:?}");
             },
         );
+    }
+
+    #[test]
+    fn streaming_terminal_text_matches_owned_sanitization() {
+        for input in [
+            "plain visible text",
+            "core\u{1b}]0;pwn\u{202e}db\u{7}\n",
+            "x\u{200b}y\u{200c}z\u{2060}w\u{feff}",
+            "one\u{2028}two\u{2029}three",
+            "é 日本語 🎉",
+        ] {
+            assert_eq!(
+                display_terminal_text(input).to_string(),
+                sanitize_terminal_text(input)
+            );
+        }
     }
 
     #[test]

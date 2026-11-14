@@ -51,6 +51,7 @@ async fn test_global_rate_limiting() {
     }
 
     assert!(limit_hit, "Should have hit global rate limit");
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -82,19 +83,9 @@ async fn test_input_validation_audit() {
     let audit_dir = temp_dir.path().join("audit");
     let audit_file = audit_dir.join("audit.jsonl");
 
-    let content = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            if let Ok(content) = tokio::fs::read_to_string(&audit_file).await
-                && content.contains("policy_violation")
-                && content.contains("Invalid package name")
-            {
-                break content;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("Audit event was not written to {audit_file:?}"));
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
+    let content = std::fs::read_to_string(&audit_file)
+        .unwrap_or_else(|error| panic!("Audit event was not written to {audit_file:?}: {error}"));
 
     assert!(content.contains("policy_violation"));
     assert!(content.contains("Invalid package name"));
@@ -133,6 +124,7 @@ async fn test_health_endpoint_returns_status() {
         }
         Response::Error { message, .. } => unreachable!("Health endpoint failed: {}", message),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -154,6 +146,7 @@ async fn test_ping_returns_pong() {
         }
         Response::Error { message, .. } => unreachable!("Ping failed: {}", message),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -177,6 +170,7 @@ async fn test_cache_stats_handler() {
         }
         Response::Error { message, .. } => unreachable!("CacheStats failed: {}", message),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -248,6 +242,7 @@ async fn test_cache_clear_handler() {
         } => assert_eq!(size, 0, "CacheClear must remove the populated query"),
         other => panic!("Expected cache statistics after clear, got: {other:?}"),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }
 
 #[tokio::test]
@@ -269,4 +264,5 @@ async fn test_explicit_count_handler() {
         }
         Response::Error { message, .. } => unreachable!("ExplicitCount failed: {}", message),
     }
+    omg_lib::core::security::audit::flush_pending_audit_events().unwrap();
 }

@@ -5,8 +5,70 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+bitflags::bitflags! {
+    /// Operations for which a configured repository may supply package data.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RepoUsage: u8 {
+        /// Refresh this repository during database synchronization.
+        const SYNC = 1;
+        /// Include this repository in package searches.
+        const SEARCH = 2;
+        /// Use this repository for implicit package installation.
+        const INSTALL = 4;
+        /// Use this repository for system upgrades.
+        const UPGRADE = 8;
+        /// Enable every repository operation.
+        const ALL = Self::SYNC.bits() | Self::SEARCH.bits() | Self::INSTALL.bits() | Self::UPGRADE.bits();
+    }
+}
+
+impl Default for RepoUsage {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl std::str::FromStr for RepoUsage {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let mut usage = Self::empty();
+        for token in value.split_whitespace() {
+            usage |= match token {
+                "Sync" => Self::SYNC,
+                "Search" => Self::SEARCH,
+                "Install" => Self::INSTALL,
+                "Upgrade" => Self::UPGRADE,
+                "All" => Self::ALL,
+                _ => anyhow::bail!("Invalid repository Usage token: {token}"),
+            };
+        }
+        anyhow::ensure!(!usage.is_empty(), "Repository Usage cannot be empty");
+        Ok(usage)
+    }
+}
+
+#[cfg(feature = "arch")]
+impl RepoUsage {
+    pub(crate) fn to_alpm(self) -> alpm::Usage {
+        let mut usage = alpm::Usage::empty();
+        for (configured, native) in [
+            (Self::SYNC, alpm::Usage::SYNC),
+            (Self::SEARCH, alpm::Usage::SEARCH),
+            (Self::INSTALL, alpm::Usage::INSTALL),
+            (Self::UPGRADE, alpm::Usage::UPGRADE),
+        ] {
+            if self.contains(configured) {
+                usage |= native;
+            }
+        }
+        usage
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RepoConfig {
+    pub usage: RepoUsage,
     pub name: String,
     pub servers: Vec<String>,
     pub sig_level: Option<String>,
@@ -124,9 +186,22 @@ impl PacmanConfig {
     }
 
     pub fn parse_str(content: &str) -> Result<Self> {
+        enum Section {
+            Preamble,
+            Options,
+            Repository(RepoConfig),
+        }
+
+        let finish = |section: Section, repos: &mut Vec<RepoConfig>| {
+            if let Section::Repository(mut repo) = section {
+                if repo.usage.is_empty() {
+                    repo.usage = RepoUsage::ALL;
+                }
+                repos.push(repo);
+            }
+        };
         let mut config = PacmanConfig::default();
-        let mut current_section: Option<String> = None;
-        let mut current_repo: Option<RepoConfig> = None;
+        let mut current_section = Section::Preamble;
         let mut repository_names = HashSet::new();
 
         for line in content.lines() {
@@ -137,24 +212,26 @@ impl PacmanConfig {
             }
 
             if line.starts_with('[') && line.ends_with(']') {
-                if let Some(repo) = current_repo.take() {
-                    config.repos.push(repo);
-                }
+                finish(
+                    std::mem::replace(&mut current_section, Section::Preamble),
+                    &mut config.repos,
+                );
 
                 let section = &line[1..line.len() - 1];
-                current_section = Some(section.to_string());
-
-                if section != "options" {
+                current_section = if section == "options" {
+                    Section::Options
+                } else {
                     validate_repository_name(section)?;
                     anyhow::ensure!(
                         repository_names.insert(section.to_string()),
                         "Duplicate pacman repository section: {section}"
                     );
-                    current_repo = Some(RepoConfig {
+                    Section::Repository(RepoConfig {
                         name: section.to_string(),
+                        usage: RepoUsage::empty(),
                         ..Default::default()
-                    });
-                }
+                    })
+                };
                 continue;
             }
 
@@ -166,22 +243,18 @@ impl PacmanConfig {
                 (line, None)
             };
 
-            match current_section.as_deref() {
-                Some("options") => {
+            match &mut current_section {
+                Section::Options => {
                     Self::parse_option(&mut config, key, value)?;
                 }
-                Some(_) => {
-                    if let Some(ref mut repo) = current_repo {
-                        Self::parse_repo_option(repo, key, value);
-                    }
+                Section::Repository(repo) => {
+                    Self::parse_repo_option(repo, key, value)?;
                 }
-                None => {}
+                Section::Preamble => {}
             }
         }
 
-        if let Some(repo) = current_repo {
-            config.repos.push(repo);
-        }
+        finish(current_section, &mut config.repos);
 
         Ok(config)
     }
@@ -278,7 +351,7 @@ impl PacmanConfig {
         Ok(())
     }
 
-    fn parse_repo_option(repo: &mut RepoConfig, key: &str, value: Option<&str>) {
+    fn parse_repo_option(repo: &mut RepoConfig, key: &str, value: Option<&str>) -> Result<()> {
         match key {
             "Server" => {
                 if let Some(v) = value {
@@ -287,8 +360,14 @@ impl PacmanConfig {
             }
             "SigLevel" => Self::append_signature_option(&mut repo.sig_level, value),
             "Include" => repo.include = value.map(String::from),
+            "Usage" => {
+                repo.usage |= value
+                    .context("Repository Usage requires a value")?
+                    .parse::<RepoUsage>()?;
+            }
             _ => {}
         }
+        Ok(())
     }
 
     pub fn get_repo_names(&self) -> Vec<&str> {
@@ -357,6 +436,67 @@ pub fn get_configured_repos() -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directives_before_a_section_do_not_configure_a_later_repository() {
+        let config = PacmanConfig::parse_str(
+            "Server = https://ignored.invalid\nUsage = Unknown\n[core]\nUsage = Search\n",
+        )
+        .expect("pre-section directives are ignored");
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].name, "core");
+        assert_eq!(config.repos[0].usage, RepoUsage::SEARCH);
+        assert!(config.repos[0].servers.is_empty());
+    }
+
+    #[test]
+    fn section_transitions_keep_repository_and_option_state_separate() {
+        let config = PacmanConfig::parse_str(
+            "Usage = Invalid\nServer = ignored\n\
+             [first]\nServer = https://first.invalid\nUsage = Search\n\
+             [options]\nIgnorePkg = first-held\nServer = ignored\n\
+             [second]\nServer = https://second.invalid\nIgnorePkg = ignored\n\
+             [options]\nIgnorePkg = second-held\n\
+             [options]\nIgnorePkg = final-held\n",
+        )
+        .expect("mixed sections retain their own directives");
+        assert_eq!(
+            config.ignore_pkg,
+            ["first-held", "second-held", "final-held"]
+        );
+        assert_eq!(config.repos.len(), 2);
+        assert_eq!(config.repos[0].name, "first");
+        assert_eq!(config.repos[0].servers, ["https://first.invalid"]);
+        assert_eq!(config.repos[0].usage, RepoUsage::SEARCH);
+        assert_eq!(config.repos[1].name, "second");
+        assert_eq!(config.repos[1].servers, ["https://second.invalid"]);
+        assert_eq!(config.repos[1].usage, RepoUsage::ALL);
+    }
+
+    #[test]
+    fn repository_usage_defaults_and_repeated_directives() {
+        let config = PacmanConfig::parse_str(
+            "[default]\n[restricted]\nUsage = Sync Search\nUsage = Upgrade\n[all]\nUsage = All\n",
+        )
+        .unwrap();
+        assert_eq!(config.repos[0].usage, RepoUsage::ALL);
+        assert_eq!(
+            config.repos[1].usage,
+            RepoUsage::SYNC | RepoUsage::SEARCH | RepoUsage::UPGRADE
+        );
+        assert_eq!(config.repos[2].usage, RepoUsage::ALL);
+    }
+
+    #[test]
+    fn batch2_rejects_invalid_repository_usage() {
+        for usage in ["Upgarde", "", "Search Unknown"] {
+            let result = PacmanConfig::parse_str(&format!("[core]\nUsage = {usage}\n"));
+            assert!(
+                result.is_err(),
+                "invalid Usage {usage:?} was accepted: {result:?}"
+            );
+        }
+    }
 
     #[test]
     #[serial_test::serial]

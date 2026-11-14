@@ -121,14 +121,43 @@ pub(super) async fn security_audit_result()
 -> Result<crate::core::security::scan::SecurityAuditResult> {
     #[cfg(unix)]
     if let Ok(mut client) = DaemonClient::connect().await {
-        return client
+        let result = client
             .security_audit()
             .await
             .context("Failed to run security audit");
+        let result = result?;
+        if !matches!(
+            result.coverage,
+            crate::core::security::scan::AuditCoverage::Unreported
+        ) {
+            return Ok(result);
+        }
+        tracing::warn!("Daemon audit omitted coverage; using the native audit instead");
     }
     let manager = crate::package_managers::get_package_manager()?;
     let scanner = crate::core::security::VulnerabilityScanner::new();
     crate::core::security::scan::scan_installed(manager.as_ref(), &scanner).await
+}
+
+pub(super) fn audit_coverage_warning(
+    coverage: &crate::core::security::scan::AuditCoverage,
+) -> Option<String> {
+    use crate::core::security::scan::AuditCoverage;
+    match coverage {
+        AuditCoverage::Unreported => {
+            Some("Advisory coverage was not reported; package safety is unknown.".into())
+        }
+        AuditCoverage::Reported {
+            assessed,
+            unassessed,
+            ..
+        } if !unassessed.is_empty() => Some(format!(
+            "Advisory scope: {} assessed package(s), {} package(s) with unknown coverage; absence of findings does not establish safety.",
+            assessed.len(),
+            unassessed.len()
+        )),
+        AuditCoverage::Reported { .. } => None,
+    }
 }
 
 /// Perform security audit (vulnerability scan)
@@ -143,8 +172,18 @@ async fn scan_with_options(_ctx: &CliContext, fail_on_findings: bool) -> Result<
     {
         let res = security_audit_result().await?;
         let total_findings = res.total_vulnerabilities;
+        let coverage_warning = audit_coverage_warning(&res.coverage);
+        if let Some(warning) = &coverage_warning {
+            ui::print_warning(warning);
+        }
         if total_findings == 0 {
-            ui::print_success("No vulnerabilities found in scanned packages.");
+            if coverage_warning.is_some() {
+                crate::cli::modern_ui::print_info(
+                    "No findings were reported; advisory coverage is incomplete.",
+                );
+            } else {
+                ui::print_success("No vulnerabilities found in assessed packages.");
+            }
         } else {
             ui::print_warning(format!(
                 "Found {} vulnerabilities ({} high severity)",
@@ -170,13 +209,20 @@ async fn scan_with_options(_ctx: &CliContext, fail_on_findings: bool) -> Result<
                         |s| format!(" [Score: {}]", style::sanitize_terminal_text(&s)),
                     );
                     println!(
-                        "    {} {} - {}{}",
+                        "    {} {} - {}{}{}",
                         style::maybe_color("→", |t| t.red().to_string()),
                         style::maybe_color(&style::sanitize_terminal_text(&vuln.id), |t| t
                             .yellow()
                             .to_string()),
                         style::sanitize_terminal_text(&vuln.summary),
-                        style::dim(&score)
+                        style::dim(&score),
+                        if vuln.applicability
+                            == crate::core::security::scan::FindingApplicability::Possible
+                        {
+                            " [possible match; applicability unverified]"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 println!();
@@ -229,6 +275,8 @@ pub async fn generate_sbom(
             "{} Inventory only: advisory matching was skipped; an empty vulnerability list is not a clean scan.",
             style::warning("⚠")
         );
+    } else if let Some(warning) = sbom_coverage_warning(&sbom) {
+        ui::print_warning(warning);
     }
 
     let path = if let Some(output_path) = output {
@@ -263,6 +311,24 @@ pub async fn generate_sbom(
     println!("  {} CycloneDX 1.5 (JSON)", style::dim("Format:"));
 
     Ok(())
+}
+
+fn sbom_coverage_warning(sbom: &crate::core::security::Sbom) -> Option<String> {
+    let properties = sbom
+        .metadata
+        .component
+        .as_ref()
+        .and_then(|component| component.properties.as_deref())
+        .unwrap_or_default();
+    let property = |name: &str| properties.iter().find(|property| property.name == name);
+    match (
+        property("omg:advisory-coverage").map(|property| property.value.as_str()),
+        property("omg:advisory-unknown-count").and_then(|property| property.value.parse::<usize>().ok()),
+    ) {
+        (Some("reported"), Some(0)) => None,
+        (Some("reported"), Some(unknown)) => Some(format!("SBOM advisory scope has {unknown} package(s) with unknown coverage; an empty findings list does not establish safety.")),
+        _ => Some("SBOM advisory coverage was not reported; an empty findings list does not establish safety.".into()),
+    }
 }
 
 fn mark_inventory_only(sbom: &mut crate::core::security::Sbom) -> Result<()> {
@@ -1140,7 +1206,27 @@ fn package_has_available_update(package: &str) -> Result<bool> {
     }
 }
 
-/// Auto-fix vulnerabilities by upgrading packages
+/// Separate applicable remediation candidates from source-review matches.
+fn remediation_findings(
+    findings: &[crate::core::security::scan::Vulnerability],
+    minimum: crate::core::security::scan::MinimumSeverity,
+) -> (Vec<&str>, Vec<&str>) {
+    let mut applicable = Vec::new();
+    let mut possible = Vec::new();
+    for finding in findings
+        .iter()
+        .filter(|finding| finding.meets_minimum(minimum))
+    {
+        if finding.applicability == crate::core::security::scan::FindingApplicability::Applicable {
+            applicable.push(finding.id.as_str());
+        } else {
+            possible.push(finding.id.as_str());
+        }
+    }
+    (applicable, possible)
+}
+
+/// Remediate applicable vulnerability findings by upgrading packages.
 pub async fn fix_vulnerabilities(
     dry_run: bool,
     yes: bool,
@@ -1175,8 +1261,22 @@ pub async fn fix_vulnerabilities(
 
     #[cfg(unix)]
     {
+        let coverage_warning = audit_coverage_warning(&scan_result.coverage);
+        if let Some(warning) = &coverage_warning {
+            ui::print_warning(warning);
+        }
         if scan_result.total_vulnerabilities == 0 {
-            println!("{} No vulnerabilities found!", style::success("✓"));
+            if coverage_warning.is_some() {
+                println!(
+                    "{} No findings were reported; advisory coverage is incomplete.",
+                    style::warning("⚠")
+                );
+            } else {
+                println!(
+                    "{} No vulnerabilities found in assessed packages!",
+                    style::success("✓")
+                );
+            }
             return Ok(());
         }
 
@@ -1194,13 +1294,11 @@ pub async fn fix_vulnerabilities(
         // vulnerability's CVSS string is parsed exactly once).
         let mut to_upgrade: Vec<String> = Vec::new();
         let mut unfixable: Vec<(String, String)> = Vec::new();
+        let mut manual_review: Vec<(String, String)> = Vec::new();
 
         for (pkg, vulns) in &scan_result.vulnerabilities {
-            let severe_vulns: Vec<&str> = vulns
-                .iter()
-                .filter(|v| v.meets_minimum(min_sev))
-                .map(|v| v.id.as_str())
-                .collect();
+            let (severe_vulns, possible) = remediation_findings(vulns, min_sev);
+            manual_review.extend(possible.into_iter().map(|id| (pkg.clone(), id.to_owned())));
             if severe_vulns.is_empty() {
                 continue;
             }
@@ -1211,6 +1309,20 @@ pub async fn fix_vulnerabilities(
                     severe_vulns
                         .into_iter()
                         .map(|id| (pkg.clone(), id.to_string())),
+                );
+            }
+        }
+
+        if !manual_review.is_empty() {
+            println!(
+                "\n{} Possible matches require manual package-source review; automatic remediation is unavailable:",
+                style::warning("⚠")
+            );
+            for (package, id) in &manual_review {
+                println!(
+                    "    {} - {}",
+                    style::sanitize_terminal_text(package),
+                    style::sanitize_terminal_text(id)
                 );
             }
         }
@@ -1887,6 +1999,10 @@ mod tests {
             "components": []
         }))
         .expect("minimal system SBOM");
+        assert!(
+            sbom_coverage_warning(&sbom).is_some(),
+            "legacy SBOM metadata must not imply complete advisory coverage"
+        );
         mark_inventory_only(&mut sbom).expect("inventory-only marker");
         let value = serde_json::to_value(sbom).expect("serialized SBOM");
         assert_eq!(
@@ -2127,5 +2243,60 @@ mod tests {
         );
         assert!(validate_compliance_export_inputs("soc2", None, "/tmp/evidence").is_err());
         assert!(validate_compliance_export_inputs("unknown", None, "audit-evidence").is_err());
+    }
+    #[test]
+    fn coverage17_unknown_and_legacy_scopes_cannot_look_clean() {
+        use crate::core::security::scan::{AuditCoverage, InstalledIdentity, UnassessedPackage};
+        let coverage = AuditCoverage::Reported {
+            assessed: Vec::new(),
+            unassessed: vec![UnassessedPackage {
+                package: InstalledIdentity {
+                    name: "custom".into(),
+                    version: "1".into(),
+                    architecture: None,
+                },
+                reason: crate::core::security::vulnerability::UnknownCoverage::OriginUnestablished,
+            }],
+            sources: Vec::new(),
+        };
+        let warning = audit_coverage_warning(&coverage).expect("unknown scope must be explicit");
+        assert!(
+            warning.contains("1 package(s) with unknown coverage"),
+            "{warning}"
+        );
+        assert!(audit_coverage_warning(&AuditCoverage::Unreported).is_some());
+        assert!(
+            audit_coverage_warning(&AuditCoverage::Reported {
+                assessed: Vec::new(),
+                unassessed: Vec::new(),
+                sources: Vec::new()
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn coverage17_possible_matches_require_manual_review_not_auto_fix() {
+        use crate::core::security::scan::{FindingApplicability, MinimumSeverity, Vulnerability};
+        let possible = Vulnerability {
+            id: "possible".into(),
+            summary: "source identity is not established".into(),
+            score: Some("9.8".into()),
+            advisory_severity: None,
+            native_advisory: None,
+            affected_installed: Vec::new(),
+            applicability: FindingApplicability::Possible,
+        };
+        let mut applicable = possible.clone();
+        applicable.id = "applicable".into();
+        applicable.applicability = FindingApplicability::Applicable;
+        let findings = [possible, applicable];
+        let (automatic, manual) = remediation_findings(&findings, MinimumSeverity::High);
+        assert_eq!(automatic, ["applicable"]);
+        assert_eq!(manual, ["possible"]);
+        assert!(
+            enforce_scan_findings(findings.len(), true).is_err(),
+            "possible findings remain in --fail-on-findings totals"
+        );
     }
 }

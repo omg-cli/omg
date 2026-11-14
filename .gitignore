@@ -23,6 +23,7 @@ bun.lock
 !/services/cloud-ci/runner/bun.lock
 !/services/ci-inspector/bun.lock
 !/services/ci-coder/bun.lock
+!/services/advisories/bun.lock
 !/services/ci/bun.lock
 package-lock.json
 !.github/deps/release-tools/package-lock.json

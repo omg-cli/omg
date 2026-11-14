@@ -1,6 +1,7 @@
 """Source-bound CPU/shell boot contracts. No VM or networking is exercised."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
@@ -263,7 +264,18 @@ elif 'systemctl reboot' in command:
             subject = root / 'boot.sh'
             subject.write_text('initial=false\n' + body)
             clone_function = clone_function.replace('/work/boot.sh', str(subject))
-            script = 'set -euo pipefail\n' + budget + '\nclone_boot_timeout=$CLONE_BOOT_TIMEOUT\nboot_args=(bios ssh)\n' + clone_function + '\nstart_clone disk vars serial.log clone.log\n'
+            activation = '''remote_argv() {
+  [[ $# == 7 ]] || return 99
+  [[ "$1" == timeout && "$2" == --kill-after=5s && "$3" == 90s &&
+     "$4" == sudo && "$5" == -n && "$6" == python3 &&
+     "$7" == /home/bench/provision-qemu-crash-channel.py ]] || return 99
+  grep -Fxq 'cloud fixture complete' clone.log || return 98
+  printf '%s\\n' "$*" > activation-command.txt
+  sleep 0.7
+  printf '{"fixture":"vendor-crash-activation"}\\n'
+}
+'''
+            script = 'set -euo pipefail\n' + budget + '\nclone_boot_timeout=$CLONE_BOOT_TIMEOUT\nboot_args=(bios ssh)\n' + activation + clone_function + '\nstart_clone disk vars serial.log clone.log\n'
             def diagnostics(result, elapsed):
                 logs = '\n'.join(f'--- {path.name} ---\n{path.read_text()}'
                                  for path in sorted(root.glob('*.log')))
@@ -274,6 +286,10 @@ elif 'systemctl reboot' in command:
             self.assertGreater(elapsed, 2.5)
             self.assertIn('setup fixture complete', (root / 'clone.log').read_text())
             self.assertIn('cloud fixture complete', (root / 'clone.log').read_text())
+            self.assertEqual((root / 'activation-command.txt').read_text(),
+                             'timeout --kill-after=5s 90s sudo -n python3 /home/bench/provision-qemu-crash-channel.py\n')
+            self.assertEqual(json.loads((root / 'clone.crash-channel.json').read_text()),
+                             {"fixture": "vendor-crash-activation"})
             # Initial composition adds all five SSH commands and reboot readiness.
             (root / 'qemu.pid').unlink()
             subject.write_text('initial=true\n' + body)

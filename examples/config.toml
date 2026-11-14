@@ -21,6 +21,13 @@
 
 [aur]
 
+# Optional restrictive admission profile. Default: "standard".
+# Hardened requires offline bubblewrap, source review and secure_makepkg.
+# It rejects install hooks, privilege-bearing files and system integration,
+# and requires a second matching build for every accepted AUR output.
+# Enable with: omg config set aur.security_profile hardened
+#security_profile = "standard"
+
 # Build method for AUR packages (default: "bubblewrap")
 # Options:
 # - "bubblewrap": Sandboxed builds using bubblewrap (most secure)
@@ -55,50 +62,47 @@
 # Example: "-j4" to limit parallel make jobs
 #makeflags = "-j8"
 
-# Custom PKGDEST (shared package cache)
-# Where built packages (.pkg.tar.zst) are stored
+# Legacy custom PKGDEST. Accepted for compatibility but ignored.
+# Outputs always use private per-invocation storage.
 #pkgdest = "/var/cache/omg/packages"
 
-# Custom SRCDEST (shared source cache)
-# Where source tarballs are cached
+# Legacy custom SRCDEST. Accepted for compatibility but ignored.
+# Sources always use private per-invocation storage.
 #srcdest = "/var/cache/omg/sources"
 
-# Enable build cache re-use based on PKGBUILD hash (default: true)
-# Skips rebuilding if PKGBUILD hasn't changed
-#cache_builds = true
+# Legacy build cache toggle (default: false). Persistent reuse is disabled.
+#cache_builds = false
 
 # Enable ccache integration (default: false)
 # Speeds up C/C++ compilation by caching object files
 #enable_ccache = false
 
-# Optional ccache directory
-# If not set, uses ccache default (~/.ccache)
+# Legacy ccache directory, ignored. Compiler caches are invocation-local.
 #ccache_dir = "/home/user/.cache/ccache"
 
 # Enable sccache integration (default: false)
 # Alternative to ccache, supports Rust compilation caching
 #enable_sccache = false
 
-# Optional sccache directory
-# If not set, uses sccache default (~/.cache/sccache)
+# Legacy sccache directory, ignored. Compiler caches are invocation-local.
 #sccache_dir = "/home/user/.cache/sccache"
 
 # ============================================================================
 # EXAMPLE CONFIGURATIONS
 # ============================================================================
 
-# --- Build Cache Tuning ---
+# --- Concurrent Sandboxed Builds ---
 # Retains the default sandbox and review settings:
 #
 # [aur]
 # build_concurrency = 8
-# cache_builds = true
 # enable_ccache = true
 
 # --- Security-Hardened Setup ---
 # Example sandboxed settings with reduced concurrency:
 #
 # [aur]
+# security_profile = "hardened"
 # build_method = "bubblewrap"
 # build_concurrency = 4
 # review_pkgbuild = true
@@ -106,12 +110,5 @@
 # allow_unsafe_builds = false
 # cache_builds = false
 
-# --- Team/CI Setup ---
-# Uncomment for reproducible team environments:
-#
-# telemetry_enabled = false
-# [aur]
-# build_method = "chroot"
-# pkgdest = "/opt/omg/packages"
-# srcdest = "/opt/omg/sources"
-# cache_builds = true
+# Unattended builds are a separate trust decision. Hardened source review and
+# exceptional archive approval require an attended terminal. See docs/aur.md.

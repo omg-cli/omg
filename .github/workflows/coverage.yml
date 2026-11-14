@@ -45,7 +45,7 @@ jobs:
     timeout-minutes: 45
     env:
       RUSTFLAGS: -C llvm-args=-runtime-counter-relocation
-      LLVM_PROFILE_FILE_NAME: omg-%p-%m%c.profraw
+      LLVM_PROFILE_FILE_NAME: omg-%p-%m.profraw
     container:
       image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
 
@@ -181,7 +181,7 @@ jobs:
       - name: Cover sandbox descendant cancellation
         id: native_fixture_tests
         shell: bash
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           profile_dir="$GITHUB_WORKSPACE/target/llvm-cov-target"
@@ -196,39 +196,134 @@ jobs:
 
           docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
-          RUN pacman -Syu --noconfirm --needed bubblewrap fakeroot && pacman -Scc --noconfirm
+          RUN pacman -Syu --noconfirm --needed apparmor bubblewrap fakeroot python sudo debugedit git make jq diffutils && pacman -Scc --noconfirm
           DOCKERFILE
+          python3 scripts/native-cli-coverage.py prepare --target "$profile_dir" \
+            --source-commit "$(git rev-parse HEAD)" --output "$evidence_dir/cli-manifest.json"
           curl -fsS https://raw.githubusercontent.com/moby/profiles/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json -o /tmp/coverage-seccomp.json
           echo '536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74  /tmp/coverage-seccomp.json' | sha256sum --check
           jq '(.syscalls[] | select(.includes.caps == ["CAP_SYS_ADMIN"]) | .names) += ["pivot_root"]' \
             /tmp/coverage-seccomp.json > /tmp/coverage-sandbox-seccomp.json
 
+          restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -r "$restriction" ]; then
+            printf '%s=' "$restriction" | tee "$evidence_dir/apparmor-diagnostic.log"
+            cat "$restriction" | tee -a "$evidence_dir/apparmor-diagnostic.log"
+          else
+            printf '%s unreadable\n' "$restriction" | tee "$evidence_dir/apparmor-diagnostic.log"
+          fi
+          if docker run --rm --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json --network none \
+            --pids-limit 32 --memory 128m --cpus 1 \
+            omg-coverage-sandbox /bin/bash -c '
+              cat /proc/self/attr/current
+              runuser -u nobody -- unshare --user /bin/cat /proc/self/attr/current
+            ' >> "$evidence_dir/apparmor-diagnostic.log" 2>&1; then
+            diagnostic_status=0
+          else
+            diagnostic_status=$?
+          fi
+          printf 'diagnostic exit=%s\n' "$diagnostic_status" | tee -a "$evidence_dir/apparmor-diagnostic.log"
+
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          profile_name="omg-coverage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          profile_loaded=0
+          container=
+          profile_text=$(printf 'abi <abi/4.0>,\nprofile %s flags=(unconfined) {\n  userns,\n}\n' "$profile_name")
+          cleanup() {
+            local status=$? cleanup_status=0
+            trap - EXIT
+            if [ -n "$container" ]; then
+              if docker rm --force "$container"; then
+                container=
+              else
+                cleanup_status=$?
+                printf 'Container removal failed; retaining AppArmor profile %s\n' "$profile_name" >&2
+              fi
+            fi
+            if [ "$profile_loaded" -eq 1 ] && [ -z "$container" ]; then
+              printf '%s\n' "$profile_text" | docker run --rm --interactive --network=none \
+                --pids-limit=32 --memory=256m --cpus=1 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=16m \
+                --cap-drop=ALL --cap-add=MAC_ADMIN --security-opt=apparmor=unconfined \
+                --mount=type=bind,src=/sys/kernel/security,dst=/sys/kernel/security --entrypoint apparmor_parser \
+                omg-coverage-sandbox --skip-cache --jobs=1 --remove || cleanup_status=$?
+            fi
+            if [ "$status" -ne 0 ]; then exit "$status"; fi
+            exit "$cleanup_status"
+          }
+          trap cleanup EXIT
+          fixture_apparmor=unconfined
+          if [ -r "$restriction" ] && [ "$(cat "$restriction")" = 1 ]; then
+            printf '%s\n' "$profile_text" | docker run --rm --interactive --network=none \
+              --pids-limit=32 --memory=256m --cpus=1 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=16m \
+              --cap-drop=ALL --cap-add=MAC_ADMIN --security-opt=apparmor=unconfined \
+              --mount=type=bind,src=/sys/kernel/security,dst=/sys/kernel/security --entrypoint apparmor_parser \
+              omg-coverage-sandbox --skip-cache --jobs=1 --replace
+            profile_loaded=1
+            fixture_apparmor=$profile_name
+          fi
+
           # Namespace permissions apply only to this credential-free fixture.
-          container=$(docker create --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+          container=$(docker create --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt "apparmor=$fixture_apparmor" \
             --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json \
-            --network none --pids-limit 128 --memory 1g --cpus 2 \
+            --network none --add-host aur.archlinux.org:127.0.0.1 --pids-limit 128 --memory 1g --cpus 2 \
             omg-coverage-sandbox /bin/bash -euo pipefail -c '
               mkdir -m 1777 /profiles
               mkdir /evidence
+              chage -l nobody > /evidence/fixture-account-before.txt
+              chage -E -1 nobody
+              chage -l nobody > /evidence/fixture-account-after.txt
+              passwd -S nobody | tee /evidence/fixture-account-status.txt
+              grep -Eq "^nobody L " /evidence/fixture-account-status.txt
+              install -d -m 700 -o nobody -g nobody /home/omg-fixture /var/tmp/omg-fixture-cache /var/tmp/omg-fixture-state /var/tmp/omg-fixture-config
+              mkdir -p /var/cache/pacman/pkg /var/lib/pacman/local /var/lib/pacman/sync
+              printf "nobody ALL=(root) NOPASSWD: /usr/bin/true\n" > /etc/sudoers.d/omg-fixture
+              chmod 440 /etc/sudoers.d/omg-fixture
+              visudo -cf /etc/sudoers.d/omg-fixture
+              runuser -u nobody -- sudo -n -- /usr/bin/true
+              runuser -u nobody -- sudo -n -v
               fixture_binary=/fixture
               fixture_profiles=/profiles
               fixture_evidence=/evidence
+              mount -t proc -o nosuid,nodev,noexec proc /proc
+              cat /proc/self/mountinfo > /evidence/mountinfo.txt
               command -v fakeroot
               bwrap --ro-bind / / --unshare-pid --proc /proc -- /bin/true
               bwrap --unshare-user --uid "$(id -u nobody)" --gid "$(id -g nobody)" \
                 --cap-drop ALL --ro-bind / / --proc /proc -- /usr/bin/id
+              cat /proc/self/attr/current | tee /evidence/apparmor-profile.txt
+              for network in --share-net --unshare-net; do
+                runuser -u nobody -- bwrap --clearenv --share-net --unshare-pid --new-session \
+                  --die-with-parent "$network" --ro-bind / / --proc /proc -- /bin/cat /proc/self/attr/current
+              done
               /fixture --include-ignored --list > /evidence/registry.txt
               run_case() {
                 local test_name=$1
                 local case_id=${test_name//::/_}
                 local log="$fixture_evidence/$case_id.log"
+                local runner=()
+                if [[ "$test_name" == package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents ||
+                      "$test_name" == package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff ||
+                      "$test_name" == package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff ||
+                      "$test_name" == package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason ||
+                      "$test_name" == package_managers::aur::utils::tests::native_lifecycle_original_user_ownership ]]; then
+                  runner=(env OMG_ARCH_INSTALL_FIXTURE=isolated-container)
+                elif [[ "$test_name" == package_managers::aur::client::tests::native_isolated_* ]]; then
+                  runner=(runuser -u nobody -- env HOME=/home/omg-fixture
+                    OMG_CACHE_DIR=/var/tmp/omg-fixture-cache OMG_DATA_DIR=/var/tmp/omg-fixture-state
+                    OMG_CONFIG_DIR=/var/tmp/omg-fixture-config OMG_AUR_NATIVE_FIXTURE=isolated-container)
+                fi
                 grep -Fx "$test_name: test" "$fixture_evidence/registry.txt"
                 LLVM_PROFILE_FILE="$fixture_profiles/omg-fixture-$case_id-%p-%m%c.profraw" \
-                  timeout --kill-after=2s 35s "$fixture_binary" --exact "$test_name" \
+                  timeout --kill-after=2s 35s "${runner[@]}" "$fixture_binary" --exact "$test_name" \
                   --include-ignored --nocapture --test-threads=1 2>&1 | tee "$log"
                 grep -Eq "^test result: ok\. 1 passed; 0 failed; 0 ignored;" "$log"
                 if grep -Eq "\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)" "$log"; then
                   return 1
+                fi
+                if [ "$test_name" = config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options ]; then
+                  grep -F "[omg-unprivileged-fixture]" "$log" | grep -F "parent_uid=0"
+                  grep -F "[omg-unprivileged-fixture-child]" "$log" | grep -F "uid=65534 "
                 fi
                 local profiles=("$fixture_profiles/omg-fixture-$case_id-"*.profraw)
                 for profile in "${profiles[@]}"; do test -s "$profile"; done
@@ -248,6 +343,16 @@ jobs:
                 package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller
                 package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db
                 package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_preserve_distinct_soname_dependencies
+                package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes
+                package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing
+                package_managers::aur::client::tests::native_isolated_history_requires_hardened_review
+                config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options
+                package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation
+                package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents
+                package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff
+                package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff
+                package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason
+                package_managers::aur::utils::tests::native_lifecycle_original_user_ownership
                 core::usage::tests::elevated_state_roundtrip_preserves_caller_files
               )
               printf "%s\n" "${cases[@]}" > /evidence/expected-tests.txt
@@ -266,9 +371,23 @@ jobs:
                 fi
               done
             ')
-          trap 'docker rm --force "$container"' EXIT
           docker cp "$binary" "$container:/fixture"
-          if timeout --kill-after=5s 180s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
+          staging="$RUNNER_TEMP/native-cli-inputs"
+          mkdir -m 755 "$staging" "$staging/bin"
+          install -m 644 scripts/native-cli-coverage.py "$staging/native-cli-coverage.py"
+          install -m 644 "$evidence_dir/cli-manifest.json" "$staging/native-cli-manifest.json"
+          while IFS=$'\t' read -r role artifact; do
+            install -m 755 "$artifact" "$staging/bin/$role"
+          done < <(jq -r '.artifacts | to_entries[] | [.key, .value.path] | @tsv' "$evidence_dir/cli-manifest.json")
+          bash scripts/benchmark-qemu.sh --distro arch --arch x86_64 \
+            --staged-dir "$staging" --native-cli-coverage-dir "$staging" \
+            --evidence-dir "$RUNNER_TEMP/native-cli-qemu"
+          mapfile -t native_returns < <(find "$RUNNER_TEMP/native-cli-qemu" -type d -name native-evidence)
+          test "${#native_returns[@]}" = 1
+          cp -a "${native_returns[0]}/cli" "$evidence_dir/cli"
+          native_profiles="${native_returns[0]%/native-evidence}/native-profiles"
+          find "$native_profiles" -maxdepth 1 -type f -name 'omg-extra-*.profraw' -exec cp -t "$profile_dir" {} +
+          if timeout --kill-after=5s 780s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
             run_status=0
           else
             run_status=$?
@@ -278,6 +397,8 @@ jobs:
           docker cp "$container:/profiles/." "$profile_dir/" || collection_status=$?
           if [ "$run_status" -ne 0 ]; then exit "$run_status"; fi
           test "$collection_status" -eq 0
+          python3 scripts/native-cli-coverage.py verify --manifest "$evidence_dir/cli-manifest.json" \
+            --evidence "$evidence_dir/cli" --profiles "$profile_dir"
           python3 - "$binary" "$profile_dir" "$evidence_dir" "$(git rev-parse HEAD)" <<'PY'
           import hashlib, json, sys
           from pathlib import Path
@@ -297,6 +418,14 @@ jobs:
           receipt = {'source_commit': sys.argv[4], 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'tests': tests}
           (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
           PY
+
+      - name: Export bounded native VM diagnostics
+        if: ${{ !cancelled() && (steps.native_fixture_tests.outcome == 'success' || steps.native_fixture_tests.outcome == 'failure') }}
+        run: |
+          if test -d "$RUNNER_TEMP/native-cli-qemu"; then
+            python3 scripts/export-qemu-evidence.py --source "$RUNNER_TEMP/native-cli-qemu" \
+              --destination "$RUNNER_TEMP/native-coverage-evidence/qemu" --uid "$(id -u)" --gid "$(id -g)"
+          fi
 
       - name: Preserve native fixture coverage evidence
         if: ${{ !cancelled() && (steps.native_fixture_tests.outcome == 'success' || steps.native_fixture_tests.outcome == 'failure') }}
@@ -378,10 +507,11 @@ jobs:
 
       - name: Collect invalid coverage diagnostics
         if: ${{ !cancelled() && steps.coverage_sanity.outcome == 'failure' }}
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           python3 - <<'PY'
-          import hashlib, json, os, re, shlex, stat, subprocess, tarfile
+          import gzip, hashlib, io, json, os, re, resource, shlex, stat, subprocess, tarfile, tempfile, time, zlib
+          from collections import deque
           from pathlib import Path
           root = Path.cwd()
           profiles = root / 'target/llvm-cov-target'
@@ -397,15 +527,32 @@ jobs:
           receipt['workflow_sha256'] = hashlib.sha256(workflow).hexdigest()
           job = workflow.decode().split('\n  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
           receipt['image'] = re.search(r'(?m)^      image: (.+)$', job)[1]
-          def command(argv):
+          deadline = time.monotonic() + 240
+          commands_left = 8500
+          def command(argv, file_limit=8 * 1024 * 1024, pass_fds=(), timeout=5, raw_output=False):
+              global commands_left
+              commands_left -= 1
+              remaining = deadline - time.monotonic()
+              if commands_left < 0 or remaining <= 0:
+                  return {'error': 'diagnostic command budget exhausted'}
               try:
-                  result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
-                  return {'exit_code': result.returncode, 'output': (result.stdout + result.stderr)[:8192]}
+                  with tempfile.TemporaryFile() as stream:
+                      result = subprocess.run(argv, stdout=stream, stderr=subprocess.STDOUT,
+                          timeout=min(timeout, remaining), pass_fds=pass_fds, preexec_fn=lambda: resource.setrlimit(
+                              resource.RLIMIT_FSIZE, (file_limit, file_limit)))
+                      stream.seek(0)
+                      data = stream.read(65537)
+                  response = {'exit_code': result.returncode, 'output': data[:65536].decode('utf-8', errors='replace'),
+                      'truncated': len(data) > 65536}
+                  if raw_output:
+                      response['raw_output'] = data
+                  return response
               except (OSError, subprocess.TimeoutExpired) as error:
                   return {'error': str(error)}
           receipt['tools']['rustc'] = command(['rustc', '-vV'])
           receipt['tools']['cargo-llvm-cov'] = command(['cargo', 'llvm-cov', '--version'])
           receipt['tools']['nextest'] = command(['cargo', 'nextest', '--version'])
+          tools = None
           libdir = command(['rustc', '--print', 'target-libdir'])
           if libdir.get('exit_code') == 0:
               tools = Path(libdir['output'].strip()).parent / 'bin'
@@ -427,6 +574,7 @@ jobs:
                           receipt['export_log_unparsed'] = True
                           continue
                       object_paths.update(argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == '-object')
+          object_identities = {}
           for name in sorted(object_paths):
               path = Path(name)
               entry = {'path': name}
@@ -451,26 +599,225 @@ jobs:
                       after = os.fstat(stream.fileno())
                       entry['changed_during_collection'] = (
                           after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns)
+                      object_identities[name] = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
               except (OSError, ValueError) as error:
                   entry['omitted'] = str(error)
               receipt['objects'].append(entry)
           expected = [profiles / (root.name + '.profdata'), profiles / (root.name + '-profraw-list')]
-          candidates = expected + sorted(profiles.glob('*.profraw')) + [export_log]
+          targeting = receipt['targeting'] = {'functions': [], 'probes': [], 'errors': []}
+          regions = root / 'coverage-regions.json.gz'
+          if regions.is_file() and not regions.is_symlink():
+              try:
+                  with gzip.open(regions, 'rb') as stream:
+                      data = stream.read(32 * 1024 * 1024 + 1)
+                  if len(data) > 32 * 1024 * 1024:
+                      raise ValueError('region decompression budget exceeded')
+                  names = {function['name'] for unit in json.loads(data)['data']
+                      for function in unit.get('functions', [])
+                      if any(region[4] >= 2**63 - 1 for region in function.get('regions', []))}
+                  if len(names) > 16 or any(not isinstance(name, str) or len(name) > 16384 for name in names):
+                      raise ValueError('saturated function name budget exceeded')
+                  targeting['functions'] = sorted(names)
+              except (OSError, EOFError, ValueError, KeyError, TypeError, IndexError, AttributeError, RecursionError, zlib.error) as error:
+                  targeting['errors'].append(str(error))
+          else:
+              targeting['errors'].append('regular region report unavailable')
+          raws = sorted(profiles.glob('*.profraw'))
+          groups = {}
+          for path in raws:
+              match = re.fullmatch(r'omg-(?:fixture-[A-Za-z0-9_]+-)?\d+-(\d+_\d+)\.profraw', path.name)
+              if match and not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(profiles.resolve()):
+                  groups.setdefault(match[1], []).append(path)
+          prioritized = {}
+          projections = {}
+          projection_bytes = 0
+          projection_budget = 16 * 1024 * 1024
+          targeting['projection_diagnostic_only'] = True
+          targeting['projection_budget_bytes'] = projection_budget
+          if targeting['functions'] and (tools is None or receipt['tools'].get('llvm-profdata', {}).get('exit_code') != 0):
+              targeting['errors'].append('matching llvm-profdata unavailable')
+          elif targeting['functions']:
+              selection_start = time.monotonic()
+              discovery = {'calls_left': 128, 'deadline': selection_start + 20}
+              cache = {}
+              def profile_digest(stream, size, phase):
+                  stream.seek(0)
+                  digest = hashlib.sha256()
+                  while size:
+                      if time.monotonic() >= min(phase['deadline'], deadline):
+                          raise ValueError('profile hashing time budget exhausted')
+                      chunk = stream.read(min(size, 1024 * 1024))
+                      if not chunk:
+                          raise ValueError('profile shrank during hashing')
+                      digest.update(chunk)
+                      size -= len(chunk)
+                  return digest.hexdigest()
+              def probe(path, name, phase):
+                  key = (path, name)
+                  if key in cache:
+                      return cache[key]
+                  remaining = phase['deadline'] - time.monotonic()
+                  if phase['calls_left'] < 1 or remaining <= 0:
+                      return None
+                  phase['calls_left'] -= 1
+                  cache[key] = None
+                  entry = {'path': path.relative_to(root).as_posix(), 'function': name}
+                  targeting['probes'].append(entry)
+                  try:
+                      if path.is_symlink() or not path.resolve().is_relative_to(profiles.resolve()):
+                          raise ValueError('profile is a symlink or outside the profile target')
+                      descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                      with os.fdopen(descriptor, 'rb') as stream:
+                          before = os.fstat(stream.fileno())
+                          if not stat.S_ISREG(before.st_mode):
+                              raise ValueError('profile is not a regular file')
+                          entry['raw_identity'] = {'device': before.st_dev, 'inode': before.st_ino,
+                              'bytes': before.st_size, 'mtime_ns': before.st_mtime_ns, 'ctime_ns': before.st_ctime_ns}
+                          try:
+                              entry['raw_sha256_before_probe'] = profile_digest(stream, before.st_size, phase)
+                              result = command([str(tools / 'llvm-profdata'), 'show', '--text', '--function=' + name,
+                                  '/proc/self/fd/' + str(stream.fileno())], pass_fds=(stream.fileno(),),
+                                  timeout=min(5, remaining), raw_output=True)
+                              data = result.pop('raw_output', b'')
+                              if result.get('exit_code') != 0 or result.get('truncated'):
+                                  entry['command_error'] = result
+                                  raise ValueError('profile probe failed or exceeded output budget')
+                              records = list(re.finditer(rb'(?m)^([^#\n][^\n]*)\n# Func Hash:\n(\d+)\n# Num Counters:\n(\d+)\n# Counter Values:\n((?:\d+\n)+)(?:\n|$)', data))
+                              selected = [record for record in records if record[1] == name.encode('utf-8')]
+                              if any(int(record[3]) != len(record[4].splitlines())
+                                      or int(record[2]) > 2**64 - 1
+                                      or any(int(count) > 2**64 - 1 for count in record[4].splitlines())
+                                      for record in selected):
+                                  raise ValueError('invalid counter record in profile probe')
+                              if name.encode('utf-8') + b'\n' in data and not selected:
+                                  raise ValueError('malformed counter record in profile probe')
+                              counts = [int(count) for record in selected for count in record[4].splitlines()]
+                              entry['present'] = bool(counts)
+                              entry['nonzero'] = any(counts)
+                              if entry['nonzero']:
+                                  entry['raw_sha256'] = profile_digest(stream, before.st_size, phase)
+                          finally:
+                              after = os.fstat(stream.fileno())
+                              try:
+                                  current = path.lstat()
+                              except OSError as error:
+                                  current = None
+                                  entry['raw_path_error'] = str(error)
+                              entry['changed_during_collection'] = (
+                                  (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) !=
+                                  (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                                  or entry.get('raw_sha256_before_probe') != entry.get('raw_sha256', entry.get('raw_sha256_before_probe'))
+                                  or current is None or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns) !=
+                                  (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns))
+                              if entry['changed_during_collection']:
+                                  entry['raw_final_identity'] = {'device': after.st_dev, 'inode': after.st_ino,
+                                      'bytes': after.st_size, 'mtime_ns': after.st_mtime_ns, 'ctime_ns': after.st_ctime_ns}
+                                  if current is not None:
+                                      entry['raw_path_final_identity'] = {'device': current.st_dev, 'inode': current.st_ino,
+                                          'bytes': current.st_size, 'mtime_ns': current.st_mtime_ns, 'ctime_ns': current.st_ctime_ns}
+                          if entry['changed_during_collection']:
+                              raise ValueError('profile changed during probing or hashing')
+                      cache[key] = entry['nonzero'] if counts else None
+                      if entry['nonzero']:
+                          if path not in prioritized:
+                              prioritized[path] = None
+                          projection = b''.join(record[0] for record in selected)
+                          global projection_bytes
+                          if projection_bytes + len(projection) > projection_budget:
+                              raise ValueError('profile projection byte budget exhausted')
+                          projection_path = output / (str(len(projections)) + '.proftext')
+                          projection_path.write_bytes(projection)
+                          entry['projection'] = 'profile-projections/' + projection_path.name
+                          entry['projection_sha256'] = hashlib.sha256(projection).hexdigest()
+                          projections[projection_path] = {'path': entry['projection'],
+                              'bytes': len(projection), 'sha256': entry['projection_sha256']}
+                          projection_bytes += len(projection)
+                  except (OSError, ValueError) as error:
+                      entry['error'] = str(error)
+                      targeting['errors'].append(str(error))
+                  return cache[key]
+              matching = []
+              for paths in groups.values():
+                  for name in targeting['functions']:
+                      if probe(paths[0], name, discovery) is not None:
+                          matching.append((paths, name))
+                      if discovery['calls_left'] < 1 or time.monotonic() >= discovery['deadline']:
+                          break
+                  if discovery['calls_left'] < 1 or time.monotonic() >= discovery['deadline']:
+                      break
+              if discovery['calls_left'] < 1 or time.monotonic() >= discovery['deadline']:
+                  targeting['errors'].append('profile discovery budget exhausted')
+              members = {'calls_left': 8192, 'deadline': time.monotonic() + 120}
+              pending = deque((iter(paths), name) for paths, name in matching)
+              while pending and members['calls_left'] > 0 and time.monotonic() < members['deadline']:
+                  paths, name = pending.popleft()
+                  path = next(paths, None)
+                  if path is not None:
+                      probe(path, name, members)
+                      pending.append((paths, name))
+              if pending:
+                  targeting['errors'].append('profile member selection budget exhausted')
+              if not prioritized:
+                  targeting['errors'].append('no nonzero saturated-function raw profile located')
+          covmaps = []
+          generated = 0
+          for index, entry in sorted(enumerate(receipt['objects']), key=lambda pair: pair[1].get('bytes', 0), reverse=True):
+              if entry.get('omitted') or entry.get('changed_during_collection'):
+                  continue
+              if tools is None or receipt['tools'].get('llvm-cov', {}).get('exit_code') != 0:
+                  targeting['errors'].append('matching llvm-cov unavailable')
+                  break
+              if generated >= 96 * 1024 * 1024:
+                  targeting['errors'].append('coverage map generation budget exhausted')
+                  break
+              path = output / (str(index) + '.covmap')
+              try:
+                  descriptor = os.open(entry['path'], os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                  with os.fdopen(descriptor, 'rb') as stream:
+                      info = os.fstat(stream.fileno())
+                      if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != object_identities[entry['path']]:
+                          raise ValueError('object changed before coverage map conversion')
+                      result = command([str(tools / 'llvm-cov'), 'convert-for-testing',
+                          '/proc/self/fd/' + str(stream.fileno()), '-o', str(path)],
+                          min(32 * 1024 * 1024, 96 * 1024 * 1024 - generated), (stream.fileno(),))
+              except (OSError, ValueError) as error:
+                  result = {'error': str(error)}
+              if result.get('exit_code') != 0 or result.get('truncated') or not path.is_file():
+                  targeting['errors'].append('coverage map conversion failed')
+                  entry['coverage_map_error'] = result
+                  path.unlink(missing_ok=True)
+                  continue
+              entry['coverage_map'] = 'coverage-maps/' + path.name
+              generated += path.stat().st_size
+              covmaps.append(path)
+          candidates = list(projections) + expected + covmaps + list(prioritized) + [path for path in raws if path not in prioritized] + [export_log]
           used = 0
           archive = output / 'profiles.tar.gz'
           with tarfile.open(archive, 'w:gz', compresslevel=1) as bundle:
               for path in candidates:
-                  entry = {'path': path.relative_to(root).as_posix()}
+                  entry = {'path': projections[path]['path'] if path in projections else (
+                      ('coverage-maps/' + path.name) if path in covmaps else path.relative_to(root).as_posix())}
                   receipt['files'].append(entry)
                   try:
                       info = path.lstat()
                       entry['bytes'] = info.st_size
-                      if not stat.S_ISREG(info.st_mode) or not path.resolve().is_relative_to(root):
+                      container = output if path in covmaps or path in projections else root
+                      if not stat.S_ISREG(info.st_mode) or not path.resolve().is_relative_to(container):
                           raise ValueError('not a regular contained file; symlinks are not followed')
                       if used + info.st_size > budget:
                           raise ValueError('input byte budget exceeded')
                       descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
                       with os.fdopen(descriptor, 'rb') as stream:
+                          opened = os.fstat(stream.fileno())
+                          if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                                  info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+                              raise ValueError('file changed before archive capture')
+                          if path in projections:
+                              data = stream.read(65537)
+                              if (len(data) > 65536 or len(data) != projections[path]['bytes']
+                                      or hashlib.sha256(data).hexdigest() != projections[path]['sha256']):
+                                  raise ValueError('profile projection changed or exceeded output budget')
+                              stream = io.BytesIO(data)
                           digest = hashlib.sha256()
                           class ProfileReader:
                               def read(self, size):
@@ -483,7 +830,7 @@ jobs:
                           used += info.st_size
                           bundle.addfile(member, ProfileReader())
                           entry['sha256'] = digest.hexdigest()
-                          changed = os.fstat(stream.fileno())
+                          changed = path.lstat() if path in projections else os.fstat(stream.fileno())
                           entry['changed_during_collection'] = (
                               changed.st_size != info.st_size or changed.st_mtime_ns != info.st_mtime_ns)
                   except (OSError, ValueError) as error:
@@ -492,7 +839,9 @@ jobs:
               entry['path'].endswith('.profraw') and 'omitted' not in entry for entry in receipt['files'])
           receipt['admitted_input_bytes'] = used
           receipt['captured_input_bytes'] = sum(entry.get('captured_bytes', 0) for entry in receipt['files'])
-          receipt['complete'] = bool(object_paths) and not receipt['raw_profiles_missing'] and not any(
+          for path in covmaps + list(projections):
+              path.unlink()
+          receipt['complete'] = bool(object_paths) and not targeting['errors'] and not receipt['raw_profiles_missing'] and not any(
               entry.get('omitted') or entry.get('changed_during_collection')
               for entry in receipt['files'] + receipt['objects']) and not receipt.get('export_log_truncated') and not receipt.get('export_log_unparsed') and all(
               receipt['tools'].get(name, {}).get('exit_code') == 0
@@ -582,6 +931,13 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 2
+
+      - name: Install pinned Rust syntax validator
+        if: needs.changes.outputs.coverage_required == 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
 
       - name: Require coverage to meet the exact base commit
         if: needs.changes.outputs.coverage_required == 'true'

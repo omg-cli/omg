@@ -1,7 +1,7 @@
 //! Direct ALPM (Arch Linux Package Manager) integration.
 //!
-//! Queries libalpm through a cached per-thread handle instead of spawning a
-//! pacman subprocess for each query.
+//! Reads package-info through the Rust ALPM database parsers. Other queries
+//! use cached native handles; sync metadata receives fresh native signature checks.
 
 use alpm::{Alpm, PackageReason};
 use anyhow::{Context, Result};
@@ -38,10 +38,10 @@ fn cached_alpm_is_reusable(
 
 fn create_alpm_handle() -> Result<Alpm> {
     use crate::package_managers::alpm_ops::open_default_alpm;
-    let alpm = open_default_alpm().context("Failed to initialize ALPM handle")?;
+    let mut alpm = open_default_alpm().context("Failed to initialize ALPM handle")?;
     let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load repositories from pacman.conf")?;
-    crate::package_managers::alpm_ops::configure_signature_policy(&alpm, &config)?;
+    crate::package_managers::alpm_ops::configure_signature_policy(&mut alpm, &config)?;
     crate::package_managers::alpm_ops::register_configured_syncdbs(&alpm, &config)
         .context("Failed to register the complete pacman repository set")?;
 
@@ -129,6 +129,10 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
         let mut results = Vec::with_capacity(64);
 
         for db in handle.syncdbs() {
+            if !db.usage()?.contains(alpm::Usage::SEARCH) {
+                continue;
+            }
+            super::alpm_ops::validate_sync_database(handle, db)?;
             for pkg in db.pkgs() {
                 if contains_ignore_case(pkg.name(), query)
                     || pkg.desc().is_some_and(|d| contains_ignore_case(d, query))
@@ -162,69 +166,37 @@ pub fn search_sync(query: &str) -> Result<Vec<SyncPackage>> {
     })
 }
 
-/// Get package info - INSTANT (<1ms)
+/// Read Rust package metadata with native verification for sync repositories.
 pub fn get_package_info(name: &str) -> Result<Option<PackageInfo>> {
-    with_handle(|handle| {
-        // Try local first
-        if let Ok(pkg) = handle.localdb().pkg(name) {
-            let Some(version) = parse_version(pkg.version()) else {
-                tracing::warn!(
-                    "Ignoring local package '{name}' with unparseable version '{}'",
-                    pkg.version()
-                );
-                return Ok(None);
-            };
-            return Ok(Some(PackageInfo {
-                name: pkg.name().to_string(),
-                version,
-                description: pkg.desc().unwrap_or("").to_string(),
-                url: pkg.url().map(std::string::ToString::to_string),
-                size: pkg.isize().try_into().unwrap_or(0),
-                install_size: Some(pkg.isize()),
-                download_size: None,
-                repo: "local".to_string(),
-                depends: pkg.depends().iter().map(|d| d.name().to_string()).collect(),
-                licenses: pkg
-                    .licenses()
-                    .iter()
-                    .map(std::string::ToString::to_string)
-                    .collect(),
-                installed: true,
-            }));
-        }
+    if let Some(pkg) = pacman_db::read_local_package(name)? {
+        let install_size = i64::try_from(pkg.size)
+            .context("Installed package size exceeds the supported range")?;
+        return Ok(Some(PackageInfo {
+            name: pkg.name,
+            version: pkg.version,
+            description: pkg.desc,
+            url: pkg.url,
+            size: pkg.size,
+            install_size: Some(install_size),
+            download_size: None,
+            repo: "local".to_owned(),
+            depends: pkg.depends,
+            licenses: pkg.licenses,
+            installed: true,
+        }));
+    }
 
-        // Try sync databases
-        for db in handle.syncdbs() {
-            if let Ok(pkg) = db.pkg(name) {
-                let Some(version) = parse_version(pkg.version()) else {
-                    tracing::warn!(
-                        "Ignoring sync package '{name}' with unparseable version '{}'",
-                        pkg.version()
-                    );
-                    return Ok(None);
-                };
-                return Ok(Some(PackageInfo {
-                    name: pkg.name().to_string(),
-                    version,
-                    description: pkg.desc().unwrap_or("").to_string(),
-                    url: pkg.url().map(std::string::ToString::to_string),
-                    size: pkg.isize().try_into().unwrap_or(0),
-                    install_size: Some(pkg.isize()),
-                    download_size: Some(pkg.download_size().try_into().unwrap_or(0)),
-                    repo: db.name().to_string(),
-                    depends: pkg.depends().iter().map(|d| d.name().to_string()).collect(),
-                    licenses: pkg
-                        .licenses()
-                        .iter()
-                        .map(std::string::ToString::to_string)
-                        .collect(),
-                    installed: false,
-                }));
-            }
-        }
-
-        Ok(None)
-    })
+    let epoch = pacman_db::SyncDbEpoch::observe()?;
+    let package = with_handle(|handle| super::alpm_ops::get_pkg_info_from_db(handle, name))?;
+    anyhow::ensure!(
+        epoch == pacman_db::SyncDbEpoch::observe()?,
+        "Package databases or configuration changed while querying; retry the operation"
+    );
+    anyhow::ensure!(
+        !package.as_ref().is_some_and(|pkg| pkg.installed),
+        "Local package state changed while querying; retry the operation"
+    );
+    Ok(package)
 }
 
 /// Preserve native ALPM identities and license metadata for security exports.
@@ -246,6 +218,7 @@ pub fn security_inventory() -> Result<Vec<crate::package_managers::types::Securi
                     "Incomplete installed ALPM identity"
                 );
                 Ok(crate::package_managers::types::SecurityPackage {
+                    origin: crate::package_managers::types::SecurityOrigin::Unknown,
                     name,
                     version,
                     advisory_source: None,
@@ -424,14 +397,17 @@ pub fn get_explicit_count_fast() -> Result<usize> {
 pub fn list_all_package_names() -> Result<Vec<String>> {
     with_handle(|handle| {
         let localdb = handle.localdb();
-        let sync_count: usize = handle.syncdbs().iter().map(|db| db.pkgs().len()).sum();
-        let mut names = ahash::AHashSet::with_capacity(localdb.pkgs().len() + sync_count);
+        let mut names = ahash::AHashSet::with_capacity(localdb.pkgs().len());
 
         for pkg in localdb.pkgs() {
             names.insert(pkg.name().to_string());
         }
 
         for db in handle.syncdbs() {
+            if !db.usage()?.contains(alpm::Usage::SEARCH) {
+                continue;
+            }
+            super::alpm_ops::validate_sync_database(handle, db)?;
             for pkg in db.pkgs() {
                 names.insert(pkg.name().to_string());
             }
@@ -579,6 +555,36 @@ mod tests {
         );
     }
 
+    fn write_sync_fixture(
+        database: &std::path::Path,
+        repository: &str,
+        packages: &[(&str, &str, &str)],
+    ) -> Result<()> {
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::File::create(database.join("sync").join(format!("{repository}.db")))?,
+            flate2::Compression::fast(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        for (name, version, fields) in packages {
+            let content = format!(
+                "%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nfixture {name}\n\n%ARCH%\nx86_64\n\n{fields}"
+            );
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(
+                    &mut header,
+                    format!("{name}-{version}/desc"),
+                    content.as_bytes(),
+                )
+                .expect("private sync fixture record is writable");
+        }
+        archive.into_inner()?.finish()?;
+        Ok(())
+    }
+
     fn with_private_alpm(name: &str, run: impl FnOnce()) {
         if crate::config::Settings::rerun_test_unprivileged(name) {
             return;
@@ -601,21 +607,7 @@ mod tests {
             "%NAME%\npacman\n\n%VERSION%\n1.0-1\n\n%DESC%\nfixture package manager\n\n%ARCH%\nx86_64\n\n%REASON%\n0\n",
         )
         .unwrap();
-        let content =
-            "%NAME%\nlinux\n\n%VERSION%\n6.1.0-1\n\n%DESC%\nfixture kernel\n\n%ARCH%\nx86_64\n";
-        let encoder = flate2::write::GzEncoder::new(
-            std::fs::File::create(sync.join("core.db")).unwrap(),
-            flate2::Compression::fast(),
-        );
-        let mut archive = tar::Builder::new(encoder);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(content.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "linux-6.1.0-1/desc", content.as_bytes())
-            .unwrap();
-        archive.into_inner().unwrap().finish().unwrap();
+        write_sync_fixture(&database, "core", &[("linux", "6.1.0-1", "")]).unwrap();
         let config = directory.path().join("pacman.conf");
         std::fs::write(&config, "[options]\nSigLevel = Never\n[core]\nServer = https://example.invalid/$repo/os/$arch\n").unwrap();
         struct Restore;
@@ -637,6 +629,318 @@ mod tests {
                 ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
             ],
             run,
+        );
+    }
+
+    #[test]
+    fn installed_info_reads_rust_metadata_when_sync_configuration_is_unavailable() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(
+                    installed_info_reads_rust_metadata_when_sync_configuration_is_unavailable
+                )
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().expect("private database");
+                let desc = database.join("local/pacman-1.0-1/desc");
+                let original = std::fs::read_to_string(&desc).unwrap();
+                std::fs::write(
+                    &desc,
+                    original + "%URL%\nhttps://example.invalid/pacman\n\n%SIZE%\n65536\n\n",
+                )
+                .unwrap();
+                std::fs::remove_file(paths::pacman_conf_path()).unwrap();
+                let info = get_package_info("pacman")
+                    .expect("installed metadata must not require synchronization configuration")
+                    .expect("installed package");
+                assert_eq!(info.repo, "local");
+                assert!(info.installed);
+                assert_eq!(info.url.as_deref(), Some("https://example.invalid/pacman"));
+                assert_eq!(
+                    (info.size, info.install_size, info.download_size),
+                    (65536, Some(65536), None)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn installed_info_rejects_invalid_utf8_metadata_without_panicking() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(installed_info_rejects_invalid_utf8_metadata_without_panicking)
+            ),
+            || {
+                let desc = paths::pacman_db_dir_result()
+                    .unwrap()
+                    .join("local/pacman-1.0-1/desc");
+                let original = std::fs::read_to_string(&desc).unwrap();
+                let content = original
+                    .replace("fixture package manager", "invalid-description")
+                    .into_bytes();
+                let offset = content
+                    .windows(b"invalid-description".len())
+                    .position(|part| part == b"invalid-description")
+                    .unwrap();
+                let mut invalid = content;
+                invalid[offset] = 0xff;
+                std::fs::write(&desc, invalid).unwrap();
+                let error = get_package_info("pacman")
+                    .expect_err("invalid metadata must be returned as an error");
+                assert!(format!("{error:#}").contains("desc"));
+            },
+        );
+    }
+
+    #[test]
+    fn installed_info_refuses_invalid_sizes_and_ambiguous_sources() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(installed_info_refuses_invalid_sizes_and_ambiguous_sources)
+            ),
+            || {
+                let local = paths::pacman_db_dir_result().unwrap().join("local");
+                let desc = local.join("pacman-1.0-1/desc");
+                let original = std::fs::read_to_string(&desc).unwrap();
+                for size in ["-1", "18446744073709551616", "9223372036854775808"] {
+                    std::fs::write(&desc, format!("{original}\n%SIZE%\n{size}\n\n")).unwrap();
+                    let error = get_package_info("pacman").expect_err("invalid installed size");
+                    assert!(format!("{error:#}").to_ascii_lowercase().contains("size"));
+                }
+                std::fs::write(&desc, &original).unwrap();
+                let other = local.join("pacman-tools-1.0-1");
+                std::fs::create_dir(&other).unwrap();
+                std::fs::write(
+                    other.join("desc"),
+                    original.replace("pacman", "pacman-tools"),
+                )
+                .unwrap();
+                assert_eq!(get_package_info("pacman").unwrap().unwrap().name, "pacman");
+                let duplicate = local.join("pacman-2.0-1");
+                std::fs::create_dir(&duplicate).unwrap();
+                std::fs::write(duplicate.join("desc"), &original).unwrap();
+                let error = get_package_info("pacman").expect_err("ambiguous installed identity");
+                assert!(format!("{error:#}").contains("Duplicate local package name"));
+                std::fs::remove_dir_all(&duplicate).unwrap();
+                std::os::unix::fs::symlink(&other, &duplicate).unwrap();
+                let error = get_package_info("pacman").expect_err("redirected local entry");
+                assert!(format!("{error:#}").contains("symlink"));
+            },
+        );
+    }
+
+    fn assert_sync_utf8_refusal(test: &str, query: impl Fn() -> Result<Option<PackageInfo>>) {
+        with_private_alpm(test, || {
+            let database = paths::pacman_db_dir_result().unwrap();
+            let content = b"%NAME%\nlinux\n\n%VERSION%\n6.1.0-1\n\n%DESC%\ninvalid-\xff-description\n\n%ARCH%\nx86_64\n\n";
+            let encoder = flate2::write::GzEncoder::new(
+                std::fs::File::create(database.join("sync/core.db")).unwrap(),
+                flate2::Compression::fast(),
+            );
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "linux-6.1.0-1/desc", content.as_slice())
+                .unwrap();
+            archive.into_inner().unwrap().finish().unwrap();
+            let error = query()
+                .expect_err("invalid sync metadata must return an error instead of panicking");
+            assert!(format!("{error:#}").contains("UTF-8"));
+        });
+    }
+
+    #[test]
+    fn direct_sync_info_rejects_invalid_utf8_without_panicking() {
+        assert_sync_utf8_refusal(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(direct_sync_info_rejects_invalid_utf8_without_panicking)
+            ),
+            || get_package_info("linux"),
+        );
+    }
+
+    #[test]
+    fn default_sync_info_rejects_invalid_utf8_without_panicking() {
+        assert_sync_utf8_refusal(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(default_sync_info_rejects_invalid_utf8_without_panicking)
+            ),
+            || super::super::alpm_ops::get_sync_pkg_info("linux"),
+        );
+    }
+
+    #[test]
+    fn scoped_sync_info_rejects_invalid_utf8_without_panicking() {
+        assert_sync_utf8_refusal(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(scoped_sync_info_rejects_invalid_utf8_without_panicking)
+            ),
+            || with_handle(|handle| super::super::alpm_ops::get_pkg_info_from_db(handle, "linux")),
+        );
+    }
+
+    #[test]
+    fn sync_info_refuses_invalid_or_overflowing_archive_sizes() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(sync_info_refuses_invalid_or_overflowing_archive_sizes)
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().unwrap();
+                for fields in [
+                    "%CSIZE%\n-1\n\n",
+                    "%ISIZE%\n-1\n\n",
+                    "%CSIZE%\n18446744073709551616\n\n",
+                    "%ISIZE%\n9223372036854775808\n\n",
+                ] {
+                    write_sync_fixture(&database, "core", &[("linux", "6.1.0-1", fields)]).unwrap();
+                    for query in [get_package_info, super::super::alpm_ops::get_sync_pkg_info] {
+                        query("linux").expect_err(
+                            "corrupt size metadata must not be clamped into a plausible package",
+                        );
+                    }
+                    with_handle(|handle| {
+                        super::super::alpm_ops::get_pkg_info_from_db(handle, "linux")
+                    })
+                    .expect_err("explicit native scope must refuse corrupt sizes too");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn native_info_preserves_dependency_constraints_across_all_query_paths() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(native_info_preserves_dependency_constraints_across_all_query_paths)
+            ),
+            || {
+                let dependencies = [
+                    "glibc>=2.40",
+                    "runtime=1:2.3-4",
+                    "older<3",
+                    "upper<=5",
+                    "newer>2",
+                    "plain",
+                    "libfoo.so=2-64",
+                    "libfoo.so=3-64",
+                ];
+                let fields = format!("%DEPENDS%\n{}\n\n", dependencies.join("\n"));
+                let database = paths::pacman_db_dir_result().expect("private database");
+                let local = database.join("local/pacman-1.0-1/desc");
+                let original = std::fs::read_to_string(&local).expect("initial local metadata");
+                std::fs::write(&local, original + &fields).expect("local dependency metadata");
+                write_sync_fixture(&database, "core", &[("linux", "6.1.0-1", &fields)])
+                    .expect("sync dependency metadata");
+                clear_alpm_cache();
+                pacman_db::invalidate_caches().expect("invalidate private metadata caches");
+                let rust_local = pacman_db::get_local_package("pacman").unwrap().unwrap();
+                let rust_sync = pacman_db::get_sync_package("linux").unwrap().unwrap();
+                assert_eq!(rust_local.depends, dependencies);
+                assert_eq!(rust_sync.depends, dependencies);
+                let native = [
+                    get_package_info("pacman").unwrap().unwrap().depends,
+                    get_package_info("linux").unwrap().unwrap().depends,
+                    with_handle(|handle| {
+                        super::super::alpm_ops::get_pkg_info_from_db(handle, "linux")
+                    })
+                    .unwrap()
+                    .unwrap()
+                    .depends,
+                ];
+                assert_eq!(
+                    native,
+                    [
+                        dependencies.to_vec(),
+                        dependencies.to_vec(),
+                        dependencies.to_vec()
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn native_sync_info_reports_archive_size_before_transaction_preparation() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(native_sync_info_reports_archive_size_before_transaction_preparation)
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().expect("private database");
+                write_sync_fixture(
+                    &database,
+                    "core",
+                    &[("linux", "6.1.0-1", "%CSIZE%\n4096\n\n%ISIZE%\n65536\n\n")],
+                )
+                .expect("sync size metadata");
+                clear_alpm_cache();
+                pacman_db::invalidate_caches().expect("invalidate private metadata caches");
+                let rust = pacman_db::get_sync_package("linux").unwrap().unwrap();
+                assert_eq!((rust.csize, rust.isize), (4096, 65536));
+                let direct = get_package_info("linux").unwrap().unwrap();
+                let shared = with_handle(|handle| {
+                    super::super::alpm_ops::get_pkg_info_from_db(handle, "linux")
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    [direct.download_size, shared.download_size],
+                    [Some(rust.csize); 2]
+                );
+                assert_eq!([direct.install_size, shared.install_size], [Some(65536); 2]);
+            },
+        );
+    }
+
+    #[test]
+    fn search_usage_excludes_repository_from_info_search_and_completion() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(search_usage_excludes_repository_from_info_search_and_completion)
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().expect("private database");
+                write_sync_fixture(
+                    &database,
+                    "upgrade-only",
+                    &[("linux", "99.0-1", ""), ("hidden-only", "1.0-1", "")],
+                )
+                .unwrap();
+                std::fs::write(
+                    paths::pacman_conf_path(),
+                    "[options]\nSigLevel = Never\n[upgrade-only]\nUsage = Upgrade\nServer = https://example.invalid/$repo/$arch\n[core]\nUsage = Search\nServer = https://example.invalid/$repo/$arch\n",
+                )
+                .unwrap();
+                clear_alpm_cache();
+
+                let info = get_package_info("linux")
+                    .unwrap()
+                    .expect("searchable kernel");
+                assert_eq!(info.repo, "core");
+                assert_eq!(info.version.to_string(), "6.1.0-1");
+                assert!(!info.installed);
+                assert!(get_package_info("hidden-only").unwrap().is_none());
+                let search = search_sync("linux").unwrap();
+                assert_eq!(search.len(), 1);
+                assert_eq!(search[0].repo, "core");
+                assert_eq!(search[0].version.to_string(), "6.1.0-1");
+                assert!(search_sync("hidden-only").unwrap().is_empty());
+                assert_eq!(list_all_package_names().unwrap(), ["linux", "pacman"]);
+            },
         );
     }
 

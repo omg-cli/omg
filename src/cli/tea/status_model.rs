@@ -18,6 +18,8 @@ pub struct StatusData {
     pub explicit_packages: usize,
     pub orphan_packages: usize,
     pub updates_available: usize,
+    /// Reported findings and uncovered packages; None when coverage is unreported.
+    pub advisory_coverage: Option<(usize, usize)>,
     pub duration_ms: f64,
     pub fast_mode: bool,
 }
@@ -30,9 +32,28 @@ impl StatusData {
             self.total_packages,
             self.explicit_packages,
         );
-        // Package counts do not establish vulnerability status. This view has
-        // no scan result, so both full and fast status must say so explicitly.
-        let _ = writeln!(output, "  {:<10} Not scanned", "Security");
+        match self.advisory_coverage {
+            Some((findings, unknown)) => {
+                let summary = if findings == 0 {
+                    style::info("No reported findings")
+                } else {
+                    style::negative(&format!("{findings} findings"))
+                };
+                let _ = writeln!(output, "  {:<10} {summary}", "Security");
+                if unknown > 0 {
+                    let _ = writeln!(
+                        output,
+                        "    {}",
+                        style::warning(&format!(
+                            "{unknown} packages have unknown advisory applicability"
+                        ))
+                    );
+                }
+            }
+            None => {
+                let _ = writeln!(output, "  {:<10} Advisory coverage unreported", "Security");
+            }
+        }
         if self.fast_mode {
             let _ = writeln!(
                 output,
@@ -144,6 +165,7 @@ impl Model for StatusModel {
                                         explicit_packages: status.explicit_packages,
                                         orphan_packages: status.orphan_packages,
                                         updates_available: status.updates_available,
+                                        advisory_coverage: status.scanned_vulnerability_summary(),
                                         duration_ms: start.elapsed().as_secs_f64() * 1000.0,
                                         fast_mode: fast,
                                     });
@@ -176,6 +198,7 @@ impl Model for StatusModel {
                             explicit_packages: explicit,
                             orphan_packages: orphans,
                             updates_available: updates,
+                            advisory_coverage: None,
                             duration_ms: start.elapsed().as_secs_f64() * 1000.0,
                             fast_mode: fast,
                         }),
@@ -225,9 +248,37 @@ mod tests {
                 ..StatusData::default()
             }
             .render();
-            assert!(output.contains("Not scanned"));
+            assert!(output.contains("Advisory coverage unreported"));
             assert!(!output.contains("No known issues"));
             assert!(!output.contains("Your system is healthy"));
+        }
+    }
+
+    #[test]
+    fn reported_status_keeps_findings_and_unknown_coverage_together() {
+        for fast_mode in [false, true] {
+            for (findings, unknown) in [(0, 0), (2, 0), (0, 3), (2, 3)] {
+                let output = StatusData {
+                    advisory_coverage: Some((findings, unknown)),
+                    fast_mode,
+                    ..StatusData::default()
+                }
+                .render();
+                assert_eq!(
+                    output
+                        .lines()
+                        .filter(|line| line.split_whitespace().next() == Some("Security"))
+                        .count(),
+                    1
+                );
+                assert!(!output.contains("unreported") && !output.contains("Not scanned"));
+                assert_eq!(output.contains("No reported findings"), findings == 0);
+                assert_eq!(output.contains("2 findings"), findings == 2);
+                assert_eq!(
+                    output.contains("3 packages have unknown advisory applicability"),
+                    unknown == 3
+                );
+            }
         }
     }
 
@@ -307,6 +358,7 @@ mod tests {
             updates_available: 5,
             duration_ms: 10.0,
             fast_mode: false,
+            advisory_coverage: None,
         };
         let _cmd = model.update(StatusMsg::Loaded(data));
         assert_eq!(model.state, StatusState::Complete);

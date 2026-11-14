@@ -1,13 +1,18 @@
 """Exercise exact coverage comparison and refusal of incomplete evidence."""
 import importlib.util
 import copy
+import contextlib
 import gzip
 import json
+import io
+import re
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("check-line-coverage.py")
 SPEC = importlib.util.spec_from_file_location("line_coverage", SCRIPT)
@@ -118,9 +123,861 @@ class LineCoverageTests(unittest.TestCase):
 
 
 
+class SourceConstructCapacityTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def fixture(self):
+        sources = {name: f'fn {name[:-3]}() {{\n    verified();\n}}\n'.encode()
+                   for name in ('first.rs', 'second.rs')}
+        section = lambda name: f'SF:/src/{name}\nDA:1,1\nDA:2,1\nDA:3,1\nLF:3\nLH:3\nend_of_record\n'
+        document = {'type': 'llvm.coverage.json.export', 'version': '3.1.0', 'data': [{
+            'files': [{'filename': f'/src/{name}', 'summary': {'lines': {'count': 3, 'covered': 3}}}
+                      for name in sources],
+            'functions': [dict(name=name[:-3], filenames=[f'/src/{name}'],
+                               regions=[[1, 1, 3, 2, 1, 0, 0, 0]]) for name in sources]}]}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); lcov = root / 'coverage.info'; regions = root / 'regions.gz'
+            lcov.write_text(''.join(section(name) for name in sources))
+            regions.write_bytes(gzip.compress(json.dumps(document).encode()))
+            yield lcov, regions, sources
+
+    def compare(self):
+        with self.fixture() as (lcov, regions, sources):
+            report = coverage.read_coverage(lcov)
+            return coverage.require_source_no_regression(report, report, regions, regions, sources, sources)
+
+    def test_main_capacity_admits_work_above_old_limit_without_changing_other_limits(self):
+        original = coverage.retained_construct_anchors
+        calls = []
+        def spend(name, old, new, before, after, base, head, base_files, head_files,
+                  work=None, inventories=None, grouped=None):
+            if not calls:
+                coverage._construct_charge(work, 20_000_001)
+            calls.append((name, id(work)))
+            return original(name, old, new, before, after, base, head, base_files, head_files,
+                            work, inventories, grouped)
+        with patch.object(coverage, 'retained_construct_anchors', side_effect=spend):
+            receipt = self.compare()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len({identity for name, identity in calls}), 1)
+        self.assertEqual(receipt['deleted_mapped'], 0)
+        self.assertEqual(coverage.SOURCE_CONSTRUCT_WORK_CAPACITY, 64_000_000)
+        self.assertEqual(coverage._ObserverWork().remaining, 20_000_000)
+
+    def test_shared_cross_file_exhaustion_has_no_partial_success(self):
+        calls = []
+        def spend(name, old, new, before, after, base, head, base_files, head_files,
+                  work=None, inventories=None, grouped=None):
+            calls.append((name, id(work)))
+            coverage._construct_charge(work, 600)
+            return {}, []
+        output = io.StringIO()
+        with self.fixture() as (lcov, regions, sources):
+            argv = ['check-line-coverage.py', '--base', str(lcov), '--head', str(lcov),
+                    '--base-regions', str(regions), '--head-regions', str(regions),
+                    '--source-repo', str(lcov.parent), '--base-sha', 'base', '--head-sha', 'head']
+            with patch.object(coverage, 'SOURCE_CONSTRUCT_WORK_CAPACITY', 1000, create=True), \
+                 patch.object(coverage, 'retained_construct_anchors', side_effect=spend), \
+                 patch.object(coverage, 'source_blobs', return_value=sources), \
+                 patch.object(sys, 'argv', argv), contextlib.redirect_stdout(output):
+                with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                    coverage.main()
+        self.assertEqual([name for name, identity in calls], ['first.rs', 'second.rs'])
+        self.assertEqual(len({identity for name, identity in calls}), 1)
+        self.assertNotIn('PASS:', output.getvalue())
+        self.assertNotIn('deleted_mapped', output.getvalue())
+
+    def test_capacity_boundary_is_fail_closed_before_following_work(self):
+        capacity = getattr(coverage, 'SOURCE_CONSTRUCT_WORK_CAPACITY', 64_000_000)
+        remaining = [capacity]
+        coverage._construct_charge(remaining, capacity)
+        self.assertEqual(remaining, [0])
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage._construct_charge(remaining, 1)
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage._construct_inventory(['fn untouched() {}'], [0])
+
+    def test_near_capacity_expensive_shapes_stop_at_existing_admission_boundaries(self):
+        literal = ['fn bounded() {', '    consume("' + 'x' * 16_384 + '");', '}']
+        owner = dict(regions=[[1, 1, 1, 2, 1, 0, 0, 0] for _ in range(128)])
+        for capacity in (20_000_000, 64_000_000):
+            with self.subTest(capacity=capacity):
+                remaining = [capacity]
+                coverage._construct_charge(remaining, capacity - 15)
+                with patch.object(coverage.hashlib, 'sha256', side_effect=AssertionError('hash before admission')):
+                    with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                        coverage._construct_inventory(literal, remaining)
+                remaining = [capacity]
+                coverage._construct_charge(remaining, capacity - 32)
+                with patch.object(coverage, '_llvm22_segments', side_effect=AssertionError('projection before admission')):
+                    with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                        coverage._owner_line_counts(owner, coverage._ObserverWork(remaining))
+        with patch.object(coverage.subprocess, 'run', side_effect=AssertionError('parser before excerpt admission')):
+            with self.assertRaisesRegex(ValueError, '64 KiB'):
+                coverage.require_rustfmt_syntax([b' ' * (64 * 1024 + 1)])
+
+    def test_repeated_line_alignment_keeps_the_same_outcome_at_both_capacities(self):
+        old = ['fn bounded() {', *['    same();' for _ in range(96)], '    old();', '}']
+        new = [line.replace('old();', 'new();') for line in old]
+        outcomes = []
+        for capacity in (20_000_000, 64_000_000):
+            remaining = [capacity]
+            coverage._construct_charge(remaining, capacity - 100_000)
+            proposals, inventories = coverage._construct_replacements(old, new, remaining, deferred=True)
+            outcomes.append(proposals)
+            self.assertGreater(remaining[0], 0)
+        self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_capacity_changes_admission_without_changing_valid_or_invalid_proof_outcomes(self):
+        receipts = []
+        failures = []
+        for capacity in (20_000_000, 64_000_000):
+            with patch.object(coverage, 'SOURCE_CONSTRUCT_WORK_CAPACITY', capacity, create=True):
+                receipts.append(SourceAwareCoverageTests().renamed_capsule_compare())
+                with self.assertRaises(ValueError) as failure:
+                    SourceAwareCoverageTests().renamed_capsule_compare(
+                        (((1, 0), (0, 1)), ((0, 0), (1, 1))))
+                failures.append(str(failure.exception))
+        self.assertEqual(receipts[0], receipts[1])
+        self.assertEqual(failures[0], failures[1])
+
+
 class SourceAwareCoverageTests(unittest.TestCase):
+    def retained_record_field_compare(self, head_counts=(1, 1), ancestor_counts=None,
+                                      refinement_counts=None, base_refinement_counts=None):
+        old = b'struct Config { name: String }\nimpl Config {\n    pub fn make(section: &str) -> Self {\n        Self {\n            name: section.to_string(),\n        }\n    }\n}\n'
+        new = b'struct Config { name: String, enabled: bool }\nimpl Config {\n    pub fn make(section: &str) -> Self {\n        Self {\n            name: section.to_string(),\n            enabled: true,\n        }\n    }\n}\n'
+        def owners(base, head):
+            for document, source, last, counts in ((base, old, 7, (1, 1)),
+                                                   (head, new, 8, head_counts)):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(
+                    name=f'make_{instance}', filenames=['/src/example.rs'],
+                    regions=[[3, lines[2].index('{') + 1, last, 6, count, 0, 0, 0]])
+                    for instance, count in enumerate(counts)]
+                if document is base and base_refinement_counts is not None:
+                    for instance, function in enumerate(document['data'][0]['functions']):
+                        function['regions'].append([5, 19, 5, 26,
+                            base_refinement_counts[instance], 0, 0, 0])
+                if document is head:
+                    for instance, function in enumerate(document['data'][0]['functions']):
+                        count = (counts if ancestor_counts is None else ancestor_counts)[instance]
+                        function['regions'].append([4, 9, 7, 10, count, 0, 0, 0])
+                        if refinement_counts is not None:
+                            function['regions'].append([5, 19, 5, 26,
+                                refinement_counts[instance], 0, 0, 0])
+        return self.compare(before=[(line, 2) for line in range(3, 8)],
+            after=[(line, sum(head_counts)) for line in range(3, 9)], mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_retained_record_field_preserves_execution_in_every_compiled_copy(self):
+        receipt = self.retained_record_field_compare()
+        self.assertEqual(receipt['deleted_mapped_hit'], 0)
+
+    def test_retained_record_field_cannot_borrow_another_compiled_copy(self):
+        with self.assertRaises(ValueError):
+            self.retained_record_field_compare((2, 0))
+
+    def test_retained_record_field_cannot_paint_a_cold_nested_region(self):
+        with self.assertRaises(ValueError):
+            self.retained_record_field_compare(ancestor_counts=(0, 2))
+
+    def test_retained_record_field_permits_uniform_region_refinement(self):
+        receipt = self.retained_record_field_compare(refinement_counts=(1, 1))
+        self.assertEqual(receipt['deleted_mapped_hit'], 0)
+
+    def test_retained_record_field_refinement_cannot_paint_a_cold_subexpression(self):
+        with self.assertRaises(ValueError):
+            self.retained_record_field_compare(refinement_counts=(0, 2))
+
+    def test_retained_record_field_keeps_existing_cold_subexpression_obligations(self):
+        receipt = self.retained_record_field_compare(refinement_counts=(0, 2),
+                                                     base_refinement_counts=(0, 2))
+        self.assertEqual(receipt['deleted_mapped_hit'], 0)
+
     old_source = b"fn obsolete() {\n}\nfn retained() {\n  exercised();\n  untested();\n}\n"
     new_source = b"fn retained() {\n  exercised();\n  untested();\n}\n"
+
+    def test_alignment_does_not_retain_a_function_endpoint_as_a_struct_endpoint(self):
+        old = ['fn obsolete() {', '    old();', '}',
+               'fn retained() {', '    same();', '}']
+        new = ['struct Manifest {', '    generation: String,', '}',
+               'fn retained() {', '    same();', '}']
+        rows = list(coverage.source_opcodes(old, new, [(4, 6, 4, 6)], {3: 1, 5: 1, 6: 1}))
+        pairs = {line + 1: c + line - a + 1 for tag, a, b, c, d, *_ in rows
+                 if tag == 'equal' for line in range(a, b)}
+        self.assertNotIn(3, pairs)
+        self.assertEqual(pairs[5], 5)
+        self.assertFalse(any(tag == 'delete' and a <= 2 < b for tag, a, b, *_ in rows))
+
+    def test_alignment_does_not_retain_a_method_on_a_replaced_receiver(self):
+        old = ['fn retained() {', '    let packages = db_paths', '        .par_iter()',
+               '        .map(old_parse)', '        .collect();', '}']
+        new = ['fn retained() {', '    let packages = config.repos', '        .par_iter()',
+               '        .map(new_parse)', '        .collect();', '}']
+        rows = list(coverage.source_opcodes(old, new, [(1, 6, 1, 6)],
+                                            {line: 1 for line in range(1, 7)}))
+        pairs = {line + 1: c + line - a + 1 for tag, a, b, c, d, *_ in rows
+                 if tag == 'equal' for line in range(a, b)}
+        self.assertNotIn(3, pairs)
+        self.assertFalse(any(tag == 'delete' for tag, *_ in rows))
+
+    def test_alignment_replaces_a_changed_tail_receiver_and_record_initializer(self):
+        cases = [
+            (['fn f() {', '    db_paths', '        .par_iter()', '        .collect()', '}'],
+             ['fn f() {', '    config.repos', '        .par_iter()', '        .collect()', '}'], 3),
+            (['fn f() {', '    Ok(Self {', '        files,', '        digest: encode(hash),', '    })', '}'],
+             ['fn f() {', '    Ok(Self {', '        files,', '        digest: encode(hash),',
+              '        parsed: OnceLock::new(),', '    })', '}'], 5),
+        ]
+        for old, new, endpoint in cases:
+            with self.subTest(endpoint=endpoint):
+                rows = list(coverage.source_opcodes(old, new, [(1, len(old), 1, len(new))],
+                                                    {line: 1 for line in range(1, len(old) + 1)}))
+                pairs = {line + 1: c + line - a + 1 for tag, a, b, c, d, *_ in rows
+                         if tag == 'equal' for line in range(a, b)}
+                self.assertNotIn(endpoint, pairs)
+
+    def test_alignment_replaces_complete_await_receivers_and_map_statements(self):
+        cases = [
+            (['fn f() {', '    let client = Client {', '        path: directory.path(),', '    };', '}'],
+             ['fn f() {', '    let client = Client {', '        path: directory.path().join("aur"),', '    };', '}'], 2),
+            (['fn f() {', '    let result = names.map(|name| {', '        cache',
+              '            .get(name)', '            .filter(|item| {', '                !old_filter(item)',
+              '            })', '            .map(old_convert)', '    }).collect();', '}'],
+             ['fn f() {', '    let result = names.map(|name| {', '        packages',
+              '            .get(name.as_str())', '            .filter(|item| {', '                !new_filter(item)',
+              '            })', '            .map(new_convert)', '    }).collect();', '}'], 5),
+            (['fn f() {', '    let error = client', '        .plan(directory.path())',
+              '        .await;', '}'],
+             ['fn f() {', '    let error = client', '        .plan(&reviewed)',
+              '        .await;', '}'], 2),
+            (['async fn f() {', '    match spawn_blocking({', '        move || old()',
+              '    })', '    .await', '    {', '        Ok(value) => value,', '    }', '}'],
+             ['async fn f() {', '    finish(spawn_blocking(move || {', '        new()',
+              '    }))', '    .await', '}'], 5),
+            (['fn f() {', '    let results = paths', '        .map(|(path, name)| {',
+              '            old_parse(path, name)', '        })', '        .collect();', '}'],
+             ['fn f() {', '    let results = repos', '        .map(|repo| {',
+              '            new_parse(repo)', '        })', '        .collect();', '}'], 5),
+        ]
+        for old, new, endpoint in cases:
+            with self.subTest(endpoint=endpoint, old=old):
+                rows = list(coverage.source_opcodes(old, new, [(1, len(old), 1, len(new))],
+                                                    {line: 1 for line in range(1, len(old) + 1)}))
+                pairs = {line + 1: c + line - a + 1 for tag, a, b, c, d, *_ in rows
+                         if tag == 'equal' for line in range(a, b)}
+                self.assertNotIn(endpoint, pairs)
+                self.assertFalse(any(tag == 'delete' and a <= endpoint - 1 < b
+                                     for tag, a, b, *_ in rows))
+
+    def test_replaced_function_and_struct_endpoints_earn_no_subtraction_credit(self):
+        old = b'fn obsolete() {\n    old();\n}\nfn retained() {\n    same();\n}\n'
+        new = b'struct Manifest {\n    generation: String,\n}\nfn retained() {\n    same();\n}\n'
+        def owners(base, head):
+            for document, source, spans in ((base, old, [('obsolete', 1, 3), ('retained', 4, 6)]),
+                                            (head, new, [('retained', 4, 6)])):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(name=name, filenames=['/src/example.rs'],
+                    regions=[[line, 1, line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
+                             for line in range(first, last + 1)]) for name, first, last in spans]
+        receipt = self.compare(before=[(line, 1) for line in range(1, 7)],
+            after=[(line, 1) for line in range(4, 7)], mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+        self.assertEqual([receipt[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        self.assertEqual(receipt['source_replacements'][0]['base_line'], 3)
+
+    def test_replaced_await_owner_without_an_execution_seed_is_refused(self):
+        old = b'async fn obsolete() {\n    match spawn_blocking({\n        move || old()\n    })\n    .await\n    {\n        Ok(value) => value,\n    }\n}\n'
+        new = b'async fn replacement() {\n    finish(spawn_blocking(move || {\n        new()\n    }))\n    .await\n}\n'
+        def owners(base, head):
+            for document, source, name in ((base, old, 'obsolete'), (head, new, 'replacement')):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(name=name, filenames=['/src/example.rs'],
+                    regions=[[line, 1, line, len(text) + 1, 1, 0, 0, 0]
+                             for line, text in enumerate(lines, 1)])]
+        with self.assertRaisesRegex(ValueError, r'Unproved retained execution.*example\.rs:\d+ -> \d+; base_count=1 head_count=1'):
+            self.compare(before=[(line, 1) for line in range(1, 10)],
+                after=[(line, 1) for line in range(1, 7)], mutate=owners,
+                sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_function_completion_keeps_its_compiler_partition_with_multiple_copies(self):
+        old = b'fn checked() {\n    old();\n}\nfn retained() {\n    same();\n}\n'
+        new = b'fn checked() {\n    new();\n    more();\n}\nfn inserted() {\n    other();\n}\nfn retained() {\n    same();\n}\n'
+        lose_copy = [False]
+        def owners(base, head):
+            for document, source, spans in ((base, old, [('checked', 1, 3), ('retained', 4, 6)]),
+                                            (head, new, [('checked', 1, 4), ('retained', 8, 10)])):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(name=f'{name}_{instance}',
+                    filenames=['/src/example.rs'], regions=[[
+                        first, lines[first - 1].index('{') + 1, last, 2,
+                        int(lose_copy[0] or instance) if document is base else instance, 0, 0, 0]])
+                    for name, first, last in spans for instance in range(2)]
+        receipt = self.compare(before=[(3, 1), (5, 1), (6, 1)],
+            after=[(4, 1), (9, 1), (10, 1)], mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+        self.assertIn([3, 4], [pair for witness in receipt['retained_function_completions']
+                              for pair in witness['pairs']])
+        lose_copy[0] = True
+        with self.assertRaisesRegex(ValueError, r'Function completion lost compiled-copy coverage.*example\.rs:3 -> 4; base_states=\[\[1\], \[1\]\] head_states=\[\[0\], \[1\]\]'):
+            self.compare(before=[(3, 2), (5, 2), (6, 2)],
+                after=[(4, 1), (9, 1), (10, 1)], mutate=owners,
+                sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_replacement_cannot_hide_an_unchanged_body_in_another_source_file(self):
+        old = b'fn obsolete() {\n    old();\n}\nfn retained() {\n    same();\n}\n'
+        new = b'struct Manifest {\n    generation: String,\n}\nfn retained() {\n    same();\n}\n'
+        def owners(base, head):
+            for document, source, spans in ((base, old, [('obsolete', 1, 3), ('retained', 4, 6)]),
+                                            (head, new, [('retained', 4, 6)])):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(name=name, filenames=['/src/example.rs'],
+                    regions=[[line, 1, line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
+                             for line in range(first, last + 1)]) for name, first, last in spans]
+        for body in (b'fn renamed() {\n    old();\n}\n',
+                     b'fn renamed() {\n    if gate() {\n        old();\n    }\n}\n'):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                self.compare(before=[(line, 1) for line in range(1, 7)],
+                    after=[(line, 1) for line in range(4, 7)], mutate=owners,
+                    sources=({'example.rs': old}, {'example.rs': new, 'elsewhere.rs': body}))
+
+    def test_repeated_signature_verification_keeps_every_hot_compiled_copy(self):
+        old = b'fn obsolete(archive: &Archive, keys: &Keys) -> Result<()> {\n    let verified = verify_archive_signature(archive, keys)?;\n    old(verified);\n    Ok(())\n}\nfn retained(archive: &Archive, keys: &Keys) -> Result<()> {\n    let verified = verify_archive_signature(archive, keys)?;\n    same(verified);\n    Ok(())\n}\n'
+        new = old.replace(b'fn obsolete(', b'fn replacement(').replace(b'old(verified)', b'new(verified)')
+        def owners(base, head):
+            for document, source, first in ((base, old, 'obsolete'), (head, new, 'replacement')):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(
+                    name=f'{name}_{instance}', filenames=['/src/example.rs'],
+                    regions=[[line, 1, line, len(lines[line - 1]) + 1,
+                              int(not (document is head and name == first and instance == 0)), 0, 0, 0]
+                             for line in range(start, end + 1)])
+                    for name, start, end in ((first, 1, 5), ('retained', 6, 10))
+                    for instance in range(2)]
+        with self.assertRaises(ValueError):
+            self.compare(before=[(line, 2) for line in range(1, 11)],
+                after=[(line, 1 if line < 6 else 2) for line in range(1, 11)],
+                mutate=owners, sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_changed_sibling_does_not_erase_verification_copy_obligation(self):
+        bodies = (
+            '    let payload = Payload {\n        verified: gate()\n            && verify_archive_signature(archive, keys),\n        other: old(),\n    };\n',
+            '    let payload = dispatch(\n        gate()\n            && verify_archive_signature(archive, keys),\n        old(),\n    );\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.splitlines()[0]):
+                old = ('fn obsolete(archive: &Archive, keys: &Keys) -> Payload {\n' + body + '    old_finish(payload)\n}\n').encode()
+                new = old.replace(b'fn obsolete(', b'fn replacement(').replace(b'old()', b'new()').replace(b'old_finish(', b'new_finish(')
+                def owners(base, head):
+                    for document, source in ((base, old), (head, new)):
+                        lines = source.decode().splitlines()
+                        document['data'][0]['functions'] = [dict(
+                            name=f'{"obsolete" if document is base else "replacement"}_{copy}', filenames=['/src/example.rs'],
+                            regions=[[line, 1, line, len(lines[line - 1]) + 1,
+                                      int(not(document is head and copy == 0 and line == 4)), 0, 0, 0]
+                                     for line in range(1, 9)]) for copy in range(2)]
+                with self.assertRaises(ValueError):
+                    self.compare(
+                        before=[(line, 2) for line in range(1, 9)],
+                        after=[(line, 1 if line == 4 else 2) for line in range(1, 9)],
+                        mutate=owners, sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_construct_ancestry_is_depth_bounded_and_charged_before_traversal(self):
+        source = coverage._boolean_source(['[' * 32 + 'value' + ']' * 32])
+        self.assertIsNotNone(source)
+        self.assertEqual(len(coverage._construct_ancestors(source, source.words.index('value'), [32])), 32)
+        self.assertIsNone(coverage._boolean_source(['[' * 33 + 'value' + ']' * 33]))
+        class Unreadable:
+            def __getitem__(self, index):
+                raise AssertionError('ancestry read before budget admission')
+        malformed = coverage._BooleanSource('', ['value'], [0], [5], Unreadable(), {}, [0])
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage._construct_ancestors(malformed, 0, [0])
+        cyclic = coverage._BooleanSource('', ['value'], [0], [5], [0], {}, [0])
+        with self.assertRaisesRegex(ValueError, 'ancestr'):
+            coverage._construct_ancestors(cyclic, 0, [32])
+
+    def test_binding_contexts_share_one_ordered_lexical_index(self):
+        old = ['use std::fmt::Debug;']
+        for ordinal in range(20):
+            old.extend([f'mod scope{ordinal} {{', '    use std::cmp::Ord;',
+                f'    fn retained{ordinal}() {{', '        old();', '        verified();', '    }', '}'])
+        new = [line.replace('old();', 'new();') for line in old]
+        work = [75_000]
+        inventories = [coverage._construct_inventory(source, work) for source in (old, new)]
+        owners = []
+        for source in (old, new):
+            members = []
+            for ordinal in range(20):
+                start = 4 + 7 * ordinal
+                members.append(dict(name=f'retained{ordinal}', filenames=['/src/example.rs'],
+                    regions=[[line, 1, line, len(source[line - 1]) + 1, 1, 0, 0, 0]
+                             for line in range(start, start + 4)]))
+            owners.append(members)
+        groups = [coverage._compiled_function_groups('example.rs', members,
+            {'/src/example.rs': 'example.rs'}, source, work) for members, source in zip(owners, (old, new))]
+        proposals = coverage._construct_replacements(old, new, work, compatible=lambda *args: True,
+            inventories=inventories, deferred=True)[0]
+        result = coverage.retained_replacement_obligations('example.rs', old, new,
+            {line: 1 for line in range(1, len(old) + 1)}, {line: 1 for line in range(1, len(new) + 1)},
+            inventories, groups, proposals, work)
+        self.assertEqual(len(result[1]), 20)
+        self.assertGreater(work[0], 0)
+
+    def test_supplied_construct_groups_do_not_charge_unread_global_owner_arrays(self):
+        class UnreadOwners:
+            def __len__(self):
+                raise AssertionError('precomputed groups must bypass global owner arrays')
+        old = ['fn retained() {', '    old();', '}']
+        new = ['fn retained() {', '    new();', '}']
+        work = [1000]
+        inventories = [coverage._construct_inventory(source, work) for source in (old, new)]
+        grouped = [((), {}, {}), ((), {}, {})]
+        pairs, receipts = coverage.retained_construct_anchors('example.rs', old, new,
+            {2: 1}, {2: 1}, UnreadOwners(), UnreadOwners(), {}, {}, work, inventories, grouped)
+        self.assertEqual((pairs, receipts), ({}, []))
+
+    def attribution_obligations(self, old, new, *, excluded=(), painted=(), callbacks=False,
+                                parent_states=((1, 1), (1, 1)), child_states=None, mutation=None):
+        sources = [source.splitlines() for source in (old, new)]
+        counts = [{line: 1 for line in range(1, len(source) + 1) if line not in excluded}
+                  for source in sources]
+        for values in counts:
+            values.update((line, 1) for line in painted)
+        owners = []
+        for side, source in enumerate(sources):
+            members = []
+            for copy, state in enumerate(parent_states[side]):
+                parent = f'_RNvCs{copy + 1}_7example8retained'
+                regions = [[line, 1, line, len(text) + 1, state, 0, 0, 0]
+                           for line, text in enumerate(source, 1) if line not in excluded]
+                members.append(dict(name=parent, filenames=['/src/example.rs'], regions=regions))
+                if callbacks:
+                    line = next(index for index, text in enumerate(source, 1) if 'verify_archive_signature' in text)
+                    text = source[line - 1]; start = text.index('verify') + 1
+                    child = (child_states or parent_states)[side][copy]
+                    members.append(dict(name='_RNC' + parent[2:] + '0B3_', filenames=['/src/example.rs'],
+                        regions=[[line, start, line, text.rindex(');') + 1, child, 0, 0, 0]]))
+            owners.append(members)
+        if mutation:
+            mutation(owners, sources)
+        work = [20_000_000]
+        inventories = [coverage._construct_inventory(source, work) for source in sources]
+        groups = [coverage._compiled_function_groups('example.rs', members,
+            {'/src/example.rs': 'example.rs'}, source, work) for members, source in zip(owners, sources)]
+        proposals = coverage._construct_replacements(*sources, work, compatible=lambda *args: True,
+            inventories=inventories, deferred=True)[0]
+        result = coverage.retained_replacement_obligations('example.rs', *sources, *counts,
+            inventories, groups, proposals, work)
+        return result
+
+    def macro_literal_obligations(self, *, capture=False, mutate=None, rewrite=None):
+        old = ('fn retained(key: &str) {\n'
+               '    anyhow::bail!(\n'
+               '        "Unknown key. \\\n'
+               '         old explanation"\n'
+               '    );\n'
+               '}\n')
+        if capture:
+            old = old.replace('Unknown key.', "Unknown '{key}'.")
+        new = old.replace('old explanation', 'new explanation')
+        if rewrite:
+            old, new = rewrite(old, new)
+        return self.attribution_obligations(old, new, excluded=(3, 4, 5), painted=(3, 4, 5),
+            parent_states=((1, 0), (1, 0)), mutation=mutate)
+
+    def test_qualified_macro_retains_head_and_associated_literal_paint(self):
+        for capture in (False, True):
+            with self.subTest(capture=capture):
+                pairs, receipts, _ = self.macro_literal_obligations(capture=capture)
+                self.assertIn((2, 2), pairs.items())
+                self.assertIn([3, 3], receipts[0]['non_executable_rows'])
+
+    def test_macro_literal_refuses_binding_fine_geometry_and_copy_changes(self):
+        rewrites = (
+            lambda old, new: (old, new.replace('key: &str', 'other: &str')),
+            lambda old, new: (old, new.replace('key: &str', '(key, other): (&str, &str)')),
+            lambda old, new: (old.replace('{\n', '{ let key = original();\n', 1),
+                              new.replace('{\n', '{ let key = replacement();\n', 1)),
+            lambda old, new: (old.replace('{\n', '{ let (key, _) = original();\n', 1),
+                              new.replace('{\n', '{ let (key, _) = replacement();\n', 1)),
+            lambda old, new: (old, new.replace('{\n', '{ use replacement as anyhow;\n', 1)),
+            lambda old, new: (old, new.replace('{\n', '{ macro_rules! shadow { () => {} }\n', 1)),
+            lambda old, new: (old, new.replace("'{key}'", "'{key:?}'")),
+        )
+        for rewrite in rewrites:
+            with self.subTest(rewrite=rewrites.index(rewrite)):
+                self.assertEqual(self.macro_literal_obligations(capture=True, rewrite=rewrite)[0], {})
+        def foreign(owners, sources):
+            owners[1].append(dict(name='foreign', filenames=['/src/example.rs'],
+                regions=[[3, 9, 3, 18, 0, 0, 0, 0]]))
+        def child(owners, sources):
+            owners[1].append(dict(name='_RNCNvCs1_7example8retained0B3_', filenames=['/src/example.rs'],
+                regions=[[3, 9, 3, 18, 0, 0, 0, 0]]))
+        def added_fine(owners, sources):
+            owners[1][0]['regions'].append([3, 9, 3, 18, 0, 0, 0, 0])
+        for mutation in (foreign, child, added_fine):
+            with self.subTest(mutation=mutation.__name__):
+                self.assertEqual(self.macro_literal_obligations(mutate=mutation)[0], {})
+        def swap(owners, sources):
+            for copy, owner in enumerate(owners[1]):
+                for region in owner['regions']:
+                    if region[0] == 2:
+                        region[4] = copy
+        try:
+            result = self.macro_literal_obligations(mutate=swap)
+        except ValueError:
+            pass
+        else:
+            self.assertEqual(result[0], {})
+
+    def test_macro_literal_preserves_visible_extern_crate_bindings(self):
+        body = ('fn retained(key: &str) {\n    anyhow::bail!(\n'
+                '        "Unknown key. \\\n         old explanation"\n    );\n}\n')
+        def proof(prefix, replacement, suffix=''):
+            old = prefix + body + suffix
+            new = replacement + body.replace('old explanation', 'new explanation') + suffix
+            start = prefix.count('\n') + 1
+            paint = tuple(start + offset for offset in (2, 3, 4))
+            excluded = tuple(range(1, start)) + paint + tuple(range(start + 6, len(old.splitlines()) + 1))
+            return self.attribution_obligations(old, new, excluded=excluded, painted=paint,
+                parent_states=((1, 0), (1, 0)))
+        declaration = 'extern crate original as anyhow;\n'
+        changed = declaration.replace('original', 'replacement')
+        with self.subTest(context='visible module binding changed'):
+            self.assertEqual(proof(declaration, changed)[0], {})
+        with self.subTest(context='visible module binding unchanged'):
+            self.assertTrue(proof(declaration, declaration)[1])
+        with self.subTest(context='ancestor module binding changed'):
+            self.assertEqual(proof('mod scope {\n' + declaration,
+                'mod scope {\n' + changed, '}\n')[0], {})
+        with self.subTest(context='foreign module binding changed'):
+            self.assertTrue(proof('mod foreign { ' + declaration.strip() + ' }\n',
+                'mod foreign { ' + changed.strip() + ' }\n')[1])
+
+    def test_macro_literal_cannot_hide_a_cold_runtime_argument(self):
+        old = ('fn retained() {\n    anyhow::bail!(\n'
+               '        "old message",\n        gate() && verify()\n    );\n}\n')
+        new = old.replace('old message', 'new message')
+        def cold(owners, sources):
+            for side, members in enumerate(owners):
+                for copy, owner in enumerate(members):
+                    owner['regions'].append([4, 19, 4, 27, int(not(side == 1 and copy == 0)), 0, 0, 0])
+        result = self.attribution_obligations(old, new, excluded=(3, 5), painted=(3, 5),
+            parent_states=((1, 1), (1, 1)), mutation=cold)
+        self.assertEqual(result[0], {})
+
+    def test_replacement_obligations_ignore_only_tokenless_rows_without_any_ir(self):
+        old = 'fn retained() {\n    // unchanged security explanation\n    old();\n    verified();\n}\n'
+        new = old.replace('old();', 'new();')
+        pairs, receipts, _ = self.attribution_obligations(old, new, excluded=(2,))
+        self.assertIn((4, 4), pairs.items())
+        self.assertTrue(receipts)
+        painted = self.attribution_obligations(old, new, excluded=(2,), painted=(2,))
+        self.assertIn((2, 2), painted[0].items())
+        self.assertIn([2, 2], painted[1][0]['non_executable_rows'])
+        def cold_comment_region(owners, sources):
+            owners[1][0]['regions'][1][4] = 0
+        with self.assertRaises(ValueError):
+            self.attribution_obligations(old, new, mutation=cold_comment_region)
+        for token in ('let text = r#"// unchanged security explanation"#;', 'real_macro!();'):
+            with self.subTest(token=token):
+                before = old.replace('// unchanged security explanation', token)
+                result = self.attribution_obligations(before, before.replace('old();', 'new();'), excluded=(2,))
+                self.assertEqual(result[0], {})
+
+    def test_replacement_obligations_attach_unchanged_callbacks_to_each_parent_copy(self):
+        old = 'fn retained() {\n    old();\n    consume(|| verify_archive_signature());\n    finish();\n}\n'
+        new = old.replace('old();', 'new();')
+        pairs, receipts, _ = self.attribution_obligations(old, new, callbacks=True,
+            parent_states=((1, 0), (1, 0)), child_states=((1, 0), (1, 0)))
+        self.assertIn((3, 3), pairs.items())
+        self.assertTrue(receipts)
+        cold = self.attribution_obligations(old, new, callbacks=True,
+            parent_states=((1, 0), (1, 0)), child_states=((0, 0), (0, 0)))
+        self.assertTrue(cold[1])
+        self.assertEqual(len(cold[1][0]['callback_capsule_sha256']), 1)
+        macro = old.replace('verify_archive_signature()', 'verify_archive_signature(real_macro!())')
+        self.assertEqual(self.attribution_obligations(macro, macro.replace('old();', 'new();'), callbacks=True)[0], {})
+        outer_macro = old.replace('consume(', 'consume!(')
+        self.assertEqual(self.attribution_obligations(outer_macro,
+            outer_macro.replace('old();', 'new();'), callbacks=True)[0], {})
+        with self.assertRaises(ValueError):
+            self.attribution_obligations(old, new, callbacks=True,
+                parent_states=((1, 0), (1, 0)), child_states=((1, 0), (0, 1)))
+        def duplicate(owners, sources):
+            owners[1].append(dict(owners[1][1]))
+        def wrong_parent(owners, sources):
+            owners[1][1]['name'] = '_RNCNvCs9_7example8retained0B3_'
+        duplicate_source = old.replace('    consume(|| verify_archive_signature());',
+            '    consume(|| verify_archive_signature());\n    consume(|| verify_archive_signature());')
+        self.assertEqual(self.attribution_obligations(duplicate_source,
+            duplicate_source.replace('old();', 'new();'), callbacks=True)[0], {})
+        for mutate in (duplicate, wrong_parent):
+            with self.subTest(mutation=mutate.__name__):
+                result = self.attribution_obligations(old, new, callbacks=True, mutation=mutate)
+                self.assertEqual(result[0], {})
+
+    def test_repeated_statements_require_unique_ancestor_source_context(self):
+        old = ('fn retained() {\n    for value in values {\n        if skip(value) {\n'
+               '            continue;\n        }\n        if reject(value) {\n'
+               '            continue;\n        }\n        old(value);\n    }\n}\n')
+        new = old.replace('old(value)', 'new(value)')
+        pairs, receipts, _ = self.attribution_obligations(old, new)
+        self.assertIn((4, 4), pairs.items())
+        self.assertIn((7, 7), pairs.items())
+        self.assertTrue(receipts)
+        duplicate = old.replace('reject(value)', 'skip(value)')
+        self.assertEqual(self.attribution_obligations(duplicate, duplicate.replace('old(value)', 'new(value)'))[0], {})
+        self.assertEqual(self.attribution_obligations(old, new.replace('skip(value)', 'unrelated(value)'))[0], {})
+        def swapped_rows(owners, sources):
+            for side, members in enumerate(owners):
+                for copy, owner in enumerate(members):
+                    for region in owner['regions']:
+                        if region[0] in (4, 7):
+                            states = ((1, 0), (0, 1)) if side == 0 else ((1, 1), (0, 0))
+                            region[4] = states[region[0] == 7][copy]
+        with self.assertRaises(ValueError):
+            self.attribution_obligations(old, new, mutation=swapped_rows)
+
+    def renamed_capsule_compare(self, copy_states=None, mutate=None, new_source=None):
+        old = b'#[test]\nfn obsolete() -> Result<()> {\n    assert_eq!(old(), false);\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\n'
+        new = new_source or b'#[test]\nfn replacement() -> Result<()> {\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\n'
+        copy_states = copy_states or (((1, 1),), ((1, 1),))
+        def owners(base, head):
+            for side, (document, source, name, zero) in enumerate(((base, old, 'obsolete', 6),
+                                                                  (head, new, 'replacement', 5))):
+                lines = source.decode().splitlines()
+                end = next(line for line, text in enumerate(lines, 1) if text == '}')
+                document['data'][0]['functions'] = []
+                for instance, states in enumerate(copy_states[side]):
+                    symbol = f'_RNvNtCs{instance + 1}_7example5testss_' + str(len(name)) + name
+                    rows = [[line, 1, line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
+                            for line in range(3, end + 1)]
+                    for number, state in zip((5 - side, 6 - side), states):
+                        rows[number - 3][4] = state
+                    document['data'][0]['functions'].append(dict(name=symbol,
+                        filenames=['/src/example.rs'], regions=[
+                            [2, lines[1].index('{') + 1, end, 2, 1, 0, 0, 0], *rows,
+                            [zero, len(lines[zero - 1]), zero, len(lines[zero - 1]) + 1, 0, 0, 0, 0]]))
+            if mutate:
+                mutate(base, head)
+        return self.compare(before=[(line, len(copy_states[0])) for line in range(2, 10)],
+            after=[(line, len(copy_states[1])) for line in range(2, len(new.decode().splitlines()) + 1)],
+            mutate=owners, sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_renamed_owner_retains_only_its_unique_capsule_and_proved_tail(self):
+        receipt = self.renamed_capsule_compare()
+        self.assertEqual([receipt[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        proofs = receipt['retained_replacement_obligations']
+        pairs = [pair for row in proofs for pair in row['pairs']]
+        self.assertTrue(all([line, line - 1] in pairs for line in range(4, 10)))
+        self.assertIn(0, proofs[0]['base_instance_states'][0])
+        self.assertEqual(proofs[0]['base_instance_states'], proofs[0]['head_instance_states'])
+
+    def test_replacement_residuals_cannot_swap_matching_copies_per_row(self):
+        with self.assertRaisesRegex(ValueError, 'Replacement residual lost compiled-copy coverage'):
+            self.renamed_capsule_compare((((1, 0), (0, 1)), ((0, 0), (1, 1))))
+
+    def test_renamed_capsule_does_not_authorize_a_cold_tail(self):
+        def cold_tail(base, head):
+            for region in head['data'][0]['functions'][0]['regions']:
+                if region[0] == region[2] == 7:
+                    region[4] = 0
+        with self.assertRaisesRegex(ValueError, 'Replacement residual lost compiled-copy coverage'):
+            self.renamed_capsule_compare((((1, 1), (1, 1)), ((1, 1), (1, 1))), mutate=cold_tail)
+
+    def test_renamed_capsule_refuses_missing_copies_foreign_owners_and_changed_attributes(self):
+        def partial(base, head):
+            head['data'][0]['functions'].pop()
+        def foreign(base, head):
+            head['data'][0]['functions'].append(dict(name='foreign', filenames=['/src/example.rs'],
+                regions=[[4, 9, 4, 19, 1, 0, 0, 0]]))
+        def wrong_parent(base, head):
+            head['data'][0]['functions'][0]['name'] = '_RNvNtCs1_7example5otherss_11replacement'
+        for mutation in (partial, foreign, wrong_parent):
+            with self.subTest(mutation=mutation.__name__), self.assertRaises(ValueError):
+                self.renamed_capsule_compare((((1, 1), (1, 1)), ((1, 1), (1, 1))), mutate=mutation)
+        changed = b'#[cfg(test)]\nfn replacement() -> Result<()> {\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\n'
+        with self.assertRaises(ValueError):
+            self.renamed_capsule_compare(new_source=changed)
+
+    def test_renamed_capsule_does_not_choose_one_of_duplicate_sources(self):
+        duplicate = b'#[test]\nfn replacement() -> Result<()> {\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n    Ok(())\n}\nfn unrelated() {\n    assert_eq!(\n        restored(),\n        expected()?\n    );\n}\n'
+        def covered_foreign(base, head):
+            lines = duplicate.decode().splitlines()
+            head['data'][0]['functions'].append(dict(name='unrelated', filenames=['/src/example.rs'],
+                regions=[[line, 1, line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
+                         for line in range(9, len(lines) + 1)]))
+        with self.assertRaisesRegex(ValueError, 'Unproved retained execution'):
+            self.renamed_capsule_compare(new_source=duplicate, mutate=covered_foreign)
+
+    def test_replacement_witness_refuses_an_exhausted_shared_budget(self):
+        original = coverage.retained_replacement_obligations
+        def exhausted(*args, **kwargs):
+            arguments = list(args)
+            arguments[8] = [0]
+            return original(*arguments, **kwargs)
+        with patch.object(coverage, 'retained_replacement_obligations', side_effect=exhausted):
+            with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                self.renamed_capsule_compare()
+
+    def test_construct_budget_covers_multiline_index_growth(self):
+        cases = [
+            (['fn f() {'] + ['    let value = {'] * 8 + [''] * 2000
+             + ['        one()'] + ['    };'] * 8 + ['}'], 1000),
+            (['async fn f() {', '    match operation('] + [''] * 2000
+             + ['    ).await {', '        Ok(value) => value,', '    };', '}'], 3000),
+        ]
+        for source, budget in cases:
+            with self.subTest(budget=budget), self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                coverage._construct_inventory(source, [budget])
+
+    def test_removed_attributed_owner_does_not_identify_a_foreign_duplicate_setup(self):
+        old = b'#[test]\nfn obsolete() {\n    let directory = prepare();\n    old(directory);\n}\nfn retained() {\n    let directory = prepare();\n    same(directory);\n}\n'
+        new = old.replace(b'fn obsolete()', b'fn replacement()').replace(b'old(directory)', b'new(directory)')
+        def owners(base, head):
+            for document, source, first in ((base, old, 'obsolete'), (head, new, 'replacement')):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(name=name, filenames=['/src/example.rs'],
+                    regions=[[line, 1, line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
+                             for line in range(start, end + 1)])
+                    for name, start, end in ((first, 2, 5), ('retained', 6, 9))]
+        rows = [(line, 1) for line in range(2, 10)]
+        with self.assertRaises(ValueError):
+            self.compare(before=rows, after=rows, mutate=owners,
+                sources=({'example.rs': old}, {'example.rs': new}))
+        ambiguous_sources = old, new
+        old = old.replace(b'fn retained() {\n    let directory = prepare();',
+                          b'fn retained() {\n    let directory = retained_setup();')
+        new = old.replace(b'fn obsolete()', b'fn replacement()').replace(b'old(directory)', b'new(directory)')
+        new = new.replace(b'let directory = prepare();', b'let directory = replacement_setup();')
+        receipt = self.compare(before=rows, after=rows, mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+        self.assertEqual([receipt[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                 'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+        self.assertIn(5, [row['base_line'] for row in receipt['source_replacements']])
+        old, new = ambiguous_sources
+        for moved in (b'fn moved() {\n    let directory = prepare();\n    old(directory);\n}\n',
+                      b'fn moved() {\n    if guard() {\n        old(directory);\n    }\n}\n'):
+            with self.subTest(moved=moved), self.assertRaises(ValueError):
+                self.compare(before=rows, after=rows, mutate=owners,
+                    sources=({'example.rs': old}, {'example.rs': new, 'moved.rs': moved}))
+
+    def test_removed_owner_keeps_repeated_rich_work_in_its_original_scope(self):
+        old = ['#[test]', 'fn obsolete() {', '    let directory = prepare();',
+               '    old(directory);', '    old(directory);', '}', 'fn retained() {',
+               '    let directory = prepare();', '    same(directory);', '}']
+        new = [text.replace('obsolete', 'replacement').replace('old(directory)', 'new(directory)') for text in old]
+        moved = ['fn moved() {', '    if guard() {', '        old(directory);', '    }', '}']
+        inventories = [coverage._construct_inventory(source, [20_000_000]) for source in (new, moved)]
+        def all_head():
+            return (set().union(*(inventory[4] for inventory in inventories)),
+                    set().union(*(inventory[5] for inventory in inventories)))
+        with self.assertRaisesRegex(ValueError, 'Ambiguous unchanged work'):
+            coverage._construct_replacements(old, new, [20_000_000], all_head,
+                lambda line, target, kind: kind == 'owner' and line < 7 and target < 7)
+
+    def formatting_closure_endpoint_compare(self, mutate=None, only_anchors=False):
+        old = ['fn retained(input: &[Value]) -> std::fmt::Result {',
+               '    for item in input {', '        if let Some(value) = item.value {',
+               '            use_value(value)?;', '        }', '    }', '    Ok(())', '}']
+        new = [old[0], '    let formatted = (|| -> std::fmt::Result {',
+               '        for item in input {', '            if let Some(value) = item.value {',
+               '                use_value(value)?;', '            }', '        }',
+               '        Ok(())', '    })();', '    formatted', '}']
+        inventory = {}
+        for side, source, endpoint in (('base', old, 5), ('head', new, 6)):
+            owners = []
+            for instance in range(2):
+                parent = f'_RNvCs{instance + 1}_7example8retained'
+                owners.append(dict(name=parent, filenames=['/src/example.rs'],
+                    regions=[[1, source[0].index('{') + 1, len(source), 2, instance, 0, 0, 0]]))
+                column = len(source[endpoint - 1])
+                row = [endpoint, column, endpoint, column + 1, instance, 0, 0, 0]
+                if side == 'base':
+                    owners[-1]['regions'].append(row)
+                else:
+                    owners.append(dict(name='_RNC' + parent[2:] + '0B3_',
+                        filenames=['/src/example.rs'], count=instance,
+                        regions=[[2, new[1].index('||') + 1, 9, 6, instance, 0, 0, 0],
+                                 [2, new[1].index('{') + 1, 2, new[1].index('{') + 2, instance, 0, 0, 0], row]))
+            inventory[side] = dict(source=source, owners=owners)
+        if mutate:
+            mutate(inventory)
+        if only_anchors:
+            return coverage.retained_construct_anchors('example.rs', inventory['base']['source'],
+                inventory['head']['source'], {1: 1, 5: 1, 8: 1},
+                {line: 1 for line in range(1, 12) if line != 7},
+                inventory['base']['owners'], inventory['head']['owners'],
+                {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'})
+        def owners(base, head):
+            for document, side in ((base, 'base'), (head, 'head')):
+                document['data'][0]['functions'] = inventory[side]['owners']
+        return self.compare(before=[(1, 1), (5, 1), (8, 1)],
+            after=[(line, 1) for line in range(1, 12) if line != 7], mutate=owners,
+            sources=tuple({'example.rs': ('\n'.join(inventory[side]['source']) + '\n').encode()}
+                          for side in ('base', 'head')))
+
+    def test_formatting_closure_uses_the_identical_inner_construct_endpoint(self):
+        receipt = self.formatting_closure_endpoint_compare()
+        pairs = [pair for row in receipt['retained_constructs'] for pair in row['pairs']]
+        self.assertIn([5, 6], pairs)
+
+    def test_formatting_closure_refuses_cold_children_and_foreign_contexts(self):
+        def cold_child(value):
+            child = value['head']['owners'][3]
+            child['count'] = 0
+            for row in child['regions']:
+                row[4] = 0
+        with self.assertRaisesRegex(ValueError, 'Retained construct lost compiled-copy coverage'):
+            self.formatting_closure_endpoint_compare(mutate=cold_child, only_anchors=True)
+        def duplicate_child(value):
+            value['head']['owners'].append(copy.deepcopy(value['head']['owners'][3]))
+        def foreign_context(value):
+            value['head']['owners'][3]['name'] += 'C3foo'
+        def changed_geometry(value):
+            value['head']['owners'][3]['regions'][-1][0] -= 1
+            value['head']['owners'][3]['regions'][-1][2] -= 1
+        def owner_attribute(value):
+            value['head']['source'].insert(0, '#[rewrite_capture]')
+            for owner in value['head']['owners']:
+                for row in owner['regions']:
+                    row[0] += 1; row[2] += 1
+        for mutate in (duplicate_child, foreign_context, changed_geometry, owner_attribute):
+            with self.subTest(mutation=mutate.__name__):
+                self.assertEqual(self.formatting_closure_endpoint_compare(
+                    mutate=mutate, only_anchors=True), ({}, []))
+
+    def test_moved_constructs_cannot_redistribute_work_between_compiled_copies(self):
+        old = ['fn retained() -> std::fmt::Result {', '    if first() {',
+               '        work_one();', '    }', '    if second() {', '        work_two();', '    }', '}']
+        new = [old[0], '    let formatted = (|| -> std::fmt::Result {',
+               *['    ' + text for text in old[1:7]], '        Ok(())', '    })();', '    formatted', '}']
+        inventories = []
+        for side, source, states in ((0, old, ((1, 0), (0, 1))), (1, new, ((0, 0), (1, 1)))):
+            owners = []
+            for instance, state in enumerate(states):
+                parent = f'_RNvCs{instance + 1}_7example8retained'
+                owner = dict(name=parent, filenames=['/src/example.rs'],
+                    regions=[[1, source[0].index('{') + 1, len(source), 2, 1, 0, 0, 0]])
+                owners.append(owner)
+                if side:
+                    owner = dict(name='_RNC' + parent[2:] + '0B3_', filenames=['/src/example.rs'], count=1,
+                        regions=[[2, new[1].index('||') + 1, 10, 6, 1, 0, 0, 0],
+                                 [2, new[1].index('{') + 1, 2, new[1].index('{') + 2, 1, 0, 0, 0]])
+                    owners.append(owner)
+                for start, count in zip((2 + side, 5 + side), state):
+                    column = len(source[start - 1]) - len(source[start - 1].lstrip()) + 1
+                    owner['regions'].append([start, column, start + 2, column + 1, count, 0, 0, 0])
+            inventories.append(owners)
+        with self.assertRaisesRegex(ValueError, 'Retained construct lost compiled-copy coverage'):
+            coverage.retained_construct_anchors('example.rs', old, new,
+                {line: 1 for line in range(1, len(old) + 1)},
+                {line: 2 for line in range(1, len(new) + 1)}, *inventories,
+                {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'})
 
     def fixture(self):
         before = [(1, 3), (2, 3), (3, 1), (4, 1), (5, 0), (6, 0)]
@@ -156,6 +1013,142 @@ class SourceAwareCoverageTests(unittest.TestCase):
             hg.write_bytes(gzip.compress(json.dumps(hr).encode()))
             old, new = sources or ({"example.rs": self.old_source}, {"example.rs": self.new_source})
             return coverage.require_source_no_regression(coverage.read_coverage(bp), coverage.read_coverage(hp), bg, hg, old, new)
+
+    def compare_additions(self, before=None, after=None, summaries=None, additions=None,
+                          old=None, new=None, mutate=None):
+        before = self.fixture()[0] if before is None else before
+        after = self.fixture()[1] if after is None else after
+        summaries = summaries or ((len(before), sum(c > 0 for _, c in before)),
+                                  (len(after), sum(c > 0 for _, c in after)))
+        additions = additions if additions is not None else {"new.rs": ([(1, 1)], (1, 1), b"new();\n")}
+        old = {"example.rs": self.old_source} if old is None else old.copy()
+        new = {"example.rs": self.new_source} if new is None else new.copy()
+        def section(name, rows, summary):
+            found, hit = summary
+            return (f"SF:/src/{name}\n" + "".join(f"DA:{line},{count}\n" for line, count in rows)
+                    + f"LF:{found}\nLH:{hit}\nend_of_record\n")
+        br, hr = self.regions(before, True), self.regions(after, False)
+        for doc, summary in ((br, summaries[0]), (hr, summaries[1])):
+            doc["data"][0]["files"][0]["summary"]["lines"] = dict(zip(("count", "covered"), summary))
+        head_lcov = section("example.rs", after, summaries[1])
+        for name, (rows, summary, source) in additions.items():
+            head_lcov += section(name, rows, summary)
+            new[name] = source
+            hr["data"][0]["files"].append({"filename": f"/src/{name}", "summary": {
+                "lines": dict(zip(("count", "covered"), summary))}})
+            hr["data"][0]["functions"].append({"name": f"owner_{name}", "filenames": [f"/src/{name}"],
+                "regions": [[line, 1, line, 2, count, 0, 0, 0] for line, count in rows]})
+        if mutate:
+            br, hr, old, new, head_lcov = mutate(br, hr, old, new, head_lcov)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bp, hp, bg, hg = (root / name for name in ("b.info", "h.info", "b.gz", "h.gz"))
+            bp.write_text(section("example.rs", before, summaries[0]))
+            hp.write_text(head_lcov)
+            bg.write_bytes(gzip.compress(json.dumps(br).encode()))
+            hg.write_bytes(gzip.compress(json.dumps(hr).encode()))
+            return coverage.require_source_no_regression(coverage.read_coverage(bp), coverage.read_coverage(hp),
+                                                         bg, hg, old, new)
+
+    def test_added_files_are_covered_and_sorted_with_deletion_credit(self):
+        added = {"z.rs": ([(1, 1), (2, 4)], (2, 2), b"a();\nb();\n"),
+                 "a.rs": ([(1, 2)], (1, 1), b"a();\n")}
+        self.assertEqual(self.compare_additions(additions=added), {
+            "deleted_summary_found": 2, "deleted_summary_hit": 2,
+            "deleted_mapped": 2, "deleted_mapped_hit": 2,
+            "added_files": [{"file": "a.rs", "summary_found": 1, "summary_hit": 1, "mapped": 1, "mapped_hit": 1},
+                            {"file": "z.rs", "summary_found": 2, "summary_hit": 2, "mapped": 2, "mapped_hit": 2}]})
+
+    def test_addition_with_unchanged_common_file_uses_fast_path(self):
+        rows = [(1, 1), (2, 0)]
+        source = b"covered();\nuncovered();\n"
+        result = self.compare_additions(before=rows, after=rows,
+            old={"example.rs": source}, new={"example.rs": source})
+        self.assertEqual(result, {"deleted_summary_found": 0, "deleted_summary_hit": 0,
+            "deleted_mapped": 0, "deleted_mapped_hit": 0,
+            "added_files": [{"file": "new.rs", "summary_found": 1, "summary_hit": 1,
+                             "mapped": 1, "mapped_hit": 1}]})
+
+    def test_empty_common_head_cannot_be_rescued_by_addition(self):
+        for after in ([], [(1, 1)]):
+            with self.subTest(after=after), self.assertRaisesRegex(ValueError, "No comparable common head"):
+                self.compare_additions(after=after, summaries=((6, 4), (0, 0)))
+
+    def test_added_file_requires_complete_independent_surfaces(self):
+        for rows, summary, source, message in [
+                ([(1, 1)], (2, 1), b"a();\n", "summary"),
+                ([(1, 0)], (1, 1), b"a();\n", r"new.rs:1"),
+                ([(2, 1)], (1, 1), b"a();\n", "source blob"),
+                ([], (0, 0), b"", "Empty")]:
+            with self.subTest(rows=rows, summary=summary), self.assertRaisesRegex(ValueError, message):
+                self.compare_additions(additions={"new.rs": (rows, summary, source)})
+
+    def test_added_file_must_not_exist_in_base_sources(self):
+        old = {"example.rs": self.old_source, "new.rs": b"existing();\n"}
+        with self.assertRaisesRegex(ValueError, "base source"):
+            self.compare_additions(old=old)
+
+    def test_added_owner_cannot_disguise_deletion(self):
+        def reuse(br, hr, old, new, lcov):
+            hr["data"][0]["functions"][-1]["name"] = "obsolete"
+            return br, hr, old, new, lcov
+        with self.assertRaisesRegex(ValueError, "retained or ambiguous"):
+            self.compare_additions(mutate=reuse)
+
+    def test_duplicate_added_owners_cannot_disguise_deletion(self):
+        def reuse(br, hr, old, new, lcov):
+            owner = hr["data"][0]["functions"][-1]
+            owner["name"] = "obsolete"
+            hr["data"][0]["functions"].append(copy.deepcopy(owner))
+            return br, hr, old, new, lcov
+        with self.assertRaisesRegex(ValueError, "retained or ambiguous"):
+            self.compare_additions(mutate=reuse)
+
+    def test_large_addition_cannot_mask_common_summary_or_mapping_regression(self):
+        old = b"fn retained() {\n  obsolete_step();\n  keep();\n  untested();\n}\n"
+        new = b"fn retained() {\n  replacement();\n  keep();\n  untested();\n}\n"
+        additions = {"new.rs": ([(i, 1) for i in range(1, 101)], (100, 100), b"x();\n" * 100)}
+        before = [(1, 1), (2, 1), (3, 1), (4, 0), (5, 0)]
+        for summary, after, expected in [
+                ((6, 3), before, "Line coverage decreased"),
+                ((6, 4), [(1, 1), (3, 1), (4, 0), (5, 0)], "Mapped line coverage decreased")]:
+            with self.subTest(summary=summary), self.assertRaisesRegex(ValueError, expected):
+                self.compare_additions(before=before, after=after,
+                    summaries=((6, 4), summary), additions=additions,
+                    old={"example.rs": old}, new={"example.rs": new})
+
+    def test_removed_coverage_file_is_refused_despite_addition(self):
+        def remove(br, hr, old, new, lcov):
+            hr["data"][0]["files"].pop(0)
+            hr["data"][0]["functions"] = hr["data"][0]["functions"][1:]
+            return br, hr, old, new, lcov[lcov.index("SF:/src/new.rs"):]
+        with self.assertRaisesRegex(ValueError, "[Rr]emoved"):
+            self.compare_additions(mutate=remove)
+
+    def test_added_file_does_not_excuse_retained_loss_or_new_zero(self):
+        with self.assertRaisesRegex(ValueError, "Retained covered line"):
+            self.compare_additions(after=[(1, 0), (2, 1), (3, 1), (4, 1)])
+        with self.assertRaisesRegex(ValueError, "New uncovered"):
+            self.compare_additions(after=[(1, 1), (2, 1), (3, 1), (4, 1), (5, 0)],
+                                   new={"example.rs": self.new_source + b"untested_new();\n"})
+
+    def test_added_evidence_still_validates_metadata_and_counters(self):
+        def change(kind):
+            def mutate(br, hr, old, new, lcov):
+                file = hr["data"][0]["files"][-1]
+                if kind == "schema": hr["version"] = "0"
+                if kind == "summary": file["summary"]["lines"]["covered"] = 0
+                if kind == "missing": del new["new.rs"]
+                if kind == "ambiguous": new["src/new.rs"] = b"x();\n"
+                if kind == "section": hr["data"][0]["files"].pop()
+                if kind == "json saturation": hr["data"][0]["functions"][-1]["regions"][0][4] = coverage.COUNTER_LIMIT
+                if kind == "lcov saturation": lcov = lcov.replace("DA:1,1\nLF:1", f"DA:1,{coverage.COUNTER_LIMIT}\nLF:1")
+                if kind == "malformed": lcov = lcov.replace("DA:1,1\nLF:1", "DA:1,-1\nLF:1")
+                return br, hr, old, new, lcov
+            return mutate
+        for kind in ("schema", "summary", "missing", "ambiguous", "section", "json saturation", "lcov saturation", "malformed"):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self.compare_additions(mutate=change(kind))
 
     def test_proven_covered_helper_deletion_preserves_both_surfaces(self):
         self.assertEqual(self.compare(), {"deleted_summary_found": 2, "deleted_summary_hit": 2,
@@ -607,6 +1600,798 @@ class SourceAwareCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "New uncovered"):
             self.duplicated_owned_calls_compare(after=rows, head_source=new)
 
+    def multiline_copies_compare(self, mutate=None, fragments=False, copies=2):
+        old = ["fn retained(", "    value: Input,", ") -> Value {",
+               "    if old_first {", "        old_one();", "    }", "    old_middle();",
+               "    if old_second {", "        old_two();", "    }", "    old_end();", "}"]
+        new = ["fn retained(", "    value: Input,", ") -> Result<Value> {",
+               "    if new_first {", "        new_one();", "        checked();", "    }",
+               "    new_middle();", "    if new_second {", "        new_two();", "    }",
+               "    new_end();", "}"]
+        if fragments:
+            for source, version in ((old, "old"), (new, "new")):
+                source[3:-1] = [line for n, token in enumerate(("a", "b", "a", "b"))
+                               for line in (f"    {version}_{n}();", f"    shared_{token}();")]
+        value = {}
+        for side, source in (("base", old), ("head", new)):
+            end = len(source)
+            source += ["fn tail() {", "    keep();", "}"]
+            value[side] = {"source": source, "counts": {n: 1 for n in range(1, len(source) + 1)},
+                          "owners": [{"name": f"{side}_crate_{instance}", "filenames": ["/src/example.rs"],
+                                      "regions": [[n, 1, n, len(source[n - 1].encode()) + 1,
+                                                   int(instance == copies - 1), 0, 0, 0]
+                                                  for n in range(1, end + 1)]}
+                                     for instance in range(copies)]}
+            value[side]["owners"].append({"name": "tail", "filenames": ["/src/example.rs"],
+                "regions": [[n, 1, n, len(source[n - 1].encode()) + 1, 1, 0, 0, 0]
+                            for n in range(end + 1, len(source) + 1)]})
+        if mutate:
+            mutate(value)
+        def owners(base, head):
+            for document, side in ((base, "base"), (head, "head")):
+                document["data"][0]["functions"] = value[side]["owners"]
+        return self.compare(before=sorted(value["base"]["counts"].items()),
+                            after=sorted(value["head"]["counts"].items()), mutate=owners,
+                            sources=tuple({"example.rs": ("\n".join(value[side]["source"]) + "\n").encode()}
+                                          for side in ("base", "head")))
+
+    def nested_callback_compare(self, mutate=None, fragments=None):
+        old = ["fn retained(", "    value: Input,", ") -> Result<Value> {",
+               "    let capture = make_state();", "    old_step();", "    action()",
+               "        .map_err(|error| override_error(&capture).unwrap_or(error))?;",
+               "    old_middle();", "    action()",
+               "        .map_err(|error| override_error(&capture).unwrap_or(error))?;",
+               "    finish()", "}", "fn override_error(state: &State) -> Option<Error> {",
+               "    None", "}"]
+        new = [line.replace('old_', 'new_') for line in old]
+        value = {}
+        for side, source in (("base", old), ("head", new)):
+            owners = []
+            for instance in range(2):
+                parent = f"_RNvCs{instance + 1}_7example8retained"
+                owners.append(dict(name=parent, filenames=["/src/example.rs"],
+                    regions=[[n, 1, n, len(source[n - 1]) + 1, instance, 0, 0, 0]
+                             for n in range(1, 13)]))
+                for line, discriminator in ((7, ''), (10, 's_')):
+                    first = source[line - 1].index('override_error') + 1
+                    end = source[line - 1].rindex('))') + 2
+                    owners.append(dict(name='_RNC' + parent[2:] + discriminator + '0B3_', count=instance,
+                        filenames=["/src/example.rs"],
+                        regions=[[line, first, line, end, instance, 0, 0, 0]]))
+            owners.append(dict(name='override_error', filenames=["/src/example.rs"],
+                regions=[[n, 1, n, len(source[n - 1]) + 1, 1, 0, 0, 0] for n in (13, 14, 15)]))
+            value[side] = dict(source=source, owners=owners)
+        if mutate:
+            mutate(value)
+        counts = [{n: 1 for n in range(1, len(value[side]['source']) + 1)}
+                  for side in ('base', 'head')]
+        return coverage.positive_source_fragments('example.rs', value['base']['source'],
+            value['head']['source'], *counts, value['base']['owners'], value['head']['owners'],
+            {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'},
+            fragments if fragments is not None else [(6, 7, 6, 7, [7]), (9, 10, 9, 10, [10])])
+
+    def test_nested_callback_refuses_outer_owner_attributes(self):
+        for side in ('base', 'head'):
+            def mutate(value):
+                value[side]['source'].insert(0, '#[rewrite_capture]')
+                for owner in value[side]['owners']:
+                    for region in owner['regions']:
+                        region[0] += 1
+                        region[2] += 1
+            fragments = ([(7, 8, 6, 7, [8]), (10, 11, 9, 10, [11])] if side == 'base'
+                         else [(6, 7, 7, 8, [7]), (9, 10, 10, 11, [10])])
+            with self.subTest(side=side), self.assertRaisesRegex(ValueError, 'Ambiguous unchanged'):
+                self.nested_callback_compare(mutate=mutate, fragments=fragments)
+
+    def test_nested_map_err_owners_preserve_complete_child_obligations(self):
+        pairs, receipts = self.nested_callback_compare()
+        self.assertEqual(pairs, {7: 7, 10: 10})
+        self.assertEqual(receipts[0]['instances'], 2)
+        self.assertTrue(receipts[0]['nested_callbacks'])
+
+    def test_nested_callback_refuses_foreign_or_incomplete_compiled_children(self):
+        def children(value):
+            return [owner for owner in value['head']['owners'] if owner['name'].startswith('_RNC')]
+        def child_name(change):
+            def mutate(value):
+                children(value)[0]['name'] = change(children(value)[0]['name'])
+            return mutate
+        def missing(value):
+            value['head']['owners'].remove(children(value)[0])
+        def extra(value):
+            child = copy.deepcopy(children(value)[0]); child['name'] = child['name'].replace('0B3_', 's0_0B3_')
+            value['head']['owners'].append(child)
+        def escaping(value):
+            children(value)[0]['regions'][0][1] = 1
+        def changed_geometry(value):
+            for owner in children(value):
+                owner['regions'][0][3] -= 1
+        def lost_child(value):
+            for owner in children(value):
+                owner['count'] = 0
+                for region in owner['regions']:
+                    region[4] = 0
+        def split_credit(value):
+            for owner in value['head']['owners']:
+                if owner['name'].startswith('_RNv'):
+                    for region in owner['regions']:
+                        region[4] = int('Cs1_' in owner['name'])
+        cases = {
+            'missing': missing, 'extra': extra, 'outside_body': escaping,
+            'changed_geometry': changed_geometry, 'lost_child_hot_bits': lost_child,
+            'parent_child_credit_split': split_credit,
+            'wrong_crate': child_name(lambda name: name.replace('Cs1_', 'Cs9_')),
+            'shim': child_name(lambda name: name.replace('_RNC', '_RNS')),
+            'wrong_backref': child_name(lambda name: name.replace('B3_', 'B2_')),
+            'foreign_instantiation': child_name(lambda name: name + 'C3foo'),
+            'vendor_suffix': child_name(lambda name: name + '.llvm.1'),
+            'unknown_symbol': child_name(lambda name: 'foreign'),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.nested_callback_compare(mutate=mutate)
+
+    def test_nested_callback_refuses_changed_or_unsupported_capture_construction(self):
+        def lines(changes):
+            def mutate(value):
+                head = value['head']
+                for line, text in changes.items():
+                    head['source'][line - 1] = text
+                for owner in head['owners']:
+                    if not owner['name'].startswith('_RNC'):
+                        for region in owner['regions']:
+                            region[3] = len(head['source'][region[2] - 1]) + 1
+            return mutate
+        cases = {
+            'changed_initializer': {4: '    let capture = other_state();'},
+            'mutable': {4: '    let mut capture = make_state();'},
+            'type_annotation': {4: '    let capture: State = make_state();'},
+            'destructuring': {4: '    let (capture, other) = make_state();'},
+            'duplicate_binding': {8: '    let capture = make_state();'},
+            'scoped_import': {8: '    use overrides::override_error;'},
+            'shadowed_function': {5: '    let override_error = another_handler;'},
+            'ancestor_capture': {5: '    if ready {', 8: '    }'},
+            'if_let_function': {4: '    if let Some(override_error) = handler {',
+                                5: '        let capture = make_state();', 8: '    }'},
+            'for_function': {4: '    for override_error in handlers {',
+                             5: '        let capture = make_state();', 8: '    }'},
+            'conditional_root_function': {13: '#[cfg(any())] fn override_error(state: &State) -> Option<Error> {'},
+            'method_not_root_function': {13: 'impl Host {',
+                14: '    fn override_error(state: &State) -> Option<Error> { None }', 15: '}'},
+        }
+        for label, changes in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.nested_callback_compare(mutate=lines(changes))
+
+    def test_nested_callback_refuses_macro_or_attribute_created_capture_shadows(self):
+        cases = {
+            'parentheses': (5, '    shadow!(capture);'),
+            'braces': (5, '    shadow! { capture }'),
+            'brackets': (5, '    shadow![capture];'),
+            'qualified': (5, '    crate::shadow!(capture);'),
+            'raw_keyword': (5, '    r#return!(capture);'),
+            'late_item': (11, '    shadow!(); finish()'),
+            'local_definition': (5, '    macro_rules! shadow { () => { let capture = other_state(); }; }'),
+            'attribute': (4, '    #[replace_binding] let capture = make_state();'),
+        }
+        for label, (line, replacement) in cases.items():
+            def mutate(value):
+                head = value['head']
+                head['source'][line - 1] = replacement
+                head['source'].append(
+                    'macro_rules! shadow { () => { fn override_error(_: &State) -> Option<Error> { other_error() } }; }'
+                    if label == 'late_item' else
+                    'macro_rules! shadow { ($name:ident) => { let $name = other_state(); }; }')
+                for owner in head['owners']:
+                    if not owner['name'].startswith('_RNC'):
+                        for region in owner['regions']:
+                            region[3] = len(head['source'][region[2] - 1]) + 1
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.nested_callback_compare(mutate=mutate)
+
+    def test_nested_callback_preserves_expression_macro_construction(self):
+        def mutate(value):
+            for side in ('base', 'head'):
+                value[side]['source'][4] = (
+                    '    let extra = if matches!(value, Some(_)) { 1 } else { 0 };')
+                for owner in value[side]['owners']:
+                    if not owner['name'].startswith('_RNC'):
+                        for region in owner['regions']:
+                            region[3] = len(value[side]['source'][region[2] - 1]) + 1
+        pairs, _ = self.nested_callback_compare(mutate=mutate)
+        self.assertEqual(pairs, {7: 7, 10: 10})
+
+    def test_nested_callback_rejects_raw_context_suffixes_before_decoding(self):
+        def contexts(value):
+            for side in ('base', 'head'):
+                for owner in value[side]['owners']:
+                    if owner['name'].startswith('_RNv'):
+                        owner['name'] += 'C3foo'
+                    elif owner['name'].startswith('_RNC'):
+                        owner['name'] += 'C3bar'
+        with mock.patch.object(coverage, 'demangle_plain_rust_callbacks',
+                               side_effect=AssertionError('invalid raw context reached GNU')):
+            with self.assertRaises(ValueError):
+                self.nested_callback_compare(mutate=contexts)
+
+    def test_nested_callback_rejects_colliding_decoded_parent_contexts(self):
+        def collide(value):
+            for owner in value['head']['owners']:
+                owner['name'] = owner['name'].replace('Cs2_', 'Cs01_')
+        with self.assertRaises(ValueError):
+            self.nested_callback_compare(mutate=collide)
+
+    def test_nested_callback_requires_supported_gnu_decoder(self):
+        coverage.demangle_plain_rust_callbacks.cache_clear()
+        with mock.patch.object(coverage.shutil, 'which', return_value=None), \
+                self.assertRaisesRegex(ValueError, r'requires GNU c\+\+filt'):
+            self.nested_callback_compare()
+
+    def test_nested_callback_refuses_decoder_failures_and_unparsed_output(self):
+        def output(value):
+            def run(argv, **kwargs):
+                data = b'GNU c++filt fixture\n' if '--version' in argv else value(kwargs['input'])
+                return subprocess.CompletedProcess(argv, 0, data, b'')
+            return run
+        cases = {
+            'echo': output(lambda data: data),
+            'missing_row': output(lambda data: b'unknown\n'),
+            'oversized': output(lambda data: b'x' * (256 * 1024 + 1)),
+            'non_ascii': output(lambda data: b'\xff\n' * len(data.splitlines())),
+            'timeout': subprocess.TimeoutExpired(['c++filt'], 5),
+            'failed_process': subprocess.CalledProcessError(1, ['c++filt']),
+        }
+        for label, result in cases.items():
+            coverage.demangle_plain_rust_callbacks.cache_clear()
+            try:
+                with self.subTest(label=label), mock.patch.object(coverage.subprocess, 'run', side_effect=result), \
+                        self.assertRaises(ValueError):
+                    self.nested_callback_compare()
+            finally:
+                coverage.demangle_plain_rust_callbacks.cache_clear()
+
+    def test_callback_decoder_rejects_unsupported_input_before_process_execution(self):
+        parent = '_RNvCs1_7example8retained'
+        cases = [
+            (parent, parent),
+            ('_R' + 'x' * 4096,),
+            tuple('_RNvCs' + str(n) + '_7example8retained' for n in range(257)),
+            (parent, parent + 'C3foo'),
+            (parent, '_RNC' + parent[2:] + '0B2_'),
+            (parent, parent + 'I' + 'B0_' * 1000),
+        ]
+        for symbols in cases:
+            with self.subTest(count=len(symbols)), mock.patch.object(coverage.subprocess, 'run',
+                    side_effect=AssertionError('unsupported symbol inventory reached GNU')), self.assertRaises(ValueError):
+                coverage.demangle_plain_rust_callbacks(symbols)
+
+    def transparent_forwarder_compare(self, mutate=None):
+        def extracted(value):
+            head = value["head"]
+            end = head["owners"][0]["regions"][-1][0]
+            body, tail = head["source"][3:end], head["source"][end:]
+            wrapper = value["base"]["source"][:3] + ["    extracted(value, None, &[])", "}"]
+            header = ["fn extracted(", "    value: Input,", "    policy: Option<&[Policy]>,",
+                      "    selections: &[Selection],", ") -> Value {"]
+            source = wrapper + header + body + tail
+            last = len(wrapper + header + body)
+            owners = []
+            for instance, owner in enumerate(head["owners"][:2]):
+                owners.append({"name": owner["name"], "filenames": owner["filenames"],
+                    "regions": [[n, 1, n, len(source[n - 1].encode()) + 1, instance, 0, 0, 0]
+                                for n in range(len(wrapper) + 1, last + 1)]})
+            for name, first, final in (("wrapper", 1, len(wrapper)), ("tail", last + 1, len(source))):
+                owners.append({"name": name, "filenames": ["/src/example.rs"],
+                    "regions": [[n, 1, n, len(source[n - 1].encode()) + 1, 1, 0, 0, 0]
+                                for n in range(first, final + 1)]})
+            head.update(source=source, counts={n: 1 for n in range(1, len(source) + 1)}, owners=owners)
+            if mutate:
+                mutate(value)
+        return self.multiline_copies_compare(mutate=extracted)
+
+    def test_transparent_forwarder_preserves_extracted_fragment_obligations(self):
+        result = self.transparent_forwarder_compare()
+        witness = result["positive_source_fragments"][0]
+        self.assertEqual(witness["pairs"], [[6, 14], [10, 18]])
+        self.assertEqual(witness["forwarder"]["wrapper_range"], [1, 5])
+        self.assertEqual(witness["forwarder"]["callee_range"], [6, 20])
+
+    def test_transparent_forwarder_refuses_changed_arguments_and_signatures(self):
+        def change(line, text):
+            def mutate(value):
+                head = value["head"]
+                head["source"][line - 1] = text
+                for owner in head["owners"]:
+                    for region in owner["regions"]:
+                        region[3] = len(head["source"][region[2] - 1].encode()) + 1
+            return mutate
+        cases = {
+            "swapped": (4, "    extracted(None, value, &[])"),
+            "repeated": (4, "    extracted(value, value, &[])"),
+            "omitted": (4, "    extracted(None, &[])"),
+            "transformed": (4, "    extracted(&value, None, &[])"),
+            "nested_call": (4, "    extracted(rewrite(value), None, &[])"),
+            "question": (4, "    extracted(value, None, &[])?"),
+            "qualified": (4, "    self::extracted(value, None, &[])"),
+            "statement": (4, "    log(); extracted(value, None, &[])"),
+            "return": (4, "    return extracted(value, None, &[])"),
+            "different_default": (4, "    extracted(value, Some(value), &[])"),
+            "changed_parameter_type": (7, "    value: OtherInput,"),
+            "duplicate_parameter_name": (8, "    value: Option<&[Policy]>,"),
+            "changed_return": (10, ") -> OtherValue {"),
+            "unsafe_callee": (6, "unsafe fn extracted("),
+        }
+        for label, (line, text) in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "Ambiguous unchanged"):
+                self.transparent_forwarder_compare(mutate=change(line, text))
+        def shadowed(value):
+            change(6, "fn value(")(value)
+            change(4, "    value(value, None, &[])")(value)
+        with self.assertRaisesRegex(ValueError, "Ambiguous unchanged"):
+            self.transparent_forwarder_compare(mutate=shadowed)
+
+    def test_transparent_forwarder_refuses_conditional_nested_or_shadowed_contexts(self):
+        def insert(head, first, lines):
+            head["source"][first - 1:first - 1] = lines
+            for owner in head["owners"]:
+                for region in owner["regions"]:
+                    for field in (0, 2):
+                        if region[field] >= first:
+                            region[field] += len(lines)
+            head["counts"] = {n: 1 for n in range(1, len(head["source"]) + 1)}
+        def surrounded(before, after):
+            def mutate(value):
+                head = value["head"]
+                insert(head, 21, after)
+                insert(head, 6, before)
+            return mutate
+        cases = {
+            "attribute": surrounded(["#[", "cfg(test)", "]"], []),
+            "impl": surrounded(["impl Holder {"], ["}"]),
+            "module": surrounded(["mod nested {"], ["}"]),
+            "macro_parentheses": surrounded(["generate!("], [");"]),
+            "macro_braces": surrounded(["generate! {"], ["}"]),
+        }
+        for label, lines in {
+            "glob_import": ["use hidden::*;"],
+            "shadowed_none_import": ["use hidden::{None};"],
+            "shadowed_none_constant": ["const None: Option<&[Policy]> = Option::Some(&[]);"],
+            "no_prelude": ["#![no_implicit_prelude]"],
+        }.items():
+            cases[label] = lambda value, lines=lines: insert(value["head"], 1, lines)
+        for label, mutate in cases.items():
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.transparent_forwarder_compare(mutate=mutate)
+
+    def test_transparent_forwarder_refuses_existing_or_shared_callees(self):
+        def append_function(side, name, body):
+            start = len(side["source"]) + 1
+            side["source"] += [f"fn {name}(", "    value: Input,", ") -> Value {", body, "}"]
+            side["counts"] = {n: 1 for n in range(1, len(side["source"]) + 1)}
+            side["owners"].append({"name": name, "filenames": ["/src/example.rs"],
+                "regions": [[n, 1, n, len(side["source"][n - 1].encode()) + 1, 1, 0, 0, 0]
+                            for n in range(start, start + 5)]})
+        def existing(value):
+            append_function(value["base"], "extracted", "    keep()")
+        def shared(value):
+            append_function(value["base"], "another", "    keep()")
+            append_function(value["head"], "another", "    extracted(value, None, &[])")
+        for label, mutate in (("existing", existing), ("shared", shared)):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.transparent_forwarder_compare(mutate=mutate)
+
+    def test_transparent_forwarder_refuses_split_fragment_ownership(self):
+        captured = {}
+        self.transparent_forwarder_compare(mutate=lambda value: captured.update(value))
+        groups = []
+        for side in ("base", "head"):
+            value = captured[side]
+            by_span = {}
+            for owner in value["owners"]:
+                regions = owner["regions"]
+                by_span.setdefault((regions[0][0], regions[-1][2]), []).append(owner)
+            groups.append({prefix: (*span, by_span[span]) for span, prefix in
+                           coverage.source_function_prefixes(value["source"], by_span).items()})
+        self.assertEqual(coverage.transparent_forwarder_groups(
+            captured["base"]["source"], captured["head"]["source"], groups,
+            [(5, 6, 13, 14, [6]), (11, 12, 4, 5, [12])]), {})
+
+    def test_transparent_forwarder_retains_every_compiled_copy_and_foreign_owner_guard(self):
+        def missing(value):
+            value["head"]["owners"].pop(0)
+        def lost(value):
+            value["head"]["owners"][1]["regions"][8][4] = 0
+        def foreign(value):
+            value["head"]["owners"].append({"name": "foreign", "filenames": ["/src/example.rs"],
+                "regions": [[14, 1, 14, 6, 1, 0, 0, 0]]})
+        for label, mutate in (("missing_copy", missing), ("lost_hot_bit", lost), ("foreign_owner", foreign)):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                self.transparent_forwarder_compare(mutate=mutate)
+
+    def cold_fragment_compare(self, mutate=None):
+        old = ['fn retained() {', '    if ready {', '        if permitted {',
+               '            if extra { old();', '        }', '    }', '    }', '    finish();', '}']
+        new = [line.replace('old();', 'new();') for line in old]
+        value = {}
+        for side, source in (('base', old), ('head', new)):
+            value[side] = dict(source=source, counts={5: int(side == 'head'), 6: 1, 8: 1},
+                owners=[dict(name=f'{side}_copy_{instance}', filenames=['/src/example.rs'],
+                    regions=[[n, 1, n, len(source[n - 1]) + 1,
+                              int(instance == 0 and (n != 5 or side == 'head')), 0, 0, 0]
+                             for n in range(1, 10) if n != 7]) for instance in range(2)])
+        if mutate:
+            mutate(value)
+        return coverage.positive_source_fragments('example.rs', old, new,
+            value['base']['counts'], value['head']['counts'],
+            value['base']['owners'], value['head']['owners'],
+            {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'},
+            [(4, 7, 4, 7, [5, 6]), (7, 8, 7, 8, [8])])
+
+    def test_fragment_preserves_cold_rows_when_every_head_candidate_is_covered(self):
+        pairs, receipts = self.cold_fragment_compare()
+        self.assertEqual(pairs, {5: 5, 6: 6, 8: 8})
+        self.assertEqual(receipts[0]['instance_states'], [[0, 0, 0], [0, 1, 1]])
+        self.assertEqual(receipts[0]['head_instance_states'], [[0, 0, 0], [1, 1, 1]])
+
+    def test_cold_fragment_requires_complete_consistent_counters_and_owners(self):
+        def foreign(value):
+            value['head']['owners'].append(dict(name='foreign', filenames=['/src/example.rs'],
+                regions=[[5, 1, 5, 10, 1, 0, 0, 0]]))
+        def lost(value):
+            value['head']['owners'][0]['regions'][5][4] = 0
+            value['head']['owners'][1]['regions'][5][4] = 1
+        def foreign_unmapped(value):
+            foreign(value)
+            value['head']['owners'][-1]['regions'] = [[7, 1, 7, 6, 1, 0, 0, 0]]
+        mutations = {
+            'base_mapping_missing': lambda v: v['base']['counts'].pop(5),
+            'head_mapping_missing': lambda v: v['head']['counts'].pop(5),
+            'head_still_cold': lambda v: v['head']['counts'].__setitem__(5, 0),
+            'base_hot_region': lambda v: v['base']['owners'][0]['regions'][4].__setitem__(4, 1),
+            'base_cold_region': lambda v: v['base']['owners'][0]['regions'][5].__setitem__(4, 0),
+            'head_cold_regions': lambda v: v['head']['owners'][0]['regions'][4].__setitem__(4, 0),
+            'lost_correlated_copy': lost,
+            'missing_copy': lambda v: v['head']['owners'].pop(),
+            'foreign_owner': foreign,
+            'foreign_unmapped_owner': foreign_unmapped,
+            'new_cold_mapping': lambda v: v['head']['counts'].__setitem__(7, 0),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, 'Ambiguous unchanged source'):
+                self.cold_fragment_compare(mutate)
+
+    def test_multiline_return_change_preserves_covered_fragments_in_every_compiled_copy(self):
+        result = self.multiline_copies_compare()
+        self.assertEqual([result[key] for key in ("deleted_summary_found", "deleted_summary_hit",
+                         "deleted_mapped", "deleted_mapped_hit")], [0, 0, 0, 0])
+        self.assertEqual(result["positive_source_fragments"][0]["pairs"], [[6, 7], [10, 11]])
+
+    def test_multiline_fragment_accepts_newly_covered_compiled_copies(self):
+        def cover_cold_copy(value):
+            for owner in value["head"]["owners"][:2]:
+                for region in owner["regions"]:
+                    region[4] = 1
+        result = self.multiline_copies_compare(mutate=cover_cold_copy)
+        self.assertEqual(result["positive_source_fragments"][0]["pairs"], [[6, 7], [10, 11]])
+        self.assertEqual(result["positive_source_fragments"][0]["instance_states"], [[0, 0], [1, 1]])
+        witness = result["positive_source_fragments"][0]
+        self.assertEqual(witness["head_instance_states"], [[1, 1], [1, 1]])
+        self.assertEqual(sorted(witness["instance_matching"]), [0, 1])
+
+    def test_multiline_fragment_preserves_whole_copy_obligations_when_coverage_grows(self):
+        def grow(value):
+            for side in ("base", "head"):
+                for instance, owner in enumerate(value[side]["owners"][:2]):
+                    for region in owner["regions"]:
+                        text = value[side]["source"][region[0] - 1]
+                        if "shared_" in text:
+                            region[4] = int(instance == (0 if "shared_a" in text else 1))
+                            if side == "head" and instance == 0:
+                                region[4] = 1
+                            elif side == "head":
+                                region[4] = int("shared_a" in text)
+        result = self.multiline_copies_compare(mutate=grow, fragments=True)
+        self.assertTrue(result["positive_source_fragments"])
+
+    def test_compiled_hit_state_matching_refuses_excessive_work(self):
+        before = [[0, 0]] * 1024
+        after = [[0, 0]] * 1023 + [[0, 1]]
+        self.assertIsNone(coverage.compiled_hit_state_matching(before, after))
+
+    def test_multiline_fragment_proof_preserves_instances_and_all_candidate_copies(self):
+        def lose_instance(value):
+            value["head"]["owners"][1]["regions"][10][4] = 0
+        def foreign(value):
+            value["head"]["owners"].append({"name": "foreign", "filenames": ["/src/example.rs"],
+                "regions": [[7, 1, 7, 6, 1, 0, 0, 0]]})
+        def foreign_path(value):
+            foreign(value)
+            value["head"]["owners"][-1]["filenames"] = ["/other-root/example.rs"]
+        mutations = {
+            "lost_instance": lose_instance,
+            "zero_candidate": lambda v: v["head"]["counts"].__setitem__(11, 0),
+            "missing_candidate": lambda v: v["head"]["counts"].pop(11),
+            "missing_copy": lambda v: v["head"]["owners"].pop(0),
+            "duplicate_symbol": lambda v: v["head"]["owners"].append(copy.deepcopy(v["head"]["owners"][0])),
+            "different_geometry": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(3, 5),
+            "different_parameter": lambda v: v["head"]["source"].__setitem__(1, "    value: OtherInput,"),
+            "foreign_owner": foreign,
+            "foreign_path_alias": foreign_path,
+            "multifile_owner": lambda v: v["head"]["owners"][0]["filenames"].append("/src/other.rs"),
+            "uninstrumented_duplicate": lambda v: v["head"]["source"].extend(
+                ["mod nested {", "fn retained(value: Input) {}", "}"]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=mutate)
+
+    def test_multiline_fragment_receipts_do_not_depend_on_instance_order_or_frequency(self):
+        expected = self.multiline_copies_compare()
+        def reordered(value):
+            value["head"]["owners"].reverse()
+            for owner in value["head"]["owners"]:
+                for region in owner["regions"]:
+                    region[4] *= 19
+        self.assertEqual(self.multiline_copies_compare(mutate=reordered), expected)
+        self.multiline_copies_compare(copies=1)
+        def same_return(value):
+            value["head"]["source"][2] = ") -> Value {"
+            for owner in value["head"]["owners"][:2]:
+                owner["regions"][2][3] = len(value["head"]["source"][2]) + 1
+        self.multiline_copies_compare(mutate=same_return)
+
+    def test_multiline_fragment_proof_rejects_incomplete_or_unsupported_evidence(self):
+        def extra_copy(value):
+            extra = copy.deepcopy(value["head"]["owners"][0]); extra["name"] = "extra"
+            value["head"]["owners"].append(extra)
+        def global_duplicate(value):
+            extra = copy.deepcopy(value["head"]["owners"][0]); extra["filenames"] = ["/src/excluded.rs"]
+            value["head"]["owners"].append(extra)
+        mutations = {
+            "extra_copy": extra_copy,
+            "global_duplicate": global_duplicate,
+            "missing_region": lambda v: v["head"]["owners"][0]["regions"].pop(10),
+            "exclusive_endpoint": lambda v: v["head"]["owners"][0]["regions"][-1].__setitem__(3, 1),
+            "negative_count": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(4, -1),
+            "boolean_count": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(4, True),
+            "expansion": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(7, 1),
+            "invalid_column": lambda v: v["head"]["owners"][0]["regions"][0].__setitem__(3, 999),
+            "where_clause": lambda v: v["head"]["source"].__setitem__(2, ") -> Value where Value: Copy {"),
+            "function_pointer": lambda v: v["head"]["source"].__setitem__(1, "    value: fn(Input) -> Value,"),
+            "unclosed_literal": lambda v: v["head"]["source"].__setitem__(4, '        call(r##"unclosed);'),
+            "hidden_duplicate_name": lambda v: v["head"]["source"].extend(
+                ["fn /* comment /* nested */ */ r#retained(other: Input) {}"]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=mutate)
+
+    def test_multiline_fragment_proof_compares_complete_instance_vectors(self):
+        def profiles(value, redistributed):
+            for side in ("base", "head"):
+                for instance, owner in enumerate(value[side]["owners"][:2]):
+                    for region in owner["regions"]:
+                        text = value[side]["source"][region[0] - 1]
+                        if "shared_" in text:
+                            region[4] = int(instance == (0 if "shared_a" in text else 1))
+                            if redistributed and side == "head":
+                                region[4] = int(instance == 0)
+        self.multiline_copies_compare(mutate=lambda v: profiles(v, False), fragments=True)
+        with self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+            self.multiline_copies_compare(mutate=lambda v: profiles(v, True), fragments=True)
+
+    def test_multiline_fragment_refuses_foreign_owners_on_unmapped_candidate_lines(self):
+        old = b"fn retained(\n    x: Input,\n) -> Value {\n    shared();\n    second();\n    old();\n    shared();\n    second();\n}\n"
+        new = old.replace(b"-> Value", b"-> Result<Value>").replace(b"    old();", b"    new();")
+        def compare(foreign_side=None, foreign_line=5):
+            def owners(base, head):
+                for side, document in (("base", base), ("head", head)):
+                    document["data"][0]["functions"] = [
+                        {"name": f"{side}_{instance}", "filenames": ["/src/example.rs"],
+                         "regions": [[1, 1, 9, 2, instance, 0, 0, 0]]} for instance in (0, 1)]
+                    if side == foreign_side:
+                        document["data"][0]["functions"].append({
+                            "name": "foreign_partial", "filenames": ["/src/example.rs"],
+                            "regions": [[foreign_line, 5, foreign_line, 14, 1, 0, 0, 0]]})
+            return self.compare(before=[(4, 1), (7, 1)], after=[(4, 1), (7, 1)], mutate=owners,
+                                sources=({"example.rs": old}, {"example.rs": new}))
+        result = compare()
+        witness = result["positive_source_fragments"][0]
+        self.assertEqual(witness["pairs"], [[4, 4]])
+        self.assertEqual(witness["candidates"], [{"base": [[4, 5], [7, 8]], "head": [[4, 5], [7, 8]]}])
+        for side in ("base", "head"):
+            for line in (5, 8):
+                with self.subTest(side=side, line=line), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                    compare(side, line)
+
+    def test_multiline_fragment_proof_cannot_grant_gray_mappings(self):
+        def new_zero(value):
+            value["head"]["source"].extend(["fn missed() {", "    never();", "}"])
+            value["head"]["counts"][18] = 0
+        with self.assertRaisesRegex(ValueError, "New uncovered instrumented line: example.rs:18"):
+            self.multiline_copies_compare(mutate=new_zero)
+        with self.assertRaisesRegex(ValueError, "New uncovered instrumented line: example.rs:6"):
+            self.multiline_copies_compare(mutate=lambda v: v["head"]["counts"].__setitem__(6, 0))
+        with self.assertRaisesRegex(ValueError, r'Retained covered line lost coverage.*example\.rs:14 -> 15; base_count=1 head_count=0'):
+            self.multiline_copies_compare(mutate=lambda v: v["head"]["counts"].__setitem__(15, 0))
+
+    def test_multiline_fragment_proof_requires_the_actual_body_boundary(self):
+        def partial(value):
+            for side, end in (("base", 10), ("head", 11)):
+                for owner in value[side]["owners"][:2]:
+                    owner["regions"] = owner["regions"][:end]
+        with self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+            self.multiline_copies_compare(mutate=partial)
+
+    def test_multiline_fragment_proof_requires_a_parseable_bounded_header(self):
+        parameters = (
+            "value: Input,,", "value: Input Input,", "value: Vec<Input,,>,", "value: Vec<Input],",
+            "value: (Input, Input),", "value: fn(Input) -> Input,", "value: if,",
+            "value:" + " " * 4096 + "Input,",
+        )
+        for parameter in parameters:
+            def malformed(value):
+                for side in ("base", "head"):
+                    source = value[side]["source"]
+                    source[1] = "    " + parameter
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][1][3] = len(source[1].encode()) + 1
+            with self.subTest(parameter=parameter[:80]), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=malformed)
+
+    def test_multiline_parser_accepts_type_syntax_without_resolving_types(self):
+        for parameter in ("value: Vec<>,", "value: &'static Input,", "value: &[Input],",
+                          "value: " + "Vec<" * 33 + "Input" + ">" * 33 + ","):
+            def header(value):
+                for side in ("base", "head"):
+                    value[side]["source"][1] = "    " + parameter
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][1][3] = len(value[side]["source"][1].encode()) + 1
+            with self.subTest(parameter=parameter[:80]):
+                self.multiline_copies_compare(mutate=header)
+
+    def test_multiline_fragment_proof_requires_balanced_body_delimiters(self):
+        for statement in ("call(;", "let x = [;", "call(];"):
+            def malformed(value):
+                for side in ("base", "head"):
+                    source = value[side]["source"]
+                    source[4] = "        " + statement
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][4][3] = len(source[4].encode()) + 1
+            with self.subTest(statement=statement), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=malformed)
+
+    def test_multiline_fragment_proof_requires_parseable_modifiers_and_body(self):
+        cases = [(0, modifier + " fn retained(") for modifier in
+                 ("pub(foo)", "pub(in garbage::)", "async async", "unsafe const pub pub")]
+        cases.append((4, "        let x = ;"))
+        for line, text in cases:
+            def malformed(value):
+                for side in ("base", "head"):
+                    value[side]["source"][line] = text
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][line][3] = len(text.encode()) + 1
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=malformed)
+
+    def test_multiline_fragment_proof_blocks_module_tokens_before_running_a_parser(self):
+        for statement in ("mod external;", '#[path = "/do-not-read.rs"] mod external;',
+                          "consume!(mod external;);", "r#mod();"):
+            def module(value):
+                for side in ("base", "head"):
+                    value[side]["source"][4] = "        " + statement
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][4][3] = len(value[side]["source"][4].encode()) + 1
+            with self.subTest(statement=statement), mock.patch.object(
+                    coverage.subprocess, "run", side_effect=AssertionError("module reached parser")), \
+                    self.assertRaisesRegex(ValueError, "Ambiguous unchanged source"):
+                self.multiline_copies_compare(mutate=module)
+
+    def test_source_comparison_without_fallback_needs_no_rustfmt(self):
+        with mock.patch.object(coverage.subprocess, "run", side_effect=AssertionError("unexpected parser dependency")):
+            self.compare()
+
+    def test_multiline_parser_uses_exact_stdin_and_private_configuration(self):
+        expected = []; parsed = []; temporary = []; real_run = subprocess.run
+        def capture(value):
+            for side in ("base", "head"):
+                source = value[side]["source"]
+                expected.append(("\n".join(source[:source.index("}") + 1]) + "\n").encode())
+        def run(command, **kwargs):
+            work = Path(kwargs["cwd"])
+            self.assertEqual(list(work.iterdir()), [])
+            self.assertNotEqual(work, Path.cwd())
+            self.assertEqual(work.parent.stat().st_mode & 0o777, 0o700)
+            temporary.append(work.parent)
+            if command[0] == "rustup":
+                self.assertEqual(command, ["rustup", "which", "--toolchain", "1.95.0", "rustfmt"])
+            else:
+                self.assertTrue(Path(command[0]).is_absolute())
+                config = Path(command[-1])
+                self.assertEqual(config.parent, work.parent)
+                self.assertEqual(config.read_text(), 'edition = "2024"\n')
+                self.assertEqual(command[1:], ["--edition", "2024", "--emit", "stdout", "--config-path", str(config)])
+                self.assertEqual(kwargs["stdout"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+                self.assertEqual(kwargs["timeout"], 10)
+                parsed.append(kwargs["input"])
+            return real_run(command, **kwargs)
+        with mock.patch.object(coverage.subprocess, "run", side_effect=run):
+            self.multiline_copies_compare(mutate=capture)
+        self.assertEqual(parsed, expected)
+        self.assertTrue(all(not path.exists() for path in temporary))
+
+    def test_multiline_parser_dependency_failures_are_explicit(self):
+        failures = (
+            (FileNotFoundError("rustup"), "requires installed rustfmt 1.95.0"),
+            (subprocess.CalledProcessError(1, ["rustup"]), "requires installed rustfmt 1.95.0"),
+            (subprocess.TimeoutExpired(["rustup"], 10), "lookup timed out"),
+        )
+        for error, message in failures:
+            with self.subTest(error=type(error).__name__), mock.patch.object(
+                    coverage.subprocess, "run", side_effect=error), self.assertRaisesRegex(ValueError, message):
+                self.multiline_copies_compare()
+        for path in ("rustfmt", "/nonexistent-omg-toolchain/rustfmt"):
+            with self.subTest(path=path), mock.patch.object(coverage.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, stdout=path)), \
+                    self.assertRaisesRegex(ValueError, "requires an absolute installed rustfmt 1.95.0 binary"):
+                self.multiline_copies_compare()
+
+    def test_multiline_parser_timeout_cannot_authorize_a_fragment(self):
+        real_run = subprocess.run
+        def run(command, **kwargs):
+            if command[0] == "rustup":
+                return real_run(command, **kwargs)
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        with mock.patch.object(coverage.subprocess, "run", side_effect=run), \
+                self.assertRaisesRegex(ValueError, "syntax check timed out"):
+            self.multiline_copies_compare()
+
+    def test_multiline_parser_refuses_oversized_input_before_tool_execution(self):
+        def oversized(value):
+            for side in ("base", "head"):
+                value[side]["source"][4] = '        consume("' + 'x' * (64 * 1024) + '");'
+                for owner in value[side]["owners"][:2]:
+                    owner["regions"][4][3] = len(value[side]["source"][4].encode()) + 1
+        with mock.patch.object(coverage.subprocess, "run", side_effect=AssertionError("oversized parser input")), \
+                self.assertRaisesRegex(ValueError, "exceeds 64 KiB syntax parser bound"):
+            self.multiline_copies_compare(mutate=oversized)
+
+    def test_multiline_parser_ignores_module_words_in_literals_and_does_not_expand_macros(self):
+        for statement in ('consume("mod external;", r#"mod external;"#); // mod external;',
+                          'include!("/nonexistent-omg-coverage-include.rs");'):
+            def body(value):
+                for side in ("base", "head"):
+                    value[side]["source"][4] = "        " + statement
+                    for owner in value[side]["owners"][:2]:
+                        owner["regions"][4][3] = len(value[side]["source"][4].encode()) + 1
+            with self.subTest(statement=statement):
+                self.multiline_copies_compare(mutate=body)
+
+    def test_multiline_fragment_proof_recognizes_the_real_hashmap_parameter(self):
+        def header(value):
+            for side in ("base", "head"):
+                source = value[side]["source"]
+                source[1] = "    packages: &HashMap<String, LocalDbPackage>,"
+                result = "std::collections::HashSet<String>"
+                source[2] = ") -> " + (result if side == "base" else f"Result<{result}>") + " {"
+                for owner in value[side]["owners"][:2]:
+                    for line in (2, 3):
+                        owner["regions"][line - 1][3] = len(source[line - 1].encode()) + 1
+        result = self.multiline_copies_compare(mutate=header)
+        self.assertEqual(result["positive_source_fragments"][0]["pairs"], [[6, 7], [10, 11]])
+
+    def test_multiline_body_scan_ignores_supported_literals_and_comments(self):
+        def literals(value):
+            for side in ("base", "head"):
+                value[side]["source"][4] = ('        ' + side +
+                    '_call("} {", \'{\', /* { /* nested } */ } */ value); // }')
+        self.multiline_copies_compare(mutate=literals)
+        def raw(value):
+            for side in ("base", "head"):
+                value[side]["source"][4] = '        ' + side + '_call(r###"} { fn retained(fake) {"###);'
+        self.multiline_copies_compare(mutate=raw)
+
     def changed_profile_role_compare(self, after=None, mutate=None, head_source=None, duplicate_declaration=None, partial_base=False):
         old = b"fn checked() {\n  if isolated(old) {\n    return;\n  }\n  first(old);\n  probe();\n  finish();\n  second(old);\n  probe();\n  finish();\n}\nfn other() {\n  if unrelated() {\n    return;\n  }\n}\n"
         new = head_source or b"fn checked() {\n  if isolated(new) {\n    return;\n  }\n  with_env(|| {\n  first(new);\n  probe();\n  finish();\n  second(new);\n  probe();\n  finish();\n  });\n}\nfn other() {\n  if unrelated() {\n    return;\n  }\n}\n"
@@ -837,7 +2622,141 @@ class SourceAwareCoverageTests(unittest.TestCase):
                         "deleted_summary_found": 0, "deleted_summary_hit": 0,
                         "deleted_mapped": 0, "deleted_mapped_hit": 0})
 
-    def wrapper_paint_compare(self, mutate=None):
+    def endpoint_paint_fixture(self):
+        old = ["fn example(items: Items) -> Old {", "    for item in items {",
+               "        value.push(item);", "    }", "}"]
+        new = ["fn example(items: Items) -> New {", "    for item in items {",
+               "        values", "            .push((item, value));", "    }", "}"]
+        def owner(name, regions):
+            return {"name": name, "filenames": ["/src/example.rs"], "regions": regions}
+        base, head = [], []
+        for i, count in enumerate((0, 5)):
+            base.append(owner(f"base{i}", [[1, 1, 1, len(old[0]) + 1, 1, 0, 0, 0],
+                [2, 23, 4, 6, count, 0, 0, 0], [5, 1, 5, 2, 1, 0, 0, 0]]))
+            head.append(owner(f"head{i}", [[1, 1, 1, len(new[0]) + 1, 1, 0, 0, 0],
+                [4, 14, 4, 18, count, 0, 0, 0], [4, 19, 4, 32, count, 0, 0, 0],
+                [6, 1, 6, 2, 1, 0, 0, 0]]))
+        return dict(name="example.rs", old=old, new=new, before={4: 5}, after={},
+                    base=base, head=head, base_files={"/src/example.rs": "example.rs"},
+                    head_files={"/src/example.rs": "example.rs"}, retained={4: 5})
+
+    def test_endpoint_paint_integration_accepts_for_brace(self):
+        value = self.endpoint_paint_fixture()
+        def owners(base, head):
+            base["data"][0]["functions"] = value["base"]
+            head["data"][0]["functions"] = value["head"]
+        sources = tuple({"example.rs": ("\n".join(value[side]) + "\n").encode()}
+                        for side in ("old", "new"))
+        result = self.compare(before=[(1, 1), (2, 1), (3, 5), (4, 5), (5, 1)],
+                              after=[(1, 1), (2, 1), (3, 5), (4, 5), (6, 1)],
+                              mutate=owners, sources=sources)
+        self.assertEqual(result["retained_block_endpoint_paint"][0]["pairs"], [[4, 5]])
+
+    def test_endpoint_paint_accepts_unmapped_retained_for_brace(self):
+        witnesses = coverage.retained_block_endpoint_paint(**self.endpoint_paint_fixture())
+        self.assertEqual([pair for witness in witnesses for pair in witness["pairs"]], [[4, 5]])
+
+    def test_endpoint_paint_refuses_incomplete_or_conflicting_evidence(self):
+        def foreign(value, side, region):
+            value[side].append({"name": "foreign", "filenames": ["/src/example.rs"], "regions": [region]})
+        cases = {
+            "explicit_zero": lambda v: v["after"].update({5: 0}),
+            "missing_copy": lambda v: v["head"].pop(),
+            "duplicate_name": lambda v: v["head"][1].__setitem__("name", "head0"),
+            "brace_touch": lambda v: v["head"][0]["regions"].append([5, 5, 5, 6, 1, 0, 0, 0]),
+            "foreign_brace": lambda v: foreign(v, "base", [4, 5, 4, 6, 1, 0, 0, 0]),
+            "foreign_witness": lambda v: foreign(v, "head", [4, 14, 4, 18, 1, 0, 0, 0]),
+            "zero_terminal": lambda v: v["head"][1]["regions"][1].__setitem__(4, 0),
+            "zero_argument": lambda v: v["head"][1]["regions"][2].__setitem__(4, 0),
+            "state_change": lambda v: [r.__setitem__(4, 0) for r in v["head"][1]["regions"][1:3]],
+            "changed_header": lambda v: v["new"].__setitem__(1, "    for item in other {"),
+            "endpoint_start": lambda v: [o["regions"][1].__setitem__(1, 22) for o in v["base"]],
+            "endpoint_end": lambda v: [o["regions"][1].__setitem__(3, 5) for o in v["base"]],
+            "tail_return": lambda v: v["new"].__setitem__(2, "        return values"),
+            "tail_macro": lambda v: v["new"].__setitem__(2, "        values!"),
+            "tail_closure": lambda v: v["new"].__setitem__(2, "        |x| values"),
+            "nested_call": lambda v: v["new"].__setitem__(3, "            .push(foo(item));"),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                value = self.endpoint_paint_fixture()
+                mutate(value)
+                self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_paint_rejects_repeated_matching_loop_header(self):
+        value = self.endpoint_paint_fixture()
+        value["new"][5:5] = [value["new"][1], "    }"]
+        for owner in value["head"]:
+            owner["regions"][-1][0] = owner["regions"][-1][2] = 8
+        self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_paint_refuses_iterator_expression_block(self):
+        value = self.endpoint_paint_fixture()
+        for side, owners in (("old", "base"), ("new", "head")):
+            value[side][1] = "    for item in {"
+            value[side][-1:-1] = ["    {", "        break;", "    }"]
+            for owner in value[owners]:
+                owner["regions"][-1][0] = owner["regions"][-1][2] = len(value[side])
+        for owner in value["base"]:
+            owner["regions"][1][1] = len(value["old"][1])
+        self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_paint_refuses_argument_calls_with_exact_geometry(self):
+        for argument in ("foo(item)", "(foo)(item)", "(foo.0)(item)",
+                         "((foo))(item)", "foo.0(item)"):
+            with self.subTest(argument=argument):
+                value = self.endpoint_paint_fixture()
+                row = value["new"][3] = f"            .push({argument});"
+                match = re.fullmatch(r"\s*\.push\((.+)\);", row)
+                for owner in value["head"]:
+                    owner["regions"][2][1] = match.start(1) + 1
+                    owner["regions"][2][3] = match.end(1) + 1
+                self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_argument_shape_accepts_only_data_expressions(self):
+        for expression in ("item", "item.field", "&item", "&&item", "(item, &value.field)",
+                           "(item, (first, second))", "first, second", " (item, &value.field) "):
+            with self.subTest(expression=expression):
+                self.assertTrue(coverage._data_argument_shape(expression))
+        for expression in ("foo(item)", "(foo)(item)", "foo.0(item)", "(foo.0)(item)",
+                           "((foo))(item)", "first & second", "value as Kind", "0", "[item]",
+                           "item + other", "" , "&" * 4097 + "item"):
+            with self.subTest(expression=expression):
+                self.assertFalse(coverage._data_argument_shape(expression))
+
+    def test_endpoint_paint_does_not_hide_other_coverage_losses(self):
+        value = self.endpoint_paint_fixture()
+        def owners(base, head):
+            base["data"][0]["functions"] = value["base"]
+            head["data"][0]["functions"] = value["head"]
+        sources = tuple({"example.rs": ("\n".join(value[side]) + "\n").encode()}
+                        for side in ("old", "new"))
+        before = [(1, 1), (2, 1), (3, 5), (4, 5), (5, 1)]
+        for after in ([(1, 1), (2, 1), (3, 5), (4, 5), (5, 0), (6, 1)],
+                      [(1, 1), (2, 1), (3, 0), (4, 5), (6, 1)],
+                      [(1, 1), (2, 0), (3, 5), (4, 5), (6, 1)]):
+            with self.subTest(after=after), self.assertRaises(ValueError):
+                self.compare(before=before, after=after, mutate=owners, sources=sources)
+
+    def test_endpoint_paint_does_not_mistake_comment_semicolon_for_statement_end(self):
+        value = self.endpoint_paint_fixture()
+        value["new"].insert(2, "        return //;")
+        for owner in value["head"]:
+            for region in owner["regions"][1:]:
+                region[0] += 1
+                region[2] += 1
+        value["retained"] = {4: 6}
+        self.assertEqual(coverage.retained_block_endpoint_paint(**value), [])
+
+    def test_endpoint_paint_requires_valid_full_function_syntax(self):
+        value = self.endpoint_paint_fixture()
+        value["new"].insert(5, "    let = ;")
+        for owner in value["head"]:
+            owner["regions"][-1][0] = owner["regions"][-1][2] = 7
+        with self.assertRaisesRegex(ValueError, "rustfmt.*did not validate"):
+            coverage.retained_block_endpoint_paint(**value)
+
+    def wrapper_paint_compare(self, mutate=None, addition=False):
         body = ["    work();", "    check()?;", "    (", "        value", "    )", "}"]
         untouched = ["fn unrelated() {", "    unavailable();", "}"]
         old = ["#[tokio::test]", "#[serial_test::serial]", "async fn checked() {", "    old_setup();", *body, *untouched]
@@ -873,9 +2792,17 @@ class SourceAwareCoverageTests(unittest.TestCase):
         def owners(base, head):
             base["data"][0]["functions"], head["data"][0]["functions"] = value["base"], value["head"]
 
-        return self.compare(before=sorted(before.items()), after=sorted(after.items()), mutate=owners,
-            sources=({"example.rs": ("\n".join(old) + "\n").encode()},
-                     {"example.rs": ("\n".join(new) + "\n").encode()}))
+        sources = ({"example.rs": ("\n".join(old) + "\n").encode()},
+                   {"example.rs": ("\n".join(new) + "\n").encode()})
+        if addition:
+            def with_addition(br, hr, old_sources, new_sources, lcov):
+                extra = hr["data"][0]["functions"][-1]
+                owners(br, hr)
+                hr["data"][0]["functions"].append(extra)
+                return br, hr, old_sources, new_sources, lcov
+            return self.compare_additions(before=sorted(before.items()), after=sorted(after.items()),
+                                          old=sources[0], new=sources[1], mutate=with_addition)
+        return self.compare(before=sorted(before.items()), after=sorted(after.items()), mutate=owners, sources=sources)
 
     def test_identical_precise_regions_resolve_only_retained_async_wrapper_paint(self):
         self.assertEqual(self.wrapper_paint_compare(), {
@@ -884,6 +2811,16 @@ class SourceAwareCoverageTests(unittest.TestCase):
             "retained_wrapper_paint": [{"file": "example.rs", "base_range": [5, 9], "head_range": [6, 10],
                                         "precise_counter_equivalence": "covered/uncovered",
                                         "precise_group_sizes": [4], "pairs": [[6, 7], [8, 9]]}]})
+
+    def test_wrapper_proof_and_failure_with_added_file(self):
+        expected = self.wrapper_paint_compare()
+        expected["added_files"] = [{"file": "new.rs", "summary_found": 1, "summary_hit": 1,
+                                    "mapped": 1, "mapped_hit": 1}]
+        self.assertEqual(self.wrapper_paint_compare(addition=True), expected)
+        def lose_precise(value):
+            value["head"][1]["regions"][1][4] = 0
+        with self.assertRaises(ValueError):
+            self.wrapper_paint_compare(mutate=lose_precise, addition=True)
 
     def serial_wrapper_compare(self, mutate=None):
         old = ['#[tokio::test]', 'async fn checked() {', '    let callback = || {',
@@ -1191,6 +3128,1077 @@ class SourceAwareCoverageTests(unittest.TestCase):
     def test_source_aware_mapping_regression_refused_when_summary_holds(self):
         with self.assertRaisesRegex(ValueError, "Mapped line coverage decreased|retained or ambiguous"):
             self.raw_ratio_retained_owner_compare((6, 4), (1, 1, 0, 0))
+
+
+class BooleanArgumentPaintTests(unittest.TestCase):
+    # Exact complete source items and LLVM rows from the frozen f2413f80/b22afa9b
+    # pair, translated together into a compact module retaining its cfg and glob.
+    base_source = '#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn transaction(\n        transaction_type: crate::core::history::TransactionType,\n        source: &str,\n        old_version: Option<&str>,\n        success: bool,\n    ) -> crate::core::history::Transaction {\n        crate::core::history::Transaction {\n            id: "test".to_string(),\n            timestamp: jiff::Timestamp::now(),\n            transaction_type,\n            changes: vec![crate::core::history::PackageChange {\n                name: "example".to_string(),\n                old_version: old_version.map(str::to_string),\n                new_version: Some("2.0-1".to_string()),\n                source: source.to_string(),\n            }],\n            success,\n        }\n    }\n\n    #[test]\n    fn rollback_plan_reverses_installs_and_restores_official_updates() -> Result<()> {\n        assert_eq!(\n            rollback_action(&transaction(\n                crate::core::history::TransactionType::Install,\n                "aur",\n                None,\n                true,\n            ))?,\n            RollbackAction::Remove(vec!["example".to_string()])\n        );\n        assert_eq!(\n            rollback_action(&transaction(\n                crate::core::history::TransactionType::Update,\n                "core",\n                Some("1.0-1"),\n                true,\n            ))?,\n            RollbackAction::Restore {\n                official: vec![("example".to_string(), "1.0-1".to_string())],\n                rebuild_from_aur: vec![],\n            }\n        );\n        Ok(())\n    }\n}\n'
+    base_owners = [{'branches': [],
+      'count': 6,
+      'filenames': ['/src/example.rs'],
+      'mcdc_records': [],
+      'name': '_RNvNtNtNtCs40j12eeWnis_7omg_lib3cli8commands5tests11transaction',
+      'regions': [[5, 5, 10, 43, 6, 0, 0, 0],
+                  [11, 9, 22, 10, 6, 0, 0, 0],
+                  [12, 17, 12, 23, 6, 0, 0, 0],
+                  [12, 24, 12, 33, 6, 0, 0, 0],
+                  [13, 24, 13, 44, 6, 0, 0, 0],
+                  [14, 13, 14, 29, 6, 0, 0, 0],
+                  [15, 22, 15, 26, 6, 0, 0, 0],
+                  [16, 23, 16, 32, 6, 0, 0, 0],
+                  [16, 33, 16, 42, 6, 0, 0, 0],
+                  [17, 30, 17, 41, 6, 0, 0, 0],
+                  [17, 42, 17, 45, 6, 0, 0, 0],
+                  [18, 30, 18, 55, 6, 0, 0, 0],
+                  [23, 5, 23, 6, 6, 0, 0, 0]]},
+     {'branches': [],
+      'count': 1,
+      'filenames': ['/src/example.rs'],
+      'mcdc_records': [],
+      'name': '_RNvNtNtNtCs40j12eeWnis_7omg_lib3cli8commands5testss_61rollback_plan_reverses_installs_and_restores_official_updates',
+      'regions': [[26, 5, 26, 85, 1, 0, 0, 0],
+                  [27, 9, 27, 19, 1, 0, 0, 0],
+                  [28, 13, 28, 28, 1, 0, 0, 0],
+                  [28, 29, 33, 14, 1, 0, 0, 0],
+                  [28, 30, 28, 41, 1, 0, 0, 0],
+                  [29, 17, 29, 63, 1, 0, 0, 0],
+                  [33, 15, 33, 16, 0, 0, 0, 0],
+                  [34, 13, 34, 64, 1, 0, 0, 0],
+                  [34, 36, 34, 40, 1, 0, 0, 0],
+                  [36, 9, 36, 19, 1, 0, 0, 0],
+                  [37, 13, 37, 28, 1, 0, 0, 0],
+                  [37, 29, 42, 14, 1, 0, 0, 0],
+                  [37, 30, 37, 41, 1, 0, 0, 0],
+                  [38, 17, 38, 62, 1, 0, 0, 0],
+                  [42, 15, 42, 16, 0, 0, 0, 0],
+                  [43, 13, 46, 14, 1, 0, 0, 0],
+                  [44, 27, 44, 31, 1, 0, 0, 0],
+                  [44, 33, 44, 42, 1, 0, 0, 0],
+                  [44, 43, 44, 52, 1, 0, 0, 0],
+                  [48, 9, 48, 15, 1, 0, 0, 0],
+                  [49, 5, 49, 6, 1, 0, 0, 0]]}]
+    base_segments = [[5, 5, 6, True, True, False],
+     [10, 43, 0, False, False, False],
+     [11, 9, 6, True, True, False],
+     [12, 17, 6, True, True, False],
+     [12, 23, 6, True, False, False],
+     [12, 24, 6, True, True, False],
+     [12, 33, 6, True, False, False],
+     [13, 24, 6, True, True, False],
+     [13, 44, 6, True, False, False],
+     [14, 13, 6, True, True, False],
+     [14, 29, 6, True, False, False],
+     [15, 22, 6, True, True, False],
+     [15, 26, 6, True, False, False],
+     [16, 23, 6, True, True, False],
+     [16, 32, 6, True, False, False],
+     [16, 33, 6, True, True, False],
+     [16, 42, 6, True, False, False],
+     [17, 30, 6, True, True, False],
+     [17, 41, 6, True, False, False],
+     [17, 42, 6, True, True, False],
+     [17, 45, 6, True, False, False],
+     [18, 30, 6, True, True, False],
+     [18, 55, 6, True, False, False],
+     [22, 10, 0, False, False, False],
+     [23, 5, 6, True, True, False],
+     [23, 6, 0, False, False, False],
+     [26, 5, 1, True, True, False],
+     [26, 85, 0, False, False, False],
+     [27, 9, 1, True, True, False],
+     [27, 19, 0, False, False, False],
+     [28, 13, 1, True, True, False],
+     [28, 28, 0, False, False, False],
+     [28, 29, 1, True, True, False],
+     [28, 30, 1, True, True, False],
+     [28, 41, 1, True, False, False],
+     [29, 17, 1, True, True, False],
+     [29, 63, 1, True, False, False],
+     [33, 14, 0, False, False, False],
+     [33, 15, 0, True, True, False],
+     [33, 16, 0, False, False, False],
+     [34, 13, 1, True, True, False],
+     [34, 36, 1, True, True, False],
+     [34, 40, 1, True, False, False],
+     [34, 64, 0, False, False, False],
+     [36, 9, 1, True, True, False],
+     [36, 19, 0, False, False, False],
+     [37, 13, 1, True, True, False],
+     [37, 28, 0, False, False, False],
+     [37, 29, 1, True, True, False],
+     [37, 30, 1, True, True, False],
+     [37, 41, 1, True, False, False],
+     [38, 17, 1, True, True, False],
+     [38, 62, 1, True, False, False],
+     [42, 14, 0, False, False, False],
+     [42, 15, 0, True, True, False],
+     [42, 16, 0, False, False, False],
+     [43, 13, 1, True, True, False],
+     [44, 27, 1, True, True, False],
+     [44, 31, 1, True, False, False],
+     [44, 33, 1, True, True, False],
+     [44, 42, 1, True, False, False],
+     [44, 43, 1, True, True, False],
+     [44, 52, 1, True, False, False],
+     [46, 14, 0, False, False, False],
+     [48, 9, 1, True, True, False],
+     [48, 15, 0, False, False, False],
+     [49, 5, 1, True, True, False],
+     [49, 6, 0, False, False, False]]
+    head_source = '#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn transaction(\n        transaction_type: crate::core::history::TransactionType,\n        source: &str,\n        old_version: Option<&str>,\n        success: bool,\n    ) -> crate::core::history::Transaction {\n        crate::core::history::Transaction {\n            id: "test".to_string(),\n            timestamp: jiff::Timestamp::now(),\n            transaction_type,\n            changes: vec![crate::core::history::PackageChange {\n                name: "example".to_string(),\n                old_version: old_version.map(str::to_string),\n                new_version: Some("2.0-1".to_string()),\n                source: source.to_string(),\n            }],\n            success,\n        }\n    }\n\n    #[test]\n    fn install_rollback_refuses_unproven_package_removal() {\n        for source in ["pacman", "local", "aur"] {\n            let mut recorded = transaction(\n                crate::core::history::TransactionType::Install,\n                source,\n                None,\n                true,\n            );\n            for version in [None, Some("1-1".to_owned())] {\n                recorded.changes[0].new_version = version;\n                let error = rollback_action(&recorded)\n                    .expect_err("install history does not prove this package was newly installed");\n                assert!(error.to_string().contains("newly installed"), "{error:#}");\n            }\n        }\n    }\n}\n'
+    head_owners = [{'branches': [],
+      'count': 8,
+      'filenames': ['/src/example.rs'],
+      'mcdc_records': [],
+      'name': '_RNvNtNtNtCskPrOzUXTdLt_7omg_lib3cli8commands5tests11transaction',
+      'regions': [[5, 5, 10, 43, 8, 0, 0, 0],
+                  [11, 9, 22, 10, 8, 0, 0, 0],
+                  [12, 17, 12, 23, 8, 0, 0, 0],
+                  [12, 24, 12, 33, 8, 0, 0, 0],
+                  [13, 24, 13, 44, 8, 0, 0, 0],
+                  [14, 13, 14, 29, 8, 0, 0, 0],
+                  [15, 22, 15, 26, 8, 0, 0, 0],
+                  [16, 23, 16, 32, 8, 0, 0, 0],
+                  [16, 33, 16, 42, 8, 0, 0, 0],
+                  [17, 30, 17, 41, 8, 0, 0, 0],
+                  [17, 42, 17, 45, 8, 0, 0, 0],
+                  [18, 30, 18, 55, 8, 0, 0, 0],
+                  [23, 5, 23, 6, 8, 0, 0, 0]]},
+     {'branches': [],
+      'count': 1,
+      'filenames': ['/src/example.rs'],
+      'mcdc_records': [],
+      'name': '_RNvNtNtNtCskPrOzUXTdLt_7omg_lib3cli8commands5testss_49install_rollback_refuses_unproven_package_removal',
+      'regions': [[26, 5, 26, 59, 1, 0, 0, 0],
+                  [27, 13, 27, 19, 3, 0, 0, 0],
+                  [27, 23, 27, 49, 1, 0, 0, 0],
+                  [28, 17, 28, 29, 3, 0, 0, 0],
+                  [28, 32, 28, 43, 3, 0, 0, 0],
+                  [29, 17, 29, 63, 3, 0, 0, 0],
+                  [30, 17, 30, 23, 3, 0, 0, 0],
+                  [31, 17, 31, 21, 3, 0, 0, 0],
+                  [34, 17, 34, 24, 6, 0, 0, 0],
+                  [34, 28, 34, 58, 3, 0, 0, 0],
+                  [34, 29, 34, 33, 3, 0, 0, 0],
+                  [35, 17, 35, 48, 6, 0, 0, 0],
+                  [35, 51, 35, 58, 6, 0, 0, 0],
+                  [36, 21, 36, 26, 6, 0, 0, 0],
+                  [36, 29, 36, 44, 6, 0, 0, 0],
+                  [36, 45, 36, 54, 6, 0, 0, 0],
+                  [37, 22, 37, 32, 6, 0, 0, 0],
+                  [37, 33, 37, 98, 6, 0, 0, 0],
+                  [38, 17, 38, 24, 6, 0, 0, 0],
+                  [38, 25, 38, 70, 6, 0, 0, 0],
+                  [41, 5, 41, 6, 1, 0, 0, 0]]}]
+    head_segments = [[5, 5, 8, True, True, False],
+     [10, 43, 0, False, False, False],
+     [11, 9, 8, True, True, False],
+     [12, 17, 8, True, True, False],
+     [12, 23, 8, True, False, False],
+     [12, 24, 8, True, True, False],
+     [12, 33, 8, True, False, False],
+     [13, 24, 8, True, True, False],
+     [13, 44, 8, True, False, False],
+     [14, 13, 8, True, True, False],
+     [14, 29, 8, True, False, False],
+     [15, 22, 8, True, True, False],
+     [15, 26, 8, True, False, False],
+     [16, 23, 8, True, True, False],
+     [16, 32, 8, True, False, False],
+     [16, 33, 8, True, True, False],
+     [16, 42, 8, True, False, False],
+     [17, 30, 8, True, True, False],
+     [17, 41, 8, True, False, False],
+     [17, 42, 8, True, True, False],
+     [17, 45, 8, True, False, False],
+     [18, 30, 8, True, True, False],
+     [18, 55, 8, True, False, False],
+     [22, 10, 0, False, False, False],
+     [23, 5, 8, True, True, False],
+     [23, 6, 0, False, False, False],
+     [26, 5, 1, True, True, False],
+     [26, 59, 0, False, False, False],
+     [27, 13, 3, True, True, False],
+     [27, 19, 0, False, False, False],
+     [27, 23, 1, True, True, False],
+     [27, 49, 0, False, False, False],
+     [28, 17, 3, True, True, False],
+     [28, 29, 0, False, False, False],
+     [28, 32, 3, True, True, False],
+     [28, 43, 0, False, False, False],
+     [29, 17, 3, True, True, False],
+     [29, 63, 0, False, False, False],
+     [30, 17, 3, True, True, False],
+     [30, 23, 0, False, False, False],
+     [31, 17, 3, True, True, False],
+     [31, 21, 0, False, False, False],
+     [34, 17, 6, True, True, False],
+     [34, 24, 0, False, False, False],
+     [34, 28, 3, True, True, False],
+     [34, 29, 3, True, True, False],
+     [34, 33, 3, True, False, False],
+     [34, 58, 0, False, False, False],
+     [35, 17, 6, True, True, False],
+     [35, 48, 0, False, False, False],
+     [35, 51, 6, True, True, False],
+     [35, 58, 0, False, False, False],
+     [36, 21, 6, True, True, False],
+     [36, 26, 0, False, False, False],
+     [36, 29, 6, True, True, False],
+     [36, 44, 0, False, False, False],
+     [36, 45, 6, True, True, False],
+     [36, 54, 0, False, False, False],
+     [37, 22, 6, True, True, False],
+     [37, 32, 0, False, False, False],
+     [37, 33, 6, True, True, False],
+     [37, 98, 0, False, False, False],
+     [38, 17, 6, True, True, False],
+     [38, 24, 0, False, False, False],
+     [38, 25, 6, True, True, False],
+     [38, 70, 0, False, False, False],
+     [41, 5, 1, True, True, False],
+     [41, 6, 0, False, False, False]]
+
+    def fixture(self):
+        return dict(name='example.rs', old=self.base_source.splitlines(),
+                    new=self.head_source.splitlines(), before={32: 1}, after={},
+                    base=copy.deepcopy(self.base_owners), head=copy.deepcopy(self.head_owners),
+                    base_files={'/src/example.rs': 'example.rs'},
+                    head_files={'/src/example.rs': 'example.rs'}, retained={32: 32},
+                    base_segments=copy.deepcopy(self.base_segments),
+                    head_segments=copy.deepcopy(self.head_segments))
+
+    def proof(self, value=None, **options):
+        return coverage.retained_boolean_argument_paint(**(value or self.fixture()), **options)
+
+    def compare(self, mutate=None):
+        value = self.fixture()
+        value['old'] = value['new'].copy()
+        value['base'] = copy.deepcopy(value['head'])
+        value['base_segments'] = copy.deepcopy(value['head_segments'])
+        value['base'][-1]['regions'].append([32, 17, 32, 21, 3, 0, 0, 0])
+        value['base_segments'].extend([[32, 17, 3, True, True, False],
+                                      [32, 21, 0, False, False, False]])
+        value['base_segments'].sort()
+        value['before'] = {row[0]: row[4] for owner in value['base'] for row in owner['regions']}
+        value['after'] = {row[0]: row[4] for owner in value['head'] for row in owner['regions']}
+        if mutate:
+            mutate(value)
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            reports = []
+            for side, rows, segments, owners in (
+                    ('base', value['before'], value['base_segments'], value['base']),
+                    ('head', value['after'], value['head_segments'], value['head'])):
+                found, hit = value.get(side + '_summary', (len(rows), sum(count > 0 for count in rows.values())))
+                path = Path(directory) / (side + '.info')
+                path.write_text('SF:/src/example.rs\n' + ''.join(
+                    f'DA:{line},{count}\n' for line, count in sorted(rows.items())) +
+                    f'LF:{found}\nLH:{hit}\nend_of_record\n')
+                reports.append(coverage.read_coverage(path))
+                data = {'type': 'llvm.coverage.json.export', 'version': '3.1.0', 'data': [{
+                    'files': [{'filename': '/src/example.rs', 'segments': segments, 'expansions': [],
+                               'summary': {'lines': {'count': found, 'covered': hit}}}],
+                    'functions': owners}]}
+                region_path = Path(directory) / (side + '.gz')
+                region_path.write_bytes(gzip.compress(json.dumps(data).encode()))
+                paths.append(region_path)
+            return coverage.require_source_no_regression(
+                *reports, *paths, {'example.rs': value.get('old_raw', '\n'.join(value['old']).encode())},
+                {'example.rs': value.get('new_raw', '\n'.join(value['new']).encode())})
+
+    def test_boolean_paint_integration_proves_only_existing_pair_without_credit(self):
+        try:
+            receipt = self.compare()
+        except ValueError as error:
+            self.fail(f'proven eager boolean remains refused: {error}')
+        self.assertEqual(receipt['retained_boolean_argument_paint'][0]['pairs'], [[32, 32]])
+        for key in ('deleted_summary_found', 'deleted_summary_hit', 'deleted_mapped', 'deleted_mapped_hit'):
+            self.assertEqual(receipt[key], 0)
+
+    def test_boolean_actual_source_owner_fixture_records_both_base_occurrences(self):
+        receipts = self.proof()
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertEqual(receipt['pairs'], [[32, 32]])
+        self.assertEqual((receipt['argument_ordinal'], receipt['arity']), (4, 4))
+        self.assertEqual([entry['eligible'] for entry in receipt['base_occurrences']], [True, False])
+        self.assertIn('non-leaf', receipt['base_occurrences'][1]['reason'])
+        self.assertEqual(receipt['module_path'], ['tests'])
+        self.assertEqual(receipt['test_gates'], ['tests'])
+        self.assertEqual(receipt['head_call_region'], [28, 32, 28, 43, 3, 0, 0, 0])
+        self.assertEqual(receipt['head_continuation_region'], [34, 28, 34, 58, 3, 0, 0, 0])
+        self.assertFalse(any('credit' in key or 'deleted' in key for key in receipt))
+
+    def eager_peer_fixture(self):
+        value = self.fixture()
+        value['before'].update({29: 1, 31: 1})
+        value['after'].update({29: 3, 31: 3})
+        return value
+
+    def test_eager_boolean_witness_only_exposes_already_positive_same_ordinal_peers(self):
+        receipt = self.proof(self.eager_peer_fixture(), eager_peers=True)[0]
+        self.assertEqual(receipt['pairs'], [[32, 32]])
+        peers = receipt['eager_argument_peers']
+        self.assertEqual([peer['pairs'] for peer in peers], [[[29, 29]], [[31, 31]]])
+        self.assertEqual([peer['argument_ordinal'] for peer in peers], [1, 3])
+        self.assertTrue(all(region[4] > 0 for peer in peers
+                            for key in ('base_observation', 'head_observation')
+                            for region in peer[key]['regions']))
+
+    def test_eager_peers_refuse_cold_copies_and_zero_subregions_under_hot_ancestors(self):
+        value = self.eager_peer_fixture()
+        extra = copy.deepcopy(value['head'][-1]); extra['name'] += '_cold'
+        for region in extra['regions']:
+            region[4] = 0
+        value['head'].append(extra)
+        self.assertEqual(self.proof(value, eager_peers=True), [])
+        value = self.eager_peer_fixture()
+        value['head'][-1]['regions'].append([29, 17, 29, 63, 0, 0, 0, 0])
+        receipt = self.proof(value, eager_peers=True)[0]
+        self.assertEqual([peer['pairs'] for peer in receipt['eager_argument_peers']], [[[31, 31]]])
+        value = self.eager_peer_fixture(); value['after'][29] = 0
+        receipt = self.proof(value, eager_peers=True)[0]
+        self.assertNotIn([[29, 29]], [peer['pairs'] for peer in receipt['eager_argument_peers']])
+
+    def test_eager_peers_do_not_follow_a_leaf_to_another_argument_ordinal(self):
+        value = self.eager_peer_fixture()
+        value['new'][29] = '                None,'
+        value['new'][30] = '                source,'
+        value['after'][30] = 3
+        for row in value['head'][-1]['regions']:
+            if row[:3] == [30, 17, 30]:
+                row[3] = 21
+            elif row[:3] == [31, 17, 31]:
+                row[3] = 23
+        for row in value['head_segments']:
+            if row[:2] == [30, 23]:
+                row[1] = 21
+            elif row[:2] == [31, 21]:
+                row[1] = 23
+        receipt = self.proof(value, eager_peers=True)[0]
+        self.assertEqual([peer['pairs'] for peer in receipt['eager_argument_peers']], [[[29, 29]]])
+
+    def test_eager_peers_do_not_borrow_none_from_an_unrelated_hot_call(self):
+        value = self.eager_peer_fixture()
+        value['new'][30] = '                other,'
+        for row in value['head'][-1]['regions']:
+            if row[:3] == [31, 17, 31]:
+                row[3] = 22
+            for index in (0, 2):
+                if row[index] >= 41:
+                    row[index] += 1
+        for row in value['head_segments']:
+            if row[:2] == [31, 21]:
+                row[1] = 22
+            if row[0] >= 41:
+                row[0] += 1
+        value['new'].insert(40, '        unrelated(None);')
+        value['head'][-1]['regions'].append([41, 9, 41, 25, 1, 0, 0, 0])
+        value['head_segments'].extend([[41, 9, 1, True, True, False], [41, 25, 0, False, False, False]])
+        value['head_segments'].sort(); value['after'][41] = 1
+        receipt = self.proof(value, eager_peers=True)[0]
+        self.assertEqual([peer['pairs'] for peer in receipt['eager_argument_peers']], [[[29, 29]]])
+
+    def test_boolean_explicit_zero_or_any_head_line_mapping_is_refused(self):
+        for mode in ('da', 'positive_region', 'zero_region', 'positive_segment', 'zero_segment', 'gap_segment'):
+            value = self.fixture()
+            if mode == 'da':
+                value['after'][32] = 0
+            elif mode.endswith('region'):
+                value['head'][-1]['regions'].append([32, 17, 32, 21, int(mode == 'positive_region'), 0, 0, 0])
+            else:
+                value['head_segments'].extend([[32, 17, int(mode == 'positive_segment'), True, True,
+                                                mode == 'gap_segment'], [32, 21, 0, False, False, False]])
+                value['head_segments'].sort()
+            with self.subTest(mode=mode):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_exact_witnesses_are_required_and_counts_must_agree(self):
+        for line in (28, 34):
+            for mode in ('missing', 'zero', 'unequal', 'short_endpoint', 'foreign'):
+                value = self.fixture()
+                rows = value['head'][-1]['regions']
+                row = next(row for row in rows if row[:4] == ([28, 32, 28, 43] if line == 28 else [34, 28, 34, 58]))
+                if mode == 'missing':
+                    rows.remove(row)
+                elif mode == 'zero':
+                    row[4] = 0
+                elif mode == 'unequal':
+                    row[4] += 1
+                elif mode == 'short_endpoint':
+                    row[3] -= 1
+                else:
+                    value['head'].append(dict(name='foreign', filenames=['/src/example.rs'], regions=[row.copy()]))
+                with self.subTest(line=line, mode=mode):
+                    self.assertEqual(self.proof(value), [])
+
+    def test_boolean_complete_singleton_inventory_includes_unhit_owners(self):
+        for side in ('base', 'head'):
+            for index in (0, 1):
+                for duplicate_name in (True, False):
+                    value = self.fixture()
+                    extra = copy.deepcopy(value[side][index])
+                    if not duplicate_name:
+                        extra['name'] += '_other_copy'
+                    extra['count'] = 0
+                    for row in extra['regions']:
+                        row[4] = 0
+                    value[side].append(extra)
+                    with self.subTest(side=side, index=index, duplicate_name=duplicate_name):
+                        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_unsafe_arguments_and_lazy_or_bypass_shapes_are_refused(self):
+        for original, replacement in (
+                ('let mut recorded = transaction(', 'let mut recorded = || transaction('),
+                ('let mut recorded = transaction(', 'let mut recorded = async { transaction('),
+                ('let mut recorded = transaction(', 'let mut recorded = object.transaction('),
+                ('let mut recorded = transaction(', 'let mut recorded = transaction!('),
+                ('let mut recorded = transaction(', 'if false { let mut recorded = transaction('),
+                ('                source,', '                source(),'),
+                ('                source,', '                source[0],'),
+                ('                source,', '                source.field,'),
+                ('                source,', '                source?, '),
+                ('                true,', '                true && false,'),
+                ('                true,', '                false,'),
+                ('                true,', '                true, other(),'),
+                ('            for version in', '            if false {} for version in'),
+                ('            for version in', '        } for version in'),
+                ('            for version in', '            let lazy = || for version in')):
+            value = self.fixture()
+            value['new'] = '\n'.join(value['new']).replace(original, replacement).splitlines()
+            with self.subTest(replacement=replacement):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_binding_and_configuration_ambiguity_are_refused(self):
+        for original, replacement in (
+                ('use super::*;', 'use other::transaction;'),
+                ('#[cfg(test)]', '#[cfg(feature = "other")]'),
+                ('    fn transaction(', '    #[cfg(test)] fn transaction('),
+                ('    fn transaction(', '    async fn transaction('),
+                ('    fn transaction(', '    fn another_helper('),
+                ('    #[test]', '    #[unknown_generator]'),
+                ('fn install_rollback_refuses_unproven_package_removal()',
+                 'fn install_rollback_refuses_unproven_package_removal(transaction: fn())'),
+                ('let mut recorded = transaction(', 'let transaction = transaction('),
+                ('            for version in', '            let transaction = alias; for version in'),
+                ('            for version in', '            use other::transaction; for version in'),
+                ('            for version in', '            create_binding!(); for version in'),
+                ('use super::*;', 'use super::*; create_binding!();')):
+            value = self.fixture()
+            value['new'] = '\n'.join(value['new']).replace(original, replacement).splitlines()
+            with self.subTest(replacement=replacement):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_second_safe_occurrence_is_ambiguous_independent_of_values(self):
+        value = self.fixture()
+        value['old'] = '\n'.join(value['old']).replace('Some("1.0-1"),', 'None         ,').splitlines()
+        for row in value['base'][-1]['regions']:
+            if row[0] >= 36:
+                row[4] = 0
+        # Matching byte widths and a second unhit call isolate occurrence uniqueness.
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_caller_rename_and_different_positive_frequency_are_supported(self):
+        value = self.fixture()
+        original = 'install_rollback_refuses_unproven_package_removal'
+        value['new'] = '\n'.join(value['new']).replace(original, 'x' * len(original)).splitlines()
+        for row in value['head'][-1]['regions']:
+            if row[4] == 3:
+                row[4] = 4
+        for row in value['head_segments']:
+            if row[2] == 3:
+                row[2] = 4
+        self.assertEqual(self.proof(value)[0]['pairs'], [[32, 32]])
+
+    def test_boolean_unhit_header_only_copy_is_not_omitted_from_inventory(self):
+        value = self.fixture()
+        row = value['head'][-1]['regions'][0].copy()
+        row[4] = 0
+        value['head'].append(dict(name='unhit_sparse_copy', filenames=['/src/example.rs'], regions=[row]))
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_segment_counts_must_support_each_exact_witness(self):
+        for line, column in ((28, 32), (34, 28)):
+            for mode in ('missing', 'count', 'entry', 'gap'):
+                value = self.fixture()
+                row = next(row for row in value['head_segments'] if row[:2] == [line, column])
+                if mode == 'missing':
+                    value['head_segments'].remove(row)
+                elif mode == 'count':
+                    row[2] = 0
+                elif mode == 'entry':
+                    row[4] = False
+                else:
+                    row[5] = True
+                with self.subTest(line=line, mode=mode):
+                    self.assertEqual(self.proof(value), [])
+
+    def test_boolean_same_owner_overlaps_must_agree_with_the_exact_witness(self):
+        for shape in ([28, 33, 28, 42], [34, 30, 34, 32]):
+            for count in (0, 4):
+                value = self.fixture()
+                value['head'][-1]['regions'].append(shape + [count, 0, 0, 0])
+                with self.subTest(shape=shape, count=count):
+                    self.assertEqual(self.proof(value), [])
+
+    def test_boolean_inactive_segment_cannot_claim_a_region_entry(self):
+        value = self.fixture()
+        next(row for row in value['head_segments'] if not row[3])[4] = True
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_base_token_segments_cannot_contradict_positive_line_paint(self):
+        value = self.fixture()
+        value['base_segments'].extend([[32, 17, 0, True, True, False], [32, 21, 1, True, False, False]])
+        value['base_segments'].sort()
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_exact_source_guard_refuses_normalized_callee_byte_changes(self):
+        for separator in ('\r\n', '\v', '\u0085'):
+            def different_raw_source(value):
+                value['new_raw'] = separator.join(value['new']).encode()
+            with self.subTest(separator=repr(separator)), self.assertRaisesRegex(ValueError, 'Retained covered line'):
+                self.compare(different_raw_source)
+
+    def test_boolean_exact_source_guard_allows_optional_final_lf_and_records_raw_hash(self):
+        def trailing_lf(value):
+            value['old_raw'] = ('\n'.join(value['old']) + '\n').encode()
+        receipt = self.compare(trailing_lf)['retained_boolean_argument_paint'][0]
+        self.assertEqual(len(receipt['source_blob_sha256']), 2)
+        self.assertNotEqual(*receipt['source_blob_sha256'])
+        self.assertEqual(*receipt['source_lines_sha256'])
+
+    def test_boolean_call_signature_and_item_bounds_count_utf8_bytes(self):
+        for mode in ('call', 'signature', 'item'):
+            value = self.fixture()
+            if mode == 'call':
+                value['new'][29] += ' /*' + 'é' * 2100 + '*/'
+            else:
+                line, repetitions = (8, 2100) if mode == 'signature' else (11, 33000)
+                for side in ('old', 'new'):
+                    value[side][line] += ' /*' + 'é' * repetitions + '*/'
+            with self.subTest(mode=mode), mock.patch.object(
+                    coverage, 'require_rustfmt_syntax', side_effect=AssertionError('over-bound syntax invocation')):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_raw_identifier_and_late_block_glob_shadow_are_refused(self):
+        for original, replacement in (
+                ('fn install_rollback_refuses_unproven_package_removal()',
+                 'fn install_rollback_refuses_unproven_package_removal(r#transaction: fn())'),
+                ('        }\n    }', '        } use other::*;\n    }')):
+            value = self.fixture()
+            value['new'] = '\n'.join(value['new']).replace(original, replacement).splitlines()
+            self.assertEqual(self.proof(value), [])
+
+    def test_boolean_string_and_comment_tokens_do_not_create_occurrences(self):
+        value = self.fixture()
+        value['new'][-1] += ' // transaction(true), fn transaction() {}'
+        value['new'].append('const WORDS: &str = "transaction(true), fn transaction() {}";')
+        self.assertEqual(self.proof(value)[0]['pairs'], [[32, 32]])
+
+    def test_boolean_adjacent_tokens_cannot_be_joined_into_a_pure_leaf(self):
+        value = self.fixture()
+        value['new'] = '\n'.join(value['new']).replace('                source,', '                source as Text,').splitlines()
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_zero_callee_entry_and_nested_base_macro_are_refused(self):
+        for mode in ('callee', 'macro'):
+            value = self.fixture()
+            if mode == 'callee':
+                for row in value['head'][0]['regions']:
+                    row[4] = 0
+            else:
+                value['old'] = '\n'.join(value['old']).replace('rollback_action(&transaction(', 'rollback_actio!(&transaction(').splitlines()
+            self.assertEqual(self.proof(value), [])
+
+    def test_boolean_proof_preserves_all_supplied_evidence(self):
+        value = self.fixture()
+        original = copy.deepcopy(value)
+        self.assertEqual(len(self.proof(value)), 1)
+        self.assertEqual(value, original)
+
+    def test_boolean_changed_callee_or_base_attribution_is_refused(self):
+        value = self.fixture()
+        value['new'] = '\n'.join(value['new']).replace('"2.0-1"', '"3.0-1"').splitlines()
+        self.assertEqual(self.proof(value), [])
+        value = self.fixture()
+        value['before'][32] = 2
+        self.assertEqual(self.proof(value), [])
+
+    def test_boolean_malformed_region_segment_and_parser_bounds_are_refused(self):
+        for mode in ('region_column', 'region_expansion', 'region_schema', 'foreign_file',
+                     'segment_schema', 'segment_column', 'segment_counter', 'missing_segments',
+                     'source_bound', 'nesting_bound', 'syntax'):
+            value = self.fixture()
+            if mode.startswith('region_'):
+                row = value['head'][-1]['regions'][0]
+                if mode == 'region_column': row[3] = 10000
+                elif mode == 'region_expansion': row[7] = 1
+                else: row.append(0)
+            elif mode == 'foreign_file':
+                value['head'][-1]['filenames'].append('/src/other.rs')
+            elif mode == 'segment_schema':
+                value['head_segments'][0].append(False)
+            elif mode == 'segment_column':
+                value['head_segments'][0][1] = 10000
+            elif mode == 'segment_counter':
+                value['head_segments'][0][2] = coverage.COUNTER_LIMIT
+            elif mode == 'missing_segments':
+                value['head_segments'] = None
+            elif mode == 'source_bound':
+                value['new'].append(' ' * (1024 * 1024 + 1))
+            elif mode == 'nesting_bound':
+                value['new'][0] = '(' * 33 + ')' * 33
+            else:
+                value['new'][27] = value['new'][27].replace('let mut', 'let mut mut')
+            with self.subTest(mode=mode):
+                self.assertEqual(self.proof(value), [])
+
+    def test_boolean_paint_does_not_hide_another_retained_zero(self):
+        with self.assertRaisesRegex(ValueError, 'Retained covered line'):
+            self.compare(lambda value: value['after'].__setitem__(36, 0))
+
+    def test_boolean_paint_preserves_new_zero_raw_counter_and_ratio_failures(self):
+        def new_zero(value):
+            value['new'].append('fn uncovered() { untested(); }')
+            value['after'][len(value['new'])] = 0
+        def summary_loss(value):
+            value['head_summary'] = (len(value['after']) + 1, len(value['after']))
+        for mutate, error in ((new_zero, 'New uncovered'), (summary_loss, 'Line coverage decreased'),
+                              (lambda value: value['after'].__setitem__(36, coverage.COUNTER_LIMIT),
+                               'Invalid LCOV coverage counter')):
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                self.compare(mutate)
+
+    def test_boolean_paint_requires_the_pinned_syntax_validator(self):
+        with mock.patch.object(coverage, 'require_rustfmt_syntax', side_effect=ValueError('parser unavailable')):
+            with self.assertRaisesRegex(ValueError, 'parser unavailable'):
+                self.proof()
+
+
+class ExactObserverTests(unittest.TestCase):
+    def fixture(self):
+        source = b"fn work() {\n    step();\n}\n"
+        filename = '/src/example.rs'
+        owners = [dict(name=name, count=count, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[1, 1, 3, 2, count, 0, 0, 0]])
+                  for name, count in [('live', 5), ('cold', 0)]]
+        record = dict(filename=filename, branches=[], mcdc_records=[], expansions=[],
+                      segments=[[1, 1, 5, True, True, False], [3, 2, 0, False, False, False]],
+                      summary={'lines': {'count': 3, 'covered': 3},
+                               'regions': {'count': 1, 'covered': 1},
+                               'functions': {'count': 1, 'covered': 1},
+                               'instantiations': {'count': 2, 'covered': 1}})
+        lcov = dict(LF=3, LH=3, counts={1: 5, 2: 5, 3: 5})
+        return filename, source, owners, record, lcov
+
+    def test_exact_observer_preserves_cold_copies_and_separate_surfaces(self):
+        observed = coverage.observe_llvm22_file(*self.fixture())
+        self.assertEqual(observed.summary, (3, 3))
+        self.assertEqual(observed.rows, ((1, 5), (2, 5), (3, 5)))
+        self.assertEqual([owner.count for owner in observed.owners], [5, 0])
+        self.assertEqual(observed.groups, (((1, 1), (0, 1)),))
+
+    def test_observer_reconciles_every_segment_and_da_count(self):
+        for kind in ('segment-count', 'segment-entry', 'segment-gap', 'missing-segment',
+                     'da-count', 'missing-da', 'summary-found', 'summary-hit'):
+            with self.subTest(kind=kind):
+                args = list(self.fixture())
+                if kind == 'segment-count': args[3]['segments'][0][2] = 4
+                if kind == 'segment-entry': args[3]['segments'][0][4] = False
+                if kind == 'segment-gap': args[3]['segments'][0][5] = True
+                if kind == 'missing-segment': args[3]['segments'].pop()
+                if kind == 'da-count': args[4]['counts'][2] = 4
+                if kind == 'missing-da': del args[4]['counts'][2]
+                if kind == 'summary-found': args[3]['summary']['lines']['count'] = 4; args[4]['LF'] = 4
+                if kind == 'summary-hit': args[3]['summary']['lines']['covered'] = 2; args[4]['LH'] = 2
+                with self.assertRaisesRegex(ValueError, 'reconciliation'):
+                    coverage.observe_llvm22_file(*args)
+
+    def test_observer_requires_complete_compiled_inventory_even_for_zero_owners(self):
+        for kind in ('drop-cold-copy', 'duplicate-copy', 'change-cold-entry', 'missing-owner-count'):
+            with self.subTest(kind=kind):
+                args = list(self.fixture())
+                if kind == 'drop-cold-copy': args[2].pop()
+                if kind == 'duplicate-copy': args[2].append(copy.deepcopy(args[2][1]))
+                if kind == 'change-cold-entry': args[2][1]['count'] = 1
+                if kind == 'missing-owner-count': del args[2][1]['count']
+                with self.assertRaisesRegex(ValueError, 'inventory|reconciliation'):
+                    coverage.observe_llvm22_file(*args)
+
+    def test_observer_refuses_unsupported_schema_geometry_and_saturation(self):
+        mutations = {
+            'foreign-file': lambda a: a[2][0]['filenames'].append('/src/foreign.rs'),
+            'file-id': lambda a: a[2][0]['regions'][0].__setitem__(5, 1),
+            'expanded-file': lambda a: a[2][0]['regions'][0].__setitem__(6, 1),
+            'gap': lambda a: a[2][0]['regions'][0].__setitem__(7, 3),
+            'reversed': lambda a: a[2][0]['regions'][0].__setitem__(2, 0),
+            'column': lambda a: a[2][0]['regions'][0].__setitem__(3, 3),
+            'negative': lambda a: a[2][0]['regions'][0].__setitem__(4, -1),
+            'bool-count': lambda a: a[2][0]['regions'][0].__setitem__(4, True),
+            'saturated-region': lambda a: a[2][0]['regions'][0].__setitem__(4, coverage.COUNTER_LIMIT),
+            'saturated-entry': lambda a: a[2][0].__setitem__('count', coverage.COUNTER_LIMIT),
+            'branch': lambda a: a[2][0]['branches'].append([1]),
+            'expansion': lambda a: a[3]['expansions'].append({}),
+            'record-filename': lambda a: a[3].__setitem__('filename', '/src/other.rs'),
+            'source-crlf': lambda a: a.__setitem__(1, a[1].replace(b'\n', b'\r\n')),
+        }
+        for kind, mutate in mutations.items():
+            with self.subTest(kind=kind):
+                args = list(self.fixture()); mutate(args)
+                with self.assertRaises(ValueError):
+                    coverage.observe_llvm22_file(*args)
+
+    def test_observer_rejects_counter_sum_that_would_saturate(self):
+        args = list(self.fixture())
+        args[2][0]['regions'][0][4] = coverage.COUNTER_LIMIT - 1
+        args[2][1]['regions'][0][4] = 1
+        with self.assertRaisesRegex(ValueError, 'saturated'):
+            coverage.observe_llvm22_file(*args)
+
+    def test_observer_validates_utf8_byte_boundaries(self):
+        args = list(self.fixture())
+        args[1] = b'fn work() {\n    step();\n}\xc3\xa9\n'
+        for owner in args[2]: owner['regions'][0][3] = 3
+        with self.assertRaisesRegex(ValueError, 'boundary'):
+            coverage.observe_llvm22_file(*args)
+
+    def test_group_maxima_do_not_require_identical_geometry_or_equal_da_hit_totals(self):
+        filename, _, _, record, _ = self.fixture()
+        source = b'fn work() {\n    a();\n    b();\n}\n'
+        owners = [dict(name='wide', count=1, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[1, 1, 4, 2, 1, 0, 0, 0], [2, 1, 4, 1, 0, 0, 0, 0]]),
+                  dict(name='short', count=2, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[1, 1, 3, 9, 2, 0, 0, 0]])]
+        record['segments'] = [[1, 1, 2, True, True, False], [2, 1, 0, True, True, False],
+                              [3, 9, 0, True, False, False], [4, 1, 1, True, False, False],
+                              [4, 2, 0, False, False, False]]
+        record['summary'] = {'lines': {'count': 4, 'covered': 3},
+                             'regions': {'count': 2, 'covered': 1},
+                             'functions': {'count': 1, 'covered': 1},
+                             'instantiations': {'count': 2, 'covered': 2}}
+        observed = coverage.observe_llvm22_file(filename, source, owners, record,
+                                                dict(LF=4, LH=3, counts={1: 2, 2: 2, 3: 0, 4: 0}))
+        self.assertEqual(observed.summary, (4, 3))
+        self.assertEqual(sum(count > 0 for _, count in observed.rows), 2)
+        self.assertEqual([len(owner.rows) for owner in observed.owners], [4, 3])
+
+    def test_owner_order_is_preserved_without_changing_reconstructed_observations(self):
+        args = list(self.fixture())
+        original = coverage.observe_llvm22_file(*args)
+        args[2].reverse()
+        reordered = coverage.observe_llvm22_file(*args)
+        self.assertEqual([owner.name for owner in reordered.owners], ['cold', 'live'])
+        self.assertEqual((original.summary, original.rows, original.segments),
+                         (reordered.summary, reordered.rows, reordered.segments))
+        self.assertNotEqual(original.inventory_sha256, reordered.inventory_sha256)
+
+    def test_whole_group_projection_preserves_all_compiled_copies_and_both_metrics(self):
+        args = list(self.fixture())
+        observed = coverage.observe_llvm22_file(*args)
+        kept = coverage.project_observer_groups(observed, ())
+        self.assertEqual((kept.summary, kept.rows), (observed.summary, observed.rows))
+        removed = coverage.project_observer_groups(observed, ((1, 1),))
+        self.assertEqual(removed.removed_owners, ('live', 'cold'))
+        self.assertEqual((removed.summary, removed.rows), ((0, 0), ()))
+        with self.assertRaisesRegex(ValueError, 'whole observer group'):
+            coverage.project_observer_groups(observed, ('cold',))
+
+    def test_overlap_projection_does_not_sum_mapped_rows_or_use_summary_as_da(self):
+        filename, source, _, record, _ = self.fixture()
+        owners = [dict(name='parent', count=5, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[1, 1, 3, 2, 5, 0, 0, 0]]),
+                  dict(name='cold-closure', count=0, filenames=[filename], branches=[], mcdc_records=[],
+                       regions=[[2, 5, 2, 9, 0, 0, 0, 0]])]
+        record['segments'] = [[1, 1, 5, True, True, False], [2, 5, 0, True, True, False],
+                              [2, 9, 5, True, False, False], [3, 2, 0, False, False, False]]
+        record['summary'] = {'lines': {'count': 4, 'covered': 3},
+                             'regions': {'count': 2, 'covered': 1},
+                             'functions': {'count': 2, 'covered': 1},
+                             'instantiations': {'count': 2, 'covered': 1}}
+        observed = coverage.observe_llvm22_file(filename, source, owners, record,
+                                                dict(LF=4, LH=3, counts={1: 5, 2: 5, 3: 5}))
+        projected = coverage.project_observer_groups(observed, ((2, 5),))
+        self.assertEqual(projected.summary, (3, 3))
+        self.assertEqual(projected.rows, observed.rows)
+        self.assertEqual(projected.removed_owners, ('cold-closure',))
+
+    def test_projection_work_budget_is_shared_and_fails_closed(self):
+        observed = coverage.observe_llvm22_file(*self.fixture())
+        work = coverage._ObserverWork()
+        work.remaining = 0
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage.project_observer_groups(observed, (), _work=work)
+
+
+class SourceObligationLedgerTests(unittest.TestCase):
+    def ledger(self, old, new, old_counts=None, new_counts=None):
+        old_counts = old_counts or {i: 1 for i, line in enumerate(old.splitlines(), 1) if line.strip()}
+        new_counts = new_counts or {i: 1 for i, line in enumerate(new.splitlines(), 1) if line.strip()}
+        return coverage.source_obligation_ledger(old.encode(), new.encode(), old_counts, new_counts)
+
+    def test_nested_endpoint_identity_has_linear_expanded_size(self):
+        def expanded_units(value, memo):
+            if not isinstance(value, tuple):
+                return 1
+            if id(value) not in memo:
+                memo[id(value)] = 1 + sum(expanded_units(item, memo) for item in value)
+            return memo[id(value)]
+
+        for depth in (12, 30):
+            source = 'fn work() {\n' + '{\n' * depth + '}\n' * (depth + 1)
+            ledger = self.ledger(source, source)
+            largest = max(expanded_units(atom.endpoint, {}) for atom in ledger.base_atoms)
+            with self.subTest(depth=depth):
+                self.assertLessEqual(largest, 16 * (depth + 1),
+                                     'one endpoint must not recursively duplicate its ancestors')
+            self.assertEqual(len(ledger.base_atoms), len(ledger.obligations))
+
+    def test_wrong_function_to_struct_endpoint_keeps_every_old_obligation(self):
+        old = 'fn obsolete() {\n    old();\n}\n'
+        new = 'struct Manifest {\n    generation: String,\n}\n'
+        ledger = self.ledger(old, new)
+        self.assertEqual([atom.line for atom in ledger.base_atoms], [1, 2, 3])
+        self.assertEqual([item.old_line for item in ledger.obligations], [1, 2, 3])
+        endpoint = ledger.obligations[2]
+        self.assertEqual(endpoint.role, 'Unresolved')
+        self.assertEqual(endpoint.head_candidates, ())
+        self.assertIn('endpoint', endpoint.reason)
+        with self.assertRaisesRegex(ValueError, 'unresolved source obligations'):
+            ledger.require_resolved()
+
+    def test_function_endpoint_inventory_excludes_macro_with_same_spelling(self):
+        old = 'fn retained() -> usize {\n    1\n}\n'
+        new = 'fn retained() -> u64 {\n    2\n}\nthread_local! {\n    static VALUE: u8 = 0;\n}\n'
+        ledger = self.ledger(old, new)
+        endpoint = next(item for item in ledger.obligations if item.old_line == 3)
+        self.assertEqual((endpoint.role, endpoint.head_line, endpoint.head_candidates),
+                         ('Retained', 3, (3,)))
+        self.assertEqual(ledger.head_atoms[-1].endpoint[0], 'macro')
+
+    def test_repeated_function_candidates_are_not_selected_by_hit_count(self):
+        old = 'fn retained() {\n    step();\n}\n'
+        new = '#[cfg(first)]\nfn retained() {\n    step();\n}\n#[cfg(second)]\nfn retained() {\n    step();\n}\n'
+        ledger = self.ledger(old, new, new_counts={2: 1, 3: 1, 4: 1, 6: 0, 7: 0, 8: 0})
+        endpoint = next(item for item in ledger.obligations if item.old_line == 3)
+        self.assertEqual(endpoint.role, 'Unresolved')
+        self.assertEqual(endpoint.head_candidates, (4, 8))
+        self.assertEqual([atom.count for atom in ledger.head_atoms], [1, 1, 1, 0, 0, 0])
+
+    def test_same_function_path_and_parameters_bound_repeated_expression_inventory(self):
+        old = 'fn load(items: &[u8]) -> usize {\n    items.par_iter()\n}\nfn other() {\n    items.par_iter()\n}\n'
+        new = 'fn load(items: &[u8]) -> Result<usize> {\n    setup();\n    items.par_iter()\n}\nfn other() {\n    items.par_iter()\n}\n'
+        ledger = self.ledger(old, new)
+        expression = next(item for item in ledger.obligations if item.old_line == 2)
+        self.assertEqual((expression.role, expression.head_line, expression.head_candidates),
+                         ('Retained', 3, (3,)))
+
+    def test_unique_complete_body_rename_preserves_endpoint_extraction_candidate(self):
+        old = 'fn previous() {\n    step();\n}\n'
+        new = 'fn renamed() {\n    step();\n}\n'
+        ledger = self.ledger(old, new)
+        endpoint = next(item for item in ledger.obligations if item.old_line == 3)
+        self.assertEqual((endpoint.role, endpoint.head_line), ('Moved', 3))
+
+    def test_deleted_or_replaced_rows_never_gain_implicit_zero_credit(self):
+        for old, new in [('fn old() {\n    unhit();\n}\nfn keep() {}\n', 'fn keep() {}\n'),
+                         ('fn keep() {\n    unhit();\n}\n', 'fn keep() {\n    replacement();\n}\n')]:
+            ledger = self.ledger(old, new, old_counts={i: 0 for i in range(1, len(old.splitlines()) + 1)})
+            self.assertEqual(len(ledger.base_atoms), len(ledger.obligations))
+            self.assertFalse(any(item.role == 'Deleted' for item in ledger.obligations))
+            with self.assertRaisesRegex(ValueError, 'unresolved source obligations'):
+                ledger.require_resolved()
+
+    def test_changed_conditional_definition_does_not_establish_endpoint_retention(self):
+        old = '#[cfg(first)]\nfn retained() {\n    step();\n}\n'
+        new = '#[cfg(second)]\nfn retained() {\n    step();\n}\n'
+        endpoint = self.ledger(old, new).obligations[-1]
+        self.assertEqual((endpoint.role, endpoint.head_candidates), ('Unresolved', (4,)))
+
+
+class DiagnosticCoverageTests(unittest.TestCase):
+    def test_serialization_admission_counts_unicode_escapes_and_shared_references(self):
+        shared = ('"\t\\\x00é😀\x7f\n', True, False, None, -123)
+        value = {'first': shared, 'second': [shared, coverage.SourceAtom(1, 'é', 0, None)]}
+        plain = coverage._diagnostic_plain_value(value)
+        self.assertEqual(coverage._diagnostic_size(value),
+                         len(json.dumps(plain).encode('utf-8')))
+
+    def test_deep_shared_graph_and_cycles_are_refused_before_copying(self):
+        shared = ('x',)
+        for _ in range(40):
+            shared = (shared,)
+        deep = shared
+        for _ in range(30):
+            deep = (deep,)
+        cycle = []
+        cycle.append(cycle)
+        for value, reason in (({'shallow': shared, 'deep': deep}, 'nesting'), (cycle, 'cycle')):
+            with self.subTest(reason=reason), \
+                    mock.patch.object(coverage, 'asdict', side_effect=AssertionError('copy before admission')):
+                with self.assertRaisesRegex(ValueError, reason):
+                    coverage._diagnostic_plain_value(value)
+
+    def fixture(self, root, lost=False):
+        source = b'fn work() {\n    step();\n}\n'
+        arguments = ['check-line-coverage.py', '--source-repo', str(root),
+                     '--base-sha', 'a' * 40, '--head-sha', 'b' * 40]
+        for side in ('base', 'head'):
+            counts = [5, 0 if lost and side == 'head' else 5, 5]
+            lcov = root / (side + '.info')
+            lcov.write_text('SF:/src/example.rs\n' + ''.join(f'DA:{i},{c}\n' for i,c in enumerate(counts,1))
+                            + f'LF:3\nLH:{sum(c>0 for c in counts)}\nend_of_record\n')
+            regions = [[line, 1, line, end, count, 0, 0, 0]
+                       for line, end, count in zip((1, 2, 3), (12, 12, 2), counts)]
+            record = dict(filename='/src/example.rs', branches=[], mcdc_records=[], expansions=[],
+                          segments=[segment for line,end,count in zip((1,2,3),(12,12,2),counts)
+                                    for segment in ([line,1,count,True,True,False],[line,end,0,False,False,False])],
+                          summary={'lines':dict(count=3,covered=sum(c>0 for c in counts)),
+                                   'regions':dict(count=3,covered=sum(c>0 for c in counts)),
+                                   'functions':dict(count=1,covered=1),
+                                   'instantiations':dict(count=1,covered=1)})
+            document = dict(type='llvm.coverage.json.export', version='3.1.0', data=[dict(files=[record],
+                            functions=[dict(name='work', count=5, filenames=['/src/example.rs'],
+                                            branches=[], mcdc_records=[], regions=regions)])])
+            archive = root / (side + '.gz')
+            archive.write_bytes(gzip.compress(json.dumps(document).encode()))
+            arguments += ['--' + side, str(lcov), '--' + side + '-regions', str(archive)]
+        return arguments, {'example.rs': source}
+
+    def run_main(self, arguments, sources):
+        out, err = io.StringIO(), io.StringIO()
+        failure = None
+        with mock.patch.object(sys, 'argv', arguments), mock.patch.object(coverage, 'source_blobs', return_value=sources), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                coverage.main()
+            except ValueError as error:
+                failure = str(error)
+        return failure, out.getvalue(), err.getvalue()
+
+    def test_optional_diagnostic_preserves_the_original_strict_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            original = self.run_main(arguments, sources)
+            output = root / 'diagnostic.json'
+            diagnostic = self.run_main(arguments + ['--diagnostic-output', str(output),
+                                                     '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[:2], original[:2])
+            self.assertIn('Retained covered line lost', diagnostic[0])
+            self.assertNotIn('PASS:', diagnostic[1])
+            report = json.loads(output.read_text())
+            self.assertFalse(report['acceptance'])
+            self.assertEqual(report['source_commits'], {'base': 'a' * 40, 'head': 'b' * 40})
+            self.assertEqual([row['line'] for row in report['files'][0]['base']['atoms']], [1, 2, 3])
+            self.assertEqual(report['files'][0]['base']['observer']['status'], 'reconciled')
+            self.assertEqual(report['files'][0]['head']['observer']['status'], 'reconciled')
+
+    def test_expanded_report_is_refused_before_dataclass_copy_or_json_serialization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            original = self.run_main(arguments, sources)
+            shared = ('x',)
+            for _ in range(26):
+                shared = (shared, shared)
+            ledger = coverage.SourceLedger((coverage.SourceAtom(1, 'x', 1, shared),), (), (), ())
+            output = root / 'report.json'
+            with mock.patch.object(coverage, 'source_obligation_ledger', return_value=ledger), \
+                    mock.patch.object(coverage, 'asdict', side_effect=AssertionError('copy before output admission')):
+                diagnostic = self.run_main(arguments + ['--diagnostic-output', str(output),
+                                                         '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[:2], original[:2])
+            self.assertFalse(output.exists())
+            self.assertIn('Diagnostic output exceeds 64 MiB bound', diagnostic[2])
+
+    def test_diagnostic_cannot_turn_a_passing_comparison_into_a_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root)
+            original = self.run_main(arguments, sources)
+            diagnostic = self.run_main(arguments + ['--diagnostic-output', str(root / 'report.json'),
+                                                     '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[:2], original[:2])
+            self.assertIsNone(diagnostic[0])
+            self.assertIn('PASS:', diagnostic[1])
+
+    def test_unsupported_diagnostic_retains_old_atoms_and_the_original_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            original = self.run_main(arguments, sources)
+            archive = root / 'head.gz'
+            document = json.loads(gzip.decompress(archive.read_bytes()))
+            document['data'][0]['functions'][0]['filenames'].append('/src/foreign.rs')
+            archive.write_bytes(gzip.compress(json.dumps(document).encode()))
+            output = root / 'report.json'
+            diagnostic = self.run_main(arguments + ['--diagnostic-output', str(output),
+                                                     '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[0], original[0])
+            row = json.loads(output.read_text())['files'][0]
+            self.assertEqual(len(row['base']['atoms']), 3)
+            self.assertEqual(row['head']['observer']['status'], 'unsupported')
+
+    def test_diagnostic_output_cannot_overwrite_an_input_or_change_the_verdict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            original = self.run_main(arguments, sources)
+            input_path = root / 'head.info'; original_bytes = input_path.read_bytes()
+            diagnostic = self.run_main(arguments + ['--diagnostic-output', str(input_path),
+                                                     '--diagnostic-file', 'example.rs'], sources)
+            self.assertEqual(diagnostic[:2], original[:2])
+            self.assertEqual(input_path.read_bytes(), original_bytes)
+            self.assertIn('Diagnostic unavailable; strict comparison unchanged', diagnostic[2])
+
+    def test_unsupported_lexical_partition_keeps_raw_old_obligations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); arguments, sources = self.fixture(root, lost=True)
+            sources = {'example.rs': b'fn work() {\n    step();\n'}
+            output = root / 'report.json'
+            self.run_main(arguments + ['--diagnostic-output', str(output),
+                                        '--diagnostic-file', 'example.rs'], sources)
+            row = json.loads(output.read_text())['files'][0]
+            self.assertEqual(row['source_obligations']['status'], 'unsupported')
+            self.assertEqual(row['source_obligations']['old_obligations'],
+                             [dict(old_line=i, role='Unresolved') for i in (1, 2, 3)])
+            self.assertEqual([item['count'] for item in row['base']['atoms']], [5, 5, 5])
+
+
+class ConstructBudgetAndConstructorRegressions(unittest.TestCase):
+    def test_side_effecting_local_Ok_keeps_hot_copy_obligation(self):
+        old = b'fn obsolete() -> Result<()> {\n    old();\n    Ok(())\n}\nfn retained() -> Result<()> {\n    same();\n    Ok(())\n}\nfn Ok(value: ()) -> Result<()> {\n    verify();\n    std::result::Result::Ok(value)\n}\n'
+        new = old.replace(b'fn obsolete(', b'fn replacement(').replace(b'old();', b'new();')
+        def owners(base, head):
+            for document, source, first in ((base, old, 'obsolete'), (head, new, 'replacement')):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = [dict(name=f'{name}_{copy}', filenames=['/src/example.rs'],
+                    regions=[[line, 1, line, len(lines[line-1])+1,
+                        int(not(document is head and name == first and copy == 0)), 0, 0, 0]
+                        for line in range(start, end+1)])
+                    for name, start, end in ((first, 1, 4), ('retained', 5, 8), ('Ok', 9, 12))
+                    for copy in range(2)]
+        with self.assertRaises(ValueError):
+            SourceAwareCoverageTests().compare(before=[(i,2) for i in range(1,13)],
+                after=[(i,1 if i < 5 else 2) for i in range(1,13)], mutate=owners,
+                sources=({'example.rs':old}, {'example.rs':new}))
+
+    def test_function_span_expansion_uses_shared_budget(self):
+        old = ['fn outer() {'] + [f'    fn nested{i}() {{' for i in range(8)] + ['']*2000 + ['        old();'] + ['    }']*8 + ['}']
+        new = [line.replace('old();', 'new();') for line in old]
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage._construct_replacements(old, new, [2000])
+
+    def test_retained_anchor_materialization_uses_remaining_shared_budget(self):
+        old=['fn retained() {','    if gate() {','        work();','    }','}']
+        new=['fn retained() {','        if gate() {','            work();','        }','}']
+        owners=[]
+        for source in (old,new):
+            column=len(source[3]); owners.append([dict(name='f', filenames=['/src/example.rs'],
+                regions=[[1,source[0].index('{')+1,5,2,1,0,0,0],[4,column,4,column+1,1,0,0,0]])])
+        inventories=[coverage._construct_inventory(source,[20_000_000]) for source in (old,new)]
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage.retained_construct_anchors('example.rs',old,new,{4:1},{4:1},*owners,
+                {'/src/example.rs':'example.rs'}, {'/src/example.rs':'example.rs'},
+                work=[0], inventories=inventories)
+
 
 if __name__ == "__main__":
     unittest.main()

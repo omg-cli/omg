@@ -9,6 +9,217 @@ use crate::package_managers::{
     types::VersionDisplay,
 };
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeOmarchyOperation {
+    PruneCache,
+    RefreshKeyrings,
+    UpgradeRepositories,
+    RemoveOrphans,
+}
+
+impl NativeOmarchyOperation {
+    #[must_use]
+    pub fn from_argument(value: &str) -> Option<Self> {
+        match value {
+            "cache-prune" => Some(Self::PruneCache),
+            "keyring-refresh" => Some(Self::RefreshKeyrings),
+            "repository-upgrade" => Some(Self::UpgradeRepositories),
+            "orphan-remove" => Some(Self::RemoveOrphans),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn argument(self) -> &'static str {
+        match self {
+            Self::PruneCache => "cache-prune",
+            Self::RefreshKeyrings => "keyring-refresh",
+            Self::UpgradeRepositories => "repository-upgrade",
+            Self::RemoveOrphans => "orphan-remove",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeOmarchyInteraction {
+    Attended,
+    Unattended,
+}
+
+impl NativeOmarchyInteraction {
+    #[must_use]
+    pub fn from_argument(value: &str) -> Option<Self> {
+        match value {
+            "attended" => Some(Self::Attended),
+            "unattended" => Some(Self::Unattended),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn argument(self) -> &'static str {
+        match self {
+            Self::Attended => "attended",
+            Self::Unattended => "unattended",
+        }
+    }
+}
+
+/// Execute one fixed, already elevated Omarchy package operation.
+///
+/// # Errors
+/// Refuses unprivileged calls, unsupported trust bootstrap and failed native operations.
+#[doc(hidden)]
+pub fn execute_native_omarchy_operation(
+    operation: NativeOmarchyOperation,
+    interaction: NativeOmarchyInteraction,
+) -> AnyhowResult<()> {
+    use crate::core::history::{HistoryManager, PackageChange, TransactionType};
+    use anyhow::Context;
+    anyhow::ensure!(
+        crate::core::is_root(),
+        "Native Omarchy package operations require elevation"
+    );
+    crate::core::privilege::set_yes_flag(interaction == NativeOmarchyInteraction::Unattended);
+    if operation == NativeOmarchyOperation::PruneCache {
+        let (files, bytes) = super::alpm_ops::clean_cache(2)?;
+        println!(
+            "Pruned {files} cache files ({bytes} bytes), retaining two versions per directory and architecture"
+        );
+        return Ok(());
+    }
+    if operation == NativeOmarchyOperation::RefreshKeyrings {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(super::sync_databases_parallel())?;
+    }
+    let targets = match operation {
+        NativeOmarchyOperation::RefreshKeyrings => {
+            let mut names = vec!["archlinux-keyring".to_owned(), "omarchy-keyring".to_owned()];
+            if std::env::consts::ARCH == "aarch64"
+                && super::is_installed_fast("archlinuxarm-keyring")?
+            {
+                names.push("archlinuxarm-keyring".to_owned());
+            }
+            let path = std::path::Path::new("/usr/share/omarchy-platform/keyrings");
+            use std::io::Read;
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+                .open(path)
+            {
+                Ok(file) => {
+                    let metadata = file.metadata()?;
+                    anyhow::ensure!(
+                        metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+                        "Platform keyring list must be a root-controlled regular file"
+                    );
+                    anyhow::ensure!(
+                        metadata.len() <= 65536,
+                        "Platform keyring list exceeds its limit"
+                    );
+                    let mut contents = String::new();
+                    file.take(65537).read_to_string(&mut contents)?;
+                    anyhow::ensure!(
+                        contents.len() <= 65536,
+                        "Platform keyring list exceeds its limit"
+                    );
+                    for line in contents.lines() {
+                        let name = line.trim();
+                        if name.is_empty() || name.starts_with('#') {
+                            continue;
+                        }
+                        if !name.ends_with("-keyring")
+                            || crate::core::security::validate_package_name(name).is_err()
+                        {
+                            tracing::warn!("Ignoring invalid platform keyring package name");
+                            continue;
+                        }
+                        if !names.iter().any(|existing| existing == name)
+                            && super::is_installed_fast(name)?
+                        {
+                            names.push(name.to_owned());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("Cannot read platform keyring packages"),
+            }
+            names
+        }
+        NativeOmarchyOperation::UpgradeRepositories => Vec::new(),
+        NativeOmarchyOperation::RemoveOrphans => super::list_orphans_direct()?,
+        NativeOmarchyOperation::PruneCache => unreachable!(),
+    };
+    if operation == NativeOmarchyOperation::RemoveOrphans && targets.is_empty() {
+        return Ok(());
+    }
+    let (kind, changes) = if operation == NativeOmarchyOperation::UpgradeRepositories {
+        (
+            TransactionType::Update,
+            super::get_update_list()?
+                .into_iter()
+                .map(|item| PackageChange {
+                    name: item.name,
+                    old_version: Some(item.old_version),
+                    new_version: Some(item.new_version),
+                    source: item.repo,
+                })
+                .collect(),
+        )
+    } else {
+        let mut changes = Vec::new();
+        for name in &targets {
+            let previous = super::get_package_info(name)?;
+            let next = if operation == NativeOmarchyOperation::RefreshKeyrings {
+                Some(super::alpm_direct::with_handle(|handle| {
+                    for database in handle.syncdbs() {
+                        if !database.usage()?.contains(alpm::Usage::INSTALL) {
+                            continue;
+                        }
+                        super::alpm_ops::validate_sync_database(handle, database)?;
+                        if let Ok(package) = database.pkg(name.as_str()) {
+                            return Ok((package.version().to_string(), database.name().to_owned()));
+                        }
+                    }
+                    anyhow::bail!(
+                        "Signing-key package {name} is unavailable from configured install repositories"
+                    )
+                })?)
+            } else {
+                None
+            };
+            changes.push(PackageChange {
+                name: name.clone(),
+                old_version: previous
+                    .as_ref()
+                    .filter(|item| item.installed)
+                    .map(|item| item.version.to_string()),
+                new_version: next.as_ref().map(|(version, _)| version.clone()),
+                source: next.map_or_else(|| "pacman".to_owned(), |(_, repository)| repository),
+            });
+        }
+        (
+            if operation == NativeOmarchyOperation::RemoveOrphans {
+                TransactionType::Remove
+            } else {
+                TransactionType::Install
+            },
+            changes,
+        )
+    };
+    let history = HistoryManager::new()?;
+    let result = super::alpm_ops::execute_omarchy_transaction(operation, targets);
+    history.finish_operation(kind, changes, result)?;
+    invalidate_caches()?;
+    println!("Native Omarchy {} completed", operation.argument());
+    Ok(())
+}
+
 /// Arch Linux package manager (ALPM) implementation
 pub struct ArchPackageManager {
     recursive_removal: bool,
@@ -23,6 +234,23 @@ async fn run_alpm_transaction(packages: Vec<String>, kind: TransactionKind) -> A
     })
     .await??;
     Ok(())
+}
+
+pub(crate) async fn install_request(
+    request: super::arch_install::InstallRequest,
+) -> AnyhowResult<()> {
+    let descriptor = request.seal()?;
+    let handoff = vec![descriptor.handoff()];
+    run_privileged_operation(
+        super::arch_install::ELEVATED_INSTALL,
+        &handoff,
+        &[],
+        || async move {
+            tokio::task::spawn_blocking(move || super::alpm_ops::execute_install_request(&request))
+                .await?
+        },
+    )
+    .await
 }
 
 impl ArchPackageManager {
@@ -61,14 +289,12 @@ where
 {
     if can_write_pacman_db() {
         tracing::debug!("Using direct ALPM access as root");
-        operation().await?;
-        after_privileged_alpm_write().await?;
-        return Ok(());
+        return finish_alpm_write(operation(), after_privileged_alpm_write()).await;
     }
 
     // A live parent spinner redraws over sudo's password prompt and over the
     // elevated child's own progress, which looks like a hung duplicate bar.
-    {
+    let operation = async {
         let _quiesce = crate::cli::modern_ui::quiesce_terminal();
         tracing::debug!("Elevating privileges for {command}");
         let mut args = vec![command];
@@ -79,18 +305,52 @@ where
         // has richer change metadata and AUR handling); the child must stay silent
         // to avoid double entries. System-upgrade delegations (fullupdate /
         // turboupdate) carry no packages and the child is their only recorder.
-        if matches!(command, "install" | "remove" | "sync") {
+        if matches!(command, "install" | "install-plan" | "remove" | "sync") {
             args.push(privilege::FLOW_PARENT_RECORDS);
         }
-        privilege::run_privileged_child(&args).await?;
+        privilege::run_privileged_child(&args).await
+    };
+    finish_alpm_write(operation, after_privileged_alpm_write()).await
+}
+
+async fn finish_alpm_write(
+    operation: impl Future<Output = AnyhowResult<()>>,
+    completion: impl Future<Output = AnyhowResult<()>>,
+) -> AnyhowResult<()> {
+    let operation = operation.await;
+    let completion = completion.await;
+    combine_write_results(operation, completion)
+}
+
+fn combine_write_results(
+    operation: AnyhowResult<()>,
+    completion: AnyhowResult<()>,
+) -> AnyhowResult<()> {
+    match (operation, completion) {
+        (Ok(()), completion) => completion,
+        (Err(operation), Ok(())) => Err(operation),
+        (Err(operation), Err(completion)) => {
+            Err(operation.context(format!("Catalog completion also failed: {completion:#}")))
+        }
     }
-    after_privileged_alpm_write().await?;
-    Ok(())
+}
+
+pub(crate) async fn complete_native_omarchy_write(success: bool) -> AnyhowResult<()> {
+    let completion = after_privileged_alpm_write().await;
+    if success {
+        completion
+    } else {
+        if let Err(error) = completion {
+            tracing::warn!("Catalog refresh after failed native Omarchy stage: {error:#}");
+        }
+        Ok(())
+    }
 }
 
 async fn after_privileged_alpm_write() -> AnyhowResult<()> {
-    invalidate_caches()?;
-    crate::core::client::refresh_daemon_after_catalog_write().await
+    let invalidation = invalidate_caches();
+    let refresh = crate::core::client::refresh_daemon_after_catalog_write().await;
+    combine_write_results(invalidation, refresh)
 }
 
 impl PackageManager for ArchPackageManager {
@@ -109,10 +369,26 @@ impl PackageManager for ArchPackageManager {
             use anyhow::Context;
             async {
                 let mut before = self.security_inventory().await?;
-                let advisories = crate::core::security::vulnerability::VulnerabilityScanner::new()
-                    .fetch_alsa_issues()
+                if before.is_empty() {
+                    anyhow::ensure!(
+                        self.security_inventory().await?.is_empty(),
+                        "Installed packages changed during native security audit"
+                    );
+                    return Ok(
+                        crate::core::security::scan::SecurityAuditResult::from_assessments(
+                            Vec::new(),
+                        ),
+                    );
+                }
+                let operation = crate::core::security::vulnerability::VulnerabilityScanner::new()
+                    .assess_arch_operation(
+                        &before,
+                        crate::core::security::vulnerability::AssessmentUse::Admission,
+                    )
                     .await?;
-                let result = super::arch_advisory::audit_result(&before, &advisories)?;
+                let result = crate::core::security::scan::SecurityAuditResult::from_assessments(
+                    operation.assessments().to_vec(),
+                );
                 let mut after = self.security_inventory().await?;
                 let identity = |package: &super::types::SecurityPackage| {
                     (
@@ -127,6 +403,7 @@ impl PackageManager for ArchPackageManager {
                     before == after,
                     "Installed packages changed during native security audit"
                 );
+                operation.validate_now()?;
                 Ok(result)
             }
             .await
@@ -189,19 +466,21 @@ impl PackageManager for ArchPackageManager {
             }
             crate::core::security::validate_package_names_or_files(&packages)?;
 
-            run_privileged_operation("install", &packages, &[], || {
-                let pkgs = packages.clone();
-                let is_local_artifact = pkgs
-                    .iter()
-                    .any(|package| crate::core::security::is_local_package_file(package));
-                let kind = if is_local_artifact {
-                    TransactionKind::InstallAurArtifact
-                } else {
-                    TransactionKind::Install
-                };
-                async move { run_alpm_transaction(pkgs, kind).await }
-            })
-            .await
+            use super::arch_install::{InstallIntent, InstallItem, InstallRequest, InstallTarget};
+            let pinned = crate::core::security::artifact::SnapshotInputs::capture(&packages)?;
+            let items = pinned
+                .targets
+                .iter()
+                .map(|package| InstallItem {
+                    target: if crate::core::security::artifact::is_handoff(package) {
+                        InstallTarget::Archive(package.clone())
+                    } else {
+                        InstallTarget::Named(package.clone())
+                    },
+                    intent: InstallIntent::Requested,
+                })
+                .collect();
+            install_request(InstallRequest::new(items)?).await
         })
     }
 
@@ -467,6 +746,141 @@ pub async fn is_installed(package: &str) -> AnyhowResult<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn empty_native_audit_reports_exact_scope_and_preserves_inventory_failures() -> AnyhowResult<()>
+    {
+        const NAME: &str = "package_managers::arch::tests::empty_native_audit_reports_exact_scope_and_preserves_inventory_failures";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return Ok(());
+        }
+        assert!(!crate::core::is_root());
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = root.join("var/lib/pacman");
+        let local = database.join("local");
+        std::fs::create_dir_all(&local)?;
+        std::fs::create_dir_all(database.join("sync"))?;
+        let version_file = local.join("ALPM_DB_VERSION");
+        std::fs::write(&version_file, "9\n")?;
+        let config = directory.path().join("pacman.conf");
+        let config_bytes = "[options]\nSigLevel = Never\n";
+        std::fs::write(&config, config_bytes)?;
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+                crate::package_managers::alpm_direct::clear_alpm_cache();
+            }
+        }
+        let _restore = Restore;
+        crate::core::paths::set_test_overrides(Some(root), Some(database));
+        crate::package_managers::alpm_direct::clear_alpm_cache();
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
+            ],
+            || -> AnyhowResult<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let manager = ArchPackageManager::new();
+                    assert!(manager.security_inventory().await?.is_empty());
+                    for round in 0..2 {
+                        let result = manager
+                            .security_audit()
+                            .expect("native audit owner")
+                            .await?;
+                        assert_eq!(result.total_vulnerabilities, 0);
+                        assert_eq!(result.high_severity, 0);
+                        assert!(result.vulnerabilities.is_empty());
+                        assert!(matches!(result.coverage,
+                            crate::core::security::scan::AuditCoverage::Reported {
+                                assessed, unassessed, sources,
+                            } if assessed.is_empty() && unassessed.is_empty() && sources.is_empty()
+                        ));
+                        assert_eq!(std::fs::read(&version_file)?, b"9\n");
+                        assert_eq!(std::fs::read_dir(&local)?.count(), 1);
+                        assert_eq!(std::fs::read(&config)?, config_bytes.as_bytes());
+                        if round == 0 {
+                            std::fs::remove_file(&config)?;
+                            crate::package_managers::alpm_direct::clear_alpm_cache();
+                            let error = manager
+                                .security_audit()
+                                .expect("native audit owner")
+                                .await
+                                .expect_err("empty database cannot hide an inventory-source error");
+                            let message = format!("{error:#}");
+                            assert!(
+                                message.contains("Failed to query native security advisories"),
+                                "{message}"
+                            );
+                            assert!(message.contains("pacman.conf"), "{message}");
+                            std::fs::write(&config, config_bytes)?;
+                            crate::package_managers::alpm_direct::clear_alpm_cache();
+                        }
+                    }
+                    Ok(())
+                })
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn failed_write_still_completes_once() {
+        let completed = std::cell::Cell::new(0);
+        let result = finish_alpm_write(
+            async { anyhow::bail!("packages committed; audit persistence failed") },
+            async {
+                completed.set(completed.get() + 1);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("packages committed")
+        );
+        assert_eq!(
+            completed.get(),
+            1,
+            "failed write bypassed catalog completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_write_retains_operation_and_completion_errors() {
+        let error = finish_alpm_write(
+            async { anyhow::bail!("native commit failed; state may have changed") },
+            async { anyhow::bail!("daemon refresh failed") },
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("native commit failed"));
+        assert!(message.contains("daemon refresh failed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn successful_write_reports_completion_failure() {
+        let error = finish_alpm_write(async { Ok(()) }, async {
+            anyhow::bail!("catalog refresh failed")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("catalog refresh failed"));
+    }
 
     #[test]
     fn orphan_removals_have_rollback_history_metadata() {

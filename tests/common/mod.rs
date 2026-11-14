@@ -586,24 +586,29 @@ pub fn native_arch_fixture_available() -> bool {
     let ordinary = false;
     // Read the real host identity: init_test_env intentionally sets mock mode
     // in this test process, so library distro detection would select the mock.
-    let arch = fs::read_to_string("/etc/os-release").is_ok_and(|contents| {
-        contents.lines().any(|line| {
-            line.strip_prefix("ID=")
-                .is_some_and(|id| id.trim().trim_matches(['\'', '"']) == "arch")
-        })
-    });
-    let available = cfg!(target_os = "linux") && ordinary && arch;
+    let identity = fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|contents| {
+            contents.lines().find_map(|line| {
+                line.strip_prefix("ID=")
+                    .map(|id| id.trim().trim_matches(['\'', '"']).to_owned())
+            })
+        });
+    let available = cfg!(target_os = "linux")
+        && ordinary
+        && matches!(identity.as_deref(), Some("arch" | "omarchy"));
     if env::var_os("OMG_CONTRACT_REQUIRE_NATIVE_ARCH").is_some() {
         assert!(
-            available,
+            available && identity.as_deref() == Some("arch"),
             "native Arch contract requires actual Arch and an ordinary UID"
         );
     }
     if available {
         #[cfg(unix)]
         eprintln!(
-            "[native-arch-fixture] uid={} actual_id=arch",
-            nix::unistd::Uid::effective().as_raw()
+            "[native-arch-fixture] uid={} actual_id={}",
+            nix::unistd::Uid::effective().as_raw(),
+            identity.as_deref().unwrap()
         );
     } else {
         eprintln!("[native-arch-fixture-skip] requires actual Arch and an ordinary UID");
@@ -737,6 +742,23 @@ impl TestProject {
                 ("TERM", "dumb"),
                 ("SHELL", "/bin/bash"),
                 ("OMG_TEST_COMMAND_TIMEOUT_SECS", "20"),
+            ],
+        )
+    }
+
+    #[cfg(feature = "arch")]
+    pub fn run_native_arch_status(&self, socket: &Path, args: &[&str]) -> CommandResult {
+        assert!(matches!(
+            args,
+            ["status" | "daemon-status"] | ["status", "--fast"]
+        ));
+        self.run_native_arch_readonly_report(
+            args,
+            &[
+                ("OMG_DISABLE_DAEMON", "0"),
+                ("OMG_SOCKET_PATH", Self::utf8_path(socket)),
+                ("OMG_NO_UPDATE_CHECK", "1"),
+                ("OMG_TEST_COMMAND_TIMEOUT_SECS", "10"),
             ],
         )
     }
@@ -1043,7 +1065,7 @@ pub fn assert_empty_daemon_status(response: omg_lib::daemon::protocol::Response,
                 (0, 0, 0, 0)
             );
             assert!(!status.vulnerabilities_scanned);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
             assert!(status.runtime_versions.is_empty());
         }
         other => panic!("empty isolated status returned {other:?}"),

@@ -26,6 +26,7 @@ SPEC.loader.exec_module(ALIGNMENT)
 
 ROOT_CONFIG_KEYS = frozenset({"telemetry_enabled", "aur"})
 AUR_CONFIG_KEYS = frozenset([
+    "security_profile",
     "build_method",
     "build_concurrency",
     "review_pkgbuild",

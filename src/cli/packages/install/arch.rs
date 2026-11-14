@@ -81,7 +81,17 @@ pub async fn install(packages: &[String], yes: bool, replacement_hops: u32) -> R
                 &vulnerability_scanner,
                 pkg,
                 &info.version,
-                false,
+                if info.repo.is_empty() {
+                    crate::package_managers::types::SecurityOrigin::Unknown
+                } else if policy.arch_advisory_repositories.contains(&info.repo) {
+                    crate::package_managers::types::SecurityOrigin::ArchRepository {
+                        repository: info.repo.clone(),
+                    }
+                } else {
+                    crate::package_managers::types::SecurityOrigin::OtherRepository {
+                        repository: info.repo.clone(),
+                    }
+                },
                 crate::core::security::policy::combined_license_expression(
                     info.licenses.iter().map(String::as_str),
                 )
@@ -594,7 +604,7 @@ async fn handle_aur_package(aur_pkg: crate::core::Package, yes: bool) -> Result<
         &vulnerability_scanner,
         &aur_pkg.name,
         &aur_pkg.version,
-        true,
+        crate::package_managers::types::SecurityOrigin::AurArchive,
         None,
     )
     .await?;
@@ -728,35 +738,132 @@ mod tests {
     }
 
     impl crate::core::security::vulnerability::VulnerabilitySource for FixtureSource {
-        fn scan_package<'a>(
+        fn assess_packages<'a>(
             &'a self,
-            name: &'a str,
-            version: &'a crate::package_managers::types::Version,
+            packages: &'a [crate::package_managers::types::SecurityPackage],
+            evidence_use: crate::core::security::vulnerability::AssessmentUse,
         ) -> Pin<
             Box<
                 dyn Future<
                         Output = std::result::Result<
-                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
                             crate::core::security::vulnerability::VulnerabilityError,
                         >,
                     > + Send
                     + 'a,
             >,
         > {
-            assert_eq!(name, "example");
-            assert_eq!(version.to_string(), "1.0-1");
+            assert_eq!(packages.len(), 1);
+            assert_eq!(packages[0].name, "example");
+            assert_eq!(packages[0].version, "1.0-1");
+            assert_eq!(
+                evidence_use,
+                crate::core::security::vulnerability::AssessmentUse::Admission
+            );
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async move {
-                Ok(if self.vulnerable {
-                    vec![crate::core::security::vulnerability::VulnerabilityReport {
-                        id: "CVE-test".to_string(),
-                        summary: "known vulnerability".to_string(),
-                        score: None,
-                    }]
-                } else {
-                    Vec::new()
-                })
+                Ok(packages
+                    .iter()
+                    .cloned()
+                    .map(|package| {
+                        let findings = if self.vulnerable {
+                            vec![crate::core::security::scan::Vulnerability {
+                                id: "CVE-test".into(),
+                                summary: "known vulnerability".into(),
+                                score: None,
+                                advisory_severity: None,
+                                native_advisory: None,
+                                applicability:
+                                    crate::core::security::scan::FindingApplicability::Applicable,
+                                affected_installed: vec![
+                                    crate::core::security::scan::InstalledIdentity::from(&package),
+                                ],
+                            }]
+                        } else {
+                            Vec::new()
+                        };
+                        crate::core::security::vulnerability::PackageAssessment {
+                            package,
+                            coverage:
+                                crate::core::security::vulnerability::PackageCoverage::Assessed {
+                                    provenance:
+                                        crate::core::security::scan::AdvisoryProvenance::Osv {
+                                            ecosystem: "fixture".into(),
+                                        },
+                                },
+                            findings,
+                        }
+                    })
+                    .collect())
             })
+        }
+    }
+
+    #[test]
+    fn install_source_denials_precede_advisory_lookups() {
+        use crate::core::security::{PolicyError, SecurityGrade, SecurityPolicy};
+        use crate::package_managers::types::SecurityOrigin;
+        let cases = [
+            (
+                SecurityPolicy {
+                    banned_packages: vec!["example".into()],
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::OtherRepository {
+                    repository: "fixture".into(),
+                },
+                Some("MIT"),
+            ),
+            (
+                SecurityPolicy {
+                    allow_aur: false,
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::AurArchive,
+                None,
+            ),
+            (
+                SecurityPolicy {
+                    minimum_grade: SecurityGrade::Verified,
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::Unknown,
+                Some("MIT"),
+            ),
+            (
+                SecurityPolicy {
+                    allowed_licenses: vec!["MIT".into()],
+                    ..SecurityPolicy::default()
+                },
+                SecurityOrigin::OtherRepository {
+                    repository: "fixture".into(),
+                },
+                None,
+            ),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let version = crate::package_managers::parse_version_or_zero("1.0-1");
+        for (mut policy, origin, license) in cases {
+            policy.advisory_requirement =
+                crate::core::security::policy::AdvisoryRequirement::Review;
+            let scanner = FixtureSource {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                vulnerable: false,
+            };
+            let error = runtime
+                .block_on(enforce_install_policy(
+                    &policy, &scanner, "example", &version, origin, license,
+                ))
+                .expect_err("source policy must reject the package");
+            assert!(error.downcast_ref::<PolicyError>().is_some(), "{error:#}");
+            assert_eq!(
+                scanner.calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "source policy denial contacted the advisory provider"
+            );
         }
     }
 
@@ -768,7 +875,10 @@ mod tests {
             return;
         }
         temp_env::with_var_unset("OMG_TEST_MODE", || {
-            let policy = crate::core::security::SecurityPolicy::default();
+            let policy = crate::core::security::SecurityPolicy {
+                advisory_requirement: crate::core::security::policy::AdvisoryRequirement::Review,
+                ..crate::core::security::SecurityPolicy::default()
+            };
             let version = crate::package_managers::parse_version_or_zero("1.0-1");
             let scanner = FixtureSource {
                 calls: std::sync::atomic::AtomicUsize::new(0),
@@ -784,7 +894,9 @@ mod tests {
                     &scanner,
                     "example",
                     &version,
-                    false,
+                    crate::package_managers::types::SecurityOrigin::OtherRepository {
+                        repository: "fixture".into(),
+                    },
                     Some("MIT"),
                 ))
                 .expect_err("vulnerable packages must be below the default Community grade");
@@ -810,7 +922,9 @@ mod tests {
                     &clean_scanner,
                     "example",
                     &version,
-                    false,
+                    crate::package_managers::types::SecurityOrigin::OtherRepository {
+                        repository: "fixture".into(),
+                    },
                     Some("MIT"),
                 ))
                 .expect("clean official package must be accepted");
@@ -1005,6 +1119,7 @@ mod tests {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
+                    crate::package_managers::aur_metadata::publish_test_metadata(&archive_path)?;
                     runtime.block_on(async {
                         anyhow::ensure!(!crate::core::paths::test_mode());
                         let client = AurClient::new()?;

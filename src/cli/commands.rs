@@ -422,7 +422,7 @@ type StatusSnapshot = (
     usize,
     usize,
     usize,
-    Option<usize>,
+    Option<(usize, usize)>,
     Option<Vec<(String, String)>>,
 );
 
@@ -476,7 +476,7 @@ fn read_status_snapshot() -> Result<StatusSnapshot> {
             res.explicit_packages,
             res.orphan_packages,
             res.updates_available,
-            res.scanned_vulnerability_count(),
+            res.scanned_vulnerability_summary(),
             Some(res.runtime_versions),
         ));
     }
@@ -523,34 +523,10 @@ pub fn status_sync() -> Result<()> {
         explicit_packages: explicit,
         orphan_packages: orphans,
         updates_available: updates,
+        advisory_coverage: security_vulnerabilities,
         ..crate::cli::tea::StatusData::default()
     };
     print!("{}", report.render());
-
-    // Security
-    match security_vulnerabilities {
-        Some(0) => {
-            println!(
-                "  {} {}",
-                style::emphasis("Security"),
-                style::positive("No known issues")
-            );
-        }
-        Some(count) => {
-            println!(
-                "  {} {}",
-                style::emphasis("Security"),
-                style::negative(&format!("{count} vulnerabilities"))
-            );
-        }
-        None => {
-            println!(
-                "  {} {}",
-                style::emphasis("Security"),
-                style::dim("Not scanned")
-            );
-        }
-    }
 
     // Daemon status: a stale socket node is not a running daemon.
     #[cfg(unix)]
@@ -584,12 +560,16 @@ pub fn status_sync() -> Result<()> {
         if !versions.is_empty() {
             println!("\n  {}", style::emphasis("Runtimes"));
             for (name, version) in &versions {
-                println!("    {} {}", runtime_display_name(name), version);
+                println!(
+                    "    {} {}",
+                    style::sanitize_terminal_text(runtime_display_name(name)),
+                    style::sanitize_terminal_text(version)
+                );
             }
         }
     }
 
-    if security_vulnerabilities != Some(0) {
+    if security_vulnerabilities != Some((0, 0)) {
         println!(
             "\n  Check vulnerabilities with {}",
             style::accent("omg audit")
@@ -1110,7 +1090,6 @@ pub fn history(
 
 #[derive(Debug, PartialEq, Eq)]
 enum RollbackAction {
-    Remove(Vec<String>),
     Restore {
         /// Official packages restorable from the pacman cache: (name, old version).
         official: Vec<(String, String)>,
@@ -1154,13 +1133,9 @@ fn rollback_action(transaction: &crate::core::history::Transaction) -> Result<Ro
     );
 
     match transaction.transaction_type {
-        crate::core::history::TransactionType::Install => Ok(RollbackAction::Remove(
-            transaction
-                .changes
-                .iter()
-                .map(|change| change.name.clone())
-                .collect(),
-        )),
+        crate::core::history::TransactionType::Install => anyhow::bail!(
+            "Cannot automatically reverse an install: history does not prove which packages were newly installed. Review the installed state and use an explicit remove or downgrade instead"
+        ),
         crate::core::history::TransactionType::Remove
         | crate::core::history::TransactionType::Update => {
             // Mixed official+AUR transactions are the common real-world case:
@@ -1347,6 +1322,8 @@ pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
         style::info(short_id(&target.id))
     );
 
+    let action = rollback_action(target)?;
+
     let attended = console::user_attended();
     if !yes
         && attended
@@ -1359,38 +1336,9 @@ pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
     }
     validate_rollback_consent(attended, yes)?;
 
-    match rollback_action(target)? {
+    match action {
         RollbackAction::NothingToDo => {
             println!("{}", style::success("Nothing to roll back"));
-        }
-        RollbackAction::Remove(packages) if packages.is_empty() => {
-            println!("{}", style::success("Nothing to roll back"));
-        }
-        RollbackAction::Remove(packages) => {
-            println!(
-                "{} Removing {} package(s)...",
-                style::info("→"),
-                packages.len()
-            );
-            let package_manager = crate::package_managers::get_package_manager()?;
-            let result = package_manager.remove(&packages).await;
-            // Record the rollback itself so history reflects reality: the
-            // packages were removed by this rollback, not by a user remove.
-            let changes = packages
-                .iter()
-                .map(|name| crate::core::history::PackageChange {
-                    name: name.clone(),
-                    old_version: None,
-                    new_version: None,
-                    source: "rollback".to_string(),
-                })
-                .collect();
-            crate::core::history::HistoryManager::new()?.finish_operation(
-                crate::core::history::TransactionType::Remove,
-                changes,
-                result,
-            )?;
-            println!("{}", style::success("✓ Rollback completed successfully"));
         }
         RollbackAction::Restore {
             official: packages,
@@ -2037,16 +1985,25 @@ mod tests {
     }
 
     #[test]
-    fn rollback_plan_reverses_installs_and_restores_official_updates() -> Result<()> {
-        assert_eq!(
-            rollback_action(&transaction(
+    fn install_rollback_refuses_unproven_package_removal() {
+        for source in ["pacman", "local", "aur"] {
+            let mut recorded = transaction(
                 crate::core::history::TransactionType::Install,
-                "aur",
+                source,
                 None,
                 true,
-            ))?,
-            RollbackAction::Remove(vec!["example".to_string()])
-        );
+            );
+            for version in [None, Some("1-1".to_owned())] {
+                recorded.changes[0].new_version = version;
+                let error = rollback_action(&recorded)
+                    .expect_err("install history does not prove this package was newly installed");
+                assert!(error.to_string().contains("newly installed"), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_plan_restores_official_updates() -> Result<()> {
         assert_eq!(
             rollback_action(&transaction(
                 crate::core::history::TransactionType::Update,

@@ -181,6 +181,11 @@ start_clone() {
   if [[ -f qemu-startup.log && ! -L qemu-startup.log ]]; then
     cp -- qemu-startup.log "${log%.log}.qemu-startup.log" || return 3
   fi
+  if [[ "$rc" == 0 ]]; then
+    remote_argv timeout --kill-after=5s 90s sudo -n python3 \
+      /home/bench/provision-qemu-crash-channel.py \
+      > "${log%.log}.crash-channel.json" 2> "${log%.log}.crash-channel.log" || rc=$?
+  fi
   return "$rc"
 }
 freeze_base() {

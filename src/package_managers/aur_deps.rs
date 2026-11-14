@@ -3,10 +3,12 @@
 //! Parses .SRCINFO and checks which dependencies are already installed
 //! to avoid redundant pacman operations.
 
-use alpm_srcinfo::SourceInfoV1;
+use alpm_srcinfo::{MergedPackage, SourceInfoV1};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+use super::types::{dependency_version_satisfies as output_version_satisfies, provision_satisfies};
 
 /// Parsed dependency information from .SRCINFO
 #[derive(Debug, Clone)]
@@ -23,28 +25,30 @@ pub(crate) fn dependency_name(dependency: &str) -> &str {
         .map_or(dependency, |index| &dependency[..index])
 }
 
-/// Parse .SRCINFO and check dependencies for the requested output closure.
+/// Read bounded current `.SRCINFO` and check the requested output dependencies.
 pub fn check_dependencies_for_outputs(
     pkg_dir: &Path,
     requested_outputs: &[String],
 ) -> Result<DependencyInfo> {
-    let srcinfo_path = pkg_dir.join(".SRCINFO");
-
-    if !srcinfo_path.exists() {
+    let Some(srcinfo) = super::aur::source_file::read_srcinfo(pkg_dir)? else {
         return Ok(DependencyInfo {
             missing: Vec::new(),
             package_outputs: requested_outputs.to_vec(),
         });
-    }
+    };
+    check_dependencies_from_metadata(&srcinfo, requested_outputs)
+}
 
-    let content = std::fs::read_to_string(&srcinfo_path).context("Failed to read .SRCINFO")?;
-    let srcinfo = SourceInfoV1::from_string(&content).context("Failed to parse .SRCINFO")?;
+pub(crate) fn check_dependencies_from_metadata(
+    srcinfo: &SourceInfoV1,
+    requested_outputs: &[String],
+) -> Result<DependencyInfo> {
     // Ask libalpm to evaluate the complete dependency expression. A package
     // with the right name but an older version is not a satisfier, while a
     // compatible virtual provider can be.
     crate::package_managers::alpm_direct::with_handle(|alpm| {
         let installed = alpm.localdb().pkgs();
-        dependency_info(&srcinfo, requested_outputs, |dependency| {
+        dependency_info(srcinfo, requested_outputs, |dependency| {
             installed.find_satisfier(dependency.to_string()).is_some()
         })
     })
@@ -60,10 +64,20 @@ fn dependency_info(
         .into_iter()
         .filter(|dependency| !is_installed(dependency))
         .collect::<Vec<_>>();
+    let arch = super::aur::utils::current_arch()
+        .context("Unsupported host architecture for AUR dependency resolution")?;
     let same_base_names = srcinfo
         .packages
         .iter()
-        .map(|package| package.name.to_string())
+        .flat_map(|package| {
+            let merged = MergedPackage::from_base_and_package(arch.clone(), &srcinfo.base, package);
+            std::iter::once(merged.name.to_string()).chain(
+                merged
+                    .provides
+                    .into_iter()
+                    .map(|provided| dependency_name(&provided.to_string()).to_owned()),
+            )
+        })
         .collect::<BTreeSet<_>>();
     let missing_build_inputs = missing
         .iter()
@@ -92,7 +106,7 @@ fn dependency_plan(
     let arch = super::aur::utils::current_arch()
         .context("Unsupported host architecture for AUR dependency resolution")?;
     let packages = srcinfo
-        .packages_for_architecture(arch)
+        .packages_for_architecture(arch.clone())
         .map(|package| (package.name.to_string(), package))
         .collect::<BTreeMap<_, _>>();
     let all_outputs = packages.keys().cloned().collect::<BTreeSet<_>>();
@@ -109,29 +123,22 @@ fn dependency_plan(
         );
     }
 
+    let declared_packages = srcinfo
+        .packages
+        .iter()
+        .map(|package| MergedPackage::from_base_and_package(arch.clone(), &srcinfo.base, package))
+        .collect::<Vec<_>>();
+    let mut internal_dependencies = BTreeSet::new();
     let mut pending_outputs = selected_outputs.iter().cloned().collect::<Vec<_>>();
     while let Some(output) = pending_outputs.pop() {
         let package = &packages[&output];
         for dependency in &package.dependencies {
             let dependency = dependency.to_string();
-            let name = dependency_name(&dependency);
-            if let Some(sibling) = packages.get(name) {
-                let version = sibling.version.to_string();
-                anyhow::ensure!(
-                    output_version_satisfies(&dependency, &version),
-                    "Same-base runtime dependency '{dependency}' cannot be satisfied by output '{name}' at version {version}; correct the recipe's dependency or output version"
-                );
-                if selected_outputs.insert(name.to_string()) {
-                    pending_outputs.push(name.to_string());
+            if let Some(name) = runtime_sibling(&dependency, &packages, &declared_packages)? {
+                internal_dependencies.insert(dependency);
+                if selected_outputs.insert(name.clone()) {
+                    pending_outputs.push(name);
                 }
-            } else {
-                anyhow::ensure!(
-                    !srcinfo
-                        .packages
-                        .iter()
-                        .any(|sibling| sibling.name.to_string() == name),
-                    "Same-base runtime output '{name}' required by '{output}' is unavailable for the host architecture"
-                );
             }
         }
     }
@@ -144,7 +151,7 @@ fn dependency_plan(
                 .dependencies
                 .iter()
                 .map(ToString::to_string)
-                .filter(|dependency| !all_outputs.contains(dependency_name(dependency))),
+                .filter(|dependency| !internal_dependencies.contains(dependency)),
         );
         // These inputs are needed before packaging. Keep complete expressions
         // even when a later output from this pkgbase has the same name.
@@ -157,31 +164,210 @@ fn dependency_plan(
     Ok((dependencies, selected_outputs.into_iter().collect()))
 }
 
-fn output_version_satisfies(dependency: &str, candidate: &str) -> bool {
-    let dependency = alpm::Depend::new(dependency);
-    let Some(required) = dependency.version() else {
-        return true;
-    };
-    let comparison = alpm::vercmp(candidate, required.to_string().as_str());
-    match dependency.depmod() {
-        alpm::DepMod::Any => true,
-        alpm::DepMod::Eq => comparison.is_eq(),
-        alpm::DepMod::Ge => !comparison.is_lt(),
-        alpm::DepMod::Le => !comparison.is_gt(),
-        alpm::DepMod::Gt => comparison.is_gt(),
-        alpm::DepMod::Lt => comparison.is_lt(),
+fn runtime_sibling(
+    dependency: &str,
+    packages: &BTreeMap<String, MergedPackage>,
+    declared_packages: &[MergedPackage],
+) -> Result<Option<String>> {
+    let name = dependency_name(dependency);
+    if let Some(sibling) = packages.get(name) {
+        let version = sibling.version.to_string();
+        anyhow::ensure!(
+            output_version_satisfies(dependency, &version),
+            "Same-base runtime dependency '{dependency}' cannot be satisfied by output '{name}' at version {version}; correct the recipe's dependency or output version"
+        );
+        return Ok(Some(name.to_owned()));
     }
+    let candidates = packages
+        .values()
+        .filter(|package| {
+            package
+                .provides
+                .iter()
+                .any(|provided| provision_satisfies(dependency, &provided.to_string()))
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        candidates.len() < 2,
+        "Same-base runtime dependency '{dependency}' has ambiguous providers: {}",
+        candidates
+            .iter()
+            .map(|package| package.name.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if let Some(package) = candidates.first() {
+        return Ok(Some(package.name.to_string()));
+    }
+    let declares_relation = |package: &MergedPackage| {
+        package.name.to_string() == name
+            || package
+                .provides
+                .iter()
+                .any(|provided| dependency_name(&provided.to_string()) == name)
+    };
+    if declared_packages.iter().any(declares_relation) {
+        anyhow::ensure!(
+            packages.values().any(declares_relation),
+            "Same-base runtime dependency '{dependency}' is unavailable for the host architecture"
+        );
+        anyhow::bail!(
+            "Same-base runtime dependency '{dependency}' has no compatible versioned provider; correct the recipe's dependency or provision"
+        );
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{SourceInfoV1, dependency_info, dependency_plan, output_version_satisfies};
 
+    #[test]
+    fn public_dependency_reader_preserves_requests_when_metadata_is_absent() {
+        let directory = tempfile::tempdir().expect("private source directory");
+        let requested = vec!["example-docs".to_owned(), "example-cli".to_owned()];
+        let info = super::check_dependencies_for_outputs(directory.path(), &requested)
+            .expect("absent metadata has no declared dependencies");
+        assert!(info.missing.is_empty());
+        assert_eq!(info.package_outputs, requested);
+        assert!(
+            directory
+                .path()
+                .read_dir()
+                .expect("private directory")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn public_dependency_reader_uses_selected_outputs_and_installed_versions() {
+        const TEST: &str = "package_managers::aur_deps::tests::public_dependency_reader_uses_selected_outputs_and_installed_versions";
+        if crate::config::Settings::rerun_test_unprivileged(TEST)
+            || crate::core::testing::run_isolated_test(TEST)
+        {
+            return;
+        }
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+                crate::package_managers::alpm_direct::clear_alpm_cache();
+            }
+        }
+        let _restore = Restore;
+        let (directory, handle) =
+            installed_fixture(&[("external-old", "1.0-1"), ("external-new", "3.0-1")]);
+        drop(handle);
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).expect("private source checkout");
+        std::fs::write(
+            source.join(".SRCINFO"),
+            "pkgbase = example\n\tpkgver = 1.0.0\n\tpkgrel = 1\n\tarch = any\npkgname = example-cli\n\tdepends = external-old>=2\n\tdepends = external-new>=2\n\tdepends = example-lib=1.0.0\npkgname = example-lib\npkgname = example-docs\n\tdepends = docs-only\n",
+        )
+        .expect("selected-output metadata");
+        let config = directory.path().join("pacman.conf");
+        std::fs::write(&config, "[options]\nSigLevel = Never\n").expect("private pacman config");
+        crate::core::paths::set_test_overrides(
+            Some(directory.path().join("root")),
+            Some(directory.path().join("db")),
+        );
+        crate::package_managers::alpm_direct::clear_alpm_cache();
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+                ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
+            ],
+            || {
+                let info =
+                    super::check_dependencies_for_outputs(&source, &["example-cli".to_owned()])
+                        .expect("bounded metadata and private native installed state");
+                assert_eq!(info.package_outputs, ["example-cli", "example-lib"]);
+                assert_eq!(info.missing, ["external-old>=2"]);
+            },
+        );
+    }
+
     fn split_fixture(base_dependencies: &str, packages: &str) -> SourceInfoV1 {
         SourceInfoV1::from_string(&format!(
             "pkgbase = example\n\tpkgdesc = dependency plan fixture\n\tpkgver = 1.0.0\n\tpkgrel = 1\n\tarch = any\n{base_dependencies}\n{packages}"
         ))
         .expect("valid split .SRCINFO")
+    }
+
+    #[test]
+    fn runtime_virtual_sibling_selects_unique_compatible_output() {
+        let srcinfo = split_fixture(
+            "",
+            "pkgname = example-cli\n\tdepends = example-api>=2\npkgname = example-lib\n\tprovides = example-api=2\n\tdepends = external>=3\npkgname = example-old\n\tprovides = example-api=1\n",
+        );
+        let (dependencies, outputs) = dependency_plan(&srcinfo, &["example-cli".into()])
+            .expect("unique compatible sibling provider");
+        assert_eq!(outputs, ["example-cli", "example-lib"]);
+        assert_eq!(dependencies, ["external>=3"]);
+    }
+
+    #[test]
+    fn runtime_virtual_sibling_rejects_incompatible_or_unversioned_provision() {
+        for provision in ["example-api=1", "example-api"] {
+            let srcinfo = split_fixture(
+                "",
+                &format!(
+                    "pkgname = example-cli\n\tdepends = example-api>=2\npkgname = example-lib\n\tprovides = {provision}\n"
+                ),
+            );
+            let error = dependency_plan(&srcinfo, &["example-cli".into()]).expect_err(
+                "an incompatible same-base provider must not satisfy a versioned requirement",
+            );
+            assert!(error.to_string().contains("example-api>=2"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn runtime_virtual_sibling_refuses_ambiguous_providers() {
+        let srcinfo = split_fixture(
+            "",
+            "pkgname = example-cli\n\tdepends = example-api>=2\npkgname = example-lib\n\tprovides = example-api=2\npkgname = example-other\n\tprovides = example-api=3\n",
+        );
+        let error = dependency_plan(&srcinfo, &["example-cli".into()])
+            .expect_err("multiple compatible siblings require an unambiguous recipe");
+        assert!(error.to_string().contains("ambiguous"), "{error:#}");
+        assert!(error.to_string().contains("example-api>=2"), "{error:#}");
+    }
+
+    #[test]
+    fn runtime_virtual_sibling_refuses_ineligible_architecture() {
+        let srcinfo = split_fixture(
+            "",
+            "pkgname = example-cli\n\tdepends = example-api>=2\npkgname = example-lib\n\tarch = riscv64\n\tprovides = example-api=2\n",
+        );
+        let error = dependency_plan(&srcinfo, &["example-cli".into()])
+            .expect_err("a foreign-architecture provider cannot enter the runtime closure");
+        assert!(error.to_string().contains("host architecture"), "{error:#}");
+    }
+
+    #[test]
+    fn virtual_sibling_build_inputs_require_an_installed_provider() {
+        for kind in ["makedepends", "checkdepends"] {
+            let srcinfo = split_fixture(
+                &format!("\t{kind} = example-api>=2\n"),
+                "pkgname = example-cli\npkgname = example-lib\n\tprovides = example-api=2\n",
+            );
+            let error = dependency_info(&srcinfo, &["example-cli".into()], |_| false)
+                .expect_err("future sibling output cannot bootstrap this build");
+            assert!(
+                error.to_string().contains("installed before building"),
+                "{error:#}"
+            );
+            let plan = dependency_info(&srcinfo, &["example-cli".into()], |dependency| {
+                dependency == "example-api>=2"
+            })
+            .expect("an already installed matching provider is a valid build input");
+            assert!(plan.missing.is_empty());
+            assert_eq!(plan.package_outputs, ["example-cli"]);
+        }
     }
 
     fn installed_fixture(packages: &[(&str, &str)]) -> (tempfile::TempDir, alpm::Alpm) {

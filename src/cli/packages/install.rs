@@ -17,35 +17,47 @@ pub(crate) async fn enforce_install_policy(
     scanner: &dyn crate::core::security::vulnerability::VulnerabilitySource,
     name: &str,
     version: &crate::package_managers::types::Version,
-    is_community_source: bool,
+    origin: crate::package_managers::types::SecurityOrigin,
     license: Option<&str>,
 ) -> Result<()> {
-    if crate::core::paths::test_mode() {
-        return policy
-            .check_source(name, is_community_source, license)
-            .map_err(Into::into);
-    }
-
-    let grade = match policy
-        .assign_grade(scanner, name, version, !is_community_source)
-        .await
-    {
-        Ok(grade) => grade,
-        Err(error) if !crate::core::security::policy::explicit_policy_exists() => {
-            // The built-in defaults remain usable when a platform has no OSV
-            // ecosystem or the evidence service is temporarily unavailable.
-            // An explicit policy file is different: its control must fail
-            // closed rather than silently degrading.
-            tracing::warn!("Vulnerability grading unavailable for {name}: {error}");
-            return policy
-                .check_source(name, is_community_source, license)
-                .map_err(Into::into);
-        }
-        Err(error) => return Err(error.into()),
+    use crate::core::security::policy::AdvisoryRequirement;
+    use crate::core::security::vulnerability::{
+        AssessmentUse, PackageAssessment, UnknownCoverage, validate_assessment_inventory,
     };
-    policy
-        .check_package(name, is_community_source, license, grade)
-        .map_err(Into::into)
+    use crate::package_managers::VersionDisplay;
+    policy.check_source(name, &origin, license)?;
+    let packages = [crate::package_managers::types::SecurityPackage {
+        origin,
+        name: name.to_owned(),
+        version: version.version_string(),
+        advisory_source: None,
+        architecture: None,
+        description: String::new(),
+        licenses: license.into_iter().map(str::to_owned).collect(),
+    }];
+    let prepared_arch_admission = policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot
+        && crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Arch;
+    let assessments = if policy.advisory_requirement == AdvisoryRequirement::Optional
+        || prepared_arch_admission
+    {
+        vec![PackageAssessment::unknown(
+            packages[0].clone(),
+            UnknownCoverage::NotRequested,
+        )]
+    } else {
+        scanner
+            .assess_packages(&packages, AssessmentUse::Admission)
+            .await?
+    };
+    validate_assessment_inventory(&packages, &assessments)?;
+    if prepared_arch_admission {
+        // Only the final prepared transaction can bind fresh evidence and
+        // acknowledge an exact uncovered artifact through the root terminal.
+        policy.check_sources_and_findings(&assessments)?;
+    } else {
+        policy.check_assessments(&assessments)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "arch")]

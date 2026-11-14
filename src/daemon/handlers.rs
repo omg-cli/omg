@@ -1718,7 +1718,8 @@ pub(super) mod tests {
     #[tokio::test]
     async fn persisted_status_does_not_restart_memory_ttl() -> anyhow::Result<()> {
         let (directory, initial) = isolated_state();
-        let status = super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some(3)).0;
+        let status =
+            super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some((3, 0))).0;
         initial.persistent.set_status(&status)?;
         let state = Arc::new(DaemonState::new_isolated(
             directory.path(),
@@ -1764,7 +1765,8 @@ pub(super) mod tests {
         let (_directory, mut state) = isolated_state();
         Arc::get_mut(&mut state).context("unique test state")?.cache =
             PackageCache::new_with_ttls(10, 300, 0);
-        let status = super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some(3)).0;
+        let status =
+            super::super::status_policy::status_snapshot(42, 20, 1, 2, vec![], Some((3, 0))).0;
         state.persistent.set_status(&status)?;
         let Response::Success {
             result: ResponseResult::Status(result),

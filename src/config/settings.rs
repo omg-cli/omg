@@ -175,6 +175,8 @@ pub struct Settings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AurBuildSettings {
+    /// Admission and build requirements for AUR code.
+    pub security_profile: AurSecurityProfile,
     /// Build method for AUR packages
     pub build_method: AurBuildMethod,
     /// Maximum concurrent AUR builds
@@ -194,11 +196,11 @@ pub struct AurBuildSettings {
     pub metadata_cache_ttl_secs: u64,
     /// Custom MAKEFLAGS (overrides auto -jN)
     pub makeflags: Option<String>,
-    /// Custom PKGDEST (shared package cache)
+    /// Legacy destination, accepted for compatibility but ignored.
     pub pkgdest: Option<PathBuf>,
-    /// Custom SRCDEST (shared source cache)
+    /// Legacy destination, accepted for compatibility but ignored.
     pub srcdest: Option<PathBuf>,
-    /// Enable build cache re-use based on PKGBUILD hash
+    /// Legacy cache request. Persistent artifact reuse is disabled.
     pub cache_builds: bool,
     /// Enable ccache integration
     pub enable_ccache: bool,
@@ -217,6 +219,52 @@ pub enum AurBuildMethod {
     Bubblewrap,
     Chroot,
     Native,
+}
+
+/// Stronger admission is explicit and cannot silently fall back to host builds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AurSecurityProfile {
+    #[default]
+    Standard,
+    Hardened,
+}
+
+impl AurSecurityProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Hardened => "hardened",
+        }
+    }
+}
+
+impl std::str::FromStr for AurSecurityProfile {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "hardened" => Ok(Self::Hardened),
+            _ => anyhow::bail!("Unknown AUR security profile '{value}'; use standard or hardened"),
+        }
+    }
+}
+
+impl AurBuildSettings {
+    pub(crate) fn validate_security_profile(&self) -> Result<()> {
+        if self.security_profile == AurSecurityProfile::Hardened {
+            anyhow::ensure!(
+                matches!(self.build_method, AurBuildMethod::Bubblewrap)
+                    && self.review_pkgbuild
+                    && self.secure_makepkg
+                    && !self.allow_network
+                    && !self.allow_unsafe_builds,
+                "aur.security_profile = hardened requires build_method = bubblewrap, review_pkgbuild = true, secure_makepkg = true, allow_network = false and allow_unsafe_builds = false"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for Settings {
@@ -238,6 +286,7 @@ impl Default for Settings {
 impl Default for AurBuildSettings {
     fn default() -> Self {
         Self {
+            security_profile: AurSecurityProfile::Standard,
             build_method: AurBuildMethod::Bubblewrap,
             build_concurrency: 1,
             review_pkgbuild: true,
@@ -249,7 +298,7 @@ impl Default for AurBuildSettings {
             makeflags: None,
             pkgdest: None,
             srcdest: None,
-            cache_builds: true,
+            cache_builds: false,
             enable_ccache: false,
             ccache_dir: None,
             enable_sccache: false,
@@ -272,7 +321,8 @@ impl Settings {
         )?;
 
         const ROOT_KEYS: [&str; 2] = ["telemetry_enabled", "aur"];
-        const AUR_KEYS: [&str; 16] = [
+        const AUR_KEYS: [&str; 17] = [
+            "security_profile",
             "build_method",
             "build_concurrency",
             "review_pkgbuild",
@@ -531,6 +581,7 @@ impl Settings {
                 validate_makeflags(makeflags)?;
             }
 
+            settings.aur.validate_security_profile()?;
             Ok(settings.with_runtime_overrides())
         } else {
             if let Some(dir) = std::env::var_os("OMG_CONFIG_DIR").filter(|v| !v.is_empty()) {
@@ -597,6 +648,7 @@ impl Settings {
 
     /// Save a complete settings value, replacing all managed values rather than patching a field.
     pub fn save(&self) -> Result<()> {
+        self.aur.validate_security_profile()?;
         let config_path = Self::config_path()?;
 
         if let Some(parent) = config_path.parent() {
@@ -630,6 +682,7 @@ impl Settings {
     /// absent key is the user's own and is preserved.
     const TOP_LEVEL_KEYS: &[&str] = &["telemetry_enabled", "aur"];
     const AUR_KEYS: &[&str] = &[
+        "security_profile",
         "build_method",
         "build_concurrency",
         "review_pkgbuild",
@@ -725,9 +778,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aur_security_profile_is_typed_and_round_trips() -> Result<()> {
+        let settings: Settings = toml::from_str("[aur]\nsecurity_profile = 'hardened'\n")?;
+        assert_eq!(
+            serde_json::to_value(&settings)?["aur"]["security_profile"],
+            "hardened"
+        );
+        assert!(toml::from_str::<Settings>("[aur]\nsecurity_profile = 'hardned'\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hardened_aur_settings_refuse_incompatible_build_options() -> Result<()> {
+        if Settings::rerun_test_unprivileged(
+            "config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options",
+        ) {
+            return Ok(());
+        }
+        if crate::core::testing::run_isolated_test(
+            "config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options",
+        ) {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("config.toml");
+        for option in [
+            "",
+            "build_method = 'native'",
+            "build_method = 'chroot'",
+            "allow_unsafe_builds = true",
+            "allow_network = true",
+            "review_pkgbuild = false",
+            "secure_makepkg = false",
+        ] {
+            std::fs::write(
+                &config,
+                format!("[aur]\nsecurity_profile = 'hardened'\n{option}\n"),
+            )
+            .expect("write hardened settings fixture");
+            let result =
+                temp_env::with_var("OMG_CONFIG_DIR", Some(directory.path()), Settings::load);
+            assert_eq!(result.is_ok(), option.is_empty(), "{option}: {result:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn config_paths_check_components_instead_of_dot_substrings() {
         assert!(validate_config_path(Path::new("pkg..cache/output"), "pkgdest").is_ok());
         assert!(validate_config_path(Path::new("cache/../escape"), "pkgdest").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standard_config_path_validation_preserves_shared_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        validate_config_path(directory.path(), "pkgdest").expect("warn about the shared directory");
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o777,
+            "configuration validation must not silently chmod a user directory"
+        );
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        validate_config_path(directory.path(), "pkgdest").expect("accept a private directory");
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "private build directories must retain their existing permissions"
+        );
+    }
+
+    #[test]
+    fn config_paths_accept_missing_directory_without_creating_it() {
+        let directory = tempfile::tempdir().expect("private configuration fixture");
+        let path = directory.path().join("future-build-output");
+        validate_config_path(&path, "pkgdest").expect("a future private output path is valid");
+        assert!(
+            !path.exists(),
+            "configuration validation must not create the configured output directory"
+        );
     }
 
     #[test]

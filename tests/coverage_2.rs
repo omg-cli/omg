@@ -130,7 +130,7 @@ fn audit_fix_is_not_paywalled() {
     result.assert_success();
     let out = result.combined_output();
     assert!(
-        out.contains("No vulnerabilities found!"),
+        out.contains("No vulnerabilities found in assessed packages!"),
         "audit fix must complete the empty-inventory scan, got:\n{out}"
     );
     project.close_checked();

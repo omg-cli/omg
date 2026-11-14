@@ -284,14 +284,17 @@ async fn run_with_status_path(
             let previous_vulns = state
                 .cache
                 .get_status()
-                .and_then(|status| status.scanned_vulnerability_count());
+                .and_then(|status| status.scanned_vulnerability_summary());
             let scan = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => {
                     tracing::debug!("Cancelled background security refresh during shutdown");
                     return;
                 }
-                result = state.scan_security() => result.map(|scan| scan.total_vulnerabilities),
+                result = state.scan_security() => result.and_then(|scan| match scan.coverage {
+                    crate::core::security::scan::AuditCoverage::Reported { unassessed, .. } => Ok((scan.total_vulnerabilities, unassessed.len())),
+                    crate::core::security::scan::AuditCoverage::Unreported => Err(anyhow::anyhow!("Security scan omitted advisory coverage")),
+                }),
             };
             if let Err(error) = &scan {
                 tracing::warn!("Vulnerability scan failed during status refresh: {error}");
@@ -302,7 +305,7 @@ async fn run_with_status_path(
                 tracing::warn!("No prior vulnerability count; not publishing a zero-vuln status");
                 return;
             };
-            let res = super::status_policy::status_snapshot(
+            let mut res = super::status_policy::status_snapshot(
                 total,
                 explicit,
                 orphans,
@@ -311,6 +314,9 @@ async fn run_with_status_path(
                 Some(vuln_count),
             )
             .0;
+            if scan.is_err() {
+                res.invalidate_security_scope();
+            }
             let res_arc = Arc::new(res);
             // The in-memory cache is authoritative, so persistence is best-effort.
             state.with_current_index(&index, || {
@@ -867,15 +873,15 @@ mod tests {
     }
 
     impl crate::core::security::vulnerability::VulnerabilitySource for PausedAdvisorySource {
-        fn scan_package<'a>(
+        fn assess_packages<'a>(
             &'a self,
-            _name: &'a str,
-            _version: &'a crate::package_managers::types::Version,
+            packages: &'a [crate::package_managers::types::SecurityPackage],
+            _evidence_use: crate::core::security::vulnerability::AssessmentUse,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
                         Output = std::result::Result<
-                            Vec<crate::core::security::vulnerability::VulnerabilityReport>,
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
                             crate::core::security::vulnerability::VulnerabilityError,
                         >,
                     > + Send
@@ -885,7 +891,23 @@ mod tests {
             Box::pin(async move {
                 self.started.notify_one();
                 self.resume.notified().await;
-                Ok(vec![])
+                Ok(packages
+                    .iter()
+                    .cloned()
+                    .map(
+                        |package| crate::core::security::vulnerability::PackageAssessment {
+                            package,
+                            coverage:
+                                crate::core::security::vulnerability::PackageCoverage::Assessed {
+                                    provenance:
+                                        crate::core::security::scan::AdvisoryProvenance::Osv {
+                                            ecosystem: "fixture".into(),
+                                        },
+                                },
+                            findings: Vec::new(),
+                        },
+                    )
+                    .collect())
             })
         }
     }
@@ -1057,6 +1079,7 @@ mod tests {
     #[test]
     fn oversized_security_audit_is_not_reported_as_complete() {
         let vulnerability = super::super::protocol::Vulnerability {
+            applicability: crate::core::security::scan::FindingApplicability::Possible,
             id: "CVE-fixture".into(),
             summary: "x".repeat(16_000),
             score: Some("9.8".into()),
@@ -1067,6 +1090,7 @@ mod tests {
         let response = Response::Success {
             id: 91,
             result: ResponseResult::SecurityAudit(SecurityAuditResult {
+                coverage: crate::core::security::scan::AuditCoverage::Unreported,
                 total_vulnerabilities: 600,
                 high_severity: 600,
                 vulnerabilities: (0..600)
@@ -1138,11 +1162,13 @@ mod tests {
         use super::super::protocol::{ExplicitResult, UpdateEntry};
         let results = [
             ResponseResult::SecurityAudit(SecurityAuditResult {
+                coverage: crate::core::security::scan::AuditCoverage::Unreported,
                 total_vulnerabilities: 1,
                 high_severity: 1,
                 vulnerabilities: vec![(
                     "package".into(),
                     vec![super::super::protocol::Vulnerability {
+                        applicability: crate::core::security::scan::FindingApplicability::Possible,
                         id: "CVE-fixture".into(),
                         summary: "fixture".into(),
                         score: Some("9.8".into()),

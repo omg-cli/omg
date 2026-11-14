@@ -1,0 +1,23 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "omg-advisories",
+    "main": "src/index.ts",
+    "compatibility_date": "2026-11-13",
+    "account_id": "f1e95b3e1b502cf366dfc81a863695fa",
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "omg-advisories",
+            "database_id": "98202f8c-7d5f-4de9-8ddd-cea35fd95d09",
+            "migrations_dir": "migrations",
+        },
+    ],
+    "r2_buckets": [{ "binding": "RAW", "bucket_name": "omg-advisories-raw" }],
+    "vars": { "CVE_BATCH_SIZE": "32" },
+    "limits": { "cpu_ms": 30000 },
+    "triggers": { "crons": ["*/5 * * * *"] },
+    "observability": {
+        "enabled": true,
+        "traces": { "enabled": true, "head_sampling_rate": 0.1 },
+    },
+}

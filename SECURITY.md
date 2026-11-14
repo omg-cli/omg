@@ -288,12 +288,29 @@ identity and verifies supported Rekor artifact signatures, not in-toto build
 provenance. Even successful checks return SLSA level `None`. A valid signature
 from an arbitrary signer is insufficient.
 
-AUR review covers the complete local regular-file source manifest, including
-`.SRCINFO`, patches and install hooks. Source symlinks are rejected; replace them
-with reviewed regular files. All cached, fresh, dependency and rollback archives
+AUR review binds the complete captured source manifest, including `.SRCINFO`,
+patches and install hooks. PKGBUILD and .SRCINFO symlinks are rejected.
+Contained auxiliary symlink target strings are included in the manifest without
+following them. Filenames and review diagnostics escape terminal controls and
+invisible formatting. All fresh, dependency and rollback archives
 must match the reviewed output identity and exact install-hook bytes. Package
 archives are snapshotted into sealed Linux files before approval and copied into
 private root staging for the complete privileged transaction.
+
+Archive admission checks raw extension headers before interpreting file entries.
+Ambiguous or unsupported PAX metadata, conflicting GNU/PAX paths, NUL paths or
+attribute names, duplicate canonical attribute names, unequal raw/PAX sizes and
+nonregular entries carrying data are rejected. Capability classification follows
+libarchive's percent-decoded LIBARCHIVE attribute names, and link privilege
+metadata is included in exceptional approval.
+
+The optional `aur.security_profile = "hardened"` setting requires offline
+Bubblewrap, secure makepkg and attended source confirmation even with `--yes`.
+It rejects hooks, privilege-bearing files, system configuration and classified
+privileged integration paths, then requires matching archives from two builds
+with separate invocation storage for every accepted output. The host toolchain
+and checkout are shared. Matching builds do not prove code safety or independent
+provenance. This setting governs OMG AUR operations, not other package managers.
 
 Bubblewrap builds are offline by default. The host prefetcher accepts only public
 HTTPS destinations, checks every redirect and pins resolved addresses. Sources

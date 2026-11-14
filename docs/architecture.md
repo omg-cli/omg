@@ -91,7 +91,7 @@ Versions live under `~/.local/share/omg/versions`. Unknown runtime names fail. O
 
 | Platform | Integration |
 | --- | --- |
-| Arch | `libalpm` for local and sync databases, plus an HTTPS AUR client |
+| Arch | Official Rust ALPM crates for cached database and source metadata; C `libalpm` for live queries, dependency solving and transactions; an HTTPS AUR client |
 | Debian and Ubuntu | Native APT |
 | Fedora | DNF and RPM database reads, with subprocess fallbacks |
 | macOS | Homebrew |

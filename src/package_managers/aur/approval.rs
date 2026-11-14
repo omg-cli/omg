@@ -10,42 +10,59 @@ use super::artifact_inspector::ArtifactInspection;
 
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 
+#[derive(Debug, Default)]
+struct Prompt(String);
+
+impl std::fmt::Write for Prompt {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        if value.len() > MAX_PROMPT_BYTES - self.0.len() {
+            return Err(std::fmt::Error);
+        }
+        self.0.push_str(value);
+        Ok(())
+    }
+}
+
 pub(crate) fn exception_prompt(inspections: &[ArtifactInspection]) -> Result<Option<String>> {
-    let exceptional = inspections
+    if !inspections
         .iter()
-        .filter(|inspection| inspection.requires_exception())
-        .collect::<Vec<_>>();
-    if exceptional.is_empty() {
+        .any(ArtifactInspection::requires_exception)
+    {
         return Ok(None);
     }
 
-    let mut prompt =
-        String::from("AUR package contents request exceptional install-time privileges:\n");
-    for inspection in exceptional {
-        write!(
-            prompt,
-            "\n{} {} [{}]",
-            crate::cli::style::sanitize_terminal_text(&inspection.package_name),
-            crate::cli::style::sanitize_terminal_text(&inspection.package_version),
-            inspection.archive_sha256
-        )?;
-        if let Some(hook) = &inspection.install_hook {
-            write!(prompt, "\n  .INSTALL hook sha256={hook}")?;
-        }
-        for file in &inspection.privileged_files {
-            let path = crate::cli::style::sanitize_terminal_text(&file.path);
-            write!(prompt, "\n  {path} mode={:04o}", file.mode & 0o7777)?;
-            if let Some(capability) = &file.capability {
-                write!(prompt, " capability={capability}")?;
+    let mut prompt = Prompt::default();
+    let formatted = (|| -> std::fmt::Result {
+        prompt.write_str("AUR package contents request exceptional install-time privileges:\n")?;
+        for inspection in inspections
+            .iter()
+            .filter(|inspection| inspection.requires_exception())
+        {
+            write!(
+                prompt,
+                "\n{} {} [{}]",
+                crate::cli::style::display_terminal_text(&inspection.package_name),
+                crate::cli::style::display_terminal_text(&inspection.package_version),
+                inspection.archive_sha256
+            )?;
+            if let Some(hook) = &inspection.install_hook {
+                write!(prompt, "\n  .INSTALL hook sha256={hook}")?;
+            }
+            for file in &inspection.privileged_files {
+                let path = crate::cli::style::display_terminal_text(&file.path);
+                write!(prompt, "\n  {path} mode={:04o}", file.mode & 0o7777)?;
+                if let Some(capability) = &file.capability {
+                    write!(prompt, " capability={capability}")?;
+                }
             }
         }
-    }
-    prompt.push_str("\n\nInstall these exact inspected archives?");
+        prompt.write_str("\n\nInstall these exact inspected archives?")
+    })();
     anyhow::ensure!(
-        prompt.len() <= MAX_PROMPT_BYTES,
+        formatted.is_ok(),
         "AUR privilege summary exceeds display limit"
     );
-    Ok(Some(prompt))
+    Ok(Some(prompt.0))
 }
 
 #[cfg(test)]
@@ -75,6 +92,83 @@ mod tests {
     fn ordinary_archive_needs_no_exception_prompt() -> Result<()> {
         assert!(exception_prompt(&[inspection()])?.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn many_privileged_outputs_cannot_truncate_the_approval_summary() {
+        let inspections: Vec<_> = (0..512)
+            .map(|index| {
+                let mut output = inspection();
+                output.package_name = format!("demo-{index}");
+                output.install_hook = Some("b".repeat(64));
+                output
+            })
+            .collect();
+        let error = exception_prompt(&inspections)
+            .expect_err("all requested outputs must fit before approval can be offered");
+        assert_eq!(
+            error.to_string(),
+            "AUR privilege summary exceeds display limit"
+        );
+    }
+
+    #[test]
+    fn prompt_buffer_refuses_overflow_without_extending_it() {
+        let mut prompt = Prompt::default();
+        prompt
+            .write_str(&"x".repeat(MAX_PROMPT_BYTES - 2))
+            .expect("text within budget");
+        prompt
+            .write_char('é')
+            .expect("UTF-8 text exactly fills byte budget");
+        let capacity = prompt.0.capacity();
+        assert!(prompt.write_char('x').is_err());
+        assert!(prompt.write_str("é").is_err());
+        assert_eq!(prompt.0.len(), MAX_PROMPT_BYTES);
+        assert_eq!(prompt.0.capacity(), capacity);
+        assert!(prompt.0.ends_with('é'));
+    }
+
+    #[test]
+    fn exception_prompt_enforces_exact_budget_and_streams_sanitized_paths() {
+        let mut inspection = inspection();
+        inspection.privileged_files.push(PrivilegedFile {
+            path: "usr/bin/marker".to_owned(),
+            mode: 0o4755,
+            capability: Some(String::new()),
+        });
+        let original = exception_prompt(std::slice::from_ref(&inspection))
+            .expect("ordinary privilege summary formats")
+            .expect("set-ID file needs a summary");
+        let room = MAX_PROMPT_BYTES - original.len();
+        inspection.privileged_files[0].capability = Some("a".repeat(room));
+        let exact = exception_prompt(std::slice::from_ref(&inspection))
+            .expect("exactly bounded privilege summary formats")
+            .expect("set-ID file needs a summary");
+        assert_eq!(exact.len(), MAX_PROMPT_BYTES);
+        inspection.privileged_files[0]
+            .capability
+            .as_mut()
+            .expect("fixture capability")
+            .push('a');
+        let error = exception_prompt(std::slice::from_ref(&inspection))
+            .expect_err("one additional byte must refuse the summary");
+        assert_eq!(
+            error.to_string(),
+            "AUR privilege summary exceeds display limit"
+        );
+
+        inspection.privileged_files[0].capability = None;
+        inspection.privileged_files[0].path = "usr/\u{1b}[31mbin/\u{202e}marker\n".to_owned();
+        let summary = exception_prompt(&[inspection])
+            .expect("sanitized summary formats")
+            .expect("set-ID summary");
+        assert!(summary.contains("usr/[31mbin/marker mode=4755"));
+        assert!(!summary.contains(['\u{1b}', '\u{202e}']));
+        assert_eq!(
+            summary.matches('\n').count(),
+            original.matches('\n').count()
+        );
     }
 
     #[test]

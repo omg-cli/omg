@@ -46,6 +46,7 @@ This example shows the current defaults for the boolean and numeric settings:
 telemetry_enabled = false
 
 [aur]
+security_profile = "standard"
 build_method = "bubblewrap"
 build_concurrency = 1
 review_pkgbuild = true
@@ -54,14 +55,19 @@ allow_unsafe_builds = false
 allow_network = false
 use_metadata_archive = true
 metadata_cache_ttl_secs = 300
-cache_builds = true
+cache_builds = false
 enable_ccache = false
 enable_sccache = false
 ```
 
 Optional AUR fields are `makeflags`, `pkgdest`, `srcdest`, `ccache_dir`, and `sccache_dir`. They are unset by default. Build methods are `bubblewrap`, `chroot`, and `native`; choosing one does not supply missing host tools. See [AUR support](./aur.md).
 
-Keep recipe review, source verification, and isolation enabled. Allowing unsafe builds or host networking increases what community build code can access. A build-cache hit is not a new security review. Do not weaken these controls as a generic CI recipe.
+Keep recipe review, source verification, and isolation enabled. Allowing unsafe builds or host networking increases what community build code can access. Persistent AUR build reuse and the legacy custom cache destinations are disabled; outputs, sources and enabled compiler caches use private invocation directories.
+
+`security_profile` accepts `standard` and `hardened`. The hardened profile
+requires offline Bubblewrap, source review and secure makepkg settings; it
+rejects privileged package integration and requires a second matching build.
+See [hardened AUR admission](./aur.md#optional-hardened-profile) for its limits.
 
 `build_concurrency` defaults to one, not CPU count. Command-boundary validation rejects invalid values; do not rely on historical load-time clamping as a recommended configuration format. Prefer `omg config validate` and inspect warnings about unsupported keys.
 
@@ -80,8 +86,8 @@ omg config set aur.build_concurrency 2
 
 | CLI operation | Accepted keys |
 | --- | --- |
-| `config get` | `data_dir`, `socket`, `telemetry.enabled`, `aur.build_concurrency`, `aur.enable_ccache`, `aur.enable_sccache`, `aur.secure_makepkg`, `aur.makeflags` |
-| `config set` | `telemetry.enabled`, `aur.build_concurrency`, `aur.enable_ccache`, `aur.enable_sccache`, `aur.secure_makepkg`, `aur.makeflags` |
+| `config get` | `data_dir`, `socket`, `telemetry.enabled`, `aur.build_concurrency`, `aur.enable_ccache`, `aur.enable_sccache`, `aur.secure_makepkg`, `aur.security_profile`, `aur.makeflags` |
+| `config set` | `telemetry.enabled`, `aur.build_concurrency`, `aur.enable_ccache`, `aur.enable_sccache`, `aur.secure_makepkg`, `aur.security_profile`, `aur.makeflags` |
 
 `data_dir` and `socket` are read-only here. To change another accepted TOML
 field, edit the file at `omg config path` and validate it. Unknown file keys

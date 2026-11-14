@@ -3,7 +3,7 @@
 use ahash::AHashSet;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,6 +21,9 @@ use tokio::process::Command;
 use tracing::{instrument, warn};
 
 use super::error::AurError;
+#[cfg(test)]
+use super::history::historical_version_not_found_message;
+use super::history::srcinfo_version;
 use super::parallel_build::BuildJob;
 use super::utils::{
     build_user, create_dir_as_user, create_dir_as_user_sync, has_word_boundary_match, is_symlink,
@@ -29,26 +32,44 @@ use super::utils::{
 };
 use super::{approval, artifact_inspector};
 
-use super::super::aur_deps::{check_dependencies_for_outputs, dependency_name};
+use super::super::aur_deps::{check_dependencies_from_metadata, dependency_name};
 use super::super::aur_index::AurIndex;
-use super::super::aur_metadata::{
-    AurJsonPackage, index_path, metadata_index_is_fresh, metadata_path,
-};
+use super::super::aur_metadata::{AurJsonPackage, open_fresh_metadata_index};
 use super::super::aur_sources::{
-    download_sources, parse_sources, parse_vcs_sources, prefetch_vcs_sources,
+    download_sources, http_sources, prefetch_vcs_sources, vcs_sources,
 };
 #[cfg(feature = "pgp")]
 use super::super::pkgbuild::PkgBuild;
-use crate::config::{AurBuildMethod, Settings};
+use crate::config::{AurBuildMethod, AurSecurityProfile, Settings};
 use crate::core::http::shared_client;
 use crate::core::{Package, PackageSource, paths};
-use crate::package_managers::{get_potential_aur_packages, pacman_db};
-use crate::runtimes::common::{
-    BudgetedReader, BudgetedWriter, MAX_DECOMPRESSED_BYTES, decode_xz_to,
+use crate::package_managers::arch_install::{
+    InstallIntent, InstallItem, InstallRequest, InstallTarget, OfficialTarget,
 };
+use crate::package_managers::pacman_db;
+use crate::runtimes::common::MAX_DECOMPRESSED_BYTES;
 
 use crate::core::security::artifact::ArchiveSnapshot;
 const AUR_RPC_URL: &str = "https://aur.archlinux.org/rpc";
+// makepkg records BUILDDIR in .BUILDINFO; physical invocation storage stays private.
+const SANDBOX_BUILD_ROOT: &str = "/omg-build";
+
+fn sandbox_build_root(mount_destinations: &[&Path]) -> Result<PathBuf> {
+    (0..=mount_destinations.len())
+        .map(|index| {
+            if index == 0 {
+                PathBuf::from(SANDBOX_BUILD_ROOT)
+            } else {
+                PathBuf::from(format!("{SANDBOX_BUILD_ROOT}-{index}"))
+            }
+        })
+        .find(|candidate| {
+            mount_destinations.iter().all(|destination| {
+                !destination.starts_with(candidate) && !candidate.starts_with(destination)
+            })
+        })
+        .context("Sandbox build root overlaps an existing mount")
+}
 
 const AUR_GIT_URL: &str = "https://aur.archlinux.org";
 const AUR_RPC_MAX_URI: usize = 4400;
@@ -161,6 +182,9 @@ fn create_scoped_pgp_home(
     source_home: &Path,
     cache_dir: &Path,
 ) -> Result<tempfile::TempDir> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     use crate::core::security::keyserver;
 
     std::fs::create_dir_all(cache_dir).with_context(|| {
@@ -171,6 +195,7 @@ fn create_scoped_pgp_home(
     })?;
     let build_keyring = tempfile::Builder::new()
         .prefix("aur-pgp-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(cache_dir)
         .context("Failed to create package-scoped AUR PGP keyring")?;
     let gpg = crate::core::privilege::root_controlled_program_path("gpg")?;
@@ -191,7 +216,13 @@ fn create_scoped_pgp_home(
         export_stderr.trim()
     );
     let key_bundle = build_keyring.path().join("trusted-keys.pgp");
-    std::fs::write(&key_bundle, &exported.stdout).context("Failed to stage AUR PGP keys")?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&key_bundle)?
+        .write_all(&exported.stdout)
+        .context("Failed to stage AUR PGP keys")?;
     let imported = std::process::Command::new(&gpg)
         .arg("--no-options")
         .arg("--batch")
@@ -323,32 +354,39 @@ pub(crate) struct AuthorizedBuild {
     reviewed_digest: ReviewedSource,
 }
 
+/// Sealed outputs admitted under the build's actual security profile.
+#[derive(Debug)]
+pub(crate) struct BuiltPackages {
+    archives: Vec<ArchiveSnapshot>,
+    profile: AurSecurityProfile,
+    requested_outputs: BTreeSet<String>,
+}
+
+impl BuiltPackages {
+    pub(crate) fn len(&self) -> usize {
+        self.archives.len()
+    }
+
+    fn require_profile(&self, current: AurSecurityProfile) -> Result<()> {
+        anyhow::ensure!(
+            current != AurSecurityProfile::Hardened || self.profile == AurSecurityProfile::Hardened,
+            "Packages built under the Standard AUR profile cannot be installed under the current Hardened profile; rebuild them under Hardened settings"
+        );
+        Ok(())
+    }
+}
+
 /// The exact local source files approved before any build command runs.
 #[derive(Debug)]
 struct ReviewedSource {
     files: std::collections::BTreeMap<PathBuf, Vec<u8>>,
     digest: String,
+    parsed_srcinfo: OnceLock<Arc<alpm_srcinfo::SourceInfoV1>>,
 }
 
 impl ReviewedSource {
     fn read_source_file(path: &Path) -> Result<Vec<u8>> {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-            .open(path)?;
-        anyhow::ensure!(
-            file.metadata()?.is_file(),
-            "AUR source must be a regular file"
-        );
-        let mut bytes = Vec::new();
-        file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        anyhow::ensure!(
-            bytes.len() <= 16 * 1024 * 1024,
-            "AUR source file exceeds limit"
-        );
-        Ok(bytes)
+        super::source_file::read_regular(path)
     }
     fn capture(directory: &Path) -> Result<Self> {
         fn visit(
@@ -375,7 +413,7 @@ impl ReviewedSource {
                         relative.as_path() != Path::new("PKGBUILD")
                             && relative.as_path() != Path::new(".SRCINFO"),
                         "AUR {} must be a regular file, not a symlink",
-                        relative.display()
+                        review_path(&relative)
                     );
                     let target = std::fs::read_link(&path)?;
                     contained_aur_symlink_target(root, &path, &target)?;
@@ -395,7 +433,7 @@ impl ReviewedSource {
                 } else {
                     anyhow::ensure!(
                         metadata.is_file()
-                            && metadata.len() <= 16 * 1024 * 1024
+                            && metadata.len() <= super::source_file::MAX_SOURCE_FILE_BYTES
                             && files.len() < 10_000,
                         "AUR source manifest exceeds file/count limits"
                     );
@@ -436,7 +474,33 @@ impl ReviewedSource {
         Ok(Self {
             files,
             digest: hex::encode(hash.finalize()),
+            parsed_srcinfo: OnceLock::new(),
         })
+    }
+
+    fn optional_srcinfo(&self) -> Result<Option<Arc<alpm_srcinfo::SourceInfoV1>>> {
+        if let Some(parsed) = self.parsed_srcinfo.get() {
+            return Ok(Some(Arc::clone(parsed)));
+        }
+        let Some(bytes) = self.files.get(Path::new(".SRCINFO")) else {
+            return Ok(None);
+        };
+        let content = std::str::from_utf8(bytes).context("Failed to read .SRCINFO")?;
+        let parsed = Arc::new(
+            alpm_srcinfo::SourceInfoV1::from_string(content).context("Failed to parse .SRCINFO")?,
+        );
+        let _ = self.parsed_srcinfo.set(Arc::clone(&parsed));
+        Ok(Some(Arc::clone(
+            self.parsed_srcinfo.get().unwrap_or(&parsed),
+        )))
+    }
+
+    fn required_srcinfo(&self, package: &str) -> Result<Arc<alpm_srcinfo::SourceInfoV1>> {
+        self.optional_srcinfo()
+            .with_context(|| format!("Failed to inspect dependencies for '{package}'"))?
+            .with_context(|| format!(
+            "AUR package '{package}' has no regular .SRCINFO; refusing to source its PKGBUILD to discover dependencies"
+        ))
     }
 
     fn verify(&self, directory: &Path) -> Result<()> {
@@ -451,7 +515,7 @@ impl ReviewedSource {
         let bytes = self
             .files
             .get(path)
-            .with_context(|| format!("Unreviewed AUR input: {}", path.display()))?;
+            .with_context(|| format!("Unreviewed AUR input: {}", review_path(path)))?;
         Ok(std::str::from_utf8(bytes)?)
     }
 }
@@ -468,11 +532,11 @@ fn encode_symlink_manifest(target: &Path) -> Vec<u8> {
 /// links that stay in the checkout (license files, vendor aliases) are
 /// hashed by target string, never followed.
 fn contained_aur_symlink_target(root: &Path, link_path: &Path, target: &Path) -> Result<()> {
+    let link_display = review_path(link_path);
+    let target_display = review_path(target);
     anyhow::ensure!(
         target.is_relative(),
-        "AUR source symlink must be relative: {} -> {}",
-        link_path.display(),
-        target.display()
+        "AUR source symlink must be relative: {link_display} -> {target_display}"
     );
     let mut resolved = link_path
         .parent()
@@ -484,25 +548,19 @@ fn contained_aur_symlink_target(root: &Path, link_path: &Path, target: &Path) ->
             std::path::Component::ParentDir => {
                 anyhow::ensure!(
                     resolved.starts_with(root) && resolved != root && resolved.pop(),
-                    "AUR source symlink escapes the checkout: {} -> {}",
-                    link_path.display(),
-                    target.display()
+                    "AUR source symlink escapes the checkout: {link_display} -> {target_display}"
                 );
             }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 anyhow::bail!(
-                    "AUR source symlink must be relative: {} -> {}",
-                    link_path.display(),
-                    target.display()
+                    "AUR source symlink must be relative: {link_display} -> {target_display}"
                 );
             }
         }
     }
     anyhow::ensure!(
         resolved.starts_with(root) && resolved != root,
-        "AUR source symlink escapes the checkout: {} -> {}",
-        link_path.display(),
-        target.display()
+        "AUR source symlink escapes the checkout: {link_display} -> {target_display}"
     );
     Ok(())
 }
@@ -510,8 +568,69 @@ fn contained_aur_symlink_target(root: &Path, link_path: &Path, target: &Path) ->
 #[derive(Debug)]
 struct AurDependencyPlan {
     aur_dependencies: Vec<String>,
-    official_dependencies: Vec<String>,
+    official_dependencies: Vec<OfficialTarget>,
     package_outputs: Vec<String>,
+}
+
+fn resolve_official_dependency(
+    alpm: &alpm::Alpm,
+    relation: &str,
+) -> Result<Option<OfficialTarget>> {
+    for database in alpm.syncdbs() {
+        if database.usage()?.contains(alpm::Usage::INSTALL) {
+            crate::package_managers::alpm_ops::validate_sync_database(alpm, database)?;
+        }
+    }
+    alpm.syncdbs()
+        .find_satisfier(relation)
+        .map(|package| {
+            Ok(OfficialTarget {
+                repository: package
+                    .db()
+                    .context("Official satisfier has no repository")?
+                    .name()
+                    .to_owned(),
+                name: package.name().to_owned(),
+                relations: vec![relation.to_owned()],
+            })
+        })
+        .transpose()
+}
+
+fn reconcile_official_dependency(alpm: &alpm::Alpm, selected: &mut OfficialTarget) -> Result<()> {
+    use crate::package_managers::types::{dependency_version_satisfies, provision_satisfies};
+
+    for database in alpm.syncdbs() {
+        if !database.usage()?.contains(alpm::Usage::INSTALL) {
+            continue;
+        }
+        let candidate = match database.pkg(selected.name.as_str()) {
+            Ok(candidate) => candidate,
+            Err(alpm::Error::PkgNotFound) => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Failed to inspect '{}/{}'", database.name(), selected.name)
+                });
+            }
+        };
+        if selected.relations.iter().all(|relation| {
+            let direct = candidate.name() == dependency_name(relation)
+                && dependency_version_satisfies(relation, candidate.version().as_str());
+            let provided = candidate
+                .provides()
+                .into_iter()
+                .any(|provided| provision_satisfies(relation, &provided.to_string()));
+            direct || provided
+        }) {
+            database.name().clone_into(&mut selected.repository);
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "No install-eligible version of '{}' satisfies all required relations: {}",
+        selected.name,
+        selected.relations.join(", ")
+    )
 }
 
 /// Identity and .INSTALL payload extracted from one package archive
@@ -789,6 +908,13 @@ struct AurReviewFiles<'a> {
     digest: String,
 }
 
+/// Keep untrusted source names visible as single-line data, including literal
+/// backslashes, controls and invisible Unicode. Filesystem and hash inputs
+/// retain their original bytes.
+fn review_path(path: &Path) -> String {
+    path.to_string_lossy().escape_debug().to_string()
+}
+
 fn pkgbuild_review_panel(
     package: &str,
     digest: &str,
@@ -853,16 +979,12 @@ fn pkgbuild_review_panel(
     }
 
     let mut file_names = vec!["PKGBUILD".to_string()];
-    file_names.extend(
-        extra_files
-            .iter()
-            .map(|file| file.relative.display().to_string()),
-    );
+    file_names.extend(extra_files.iter().map(|file| review_path(file.relative)));
     lines.push(chrome::kv("files", &file_names.join("  ")));
     lines.push(chrome::kv("sha-256", digest));
     lines.push(chrome::kv(
         "open",
-        &chrome::osc8_file(pkgbuild_path, &pkgbuild_path.display().to_string()),
+        &chrome::osc8_file(pkgbuild_path, &review_path(pkgbuild_path)),
     ));
     lines.push(chrome::rail_line(""));
 
@@ -876,7 +998,7 @@ fn pkgbuild_review_panel(
                 "file",
                 &format!(
                     "{}  {} B  {}",
-                    file.relative.display(),
+                    review_path(file.relative),
                     file.bytes,
                     file.digest
                 ),
@@ -907,10 +1029,7 @@ fn pkgbuild_review_panel(
     // these reviewed bytes before any root installation.
     for (name, contents) in install_hooks {
         lines.push(chrome::rail_line(""));
-        lines.push(chrome::kv(
-            "hook",
-            &crate::cli::style::sanitize_terminal_text(name),
-        ));
+        lines.push(chrome::kv("hook", &review_path(Path::new(name))));
         for (number, line) in contents.lines().enumerate() {
             lines.push(chrome::snippet_line(number + 1, line));
         }
@@ -949,16 +1068,17 @@ fn declared_install_hook_previews(source: &ReviewedSource) -> Result<Vec<(String
     names
         .into_iter()
         .map(|name| {
+            let display_name = review_path(Path::new(&name));
             let bytes = source
                 .files
                 .get(Path::new(&name))
-                .with_context(|| format!("Declared install hook is absent: {name}"))?;
+                .with_context(|| format!("Declared install hook is absent: {display_name}"))?;
             anyhow::ensure!(
                 bytes.len() <= MAX_PKGBUILD_REVIEW_BYTES,
-                "Install hook {name} exceeds the review limit"
+                "Install hook {display_name} exceeds the review limit"
             );
             let text = std::str::from_utf8(bytes)
-                .with_context(|| format!("Install hook {name} is not UTF-8"))?;
+                .with_context(|| format!("Install hook {display_name} is not UTF-8"))?;
             // Make control/bidi bytes visible instead of silently removing them.
             let contents = text
                 .chars()
@@ -1189,6 +1309,22 @@ fn redact_aur_transport_error(_: reqwest::Error) -> anyhow::Error {
     AurRpcRequestError::Transport.into()
 }
 
+async fn finish_metadata_read(
+    worker: tokio::task::JoinHandle<Result<Option<AurIndex>>>,
+) -> Option<AurIndex> {
+    match worker.await {
+        Ok(Ok(index)) => index,
+        Ok(Err(error)) => {
+            warn!("Failed to open fresh AUR metadata: {error:#}");
+            None
+        }
+        Err(error) => {
+            warn!("AUR metadata freshness worker failed: {error}");
+            None
+        }
+    }
+}
+
 impl AurClient {
     pub fn new() -> Result<Self> {
         let settings = Settings::load().context("Failed to load OMG settings for AUR")?;
@@ -1201,51 +1337,8 @@ impl AurClient {
         })
     }
 
-    /// This inode must survive removal and recreation of the build tree.
     fn open_lifecycle_lock(&self) -> Result<File> {
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-        let lock_path = self.build_dir.with_added_extension("lifecycle.lock");
-        let parent = lock_path
-            .parent()
-            .context("AUR build directory has no parent")?;
-        create_dir_as_user_sync(parent)?;
-        let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-        let (file, created) = match options.create_new(true).open(&lock_path) {
-            Ok(file) => (file, true),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                (options.create_new(false).open(&lock_path)?, false)
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to open AUR lifecycle lock {}", lock_path.display())
-                });
-            }
-        };
-        let metadata = file.metadata()?;
-        anyhow::ensure!(
-            metadata.is_file() && metadata.nlink() == 1,
-            "AUR lifecycle lock must be a single-link regular file"
-        );
-        if let Some(user) = original_user() {
-            let account = nix::unistd::User::from_name(&user)?
-                .with_context(|| format!("Original user '{user}' has no system account"))?;
-            if created {
-                nix::unistd::fchown(&file, Some(account.uid), Some(account.gid))
-                    .context("Failed to set AUR lifecycle lock ownership")?;
-            } else {
-                anyhow::ensure!(
-                    metadata.uid() == account.uid.as_raw(),
-                    "Existing AUR lifecycle lock is not owned by the original user"
-                );
-            }
-        }
-        Ok(file)
+        super::utils::open_build_lifecycle_lock(&self.build_dir)
     }
 
     /// File ownership spans async build work intentionally. Acquisition never
@@ -1281,15 +1374,7 @@ impl AurClient {
         create_dir_as_user(&lock_dir).await?;
         let lock_path = lock_dir.join(format!("{package_base}.lock"));
         self.blocking_build_work(move || -> Result<File> {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-                .with_context(|| {
-                    format!("Failed to open AUR build lock {}", lock_path.display())
-                })?;
+            let file = super::utils::open_effective_user_lock(&lock_path)?;
             file.lock().with_context(|| {
                 format!("Failed to acquire AUR build lock {}", lock_path.display())
             })?;
@@ -1317,27 +1402,16 @@ impl AurClient {
         self.settings.aur.build_concurrency.max(1)
     }
 
-    async fn fresh_metadata_index_path(&self) -> Option<PathBuf> {
+    async fn fresh_metadata_index(&self) -> Option<AurIndex> {
         if !self.settings.aur.use_metadata_archive {
             return None;
         }
 
-        let archive_path = metadata_path();
-        let index_path = index_path();
         let ttl = Duration::from_secs(self.settings.aur.metadata_cache_ttl_secs);
-        match tokio::task::spawn_blocking({
-            let index_path = index_path.clone();
-            move || metadata_index_is_fresh(&archive_path, &index_path, ttl)
-        })
+        finish_metadata_read(tokio::task::spawn_blocking(move || {
+            open_fresh_metadata_index(ttl)
+        }))
         .await
-        {
-            Ok(true) => Some(index_path),
-            Ok(false) => None,
-            Err(error) => {
-                warn!("AUR metadata freshness check failed: {error}");
-                None
-            }
-        }
     }
 
     /// Search AUR packages
@@ -1346,10 +1420,9 @@ impl AurClient {
 
         // Try the binary index only while its source archive is within the
         // configured TTL. Stale indexes fall through to the live RPC.
-        if let Some(index_path) = self.fresh_metadata_index_path().await {
+        if let Some(index) = self.fresh_metadata_index().await {
             let query_owned = query.to_string();
             let result = tokio::task::spawn_blocking(move || -> Result<Vec<Package>> {
-                let index = AurIndex::open(&index_path)?;
                 // Install resolution consumes this bounded search: reserve its
                 // exact source/binary identities before substring matches fill it.
                 let binary_name = format!("{query_owned}-bin");
@@ -1510,10 +1583,9 @@ impl AurClient {
         crate::core::security::validate_package_name(package)?;
 
         // Try the binary index only while its source archive is fresh.
-        if let Some(index_path) = self.fresh_metadata_index_path().await {
+        if let Some(index) = self.fresh_metadata_index().await {
             let package_owned = package.to_string();
             let result = tokio::task::spawn_blocking(move || -> Result<Option<Package>> {
-                let index = AurIndex::open(&index_path)?;
                 if let Some(entry) = index.get(&package_owned)? {
                     validate_index_entry_name(entry.name.as_str(), Some(&package_owned))?;
                     // A corrupt index version must not compare as a fabricated
@@ -1599,15 +1671,29 @@ impl AurClient {
     pub async fn get_update_list(&self) -> Result<Vec<(String, Version, Version)>> {
         // 1. Get all packages not in official repos
         let foreign_packages = tokio::task::spawn_blocking(|| -> Result<Vec<String>> {
-            let mut packages = get_potential_aur_packages()?;
+            let packages = pacman_db::get_potential_aur_package_records()?;
             if packages.is_empty() {
-                return Ok(packages);
+                return Ok(Vec::new());
             }
             let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
                 .context("Failed to load AUR update filters from pacman.conf")?;
-            let ignored = pacman_db::compile_ignore_patterns(&config.ignore_pkg, "IgnorePkg")?;
-            packages.retain(|name| !ignored.is_match(name));
-            Ok(packages)
+            let ignored = pacman_db::compile_package_patterns(&config.ignore_pkg, "IgnorePkg")?;
+            let ignored_groups =
+                pacman_db::compile_package_patterns(&config.ignore_group, "IgnoreGroup")?;
+            let mut retained = Vec::with_capacity(packages.len());
+            for package in packages {
+                if ignored.is_match(&package.name) {
+                    continue;
+                }
+                if !package
+                    .groups
+                    .iter()
+                    .any(|group| ignored_groups.is_match(group))
+                {
+                    retained.push(package.name);
+                }
+            }
+            Ok(retained)
         })
         .await
         .context("AUR foreign-package scan task failed")??;
@@ -1620,30 +1706,23 @@ impl AurClient {
         // Update discovery never synchronously refreshes global metadata: if
         // the index is stale, absent, unreadable, or errors, fall straight
         // through to the AUR RPC instead.
-        if let Some(index_path) = self.fresh_metadata_index_path().await {
+        if let Some(index) = self.fresh_metadata_index().await {
             let local_names = foreign_packages.clone();
             let result = tokio::task::spawn_blocking(
-                move || -> Result<Option<(Vec<(String, Version, Version)>, Vec<String>)>> {
+                move || -> Result<(Vec<(String, Version, Version)>, Vec<String>)> {
                     let mut local_pkgs = Vec::with_capacity(local_names.len());
                     for name in local_names {
                         if let Some(package) = pacman_db::get_local_package(&name)? {
                             local_pkgs.push((name, package.version));
                         }
                     }
-                    let index = match AurIndex::open(&index_path) {
-                        Ok(idx) => idx,
-                        Err(e) => {
-                            warn!("Failed to open AUR index: {}. Will fallback to RPC.", e);
-                            return Ok(None);
-                        }
-                    };
 
-                    Ok(Some(index.updates_for(&local_pkgs)?))
+                    index.updates_for(&local_pkgs)
                 },
             )
             .await?;
 
-            if let Ok(Some((mut updates, missing))) = result {
+            if let Ok((mut updates, missing)) = result {
                 if missing.is_empty() {
                     tracing::debug!("AUR update check completed via binary index");
                     return Ok(updates);
@@ -1922,17 +2001,14 @@ impl AurClient {
     }
 
     fn begin_rollback_worktree(work: &Path, base: &str) -> Result<tempfile::TempDir> {
+        use std::os::unix::fs::PermissionsExt;
+
         crate::core::security::validate_package_name(base)?;
         tempfile::Builder::new()
             .prefix(&format!("{base}-"))
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(work)
             .context("Failed to create owned AUR rollback checkout")
-    }
-
-    fn historical_version_not_found_message(base: &str, version: &str) -> String {
-        format!(
-            "version {version} of '{base}' was not found in the AUR git history (the repository may have been force-pushed since it was installed)"
-        )
     }
 
     fn historical_build_failure_message(package: &str, version: &str, log_path: &Path) -> String {
@@ -1974,96 +2050,8 @@ impl AurClient {
         let checkout_owner = Self::begin_rollback_worktree(&work, &base)?;
         let repo_dir = checkout_owner.path().to_path_buf();
 
-        // Full-history partial clone (blobs fetched on demand at checkout).
         let url = format!("{AUR_GIT_URL}/{base}.git");
-        let clone = Command::new("git")
-            .kill_on_drop(true)
-            .args([
-                "clone",
-                "--filter=blob:none",
-                "--",
-                &url,
-                repo_dir.to_string_lossy().as_ref(),
-            ])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .output()
-            .await;
-        match clone {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => {
-                let stderr = crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(
-                    &output.stderr,
-                ));
-                anyhow::bail!(
-                    "Failed to clone AUR history for '{base}': {}",
-                    stderr.trim()
-                );
-            }
-            Err(error) => {
-                anyhow::bail!("git is required for AUR version rollback: {error}");
-            }
-        }
-
-        // Walk commits newest -> oldest looking for the recorded version.
-        let shas = Command::new("git")
-            .kill_on_drop(true)
-            .args(["-C"])
-            .arg(&repo_dir)
-            .args(["log", "--format=%H"])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .output()
-            .await
-            .context("Failed to list AUR repository history")?;
-        if !shas.status.success() {
-            let stderr =
-                crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&shas.stderr));
-            anyhow::bail!("Failed to list AUR history for '{base}': {}", stderr.trim());
-        }
-        let sha_list = String::from_utf8_lossy(&shas.stdout);
-        let mut matched_sha: Option<String> = None;
-        for sha in sha_list.lines().map(str::trim).filter(|s| !s.is_empty()) {
-            let show = Command::new("git")
-                .kill_on_drop(true)
-                .args(["-C"])
-                .arg(&repo_dir)
-                .args(["show", &format!("{sha}:.SRCINFO")])
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .stdin(Stdio::null())
-                .output()
-                .await
-                .context("Failed to read .SRCINFO from history")?;
-            if !show.status.success() {
-                continue; // commit predates .SRCINFO generation or blob gone
-            }
-            let content = String::from_utf8_lossy(&show.stdout);
-            if Self::srcinfo_version(&content).as_deref() == Some(version) {
-                matched_sha = Some(sha.to_string());
-                break;
-            }
-        }
-
-        let Some(sha) = matched_sha else {
-            anyhow::bail!(
-                "{}",
-                Self::historical_version_not_found_message(&base, version)
-            );
-        };
-
-        let checkout = Command::new("git")
-            .kill_on_drop(true)
-            .args(["-C"])
-            .arg(&repo_dir)
-            .args(["checkout", "--detach", &sha])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .status()
-            .await
-            .context("Failed to checkout historical commit")?;
-        if !checkout.success() {
-            anyhow::bail!("Failed to checkout commit {sha} of '{base}'");
-        }
+        super::history::checkout_version(&url, &repo_dir, &base, version).await?;
 
         // Use the same hardened validation, environment, and sandboxing
         // pipeline as regular installs.
@@ -2084,7 +2072,9 @@ impl AurClient {
         // ALWAYS show the review prompt during rollback rebuilds,
         // independent of the user's day-to-day review preference.
         let pkgbuild_path = pkg_dir.join("PKGBUILD");
-        let reviewed_digest = Self::review_pkgbuild(package, &pkgbuild_path).await?;
+        let reviewed_digest =
+            Self::review_pkgbuild(package, &pkgbuild_path, self.settings.aur.security_profile)
+                .await?;
         set_reproducible_source_epoch(&mut env, &reviewed_digest)?;
         env.pgp_home = Self::fetch_missing_pgp_keys(&pkgbuild_path).await?;
         println!(
@@ -2093,7 +2083,7 @@ impl AurClient {
         );
         reviewed_digest.verify(&pkg_dir)?;
         let status = self
-            .run_build(&pkg_dir, &env, package)
+            .run_build(&pkg_dir, &env, package, &reviewed_digest)
             .await
             .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
         if !status.success() {
@@ -2122,12 +2112,13 @@ impl AurClient {
                 &reviewed_digest,
                 &base,
                 &[package.to_owned()],
+                &[package.to_owned()],
                 false,
                 &pkg_dir,
                 &env,
             )
             .await?;
-        Self::install_built_packages(&archives, sudoloop.as_ref()).await?;
+        Self::install_built_packages(std::slice::from_ref(&archives), sudoloop.as_ref()).await?;
         crate::cli::modern_ui::print_success(&format!("Installed {package} {version}"));
         // Use async cleanup on success and report failures. The owner also
         // attempts cleanup on error/cancellation; logs remain outside this tree.
@@ -2138,32 +2129,6 @@ impl AurClient {
             );
         }
         Ok(())
-    }
-
-    /// Extract `pkgver-pkgrel` from `.SRCINFO` text (first occurrences).
-    fn srcinfo_version(content: &str) -> Option<String> {
-        let mut epoch: Option<&str> = None;
-        let mut pkgver: Option<&str> = None;
-        let mut pkgrel: Option<&str> = None;
-        for line in content.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            match key.trim() {
-                "epoch" if epoch.is_none() => epoch = Some(value.trim()),
-                "pkgver" if pkgver.is_none() => pkgver = Some(value.trim()),
-                "pkgrel" if pkgrel.is_none() => pkgrel = Some(value.trim()),
-                _ => {}
-            }
-        }
-        let prefix = epoch
-            .filter(|value| !value.is_empty())
-            .map_or_else(String::new, |value| format!("{value}:"));
-        match (pkgver, pkgrel) {
-            (Some(v), Some(r)) => Some(format!("{prefix}{v}-{r}")),
-            (Some(v), None) => Some(format!("{prefix}{v}")),
-            _ => None,
-        }
     }
 
     pub async fn install(&self, package: &str) -> Result<()> {
@@ -2292,7 +2257,8 @@ impl AurClient {
             return Err(AurError::PkgbuildNotFound(package.to_string()).into());
         }
         let reviewed_digest = if self.settings.aur.review_pkgbuild {
-            Self::review_pkgbuild(package, &pkgbuild_path).await?
+            Self::review_pkgbuild(package, &pkgbuild_path, self.settings.aur.security_profile)
+                .await?
         } else {
             ReviewedSource::capture(&pkg_dir)?
         };
@@ -2325,7 +2291,7 @@ impl AurClient {
             .install_authorized_package_outputs(authorized, sudoloop.as_ref())
             .await?;
         crate::cli::modern_ui::print_info(&format!("Installing {output_names}"));
-        Self::install_built_packages(&archives, sudoloop.as_ref()).await?;
+        Self::install_built_packages(std::slice::from_ref(&archives), sudoloop.as_ref()).await?;
         crate::cli::modern_ui::print_success(&format!("Installed {output_names}"));
         Ok(())
     }
@@ -2334,7 +2300,7 @@ impl AurClient {
         &self,
         authorized: AuthorizedBuild,
         sudoloop: Option<&crate::core::sudoloop::SudoLoop>,
-    ) -> Result<Vec<ArchiveSnapshot>> {
+    ) -> Result<BuiltPackages> {
         let AuthorizedBuild {
             lifecycle_guard: _lifecycle_guard,
             package,
@@ -2358,9 +2324,9 @@ impl AurClient {
         env.pgp_home = pgp_home;
 
         let dependency_plan = self
-            .aur_dependency_plan(&pkg_dir, &package, &requested_outputs)
+            .aur_dependency_plan(&reviewed_digest, &package, &requested_outputs)
             .await?;
-        let requested_outputs = dependency_plan.package_outputs;
+        let package_outputs = dependency_plan.package_outputs;
         let mut dependency_builds =
             AHashSet::from_iter([package.clone(), Self::package_base_marker(&package)]);
         drop(package_checkout_file_guard);
@@ -2373,17 +2339,20 @@ impl AurClient {
             let dep_packages = self
                 .build_only(&dep, &mut dependency_builds, sudoloop)
                 .await?;
-            Self::install_built_packages(&dep_packages, sudoloop).await?;
+            Self::install_built_packages(std::slice::from_ref(&dep_packages), sudoloop).await?;
             crate::cli::modern_ui::print_success(&format!("Installed dependency: {dep}"));
         }
-        self.ensure_dependencies_satisfied(&pkg_dir, &requested_outputs)
+        self.ensure_dependencies_satisfied(&reviewed_digest, &package_outputs)
             .await?;
 
         let _package_build_guard = package_lock.lock().await;
         let _package_build_file_guard = self.acquire_package_base_file_lock(&package).await?;
 
         // Best-effort pre-download: makepkg still fetches anything we miss.
-        match parse_sources(&pkg_dir) {
+        match reviewed_digest
+            .optional_srcinfo()
+            .map(|metadata| metadata.map_or_else(Vec::new, |info| http_sources(&info)))
+        {
             Ok(sources) if sources.is_empty() => {}
             Ok(sources) => {
                 let summary = download_sources(sources, &env.srcdest).await;
@@ -2404,7 +2373,10 @@ impl AurClient {
 
         // Best-effort VCS mirroring: it warms SRCDEST for a later offline
         // rebuild, but a failure here is not fatal when networking is allowed.
-        match parse_vcs_sources(&pkg_dir) {
+        match reviewed_digest
+            .optional_srcinfo()
+            .map(|metadata| metadata.map_or_else(Vec::new, |info| vcs_sources(&info)))
+        {
             Ok(vcs_sources) if !vcs_sources.is_empty() => {
                 let summary = prefetch_vcs_sources(&vcs_sources, &env.srcdest).await;
                 if !summary.needs_network.is_empty() {
@@ -2420,52 +2392,31 @@ impl AurClient {
             }
         }
 
-        let cache_key = self.cache_key(&pkg_dir, &env.makeflags)?;
-
-        let cached = Self::cached_artifacts(
-            &package,
-            &requested_outputs,
-            &pkg_dir,
-            &env.pkgdest,
-            &cache_key,
-        );
-        let mut pkg_files = match cached {
-            Some(archives) => {
-                crate::cli::modern_ui::print_info(&format!("Using cached build for {package}"));
-                archives
+        reviewed_digest.verify(&pkg_dir)?;
+        let log_path = self.build_log_path(&package);
+        let status = self
+            .run_build(&pkg_dir, &env, &package, &reviewed_digest)
+            .await
+            .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
+        if !status.success() {
+            return Err(AurError::BuildFailed {
+                package: package.clone(),
+                log_path: log_path.display().to_string(),
             }
-            None => Vec::new(),
-        };
-
-        let fresh = pkg_files.is_empty();
-        if fresh {
-            reviewed_digest.verify(&pkg_dir)?;
-            let log_path = self.build_log_path(&package);
-
-            let status = self
-                .run_build(&pkg_dir, &env, &package)
-                .await
-                .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
-
-            if !status.success() {
-                return Err(AurError::BuildFailed {
-                    package: package.clone(),
-                    log_path: log_path.display().to_string(),
-                }
-                .into());
-            }
-
-            pkg_files = Self::find_built_packages(&pkg_dir, &env.pkgdest, &requested_outputs)
-                .await
-                .map_err(|_| AurError::PackageArchiveNotFound(package.clone()))?;
+            .into());
         }
+
+        let pkg_files = Self::find_built_packages(&pkg_dir, &env.pkgdest, &package_outputs)
+            .await
+            .map_err(|_| AurError::PackageArchiveNotFound(package.clone()))?;
 
         self.authorize_with_paired_build(
             &pkg_files,
             &reviewed_digest,
             &package,
+            &package_outputs,
             &requested_outputs,
-            fresh,
+            true,
             &pkg_dir,
             &env,
         )
@@ -2477,7 +2428,7 @@ impl AurClient {
         package: &'a str,
         in_flight: &'a mut AHashSet<String>,
         sudoloop: Option<&'a crate::core::sudoloop::SudoLoop>,
-    ) -> BoxFuture<'a, Result<Vec<ArchiveSnapshot>>> {
+    ) -> BoxFuture<'a, Result<BuiltPackages>> {
         async move {
             Self::enter_dependency_build(in_flight, package)?;
             let package_base = match self.resolve_package_base(package).await {
@@ -2526,7 +2477,7 @@ impl AurClient {
         package_base: &str,
         in_flight: &mut AHashSet<String>,
         sudoloop: Option<&crate::core::sudoloop::SudoLoop>,
-    ) -> Result<Vec<ArchiveSnapshot>> {
+    ) -> Result<BuiltPackages> {
         crate::core::security::validate_package_name(package)?;
         let package_lock = self.package_base_lock(package_base);
         let package_checkout_guard = package_lock.lock().await;
@@ -2587,14 +2538,19 @@ impl AurClient {
         // Same hash seal as install_package_outputs: re-verify the reviewed
         // PKGBUILD right before this dependency build runs.
         let reviewed_digest = if self.settings.aur.review_pkgbuild {
-            Self::review_pkgbuild(package_base, &pkgbuild_path).await?
+            Self::review_pkgbuild(
+                package_base,
+                &pkgbuild_path,
+                self.settings.aur.security_profile,
+            )
+            .await?
         } else {
             ReviewedSource::capture(&pkg_dir)?
         };
         let pgp_home = Self::fetch_missing_pgp_keys(&pkgbuild_path).await?;
 
         let dependency_plan = self
-            .aur_dependency_plan(&pkg_dir, package, &[package.to_string()])
+            .aur_dependency_plan(&reviewed_digest, package, &[package.to_string()])
             .await?;
         let package_outputs = dependency_plan.package_outputs;
         drop(package_checkout_file_guard);
@@ -2605,10 +2561,10 @@ impl AurClient {
                 "Installing AUR dependency for {package}: {dependency}"
             ));
             let archives = self.build_only(&dependency, in_flight, sudoloop).await?;
-            Self::install_built_packages(&archives, sudoloop).await?;
+            Self::install_built_packages(std::slice::from_ref(&archives), sudoloop).await?;
             crate::cli::modern_ui::print_success(&format!("Installed dependency: {dependency}"));
         }
-        self.ensure_dependencies_satisfied(&pkg_dir, &package_outputs)
+        self.ensure_dependencies_satisfied(&reviewed_digest, &package_outputs)
             .await?;
 
         let _package_build_guard = package_lock.lock().await;
@@ -2616,31 +2572,10 @@ impl AurClient {
         let mut env = self.makepkg_env(&pkg_dir).await?;
         set_reproducible_source_epoch(&mut env, &reviewed_digest)?;
         env.pgp_home = pgp_home;
-        let cache_key = self.cache_key(&pkg_dir, &env.makeflags)?;
-        if let Some(archives) = Self::cached_artifacts(
-            package_base,
-            &package_outputs,
-            &pkg_dir,
-            &env.pkgdest,
-            &cache_key,
-        ) {
-            return self
-                .authorize_with_paired_build(
-                    &archives,
-                    &reviewed_digest,
-                    package_base,
-                    &package_outputs,
-                    false,
-                    &pkg_dir,
-                    &env,
-                )
-                .await;
-        }
-
         reviewed_digest.verify(&pkg_dir)?;
         let log_path = self.build_log_path(package);
         let status = self
-            .run_build(&pkg_dir, &env, package)
+            .run_build(&pkg_dir, &env, package, &reviewed_digest)
             .await
             .with_context(|| format!("Failed to run makepkg for '{package}'"))?;
 
@@ -2660,6 +2595,7 @@ impl AurClient {
             &reviewed_digest,
             package_base,
             &package_outputs,
+            &[],
             true,
             &pkg_dir,
             &env,
@@ -2857,7 +2793,7 @@ impl AurClient {
     ) -> Result<Vec<ArchiveSnapshot>> {
         let srcinfo = source.text(Path::new(".SRCINFO"))?;
         let expected_version =
-            Self::srcinfo_version(srcinfo).context("Missing reviewed package version")?;
+            srcinfo_version(srcinfo).context("Missing reviewed package version")?;
         anyhow::ensure!(
             Self::srcinfo_pkgbase(srcinfo) == Some(base)
                 && paths.len() == outputs.len()
@@ -2878,7 +2814,8 @@ impl AurClient {
             .zip(outputs)
             .map(|(path, output)| {
                 let snapshot = ArchiveSnapshot::capture(path)?;
-                let inspection = artifact_inspector::inspect_archive(&snapshot.path())?;
+                let admission = artifact_inspector::inspect_archive(&snapshot.path())?;
+                let inspection = admission.inspection();
                 snapshot.verify_sha256(&inspection.archive_sha256)?;
                 let identity = Self::cached_archive_identity(Path::new(&snapshot.handoff()))?
                     .context("Archive lacks package identity")?;
@@ -2944,6 +2881,7 @@ impl AurClient {
             source.digest.as_str(),
             env.makeflags.as_str(),
             method.as_str(),
+            self.settings.aur.security_profile.as_str(),
             makepkg_args.as_str(),
             if self.settings.aur.secure_makepkg {
                 "secure-makepkg"
@@ -3010,20 +2948,39 @@ impl AurClient {
         source: &ReviewedSource,
         base: &str,
         outputs: &[String],
+        requested_outputs: &[String],
         fresh: bool,
         pkg_dir: &Path,
         primary_env: &MakepkgEnv,
-    ) -> Result<Vec<ArchiveSnapshot>> {
+    ) -> Result<BuiltPackages> {
+        anyhow::ensure!(
+            requested_outputs
+                .iter()
+                .all(|output| outputs.contains(output)),
+            "Requested AUR outputs must belong to the authorized build output set"
+        );
         let primary = Self::authorize_archives(paths, source, base, outputs, fresh)?;
         let primary_inspections = primary
             .iter()
-            .map(|archive| artifact_inspector::inspect_archive(&archive.path()))
+            .map(|archive| {
+                artifact_inspector::inspect_archive(&archive.path())
+                    .map(artifact_inspector::ArchiveAdmission::into_inspection)
+            })
             .collect::<Result<Vec<_>>>()?;
+        let profile = self.settings.aur.security_profile;
+        self.settings.aur.validate_security_profile()?;
+        for inspection in &primary_inspections {
+            inspection.enforce_profile(profile)?;
+        }
         if !primary_inspections
             .iter()
-            .any(artifact_inspector::ArtifactInspection::requires_paired_build)
+            .any(|inspection| inspection.requires_paired_build_for(profile))
         {
-            return Ok(primary);
+            return Ok(BuiltPackages {
+                archives: primary,
+                profile,
+                requested_outputs: requested_outputs.iter().cloned().collect(),
+            });
         }
 
         let cache_key = self.paired_build_cache_key(source, primary_env, &primary_inspections);
@@ -3041,17 +2998,23 @@ impl AurClient {
                 ],
                 "succeeded",
             )?;
-            return Ok(primary);
+            return Ok(BuiltPackages {
+                archives: primary,
+                profile,
+                requested_outputs: requested_outputs.iter().cloned().collect(),
+            });
         }
 
         crate::cli::modern_ui::print_info(&format!(
-            "Rebuilding high-risk AUR package {base} independently for exact comparison"
+            "Rebuilding AUR package {base} with separate output storage for exact comparison"
         ));
         source.verify(pkg_dir)?;
         let mut secondary_env = self.makepkg_env(pkg_dir).await?;
         set_reproducible_source_epoch(&mut secondary_env, source)?;
         secondary_env.pgp_home = Self::fetch_missing_pgp_keys(&pkg_dir.join("PKGBUILD")).await?;
-        let status = self.run_build(pkg_dir, &secondary_env, base).await?;
+        let status = self
+            .run_build(pkg_dir, &secondary_env, base, source)
+            .await?;
         anyhow::ensure!(
             status.success(),
             "Independent verification build failed for high-risk AUR package {base}"
@@ -3062,7 +3025,10 @@ impl AurClient {
         let secondary = Self::authorize_archives(&secondary_paths, source, base, outputs, fresh)?;
         let secondary_inspections = secondary
             .iter()
-            .map(|archive| artifact_inspector::inspect_archive(&archive.path()))
+            .map(|archive| {
+                artifact_inspector::inspect_archive(&archive.path())
+                    .map(artifact_inspector::ArchiveAdmission::into_inspection)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         // Reproducible Builds recommends rebuilding independently and comparing
@@ -3084,7 +3050,11 @@ impl AurClient {
             ],
             "succeeded",
         )?;
-        Ok(primary)
+        Ok(BuiltPackages {
+            archives: primary,
+            profile,
+            requested_outputs: requested_outputs.iter().cloned().collect(),
+        })
     }
 
     /// Retained metadata/hook regression checks. These are necessary but
@@ -3107,7 +3077,7 @@ impl AurClient {
                 return false;
             }
         };
-        let Some(expected_version) = Self::srcinfo_version(&srcinfo) else {
+        let Some(expected_version) = srcinfo_version(&srcinfo) else {
             tracing::warn!(
                 "Cached artifact provenance for {output}: .SRCINFO has no usable version; rejecting cache hit"
             );
@@ -3371,25 +3341,7 @@ impl AurClient {
             Some(snapshot) => snapshot.reader()?,
             None => File::open(path)?,
         };
-        if path.extension().is_some_and(|ext| ext == "zst") {
-            let decoder = ruzstd::decoding::StreamingDecoder::new(file)
-                .map_err(|error| anyhow::anyhow!("zstd: {error}"))?;
-            Ok(Box::new(BudgetedReader::new(decoder, budget)))
-        } else if path.extension().is_some_and(|ext| ext == "xz") {
-            let temporary = tempfile::NamedTempFile::new()
-                .context("Failed to create temporary AUR package metadata spool")?;
-            let mut output = BudgetedWriter::new(temporary, budget);
-            decode_xz_to(BufReader::new(file), &mut output)
-                .map_err(|error| anyhow::anyhow!("xz: {error}"))?;
-            let mut output = output.into_inner().into_file();
-            output.rewind()?;
-            Ok(Box::new(output))
-        } else {
-            Ok(Box::new(BudgetedReader::new(
-                flate2::read::GzDecoder::new(file),
-                budget,
-            )))
-        }
+        super::archive_reader::decode(file, budget)
     }
 
     fn pkg_name_and_version_from_archive_result(path: &Path) -> Result<Option<(String, String)>> {
@@ -3428,54 +3380,57 @@ impl AurClient {
 
     async fn aur_dependency_plan(
         &self,
-        pkg_dir: &Path,
+        source: &ReviewedSource,
         package: &str,
         requested_outputs: &[String],
     ) -> Result<AurDependencyPlan> {
-        anyhow::ensure!(
-            pkg_dir.join(".SRCINFO").is_file(),
-            "AUR package '{package}' has no regular .SRCINFO; refusing to source its PKGBUILD to discover dependencies"
-        );
-        let dependency_dir = pkg_dir.to_path_buf();
+        let srcinfo = source.required_srcinfo(package)?;
         let requested_outputs = requested_outputs.to_vec();
         let dep_info = tokio::task::spawn_blocking(move || {
-            check_dependencies_for_outputs(&dependency_dir, &requested_outputs)
+            check_dependencies_from_metadata(&srcinfo, &requested_outputs)
         })
         .await
         .context("AUR dependency inspection task failed")?
         .with_context(|| format!("Failed to inspect dependencies for '{package}'"))?;
 
         let package_outputs = dep_info.package_outputs;
-        let missing_dependencies = dep_info.missing;
-        let classified = tokio::task::spawn_blocking(move || {
+        let missing_dependencies = dep_info
+            .missing
+            .into_iter()
+            .filter(|dependency| {
+                let name = dependency_name(dependency);
+                !name.is_empty() && name != package
+            })
+            .collect::<Vec<_>>();
+        let (official_dependencies, other_dependencies) = tokio::task::spawn_blocking(move || {
             crate::package_managers::alpm_direct::with_handle(|alpm| {
-                Ok(missing_dependencies
-                    .into_iter()
-                    .map(|dependency| {
-                        let official_package = alpm
-                            .syncdbs()
-                            .find_satisfier(dependency.clone())
-                            .map(|package| package.name().to_string());
-                        (dependency, official_package)
-                    })
-                    .collect::<Vec<_>>())
+                let mut official: BTreeMap<String, OfficialTarget> = BTreeMap::new();
+                let mut other = Vec::new();
+                for dependency in missing_dependencies {
+                    if let Some(selected) = resolve_official_dependency(alpm, &dependency)? {
+                        if let Some(existing) = official.get_mut(&selected.name) {
+                            existing.relations.extend(selected.relations);
+                        } else {
+                            official.insert(selected.name.clone(), selected);
+                        }
+                    } else {
+                        other.push(dependency);
+                    }
+                }
+                for selected in official.values_mut() {
+                    reconcile_official_dependency(alpm, selected)?;
+                }
+                Ok((official.into_values().collect(), other))
             })
         })
         .await
         .context("Official dependency classification task failed")??;
 
         let mut aur_dependencies = Vec::new();
-        let mut official_dependencies = Vec::new();
         let mut unresolved = Vec::new();
-        for (dependency, official_package) in classified {
+        for dependency in other_dependencies {
             let name = dependency_name(&dependency);
-            if name.is_empty() || name == package {
-                continue;
-            }
-
-            if let Some(official_package) = official_package {
-                official_dependencies.push(official_package);
-            } else if self.info(name).await?.is_some() {
+            if self.info(name).await?.is_some() {
                 aur_dependencies.push(name.to_string());
             } else {
                 unresolved.push(dependency);
@@ -3489,8 +3444,6 @@ impl AurClient {
         );
         aur_dependencies.sort();
         aur_dependencies.dedup();
-        official_dependencies.sort();
-        official_dependencies.dedup();
         Ok(AurDependencyPlan {
             aur_dependencies,
             official_dependencies,
@@ -3498,7 +3451,7 @@ impl AurClient {
         })
     }
 
-    async fn install_official_dependencies(packages: &[String]) -> Result<()> {
+    async fn install_official_dependencies(packages: &[OfficialTarget]) -> Result<()> {
         if packages.is_empty() {
             return Ok(());
         }
@@ -3506,24 +3459,37 @@ impl AurClient {
         let _install_guard = INSTALL_LOCK.lock().await;
         crate::cli::modern_ui::print_info(&format!(
             "Installing official build dependencies: {}",
-            packages.join(", ")
+            packages
+                .iter()
+                .map(|package| format!("{}/{}", package.repository, package.name))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
-        use crate::package_managers::traits::PackageManager;
-        crate::package_managers::ArchPackageManager::new()
-            .install(packages)
+        let request = InstallRequest::new(
+            packages
+                .iter()
+                .map(|package| InstallItem {
+                    target: InstallTarget::Resolved(package.clone()),
+                    intent: InstallIntent::Automatic,
+                })
+                .collect(),
+        )?;
+        crate::package_managers::arch::install_request(request)
             .await
             .context("Failed to install official AUR build dependencies")
     }
 
     async fn ensure_dependencies_satisfied(
         &self,
-        pkg_dir: &Path,
+        source: &ReviewedSource,
         package_outputs: &[String],
     ) -> Result<()> {
-        let pkg_dir = pkg_dir.to_path_buf();
+        let srcinfo = source
+            .optional_srcinfo()?
+            .context("AUR build has no .SRCINFO")?;
         let package_outputs = package_outputs.to_vec();
         self.blocking_build_work(move || {
-            let remaining = check_dependencies_for_outputs(&pkg_dir, &package_outputs)
+            let remaining = check_dependencies_from_metadata(&srcinfo, &package_outputs)
                 .context("Failed to verify AUR build dependencies")?
                 .missing;
             anyhow::ensure!(
@@ -3630,9 +3596,12 @@ impl AurClient {
         pkg_dir: &Path,
         env: &MakepkgEnv,
         package: &str,
+        source: &ReviewedSource,
     ) -> Result<std::process::ExitStatus> {
+        self.settings.aur.validate_security_profile()?;
         if !self.settings.aur.allow_network {
-            let sources = parse_sources(pkg_dir)?;
+            let metadata = source.optional_srcinfo()?;
+            let sources = metadata.as_deref().map_or_else(Vec::new, http_sources);
             let summary = download_sources(sources, &env.srcdest).await;
             anyhow::ensure!(
                 summary.failed == 0,
@@ -3644,7 +3613,7 @@ impl AurClient {
             // the ones omg can reproduce into SRCDEST, and fail with an
             // actionable message for the rest instead of letting makepkg
             // surface a bare DNS failure from inside the namespace.
-            let vcs_sources = parse_vcs_sources(pkg_dir)?;
+            let vcs_sources = metadata.as_deref().map_or_else(Vec::new, vcs_sources);
             if !vcs_sources.is_empty() {
                 let vcs = prefetch_vcs_sources(&vcs_sources, &env.srcdest).await;
                 anyhow::ensure!(
@@ -3778,6 +3747,17 @@ impl AurClient {
             let pacman_cache_root = paths::pacman_cache_root_dir_result()?;
             let pacman_cache_root_str = pacman_cache_root.to_string_lossy();
             let home_str = home.to_string_lossy();
+            let mut mount_destinations = vec![
+                home.as_path(),
+                pkg_dir_canonical.as_path(),
+                pkgdest_canonical.as_path(),
+                srcdest_canonical.as_path(),
+                pacman_db_dir.as_path(),
+                pacman_cache_root.as_path(),
+            ];
+            mount_destinations.extend(compiler_cache_mounts.iter().map(PathBuf::as_path));
+            mount_destinations.extend(pgp_home.as_deref());
+            let build_root = sandbox_build_root(&mount_destinations)?;
 
             // Keep bwrap as omg's direct child for parent-death handling.
             // Its PID namespace makes cancellation kill compiler descendants
@@ -3826,7 +3806,7 @@ impl AurClient {
             cmd.arg(&*srcdest_str);
             cmd.args(["--bind"]);
             cmd.arg(&*builddir_str);
-            cmd.arg(&*builddir_str);
+            cmd.arg(&build_root);
             for cache_dir in &compiler_cache_mounts {
                 cmd.args(["--bind"]);
                 cmd.arg(cache_dir);
@@ -3872,7 +3852,7 @@ impl AurClient {
             cmd.args(["--setenv", "SRCDEST"]);
             cmd.arg(&*srcdest_str);
             cmd.args(["--setenv", "BUILDDIR"]);
-            cmd.arg(&*builddir_str);
+            cmd.arg(&build_root);
             if let Some(path) = &pgp_home {
                 cmd.args(["--setenv", "GNUPGHOME"]);
                 cmd.arg(path);
@@ -4168,7 +4148,11 @@ impl AurClient {
     /// Captures all local build inputs and their manifest digest so the caller
     /// can reject additions, removals, permission changes and modified content
     /// immediately before building.
-    async fn review_pkgbuild(package: &str, pkgbuild_path: &Path) -> Result<ReviewedSource> {
+    async fn review_pkgbuild(
+        package: &str,
+        pkgbuild_path: &Path,
+        profile: crate::config::AurSecurityProfile,
+    ) -> Result<ReviewedSource> {
         // Quiesce before joining the review queue: a queued review should
         // hold one continuous quiesce across the wait and confirm, so
         // concurrent spinners neither flicker nor overwrite review output.
@@ -4215,7 +4199,9 @@ impl AurClient {
             )
         );
 
-        if !crate::core::privilege::get_yes_flag() {
+        if profile == crate::config::AurSecurityProfile::Hardened
+            || !crate::core::privilege::get_yes_flag()
+        {
             let proceed = confirm_prompt(pkgbuild_review_prompt(package), true).await?;
             if !proceed {
                 anyhow::bail!("Build aborted by user after PKGBUILD review.");
@@ -4450,6 +4436,7 @@ impl AurClient {
         })
     }
 
+    #[cfg(test)]
     fn cache_key(&self, pkg_dir: &Path, makeflags: &str) -> Result<String> {
         let source = ReviewedSource::capture(pkg_dir)?;
         let makepkg_args = self.makepkg_args().join(" ");
@@ -4483,6 +4470,7 @@ impl AurClient {
     /// Legacy hash markers bind source text only, not the complete archive.
     /// Do not promote recipe-writable payloads into trusted cache entries.
     /// Reuse stays disabled until controller-owned archive provenance exists.
+    #[cfg(test)]
     fn cached_artifacts(
         _cache_name: &str,
         _artifacts: &[String],
@@ -4495,17 +4483,36 @@ impl AurClient {
 
     /// Install the built package via direct ALPM or elevated OMG transaction.
     pub(crate) async fn install_built_packages(
-        pkg_paths: &[ArchiveSnapshot],
+        batches: &[BuiltPackages],
         sudoloop: Option<&crate::core::sudoloop::SudoLoop>,
     ) -> Result<()> {
-        if pkg_paths.is_empty() {
+        if batches.is_empty() || batches.iter().any(|batch| batch.archives.is_empty()) {
             anyhow::bail!("AUR build produced no package archives to install");
         }
 
-        let inspections = pkg_paths
-            .iter()
-            .map(|snapshot| artifact_inspector::inspect_archive(&snapshot.path()))
-            .collect::<Result<Vec<_>>>()?;
+        let settings = Settings::load()?;
+        settings.aur.validate_security_profile()?;
+        let profile = settings.aur.security_profile;
+        let mut inspections = Vec::new();
+        let mut items = Vec::new();
+        for batch in batches {
+            batch.require_profile(profile)?;
+            for snapshot in &batch.archives {
+                let inspection =
+                    artifact_inspector::inspect_archive(&snapshot.path())?.into_inspection();
+                snapshot.verify_sha256(&inspection.archive_sha256)?;
+                inspection.enforce_profile(profile)?;
+                items.push(InstallItem {
+                    target: InstallTarget::Archive(snapshot.handoff()),
+                    intent: if batch.requested_outputs.contains(&inspection.package_name) {
+                        InstallIntent::Requested
+                    } else {
+                        InstallIntent::Automatic
+                    },
+                });
+                inspections.push(inspection);
+            }
+        }
         if let Some(prompt) = approval::exception_prompt(&inspections)? {
             let evidence = inspections
                 .iter()
@@ -4539,32 +4546,19 @@ impl AurClient {
         // Serialize database mutations across all concurrent builds.
         let _install_guard = INSTALL_LOCK.lock().await;
 
-        // Only an already-root process may mutate ALPM directly.
-        if crate::core::caps::can_write_pacman_db() {
-            let packages = pkg_paths.iter().map(ArchiveSnapshot::handoff).collect();
-            tokio::task::spawn_blocking(move || {
-                crate::package_managers::execute_transaction(
-                    packages,
-                    crate::package_managers::TransactionKind::InstallAurArtifact,
-                    None,
-                )
-            })
-            .await
-            .context("Direct ALPM install worker failed")??;
-        } else {
-            // Refresh sudo credentials right before install to prevent timeout
-            if let Some(sl) = sudoloop {
-                sl.refresh_now().await;
-            }
-
-            let package_strs: Vec<String> =
-                pkg_paths.iter().map(ArchiveSnapshot::handoff).collect();
-            let mut args = vec!["install", "--"];
-            let pkg_refs: Vec<&str> = package_strs.iter().map(String::as_str).collect();
-            args.extend(pkg_refs);
-            args.push(crate::core::privilege::FLOW_PARENT_RECORDS);
-            crate::core::privilege::run_privileged_child(&args).await?;
+        if let Some(sl) = sudoloop {
+            sl.refresh_now().await;
         }
+        let settings = Settings::load()?;
+        settings.aur.validate_security_profile()?;
+        let current_profile = settings.aur.security_profile;
+        for batch in batches {
+            batch.require_profile(current_profile)?;
+        }
+        for inspection in &inspections {
+            inspection.enforce_profile(current_profile)?;
+        }
+        crate::package_managers::arch::install_request(InstallRequest::new(items)?).await?;
 
         Ok(())
     }
@@ -4756,7 +4750,10 @@ fn compiler_job_flags(
 #[cfg(test)]
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     use super::*;
+    use crate::package_managers::aur_metadata::{index_path, metadata_path, publish_test_metadata};
 
     // S72 fixture methods must run in a dedicated unprivileged receiver. A root
     // invocation is a fixture prerequisite error, never the behavioral RED.
@@ -4915,9 +4912,9 @@ mod tests {
             let mut gzip = flate2::write::GzEncoder::new(file, flate2::Compression::default());
             std::io::Write::write_all(&mut gzip, &serde_json::to_vec(&envelope["results"])?)?;
             gzip.finish()?;
-            crate::package_managers::aur_index::build_index(&archive, &index_path())?;
+            publish_test_metadata(&archive)?;
             anyhow::ensure!(
-                metadata_index_is_fresh(&archive, &index_path(), Duration::from_hours(1)),
+                open_fresh_metadata_index(Duration::from_hours(1))?.is_some(),
                 "fixture index must actually be fresh and coherent"
             );
             Ok(())
@@ -4944,6 +4941,197 @@ mod tests {
     }
 
     #[test]
+    fn aur_metadata_reader_lock_failure_preserves_generation() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::aur_metadata_reader_lock_failure_preserves_generation";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["installed-demo"])?;
+        fixture.with_environment(async {
+            S72Fixture::index(&["metadata-demo"])?;
+            let client = fixture.client();
+            let snapshot = client
+                .fresh_metadata_index()
+                .await
+                .context("published metadata must be readable before the lock fault")?;
+            assert_eq!(
+                snapshot
+                    .get("metadata-demo")?
+                    .context("published package")?
+                    .version
+                    .as_str(),
+                "2.0-1"
+            );
+            let local_before = fixture.local_bytes()?;
+            let metadata_root = paths::cache_dir().join("aur/_meta");
+            let manifest = metadata_root.join("manifest.json");
+            let manifest_before = std::fs::read(&manifest)?;
+            let published: serde_json::Value = serde_json::from_slice(&manifest_before)?;
+            let generation = metadata_root.join(
+                published["generation"]
+                    .as_str()
+                    .context("published fixture must name its generation")?,
+            );
+            let archive = generation.join("archive.gz");
+            let index = generation.join("index.rkyv");
+            let archive_before = std::fs::read(&archive)?;
+            let index_before = std::fs::read(&index)?;
+            let lock = metadata_root.join("publication.lock");
+            let saved_lock = metadata_root.join("publication.lock.saved");
+            std::fs::rename(&lock, &saved_lock)?;
+            std::fs::create_dir(&lock)?;
+
+            let error = open_fresh_metadata_index(Duration::from_hours(1))
+                .expect_err("a directory cannot be opened as the metadata publication lock");
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<std::io::Error>().is_some()),
+                "the fixture must exercise a real metadata I/O failure: {error:#}"
+            );
+            assert!(
+                client.fresh_metadata_index().await.is_none(),
+                "an unreadable metadata generation must fall back instead of failing the caller"
+            );
+            assert!(
+                lock.is_dir(),
+                "reader fallback must preserve the failed lock for diagnosis"
+            );
+            assert_eq!(std::fs::read(&manifest)?, manifest_before);
+            assert_eq!(std::fs::read(&archive)?, archive_before);
+            assert_eq!(std::fs::read(&index)?, index_before);
+            assert_eq!(fixture.local_bytes()?, local_before);
+            assert!(
+                snapshot.get("metadata-demo")?.is_some(),
+                "an earlier owned snapshot stays usable"
+            );
+
+            std::fs::remove_dir(&lock)?;
+            std::fs::rename(&saved_lock, &lock)?;
+            assert!(
+                client.fresh_metadata_index().await.is_some(),
+                "restored access must make the same generation readable again"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn aur_metadata_task_completion_preserves_snapshots_and_falls_back() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::aur_metadata_task_completion_preserves_snapshots_and_falls_back";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&[])?;
+        fixture.with_environment(async {
+            S72Fixture::index(&["metadata-demo"])?;
+            let index = open_fresh_metadata_index(Duration::from_hours(1))?
+                .context("published metadata fixture must contain an index")?;
+            let snapshot = finish_metadata_read(tokio::spawn(async move { Ok(Some(index)) }))
+                .await
+                .context("a successful metadata worker must retain its owned snapshot")?;
+            assert_eq!(
+                snapshot
+                    .get("metadata-demo")?
+                    .context("published package")?
+                    .version
+                    .as_str(),
+                "2.0-1"
+            );
+            assert!(
+                finish_metadata_read(tokio::spawn(async { Ok(None) }))
+                    .await
+                    .is_none()
+            );
+            assert!(
+                finish_metadata_read(tokio::spawn(async {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "metadata reader sentinel",
+                    )
+                    .into())
+                }))
+                .await
+                .is_none(),
+                "metadata-reader errors must leave the caller free to use RPC"
+            );
+            let panicked = tokio::spawn(async {
+                panic!("metadata worker panic sentinel");
+            });
+            assert!(
+                finish_metadata_read(panicked).await.is_none(),
+                "a real panicked task must use the same fallback contract"
+            );
+
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let cancelled = tokio::spawn(async move {
+                started
+                    .send(())
+                    .expect("cancellation observer remains alive");
+                std::future::pending::<Result<Option<AurIndex>>>().await
+            });
+            entered
+                .await
+                .context("metadata cancellation task must have started")?;
+            cancelled.abort();
+            assert!(
+                finish_metadata_read(cancelled).await.is_none(),
+                "a genuinely cancelled async task must fall back without propagating a JoinError"
+            );
+            assert!(
+                snapshot.get("metadata-demo")?.is_some(),
+                "task failures must not invalidate a separately owned index"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn aur_official_dependencies_reject_oversized_install_request_before_mutation() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::aur_official_dependencies_reject_oversized_install_request_before_mutation";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&["installed-demo"])?;
+        fixture.with_environment(async {
+            let local_before = fixture.local_bytes()?;
+            let selected = (0..4_097)
+                .map(|index| {
+                    let name = format!("dependency-{index}");
+                    OfficialTarget {
+                        repository: "fixture".to_owned(),
+                        relations: vec![format!("{name}>=1")],
+                        name,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let error = AurClient::install_official_dependencies(&selected)
+                .await
+                .expect_err(
+                    "an oversized dependency graph must be refused at the bounded request boundary",
+                );
+            assert_eq!(
+                error.to_string(),
+                "Invalid installation item count",
+                "the refusal must occur before native installation or elevation: {error:#}"
+            );
+            assert_eq!(
+                fixture.local_bytes()?,
+                local_before,
+                "bounded-request refusal must preserve the installed catalog"
+            );
+            assert!(
+                !fixture.db.join("db.lck").exists(),
+                "request refusal must not acquire a native transaction lock"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
     fn aur_updates_honor_exact_and_glob_ignore_pkg_in_fresh_index() -> Result<()> {
         if crate::core::testing::run_isolated_test(
             "package_managers::aur::client::tests::aur_updates_honor_exact_and_glob_ignore_pkg_in_fresh_index",
@@ -4958,6 +5146,10 @@ mod tests {
         let fixture = S72Fixture::new(&["held-demo", "held-extra", "free-demo"])?;
         fixture.with_environment(async {
             S72Fixture::index(&["held-demo", "held-extra", "free-demo"])?;
+            let held_desc = fixture.db.join("local/held-demo-1.0-1/desc");
+            let mut content = std::fs::read_to_string(&held_desc)?;
+            content.push_str("%GROUPS%\npinned\n\n");
+            std::fs::write(&held_desc, content)?;
             let client = fixture.client();
             let before = fixture.local_bytes()?;
             let names = |mut updates: Vec<(String, Version, Version)>| {
@@ -4968,6 +5160,16 @@ mod tests {
                 }
                 updates.into_iter().map(|row| row.0).collect::<Vec<_>>()
             };
+            assert_eq!(
+                names(client.get_update_list().await?),
+                ["free-demo", "held-demo", "held-extra"]
+            );
+            std::fs::write(&fixture.conf, "[options]\nIgnoreGroup = pinned\n")?;
+            assert_eq!(
+                names(client.get_update_list().await?),
+                ["free-demo", "held-extra"]
+            );
+            std::fs::write(&fixture.conf, "[options]\nIgnorePkg = held{,-demo}\n")?;
             assert_eq!(
                 names(client.get_update_list().await?),
                 ["free-demo", "held-demo", "held-extra"]
@@ -4984,6 +5186,29 @@ mod tests {
                 before,
                 "update reads preserve package state"
             );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn aur_updates_empty_local_catalog_does_not_require_index_or_rpc() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::aur_updates_empty_local_catalog_does_not_require_index_or_rpc";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&[])?;
+        std::fs::create_dir(fixture.db.join("local"))?;
+        fixture.with_environment(async {
+            assert!(pacman_db::get_potential_aur_package_records()?.is_empty());
+            assert!(!metadata_path().exists() && !index_path().exists());
+            let updates =
+                tokio::time::timeout(Duration::from_secs(2), fixture.client().get_update_list())
+                    .await
+                    .context("an empty installed catalog must complete without AUR RPC")??;
+            assert!(updates.is_empty());
+            assert!(!metadata_path().exists() && !index_path().exists());
+            assert!(fixture.local_bytes()?.is_empty());
             Ok(())
         })
     }
@@ -5045,7 +5270,10 @@ mod tests {
                 "[options]\n[core]\nServer = https://example.invalid/$repo/$arch\n",
             )?;
             pacman_db::invalidate_caches()?;
-            let foreign = get_potential_aur_packages()?;
+            let foreign: Vec<String> = pacman_db::get_potential_aur_package_records()?
+                .into_iter()
+                .map(|package| package.name)
+                .collect();
             assert_eq!(
                 foreign,
                 ["aur-demo"],
@@ -5373,6 +5601,40 @@ mod tests {
         Ok(())
     }
 
+    async fn replaced_reviewed_source_fixture() -> Result<(tempfile::TempDir, ReviewedSource)> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        let srcinfo = directory.path().join(".SRCINFO");
+        std::fs::write(
+            &srcinfo,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/reviewed.tar.gz\nsource = git+https://example.org/reviewed.git\npkgname = demo\n",
+        )?;
+        let reviewed = ReviewedSource::capture(directory.path())?;
+        tokio::task::yield_now().await;
+        std::fs::write(
+            &srcinfo,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\nsource = https://example.org/replacement.tar.gz\nsource = git+https://example.org/replacement.git\npkgname = demo\n",
+        )?;
+
+        Ok((directory, reviewed))
+    }
+
+    #[tokio::test]
+    async fn reviewed_http_prefetch_uses_captured_metadata_after_checkout_changes() -> Result<()> {
+        let (_directory, reviewed) = replaced_reviewed_source_fixture().await?;
+        let http = http_sources(reviewed.required_srcinfo("demo")?.as_ref());
+        assert_eq!(http[0].url, "https://example.org/reviewed.tar.gz");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reviewed_vcs_prefetch_uses_captured_metadata_after_checkout_changes() -> Result<()> {
+        let (_directory, reviewed) = replaced_reviewed_source_fixture().await?;
+        let vcs = vcs_sources(reviewed.required_srcinfo("demo")?.as_ref());
+        assert_eq!(vcs[0].url, "https://example.org/reviewed.git");
+        Ok(())
+    }
+
     #[test]
     fn contained_license_symlink_is_reviewed_by_target() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -5444,7 +5706,7 @@ mod tests {
             "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
         )?;
         let source = ReviewedSource::capture(directory.path())?;
-        let archive_dir = tempfile::tempdir()?;
+        let archive_dir = private_fixture_dir()?;
         let archive = archive_dir.path().join("demo-2-1-any.pkg.tar.gz");
         write_pkg_archive(
             &archive,
@@ -5474,7 +5736,7 @@ mod tests {
             "post_install() { :; }\n",
         )?;
         let source = ReviewedSource::capture(directory.path())?;
-        let archive_dir = tempfile::tempdir()?;
+        let archive_dir = private_fixture_dir()?;
         let archive = archive_dir.path().join("demo-1-1-any.pkg.tar.gz");
         // write_pkg_archive supplies the fixture's single `arch = any` field.
         let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
@@ -5577,9 +5839,21 @@ mod tests {
         assert!(!message.contains("arg="));
     }
 
+    fn private_fixture_dir() -> std::io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+    }
+
     fn write_tar_gz(path: &std::path::Path, entries: &[(&str, &[u8])]) {
         let encoder = flate2::write::GzEncoder::new(
-            std::fs::File::create(path).unwrap(),
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap(),
             flate2::Compression::fast(),
         );
         let mut tar = tar::Builder::new(encoder);
@@ -6248,6 +6522,63 @@ mod tests {
     }
 
     #[test]
+    fn source_filename_review_escapes_controls_without_hiding_identity() {
+        let raw = "patch\n\r\u{1b}[2J\u{202e}\u{200b}\u{2028}\\n.diff";
+        let file = AurReviewFiles {
+            relative: Path::new(raw),
+            bytes: 12,
+            digest: "a".repeat(64),
+        };
+        for verbose in [false, true] {
+            let panel = pkgbuild_review_panel(
+                "demo",
+                &"b".repeat(64),
+                "pkgname=demo",
+                Path::new("/tmp/PKGBUILD"),
+                std::slice::from_ref(&file),
+                &[],
+                verbose,
+            );
+            assert!(!panel.contains(raw));
+            assert!(!panel.contains('\r'));
+            for control in ['\u{202e}', '\u{200b}', '\u{2028}'] {
+                assert!(!panel.contains(control));
+            }
+            assert!(panel.contains("patch\\n\\r\\u{1b}[2J\\u{202e}\\u{200b}\\u{2028}\\\\n.diff"));
+        }
+    }
+
+    #[test]
+    fn source_filename_review_errors_escape_hook_and_symlink_names() -> Result<()> {
+        let hook = "hook\u{1b}[2J\u{202e}.install";
+        let source = ReviewedSource {
+            files: std::collections::BTreeMap::from([(
+                PathBuf::from(".SRCINFO"),
+                format!("install = {hook}\n").into_bytes(),
+            )]),
+            digest: "a".repeat(64),
+            parsed_srcinfo: OnceLock::new(),
+        };
+        let error = declared_install_hook_previews(&source)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains('\u{1b}'));
+        assert!(!error.contains('\u{202e}'));
+        assert!(error.contains("hook\\u{1b}[2J\\u{202e}.install"));
+        let root = tempfile::tempdir()?;
+        let error = contained_aur_symlink_target(
+            root.path(),
+            &root.path().join("file\n\u{1b}[2J"),
+            Path::new("/outside\r\u{202e}"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains(['\n', '\r', '\u{1b}', '\u{202e}']));
+        assert!(error.contains("file\\n\\u{1b}[2J"));
+        Ok(())
+    }
+
+    #[test]
     fn pkgbuild_review_summary_is_one_line_without_source_text() {
         let digest = pkgbuild_digest(b"pkgname=demo\nsource=('https://example.test')\n");
         let summary = pkgbuild_review_summary("demo", &digest, 2);
@@ -6410,6 +6741,7 @@ mod tests {
         let source = ReviewedSource {
             files,
             digest: String::new(),
+            parsed_srcinfo: OnceLock::new(),
         };
         let hooks = declared_install_hook_previews(&source).unwrap();
         assert_eq!(hooks.len(), 1);
@@ -6939,11 +7271,73 @@ mod tests {
             settings: Settings::default(),
             package_base_locks: Arc::new(dashmap::DashMap::new()),
         };
+        let source = ReviewedSource {
+            files: std::collections::BTreeMap::new(),
+            digest: String::new(),
+            parsed_srcinfo: OnceLock::new(),
+        };
         let error = client
-            .aur_dependency_plan(directory.path(), "example", &["example".to_string()])
+            .aur_dependency_plan(&source, "example", &["example".to_string()])
             .await
             .expect_err("missing .SRCINFO must fail before PKGBUILD execution");
         assert!(error.to_string().contains("has no regular .SRCINFO"));
+    }
+
+    #[test]
+    fn reviewed_source_optional_metadata_preserves_absence_and_parse_errors() -> Result<()> {
+        let mut source = ReviewedSource {
+            files: std::collections::BTreeMap::new(),
+            digest: String::new(),
+            parsed_srcinfo: OnceLock::new(),
+        };
+        assert!(source.optional_srcinfo()?.is_none());
+        source.files.insert(
+            PathBuf::from(".SRCINFO"),
+            b"\tnonsense-key with no value structure\n".to_vec(),
+        );
+        assert!(
+            format!(
+                "{:#}",
+                source.optional_srcinfo().expect_err("malformed metadata")
+            )
+            .contains("Failed to parse .SRCINFO")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reviewed_dependency_consumers_use_captured_metadata_after_checkout_changes() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::reviewed_dependency_consumers_use_captured_metadata_after_checkout_changes";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&[])?;
+        std::fs::create_dir_all(fixture.db.join("local"))?;
+        std::fs::write(fixture.db.join("local/ALPM_DB_VERSION"), "9\n")?;
+        std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        let path = fixture.directory.path().join(".SRCINFO");
+        std::fs::write(
+            &path,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
+        )?;
+        let source = ReviewedSource::capture(fixture.directory.path())?;
+        std::fs::write(
+            &path,
+            "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = replacement\n",
+        )?;
+        fixture.with_environment(async {
+            tokio::task::yield_now().await;
+            let client = fixture.client();
+            let plan = client
+                .aur_dependency_plan(&source, "demo", &["demo".to_owned()])
+                .await?;
+            assert_eq!(plan.package_outputs, ["demo"]);
+            client
+                .ensure_dependencies_satisfied(&source, &plan.package_outputs)
+                .await?;
+            Ok(())
+        })
     }
 
     #[test]
@@ -6966,6 +7360,76 @@ mod tests {
                 .to_string()
                 .contains("Circular AUR package-base dependency")
         );
+    }
+
+    #[tokio::test]
+    async fn build_only_refuses_an_in_flight_package_without_touching_the_checkout() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::build_only_refuses_an_in_flight_package_without_touching_the_checkout";
+        if Settings::rerun_test_unprivileged(TEST) {
+            return Ok(());
+        }
+        assert!(
+            !crate::core::is_root(),
+            "build fixture requires an ordinary UID"
+        );
+        let owner = private_fixture_dir()?;
+        let client = AurClient {
+            build_dir: owner.path().join("aur"),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut in_flight =
+            AHashSet::from_iter(["root-package".to_owned(), "unrelated-package".to_owned()]);
+        let error = client
+            .build_only("root-package", &mut in_flight, None)
+            .await
+            .expect_err("the public dependency build entry must reject a cycle before lookup");
+        assert_eq!(
+            error.to_string(),
+            "Circular AUR dependency detected while resolving 'root-package'"
+        );
+        assert_eq!(
+            in_flight,
+            AHashSet::from_iter(["root-package".to_owned(), "unrelated-package".to_owned()])
+        );
+        assert!(!client.build_dir.exists());
+        assert_eq!(std::fs::read_dir(owner.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_only_inner_refuses_an_invalid_package_before_creating_a_checkout() -> Result<()>
+    {
+        const TEST: &str = "package_managers::aur::client::tests::build_only_inner_refuses_an_invalid_package_before_creating_a_checkout";
+        if Settings::rerun_test_unprivileged(TEST) {
+            return Ok(());
+        }
+        assert!(
+            !crate::core::is_root(),
+            "build fixture requires an ordinary UID"
+        );
+        let owner = private_fixture_dir()?;
+        let client = AurClient {
+            build_dir: owner.path().join("aur"),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut in_flight = AHashSet::from_iter(["unrelated-package".to_owned()]);
+        let error = client
+            .build_only_inner("-invalid", "valid-base", &mut in_flight, None)
+            .await
+            .expect_err("an invalid external package name must fail before checkout creation");
+        assert_eq!(
+            error.downcast_ref::<crate::core::security::ValidationError>(),
+            Some(&crate::core::security::ValidationError::PackageNameStartsWithDash)
+        );
+        assert_eq!(
+            in_flight,
+            AHashSet::from_iter(["unrelated-package".to_owned()])
+        );
+        assert!(!client.build_dir.exists());
+        assert_eq!(std::fs::read_dir(owner.path())?.count(), 0);
+        Ok(())
     }
 
     #[tokio::test]
@@ -7058,6 +7522,13 @@ mod tests {
         let work = tempfile::tempdir()?;
         let first = AurClient::begin_rollback_worktree(work.path(), "example")?;
         let second = AurClient::begin_rollback_worktree(work.path(), "example")?;
+        for checkout in [&first, &second] {
+            assert_eq!(
+                std::fs::metadata(checkout.path())?.permissions().mode() & 0o777,
+                0o700,
+                "rollback checkouts must be private at creation"
+            );
+        }
         assert!(
             first
                 .path()
@@ -7127,7 +7598,7 @@ mod tests {
 
     #[test]
     fn rollback_errors_do_not_contain_literal_escape_text() {
-        let not_found = AurClient::historical_version_not_found_message("example", "1.0-1");
+        let not_found = historical_version_not_found_message("example", "1.0-1");
         assert!(!not_found.contains('\\'));
 
         let build_failed = AurClient::historical_build_failure_message(
@@ -7270,9 +7741,9 @@ mod tests {
 
     #[tokio::test]
     async fn package_base_file_locks_live_under_the_build_directory() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_fixture_dir().unwrap();
         let client = AurClient {
-            build_dir: directory.path().to_path_buf(),
+            build_dir: directory.path().join("aur"),
             settings: Settings::default(),
             package_base_locks: Arc::new(dashmap::DashMap::new()),
         };
@@ -7282,8 +7753,55 @@ mod tests {
             .await
             .expect("package-base file lock");
 
-        assert!(directory.path().join("_locks/shared-base.lock").is_file());
+        let lock_path = client.build_dir.join("_locks/shared-base.lock");
+        assert!(lock_path.is_file());
+        assert_eq!(
+            std::fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "package-base coordination files must be private at creation"
+        );
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn package_base_file_locks_reject_symlinks_and_hardlinks() -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let directory = private_fixture_dir()?;
+        let client = AurClient {
+            build_dir: directory.path().join("aur"),
+            settings: Settings::default(),
+            package_base_locks: Arc::new(dashmap::DashMap::new()),
+        };
+        let locks = client.build_dir.join("_locks");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&locks)?;
+        let ordinary = client.acquire_package_base_file_lock("ordinary").await?;
+        drop(ordinary);
+        let target = directory.path().join("unrelated");
+        std::fs::write(&target, b"unrelated inode")?;
+        let lock_path = locks.join("shared-base.lock");
+        std::os::unix::fs::symlink(&target, &lock_path)?;
+        assert!(
+            client
+                .acquire_package_base_file_lock("shared-base")
+                .await
+                .is_err(),
+            "a package-base lock must not follow a symlink to an unrelated inode"
+        );
+        std::fs::remove_file(&lock_path)?;
+        std::fs::hard_link(&target, &lock_path)?;
+        assert!(
+            client
+                .acquire_package_base_file_lock("shared-base")
+                .await
+                .is_err(),
+            "a package-base lock must not share an unrelated hardlinked inode"
+        );
+        assert_eq!(std::fs::read(target)?, b"unrelated inode");
+        Ok(())
     }
 
     #[test]
@@ -7456,6 +7974,7 @@ mod tests {
                 b"install = demo.install\n".to_vec(),
             )]),
             digest: String::new(),
+            parsed_srcinfo: OnceLock::new(),
         };
         assert!(declared_install_hook_previews(&source).is_err());
         source.files.insert(
@@ -7623,17 +8142,14 @@ mod tests {
              pkgdesc = PostgreSQL\n\
              \n\
              pkgname = postgresql18\n";
-        assert_eq!(
-            AurClient::srcinfo_version(srcinfo).as_deref(),
-            Some("18.4-1")
-        );
+        assert_eq!(srcinfo_version(srcinfo).as_deref(), Some("18.4-1"));
         // First occurrences win over later split-package duplicates.
         let dup = "pkgver = 1.0\npkgrel = 2\npkgname = a\npkgver = 9.9\n";
-        assert_eq!(AurClient::srcinfo_version(dup).as_deref(), Some("1.0-2"));
-        assert_eq!(AurClient::srcinfo_version("pkgname = x"), None);
+        assert_eq!(srcinfo_version(dup).as_deref(), Some("1.0-2"));
+        assert_eq!(srcinfo_version("pkgname = x"), None);
         // makepkg emits epoch after pkgver/pkgrel in the pkgbase section.
         assert_eq!(
-            AurClient::srcinfo_version("pkgver = 1.0~rc1\npkgrel = 3\nepoch = 2"),
+            srcinfo_version("pkgver = 1.0~rc1\npkgrel = 3\nepoch = 2"),
             Some("2:1.0~rc1-3".to_string())
         );
     }
@@ -7643,7 +8159,9 @@ mod tests {
     /// Build an architecture-independent fixture so provenance tests exercise
     /// the selected identity/hook defect rather than missing architecture.
     fn write_pkg_archive(path: &Path, pkginfo: &str, install: Option<&str>) {
-        let pkginfo = format!("arch = any\n{pkginfo}");
+        let pkginfo = format!(
+            "arch = any\npackager = Fixture Maintainer <fixture@example.invalid>\n{pkginfo}"
+        );
         let field = |name: &str| {
             pkginfo
                 .lines()
@@ -7651,7 +8169,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("fixture is missing {name}"))
         };
         let buildinfo = format!(
-            "format = 2\npkgname = {}\npkgbase = {}\npkgver = {}\npkgarch = any\n",
+            "format = 2\npkgname = {}\npkgbase = {}\npkgver = {}\npkgarch = any\npackager = Fixture Maintainer <fixture@example.invalid>\n",
             field("pkgname"),
             field("pkgbase"),
             field("pkgver")
@@ -7704,7 +8222,7 @@ mod tests {
         let audit_dir = tempfile::tempdir()?;
         temp_env::with_var("OMG_DATA_DIR", Some(audit_dir.path()), || -> Result<()> {
             let source_dir = tempfile::tempdir()?;
-            let archive_dir = tempfile::tempdir()?;
+            let archive_dir = private_fixture_dir()?;
             let pkgbuild = b"pkgbase=split\npkgname=(app docs)\npkgver=1.0\npkgrel=1\n";
             std::fs::write(source_dir.path().join("PKGBUILD"), pkgbuild)?;
             std::fs::write(source_dir.path().join(".SRCINFO"), srcinfo)?;
@@ -7864,7 +8382,7 @@ mod tests {
 
     #[test]
     fn cached_architecture_eligibility_matches_sealed_authorization() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+        let dir = private_fixture_dir()?;
         let root = dir.path().canonicalize()?;
         let pkg_dir = root.join("fixture");
         std::fs::create_dir(&pkg_dir)?;
@@ -8011,7 +8529,9 @@ mod tests {
         std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
         std::fs::write(cache_path, "matching-key").unwrap();
         let write_split_archive = |path: &Path, pkginfo: &str| {
-            let pkginfo = format!("arch = any\n{pkginfo}");
+            let pkginfo = format!(
+                "arch = any\npackager = Fixture Maintainer <fixture@example.invalid>\n{pkginfo}"
+            );
             let encoder = zstd::Encoder::new(std::fs::File::create(path).unwrap(), 0).unwrap();
             let mut archive = tar::Builder::new(encoder);
             let mut header = tar::Header::new_gnu();
@@ -8519,8 +9039,8 @@ mod tests {
         if which::which("gpg").is_err() {
             return;
         }
-        let source_home = tempfile::tempdir().unwrap();
-        let cache_dir = tempfile::tempdir().unwrap();
+        let source_home = private_fixture_dir().unwrap();
+        let cache_dir = private_fixture_dir().unwrap();
         let identity = format!(
             "OMG scoped keyring test {} <test@example.invalid>",
             uuid::Uuid::new_v4()
@@ -8573,6 +9093,24 @@ mod tests {
             cache_dir.path(),
         )
         .unwrap();
+        assert_eq!(
+            std::fs::metadata(scoped.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "package-scoped keyrings must be private at creation"
+        );
+        assert_eq!(
+            std::fs::metadata(scoped.path().join("trusted-keys.pgp"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the staged key bundle must be private"
+        );
         assert!(keyserver::is_key_in_gnupg(&fingerprint, scoped.path()).unwrap());
         let secrets = std::process::Command::new("gpg")
             .args(["--no-options", "--batch", "--with-colons", "--homedir"])
@@ -8998,6 +9536,1280 @@ mod tests {
             install_hook: None,
             paired_build_reasons: vec!["system-configuration".to_owned()],
         }
+    }
+
+    #[test]
+    #[ignore = "requires native Arch build tools and explicitly isolated fixture state"]
+    fn native_isolated_fixture_builds_reviewed_source_without_installing() -> Result<()> {
+        use std::collections::HashMap;
+
+        use super::super::parallel_build::ParallelBuilder;
+
+        anyhow::ensure!(
+            matches!(
+                std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref(),
+                Ok("isolated-container" | "private-build")
+            ),
+            "native fixture requires explicitly isolated build state"
+        );
+        for variable in ["OMG_CACHE_DIR", "OMG_DATA_DIR", "OMG_CONFIG_DIR"] {
+            anyhow::ensure!(
+                std::env::var_os(variable).is_some_and(|path| Path::new(&path).is_absolute()),
+                "native fixture requires an absolute private {variable}"
+            );
+        }
+        anyhow::ensure!(
+            !crate::core::is_root(),
+            "native fixture must run unprivileged"
+        );
+        let cache = paths::cache_dir();
+        std::fs::create_dir_all(&cache)?;
+        let directory = tempfile::tempdir_in(&cache)?;
+        let socket = directory.path().join("absent.sock");
+        temp_env::with_vars(
+            [
+                ("CARGO_PRIMARY_PACKAGE", Some(std::ffi::OsStr::new("1"))),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let build_dir = directory.path().join("aur");
+                        let checkout = build_dir.join("omg-coverage-fixture");
+                        std::fs::create_dir_all(&checkout)?;
+                        std::fs::write(
+                            checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG coverage fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-fixture/empty\"; }\n",
+                        ).expect("write fixture file");
+                        std::fs::write(
+                            checkout.join(".SRCINFO"),
+                            "pkgbase = omg-coverage-fixture\n\tpkgdesc = Inert OMG coverage fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-fixture\n",
+                        ).expect("write fixture file");
+                        let outputs = vec!["omg-coverage-fixture".to_owned()];
+                        let source = ReviewedSource::capture(&checkout)?;
+                        let dependencies = check_dependencies_from_metadata(source.required_srcinfo("fixture")?.as_ref(), &outputs)?;
+                        anyhow::ensure!(
+                            dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
+                            "fixture must never require dependency installation"
+                        );
+                        let mut settings = Settings::default();
+                        settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
+                        let client = AurClient {
+                            build_dir,
+                            settings,
+                            package_base_locks: Arc::new(dashmap::DashMap::new()),
+                        };
+                        let mut hashes = Vec::new();
+                        for _ in 0..2 {
+                            let authorized = AuthorizedBuild {
+                                lifecycle_guard: client.acquire_build_lifecycle().await?,
+                                package: "omg-coverage-fixture".to_owned(),
+                                requested_outputs: outputs.clone(),
+                                reviewed_digest: ReviewedSource::capture(&checkout)?,
+                            };
+                            let result = client
+                                .install_authorized_package_outputs(authorized, None)
+                                .await;
+                            let log_path = client.build_log_path("omg-coverage-fixture");
+                            let log = std::fs::read_to_string(&log_path);
+                            let diagnostic = format!(
+                                "Native fixture build log ({}):\n{log:?}",
+                                log_path.display()
+                            );
+                            let archives = result.context(diagnostic)?;
+                            assert_eq!(archives.len(), 1);
+                            let inspected = artifact_inspector::inspect_archive(&archives.archives[0].path())?.into_inspection();
+                            assert_eq!(inspected.package_name, "omg-coverage-fixture");
+                            assert!(inspected.install_hook.is_none());
+                            hashes.push(inspected.archive_sha256);
+                        }
+                        assert_eq!(
+                            hashes[0], hashes[1],
+                            "repeated admission preserves archive identity"
+                        );
+                        std::fs::write(
+                            checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-fixture\npkgver=1\npkgrel=1\narch=('any')\npackage() { printf 'intentional-fixture-failure\\n' >&2; return 1; }\n",
+                        ).expect("write fixture file");
+                        let authorized = AuthorizedBuild {
+                            lifecycle_guard: client.acquire_build_lifecycle().await?,
+                            package: "omg-coverage-fixture".to_owned(),
+                            requested_outputs: outputs,
+                            reviewed_digest: ReviewedSource::capture(&checkout)?,
+                        };
+                        let error = client
+                            .install_authorized_package_outputs(authorized, None)
+                            .await
+                            .expect_err("a failed recipe must not reuse previously accepted archives");
+                        let diagnostic = format!("{error:#}");
+                        let error_kind = error.downcast_ref::<AurError>();
+                        let build_failed = matches!(error_kind, Some(AurError::BuildFailed { .. }));
+                        assert!(build_failed, "{diagnostic}");
+                        let log = std::fs::read_to_string(client.build_log_path("omg-coverage-fixture"))?;
+                        assert!(log.contains("intentional-fixture-failure"), "{log}");
+
+                        let success = "omg-coverage-wave-fixture";
+                        let failure = "omg-coverage-fixture";
+                        let success_checkout = client.build_dir.join(success);
+                        std::fs::create_dir_all(&success_checkout)?;
+                        std::fs::write(
+                            success_checkout.join("PKGBUILD"),
+                            "pkgname=omg-coverage-wave-fixture\npkgver=1\npkgrel=1\npkgdesc='Inert OMG parallel wave fixture'\narch=('any')\nlicense=('MIT')\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/omg-coverage-wave-fixture/empty\"; printf 'wave-success-complete\\n' >&2; }\n",
+                        )?;
+                        std::fs::write(
+                            success_checkout.join(".SRCINFO"),
+                            "pkgbase = omg-coverage-wave-fixture\n\tpkgdesc = Inert OMG parallel wave fixture\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\tlicense = MIT\n\npkgname = omg-coverage-wave-fixture\n",
+                        )?;
+                        let client = Arc::new(client);
+                        let builder = ParallelBuilder::new(Arc::clone(&client), 2);
+                        let empty = builder
+                            .build_level(1, 1, &[], &HashMap::new(), &mut HashMap::new())
+                            .await?;
+                        assert_eq!(empty.succeeded_output_count(), 0);
+                        assert_eq!(empty.failed_output_count(), 0);
+                        assert_eq!(empty.skipped_output_count(), 0);
+                        assert!(empty.failures().next().is_none());
+                        assert!(empty.skipped_outputs().is_empty());
+
+                        let packages = vec![failure.to_owned(), success.to_owned()];
+                        let mut jobs = HashMap::new();
+                        let mut authorizations = HashMap::new();
+                        let success_source = ReviewedSource::capture(&success_checkout)?.digest;
+                        for package in &packages {
+                            let checkout = client.build_dir.join(package);
+                            let outputs = vec![package.clone()];
+                            let source = ReviewedSource::capture(&checkout)?;
+                            let dependencies = check_dependencies_from_metadata(source.required_srcinfo("fixture")?.as_ref(), &outputs)?;
+                            anyhow::ensure!(
+                                dependencies.missing.is_empty() && dependencies.package_outputs == outputs,
+                                "parallel fixture must never require dependency installation"
+                            );
+                            jobs.insert(package.clone(), BuildJob::new(package.clone(), Vec::new()));
+                            authorizations.insert(
+                                package.clone(),
+                                AuthorizedBuild {
+                                    lifecycle_guard: client.acquire_build_lifecycle().await?,
+                                    package: package.clone(),
+                                    requested_outputs: outputs,
+                                    reviewed_digest: ReviewedSource::capture(&checkout)?,
+                                },
+                            );
+                        }
+                        std::fs::remove_file(client.build_log_path(failure))?;
+                        let audit_path = paths::data_dir().join("audit/audit.jsonl");
+                        let before = std::fs::read_to_string(&audit_path)?;
+                        let error = builder
+                            .build_level(1, 1, &packages, &jobs, &mut authorizations)
+                            .await
+                            .expect_err("a collected native archive must reach inert installation refusal");
+                        assert!(authorizations.is_empty(), "both native jobs must be consumed");
+                        assert!(
+                            error.chain().any(|cause| {
+                                cause.to_string().lines().next()
+                                    == Some("Privilege elevation not supported in development mode.")
+                            }),
+                            "{error:#}"
+                        );
+                        let success_log = std::fs::read_to_string(client.build_log_path(success))?;
+                        assert!(success_log.contains("wave-success-complete"), "{success_log}");
+                        let failure_log = std::fs::read_to_string(client.build_log_path(failure))?;
+                        assert!(
+                            failure_log.contains("intentional-fixture-failure"),
+                            "{failure_log}"
+                        );
+                        let after = std::fs::read_to_string(audit_path)?;
+                        let entries = after
+                            .strip_prefix(&before)
+                            .context("native fixture audit must retain the pre-wave prefix")?
+                            .lines()
+                            .map(serde_json::from_str::<crate::core::security::audit::AuditEntry>)
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        assert_eq!(
+                            entries.iter().filter(|entry| {
+                                entry.description.starts_with("Package operation aur_inspection: succeeded;")
+                                    && entry.resource.contains(&format!("source_manifest_sha256={success_source}"))
+                                    && entry.resource.contains(&format!("{success} 1-1 archive_sha256="))
+                            }).count(),
+                            2,
+                            "both native archives must be inspected for the new wave source: {entries:?}"
+                        );
+                        assert!(
+                            entries.iter().any(|entry| {
+                                entry.description.starts_with("Package operation aur_paired_build: succeeded;")
+                                    && entry.resource.contains(&format!("source_manifest_sha256={success_source}"))
+                                    && entry.resource.contains(&format!("outputs={success}"))
+                                    && entry.resource.contains("result=exact-match")
+                            }),
+                            "successful wave fixture must complete independent exact-match verification: {entries:?}"
+                        );
+                        Ok(())
+                    })
+            },
+        )
+    }
+
+    #[test]
+    #[ignore = "requires the disposable, network-isolated Arch coverage container"]
+    fn native_isolated_history_requires_hardened_review() -> Result<()> {
+        anyhow::ensure!(
+            std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container")
+                && !crate::core::is_root(),
+            "history fixture requires the unprivileged isolated container"
+        );
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes",
+                "--nocapture",
+            ])
+            .env("OMG_AUR_HISTORY_FIXTURE", "1")
+            .output()?;
+        let diagnostic = format!(
+            "history fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        anyhow::ensure!(output.status.success(), "{diagnostic}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attended_review_requires_hardened_confirmation_even_with_yes() -> Result<()> {
+        if Settings::rerun_test_unprivileged(
+            "package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes",
+        ) {
+            return Ok(());
+        }
+        const MODE: &str = "OMG_AUR_REVIEW_PTY_MODE";
+        if let Ok(mode) = std::env::var(MODE) {
+            let history = matches!(mode.as_str(), "history" | "history-accept-failing-build");
+            let directory = if history {
+                anyhow::ensure!(
+                    std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container"),
+                    "historical fixture requires the isolated container"
+                );
+                anyhow::ensure!(
+                    std::env::var_os("OMG_CACHE_DIR")
+                        .is_some_and(|path| Path::new(&path).is_absolute()),
+                    "historical fixture requires an absolute private cache"
+                );
+                let cache = paths::cache_dir();
+                std::fs::create_dir_all(&cache).expect("create private fixture cache");
+                tempfile::tempdir_in(cache)?
+            } else {
+                tempfile::tempdir()?
+            };
+            let pkgbuild = directory.path().join("PKGBUILD");
+            std::fs::write(&pkgbuild, "pkgname=demo\n").expect("write fixture file");
+            std::fs::write(directory.path().join(".SRCINFO"), "pkgbase = demo\n")
+                .expect("write fixture file");
+            crate::core::privilege::set_yes_flag(true);
+            let profile = match mode.as_str() {
+                "standard" | "authorize" => crate::config::AurSecurityProfile::Standard,
+                _ => crate::config::AurSecurityProfile::Hardened,
+            };
+            if history {
+                let mut settings = Settings::default();
+                settings.aur.security_profile = profile;
+                let client = AurClient {
+                    build_dir: directory.path().join("build"),
+                    settings,
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let error = client
+                    .downgrade_from_history("demo", "1-1")
+                    .await
+                    .expect_err("historical fixture must not install a package");
+                if mode == "history" {
+                    assert!(
+                        error.to_string().contains("Build aborted by user"),
+                        "{error:#}"
+                    );
+                    println!("REVIEW_DECLINED");
+                } else {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Historical build of demo 1-1 failed"),
+                        "{error:#}"
+                    );
+                    let log = std::fs::read_to_string(client.build_log_path("demo"))?;
+                    assert!(log.contains("intentional-history-fixture-failure"), "{log}");
+                    println!("HISTORY_BUILD_FAILED");
+                }
+            } else if mode == "authorize" {
+                let client = AurClient {
+                    build_dir: directory.path().join("build"),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let authorized = client
+                    .authorize_package_outputs("demo", &["demo".to_owned()])
+                    .await?;
+                authorized
+                    .reviewed_digest
+                    .verify(&client.build_dir.join("demo"))?;
+                println!("REVIEW_ACCEPTED");
+            } else {
+                let result = AurClient::review_pkgbuild("demo", &pkgbuild, profile).await;
+                if mode == "standard" {
+                    result?.verify(directory.path())?;
+                    println!("REVIEW_ACCEPTED");
+                } else {
+                    let error = result.expect_err("declining hardened review must abort");
+                    assert!(
+                        error.to_string().contains("Build aborted by user"),
+                        "{error:#}"
+                    );
+                    println!("REVIEW_DECLINED");
+                }
+            }
+            return Ok(());
+        }
+
+        // The child owns its terminal and global --yes flag. Input is sent only
+        // after the prompt appears, so an unexpected skipped prompt fails.
+        let driver = r#"
+import errno, os, pty, select, shutil, signal, subprocess, sys, tempfile, time
+mode, executable, test_name = sys.argv[1:]
+fixture = tempfile.mkdtemp(prefix='omg-review-pty-')
+with open(os.path.join(fixture, 'git'), 'w') as script:
+    script.write('''#!/bin/sh
+set -eu
+sha=0123456789abcdef0123456789abcdef01234567
+if [ "$1" = clone ] && [ "$#" -eq 5 ] && [ "$2" = --filter=blob:none ] && [ "$3" = -- ] && [ "$4" = https://aur.archlinux.org/demo.git ]; then
+    case "$5" in */_rollback/demo-*) exit 0;; *) exit 1;; esac
+fi
+if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
+    case "$2" in */_rollback/demo-*) ;; *) exit 1;; esac
+    if [ "$#" -eq 6 ] && [ "$3" = log ] && [ "$4" = --no-show-signature ] && [ "$5" = --format=%H ] && [ "$6" = --max-count=10001 ]; then
+        printf '%s\\n' "$sha"
+        exit 0
+    fi
+    if [ "$#" -eq 4 ] && [ "$3" = show ] && [ "$4" = "${sha}:.SRCINFO" ]; then
+        printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n'
+        exit 0
+    fi
+    if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = "$sha" ]; then
+        printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\npackage() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' > "$2/PKGBUILD"
+        printf 'pkgbase = demo\\npkgver = 1\\npkgrel = 1\\narch = any\\npkgname = demo\\n' > "$2/.SRCINFO"
+        exit 0
+    fi
+    exit 1
+fi
+[ "$#" -eq 6 ] && [ "$1" = clone ] && [ "$2" = --depth=1 ] && [ "$3" = --filter=blob:none ] && [ "$4" = -- ] && [ "$5" = https://aur.archlinux.org/demo.git ]
+mkdir "$6"
+printf 'pkgname=demo\\n' > "$6/PKGBUILD"
+printf 'pkgbase = demo\\n' > "$6/.SRCINFO"
+''')
+os.chmod(os.path.join(fixture, 'git'), 0o700)
+if mode == 'git-contract':
+    try:
+        checkout = os.path.join(fixture, '_rollback', 'demo-contract')
+        os.makedirs(checkout)
+        git = os.path.join(fixture, 'git')
+        sha = '0123456789abcdef0123456789abcdef01234567'
+        bounded_log = ['log', '--no-show-signature', '--format=%H', '--max-count=10001']
+        commands = [
+            (bounded_log, True),
+            (['log', '--format=%H'], False),
+            (bounded_log[:-1], False),
+            (['log', '--format=%H', '--max-count=10001'], False),
+            (bounded_log[:-1] + ['--max-count=10002'], False),
+            (['show', sha + ':.SRCINFO'], True),
+            (['show', 'fixture-commit:.SRCINFO'], False),
+            (['checkout', '--detach', sha], True),
+            (['checkout', '--detach', 'fixture-commit'], False),
+        ]
+        for arguments, accepted in commands:
+            result = subprocess.run([git, '-C', checkout] + arguments,
+                                    capture_output=True, timeout=5)
+            if (result.returncode == 0) != accepted:
+                raise RuntimeError('Git fixture contract mismatch for ' + repr(arguments) +
+                                   ': status=' + str(result.returncode) +
+                                   ' stderr=' + repr(result.stderr))
+            if arguments == bounded_log and result.stdout != (sha + '\n').encode():
+                raise RuntimeError('Git fixture must emit one full commit ID: ' + repr(result.stdout))
+            if arguments == ['show', sha + ':.SRCINFO'] and b'pkgver = 1\n' not in result.stdout:
+                raise RuntimeError('Git fixture must emit historical metadata: ' + repr(result.stdout))
+        with open(os.path.join(checkout, 'PKGBUILD')) as recipe:
+            if 'intentional-history-fixture-failure' not in recipe.read():
+                raise RuntimeError('Git fixture must preserve the intentional build failure')
+        print('GIT_FIXTURE_CONTRACT_PASSED ' + str(len(commands)) + ' commands')
+    finally:
+        shutil.rmtree(fixture)
+    sys.exit(0)
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ['OMG_AUR_REVIEW_PTY_MODE'] = mode
+    os.environ['PATH'] = fixture + ':/usr/bin:/bin'
+    os.execv(executable, [executable, '--exact', test_name, '--nocapture'])
+output = bytearray()
+sent = False
+deadline = time.monotonic() + 45
+status = None
+try:
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if readable:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                chunk = b''
+            output.extend(chunk)
+            if len(output) > 1024 * 1024:
+                raise RuntimeError('review output exceeded limit')
+            if mode in ('hardened', 'history', 'history-accept-failing-build') and not sent and b'Build demo from this PKGBUILD?' in output:
+                os.write(fd, b'y\n' if mode == 'history-accept-failing-build' else b'n\n')
+                sent = True
+        done, child_status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            status = child_status
+            while True:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > 1024 * 1024:
+                    raise RuntimeError('review output exceeded limit')
+            break
+    else:
+        raise RuntimeError('review child timed out')
+    expected = (b'REVIEW_DECLINED' if mode in ('hardened', 'history') else
+                b'HISTORY_BUILD_FAILED' if mode == 'history-accept-failing-build' else b'REVIEW_ACCEPTED')
+    prompt_required = mode in ('hardened', 'history', 'history-accept-failing-build')
+    if (os.waitstatus_to_exitcode(status) != 0 or expected not in output or
+            (prompt_required and not sent) or
+            (mode == 'history-accept-failing-build' and b'REVIEW_DECLINED' in output)):
+        raise RuntimeError('review child failed or did not show the expected prompt')
+finally:
+    if status is None:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)
+    shutil.rmtree(fixture)
+    sys.stdout.buffer.write(output)
+"#;
+        let mut modes = vec!["git-contract", "standard", "hardened", "authorize"];
+        if std::env::var("OMG_AUR_HISTORY_FIXTURE").as_deref() == Ok("1") {
+            modes.extend(["history", "history-accept-failing-build"]);
+        }
+        for mode in modes {
+            let output = std::process::Command::new("python3")
+                .args(["-c", driver, mode])
+                .arg(std::env::current_exe()?)
+                .arg("package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes")
+                .output()?;
+            let diagnostic = format!(
+                "{mode} review fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "{diagnostic}");
+        }
+        Ok(())
+    }
+
+    fn with_private_admission_fixture(
+        test: &str,
+        body: impl FnOnce(&tokio::runtime::Runtime, &Path) -> Result<()>,
+    ) -> Result<()> {
+        if Settings::rerun_test_unprivileged(test) || crate::core::testing::run_isolated_test(test)
+        {
+            return Ok(());
+        }
+        let fixture = private_fixture_dir()?;
+        let configuration = fixture.path().join("config");
+        let data = fixture.path().join("data");
+        let cache = fixture.path().join("cache");
+        let socket = fixture.path().join("absent.sock");
+        for directory in [&configuration, &data, &cache] {
+            std::fs::create_dir(directory)?;
+        }
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(configuration.as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+                ("CARGO_PRIMARY_PACKAGE", Some(std::ffi::OsStr::new("1"))),
+            ],
+            || {
+                std::fs::write(
+                    configuration.join("config.toml"),
+                    "[aur]\nsecurity_profile = 'standard'\n",
+                )?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                body(&runtime, fixture.path())
+            },
+        )
+    }
+
+    #[test]
+    fn archive_admission_enforces_profile_and_binds_paired_cache_to_it() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::archive_admission_enforces_profile_and_binds_paired_cache_to_it";
+        with_private_admission_fixture(TEST, |runtime, fixture| {
+            runtime.block_on(async {
+                let checkout = tempfile::tempdir_in(fixture)?;
+                std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
+                    .expect("write fixture file");
+                std::fs::write(
+                    checkout.path().join(".SRCINFO"),
+                    "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\ninstall = demo.install\npkgname = demo\n",
+                )
+                .expect("write fixture file");
+                let hook = "post_install() { :; }\n";
+                std::fs::write(checkout.path().join("demo.install"), hook).expect("write fixture file");
+                let source = ReviewedSource::capture(checkout.path())?;
+                let archives = tempfile::Builder::new()
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(fixture)?;
+                let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+                let info = "pkgname = demo\npkgbase = demo\npkgver = 1-1\n";
+                write_pkg_archive(&archive, info, Some(hook));
+                let invocation = tempfile::tempdir_in(fixture)?;
+                let env = MakepkgEnv {
+                    pkgdest: invocation.path().join("pkg"),
+                    srcdest: invocation.path().join("src"),
+                    builddir: invocation.path().join("build"),
+                    _invocation: invocation,
+                    makeflags: String::new(),
+                    compiler_cache_dirs: Vec::new(),
+                    extra_env: Vec::new(),
+                    pgp_home: None,
+                };
+                let mut client = AurClient {
+                    build_dir: checkout.path().to_path_buf(),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let inspection = artifact_inspector::inspect_archive(&archive)?.into_inspection();
+                for old_version in [3, 4, 5] {
+                    let mut old_policy = inspection.clone();
+                    old_policy.policy_version = old_version;
+                    assert_ne!(
+                        client.paired_build_cache_key(&source, &env, std::slice::from_ref(&old_policy)),
+                        client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection)),
+                        "a policy-{old_version} paired-build proof must not authorize the current archive policy"
+                    );
+                }
+                let standard_key =
+                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+                client.settings.aur.security_profile = crate::config::AurSecurityProfile::Hardened;
+                let hardened_key =
+                    client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+                assert_ne!(
+                    standard_key, hardened_key,
+                    "a proof under one profile must not authorize another"
+                );
+                let error = client
+                    .authorize_with_paired_build(
+                        std::slice::from_ref(&archive),
+                        &source,
+                        "demo",
+                        &["demo".to_owned()],
+                        &["demo".to_owned()],
+                        true,
+                        checkout.path(),
+                        &env,
+                    )
+                    .await
+                    .expect_err("hardened admission must reject an install hook before rebuilding");
+                assert!(
+                    error.to_string().contains("Hardened AUR profile rejects"),
+                    "{error:#}"
+                );
+                client.settings.aur.review_pkgbuild = false;
+                let error = client
+                    .run_build(checkout.path(), &env, "demo", &source)
+                    .await
+                    .expect_err("an invalid hardened configuration must fail before running a build");
+                assert!(
+                    error.to_string().contains("requires build_method"),
+                    "{error:#}"
+                );
+                Ok(())
+            })
+        })
+    }
+
+    #[test]
+    fn standard_admission_accepts_an_ordinary_archive_without_rebuild() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::standard_admission_accepts_an_ordinary_archive_without_rebuild";
+        with_private_admission_fixture(TEST, |runtime, fixture| {
+            runtime.block_on(async {
+                let checkout = tempfile::tempdir_in(fixture)?;
+                std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
+                    .expect("write fixture file");
+                std::fs::write(
+                    checkout.path().join(".SRCINFO"),
+                    "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
+                )
+                .expect("write fixture file");
+                let source = ReviewedSource::capture(checkout.path())?;
+                let archives = tempfile::Builder::new()
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(fixture)?;
+                let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+                write_pkg_archive(
+                    &archive,
+                    "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
+                    None,
+                );
+                let invocation = tempfile::tempdir_in(fixture)?;
+                let env = MakepkgEnv {
+                    pkgdest: invocation.path().join("pkg"),
+                    srcdest: invocation.path().join("src"),
+                    builddir: invocation.path().join("build"),
+                    _invocation: invocation,
+                    makeflags: String::new(),
+                    compiler_cache_dirs: Vec::new(),
+                    extra_env: Vec::new(),
+                    pgp_home: None,
+                };
+                let client = AurClient {
+                    build_dir: checkout.path().to_path_buf(),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let accepted = client
+                    .authorize_with_paired_build(
+                        std::slice::from_ref(&archive),
+                        &source,
+                        "demo",
+                        &["demo".to_owned()],
+                        &["demo".to_owned()],
+                        true,
+                        checkout.path(),
+                        &env,
+                    )
+                    .await?;
+                assert_eq!(accepted.len(), 1);
+                assert_eq!(
+                    artifact_inspector::inspect_archive(&accepted.archives[0].path())?
+                        .into_inspection()
+                        .package_name,
+                    "demo"
+                );
+                let journal = fixture.join("data/audit/audit.jsonl");
+                assert!(
+                    journal.is_file(),
+                    "inspection audit journal: {}",
+                    journal.display()
+                );
+                let audit = std::fs::read_to_string(&journal)?;
+                assert!(audit.contains("aur_inspection"), "{audit}");
+                assert!(audit.contains("succeeded"), "{audit}");
+                Ok(())
+            })
+        })
+    }
+
+    #[test]
+    fn standard_build_is_rejected_after_current_profile_becomes_hardened() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::standard_build_is_rejected_after_current_profile_becomes_hardened";
+        with_private_admission_fixture(TEST, |runtime, fixture| {
+            runtime.block_on(async {
+                let checkout = tempfile::tempdir_in(fixture)?;
+                std::fs::write(checkout.path().join("PKGBUILD"), "pkgname=demo\n")
+                    .expect("write fixture file");
+                std::fs::write(
+                    checkout.path().join(".SRCINFO"),
+                    "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\n",
+                )
+                .expect("write fixture file");
+                let source = ReviewedSource::capture(checkout.path())?;
+                let archives = tempfile::Builder::new()
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(fixture)?;
+                let archive = archives.path().join("demo-1-1-any.pkg.tar.gz");
+                write_pkg_archive(
+                    &archive,
+                    "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
+                    None,
+                );
+                let invocation = tempfile::tempdir_in(fixture)?;
+                let env = MakepkgEnv {
+                    pkgdest: invocation.path().join("pkg"),
+                    srcdest: invocation.path().join("src"),
+                    builddir: invocation.path().join("build"),
+                    _invocation: invocation,
+                    makeflags: String::new(),
+                    compiler_cache_dirs: Vec::new(),
+                    extra_env: Vec::new(),
+                    pgp_home: None,
+                };
+                let client = AurClient {
+                    build_dir: checkout.path().to_path_buf(),
+                    settings: Settings::default(),
+                    package_base_locks: Arc::new(dashmap::DashMap::new()),
+                };
+                let accepted = client
+                    .authorize_with_paired_build(
+                        std::slice::from_ref(&archive),
+                        &source,
+                        "demo",
+                        &["demo".to_owned()],
+                        &["demo".to_owned()],
+                        true,
+                        checkout.path(),
+                        &env,
+                    )
+                    .await?;
+                let journal = fixture.join("data/audit/audit.jsonl");
+                assert!(
+                    journal.is_file(),
+                    "inspection audit journal: {}",
+                    journal.display()
+                );
+                let audit = std::fs::read_to_string(&journal)?;
+                assert!(audit.contains("aur_inspection"), "{audit}");
+                assert!(audit.contains("succeeded"), "{audit}");
+                std::fs::write(
+                    fixture.join("config/config.toml"),
+                    "[aur]\nsecurity_profile = 'hardened'\n",
+                )?;
+                let error =
+                    AurClient::install_built_packages(std::slice::from_ref(&accepted), None)
+                        .await
+                        .expect_err(
+                            "standard build evidence must not satisfy the newly hardened profile",
+                        );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("built under the Standard AUR profile"),
+                    "{error:#}"
+                );
+                let wave = [
+                    BuiltPackages {
+                        archives: vec![ArchiveSnapshot::capture(&archive)?],
+                        profile: AurSecurityProfile::Hardened,
+                        requested_outputs: BTreeSet::from(["demo".to_owned()]),
+                    },
+                    accepted,
+                ];
+                let error = AurClient::install_built_packages(&wave, None)
+                    .await
+                    .expect_err(
+                        "a hardened first batch must not authorize a standard second batch",
+                    );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("built under the Standard AUR profile"),
+                    "{error:#}"
+                );
+                Ok(())
+            })
+        })
+    }
+
+    fn write_review_repository(
+        database: &Path,
+        repository: &str,
+        version: &str,
+        provided: &str,
+    ) -> Result<()> {
+        let desc = format!(
+            "%NAME%\nhelper\n\n%VERSION%\n{version}\n\n%DESC%\nreview fixture\n\n%ARCH%\nany\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n%PROVIDES%\n{provided}\n\n"
+        );
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive.append_data(
+            &mut header,
+            format!("helper-{version}/desc"),
+            desc.as_bytes(),
+        )?;
+        std::fs::write(
+            database.join("sync").join(format!("{repository}.db")),
+            archive.into_inner()?.finish()?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn review_official_classification_requires_complete_install_catalog() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::review_official_classification_requires_complete_install_catalog";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&[])?;
+        std::fs::create_dir_all(fixture.db.join("local"))?;
+        std::fs::write(fixture.db.join("local/ALPM_DB_VERSION"), "9\n")?;
+        write_review_repository(&fixture.db, "low", "2-1", "virtual-helper=2")?;
+        let alpm = alpm::Alpm::new(
+            fixture
+                .directory
+                .path()
+                .join("root")
+                .to_str()
+                .context("fixture root is not UTF-8")?,
+            fixture
+                .db
+                .to_str()
+                .context("fixture database is not UTF-8")?,
+        )?;
+        let missing = alpm.register_syncdb("missing", alpm::SigLevel::NONE)?;
+        missing.set_usage(alpm::Usage::SEARCH)?;
+        alpm.register_syncdb("low", alpm::SigLevel::NONE)?;
+        assert_eq!(
+            resolve_official_dependency(&alpm, "helper>=2")?
+                .context("low helper must be selected")?
+                .repository,
+            "low"
+        );
+        assert_eq!(resolve_official_dependency(&alpm, "aur-helper")?, None);
+        missing.set_usage(alpm::Usage::INSTALL)?;
+        for relation in ["aur-helper", "helper>=2"] {
+            let error = resolve_official_dependency(&alpm, relation)
+                .expect_err("an unavailable eligible repository cannot prove absence or select a lower repository");
+            assert!(
+                format!("{error:#}").contains("missing"),
+                "{relation}: {error:#}"
+            );
+        }
+        std::fs::write(
+            &fixture.conf,
+            "[options]\nSigLevel = Never\n[missing]\n[low]\n",
+        )?;
+        std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        fixture.with_environment(async {
+            S72Fixture::index(&["aur-helper"])?;
+            let client = fixture.client();
+            assert!(client.info("aur-helper").await?.is_some(), "same-named AUR candidate exists");
+            std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
+            let error = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await
+                .expect_err("incomplete official classification must fail before accepting the AUR candidate");
+            assert!(format!("{error:#}").contains("missing"), "{error:#}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn review_official_plan_combines_constraints_for_one_selected_identity() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::review_official_plan_combines_constraints_for_one_selected_identity";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let fixture = S72Fixture::new(&[])?;
+        std::fs::create_dir_all(fixture.db.join("local"))?;
+        std::fs::write(fixture.db.join("local/ALPM_DB_VERSION"), "9\n")?;
+        write_review_repository(&fixture.db, "high", "1-1", "virtual-helper=5")?;
+        write_review_repository(&fixture.db, "low", "2-1", "virtual-helper=10")?;
+        write_review_repository(&fixture.db, "search-only", "99-1", "virtual-helper=99")?;
+        write_tar_gz(&fixture.db.join("sync/empty.db"), &[]);
+        std::fs::write(
+            &fixture.conf,
+            "[options]\nSigLevel = Never\n[search-only]\nUsage = Search\n[empty]\n[high]\n[low]\n",
+        )?;
+        std::fs::write(fixture.directory.path().join("PKGBUILD"), "pkgname=demo\n")?;
+        fixture.with_environment(async {
+            let client = fixture.client();
+            for relations in [["helper>=1", "helper>=2"], ["helper>=2", "virtual-helper>=10"], ["virtual-helper>=1", "virtual-helper>=10"]] {
+                std::fs::write(fixture.directory.path().join(".SRCINFO"), format!("pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = {}\ndepends = {}\n", relations[0], relations[1]))?;
+                let plan = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await?;
+                assert!(plan.aur_dependencies.is_empty(), "official relations must not fall back to AUR");
+                assert_eq!(plan.official_dependencies, vec![OfficialTarget {
+                    repository: "low".to_owned(),
+                    name: "helper".to_owned(),
+                    relations: relations.map(str::to_owned).to_vec(),
+                }], "all constraints must select one coherent package for {relations:?}");
+                InstallRequest::new(plan.official_dependencies.into_iter().map(|selected| InstallItem {
+                    target: InstallTarget::Resolved(selected),
+                    intent: InstallIntent::Automatic,
+                }).collect())?;
+            }
+            S72Fixture::index(&["aur-helper"])?;
+            std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = aur-helper\n")?;
+            let plan = client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await?;
+            assert!(plan.official_dependencies.is_empty());
+            assert_eq!(plan.aur_dependencies, ["aur-helper"]);
+            std::fs::write(fixture.directory.path().join(".SRCINFO"), "pkgbase = demo\npkgver = 1\npkgrel = 1\narch = any\npkgname = demo\ndepends = helper<2\ndepends = helper>=2\n")?;
+            client.aur_dependency_plan(&ReviewedSource::capture(fixture.directory.path())?, "demo", &["demo".to_owned()]).await
+                .expect_err("contradictory constraints must fail closed before installation");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn review_queued_install_rechecks_current_profile_before_elevation() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::review_queued_install_rechecks_current_profile_before_elevation";
+        if crate::core::testing::run_isolated_test(TEST) || Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        let directory = private_fixture_dir()?;
+        let configuration = directory.path().join("config.toml");
+        let socket = directory.path().join("absent.sock");
+        std::fs::write(&configuration, "[aur]\nsecurity_profile = 'standard'\n")?;
+        let archive = directory.path().join("demo-1-1-any.pkg.tar.gz");
+        write_pkg_archive(
+            &archive,
+            "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
+            None,
+        );
+        let standard = BuiltPackages {
+            archives: vec![ArchiveSnapshot::capture(&archive)?],
+            profile: AurSecurityProfile::Standard,
+            requested_outputs: BTreeSet::from(["demo".to_owned()]),
+        };
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+                ("CARGO_PRIMARY_PACKAGE", Some(std::ffi::OsStr::new("1"))),
+            ],
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(async {
+                        let control = AurClient::install_built_packages(
+                            std::slice::from_ref(&standard),
+                            None,
+                        )
+                        .await
+                        .expect_err("the admitted Standard control reaches inert elevation");
+                        assert!(
+                            format!("{control:#}")
+                                .contains("Privilege elevation not supported in development mode"),
+                            "{control:#}"
+                        );
+                        let mut stopped = crate::core::sudoloop::SudoLoop::start();
+                        stopped.stop();
+                        assert!(!stopped.is_running());
+                        let stopped_control = AurClient::install_built_packages(
+                            std::slice::from_ref(&standard),
+                            Some(&stopped),
+                        )
+                        .await
+                        .expect_err("a stopped sudoloop must retain the inert elevation refusal");
+                        assert!(
+                            format!("{stopped_control:#}")
+                                .contains("Privilege elevation not supported in development mode"),
+                            "{stopped_control:#}"
+                        );
+                        let lock = INSTALL_LOCK.lock().await;
+                        let mut install = Box::pin(AurClient::install_built_packages(
+                            std::slice::from_ref(&standard),
+                            None,
+                        ));
+                        assert!(
+                            futures::poll!(install.as_mut()).is_pending(),
+                            "the validated Standard batch must wait for INSTALL_LOCK"
+                        );
+                        std::fs::write(&configuration, "[aur]\nsecurity_profile = 'hardened'\n")?;
+                        drop(lock);
+                        let error = install.await.expect_err(
+                            "queued Standard evidence must fail under the newly Hardened profile",
+                        );
+                        assert!(
+                            format!("{error:#}").contains("built under the Standard AUR profile"),
+                            "{error:#}"
+                        );
+                        Ok(())
+                    })
+            },
+        )
+    }
+
+    #[test]
+    fn official_dependency_selection_preserves_native_repository_and_relation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = directory.path().join("db");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(database.join("sync"))?;
+        for (repository, version) in [("high", "1-1"), ("low", "2-1")] {
+            let desc = format!(
+                "%NAME%\nhelper\n\n%VERSION%\n{version}\n\n%DESC%\nselected identity fixture\n\n%ARCH%\nany\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n%PROVIDES%\nvirtual-helper={version}\n\n"
+            );
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(desc.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(
+                &mut header,
+                format!("helper-{version}/desc"),
+                desc.as_bytes(),
+            )?;
+            std::fs::write(
+                database.join("sync").join(format!("{repository}.db")),
+                archive.into_inner()?.finish()?,
+            )?;
+        }
+        let alpm = alpm::Alpm::new(
+            root.to_str().context("fixture root is not UTF-8")?,
+            database.to_str().context("fixture database is not UTF-8")?,
+        )?;
+        alpm.register_syncdb("high", alpm::SigLevel::NONE)?;
+        alpm.register_syncdb("low", alpm::SigLevel::NONE)?;
+        for (relation, repository) in [
+            ("helper", "high"),
+            ("helper>=2", "low"),
+            ("virtual-helper>=2", "low"),
+        ] {
+            assert_eq!(
+                resolve_official_dependency(&alpm, relation)?,
+                Some(OfficialTarget {
+                    repository: repository.to_owned(),
+                    name: "helper".to_owned(),
+                    relations: vec![relation.to_owned()],
+                }),
+                "native selection for {relation}"
+            );
+        }
+        assert_eq!(resolve_official_dependency(&alpm, "helper>=3")?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicitly provisioned disposable native Arch fixture"]
+    async fn batch2_native_automatic_dependency_reason() -> Result<()> {
+        anyhow::ensure!(
+            std::env::var("OMG_ARCH_INSTALL_FIXTURE").as_deref() == Ok("isolated-container"),
+            "OMG_ARCH_INSTALL_FIXTURE=isolated-container is required"
+        );
+        anyhow::ensure!(crate::core::is_root(), "guest fixture requires root");
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = directory.path().join("db");
+        let cache = root.join("var/cache/pacman/pkg");
+        for path in [
+            root.join("etc/pacman.d/gnupg"),
+            database.join("local"),
+            database.join("sync"),
+            cache.clone(),
+        ] {
+            std::fs::create_dir_all(path)?;
+        }
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
+        let filename = "helper-2-1-any.pkg.tar.gz";
+        let package = cache.join(filename);
+        write_pkg_archive(
+            &package,
+            "pkgname = helper\npkgbase = helper\npkgver = 2-1\n",
+            None,
+        );
+        let bytes = std::fs::read(&package)?;
+        let desc = format!(
+            "%NAME%\nhelper\n\n%VERSION%\n2-1\n\n%DESC%\ninert automatic dependency fixture\n\n%ARCH%\nany\n\n%PACKAGER%\nFixture Maintainer <fixture@example.invalid>\n\n%FILENAME%\n{filename}\n\n%CSIZE%\n{}\n\n%ISIZE%\n0\n\n%SHA256SUM%\n{}\n\n",
+            bytes.len(),
+            hex::encode(Sha256::digest(&bytes))
+        );
+        write_tar_gz(
+            &database.join("sync/omg-fixture.db"),
+            &[("helper-2-1/desc", desc.as_bytes())],
+        );
+        let configuration = directory.path().join("pacman.conf");
+        std::fs::write(
+            &configuration,
+            format!(
+                "[options]\nArchitecture = auto\nSigLevel = Never\n[omg-fixture]\nSigLevel = Never\nServer = file://{}\n",
+                cache.display()
+            ),
+        )?;
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
+        assert!(
+            std::process::Command::new("mount")
+                .args(["--make-rprivate", "/"])
+                .status()?
+                .success()
+        );
+        assert!(
+            std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(&configuration)
+                .arg("/etc/pacman.conf")
+                .status()?
+                .success()
+        );
+        crate::core::paths::set_test_overrides(Some(root.clone()), Some(database.clone()));
+        let before = alpm::Alpm::new(
+            root.to_str().context("fixture root")?,
+            database.to_str().context("fixture database")?,
+        )?;
+        assert_eq!(before.localdb().pkgs().len(), 0);
+        drop(before);
+        let selected = crate::package_managers::alpm_direct::with_handle(|alpm| {
+            resolve_official_dependency(alpm, "helper>=2")?
+                .context("fixture helper is absent from sync repositories")
+        })?;
+        assert_eq!(selected.repository, "omg-fixture");
+        AurClient::install_official_dependencies(std::slice::from_ref(&selected)).await?;
+        let after = alpm::Alpm::new(
+            root.to_str().context("fixture root")?,
+            database.to_str().context("fixture database")?,
+        )?;
+        assert_eq!(after.localdb().pkgs().len(), 1);
+        assert_eq!(
+            after.localdb().pkg("helper")?.reason(),
+            alpm::PackageReason::Depend,
+            "new official AUR build dependencies must remain eligible for orphan cleanup"
+        );
+        drop(after);
+        use crate::package_managers::traits::PackageManager;
+        crate::package_managers::ArchPackageManager::new()
+            .install(&["omg-fixture/helper".to_owned()])
+            .await?;
+        AurClient::install_official_dependencies(&[selected]).await?;
+        let promoted = alpm::Alpm::new(
+            root.to_str().context("fixture root")?,
+            database.to_str().context("fixture database")?,
+        )?;
+        assert_eq!(
+            promoted.localdb().pkg("helper")?.reason(),
+            alpm::PackageReason::Explicit,
+            "an automatic build dependency request must preserve an existing explicit reason"
+        );
+        drop(promoted);
+        let mut archives = Vec::new();
+        for name in ["omg-fixture-app", "omg-fixture-libs"] {
+            let archive = directory.path().join(format!("{name}-1-1-any.pkg.tar.gz"));
+            write_pkg_archive(
+                &archive,
+                &format!("pkgname = {name}\npkgbase = omg-fixture-split\npkgver = 1-1\n"),
+                None,
+            );
+            archives.push(ArchiveSnapshot::capture(&archive)?);
+        }
+        let mut batch = BuiltPackages {
+            archives,
+            profile: AurSecurityProfile::Hardened,
+            requested_outputs: BTreeSet::from(["omg-fixture-app".to_owned()]),
+        };
+        AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
+        let installed = || -> Result<Vec<(String, alpm::PackageReason)>> {
+            let alpm = alpm::Alpm::new(
+                root.to_str().context("fixture root")?,
+                database.to_str().context("fixture database")?,
+            )?;
+            let mut packages = alpm
+                .localdb()
+                .pkgs()
+                .iter()
+                .map(|package| (package.name().to_owned(), package.reason()))
+                .collect::<Vec<_>>();
+            packages.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok(packages)
+        };
+        use alpm::PackageReason::{Depend, Explicit};
+        assert_eq!(
+            installed()?,
+            vec![
+                ("helper".to_owned(), Explicit),
+                ("omg-fixture-app".to_owned(), Explicit),
+                ("omg-fixture-libs".to_owned(), Depend),
+            ],
+            "only requested outputs from an admitted build batch become explicit"
+        );
+        batch.requested_outputs.clear();
+        AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
+        assert_eq!(
+            installed()?[1].1,
+            Explicit,
+            "an automatic rebuild must not demote an existing explicit split output"
+        );
+        batch
+            .requested_outputs
+            .insert("omg-fixture-libs".to_owned());
+        AurClient::install_built_packages(std::slice::from_ref(&batch), None).await?;
+        assert!(installed()?.iter().all(|(_, reason)| *reason == Explicit));
+        Ok(())
+    }
+
+    #[test]
+    fn final_install_rechecks_current_hardened_profile_before_elevation() -> Result<()> {
+        const TEST: &str = "package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation";
+        if Settings::rerun_test_unprivileged(TEST) || crate::core::testing::run_isolated_test(TEST)
+        {
+            return Ok(());
+        }
+        let directory = private_fixture_dir()?;
+        let archive = directory.path().join("demo-1-1-any.pkg.tar.gz");
+        write_pkg_archive(
+            &archive,
+            "pkgname = demo\npkgbase = demo\npkgver = 1-1\narch = any\n",
+            Some("post_install() { :; }\n"),
+        );
+        let snapshot = ArchiveSnapshot::capture(&archive)?;
+        std::fs::write(
+            directory.path().join("config.toml"),
+            "[aur]\nsecurity_profile = 'hardened'\n",
+        )
+        .expect("write fixture file");
+        temp_env::with_var("OMG_CONFIG_DIR", Some(directory.path()), || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let error = runtime
+                .block_on(AurClient::install_built_packages(
+                    &[BuiltPackages {
+                        archives: vec![snapshot],
+                        profile: AurSecurityProfile::Hardened,
+                        requested_outputs: BTreeSet::from(["demo".to_owned()]),
+                    }],
+                    None,
+                ))
+                .expect_err("the current hardened profile must reject hooks before elevation");
+            assert!(
+                error.to_string().contains("Hardened AUR profile rejects"),
+                "{error:#}"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn sandbox_build_root_keeps_existing_mounts_visible_and_identity_stable() -> Result<()> {
+        let first = [
+            Path::new("/omg-build/checkout"),
+            Path::new("/cache/first/packages"),
+        ];
+        let second = [
+            Path::new("/omg-build/checkout"),
+            Path::new("/cache/second/packages"),
+        ];
+        let root = sandbox_build_root(&first)?;
+        for destination in first {
+            let diagnostic = format!(
+                "build root {} must not obscure mount {}",
+                root.display(),
+                destination.display()
+            );
+            assert!(
+                !destination.starts_with(&root) && !root.starts_with(destination),
+                "{diagnostic}"
+            );
+        }
+        assert_eq!(root, sandbox_build_root(&second)?);
+        assert_eq!(
+            sandbox_build_root(&[Path::new("/omg-builder/cache")])?,
+            Path::new(SANDBOX_BUILD_ROOT)
+        );
+        assert!(sandbox_build_root(&[Path::new("/")]).is_err());
+        Ok(())
     }
 
     #[test]

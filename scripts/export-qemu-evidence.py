@@ -19,11 +19,12 @@ MAX_TOTAL_BYTES = 256 * 1024 * 1024
 NAME = r"[a-zA-Z0-9][a-zA-Z0-9_.-]*"
 RUN = r"run-[a-zA-Z0-9-]+"
 HOST_FILES = {
+    "native-poweroff.json",
     "fedora-sqlite-manifest.json", "fedora-sqlite-admission.log", "fedora-sqlite-install.log",
     "results.json", "sentry-results.json", "backend-mismatch-results.json",
     "backend-mismatch.json", "backend-mismatch.log", "metadata.txt", "host-metadata.txt",
     "cleanup.log", "reporting.log", "reporting-status.json", "kvm-probe.log", "engine-preflight.log",
-    "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "boot.diagnostics.log", "guest-check.log",
+    "controller-setup.log", "controller-security.log", "controller-pull.log", "image-setup.log", "boot.log", "boot.diagnostics.log", "guest-check.log", "native-coverage.log",
     "evidence-copy.log", "benchmark-validation.log", "transactions.log",
     "transaction-validation.log", "inventory.log",
     "guest-health.json", "guest-boot-id.txt", "controller-health.json", "controller-final-state.json", "health-validation.log",
@@ -154,7 +155,7 @@ def allowed_directory(parts):
     if not re.fullmatch(RUN, parts[0]):
         return False
     rest = parts[1:]
-    return rest in ((), ("guest",), ("guest", "evidence"),
+    return rest in ((), ("native-evidence",), ("native-evidence", "cli"), ("guest",), ("guest", "evidence"),
                     ("guest", "evidence", "benchmarks"), ("guest", "evidence", "apt-abi"), ("guest", "evidence", "osv"), ("guest", "evidence", "arch-advisory"), ("guest", "evidence", "fedora-advisory"), ("inventory",),
                     ("inventory", "rows"), ("mutation-refusal",),
                     ("mutation-refusal", "inventory"), ("mutation-refusal", "inventory", "rows"),
@@ -173,6 +174,14 @@ def allowed_file(parts):
     parent, name = parts[1:-1], parts[-1]
     if parent == ():
         return name in HOST_FILES
+    if parent == ("native-evidence", "cli"):
+        return name in {"tests.xml", "verification.json", "expected-tests.tsv", "passed.tsv",
+                        "process-checks.tsv", "db-before.txt", "db-after.txt", "identity.txt",
+                        "artifacts.sha256", "artifact-check.txt", "all-stages-pass.txt"} or re.fullmatch(
+            r"(?:omarchy-(?:success|vendor-failure|declined|optional-failures|migration-refusal|unsupported-mode|invalid-transport|snapshot-missing|snapshot-unsupported|required-helper-missing|reboot-decline|reboot-accept|reboot-failure|authorization-refresh|authorization-denied|runtime-fallback|runtime-foreign-lock|interrupted|output-closed|terminal-closed|preflight-failure|confirmation-failure|development-failure|inhibitor-start-failure|inhibitor-stop-failure)"
+            r"(?:\.log|-helpers\.tsv|-native-state\.json|-transcript\.log|-coordination\.txt|-layout\.txt|-interaction\.json|-control\.json|-authorization\.json|-authorization\.log|-exit\.txt)"
+            r"|arch-(?:dry-run|check)(?:\.log|-native-state\.json|-isolation\.txt)|test-[0-9]{2}\.log|daemon\.log|cli-(?:q|v|vv|vvv)\.log)", name
+        ) is not None
     if parent == ("guest",):
         return name in {"serial.log", "qemu-startup.log"}
     if parent == ("guest", "evidence"):

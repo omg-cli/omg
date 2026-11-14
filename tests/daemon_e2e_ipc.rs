@@ -20,6 +20,15 @@ struct IpcTestFixture {
     state: Arc<DaemonState>,
 }
 
+impl Drop for IpcTestFixture {
+    fn drop(&mut self) {
+        let result = omg_lib::core::security::audit::flush_pending_audit_events();
+        if !std::thread::panicking() {
+            result.expect("IPC audit events must finish before the collection is removed");
+        }
+    }
+}
+
 impl IpcTestFixture {
     fn new() -> Result<Self> {
         let temp_dir = TempDir::new()?;

@@ -1791,6 +1791,7 @@ impl PackageManager for DnfPackageManager {
             Ok(Self::parse_versioned_packages(&output)?
                 .into_iter()
                 .map(|package| super::types::SecurityPackage {
+                    origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
                     name: package.name,
                     version: package.version,
                     advisory_source: None,
@@ -1844,6 +1845,14 @@ impl PackageManager for DnfPackageManager {
                     "Installed packages changed during native security audit"
                 );
                 let mut result = super::dnf_advisory::audit_result(rows)?;
+                result.coverage = crate::core::security::scan::AuditCoverage::Reported {
+                    assessed: before
+                        .iter()
+                        .map(crate::core::security::scan::InstalledIdentity::from)
+                        .collect(),
+                    unassessed: Vec::new(),
+                    sources: vec![crate::core::security::scan::AdvisoryProvenance::NativeDnf],
+                };
                 for (_, findings) in &mut result.vulnerabilities {
                     for finding in findings {
                         let native = finding
@@ -2468,6 +2477,7 @@ mod tests {
     #[tokio::test]
     async fn native_advisory_identity_excludes_patched_versions_and_other_architectures() {
         let package = |version: &str, architecture: &str| super::super::types::SecurityPackage {
+            origin: crate::package_managers::types::SecurityOrigin::DistributionPackage,
             name: "fixture".into(),
             version: version.into(),
             advisory_source: None,

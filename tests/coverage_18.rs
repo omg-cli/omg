@@ -29,6 +29,7 @@ use omg_lib::daemon::protocol::{
     MetricsSnapshot, PROTOCOL_VERSION, Request, Response, ResponseResult, error_codes,
 };
 use omg_lib::daemon::server;
+use omg_lib::package_managers::PackageManager;
 use omg_lib::package_managers::mock::MockPackageManager;
 use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
@@ -57,6 +58,90 @@ const RATE_LIMITED_MESSAGE: &str = "Rate limit exceeded. Please slow down.";
 // ═══════════════════════════════════════════════════════════════════════════════
 // Fixture: the REAL daemon server on a private Unix socket
 // ═══════════════════════════════════════════════════════════════════════════════
+
+struct DistributionFixtureManager(MockPackageManager);
+
+impl PackageManager for DistributionFixtureManager {
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    fn security_inventory(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        anyhow::Result<Vec<omg_lib::package_managers::types::SecurityPackage>>,
+    > {
+        Box::pin(async move {
+            let mut packages = self.0.security_inventory().await?;
+            for package in &mut packages {
+                package.origin =
+                    omg_lib::package_managers::types::SecurityOrigin::DistributionPackage;
+            }
+            Ok(packages)
+        })
+    }
+
+    fn search(
+        &self,
+        query: &str,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<omg_lib::core::Package>>> {
+        self.0.search(query)
+    }
+
+    fn install(&self, packages: &[String]) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.0.install(packages)
+    }
+
+    fn remove(&self, packages: &[String]) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.0.remove(packages)
+    }
+
+    fn update(&self) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.0.update()
+    }
+
+    fn sync(&self) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.0.sync()
+    }
+
+    fn info(
+        &self,
+        name: &str,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Option<omg_lib::core::Package>>> {
+        self.0.info(name)
+    }
+
+    fn list_installed(
+        &self,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<omg_lib::core::Package>>> {
+        self.0.list_installed()
+    }
+
+    fn get_status(
+        &self,
+        fast: bool,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<(usize, usize, usize, usize)>> {
+        self.0.get_status(fast)
+    }
+
+    fn list_explicit(&self) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<String>>> {
+        self.0.list_explicit()
+    }
+
+    fn list_updates(
+        &self,
+    ) -> futures::future::BoxFuture<
+        '_,
+        anyhow::Result<Vec<omg_lib::package_managers::types::UpdateInfo>>,
+    > {
+        self.0.list_updates()
+    }
+
+    fn is_installed(&self, name: &str) -> futures::future::BoxFuture<'_, anyhow::Result<bool>> {
+        self.0.is_installed(name)
+    }
+}
 
 struct RealServerFixture {
     temp_dir: Option<TempDir>,
@@ -107,10 +192,13 @@ impl RealServerFixture {
                 "available": available,
             }))?,
         )?;
-        let manager = Arc::new(MockPackageManager::new_in(
-            if indexed { "fedora" } else { "arch" },
-            &data_dir,
-        ));
+        let manager =
+            MockPackageManager::new_in(if indexed { "fedora" } else { "arch" }, &data_dir);
+        let manager: Arc<dyn PackageManager> = if scanner.is_some() {
+            Arc::new(DistributionFixtureManager(manager))
+        } else {
+            Arc::new(manager)
+        };
         // The portable DNF index adapter consumes the explicitly seeded manager
         // inventory. No host repositories or test-only production API are needed.
         let index = if indexed {
@@ -355,7 +443,7 @@ async fn package_inventory_and_updates_survive_the_production_transport() -> Res
             assert_eq!(status.explicit_packages, 2);
             assert_eq!(status.orphan_packages, 0);
             assert_eq!(status.updates_available, 1);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
         }
         other => panic!("status returned {other:?}"),
     }
@@ -507,7 +595,7 @@ async fn status_reports_backend_corruption_without_cached_success_and_recovers_o
         } => {
             assert_eq!(status.total_packages, 2);
             assert_eq!(status.updates_available, 1);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
         }
         other => panic!("initial status returned {other:?}"),
     }
@@ -540,7 +628,7 @@ async fn status_reports_backend_corruption_without_cached_success_and_recovers_o
             assert_eq!(status.explicit_packages, 2);
             assert_eq!(status.orphan_packages, 0);
             assert_eq!(status.updates_available, 1);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
         }
         other => panic!("recovered status returned {other:?}"),
     }
@@ -1534,6 +1622,12 @@ async fn security_audit_backend_failure_cannot_report_a_clean_scan() -> Result<(
                 assert_eq!(result.total_vulnerabilities, 0);
                 assert_eq!(result.high_severity, 0);
                 assert!(result.vulnerabilities.is_empty());
+                assert!(matches!(
+                    &result.coverage,
+                    omg_lib::core::security::scan::AuditCoverage::Reported {
+                        assessed, unassessed, sources,
+                    } if assessed.is_empty() && unassessed.is_empty() && sources.is_empty()
+                ));
             }
             other => anyhow::bail!("empty-inventory audit returned {other:?}"),
         }
@@ -1695,6 +1789,27 @@ async fn security_audit_fetches_all_osv_pages_and_refuses_partial_results_over_r
                 assert_eq!(result.total_vulnerabilities, 2);
                 assert_eq!(result.high_severity, 1);
                 assert_eq!(result.vulnerabilities.len(), 1);
+                match &result.coverage {
+                    omg_lib::core::security::scan::AuditCoverage::Reported {
+                        assessed,
+                        unassessed,
+                        sources,
+                    } => {
+                        assert_eq!(assessed.len(), 1);
+                        assert_eq!(assessed[0].name, package);
+                        assert_eq!(assessed[0].version, "1.0.0");
+                        assert!(unassessed.is_empty());
+                        assert_eq!(
+                            sources,
+                            &[omg_lib::core::security::scan::AdvisoryProvenance::Osv {
+                                ecosystem: "Debian:12".into(),
+                            }]
+                        );
+                    }
+                    other @ omg_lib::core::security::scan::AuditCoverage::Unreported => {
+                        anyhow::bail!("complete OSV audit omitted its coverage: {other:?}")
+                    }
+                }
                 let (name, findings) = &result.vulnerabilities[0];
                 assert_eq!(name, &package);
                 assert_eq!(findings.len(), 2);

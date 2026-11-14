@@ -111,6 +111,7 @@ fn status_refresh_invalidates_the_previous_explicit_list() {
         updates_available: 2,
         security_vulnerabilities: 0,
         vulnerabilities_scanned: true,
+        security_unknown_packages: Some(0),
         runtime_versions: vec![],
     }));
 
@@ -129,6 +130,7 @@ fn test_system_status_cache() {
         updates_available: 2,
         security_vulnerabilities: 0,
         vulnerabilities_scanned: true,
+        security_unknown_packages: Some(0),
         runtime_versions: vec![],
     };
 
@@ -190,6 +192,7 @@ fn populated_cache(ttl_secs: u64, status_ttl_secs: u64) -> PackageCache {
         updates_available: 4,
         security_vulnerabilities: 5,
         vulnerabilities_scanned: true,
+        security_unknown_packages: Some(0),
         runtime_versions: vec![("rust".to_string(), "1.95".to_string())],
     }));
     cache.update_explicit(vec!["alpha".to_string(), "beta".to_string()]);
@@ -339,6 +342,7 @@ fn explicit_refresh_replaces_status_count_without_changing_status_snapshot() {
         updates_available: 4,
         security_vulnerabilities: 5,
         vulnerabilities_scanned: true,
+        security_unknown_packages: Some(0),
         runtime_versions: vec![("rust".to_string(), "1.95".to_string())],
     }));
     assert_eq!(cache.get_explicit_count(), Some(17));

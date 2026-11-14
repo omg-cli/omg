@@ -1845,7 +1845,10 @@ mod tests {
             return;
         }
         use std::os::unix::fs::PermissionsExt as _;
-        let directory = tempfile::tempdir().expect("offline pip fixture");
+        let directory = tempfile::Builder::new()
+            .prefix("omg-pip-")
+            .tempdir_in("/tmp")
+            .expect("short private offline pip fixture");
         let root = directory.path().join(if with_spaces {
             "path with spaces and an apostrophe's value"
         } else {
@@ -1915,6 +1918,12 @@ pip.chmod(0o755)
                 .block_on(install_managed("pip", "black", "black", &tools, &bin))
                 .expect("actual pip installation must publish a runnable entry point");
         });
+        let entry = fs::read_to_string(bin.join("black")).expect("installed console script");
+        assert_eq!(
+            entry.starts_with("#!/bin/sh\n'''exec' "),
+            with_spaces,
+            "exercise a direct interpreter header without spaces and a shell trampoline with spaces"
+        );
         let output = Command::new(bin.join("black"))
             .output()
             .expect("promoted pip console entry point must execute after staging disappears");

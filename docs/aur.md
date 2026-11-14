@@ -37,6 +37,9 @@ OMG asks before the package transaction. `--yes` skips that normal confirmation 
 1. OMG fetches recipe sources without executing the PKGBUILD, then presents the source tree for review when `aur.review_pkgbuild` is enabled.
 2. It hashes and rechecks the reviewed tree before the build. The default Bubblewrap path isolates the build home and environment and denies build network access unless configured otherwise.
 3. It inspects output archives before installation. The inspector rejects unsafe paths, escaping links, special entries, and inconsistent or undeclared metadata.
+   It also rejects ambiguous PAX/GNU metadata and data-bearing nonregular
+   entries before passing archives to native libalpm. Capability classification
+   uses the attribute name decoded by libarchive.
 4. Outputs with privileged integration, such as install hooks, capabilities, systemd units, kernel modules, package-manager hooks, or `/etc` content, receive a second private build. The outputs must match byte for byte.
 5. Accepted archive bytes move through a sealed in-memory handoff to the privileged transaction, which reinspects the staged bytes.
 
@@ -65,7 +68,94 @@ allow_network = false
 allow_unsafe_builds = false
 ```
 
-`build_method` also accepts `chroot` and `native`. Native builds require the explicit `allow_unsafe_builds` opt-in. Chroot devtools can execute recipe code on the host before isolation and need the unsafe opt-in; they cannot enforce an offline build. Keep the default unless you understand those limits. `makeflags`, `cache_builds`, `enable_ccache`, `enable_sccache`, `pkgdest`, and `srcdest` are optional settings. A higher `build_concurrency` uses more CPU and memory and is not a guarantee of a faster build.
+`build_method` also accepts `chroot` and `native`. Native builds require the explicit `allow_unsafe_builds` opt-in. Chroot devtools can execute recipe code on the host before isolation and require both unsafe and network opt-ins. They cannot enforce an offline build. Keep the default unless you understand those limits.
+
+Build outputs, downloaded sources and compiler caches use private invocation
+directories. Legacy `cache_builds`, `pkgdest`, `srcdest`, `ccache_dir` and
+`sccache_dir` values remain accepted for compatibility, but shared storage and
+persistent artifact reuse are disabled. `enable_ccache` and `enable_sccache`
+enable invocation-local compiler caches. A higher `build_concurrency` uses more
+CPU and memory and is not a guarantee of a faster build.
+
+## Optional hardened profile
+
+Enable the profile before installing AUR packages:
+
+```bash
+omg config set aur.security_profile hardened
+omg config get aur.security_profile
+```
+
+The equivalent configuration is:
+
+```toml
+[aur]
+security_profile = "hardened"
+build_method = "bubblewrap"
+review_pkgbuild = true
+secure_makepkg = true
+allow_network = false
+allow_unsafe_builds = false
+```
+
+Conflicting settings fail instead of weakening the profile. Missing Bubblewrap
+also fails. Source review still requires an attended terminal, and `--yes`
+cannot skip its confirmation in hardened mode.
+
+This profile rejects install hooks, setuid/setgid files, file capabilities,
+`/etc` content and the privileged integration paths classified by OMG, such as
+systemd units, kernel modules, ALPM hooks and polkit policies. The classifier
+includes the documented local and runtime loader roots for systemd, udev,
+tmpfiles, sysusers, module loading, polkit and D-Bus system services, along with
+kernel-install configuration. It requires two
+builds with separate output, source and compiler-cache directories to produce
+identical archive hashes for every accepted output. Some legitimate AUR recipes
+will fail these requirements. Use `standard` to restore the default profile.
+
+Both builds use the same host toolchain and reviewed checkout. A deterministic
+malicious program can pass. These checks do not authenticate the maintainer or
+vet arbitrary code, and the profile only governs OMG operations. It does not
+govern packages installed through yay, Aura or direct pacman commands. To refuse
+AUR entirely, set `allow_aur = false` in your OMG `policy.toml`; see
+[security](./security.md).
+
+Advisory admission is a separate policy control. The hardened build profile does
+not silently enable network access or change its offline build contract. To add
+fresh final Arch advisory checks, select `advisory_requirement = "fresh_snapshot"`
+and declare the applicable repository scopes in `policy.toml`; see
+[security policy](./security.md#security-policy). AUR artifacts still have Unknown
+distribution-advisory applicability. The privileged operation requires attended
+confirmation of that gap for the exact final archive batch. That confirmation
+is an exception to missing coverage, not a claim that the recipe was vetted.
+
+Both profiles check each built archive against its MTREE inventory using the
+official Rust ALPM parser. Paths, file types, permissions, regular-file sizes
+and symlink targets must agree with the archive. Before installation, OMG checks
+the native loaded package's file names, types, permissions and regular-file
+sizes against that inventory. A profile exception cannot bypass malformed
+metadata or an inventory mismatch.
+
+Ordinary makepkg output is supported. Custom producers must use canonical
+relative archive names and plain UTF-8 or one complete gzip member for MTREE.
+Leading `./`, repeated separators and inner `./` in archive payload names are
+rejected. Hard links must refer directly to an earlier regular payload file;
+forward references and chains are rejected. Encoded and decoded MTREE each
+have a 16 MiB limit, alongside archive entry and path limits. These are OMG
+admission rules, so changing to `standard` does not disable them.
+
+Privilege metadata has separate admission bounds: 8 KiB per capability value
+before hex encoding, and 64 KiB per archive for retained privileged paths and
+encoded capability values. The attended privilege summary has a 32 KiB display
+limit. OMG refuses approval when the complete summary exceeds that limit,
+even if each archive passes inspection. These are OMG compatibility limits,
+not a claim that the metadata is a valid Linux capability. Inspection policy 6
+invalidates admission evidence produced before the current limits and loader-path
+classification.
+
+Inventory agreement does not vet program behavior or authenticate MTREE content
+hashes. Native file-list agreement also does not prove successful extraction.
+The sealed-byte handoff, source review and paired-build checks remain separate
+controls.
 
 ## Update or remove
 

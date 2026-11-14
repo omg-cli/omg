@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::os::unix::{
     ffi::OsStrExt,
@@ -26,6 +26,7 @@ use std::sync::RwLock;
 use std::time::SystemTime;
 use tracing::instrument;
 
+use crate::core::pacman_conf::{PacmanConfig, RepoUsage};
 use crate::core::paths;
 use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter, decode_xz_to};
 
@@ -33,6 +34,7 @@ use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter, deco
 const CACHE_TTL_SECS: u64 = 30 * 60;
 const MAX_DESC_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SYNC_ENTRIES: usize = 100_000;
+const MAX_DERIVED_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Sync database cache, validated against its source identity on reuse.
 static SYNC_DB_CACHE: std::sync::LazyLock<RwLock<DbCache>> =
@@ -44,32 +46,63 @@ static LOCAL_DB_CACHE: std::sync::LazyLock<RwLock<LocalDbCache>> =
 
 #[derive(Default, Serialize, Deserialize)]
 struct DbCache {
-    packages: HashMap<String, SyncDbPackage>,
+    packages: Vec<RepositoryPackages>,
     last_modified: Option<SyncDbEpoch>,
     #[serde(skip)]
     last_accessed: Option<SystemTime>,
 }
 
-fn load_sync_packages(sync_dir: &Path) -> Result<HashMap<String, SyncDbPackage>> {
-    let db_paths = collect_sync_db_paths(sync_dir)?;
-    let parsed: Vec<HashMap<String, SyncDbPackage>> = db_paths
-        .par_iter()
-        .map(|(path, name)| {
-            parse_sync_db(path, name)
-                .with_context(|| format!("Failed to parse database: {} ({})", path.display(), name))
-        })
-        .collect::<Result<Vec<_>>>()?;
+#[derive(Serialize, Deserialize)]
+struct RepositoryPackages {
+    name: String,
+    usage: RepoUsage,
+    packages: std::result::Result<HashMap<String, SyncDbPackage>, String>,
+}
 
-    let mut packages = HashMap::with_capacity(20000);
-    for pkgs in parsed {
-        // First repo wins: official repos are collected before custom ones
-        // (see `collect_sync_db_paths`), so a custom repo cannot silently
-        // shadow an official package of the same name in update checks.
-        for (name, pkg) in pkgs {
-            packages.entry(name).or_insert(pkg);
+impl DbCache {
+    fn select(&self, usage: RepoUsage) -> Result<HashMap<&str, &SyncDbPackage>> {
+        let mut selected = HashMap::with_capacity(20_000);
+        for repository in &self.packages {
+            if !repository.usage.intersects(usage) {
+                continue;
+            }
+            let packages = repository.packages.as_ref().map_err(|error| {
+                anyhow::anyhow!(
+                    "Repository '{}' is unavailable or incomplete: {error}. Run 'omg sync' and retry",
+                    repository.name
+                )
+            })?;
+            for (name, package) in packages {
+                selected.entry(name.as_str()).or_insert(package);
+            }
         }
+        Ok(selected)
     }
-    Ok(packages)
+}
+
+fn load_sync_packages(sync_dir: &Path) -> Result<Vec<RepositoryPackages>> {
+    let config = PacmanConfig::parse(paths::pacman_conf_path())
+        .context("Failed to read pacman repository policy")?;
+    let available: HashMap<_, _> = collect_sync_db_paths(sync_dir)?
+        .into_iter()
+        .map(|(path, name)| (name, path))
+        .collect();
+    Ok(config
+        .repos
+        .par_iter()
+        .map(|repo| {
+            let path = available
+                .get(&repo.name)
+                .cloned()
+                .unwrap_or_else(|| sync_dir.join(format!("{}.db", repo.name)));
+            RepositoryPackages {
+                name: repo.name.clone(),
+                usage: repo.usage,
+                packages: parse_sync_db(&path, &repo.name)
+                    .map_err(|error| format!("{}: {error:#}", path.display())),
+            }
+        })
+        .collect())
 }
 
 fn collect_sync_db_paths(sync_dir: &Path) -> Result<Vec<(PathBuf, String)>> {
@@ -137,6 +170,7 @@ struct LocalDbCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncDbPackage {
     pub name: String,
+    #[serde(deserialize_with = "deserialize_package_version")]
     pub version: Version,
     pub desc: String,
     pub filename: String,
@@ -184,10 +218,15 @@ impl Default for SyncDbPackage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalDbPackage {
     pub name: String,
+    #[serde(deserialize_with = "deserialize_package_version")]
     pub version: Version,
     pub desc: String,
     pub install_date: String,
+    pub url: Option<String>,
+    pub size: u64,
     pub licenses: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<String>,
     pub explicit: bool, // Explicitly installed vs dependency
     /// Runtime dependencies this package declares (`%DEPENDS%`).
     ///
@@ -210,7 +249,10 @@ impl Default for LocalDbPackage {
             version: super::super::types::zero_version(),
             desc: String::new(),
             install_date: String::new(),
+            url: None,
+            size: 0,
             licenses: Vec::new(),
+            groups: Vec::new(),
             explicit: false,
             depends: Vec::new(),
             optdepends: Vec::new(),
@@ -222,8 +264,16 @@ impl Default for LocalDbPackage {
 /// Parse a sync database file (core.db, extra.db, multilib.db)
 /// Returns a `HashMap` of package name -> `SyncDbPackage`
 pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, SyncDbPackage>> {
-    let mut file =
-        File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    anyhow::ensure!(
+        file.metadata()?.is_file(),
+        "Pacman sync database is not a regular file: {}",
+        path.display()
+    );
 
     let reader: Box<dyn Read> = {
         let mut probe = [0u8; 263];
@@ -233,6 +283,11 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
         if probe.starts_with(&[0x1f, 0x8b]) {
             Box::new(BudgetedReader::new(
                 GzDecoder::new(file),
+                BudgetedSink::max_budget(),
+            ))
+        } else if probe.starts_with(b"BZh") {
+            Box::new(BudgetedReader::new(
+                bzip2::read::MultiBzDecoder::new(file),
                 BudgetedSink::max_budget(),
             ))
         } else if probe.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
@@ -262,6 +317,8 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
     let mut archive = tar::Archive::new(reader);
     let mut packages = HashMap::new();
     let mut entry_count = 0usize;
+    let mut descriptions = Vec::new();
+    let mut buffered_bytes = 0usize;
 
     for entry in archive.entries().with_context(|| {
         format!(
@@ -284,9 +341,6 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
                 entry.size() <= MAX_DESC_BYTES,
                 "Pacman sync database desc exceeds the {MAX_DESC_BYTES}-byte limit"
             );
-            // The db is a tar stream; a desc can legitimately be arbitrary
-            // bytes on a damaged mirror. Lossy-decode instead of failing the
-            // whole repository read (matches pacman's tolerant reader).
             let mut raw = Vec::new();
             entry
                 .take(MAX_DESC_BYTES + 1)
@@ -301,32 +355,120 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
                 raw.len() as u64 <= MAX_DESC_BYTES,
                 "Pacman sync database desc exceeds the {MAX_DESC_BYTES}-byte limit"
             );
-            let content = String::from_utf8_lossy(&raw).into_owned();
-
-            match parse_desc_content(&content, repo_name) {
-                Ok(pkg) if !pkg.name.is_empty() => {
-                    packages.insert(pkg.name.clone(), pkg);
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        repo = repo_name,
-                        entry = %entry_path.display(),
-                        "Ignoring sync database entry without a package name"
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        repo = repo_name,
-                        entry = %entry_path.display(),
-                        error = %error,
-                        "Ignoring malformed sync database package entry"
-                    );
-                }
+            buffered_bytes += raw.len() + entry_path.as_os_str().len();
+            descriptions.push((entry_path, raw));
+            if descriptions.len() == 512 || buffered_bytes >= 1024 * 1024 {
+                merge_sync_descriptions(&mut packages, &mut descriptions, repo_name)?;
+                buffered_bytes = 0;
             }
         }
     }
 
+    merge_sync_descriptions(&mut packages, &mut descriptions, repo_name)?;
+
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink()).with_context(|| {
+        format!(
+            "Failed to finish decoding repository database {}",
+            path.display()
+        )
+    })?;
     Ok(packages)
+}
+
+fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<SyncDbPackage> {
+    let content = String::from_utf8(raw).with_context(|| {
+        format!(
+            "Invalid UTF-8 in {} from repository {repo_name}",
+            entry_path.display()
+        )
+    })?;
+    let pkg = parse_desc_content(&content, repo_name).with_context(|| {
+        format!(
+            "Malformed desc {} from repository {repo_name}",
+            entry_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        !pkg.name.is_empty(),
+        "Missing package name in {} from repository {repo_name}",
+        entry_path.display()
+    );
+    let directory = entry_path
+        .parent()
+        .and_then(Path::to_str)
+        .context("Invalid sync package directory identity")?;
+    anyhow::ensure!(
+        !directory.contains('/'),
+        "Nested sync package directory identity in {} from repository {repo_name}",
+        entry_path.display()
+    );
+    alpm_types::Name::from_str(&pkg.name).with_context(|| {
+        format!(
+            "Invalid package name in {} from repository {repo_name}",
+            entry_path.display()
+        )
+    })?;
+    let (before_release, _) = directory
+        .rsplit_once('-')
+        .context("Missing sync package release in directory identity")?;
+    let (native_name, _) = before_release
+        .rsplit_once('-')
+        .context("Missing sync package version in directory identity")?;
+    let native_version = require_package_version(&directory[native_name.len() + 1..])?;
+    anyhow::ensure!(
+        native_name == pkg.name && native_version.to_string() == pkg.version.to_string(),
+        "Inconsistent package identity in {} from repository {repo_name}",
+        entry_path.display()
+    );
+    Ok(pkg)
+}
+
+fn merge_sync_descriptions(
+    packages: &mut HashMap<String, SyncDbPackage>,
+    descriptions: &mut Vec<(PathBuf, Vec<u8>)>,
+    repo_name: &str,
+) -> Result<()> {
+    static POOL: std::sync::LazyLock<Option<rayon::ThreadPool>> = std::sync::LazyLock::new(|| {
+        let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
+        match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+            Ok(pool) => Some(pool),
+            Err(error) => {
+                tracing::warn!(
+                    "Cannot start repository parsing workers; parsing serially: {error}"
+                );
+                None
+            }
+        }
+    });
+    if descriptions.is_empty() {
+        return Ok(());
+    }
+    // At most four parsing tasks per bounded batch. Archive I/O stays serial.
+    let minimum_records = descriptions.len().div_ceil(4).max(16);
+    let entries = std::mem::take(descriptions);
+    let parse = |(path, raw): (PathBuf, Vec<u8>)| {
+        let package = parse_sync_desc(&path, raw, repo_name);
+        (path, package)
+    };
+    let parsed: Vec<_> = match &*POOL {
+        Some(pool) => pool.install(|| {
+            entries
+                .into_par_iter()
+                .with_min_len(minimum_records)
+                .map(parse)
+                .collect()
+        }),
+        None => entries.into_iter().map(parse).collect(),
+    };
+    for (path, package) in parsed {
+        let package = package?;
+        anyhow::ensure!(
+            packages.insert(package.name.clone(), package).is_none(),
+            "Duplicate package identity in {} from repository {repo_name}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Extract a human-readable message from a `catch_unwind` panic payload.
@@ -343,7 +485,7 @@ macro_rules! sync_pkg_from_desc {
     ($desc:expr, $repo:expr) => {
         SyncDbPackage {
             name: $desc.name.to_string(),
-            version: $desc.version.into(),
+            version: Version::from($desc.version),
             desc: $desc.description.to_string(),
             filename: $desc.file_name.to_string(),
             csize: $desc.compressed_size,
@@ -444,6 +586,7 @@ fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
     };
 
     let mut current_section = "";
+    let mut has_version = false;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -459,6 +602,7 @@ fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
             "%NAME%" => pkg.name = line.to_string(),
             "%VERSION%" => {
                 pkg.version = require_package_version(line)?;
+                has_version = true;
             }
             "%DESC%" => pkg.desc = line.to_string(),
             "%URL%" => pkg.url = line.to_string(),
@@ -486,6 +630,7 @@ fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
         }
     }
 
+    anyhow::ensure!(has_version, "Missing package version in repository {repo}");
     Ok(pkg)
 }
 
@@ -499,9 +644,8 @@ pub(crate) fn check_local_db_health(path: &Path) -> Result<(usize, Vec<Unsatisfi
     Ok((snapshot.packages.len(), missing))
 }
 
-/// Use pacman's documented offline -Dk operation for dependency, conflict and
-/// duplicate file ownership semantics. An explicit empty config and dbpath
-/// prevent an unrelated configured database or repository from being checked.
+/// Offline health results from the validated Rust snapshot and native ALPM.
+/// No sync databases, transactions, package hooks or external manager are used.
 pub(crate) struct NativeLocalDbHealth {
     pub packages: usize,
     pub missing: Vec<UnsatisfiedDependency>,
@@ -520,22 +664,7 @@ pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<NativeLo
     let snapshot = LocalHealthSnapshot::capture(path)?;
     validate_health_relations(&snapshot.packages)?;
     let missing = unsatisfied_dependencies(&snapshot.packages);
-    let mut command = crate::core::privilege::system_command("pacman")?;
-    command
-        .env_clear()
-        .env("PATH", crate::core::privilege::SYSTEM_PATH)
-        .env("LC_ALL", "C")
-        .args([
-            "--config",
-            "/dev/null",
-            "--color",
-            "never",
-            "-Dk",
-            "--dbpath",
-        ])
-        .arg(path.parent().context("ALPM local database has no parent")?);
-    let result =
-        bounded_native_check(command, std::time::Duration::from_secs(15), 1024 * 1024).await;
+    let result = inspect_native_local_database(path, &snapshot);
     snapshot.revalidate(path)?;
     Ok(NativeLocalDbHealth {
         packages: snapshot.packages.len(),
@@ -544,121 +673,144 @@ pub(crate) async fn check_native_local_db_health(path: &Path) -> Result<NativeLo
     })
 }
 
-async fn bounded_native_check(
-    command: std::process::Command,
-    deadline: std::time::Duration,
-    max_output: u64,
-) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-    let mut command = tokio::process::Command::from(command);
-    let operation = async {
-        let mut child = command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("Could not start pacman -Dk")?;
-        let stdout = child.stdout.take().context("pacman stdout not captured")?;
-        let stderr = child.stderr.take().context("pacman stderr not captured")?;
-        async fn read_limited(
-            reader: impl tokio::io::AsyncRead + Unpin,
-            limit: u64,
-        ) -> Result<Vec<u8>> {
-            let mut bytes = Vec::new();
-            reader.take(limit + 1).read_to_end(&mut bytes).await?;
-            anyhow::ensure!(
-                bytes.len() as u64 <= limit,
-                "pacman -Dk output exceeds limit"
-            );
-            Ok(bytes)
-        }
-        let (stdout, stderr) = tokio::try_join!(
-            read_limited(stdout, max_output),
-            read_limited(stderr, max_output)
-        )?;
-        let status = child
-            .wait()
-            .await
-            .context("Could not wait for pacman -Dk")?;
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        let detail = String::from_utf8_lossy(&detail);
-        let detail = detail
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .take(8)
-            .map(|line| {
-                crate::cli::style::sanitize_terminal_text(line)
-                    .chars()
-                    .take(160)
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
+fn inspect_native_local_database(path: &Path, snapshot: &LocalHealthSnapshot) -> Result<()> {
+    let database = path.parent().context("ALPM local database has no parent")?;
+    let handle = crate::package_managers::alpm_ops::open_alpm_at(Path::new("/"), database)?;
+    handle
+        .localdb()
+        .is_valid()
+        .context("Invalid native local database")?;
+    let packages = handle.localdb().pkgs();
+    anyhow::ensure!(
+        packages.len() == snapshot.packages.len(),
+        "Native local database inventory is incomplete"
+    );
+    for package in packages {
+        let observed = snapshot
+            .packages
+            .get(package.name())
+            .context("Native local database inventory differs from the validated snapshot")?;
         anyhow::ensure!(
-            status.success(),
-            "pacman -Dk rejected local database ({status}): {detail}"
+            package.version().as_str() == observed.version.to_string(),
+            "Native local database version differs for {}",
+            package.name()
         );
-        Ok(())
-    };
-    tokio::time::timeout(deadline, operation)
-        .await
-        .context("pacman -Dk timed out")?
+    }
+    let empty = std::iter::empty::<&alpm::Pkg>();
+    let missing = handle.check_deps(empty.clone(), empty, packages.iter(), false);
+    if let Some(dependency) = missing.iter().next() {
+        anyhow::bail!(
+            "Installed package {} requires {}",
+            crate::cli::style::sanitize_terminal_text(dependency.target()),
+            crate::cli::style::sanitize_terminal_text(&dependency.depend().to_string())
+        );
+    }
+    let conflicts = handle.check_conflicts(packages.iter());
+    if let Some(conflict) = conflicts.iter().next() {
+        anyhow::bail!(
+            "Installed package conflict: {} and {} ({})",
+            crate::cli::style::sanitize_terminal_text(conflict.package1().name()),
+            crate::cli::style::sanitize_terminal_text(conflict.package2().name()),
+            crate::cli::style::sanitize_terminal_text(&conflict.reason().to_string())
+        );
+    }
+    let mut owners = HashMap::new();
+    for package in packages {
+        for file in package.files().files() {
+            let name = file.name();
+            if name.ends_with(b"/") {
+                continue;
+            }
+            if let Some(previous) = owners.insert(name, package.name()) {
+                anyhow::ensure!(
+                    previous == package.name(),
+                    "Duplicate installed file ownership: {} and {} own {}",
+                    crate::cli::style::sanitize_terminal_text(previous),
+                    crate::cli::style::sanitize_terminal_text(package.name()),
+                    crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(name))
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod native_health_tests {
-    use super::bounded_native_check;
-    use std::time::Duration;
+    use super::check_native_local_db_health;
+    use std::path::Path;
 
-    #[tokio::test]
-    async fn native_check_propagates_failure_and_sanitizes_diagnostic() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", "printf 'missing dependency\\033[31m\\n' >&2; exit 1"]);
-        let error = bounded_native_check(command, Duration::from_secs(2), 1024)
-            .await
-            .unwrap_err();
-        let detail = error.to_string();
-        assert!(detail.contains("rejected local database"));
-        assert!(detail.contains("missing dependency"));
-        assert!(!detail.contains('\x1b'));
+    fn package(database: &Path, name: &str, extra: &str, files: &str) {
+        let directory = database.join("local").join(format!("{name}-1.0-1"));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("desc"),
+            format!("%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n0\n\n{extra}"),
+        )
+        .unwrap();
+        std::fs::write(directory.join("files"), format!("%FILES%\n{files}\n\n")).unwrap();
     }
 
     #[tokio::test]
-    async fn native_check_requires_success_and_bounds_elapsed_and_both_streams() {
-        let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", "exit 0"]);
-        bounded_native_check(command, Duration::from_secs(2), 16)
+    async fn native_health_accepts_shared_directories_without_writes_or_repository_access() {
+        let owner = tempfile::tempdir().unwrap();
+        let database = owner.path();
+        package(
+            database,
+            "app",
+            "%DEPENDS%\nvirtual>=2\n\n",
+            "usr/\nusr/bin/app",
+        );
+        package(
+            database,
+            "provider",
+            "%PROVIDES%\nvirtual=2\n\n",
+            "usr/\nusr/lib/provider",
+        );
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n").unwrap();
+        let before = super::LocalHealthSnapshot::capture(&database.join("local")).unwrap();
+        let report = check_native_local_db_health(&database.join("local"))
             .await
             .unwrap();
-        for target in ["", " >&2"] {
-            let mut command = std::process::Command::new("/bin/sh");
-            command.args(["-c", &format!("printf '01234567890123456789'{target}")]);
-            let error = bounded_native_check(command, Duration::from_secs(2), 16)
+        assert_eq!(report.packages, 2);
+        assert!(report.missing.is_empty());
+        report.native.unwrap();
+        before.revalidate(&database.join("local")).unwrap();
+        assert!(!database.join("db.lck").exists());
+        assert!(!database.join("sync").exists());
+    }
+
+    #[tokio::test]
+    async fn native_health_refuses_missing_dependencies_conflicts_and_shared_files() {
+        for (extra, files, expected) in [
+            (
+                "%DEPENDS%\nabsent>=2\n\n",
+                "usr/bin/app",
+                "requires absent>=2",
+            ),
+            (
+                "%CONFLICTS%\nother\n\n",
+                "usr/bin/app",
+                "Installed package conflict",
+            ),
+            ("", "usr/bin/shared", "Duplicate installed file ownership"),
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            package(owner.path(), "app", extra, files);
+            package(owner.path(), "other", "", "usr/bin/shared");
+            std::fs::write(owner.path().join("local/ALPM_DB_VERSION"), "9\n").unwrap();
+            let before = super::LocalHealthSnapshot::capture(&owner.path().join("local")).unwrap();
+            let report = check_native_local_db_health(&owner.path().join("local"))
                 .await
-                .unwrap_err();
-            assert!(error.to_string().contains("output exceeds limit"));
+                .unwrap();
+            let error = report.native.expect_err("unhealthy native database");
+            assert!(
+                error.to_string().contains(expected),
+                "{expected}: {error:#}"
+            );
+            before.revalidate(&owner.path().join("local")).unwrap();
+            assert!(!owner.path().join("db.lck").exists());
         }
-        let fixture = tempfile::TempDir::new().unwrap();
-        let pid_file = fixture.path().join("pid");
-        let mut command = std::process::Command::new("/bin/sh");
-        command.args(["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 5", "_"]);
-        command.arg(&pid_file);
-        let started = std::time::Instant::now();
-        let error = bounded_native_check(command, Duration::from_millis(250), 16)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(1));
-        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
-        let pid = nix::unistd::Pid::from_raw(pid);
-        for _ in 0..20 {
-            if nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("Timed-out native check child was not killed and reaped");
     }
 }
 
@@ -830,76 +982,47 @@ impl LocalHealthSnapshot {
 pub fn parse_local_db(path: &Path) -> Result<HashMap<String, LocalDbPackage>> {
     let mut packages = HashMap::with_capacity(2000); // Pre-allocate for typical system
 
-    if !path.exists() {
+    if !path.try_exists().with_context(|| {
+        format!(
+            "Failed to inspect pacman local directory {}",
+            path.display()
+        )
+    })? {
         return Ok(packages);
     }
 
     for entry in std::fs::read_dir(path)
         .with_context(|| format!("Failed to read pacman local directory {}", path.display()))?
     {
-        // Match the sync-db policy: one corrupt entry must never take down
-        // the whole local database (it breaks every pacman feature).
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "Ignoring unreadable pacman local directory entry"
-                );
-                continue;
-            }
-        };
+        let entry =
+            entry.with_context(|| format!("Failed to read local entry in {}", path.display()))?;
         let pkg_path = entry.path();
-        let meta = match entry.metadata() {
-            Ok(meta) => meta,
-            Err(error) => {
-                tracing::warn!(
-                    pkg_dir = %pkg_path.display(),
-                    error = %error,
-                    "Ignoring pacman local package with unreadable metadata"
-                );
-                continue;
-            }
-        };
+        let meta = entry
+            .metadata()
+            .with_context(|| format!("Failed to inspect local entry {}", pkg_path.display()))?;
         if !meta.is_dir() {
             continue;
         }
-
         let desc_path = pkg_path.join("desc");
-        if !desc_path.exists() {
-            tracing::warn!(
-                pkg_dir = %pkg_path.display(),
-                "Ignoring local package directory missing its desc file (corrupt pacman local db entry)"
-            );
-            continue;
-        }
-
-        match parse_local_desc(&desc_path) {
-            Ok(pkg) if !pkg.name.is_empty() => {
-                packages.insert(pkg.name.clone(), pkg);
-            }
-            Ok(_) => {
-                tracing::warn!(
-                    pkg_dir = %pkg_path.display(),
-                    "Ignoring local package entry without a package name"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    pkg_dir = %pkg_path.display(),
-                    error = %error,
-                    "Ignoring malformed local pacman database package entry"
-                );
-            }
-        }
+        let pkg = parse_local_desc(&desc_path)
+            .with_context(|| format!("Incomplete local package entry {}", desc_path.display()))?;
+        packages.insert(pkg.name.clone(), pkg);
     }
 
     Ok(packages)
 }
 
 fn require_package_version(raw: &str) -> Result<Version> {
-    Version::from_str(raw)
-        .map_err(|error| anyhow::anyhow!("Invalid package version {raw}: {error}"))
+    crate::package_managers::parse_version(raw)
+        .with_context(|| format!("Invalid package version {raw:?}"))
+}
+
+fn deserialize_package_version<'de, D>(deserializer: D) -> std::result::Result<Version, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = Version::deserialize(deserializer)?;
+    require_package_version(&version.to_string()).map_err(serde::de::Error::custom)
 }
 
 fn parse_local_desc(path: &Path) -> Result<LocalDbPackage> {
@@ -932,50 +1055,47 @@ fn parse_local_desc(path: &Path) -> Result<LocalDbPackage> {
 }
 
 fn parse_local_desc_content(content: &str) -> Result<LocalDbPackage> {
+    use alpm_db::desc::DbDescFile;
+
     // Modern pacman never writes `%REQUIREDBY%`/`%OPTFOR%` sections into local
     // desc files, so reverse dependencies cannot be read from disk. They are
     // derived from `%DEPENDS%`/`%PROVIDES%` at query time (see
     // `compute_required_names`) under the canonical orphan rule
     // (`types::is_orphan_package`, `pacman -Qdt` semantics).
-    if let Ok(desc) = alpm_db::desc::DbDescFileV1::from_str(content) {
-        Ok(LocalDbPackage {
-            name: desc.name.to_string(),
-            version: desc.version.into(),
-            desc: desc.description.to_string(),
-            install_date: desc.installdate.to_string(),
-            licenses: desc.license.iter().map(ToString::to_string).collect(),
-            explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
-            depends: desc.depends.iter().map(ToString::to_string).collect(),
-            optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
-            provides: desc.provides.iter().map(ToString::to_string).collect(),
-        })
-    } else if let Ok(desc) = alpm_db::desc::DbDescFileV2::from_str(content) {
-        // V2 (has XDATA support)
-        Ok(LocalDbPackage {
-            name: desc.name.to_string(),
-            version: desc.version.into(),
-            desc: desc.description.to_string(),
-            install_date: desc.installdate.to_string(),
-            licenses: desc.license.iter().map(ToString::to_string).collect(),
-            explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
-            depends: desc.depends.iter().map(ToString::to_string).collect(),
-            optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
-            provides: desc.provides.iter().map(ToString::to_string).collect(),
-        })
-    } else {
-        // Fallback: manual parsing for edge cases
-        parse_local_desc_manual(content)
-    }
+    let desc = match DbDescFile::from_str(content) {
+        Ok(DbDescFile::V1(desc)) => desc,
+        Ok(DbDescFile::V2(desc)) => desc.into(),
+        Err(_) => match alpm_db::desc::DbDescFileV1::from_str(content) {
+            Ok(desc) => desc,
+            Err(_) => return parse_local_desc_manual(content),
+        },
+    };
+    Ok(LocalDbPackage {
+        name: desc.name.to_string(),
+        version: require_package_version(&desc.version.to_string())?,
+        desc: desc.description.to_string(),
+        install_date: desc.installdate.to_string(),
+        url: desc.url.as_ref().map(ToString::to_string),
+        size: desc.size,
+        licenses: desc.license.iter().map(ToString::to_string).collect(),
+        groups: desc.groups.iter().map(ToString::to_string).collect(),
+        explicit: matches!(desc.reason, alpm_types::PackageInstallReason::Explicit),
+        depends: desc.depends.iter().map(ToString::to_string).collect(),
+        optdepends: desc.optdepends.iter().map(ToString::to_string).collect(),
+        provides: desc.provides.iter().map(ToString::to_string).collect(),
+    })
 }
-
 /// Manual local desc parser as fallback
 fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
     let mut name = String::new();
     let mut version = String::new();
     let mut desc = String::new();
     let mut install_date = String::new();
+    let mut url = None;
+    let mut size = 0;
     let mut reason = String::new();
     let mut licenses = Vec::new();
+    let mut groups = Vec::new();
     let mut depends = Vec::new();
     let mut optdepends = Vec::new();
     let mut provides = Vec::new();
@@ -998,8 +1118,13 @@ fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
             Some("%VERSION%") => version = line.to_string(),
             Some("%DESC%") => desc = line.to_string(),
             Some("%INSTALLDATE%") => install_date = line.to_string(),
+            Some("%URL%") => url = Some(line.to_string()),
+            Some("%SIZE%") => {
+                size = line.parse().context("Invalid %SIZE% value in local desc")?;
+            }
             Some("%REASON%") => reason = line.to_string(),
             Some("%LICENSE%") => licenses.push(line.to_string()),
+            Some("%GROUPS%") => groups.push(line.to_string()),
             Some("%DEPENDS%") => depends.push(line.to_string()),
             Some("%OPTDEPENDS%") => optdepends.push(line.to_string()),
             Some("%PROVIDES%") => provides.push(line.to_string()),
@@ -1024,7 +1149,10 @@ fn parse_local_desc_manual(content: &str) -> Result<LocalDbPackage> {
         version: require_package_version(&version)?,
         desc,
         install_date,
+        url,
+        size,
         licenses,
+        groups,
         explicit,
         depends,
         optdepends,
@@ -1037,27 +1165,86 @@ fn save_cache_to_disk<T: Serialize>(cache: &T, name: &str) -> Result<()> {
     save_cache_to_disk_in(cache, &paths::cache_dir(), name)
 }
 
+fn open_package_cache_directory(path: &Path, create: bool) -> Result<fs::File> {
+    use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+    use std::path::Component;
+
+    anyhow::ensure!(
+        path.is_absolute(),
+        "Package cache directory must be absolute"
+    );
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let owner = nix::unistd::geteuid().as_raw();
+    let mut directory = fs::File::from(open("/", flags, Mode::empty())?);
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let next = match openat(&directory, name, flags, Mode::empty()) {
+                    Ok(next) => next,
+                    Err(rustix::io::Errno::NOENT) if create => {
+                        match mkdirat(&directory, name, Mode::RWXU) {
+                            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        openat(&directory, name, flags, Mode::empty())?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let next = fs::File::from(next);
+                let metadata = next.metadata()?;
+                // Root-owned sticky temporary directories are safe ancestors,
+                // but the cache itself must have an exclusive writer below them.
+                let sticky_root = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
+                anyhow::ensure!(
+                    (metadata.uid() == owner || metadata.uid() == 0)
+                        && (metadata.mode() & 0o022 == 0 || sticky_root),
+                    "Package cache has an untrusted ancestor: {}",
+                    path.display()
+                );
+                directory = next;
+            }
+            _ => anyhow::bail!("Package cache path must not traverse parent directories"),
+        }
+    }
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.uid() == owner && metadata.mode() & 0o022 == 0,
+        "Package cache must be owned by the effective user and not writable by others"
+    );
+    Ok(directory)
+}
+
 fn save_cache_to_disk_in<T: Serialize>(cache: &T, cache_dir: &Path, name: &str) -> Result<()> {
-    fs::create_dir_all(cache_dir).with_context(|| {
-        format!(
-            "Failed to create package cache directory: {}",
-            cache_dir.display()
-        )
-    })?;
-    let path = cache_dir.join(format!("{name}.bin"));
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+
+    let directory = open_package_cache_directory(cache_dir, true)?;
     let data = bitcode::serialize(cache)?;
-    let mut file = tempfile::NamedTempFile::new_in(cache_dir).with_context(|| {
-        format!(
-            "Failed to create temporary package cache in {}",
-            cache_dir.display()
-        )
-    })?;
-    file.write_all(&data)?;
-    file.as_file_mut().sync_all()?;
-    file.persist(&path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("Failed to persist package cache at {}", path.display()))?;
-    Ok(())
+    anyhow::ensure!(
+        data.len() as u64 <= MAX_DERIVED_CACHE_BYTES,
+        "Package cache exceeds size limit"
+    );
+    let temporary = format!(".{name}-{}.tmp", uuid::Uuid::new_v4());
+    let mut file = fs::File::from(openat(
+        &directory,
+        &temporary,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    let result = (|| {
+        file.write_all(&data)?;
+        file.sync_all()?;
+        renameat(&directory, &temporary, &directory, format!("{name}.bin"))?;
+        directory.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err()
+        && let Err(error) = unlinkat(&directory, &temporary, AtFlags::empty())
+        && error != rustix::io::Errno::NOENT
+    {
+        tracing::warn!("Failed to remove temporary package cache: {error}");
+    }
+    result
 }
 
 fn persist_cache_best_effort<T: Serialize>(cache: &T, name: &str) {
@@ -1066,30 +1253,8 @@ fn persist_cache_best_effort<T: Serialize>(cache: &T, name: &str) {
     }
 }
 
-/// Load cache from disk.
-///
-/// SECURITY (audit sec04 F1): when omg runs elevated (root via sudo), the
-/// cache directory still belongs to the ORIGINAL user, who is fully
-/// adversarial relative to the root process. Parsing attacker-writable
-/// bytes as trusted derived state lets them poison what root reads/writes.
-/// Elevated runs therefore bypass user-owned derived caches entirely and go
-/// to ground truth (ALPM/dpkg); the cache remains a fast path for the
-/// unprivileged user's own sessions.
+/// Load derived state only through the effective user's trusted cache directory.
 fn load_cache_from_disk<T: for<'de> Deserialize<'de>>(name: &str) -> Result<T> {
-    #[cfg(unix)]
-    if crate::core::is_root() {
-        use std::os::unix::fs::MetadataExt as _;
-        let dir = paths::cache_dir();
-        if let Ok(meta) = std::fs::metadata(&dir)
-            && meta.uid() != 0
-        {
-            tracing::debug!(
-                "Elevated run: ignoring user-owned derived cache {}",
-                dir.display()
-            );
-            anyhow::bail!("derived cache skipped under elevation");
-        }
-    }
     load_cache_from_disk_in(&paths::cache_dir(), name)
 }
 
@@ -1097,8 +1262,39 @@ fn load_cache_from_disk_in<T: for<'de> Deserialize<'de>>(
     cache_dir: &Path,
     name: &str,
 ) -> Result<T> {
-    let path = cache_dir.join(format!("{name}.bin"));
-    let data = fs::read(&path)?;
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let directory = open_package_cache_directory(cache_dir, false)?;
+    let file = fs::File::from(openat(
+        &directory,
+        format!("{name}.bin"),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file()
+            && before.uid() == nix::unistd::geteuid().as_raw()
+            && before.mode() & 0o022 == 0
+            && before.nlink() == 1,
+        "Derived package cache must be a regular, singly linked file owned by the effective user and not writable by others"
+    );
+    anyhow::ensure!(
+        before.len() <= MAX_DERIVED_CACHE_BYTES,
+        "Package cache exceeds size limit"
+    );
+    let mut data = Vec::new();
+    (&file)
+        .take(MAX_DERIVED_CACHE_BYTES + 1)
+        .read_to_end(&mut data)?;
+    anyhow::ensure!(
+        data.len() as u64 <= MAX_DERIVED_CACHE_BYTES,
+        "Package cache exceeds size limit"
+    );
+    anyhow::ensure!(
+        health_identity(&before) == health_identity(&file.metadata()?),
+        "Package cache changed while reading"
+    );
     let cache: T = bitcode::deserialize(&data)?;
     Ok(cache)
 }
@@ -1126,11 +1322,12 @@ fn is_cache_reusable<E: Copy + Eq>(
 /// single generic loader serves both timestamp and metadata identities.
 /// Each cache's disk namespace identifies its persisted representation.
 trait PackageCache: Serialize + for<'de> Deserialize<'de> {
-    type Package;
+    type Packages;
+
+    fn has_packages(&self) -> bool;
     type Epoch: Copy + Eq;
 
-    fn packages(&self) -> &HashMap<String, Self::Package>;
-    fn packages_mut(&mut self) -> &mut HashMap<String, Self::Package>;
+    fn packages_mut(&mut self) -> &mut Self::Packages;
     fn last_modified(&self) -> Option<Self::Epoch>;
     fn set_last_modified(&mut self, time: Option<Self::Epoch>);
     fn last_accessed(&self) -> Option<SystemTime>;
@@ -1138,13 +1335,14 @@ trait PackageCache: Serialize + for<'de> Deserialize<'de> {
 }
 
 impl PackageCache for DbCache {
-    type Package = SyncDbPackage;
+    type Packages = Vec<RepositoryPackages>;
+
+    fn has_packages(&self) -> bool {
+        !self.packages.is_empty()
+    }
     type Epoch = SyncDbEpoch;
 
-    fn packages(&self) -> &HashMap<String, Self::Package> {
-        &self.packages
-    }
-    fn packages_mut(&mut self) -> &mut HashMap<String, Self::Package> {
+    fn packages_mut(&mut self) -> &mut Self::Packages {
         &mut self.packages
     }
     fn last_modified(&self) -> Option<SyncDbEpoch> {
@@ -1162,13 +1360,14 @@ impl PackageCache for DbCache {
 }
 
 impl PackageCache for LocalDbCache {
-    type Package = LocalDbPackage;
+    type Packages = HashMap<String, LocalDbPackage>;
+
+    fn has_packages(&self) -> bool {
+        !self.packages.is_empty()
+    }
     type Epoch = LocalDbEpoch;
 
-    fn packages(&self) -> &HashMap<String, Self::Package> {
-        &self.packages
-    }
-    fn packages_mut(&mut self) -> &mut HashMap<String, Self::Package> {
+    fn packages_mut(&mut self) -> &mut Self::Packages {
         &mut self.packages
     }
     fn last_modified(&self) -> Option<LocalDbEpoch> {
@@ -1209,13 +1408,13 @@ fn ensure_cache_loaded<C: PackageCache>(
     cache_lock: &RwLock<C>,
     disk_name: &str,
     current_epoch: C::Epoch,
-    load_fresh: impl FnOnce() -> Result<HashMap<String, C::Package>>,
+    load_fresh: impl FnOnce() -> Result<C::Packages>,
 ) -> Result<()> {
     let reusable = |cache: &C| {
         is_cache_reusable(
             cache.last_modified(),
             current_epoch,
-            !cache.packages().is_empty(),
+            cache.has_packages(),
             cache.last_accessed(),
         )
     };
@@ -1269,9 +1468,9 @@ fn ensure_cache_loaded<C: PackageCache>(
 /// Ensure sync cache is loaded (fast if already loaded)
 fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
     let current_epoch = SyncDbEpoch::from_configured_sync_dir(sync_dir)?;
-    // Configuration participates in the source identity, so persisted entries
-    // produced before a repository-order change cannot be reused.
-    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v1", current_epoch, || {
+    // v4 also requires complete compressed-stream validation. Older cache
+    // records may have been derived without checking their source footer.
+    ensure_cache_loaded(&SYNC_DB_CACHE, "sync_db_source_v4", current_epoch, || {
         let packages = load_sync_packages(sync_dir)?;
         anyhow::ensure!(
             current_epoch == SyncDbEpoch::from_configured_sync_dir(sync_dir)?,
@@ -1291,10 +1490,31 @@ fn ensure_sync_cache_loaded(sync_dir: &Path) -> Result<()> {
 /// Ensure local cache is loaded (fast if already loaded)
 fn ensure_local_cache_loaded(local_dir: &Path) -> Result<()> {
     let current_epoch = LocalDbEpoch::from_local_dir(local_dir)?;
-    // The previous local_db_rdeps layout stores only a directory timestamp.
-    ensure_cache_loaded(&LOCAL_DB_CACHE, "local_db_source_v1", current_epoch, || {
-        parse_local_db(local_dir)
-    })
+    // v4 also retains URL and installed size for Rust package-info queries.
+    ensure_cache_loaded(&LOCAL_DB_CACHE, "local_db_source_v4", current_epoch, || {
+        let packages = parse_local_db(local_dir)?;
+        #[cfg(test)]
+        AFTER_LOCAL_PARSE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        anyhow::ensure!(
+            current_epoch == LocalDbEpoch::from_local_dir(local_dir)?,
+            "Local package database changed while loading; retry the operation"
+        );
+        Ok(packages)
+    })?;
+    anyhow::ensure!(
+        current_epoch == LocalDbEpoch::from_local_dir(local_dir)?,
+        "Local package database changed while loading; retry the operation"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_LOCAL_PARSE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Metadata identity of the complete sync directory. Ordering is meaningless:
@@ -1513,6 +1733,12 @@ pub fn invalidate_caches() -> Result<()> {
 
 fn invalidate_derived_cache_files(cache_dir: &Path) -> Result<()> {
     for name in [
+        "sync_db_source_v4",
+        "sync_db_source_v3",
+        "sync_db_source_v2",
+        "local_db_source_v4",
+        "local_db_source_v3",
+        "local_db_source_v2",
         "sync_db_source_v1",
         "local_db_source_v1",
         "sync_db",
@@ -1533,13 +1759,22 @@ fn remove_cache_file(path: &Path) -> Result<()> {
     }
 }
 
-/// Detailed sync packages for indexing consumers (daemon, resolver).
+/// Search-eligible packages, with duplicate names selected by repository priority.
 pub fn get_detailed_packages() -> Result<Vec<SyncDbPackage>> {
     let sync_dir = paths::pacman_sync_dir_result()?;
     ensure_sync_cache_loaded(&sync_dir)?;
 
     let cache = read_lock(&SYNC_DB_CACHE);
-    Ok(cache.packages.values().cloned().collect())
+    let packages = cache
+        .select(RepoUsage::SEARCH)?
+        .into_values()
+        .cloned()
+        .collect();
+    anyhow::ensure!(
+        cache.last_modified == Some(SyncDbEpoch::from_configured_sync_dir(&sync_dir)?),
+        "Package databases changed while querying; retry the operation"
+    );
+    Ok(packages)
 }
 
 /// A pending update derived from the pure-Rust pacman caches.
@@ -1554,10 +1789,11 @@ pub struct CachedUpdate {
 /// Cached update check across all configured repositories.
 #[instrument]
 pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
+    let before = AlpmCatalogEpoch::observe()?;
     let pacman_config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load update filters from pacman.conf")?;
-    let ignored_packages = compile_ignore_patterns(&pacman_config.ignore_pkg, "IgnorePkg")?;
-    let ignored_groups = compile_ignore_patterns(&pacman_config.ignore_group, "IgnoreGroup")?;
+    let ignored_packages = compile_package_patterns(&pacman_config.ignore_pkg, "IgnorePkg")?;
+    let ignored_groups = compile_package_patterns(&pacman_config.ignore_group, "IgnoreGroup")?;
     let sync_dir = paths::pacman_sync_dir_result()?;
     let local_dir = paths::pacman_local_dir_result()?;
 
@@ -1568,6 +1804,7 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
     // Hold both cache locks simultaneously - no cloning!
     let sync_cache = read_lock(&SYNC_DB_CACHE);
     let local_cache = read_lock(&LOCAL_DB_CACHE);
+    let sync_packages = sync_cache.select(RepoUsage::UPGRADE)?;
 
     // Compare versions - Parallelized with Rayon for <1ms update check on 2000+ pkgs
     // Optimized: filter references first, then clone only needed data at the end
@@ -1575,11 +1812,23 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
         .packages
         .par_iter()
         .filter_map(|(name, local_pkg)| {
-            sync_cache
-                .packages
-                .get(name)
+            if package_is_ignored(
+                &local_pkg.name,
+                &local_pkg.groups,
+                &ignored_packages,
+                &ignored_groups,
+            ) {
+                return None;
+            }
+            sync_packages
+                .get(name.as_str())
                 .filter(|sync_pkg| {
-                    !sync_package_is_ignored(sync_pkg, &ignored_packages, &ignored_groups)
+                    !package_is_ignored(
+                        &sync_pkg.name,
+                        &sync_pkg.groups,
+                        &ignored_packages,
+                        &ignored_groups,
+                    )
                 })
                 .filter(|sync_pkg| {
                     crate::package_managers::types::compare_versions(
@@ -1600,34 +1849,104 @@ pub fn check_updates_cached() -> Result<Vec<CachedUpdate>> {
         })
         .collect();
 
+    anyhow::ensure!(
+        before == AlpmCatalogEpoch::observe()?,
+        "Package catalogs changed while checking updates; retry the operation"
+    );
     Ok(updates)
 }
 
-pub(crate) fn compile_ignore_patterns(
-    patterns: &[String],
-    setting: &str,
-) -> Result<globset::GlobSet> {
-    let mut builder = globset::GlobSetBuilder::new();
-    for pattern in patterns {
-        let glob = globset::Glob::new(pattern)
-            .with_context(|| format!("Invalid {setting} pattern {pattern:?}"))?;
-        builder.add(glob);
+pub(crate) struct PacmanPatterns(Vec<(String, std::ffi::CString)>);
+
+impl PacmanPatterns {
+    #[expect(
+        unsafe_code,
+        reason = "POSIX fnmatch is the native pacman pattern grammar; owned CStrings satisfy its read-only pointer contract"
+    )]
+    pub(crate) fn matching_pattern(&self, name: &str) -> Option<&str> {
+        let name = std::ffi::CString::new(name).ok()?;
+        self.0.iter().find_map(|(source, pattern)| {
+            // SAFETY: both pointers refer to live NUL-terminated strings; fnmatch only reads them.
+            (unsafe { nix::libc::fnmatch(pattern.as_ptr(), name.as_ptr(), 0) } == 0)
+                .then_some(source.as_str())
+        })
     }
-    builder
-        .build()
-        .with_context(|| format!("Failed to compile {setting} patterns"))
+
+    pub(crate) fn is_match(&self, name: &str) -> bool {
+        self.matching_pattern(name).is_some()
+    }
 }
 
-fn sync_package_is_ignored(
-    package: &SyncDbPackage,
-    ignored_packages: &globset::GlobSet,
-    ignored_groups: &globset::GlobSet,
+pub(crate) fn compile_package_patterns(
+    patterns: &[String],
+    setting: &str,
+) -> Result<PacmanPatterns> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            let native = std::ffi::CString::new(pattern.as_str())
+                .with_context(|| format!("Invalid {setting} pattern {pattern:?}"))?;
+            Ok((pattern.clone(), native))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(PacmanPatterns)
+}
+
+fn package_is_ignored(
+    name: &str,
+    groups: &[String],
+    ignored_packages: &PacmanPatterns,
+    ignored_groups: &PacmanPatterns,
 ) -> bool {
-    ignored_packages.is_match(&package.name)
-        || package
-            .groups
-            .iter()
-            .any(|group| ignored_groups.is_match(group))
+    ignored_packages.is_match(name) || groups.iter().any(|group| ignored_groups.is_match(group))
+}
+
+/// Read installed package-info from its source, without trusting derived caches.
+pub(crate) fn read_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
+    read_local_package_at(&paths::pacman_local_dir_result()?, name)
+}
+
+/// Read an installed record within an explicit local database scope.
+pub(crate) fn read_local_package_at(
+    local_dir: &Path,
+    name: &str,
+) -> Result<Option<LocalDbPackage>> {
+    let epoch = LocalDbEpoch::from_local_dir(local_dir)?;
+    let entries = match fs::read_dir(local_dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("Failed to read local package database"),
+    };
+    let prefix = format!("{name}-");
+    let mut package = None;
+    for entry in entries.into_iter().flatten() {
+        let entry = entry.context("Failed to enumerate local package database")?;
+        if !entry.file_name().as_bytes().starts_with(prefix.as_bytes()) {
+            continue;
+        }
+        let metadata = entry
+            .file_type()
+            .context("Failed to inspect local package entry")?;
+        anyhow::ensure!(
+            !metadata.is_symlink(),
+            "Local package entry must not be a symlink"
+        );
+        if !metadata.is_dir() {
+            continue;
+        }
+        let desc = entry.path().join("desc");
+        let parsed = parse_local_desc(&desc)
+            .with_context(|| format!("Incomplete local package entry {}", desc.display()))?;
+        if parsed.name == name {
+            anyhow::ensure!(package.is_none(), "Duplicate local package name {name}");
+            package = Some(parsed);
+        }
+    }
+    anyhow::ensure!(
+        epoch == LocalDbEpoch::from_local_dir(local_dir)?,
+        "Local package database changed while querying; retry the operation"
+    );
+    Ok(package)
 }
 
 /// Get a specific local package - FAST (<1ms)
@@ -1637,17 +1956,31 @@ pub fn get_local_package(name: &str) -> Result<Option<LocalDbPackage>> {
     ensure_local_cache_loaded(&local_dir)?;
 
     let cache = read_lock(&LOCAL_DB_CACHE);
-    Ok(cache.packages.get(name).cloned())
+    let package = cache.packages.get(name).cloned();
+    anyhow::ensure!(
+        cache.last_modified == Some(LocalDbEpoch::from_local_dir(&local_dir)?),
+        "Local package database changed while querying; retry the operation"
+    );
+    Ok(package)
 }
 
-/// Get a specific sync package by exact name - FAST (<1ms)
+/// Get the first install-eligible sync package by exact name.
 #[inline]
 pub fn get_sync_package(name: &str) -> Result<Option<SyncDbPackage>> {
     let sync_dir = paths::pacman_sync_dir_result()?;
     ensure_sync_cache_loaded(&sync_dir)?;
 
     let cache = read_lock(&SYNC_DB_CACHE);
-    Ok(cache.packages.get(name).cloned())
+    let package = cache
+        .select(RepoUsage::INSTALL)?
+        .get(name)
+        .copied()
+        .cloned();
+    anyhow::ensure!(
+        cache.last_modified == Some(SyncDbEpoch::from_configured_sync_dir(&sync_dir)?),
+        "Package databases changed while querying; retry the operation"
+    );
+    Ok(package)
 }
 
 /// List all local packages using cache - FAST (<1ms)
@@ -1656,7 +1989,12 @@ pub fn list_local_cached() -> Result<Vec<LocalDbPackage>> {
     ensure_local_cache_loaded(&local_dir)?;
 
     let cache = read_lock(&LOCAL_DB_CACHE);
-    Ok(cache.packages.values().cloned().collect())
+    let packages = cache.packages.values().cloned().collect();
+    anyhow::ensure!(
+        cache.last_modified == Some(LocalDbEpoch::from_local_dir(&local_dir)?),
+        "Local package database changed while querying; retry the operation"
+    );
+    Ok(packages)
 }
 
 /// A declared dependency that nothing installed satisfies.
@@ -1731,6 +2069,10 @@ struct HealthRelation<'a> {
 }
 
 fn health_relation(raw: &str) -> Result<HealthRelation<'_>> {
+    anyhow::ensure!(
+        !raw.as_bytes().contains(&0),
+        "NUL in dependency or provision"
+    );
     alpm_types::RelationOrSoname::from_str(raw)
         .with_context(|| format!("Invalid required dependency or provision {raw}"))?;
     if let Some(index) = raw.find(['<', '>', '=']) {
@@ -1794,11 +2136,9 @@ fn validate_health_relations(packages: &HashMap<String, LocalDbPackage>) -> Resu
     Ok(())
 }
 
-/// Identify potential AUR packages (installed but not in any sync database).
-///
-/// Uses pure Rust cache for extreme speed (<1ms).
-/// Excludes packages from ALL sync databases (official + custom repos).
-pub fn get_potential_aur_packages() -> Result<Vec<String>> {
+/// Read foreign identities and metadata from the same epoch-checked cached catalogs.
+pub(crate) fn get_potential_aur_package_records() -> Result<Vec<LocalDbPackage>> {
+    let before = AlpmCatalogEpoch::observe()?;
     let sync_dir = paths::pacman_sync_dir_result()?;
     let local_dir = paths::pacman_local_dir_result()?;
 
@@ -1808,28 +2148,19 @@ pub fn get_potential_aur_packages() -> Result<Vec<String>> {
     let sync_cache = read_lock(&SYNC_DB_CACHE);
     let local_cache = read_lock(&LOCAL_DB_CACHE);
 
+    let sync_packages = sync_cache.select(RepoUsage::ALL)?;
     let mut potential = Vec::with_capacity(local_cache.packages.len() / 10);
-    for name in local_cache.packages.keys() {
-        if !sync_cache.packages.contains_key(name) {
-            potential.push(name.clone());
+    for package in local_cache.packages.values() {
+        if !sync_packages.contains_key(package.name.as_str()) {
+            potential.push(package.clone());
         }
     }
 
+    anyhow::ensure!(
+        before == AlpmCatalogEpoch::observe()?,
+        "Package catalogs changed while classifying foreign packages; retry the operation"
+    );
     Ok(potential)
-}
-
-/// Reduce an alpm relation or optdepend string to the bare name that participates in
-/// dependency resolution: `"curl>=7.0"` → `"curl"`,
-/// `"libfoo.so=1-64"` → `"libfoo.so"`,
-/// `"lib:libfoo.so.1"` → `"lib:libfoo.so.1"`,
-/// `"python-pillow: for image support"` → `"python-pillow"`.
-fn dependency_base_name(relation: &str) -> &str {
-    let relation = relation.split_once(": ").map_or(relation, |(name, _)| name);
-    relation
-        .split(['<', '>', '='])
-        .next()
-        .unwrap_or(relation)
-        .trim()
 }
 
 /// Names of installed packages that at least one other installed package
@@ -1841,59 +2172,53 @@ fn dependency_base_name(relation: &str) -> &str {
 /// instead of trusting `%REQUIREDBY%` sections, which modern pacman no longer writes.
 fn compute_required_names(
     packages: &HashMap<String, LocalDbPackage>,
-) -> std::collections::HashSet<String> {
+) -> Result<std::collections::HashSet<String>> {
     // Virtual dependencies ("app depends on virtual-svc") are satisfied by
     // the installed packages whose `%PROVIDES%` name that capability.
-    let mut providers: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut providers: HashMap<&str, Vec<(&str, HealthRelation<'_>)>> = HashMap::new();
     for (name, pkg) in packages {
         for provide in &pkg.provides {
+            let relation = health_relation(provide)?;
+            anyhow::ensure!(
+                matches!(relation.operator, "" | "="),
+                "Unsupported provision {provide} declared by {name}"
+            );
             providers
-                .entry(dependency_base_name(provide))
+                .entry(relation.name)
                 .or_default()
-                .push(name);
+                .push((name, relation));
         }
     }
 
     let mut required: std::collections::HashSet<String> =
         std::collections::HashSet::with_capacity(packages.len());
     for pkg in packages.values() {
-        for depend in &pkg.depends {
-            let target = dependency_base_name(depend);
-            if target == pkg.name {
-                continue;
+        for raw in pkg.depends.iter().chain(&pkg.optdepends) {
+            let raw = raw
+                .split_once(": ")
+                .map_or(raw.as_str(), |(relation, _)| relation);
+            let relation = health_relation(raw)
+                .with_context(|| format!("Invalid dependency declared by {}", pkg.name))?;
+            if let Some(installed) = packages.get(relation.name)
+                && installed.name != pkg.name
+                && relation.accepts(Some(&installed.version.to_string()))
+            {
+                required.insert(installed.name.clone());
             }
-            if packages.contains_key(target) {
-                required.insert(target.to_owned());
-            }
-            if let Some(provider_names) = providers.get(target) {
+            if let Some(candidates) = providers.get(relation.name) {
                 required.extend(
-                    provider_names
+                    candidates
                         .iter()
-                        .filter(|provider| **provider != pkg.name)
-                        .map(|provider| (*provider).to_owned()),
-                );
-            }
-        }
-        for optdepend in &pkg.optdepends {
-            let target = dependency_base_name(optdepend);
-            if target == pkg.name {
-                continue;
-            }
-            if packages.contains_key(target) {
-                required.insert(target.to_owned());
-            }
-            if let Some(provider_names) = providers.get(target) {
-                required.extend(
-                    provider_names
-                        .iter()
-                        .filter(|provider| **provider != pkg.name)
-                        .map(|provider| (*provider).to_owned()),
+                        .filter(|(owner, provided)| {
+                            *owner != pkg.name && relation.accepts(provided.version)
+                        })
+                        .map(|(owner, _)| (*owner).to_owned()),
                 );
             }
         }
     }
 
-    required
+    Ok(required)
 }
 
 /// Get total package counts - INSTANT (<1ms with cache)
@@ -1911,7 +2236,7 @@ pub fn get_counts_fast() -> Result<(usize, usize, usize)> {
 
     let cache = read_lock(&LOCAL_DB_CACHE);
     let total = cache.packages.len();
-    let required = compute_required_names(&cache.packages);
+    let required = compute_required_names(&cache.packages)?;
     let mut explicit = 0;
     let mut orphans = 0;
     for (name, pkg) in &cache.packages {
@@ -1925,6 +2250,10 @@ pub fn get_counts_fast() -> Result<(usize, usize, usize)> {
         }
     }
 
+    anyhow::ensure!(
+        cache.last_modified == Some(LocalDbEpoch::from_local_dir(&local_dir)?),
+        "Local package database changed while counting; retry the operation"
+    );
     Ok((total, explicit, orphans))
 }
 
@@ -1939,6 +2268,625 @@ pub fn get_explicit_count() -> Result<usize> {
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
     use super::*;
+    use std::fs::File;
+
+    #[test]
+    fn official_full_version_conversion_preserves_catalog_versions() {
+        for text in [
+            "foo-1",
+            "1:foo-1",
+            "0:1.0-1",
+            "2:1.0-01",
+            "2026.11.13-1",
+            "1.2.3.r45.gabcdef-2.1",
+            "42:1.0+git.20261113-3",
+        ] {
+            let full =
+                alpm_types::FullVersion::from_str(text).expect("valid official version fixture");
+            let round_trip = require_package_version(&full.to_string()).unwrap();
+            let converted = Version::from(full);
+            assert_eq!(converted, round_trip, "version {text}");
+            assert_eq!(
+                converted.to_string(),
+                round_trip.to_string(),
+                "version {text}"
+            );
+        }
+    }
+
+    fn batch2_write_sync(path: &Path, version: &str) {
+        let content = format!("%NAME%\nwidget\n\n%VERSION%\n{version}\n\n");
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                format!("widget-{version}/desc").replace('\0', "_"),
+                content.as_bytes(),
+            )
+            .unwrap();
+        let raw = archive.into_inner().unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&raw).unwrap();
+        fs::write(path, gzip.finish().unwrap()).unwrap();
+    }
+
+    fn batch2_catalog_fixture(test_name: &str, repos: &str, run: impl FnOnce(&Path)) {
+        if crate::core::testing::run_isolated_test(test_name)
+            || crate::config::Settings::rerun_test_unprivileged(test_name)
+        {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "catalog overrides require unprivileged caller"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let db = root.join("var/lib/pacman");
+        fs::create_dir_all(db.join("sync")).unwrap();
+        fs::create_dir_all(db.join("local/widget-1")).unwrap();
+        fs::write(db.join("local/ALPM_DB_VERSION"), "9\n").unwrap();
+        fs::write(
+            db.join("local/widget-1/desc"),
+            "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n",
+        )
+        .unwrap();
+        let conf = temp.path().join("pacman.conf");
+        fs::write(
+            &conf,
+            format!("[options]\nSigLevel = Never\nArchitecture = x86_64\n{repos}"),
+        )
+        .unwrap();
+        let cache = temp.path().join("cache");
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+                *write_lock(&SYNC_DB_CACHE) = DbCache::default();
+                *write_lock(&LOCAL_DB_CACHE) = LocalDbCache::default();
+                AFTER_LOCAL_PARSE.with(|hook| {
+                    hook.borrow_mut().take();
+                });
+            }
+        }
+        let _restore = Restore;
+        crate::core::paths::set_test_overrides(Some(root), Some(db.clone()));
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None),
+                ("OMG_PACMAN_CONF", Some(conf.to_str().unwrap())),
+                ("OMG_CACHE_DIR", Some(cache.to_str().unwrap())),
+            ],
+            || run(&db),
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_empty_configuration_is_empty_repository_universe() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_empty_configuration_is_empty_repository_universe",
+            "",
+            |db| {
+                batch2_write_sync(&db.join("sync/unconfigured.db"), "99-1");
+                assert!(check_updates_cached().unwrap().is_empty());
+                assert_eq!(
+                    get_potential_aur_package_records()
+                        .unwrap()
+                        .into_iter()
+                        .map(|package| package.name)
+                        .collect::<Vec<_>>(),
+                    ["widget"]
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn foreign_package_records_keep_identity_and_groups_across_cache_refresh() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::foreign_package_records_keep_identity_and_groups_across_cache_refresh",
+            "",
+            |db| {
+                let desc = db.join("local/widget-1/desc");
+                fs::write(
+                    &desc,
+                    "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%GROUPS%\nreviewed-group\n",
+                )
+                .expect("write original private package metadata");
+                let held = get_potential_aur_package_records().expect("original foreign records");
+                assert_eq!(held.len(), 1);
+                assert_eq!(held[0].name, "widget");
+                assert_eq!(held[0].version.to_string(), "1-1");
+                assert_eq!(held[0].groups, ["reviewed-group"]);
+                assert_eq!(
+                    get_potential_aur_package_records()
+                        .unwrap()
+                        .into_iter()
+                        .map(|package| package.name)
+                        .collect::<Vec<_>>(),
+                    ["widget"]
+                );
+
+                fs::write(
+                    &desc,
+                    "%NAME%\nwidget\n\n%VERSION%\n2-1\n\n%REASON%\n0\n\n%GROUPS%\nnew-group\n",
+                )
+                .expect("replace private package metadata");
+                invalidate_caches().expect("refresh private package catalogs");
+                let fresh = get_potential_aur_package_records().expect("refreshed foreign records");
+                assert_eq!(fresh.len(), 1);
+                assert_eq!(fresh[0].name, "widget");
+                assert_eq!(fresh[0].version.to_string(), "2-1");
+                assert_eq!(fresh[0].groups, ["new-group"]);
+                assert_eq!(
+                    get_potential_aur_package_records()
+                        .unwrap()
+                        .into_iter()
+                        .map(|package| package.name)
+                        .collect::<Vec<_>>(),
+                    ["widget"]
+                );
+
+                assert_eq!(held[0].name, "widget");
+                assert_eq!(held[0].version.to_string(), "1-1");
+                assert_eq!(held[0].groups, ["reviewed-group"]);
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_native_search_respects_usage() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_native_search_respects_usage",
+            "[hidden]\nUsage = Sync Upgrade\n[visible]\nUsage = Search\n",
+            |db| {
+                batch2_write_sync(&db.join("sync/hidden.db"), "9-1");
+                batch2_write_sync(&db.join("sync/visible.db"), "2-1");
+                let matches = crate::package_managers::alpm_direct::search_sync("widget").unwrap();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "search must exclude repositories without Search usage"
+                );
+                assert_eq!(matches[0].repo, "visible");
+                assert_eq!(get_detailed_packages().unwrap()[0].repo, "visible");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_unreadable_local_desc_rejects_installed_and_counts() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_unreadable_local_desc_rejects_installed_and_counts",
+            "",
+            |db| {
+                use std::os::unix::fs::PermissionsExt;
+                let desc = db.join("local/widget-1/desc");
+                fs::set_permissions(&desc, fs::Permissions::from_mode(0o000)).unwrap();
+                let installed = crate::package_managers::alpm_direct::is_installed_fast("widget");
+                let counts = get_counts_fast();
+                fs::set_permissions(&desc, fs::Permissions::from_mode(0o644)).unwrap();
+                assert!(
+                    installed.is_err(),
+                    "unreadable installed package cannot become absence"
+                );
+                assert!(
+                    counts.is_err(),
+                    "unreadable local metadata cannot produce complete counts"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_updates_choose_lower_eligible_repository() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_updates_choose_lower_eligible_repository",
+            "[testing]\nUsage = Sync Search\n[stable]\n",
+            |db| {
+                batch2_write_sync(&db.join("sync/testing.db"), "9-1");
+                batch2_write_sync(&db.join("sync/stable.db"), "2-1");
+                let updates = check_updates_cached().unwrap();
+                assert_eq!(updates.len(), 1);
+                assert_eq!(
+                    updates[0].repo, "stable",
+                    "Upgrade must select first eligible repository"
+                );
+                assert_eq!(updates[0].new_version.to_string(), "2-1");
+                assert_eq!(get_detailed_packages().unwrap()[0].repo, "testing");
+                assert_eq!(get_sync_package("widget").unwrap().unwrap().repo, "stable");
+                assert_eq!(check_updates_cached().unwrap()[0].repo, "stable");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_missing_required_repository_rejects_updates_and_foreign() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_missing_required_repository_rejects_updates_and_foreign",
+            "[core]\n[extra]\n",
+            |db| {
+                batch2_write_sync(&db.join("sync/core.db"), "2-1");
+                let updates = check_updates_cached();
+                assert!(
+                    updates.is_err(),
+                    "incomplete update catalog succeeded: {updates:?}"
+                );
+                let foreign = get_potential_aur_package_records();
+                assert!(
+                    foreign.is_err(),
+                    "incomplete foreign catalog succeeded: {foreign:?}"
+                );
+                batch2_write_sync(&db.join("sync/extra.db"), "3-1");
+                assert_eq!(check_updates_cached().unwrap()[0].repo, "core");
+                assert!(get_potential_aur_package_records().unwrap().is_empty());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_missing_ineligible_repository_allows_updates_but_not_foreign() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_missing_ineligible_repository_allows_updates_but_not_foreign",
+            "[testing]\nUsage = Search\n[stable]\n",
+            |db| {
+                batch2_write_sync(&db.join("sync/stable.db"), "2-1");
+                assert_eq!(check_updates_cached().unwrap()[0].repo, "stable");
+                let foreign = get_potential_aur_package_records();
+                assert!(
+                    foreign.is_err(),
+                    "foreign requires every configured repository: {foreign:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_absent_sync_directory_does_not_block_local_only_queries() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_absent_sync_directory_does_not_block_local_only_queries",
+            "[core]\n",
+            |db| {
+                fs::remove_dir(db.join("sync")).unwrap();
+                assert!(get_local_package("widget").unwrap().is_some());
+                assert!(
+                    check_updates_cached().is_err(),
+                    "absent sync directory is not a complete configured universe"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_corrupt_high_priority_sync_entry_is_not_absence() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_corrupt_high_priority_sync_entry_is_not_absence",
+            "[first]\n[second]\n",
+            |db| {
+                batch2_write_sync(&db.join("sync/first.db"), "not a version!!!");
+                batch2_write_sync(&db.join("sync/second.db"), "2-1");
+                let result = check_updates_cached();
+                assert!(
+                    result.is_err(),
+                    "corrupt first repository fell through: {result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn batch2_corrupt_local_entries_reject_complete_catalog() {
+        for desc in [
+            None,
+            Some("%NAME%\nwidget\n\n%VERSION%\nnot a version!!!\n"),
+            Some("%VERSION%\n1-1\n"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let entry = temp.path().join("widget-1");
+            fs::create_dir(&entry).unwrap();
+            if let Some(desc) = desc {
+                fs::write(entry.join("desc"), desc).unwrap();
+            }
+            let result = parse_local_db(temp.path());
+            assert!(
+                result.is_err(),
+                "invalid local desc {desc:?} became successful absence: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_local_parse_rejects_observed_epoch_change() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_local_parse_rejects_observed_epoch_change",
+            "",
+            |db| {
+                let desc = db.join("local/widget-1/desc");
+                AFTER_LOCAL_PARSE.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        fs::write(desc, "%NAME%\nwidget\n\n%VERSION%\n22-1\n\n").unwrap();
+                    }));
+                });
+                let result = get_local_package("widget");
+                assert!(
+                    result.is_err(),
+                    "changed local snapshot was returned: {result:?}"
+                );
+                assert_eq!(
+                    get_local_package("widget")
+                        .unwrap()
+                        .unwrap()
+                        .version
+                        .to_string(),
+                    "22-1"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sync_cache_cannot_reuse_metadata_from_before_complete_stream_validation() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::sync_cache_cannot_reuse_metadata_from_before_complete_stream_validation",
+            "[core]\n",
+            |db| {
+                let source = db.join("sync/core.db");
+                batch2_write_sync(&source, "2-1");
+                let mut damaged = fs::read(&source).unwrap();
+                let checksum = damaged.len() - 8;
+                damaged[checksum] ^= 1;
+                fs::write(&source, damaged).unwrap();
+                let old = DbCache {
+                    packages: vec![RepositoryPackages {
+                        name: "core".to_owned(),
+                        usage: RepoUsage::all(),
+                        packages: Ok(HashMap::from([(
+                            "widget".to_owned(),
+                            SyncDbPackage {
+                                name: "widget".to_owned(),
+                                version: require_package_version("2-1").unwrap(),
+                                repo: "core".to_owned(),
+                                ..SyncDbPackage::default()
+                            },
+                        )])),
+                    }],
+                    last_modified: Some(
+                        SyncDbEpoch::from_configured_sync_dir(&db.join("sync")).unwrap(),
+                    ),
+                    ..DbCache::default()
+                };
+                let original = bitcode::serialize(&old).unwrap();
+                save_cache_to_disk(&old, "sync_db_source_v3").unwrap();
+                assert!(
+                    check_updates_cached().is_err(),
+                    "an older derived cache must not bless a source whose compression checksum has never been checked"
+                );
+                assert_eq!(
+                    fs::read(paths::cache_dir().join("sync_db_source_v3.bin")).unwrap(),
+                    original
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn installed_info_uses_source_metadata_instead_of_derived_cache() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::installed_info_uses_source_metadata_instead_of_derived_cache",
+            "",
+            |db| {
+                fs::write(
+                    db.join("local/widget-1/desc"),
+                    "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%DESC%\nsource description\n\n",
+                )
+                .unwrap();
+                assert_eq!(
+                    get_local_package("widget").unwrap().unwrap().desc,
+                    "source description"
+                );
+                write_lock(&LOCAL_DB_CACHE)
+                    .packages
+                    .get_mut("widget")
+                    .unwrap()
+                    .desc = "untrusted derived metadata".to_owned();
+                let info = crate::package_managers::alpm_direct::get_package_info("widget")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(info.description, "source description");
+                save_cache_to_disk(&*read_lock(&LOCAL_DB_CACHE), "local_db_source_v4").unwrap();
+                *write_lock(&LOCAL_DB_CACHE) = LocalDbCache::default();
+                assert_eq!(
+                    get_local_package("widget").unwrap().unwrap().desc,
+                    "untrusted derived metadata"
+                );
+                let info = crate::package_managers::alpm_direct::get_package_info("widget")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(info.description, "source description");
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_updates_preserve_installed_ignore_groups_across_disk_reuse() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::cached_updates_preserve_installed_ignore_groups_across_disk_reuse",
+            "IgnoreGroup = pinned\n[core]\n",
+            |db| {
+                for (groups, expected) in [("pinned", 0), ("other", 1), ("misc\npinned", 0)] {
+                    fs::write(
+                        db.join("local/widget-1/desc"),
+                        format!("%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%GROUPS%\n{groups}\n\n"),
+                    )
+                    .unwrap();
+                    batch2_write_sync(&db.join("sync/core.db"), "2-1");
+                    invalidate_caches().unwrap();
+                    assert_eq!(
+                        check_updates_cached().unwrap().len(),
+                        expected,
+                        "groups {groups:?}"
+                    );
+                    *write_lock(&LOCAL_DB_CACHE) = LocalDbCache::default();
+                    *write_lock(&SYNC_DB_CACHE) = DbCache::default();
+                    assert_eq!(
+                        check_updates_cached().unwrap().len(),
+                        expected,
+                        "disk groups {groups:?}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_updates_do_not_reuse_group_unaware_local_cache() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::cached_updates_do_not_reuse_group_unaware_local_cache",
+            "IgnoreGroup = pinned\n[core]\n",
+            |db| {
+                fs::write(
+                    db.join("local/widget-1/desc"),
+                    "%NAME%\nwidget\n\n%VERSION%\n1-1\n\n%REASON%\n0\n\n%GROUPS%\npinned\n\n",
+                )
+                .unwrap();
+                batch2_write_sync(&db.join("sync/core.db"), "2-1");
+                let legacy = LocalDbCache {
+                    packages: HashMap::from([(
+                        "widget".to_owned(),
+                        LocalDbPackage {
+                            name: "widget".to_owned(),
+                            version: Version::from_str("1-1").unwrap(),
+                            ..LocalDbPackage::default()
+                        },
+                    )]),
+                    last_modified: Some(LocalDbEpoch::from_local_dir(&db.join("local")).unwrap()),
+                    ..LocalDbCache::default()
+                };
+                let bytes = bitcode::serialize(&legacy).unwrap();
+                let cache_dir = paths::cache_dir();
+                fs::create_dir_all(&cache_dir).unwrap();
+                let old_path = cache_dir.join("local_db_source_v2.bin");
+                fs::write(&old_path, &bytes).unwrap();
+                assert!(
+                    check_updates_cached().unwrap().is_empty(),
+                    "old cache must not erase installed IgnoreGroup membership"
+                );
+                assert_eq!(fs::read(&old_path).unwrap(), bytes);
+                assert!(cache_dir.join("local_db_source_v4.bin").is_file());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch3_cached_updates_reject_nul_before_native_comparison() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch3_cached_updates_reject_nul_before_native_comparison",
+            "[core]\n",
+            |db| {
+                for (installed, available) in [("1\0-1", "0:2-1"), ("1-1", "0:2\0-1")] {
+                    fs::write(
+                        db.join("local/widget-1/desc"),
+                        format!("%NAME%\nwidget\n\n%VERSION%\n{installed}\n\n%REASON%\n0\n"),
+                    )
+                    .unwrap();
+                    batch2_write_sync(&db.join("sync/core.db"), available);
+                    invalidate_caches().unwrap();
+                    let error =
+                        check_updates_cached().expect_err("malformed versions must fail closed");
+                    assert!(
+                        format!("{error:#}").contains("Invalid package version"),
+                        "installed {installed:?}, available {available:?}: {error:#}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn batch2_cached_updates_preserve_optional_epoch_and_release_semantics() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::batch2_cached_updates_preserve_optional_epoch_and_release_semantics",
+            "[core]\n",
+            |db| {
+                for (installed, available, expected_count) in [
+                    ("0:2.0-1", "3.0-1", 1),
+                    ("3.0-1", "0:2.0-1", 0),
+                    ("0:1.0-1", "1.0-1", 0),
+                    ("1.0-1", "0:1.0-1", 0),
+                    ("2.0-1", "0:3.0-1", 1),
+                    ("0:3.0-1", "2.0-1", 0),
+                    ("9.0-1", "1:1.0-1", 1),
+                    ("1:1.0-1", "0:9.0-1", 0),
+                    ("1.0", "1.0-1", 0),
+                    ("1.0-1", "1.0", 0),
+                    ("1.0", "2.0-1", 1),
+                    ("2.0-1", "1.0", 0),
+                    ("1.0-1", "2.0", 1),
+                    ("2.0", "1.0-1", 0),
+                ] {
+                    fs::write(
+                        db.join("local/widget-1/desc"),
+                        format!("%NAME%\nwidget\n\n%VERSION%\n{installed}\n\n%REASON%\n0\n"),
+                    )
+                    .unwrap();
+                    batch2_write_sync(&db.join("sync/core.db"), available);
+                    invalidate_caches().unwrap();
+
+                    let result = check_updates_cached();
+                    if !available.contains('-') {
+                        assert!(
+                            result.is_err(),
+                            "a sync archive without a release has no native package identity"
+                        );
+                        assert_eq!(
+                            usize::from(
+                                crate::package_managers::types::compare_versions(
+                                    &Version::from_str(installed).unwrap(),
+                                    &Version::from_str(available).unwrap(),
+                                )
+                                .is_lt()
+                            ),
+                            expected_count,
+                            "standalone version semantics remain valid for {installed} / {available}"
+                        );
+                        continue;
+                    }
+                    let updates = result.unwrap();
+                    assert_eq!(
+                        updates.len(),
+                        expected_count,
+                        "installed {installed}, available {available}: {updates:?}"
+                    );
+                    for update in updates {
+                        assert_eq!(update.name, "widget");
+                        assert_eq!(update.old_version.to_string(), installed);
+                        assert_eq!(update.new_version.to_string(), available);
+                        assert_eq!(update.repo, "core");
+                    }
+                }
+            },
+        );
+    }
 
     /// Regression for ARCH-N1: `alpm_types::Version`'s `Ord` impl unwraps
     /// `parse::<usize>()` on numeric segments above `usize::MAX` and panics
@@ -1971,6 +2919,388 @@ mod tests {
                 assert_eq!(compare(&va, &vb), va.cmp(&vb), "{a} vs {b}");
             }
         }
+    }
+
+    fn write_sync_identity_fixture(path: &Path, entries: &[(&str, &str)]) {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (entry, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, entry, content.as_bytes())
+                .unwrap();
+        }
+        fs::write(path, archive.into_inner().unwrap().finish().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sync_catalog_remains_readable_when_worker_creation_is_refused() {
+        const TEST: &str = "package_managers::pacman_db::db::tests::sync_catalog_remains_readable_when_worker_creation_is_refused";
+        if crate::config::Settings::rerun_test_unprivileged(TEST) {
+            return;
+        }
+        if std::env::var_os("OMG_SYNC_THREAD_LIMIT_FIXTURE").is_some() {
+            use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+            assert!(
+                !nix::unistd::Uid::current().is_root(),
+                "run resource-limit checks with the unprivileged fixture runner"
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("core.db");
+            write_sync_identity_fixture(
+                &path,
+                &[("helper-1-1/desc", "%NAME%\nhelper\n\n%VERSION%\n1-1\n")],
+            );
+            let saved = getrlimit(Resource::Nproc);
+            setrlimit(
+                Resource::Nproc,
+                Rlimit {
+                    current: Some(0),
+                    maximum: saved.maximum,
+                },
+            )
+            .expect("restrict only the fixture process's worker creation");
+            let parsed = std::panic::catch_unwind(|| parse_sync_db(&path, "core"));
+            setrlimit(Resource::Nproc, saved).expect("restore fixture process limit");
+            let packages = parsed
+                .expect("worker creation failure must not panic")
+                .expect("metadata must remain readable without workers");
+            assert_eq!(packages["helper"].version.to_string(), "1-1");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "package_managers::pacman_db::db::tests::sync_catalog_remains_readable_when_worker_creation_is_refused",
+                "--nocapture",
+            ])
+            .env("OMG_SYNC_THREAD_LIMIT_FIXTURE", "1")
+            .output()
+            .expect("isolated resource-limit fixture");
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn long_sync_paths_preserve_early_identity_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("core.db");
+        let long_path = format!("{}-1-1/desc", "a".repeat(1024 * 1024));
+        let desc = b"%NAME%\nhelper\n\n%VERSION%\n1-1\n";
+        let mut archive = tar::Builder::new(Vec::new());
+        for name in [long_path.as_str(), "later-1-1/desc"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(desc.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, desc.as_slice())
+                .unwrap();
+        }
+        let mut raw = archive.into_inner().unwrap();
+        let later_header = tar::Archive::new(Cursor::new(&raw))
+            .entries()
+            .unwrap()
+            .nth(1)
+            .unwrap()
+            .unwrap()
+            .raw_header_position();
+        raw[usize::try_from(later_header).unwrap() + 148] ^= 1;
+        fs::write(&path, raw).unwrap();
+        let error = parse_sync_db(&path, "core")
+            .expect_err("an oversized path must be validated before buffering later records");
+        assert!(
+            format!("{error:#}").contains("Inconsistent package identity"),
+            "long path buffering consumed the damaged later header first: {error:#}"
+        );
+    }
+
+    #[test]
+    fn large_sync_catalog_preserves_all_records_and_rejects_late_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("core.db");
+        let entries: Vec<_> = (0..129)
+            .map(|index| {
+                let name = format!("package-{index}");
+                (
+                    format!("{name}-1-1/desc"),
+                    format!(
+                        "%NAME%\n{name}\n\n%VERSION%\n1-1\n\n%DESC%\n{}\n\n",
+                        "catalog description ".repeat(900)
+                    ),
+                )
+            })
+            .collect();
+        let write = |records: &[(String, String)]| {
+            write_sync_identity_fixture(
+                &path,
+                &records
+                    .iter()
+                    .map(|(path, desc)| (path.as_str(), desc.as_str()))
+                    .collect::<Vec<_>>(),
+            );
+        };
+        write(&entries);
+        let packages = parse_sync_db(&path, "core").expect("complete large catalog");
+        assert_eq!(packages.len(), entries.len());
+        for index in 0..entries.len() {
+            assert_eq!(
+                packages[&format!("package-{index}")].version.to_string(),
+                "1-1"
+            );
+        }
+
+        for (replacement, diagnostic) in [
+            (entries[0].clone(), "Duplicate package identity"),
+            (
+                (
+                    "package-128-1-1/desc".into(),
+                    "%NAME%\npackage-128\n".into(),
+                ),
+                "Missing package version",
+            ),
+            (
+                ("nested/package-128-1-1/desc".into(), entries[128].1.clone()),
+                "Nested sync package directory identity",
+            ),
+        ] {
+            let mut corrupted = entries.clone();
+            corrupted[128] = replacement;
+            write(&corrupted);
+            let error = parse_sync_db(&path, "core")
+                .expect_err("late corruption must reject the entire catalog");
+            assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn sync_archive_identity_refuses_conflicting_names_versions_and_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("core.db");
+        for entries in [
+            vec![(
+                "nested/actual-1-1/desc",
+                "%NAME%\nnested/actual\n\n%VERSION%\n1-1\n",
+            )],
+            vec![("actual-1-1/desc", "%NAME%\nother\n\n%VERSION%\n1-1\n")],
+            vec![("actual-1-1/desc", "%NAME%\nactual\n\n%VERSION%\n2-1\n")],
+            vec![
+                ("actual-1-1/desc", "%NAME%\nactual\n\n%VERSION%\n1-1\n"),
+                ("actual-2-1/desc", "%NAME%\nactual\n\n%VERSION%\n2-1\n"),
+            ],
+        ] {
+            write_sync_identity_fixture(&path, &entries);
+            assert!(
+                parse_sync_db(&path, "core").is_err(),
+                "accepted {entries:?}"
+            );
+        }
+        for version in ["1-1", "1:2-01", "2:1.0-3"] {
+            let entry = format!("actual-package-{version}/desc");
+            let desc = format!("%NAME%\nactual-package\n\n%VERSION%\n{version}\n");
+            write_sync_identity_fixture(&path, &[(&entry, &desc)]);
+            assert!(
+                parse_sync_db(&path, "core")
+                    .unwrap()
+                    .contains_key("actual-package")
+            );
+        }
+    }
+
+    #[test]
+    fn sync_archive_identity_reports_invalid_package_names_at_the_flat_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private sync archive owner");
+        let path = owner.path().join("audit-repo.db");
+        let entry = "actual-1-1/desc";
+        for name in ["bad/name", "bad name"] {
+            let description = format!("%NAME%\n{name}\n\n%VERSION%\n1-1\n");
+            write_sync_identity_fixture(&path, &[(entry, &description)]);
+            let error = parse_sync_db(&path, "audit-repo")
+                .expect_err("an invalid package name must refuse the flat sync entry");
+            assert_eq!(
+                error.to_string(),
+                "Invalid package name in actual-1-1/desc from repository audit-repo",
+                "invalid name {name:?} must identify its archive entry and repository"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sync_archive_identity_does_not_reuse_unvalidated_legacy_cache() {
+        batch2_catalog_fixture(
+            "package_managers::pacman_db::db::tests::sync_archive_identity_does_not_reuse_unvalidated_legacy_cache",
+            "[core]\n",
+            |db| {
+                write_sync_identity_fixture(
+                    &db.join("sync/core.db"),
+                    &[("actual-1-1/desc", "%NAME%\nother\n\n%VERSION%\n1-1\n")],
+                );
+                let legacy = DbCache {
+                    packages: vec![RepositoryPackages {
+                        name: "core".to_owned(),
+                        usage: RepoUsage::ALL,
+                        packages: Ok(HashMap::from([(
+                            "widget".to_owned(),
+                            SyncDbPackage {
+                                name: "widget".to_owned(),
+                                repo: "core".to_owned(),
+                                version: Version::from_str("2-1").unwrap(),
+                                ..SyncDbPackage::default()
+                            },
+                        )])),
+                    }],
+                    last_modified: Some(
+                        SyncDbEpoch::from_configured_sync_dir(&db.join("sync")).unwrap(),
+                    ),
+                    ..DbCache::default()
+                };
+                save_cache_to_disk_in(&legacy, &paths::cache_dir(), "sync_db_source_v2").unwrap();
+                assert!(
+                    check_updates_cached().is_err(),
+                    "old cache must not conceal inconsistent source identities"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn sync_database_fifo_is_refused_without_waiting_for_a_writer() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("core.db");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let (send, receive) = channel();
+        let read_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            send.send(parse_sync_db(&read_path, "core")).unwrap();
+        });
+        let observed = receive.recv_timeout(std::time::Duration::from_secs(1));
+        let blocked = matches!(observed, Err(RecvTimeoutError::Timeout));
+        if blocked {
+            drop(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+        }
+        let parsed = observed.unwrap_or_else(|_| {
+            receive
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        });
+        reader.join().unwrap();
+        assert!(
+            !blocked,
+            "sync database parser blocked waiting for a FIFO writer before rejecting the file type"
+        );
+        let error = parsed.expect_err("a FIFO is not a regular repository database");
+        assert!(format!("{error:#}").contains("regular"));
+    }
+
+    #[test]
+    fn rust_sync_metadata_preserves_native_bzip2_repository_support() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("root");
+        let database = directory.path().join("db");
+        fs::create_dir(&root)?;
+        fs::create_dir_all(database.join("local"))?;
+        fs::create_dir(database.join("sync"))?;
+        fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
+        let compressed = [
+            66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 55, 125, 43, 15, 0, 0, 177, 95, 128, 204, 144,
+            66, 3, 255, 3, 47, 103, 221, 16, 127, 173, 94, 114, 4, 8, 48, 0, 185, 33, 170, 102,
+            166, 147, 212, 211, 212, 0, 61, 65, 163, 65, 181, 27, 77, 70, 77, 27, 72, 208, 195, 67,
+            64, 0, 0, 104, 0, 0, 0, 1, 37, 33, 161, 26, 100, 104, 208, 3, 65, 160, 0, 13, 3, 77,
+            177, 85, 11, 1, 4, 45, 16, 33, 235, 80, 12, 172, 235, 200, 16, 192, 109, 20, 252, 130,
+            94, 87, 6, 64, 5, 164, 18, 83, 97, 250, 39, 89, 231, 112, 219, 93, 42, 153, 28, 99, 21,
+            158, 209, 187, 38, 73, 146, 91, 165, 67, 113, 196, 192, 107, 142, 231, 245, 150, 84,
+            44, 96, 228, 184, 213, 206, 93, 163, 114, 216, 210, 130, 23, 4, 52, 55, 95, 25, 220,
+            107, 228, 138, 19, 10, 78, 20, 84, 13, 78, 46, 176, 35, 57, 226, 50, 141, 147, 46, 43,
+            193, 38, 9, 143, 131, 5, 100, 255, 84, 204, 5, 108, 136, 93, 97, 223, 117, 160, 78,
+            235, 70, 55, 156, 126, 3, 188, 46, 91, 27, 80, 76, 31, 171, 5, 69, 231, 240, 36, 131,
+            248, 187, 146, 41, 194, 132, 129, 187, 233, 88, 120,
+        ];
+        let source = database.join("sync/core.db");
+        fs::write(&source, compressed)?;
+        let native = alpm::Alpm::new(root.to_str().unwrap(), database.to_str().unwrap())?;
+        let repository = native.register_syncdb("core", alpm::SigLevel::NONE)?;
+        assert_eq!(repository.pkg("fixture")?.version().to_string(), "1-1");
+        let parsed = parse_sync_db(&source, "core")
+            .expect("Rust metadata must preserve native bzip2 database support");
+        let package = parsed.get("fixture").unwrap();
+        assert_eq!((package.csize, package.isize), (12, 34));
+        assert_eq!(package.depends, ["glibc>=2"]);
+        let info =
+            crate::package_managers::alpm_ops::get_pkg_info_from_db(&native, "fixture")?.unwrap();
+        assert_eq!(info.version.to_string(), "1-1");
+        assert_eq!(
+            (info.download_size, info.install_size),
+            (Some(12), Some(34))
+        );
+        fs::write(&source, &compressed[..compressed.len() - 4])?;
+        parse_sync_db(&source, "core")
+            .expect_err("truncated bzip2 footer must not hide behind tar EOF");
+        let mut raw = Vec::new();
+        bzip2::read::MultiBzDecoder::new(compressed.as_slice()).read_to_end(&mut raw)?;
+        let mut joined = Vec::new();
+        for segment in [&raw[..512], &raw[512..]] {
+            let mut member = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+            member.write_all(segment)?;
+            joined.extend(member.finish()?);
+        }
+        fs::write(&source, &joined)?;
+        assert_eq!(
+            parse_sync_db(&source, "core")?
+                .get("fixture")
+                .unwrap()
+                .csize,
+            12
+        );
+        joined.truncate(joined.len() - 4);
+        fs::write(&source, joined)?;
+        parse_sync_db(&source, "core")
+            .expect_err("each concatenated bzip2 member must finish validation");
+        Ok(())
+    }
+
+    #[test]
+    fn sync_database_checks_compression_footer_after_tar_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut archive = tar::Builder::new(Vec::new());
+        let desc = b"%NAME%\nfixture\n\n%VERSION%\n1-1\n\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "fixture-1-1/desc", desc.as_slice())
+            .unwrap();
+        let raw = archive.into_inner().unwrap();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&raw).unwrap();
+        let mut compressed = gzip.finish().unwrap();
+        let path = directory.path().join("core.db");
+        fs::write(&path, &compressed).unwrap();
+        assert!(
+            parse_sync_db(&path, "core")
+                .unwrap()
+                .contains_key("fixture")
+        );
+        let crc = compressed.len() - 8;
+        compressed[crc] ^= 1;
+        fs::write(&path, compressed).unwrap();
+        parse_sync_db(&path, "core")
+            .expect_err("a valid tar terminator must not hide a corrupted compression checksum");
     }
 
     /// Regression: the compression-format probe must rewind the stream before
@@ -2027,8 +3357,12 @@ mod tests {
         let mut lz4_encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
         lz4_encoder.write_all(&raw).unwrap();
         let lz4_bytes = lz4_encoder.finish().unwrap();
+        let mut bzip2 = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        bzip2.write_all(&raw).unwrap();
+        let bzip2_bytes = bzip2.finish().unwrap();
 
         for (name, bytes) in [
+            ("bzip2", bzip2_bytes),
             ("zstd", zstd_bytes),
             ("xz", xz_bytes),
             ("lz4", lz4_bytes),
@@ -2066,7 +3400,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_sync_package_does_not_hide_valid_repository_entries() {
+    fn malformed_sync_package_rejects_incomplete_repository() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("custom.db");
         let invalid = b"%NAME%\nbroken\n\n%VERSION%\nnot a version!!!\n\n";
@@ -2093,9 +3427,130 @@ mod tests {
         }
         std::fs::write(&path, compressed).unwrap();
 
-        let packages = parse_sync_db(&path, "custom").unwrap();
-        assert!(packages.contains_key("good"));
-        assert!(!packages.contains_key("broken"));
+        let error = parse_sync_db(&path, "custom").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Malformed desc broken-1/desc from repository custom"
+        );
+        assert!(format!("{error:#}").contains("broken-1/desc"));
+        assert!(format!("{error:#}").contains("Invalid package version"));
+    }
+
+    #[test]
+    fn malformed_sync_desc_rejects_repository_with_healthy_package() {
+        let cases: [(&str, &[u8], &str); 3] = [
+            (
+                "invalid-utf8",
+                b"%NAME%\nbroken\n\n%VERSION%\n1-1\n\n%DESC%\n\xff\n",
+                "Invalid UTF-8",
+            ),
+            (
+                "absent-name",
+                b"%VERSION%\n1-1\n\n%DESC%\nNameless package\n",
+                "Missing package name",
+            ),
+            (
+                "empty-name",
+                b"%NAME%\n\n%VERSION%\n1-1\n\n",
+                "Missing package name",
+            ),
+        ];
+        let temp = tempfile::tempdir().unwrap();
+        let healthy = b"%NAME%\nhealthy\n\n%VERSION%\n1-1\n\n";
+        for (case, malformed, diagnostic) in cases {
+            let path = temp.path().join(format!("{case}.db"));
+            let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::fast(),
+            ));
+            for (entry, content) in [
+                ("healthy-1-1/desc", healthy.as_slice()),
+                ("broken-1-1/desc", malformed),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive.append_data(&mut header, entry, content).unwrap();
+            }
+            fs::write(&path, archive.into_inner().unwrap().finish().unwrap()).unwrap();
+
+            let error = parse_sync_db(&path, "custom")
+                .expect_err("a healthy package must not conceal malformed repository metadata");
+            let message = format!("{error:#}");
+            assert!(message.contains(diagnostic), "{case}: {message}");
+            assert!(message.contains("broken-1-1/desc"), "{case}: {message}");
+            assert!(message.contains("repository custom"), "{case}: {message}");
+            if case == "invalid-utf8" {
+                assert!(
+                    error.downcast_ref::<std::string::FromUtf8Error>().is_some(),
+                    "invalid UTF-8 must retain its decoding cause: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_sync_desc_payload_retains_entry_and_repository_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("custom.db");
+        let desc = b"%NAME%\nwidget\n\n%VERSION%\n1-1\n\n";
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "widget-1/desc", desc.as_slice())
+            .unwrap();
+        let raw = tar.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let partial_desc_end = header.as_bytes().len() + desc.len() / 2;
+        encoder.write_all(&raw[..partial_desc_end]).unwrap();
+        encoder.flush().unwrap();
+        let truncated_len = encoder.get_ref().len();
+        encoder.write_all(&raw[partial_desc_end..]).unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.truncate(truncated_len);
+        fs::write(&path, compressed).unwrap();
+
+        let error = parse_sync_db(&path, "custom")
+            .expect_err("an interrupted desc payload must reject the repository snapshot");
+        assert_eq!(
+            error.to_string(),
+            "Failed to read desc widget-1/desc from repo custom"
+        );
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::UnexpectedEof)),
+            "the truncated compressed payload must retain its I/O cause: {error:#}"
+        );
+    }
+
+    #[test]
+    fn utf8_sync_desc_missing_required_version_retains_repository_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("custom.db");
+        let desc = "%NAME%\nwidget\n\n%DESC%\nValid UTF-8 description\n\n";
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(desc.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "widget-1/desc", desc.as_bytes())
+            .unwrap();
+        let raw = tar.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        fs::write(&path, encoder.finish().unwrap()).unwrap();
+
+        let error = parse_sync_db(&path, "custom")
+            .expect_err("valid UTF-8 cannot make a desc without a package version complete");
+        assert_eq!(
+            error.to_string(),
+            "Malformed desc widget-1/desc from repository custom"
+        );
+        assert!(format!("{error:#}").contains("Missing package version in repository custom"));
     }
 
     #[test]
@@ -2135,20 +3590,45 @@ mod tests {
             groups: vec!["kernel".to_string()],
             ..SyncDbPackage::default()
         };
-        let packages = compile_ignore_patterns(&["linux".to_string()], "IgnorePkg").unwrap();
-        let groups = compile_ignore_patterns(&["kernel".to_string()], "IgnoreGroup").unwrap();
-        let none = compile_ignore_patterns(&[], "empty").unwrap();
-        assert!(sync_package_is_ignored(&package, &packages, &none));
-        assert!(sync_package_is_ignored(&package, &none, &groups));
-        let base = compile_ignore_patterns(&["base".to_string()], "IgnoreGroup").unwrap();
-        assert!(!sync_package_is_ignored(&package, &none, &base));
+        let packages = compile_package_patterns(&["linux".to_string()], "IgnorePkg").unwrap();
+        let groups = compile_package_patterns(&["kernel".to_string()], "IgnoreGroup").unwrap();
+        let none = compile_package_patterns(&[], "empty").unwrap();
+        assert!(package_is_ignored(
+            &package.name,
+            &package.groups,
+            &packages,
+            &none
+        ));
+        assert!(package_is_ignored(
+            &package.name,
+            &package.groups,
+            &none,
+            &groups
+        ));
+        let base = compile_package_patterns(&["base".to_string()], "IgnoreGroup").unwrap();
+        assert!(!package_is_ignored(
+            &package.name,
+            &package.groups,
+            &none,
+            &base
+        ));
 
         package.name = "linux-zen".to_string();
         package.groups = vec!["kernel-zen".to_string()];
-        let packages = compile_ignore_patterns(&["linux-*".to_string()], "IgnorePkg").unwrap();
-        let groups = compile_ignore_patterns(&["kernel-*".to_string()], "IgnoreGroup").unwrap();
-        assert!(sync_package_is_ignored(&package, &packages, &none));
-        assert!(sync_package_is_ignored(&package, &none, &groups));
+        let packages = compile_package_patterns(&["linux-*".to_string()], "IgnorePkg").unwrap();
+        let groups = compile_package_patterns(&["kernel-*".to_string()], "IgnoreGroup").unwrap();
+        assert!(package_is_ignored(
+            &package.name,
+            &package.groups,
+            &packages,
+            &none
+        ));
+        assert!(package_is_ignored(
+            &package.name,
+            &package.groups,
+            &none,
+            &groups
+        ));
     }
 
     #[test]
@@ -2349,15 +3829,178 @@ mod tests {
         assert!(packages.is_empty());
     }
 
-    /// Wave-2 policy fix: a package directory without its desc file is a
-    /// corrupt-entry condition - it must be skipped with a warning, not abort
-    /// the whole local database read.
     #[test]
-    fn test_parse_local_db_missing_desc_is_skipped() {
+    #[cfg(unix)]
+    fn inaccessible_local_database_is_not_an_empty_catalog() {
+        use std::os::unix::fs::PermissionsExt;
+        const TEST: &str = "package_managers::pacman_db::db::tests::inaccessible_local_database_is_not_an_empty_catalog";
+        if crate::config::Settings::rerun_test_unprivileged(TEST) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("blocked");
+        let local = parent.join("local");
+        fs::create_dir_all(&local).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = parse_local_db(&local);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let error =
+            result.expect_err("an inaccessible local database must not become an empty catalog");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(format!("{error:#}").contains(&local.display().to_string()));
+    }
+
+    #[test]
+    fn test_parse_local_db_missing_desc_is_rejected() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(temp_dir.path().join("vim-9.1.0-1")).unwrap();
-        let packages = parse_local_db(temp_dir.path()).unwrap();
-        assert!(packages.is_empty(), "desc-less entry must be skipped");
+        let error = parse_local_db(temp_dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("vim-9.1.0-1/desc"));
+    }
+
+    #[test]
+    fn incomplete_local_entry_rejects_snapshot_with_healthy_package() {
+        let temp = tempfile::tempdir().unwrap();
+        write_local_desc(&temp, "healthy", "0", "");
+        let healthy_desc = temp.path().join("healthy/desc");
+        let healthy_bytes = fs::read(&healthy_desc).unwrap();
+        assert_eq!(parse_local_db(temp.path()).unwrap().len(), 1);
+
+        let incomplete = temp.path().join("incomplete-1");
+        fs::create_dir(&incomplete).unwrap();
+        for desc in [
+            None,
+            Some("%NAME%\nincomplete\n\n%VERSION%\ninvalid version\n"),
+        ] {
+            if let Some(desc) = desc {
+                fs::write(incomplete.join("desc"), desc).unwrap();
+            }
+            let error = parse_local_db(temp.path())
+                .expect_err("a healthy package cannot conceal an incomplete local entry");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Incomplete local package entry {}",
+                    incomplete.join("desc").display()
+                )
+            );
+            assert_eq!(fs::read(&healthy_desc).unwrap(), healthy_bytes);
+        }
+    }
+
+    #[test]
+    fn malformed_local_desc_rejects_snapshot_with_healthy_package() {
+        let temp = tempfile::tempdir().unwrap();
+        write_local_desc(&temp, "healthy", "0", "");
+        let healthy_desc = temp.path().join("healthy/desc");
+        let healthy_bytes = fs::read(&healthy_desc).unwrap();
+        assert_eq!(parse_local_db(temp.path()).unwrap().len(), 1);
+        let broken = temp.path().join("broken-1-1");
+        fs::create_dir(&broken).unwrap();
+        let cases: [(&str, &[u8]); 3] = [
+            ("absent-name", b"%VERSION%\n1-1\n\n%REASON%\n0\n"),
+            ("empty-name", b"%NAME%\n\n%VERSION%\n1-1\n\n%REASON%\n0\n"),
+            (
+                "invalid-utf8",
+                b"%NAME%\nbroken\n\n%VERSION%\n1-1\n\n%DESC%\n\xff\n",
+            ),
+        ];
+        for (case, content) in cases {
+            fs::write(broken.join("desc"), content).unwrap();
+            let error = parse_local_db(temp.path())
+                .expect_err("a healthy package must not conceal malformed local metadata");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("Incomplete local package entry"),
+                "{case}: {message}"
+            );
+            assert!(message.contains("broken-1-1/desc"), "{case}: {message}");
+            if case == "invalid-utf8" {
+                assert!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|cause| { cause.kind() == std::io::ErrorKind::InvalidData }),
+                    "invalid UTF-8 must retain its decoding cause: {message}"
+                );
+            } else {
+                assert!(message.contains("no NAME found"), "{case}: {message}");
+            }
+            assert_eq!(fs::read(&healthy_desc).unwrap(), healthy_bytes, "{case}");
+        }
+    }
+
+    #[test]
+    fn official_local_desc_formats_preserve_metadata_and_refuse_nul_versions() {
+        use std::fmt::Write as _;
+
+        let fields = [
+            ("NAME", "widget"),
+            ("VERSION", "1:2.3-01"),
+            ("BASE", "widget"),
+            ("DESC", "Offline metadata fixture"),
+            ("URL", "https://example.org/widget"),
+            ("ARCH", "x86_64"),
+            ("BUILDDATE", "1"),
+            ("INSTALLDATE", "2"),
+            ("PACKAGER", "Audit Fixture <fixture@example.org>"),
+            ("SIZE", "123"),
+            ("GROUPS", "pinned\nother"),
+            ("REASON", "1"),
+            ("LICENSE", "MIT"),
+            ("VALIDATION", "pgp"),
+            ("REPLACES", "old-widget"),
+            ("DEPENDS", "glibc>=2"),
+            ("OPTDEPENDS", "extra-widget: optional feature"),
+            ("CONFLICTS", "incompatible-widget"),
+            ("PROVIDES", "virtual-widget=1"),
+        ];
+        let mut v1 = String::new();
+        for (key, value) in fields {
+            writeln!(v1, "%{key}%\n{value}\n").expect("in-memory fixture formatting");
+        }
+        let v2 = format!("{v1}%XDATA%\npkgtype=pkg\n\n");
+        alpm_db::desc::DbDescFileV1::from_str(&v1).expect("complete V1 fixture");
+        alpm_db::desc::DbDescFileV2::from_str(&v2).expect("complete V2 fixture");
+        let marker = v1
+            .replace("Offline metadata fixture", "Literal %XDATA% marker")
+            .replace("%INSTALLDATE%\n2\n", "%INSTALLDATE%\n0002\n");
+        let explicit = v2.replace("%REASON%\n1\n", "%REASON%\n0\n");
+        assert!(matches!(
+            alpm_db::desc::DbDescFile::from_str(&v1),
+            Ok(alpm_db::desc::DbDescFile::V1(_))
+        ));
+        assert!(matches!(
+            alpm_db::desc::DbDescFile::from_str(&v2),
+            Ok(alpm_db::desc::DbDescFile::V2(_))
+        ));
+        for (body, description, is_explicit) in [
+            (&v1, "Offline metadata fixture", false),
+            (&v2, "Offline metadata fixture", false),
+            (&marker, "Literal %XDATA% marker", false),
+            (&explicit, "Offline metadata fixture", true),
+        ] {
+            let parsed =
+                parse_local_desc_content(body).expect("official local metadata must parse");
+            assert_eq!(parsed.name, "widget");
+            assert_eq!(parsed.desc, description);
+            assert_eq!(parsed.version.to_string(), "1:2.3-1");
+            assert_eq!(parsed.groups, ["pinned", "other"]);
+            assert_eq!(parsed.explicit, is_explicit);
+            assert_eq!(parsed.install_date, "2");
+            assert_eq!(parsed.url.as_deref(), Some("https://example.org/widget"));
+            assert_eq!(parsed.size, 123);
+            assert_eq!(parsed.licenses, ["MIT"]);
+            assert_eq!(parsed.depends, ["glibc>=2"]);
+            assert_eq!(parsed.provides, ["virtual-widget=1"]);
+            assert_eq!(parsed.optdepends, ["extra-widget: optional feature"]);
+            let malformed = body.replace("1:2.3-01", "1:2\0.3-01");
+            let error = parse_local_desc_content(&malformed)
+                .expect_err("a NUL version must be refused by either local metadata format");
+            assert!(format!("{error:#}").contains("Invalid package version"));
+        }
     }
 
     #[test]
@@ -2370,10 +4013,8 @@ mod tests {
             "%NAME%\nvim\n\n%VERSION%\nnot a version!!!\n\n%DESC%\nVi Improved\n",
         )
         .unwrap();
-        // A malformed version means the entry itself is dropped (per the
-        // sync-db's per-entry degrade policy); the read as a whole succeeds.
-        let packages = parse_local_db(temp_dir.path()).unwrap();
-        assert!(packages.is_empty(), "invalid entry must be skipped");
+        let error = parse_local_db(temp_dir.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("Invalid package version"));
     }
 
     #[test]
@@ -2600,6 +4241,58 @@ mod tests {
     }
 
     #[test]
+    fn persisted_caches_reject_nul_versions_and_accept_healthy_versions() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        for raw in ["1\0-1", "0:2-1"] {
+            let version = Version::from_str(raw)?;
+            let sync = DbCache {
+                packages: vec![RepositoryPackages {
+                    name: "core".to_owned(),
+                    usage: RepoUsage::UPGRADE,
+                    packages: Ok(HashMap::from([(
+                        "widget".to_owned(),
+                        SyncDbPackage {
+                            name: "widget".to_owned(),
+                            version: version.clone(),
+                            ..SyncDbPackage::default()
+                        },
+                    )])),
+                }],
+                ..DbCache::default()
+            };
+            save_cache_to_disk_in(&sync, directory.path(), "sync_db_source_v4")?;
+            let loaded_sync: Result<DbCache> =
+                load_cache_from_disk_in(directory.path(), "sync_db_source_v4");
+            assert_eq!(
+                loaded_sync.is_ok(),
+                !raw.contains('\0'),
+                "sync cache {raw:?}"
+            );
+
+            let local = LocalDbCache {
+                packages: HashMap::from([(
+                    "widget".to_owned(),
+                    LocalDbPackage {
+                        name: "widget".to_owned(),
+                        version,
+                        ..LocalDbPackage::default()
+                    },
+                )]),
+                ..LocalDbCache::default()
+            };
+            save_cache_to_disk_in(&local, directory.path(), "local_db_source_v4")?;
+            let loaded_local: Result<LocalDbCache> =
+                load_cache_from_disk_in(directory.path(), "local_db_source_v4");
+            assert_eq!(
+                loaded_local.is_ok(),
+                !raw.contains('\0'),
+                "local cache {raw:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sync_identity_cache_uses_versioned_namespace() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let cache = DbCache {
@@ -2608,10 +4301,10 @@ mod tests {
         };
         fs::write(directory.path().join("sync_db.bin"), b"legacy cache")?;
         fs::write(
-            directory.path().join("sync_db_source_v1.bin"),
+            directory.path().join("sync_db_source_v4.bin"),
             bitcode::serialize(&cache)?,
         )?;
-        let decoded: DbCache = load_cache_from_disk_in(directory.path(), "sync_db_source_v1")?;
+        let decoded: DbCache = load_cache_from_disk_in(directory.path(), "sync_db_source_v4")?;
         assert_eq!(decoded.last_modified, cache.last_modified);
         assert_eq!(
             fs::read(directory.path().join("sync_db.bin"))?,
@@ -2624,6 +4317,12 @@ mod tests {
     fn invalidate_derived_cache_files_removes_live_and_legacy_names() -> Result<()> {
         let directory = tempfile::tempdir()?;
         for name in [
+            "sync_db_source_v4.bin",
+            "sync_db_source_v3.bin",
+            "sync_db_source_v2.bin",
+            "local_db_source_v4.bin",
+            "local_db_source_v3.bin",
+            "local_db_source_v2.bin",
             "sync_db_source_v1.bin",
             "local_db_source_v1.bin",
             "sync_db.bin",
@@ -2635,6 +4334,12 @@ mod tests {
         }
         invalidate_derived_cache_files(directory.path())?;
         for name in [
+            "sync_db_source_v4.bin",
+            "sync_db_source_v3.bin",
+            "sync_db_source_v2.bin",
+            "local_db_source_v4.bin",
+            "local_db_source_v3.bin",
+            "local_db_source_v2.bin",
             "sync_db_source_v1.bin",
             "local_db_source_v1.bin",
             "sync_db.bin",
@@ -3198,6 +4903,39 @@ mod tests {
     }
 
     #[test]
+    fn health_matching_refuses_nul_relations_before_native_comparison() {
+        for extra in [
+            "\n%DEPENDS%\nprovider>=1\0\n",
+            "\n%PROVIDES%\nvirtual=1\0\n",
+        ] {
+            let temp = health_fixture();
+            write_local_desc(&temp, "app", "0", extra);
+            assert!(check_local_db_health(temp.path()).is_err(), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn ignore_patterns_follow_native_fnmatch_grammar() {
+        for (pattern, value, expected) in [
+            ("widget{,-git}", "widget", false),
+            ("widget{,-git}", "widget-git", false),
+            ("widget{,-git}", "widget{,-git}", true),
+            ("[!a]*", "widget", true),
+            ("[!a]*", "arch", false),
+            ("widget[", "widget[", true),
+            ("widget-*", "widget-git", true),
+        ] {
+            let compiled = compile_package_patterns(&[pattern.to_owned()], "IgnorePkg")
+                .expect("pacman permits literal unmatched brackets");
+            assert_eq!(
+                compiled.is_match(value),
+                expected,
+                "{pattern:?} / {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn health_matching_cpu_comparator_controls_relation_decisions() {
         for (candidate, required) in [
             ("1-64", "1"),
@@ -3231,7 +4969,7 @@ mod tests {
     /// reverse dependencies derived from `%DEPENDS%`/`%PROVIDES%`.
     fn fixture_orphans(temp: &tempfile::TempDir) -> Vec<String> {
         let packages = parse_local_db(temp.path()).unwrap();
-        let required = compute_required_names(&packages);
+        let required = compute_required_names(&packages).unwrap();
         let mut orphans: Vec<String> = packages
             .iter()
             .filter(|(name, pkg)| {
@@ -3247,10 +4985,65 @@ mod tests {
     }
 
     #[test]
-    fn dependency_base_name_strips_version_constraints_and_sonames() {
-        assert_eq!(dependency_base_name("curl"), "curl");
-        assert_eq!(dependency_base_name("curl>=7.0"), "curl");
-        assert_eq!(dependency_base_name("libfoo.so=1-64"), "libfoo.so");
+    fn dependency_relations_preserve_version_constraints_and_sonames() {
+        assert_eq!(health_relation("curl").unwrap().name, "curl");
+        let versioned = health_relation("curl>=7.0").unwrap();
+        assert_eq!(versioned.name, "curl");
+        assert_eq!(versioned.version, Some("7.0"));
+        assert_eq!(health_relation("libfoo.so=1-64").unwrap().name, "libfoo.so");
+    }
+
+    #[test]
+    fn orphan_versions_match_libalpm_for_direct_and_virtual_dependencies() {
+        for section in ["DEPENDS", "OPTDEPENDS"] {
+            for (requirement, provision) in [
+                ("provider>=2", None),
+                ("virtual>=2", Some("virtual")),
+                ("virtual>=2", Some("virtual=1")),
+                ("virtual>=2", Some("virtual=3")),
+                ("virtual=1-64", Some("virtual=1-32")),
+                ("virtual", Some("virtual=1")),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let local = directory.path().join("local");
+                let root = directory.path().join("root");
+                std::fs::create_dir_all(&local).unwrap();
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+                for (name, reason, extra) in [
+                    ("app", "0", format!("%{section}%\n{requirement}\n\n")),
+                    (
+                        "provider",
+                        "1",
+                        provision
+                            .map_or_else(String::new, |value| format!("%PROVIDES%\n{value}\n\n")),
+                    ),
+                ] {
+                    let entry = local.join(format!("{name}-1.0-1"));
+                    std::fs::create_dir(&entry).unwrap();
+                    std::fs::write(
+                        entry.join("desc"),
+                        format!(
+                            "%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n{reason}\n\n{extra}"
+                        ),
+                    )
+                    .unwrap();
+                }
+                let packages = parse_local_db(&local).unwrap();
+                let required = compute_required_names(&packages).unwrap();
+                let alpm =
+                    alpm::Alpm::new(root.to_str().unwrap(), directory.path().to_str().unwrap())
+                        .unwrap();
+                let provider = alpm.localdb().pkg("provider").unwrap();
+                let native_required =
+                    !provider.required_by().is_empty() || !provider.optional_for().is_empty();
+                assert_eq!(
+                    required.contains("provider"),
+                    native_required,
+                    "{section}: {requirement} / {provision:?}"
+                );
+            }
+        }
     }
 
     /// #687: a local database that parses cleanly can still declare a
@@ -3394,7 +5187,7 @@ mod tests {
 
         let packages = parse_local_db(temp.path()).unwrap();
         assert_eq!(packages.len(), 7);
-        let required = compute_required_names(&packages);
+        let required = compute_required_names(&packages).unwrap();
         assert_eq!(
             required.len(),
             3,
@@ -3697,6 +5490,132 @@ mod tests {
     }
 
     #[test]
+    fn package_cache_refuses_symlinked_parent_directories() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let owner = tempfile::tempdir()?;
+        let destination = owner.path().join("destination");
+        fs::create_dir(&destination)?;
+        symlink(&destination, owner.path().join("redirect"))?;
+        let cache = owner.path().join("redirect/cache");
+        let result = save_cache_to_disk_in(&LocalDbCache::default(), &cache, "fixture");
+        assert!(
+            result.is_err(),
+            "cache persistence followed a symlinked parent"
+        );
+        assert!(!destination.join("cache/fixture.bin").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_symlinked_cache_files() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let owner = tempfile::tempdir()?;
+        let target = owner.path().join("target.bin");
+        fs::write(&target, bitcode::serialize(&LocalDbCache::default())?)?;
+        symlink(&target, owner.path().join("fixture.bin"))?;
+        let loaded = load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture");
+        assert!(loaded.is_err(), "derived cache accepted a redirected file");
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_shared_writable_directories() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = tempfile::tempdir()?;
+        let cache = owner.path().join("shared");
+        fs::create_dir(&cache)?;
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o777))?;
+        fs::write(
+            cache.join("fixture.bin"),
+            bitcode::serialize(&LocalDbCache::default())?,
+        )?;
+        let loaded = load_cache_from_disk_in::<LocalDbCache>(&cache, "fixture");
+        let saved = save_cache_to_disk_in(&LocalDbCache::default(), &cache, "other");
+        assert!(
+            loaded.is_err(),
+            "derived cache trusted a shared writable directory"
+        );
+        assert!(
+            saved.is_err(),
+            "derived cache wrote into a shared writable directory"
+        );
+        assert!(!cache.join("other.bin").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_writable_and_hardlinked_files() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = tempfile::tempdir()?;
+        let path = owner.path().join("fixture.bin");
+        fs::write(&path, bitcode::serialize(&LocalDbCache::default())?)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        let writable_accepted =
+            load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture").is_ok();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        fs::hard_link(&path, owner.path().join("alias.bin"))?;
+        let hardlink_accepted =
+            load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture").is_ok();
+        assert_eq!(
+            [writable_accepted, hardlink_accepted],
+            [false, false],
+            "unsafe cache files were accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_fifo_without_waiting_for_its_writer() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let path = owner.path().join("fixture.bin");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let directory = owner.path().to_owned();
+        let (done, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = load_cache_from_disk_in::<LocalDbCache>(&directory, "fixture");
+            done.send(result.map(|_| ())).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            if let Ok(result) = received.try_recv() {
+                break result;
+            }
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(mut writer) => {
+                    // Release a blocked old reader so failing-before proof leaves no live thread.
+                    if let Err(error) =
+                        writer.write_all(&bitcode::serialize(&LocalDbCache::default())?)
+                    {
+                        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+                    }
+                    drop(writer);
+                    break received.recv_timeout(std::time::Duration::from_secs(5))?;
+                }
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {}
+                Err(error) => return Err(error.into()),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "FIFO reader did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        reader.join().unwrap();
+        assert!(
+            result.is_err(),
+            "cache reader waited for and accepted FIFO bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn package_cache_round_trips_through_atomic_persist() {
         let temp = tempfile::TempDir::new().unwrap();
         let cache = LocalDbCache {
@@ -3712,9 +5631,9 @@ mod tests {
         };
 
         fs::write(temp.path().join("local_db_rdeps.bin"), b"legacy cache").unwrap();
-        save_cache_to_disk_in(&cache, temp.path(), "local_db_source_v1").unwrap();
+        save_cache_to_disk_in(&cache, temp.path(), "local_db_source_v4").unwrap();
         let loaded: LocalDbCache =
-            load_cache_from_disk_in(temp.path(), "local_db_source_v1").unwrap();
+            load_cache_from_disk_in(temp.path(), "local_db_source_v4").unwrap();
         assert!(loaded.packages.contains_key("firefox"));
         assert_eq!(loaded.last_modified, cache.last_modified);
         assert_eq!(

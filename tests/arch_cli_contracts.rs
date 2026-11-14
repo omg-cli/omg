@@ -21,12 +21,201 @@ fn run(root: &Path, args: &[&str]) -> CommandResult {
             ("OMG_TEST_DISTRO", "arch"),
             ("NO_COLOR", "1"),
             ("OMG_DISABLE_TELEMETRY", "1"),
+            // Contract output must not depend on the developer's log filter.
+            ("RUST_LOG", "error"),
         ],
     )
 }
 
 fn output_text(output: &CommandResult) -> String {
     output.combined_output()
+}
+
+#[cfg(unix)]
+#[test]
+fn native_status_preserves_daemon_advisory_coverage() -> Result<()> {
+    use omg_lib::daemon::protocol::{
+        Request, Response, ResponseResult, StatusResult, encode_frame, read_frame, split_frame,
+        write_frame,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    if !common::native_arch_fixture_available() {
+        return Ok(());
+    }
+    let project = common::TestProject::new();
+    prepare_native_size_fixture(&project, &[], &[])?;
+    let before = private_fixture_state(project.pacman_root.path())?;
+    for (findings, unknown, scanned, message) in [
+        (0, Some(0), true, "No reported findings"),
+        (2, Some(0), true, "2 findings"),
+        (0, Some(3), true, "No reported findings"),
+        (2, None, true, "Advisory coverage unreported"),
+        (2, Some(0), false, "Advisory coverage unreported"),
+    ] {
+        for args in [
+            &["status"][..],
+            &["status", "--fast"][..],
+            &["daemon-status"][..],
+        ] {
+            let requests = match args {
+                ["status"] => vec![
+                    vec![Request::Status { id: 0 }],
+                    vec![Request::Ping { id: 0 }],
+                ],
+                ["daemon-status"] => vec![vec![
+                    Request::Ping { id: 0 },
+                    Request::Metrics { id: 0 },
+                    Request::Status { id: 0 },
+                ]],
+                _ => vec![vec![Request::Status { id: 0 }]],
+            };
+            let directory = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")?;
+            let socket = directory.path().join("daemon.sock");
+            omg_lib::core::client::validate_socket_with_context(&socket)?;
+            let listener = UnixListener::bind(&socket)?;
+            listener.set_nonblocking(true)?;
+            let server = std::thread::spawn(move || -> Result<()> {
+                for connection in requests {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                anyhow::ensure!(
+                                    Instant::now() < deadline,
+                                    "native status did not contact its private daemon (requests={connection:?})"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                    for expected in connection {
+                        let body = read_frame(&mut stream)?;
+                        let (_, payload) = split_frame(&body)?;
+                        let request: Request = bitcode::deserialize(payload)?;
+                        anyhow::ensure!(
+                            std::mem::discriminant(&request) == std::mem::discriminant(&expected),
+                            "unexpected request order: {request:?}, expected {expected:?}"
+                        );
+                        let result = match &request {
+                            Request::Status { .. } => ResponseResult::Status(StatusResult {
+                                total_packages: 9,
+                                explicit_packages: 5,
+                                orphan_packages: 0,
+                                updates_available: 2,
+                                security_vulnerabilities: findings,
+                                vulnerabilities_scanned: scanned,
+                                security_unknown_packages: unknown,
+                                runtime_versions: vec![
+                                    ("node".into(), "v99.fixture\u{1b}[2J\nFORGED\r".into()),
+                                    ("foreign\r\nFORGED".into(), "\u{202e}fixture".into()),
+                                ],
+                            }),
+                            Request::Ping { .. } => ResponseResult::Ping("pong".into()),
+                            Request::Metrics { .. } => ResponseResult::Metrics(
+                                omg_lib::daemon::protocol::MetricsSnapshot {
+                                    requests_total: 4,
+                                    requests_failed: findings as u64,
+                                    rate_limit_hits: findings as u64,
+                                    validation_failures: findings as u64,
+                                    active_connections: 1,
+                                    security_audit_requests: 1,
+                                    bytes_received: 40,
+                                    bytes_sent: 60,
+                                    cache_hits: 1,
+                                    cache_misses: 1,
+                                    search_requests: 1,
+                                    info_requests: 1,
+                                    status_requests: 1,
+                                },
+                            ),
+                            other => anyhow::bail!("unexpected private status request: {other:?}"),
+                        };
+                        write_frame(
+                            &mut stream,
+                            &encode_frame(&Response::Success {
+                                id: request.id(),
+                                result,
+                            })?,
+                        )?;
+                    }
+                }
+                Ok(())
+            });
+            let output = project.run_native_arch_status(&socket, args);
+            let served = server.join().expect("private status server panicked");
+            assert!(output.success, "{}", output_text(&output));
+            served.with_context(|| format!("native status output: {}", output_text(&output)))?;
+            let text = output_text(&output);
+            assert!(
+                !text.contains('\u{1b}') && !text.contains('\r') && !text.contains('\u{202e}'),
+                "runtime metadata reached the terminal with control characters: {text:?}"
+            );
+            assert!(
+                !text.lines().any(|line| line == "FORGED"),
+                "runtime metadata forged a status row: {text:?}"
+            );
+            if args == ["daemon-status"] {
+                let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                if let Some(unknown) = unknown.filter(|_| scanned) {
+                    assert!(
+                        flat.contains(&format!(
+                            "Findings: {findings} Unassessed packages: {unknown}"
+                        )),
+                        "{text}"
+                    );
+                } else {
+                    assert!(flat.contains("Advisory coverage: unreported"), "{text}");
+                    assert!(!text.contains("Findings:"), "{text}");
+                }
+                assert!(
+                    text.contains("Daemon is running") && text.contains("v99.fixture"),
+                    "{text}"
+                );
+                continue;
+            }
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.split_whitespace().next() == Some("Security"))
+                    .count(),
+                1,
+                "security status must render exactly one authoritative row: {text}"
+            );
+            if scanned && unknown.is_some() {
+                assert!(
+                    !text.contains("Not scanned"),
+                    "reported scan was presented as unscanned: {text}"
+                );
+            }
+            assert!(text.contains(message), "{text}");
+            if args == ["status"] {
+                assert!(
+                    text.contains("Running") && text.contains("v99.fixture"),
+                    "{text}"
+                );
+                assert_eq!(
+                    text.contains("Check vulnerabilities"),
+                    !(scanned && findings == 0 && unknown == Some(0)),
+                    "{text}"
+                );
+            }
+            assert_eq!(
+                text.contains("3 packages have unknown advisory applicability"),
+                unknown == Some(3),
+                "{text}"
+            );
+        }
+    }
+    assert_eq!(private_fixture_state(project.pacman_root.path())?, before);
+    Ok(())
 }
 
 #[test]
@@ -79,6 +268,41 @@ fn unknown_config_keys_fail() -> Result<()> {
 }
 
 #[test]
+fn hardened_aur_profile_round_trips_and_refuses_weakening() -> Result<()> {
+    let root = TempDir::new()?;
+    let config = root.path().join("config");
+    std::fs::create_dir(&config)?;
+    let config_text = config.to_string_lossy().into_owned();
+    let invoke = |args: &[&str]| {
+        common::run_omg_with_options(
+            args,
+            Some(root.path()),
+            &[("OMG_CONFIG_DIR", config_text.as_str()), ("NO_COLOR", "1")],
+        )
+    };
+    let initial = invoke(&["config", "get", "aur.security_profile"]);
+    assert!(initial.success, "{}", output_text(&initial));
+    assert_eq!(initial.stdout.trim(), "standard");
+    let enabled = invoke(&["config", "set", "aur.security_profile", "hardened"]);
+    assert!(enabled.success, "{}", output_text(&enabled));
+    let selected = invoke(&["config", "get", "aur.security_profile"]);
+    assert!(selected.success, "{}", output_text(&selected));
+    assert_eq!(selected.stdout.trim(), "hardened");
+    let before = std::fs::read(config.join("config.toml"))?;
+    for args in [
+        ["config", "set", "aur.security_profile", "hardned"],
+        ["config", "set", "aur.secure_makepkg", "false"],
+    ] {
+        let rejected = invoke(&args);
+        assert!(!rejected.success, "{}", output_text(&rejected));
+        assert_eq!(std::fs::read(config.join("config.toml"))?, before);
+    }
+    let restored = invoke(&["config", "set", "aur.security_profile", "standard"]);
+    assert!(restored.success, "{}", output_text(&restored));
+    Ok(())
+}
+
+#[test]
 fn privacy_export_works_without_a_license() -> Result<()> {
     let root = TempDir::new()?;
     let export_path = root.path().join("privacy.json");
@@ -112,6 +336,85 @@ fn advertised_json_outputs_are_valid_json() -> Result<()> {
             "{command} emitted non-error diagnostics in JSON mode: {}",
             output.stderr
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn outdated_reports_empty_and_populated_arch_inventory_in_both_formats() -> Result<()> {
+    let project = common::TestProject::new();
+    let root = project.pacman_root.path();
+    let db = root.join("var/lib/pacman");
+    let local = db.join("local");
+    let sync = db.join("sync");
+    std::fs::create_dir_all(&local)?;
+    std::fs::create_dir_all(&sync)?;
+    std::fs::write(local.join("ALPM_DB_VERSION"), b"9\n")?;
+    let configuration = project.config_dir.path().join("pacman.conf");
+    std::fs::write(
+        &configuration,
+        format!(
+            "[options]\nRootDir = {}\nDBPath = {}\nArchitecture = auto\n",
+            root.display(),
+            db.display()
+        ),
+    )?;
+    project.mock_install("git", "2.43.0")?;
+    project.mock_available("git", "2.43.0")?;
+    let args: [&[&str]; 2] = [&["outdated"], &["--json", "outdated"]];
+    for populated in [false, true] {
+        if populated {
+            project.mock_available("git", "2.44.0")?;
+        }
+        for args in args {
+            let output = project.run_with_env(
+                args,
+                &[
+                    ("OMG_TEST_DISTRO", "arch"),
+                    ("NO_COLOR", "1"),
+                    (
+                        "OMG_PACMAN_CONF",
+                        configuration.to_str().context("UTF-8 private config")?,
+                    ),
+                    (
+                        "OMG_PACMAN_DB_DIR",
+                        db.to_str().context("UTF-8 private database")?,
+                    ),
+                    (
+                        "OMG_PACMAN_LOCAL_DIR",
+                        local.to_str().context("UTF-8 private local database")?,
+                    ),
+                    (
+                        "OMG_PACMAN_SYNC_DIR",
+                        sync.to_str().context("UTF-8 private sync database")?,
+                    ),
+                ],
+            );
+            assert!(output.success, "{}", output_text(&output));
+            if args[0] == "--json" {
+                let rows: Vec<serde_json::Value> = serde_json::from_str(&output.stdout)?;
+                assert_eq!(rows.len(), usize::from(populated));
+                if populated {
+                    assert_eq!(rows[0]["name"], "git");
+                    assert_eq!(rows[0]["current_version"], "2.43.0");
+                    assert_eq!(rows[0]["new_version"], "2.44.0");
+                    assert_eq!(rows[0]["repo"], "extra");
+                }
+            } else {
+                let text = output_text(&output);
+                assert!(
+                    text.contains(if populated {
+                        "Available Updates"
+                    } else {
+                        "up to date"
+                    }),
+                    "{text}"
+                );
+                if populated {
+                    assert!(text.contains("git") && text.contains("2.44.0"), "{text}");
+                }
+            }
+        }
     }
     Ok(())
 }

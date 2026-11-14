@@ -39,6 +39,41 @@ FEDORA_EXCLUSION_DIAGNOSTICS = (
 
 
 class AllowlistTests(unittest.TestCase):
+    def test_native_poweroff_receipt_stays_at_controller_root(self):
+        self.assertTrue(exporter.allowed_file(('run-test', 'native-poweroff.json')))
+        self.assertFalse(exporter.allowed_file(('run-test', 'guest', 'native-poweroff.json')))
+        self.assertFalse(exporter.allowed_file(('run-test', 'native-poweroff.json.bak')))
+
+    def test_arch_readonly_reports_have_exact_boundaries(self):
+        root = ('run-test', 'native-evidence', 'cli')
+        for stage in ('arch-dry-run', 'arch-check'):
+            for suffix in ('.log', '-native-state.json', '-isolation.txt'):
+                self.assertTrue(exporter.allowed_file((*root, stage + suffix)))
+                self.assertFalse(exporter.allowed_file((*root, 'private', stage + suffix)))
+                self.assertFalse(exporter.allowed_file((*root, stage + suffix + '.bak')))
+            self.assertFalse(exporter.allowed_file((*root, stage + '-helpers.tsv')))
+        self.assertFalse(exporter.allowed_file((*root, 'arch-unknown.log')))
+
+    def test_native_optional_helper_diagnostics_stay_at_the_cli_root(self):
+        prefix = ('run-test', 'native-evidence', 'cli')
+        for stage in ('omarchy-snapshot-missing', 'omarchy-snapshot-unsupported',
+                      'omarchy-required-helper-missing', 'omarchy-reboot-decline',
+                      'omarchy-reboot-accept', 'omarchy-reboot-failure',
+                      'omarchy-authorization-refresh', 'omarchy-authorization-denied',
+                      'omarchy-runtime-fallback', 'omarchy-runtime-foreign-lock',
+                      'omarchy-interrupted', 'omarchy-output-closed', 'omarchy-terminal-closed',
+                      'omarchy-preflight-failure', 'omarchy-confirmation-failure',
+                      'omarchy-development-failure', 'omarchy-inhibitor-start-failure',
+                      'omarchy-inhibitor-stop-failure'):
+            for suffix in ('.log', '-helpers.tsv', '-native-state.json', '-layout.txt', '-interaction.json', '-control.json', '-authorization.json', '-authorization.log', '-exit.txt'):
+                name = stage + suffix
+                with self.subTest(name=name):
+                    self.assertTrue(exporter.allowed_file((*prefix, name)))
+                    self.assertFalse(exporter.allowed_file((*prefix, 'private', name)))
+                    self.assertFalse(exporter.allowed_file((*prefix, name + '.bak')))
+                    self.assertFalse(exporter.allowed_file(('run-test', name)))
+        self.assertFalse(exporter.allowed_file((*prefix, 'omarchy-unknown.log')))
+
     def test_fedora_exclusion_controls_are_limited_to_the_advisory_root(self):
         prefix = ("run-test", "guest", "evidence", "fedora-advisory")
         for name in FEDORA_EXCLUSION_DIAGNOSTICS:
@@ -505,6 +540,31 @@ class DescriptorTests(unittest.TestCase):
             self.assertEqual((self.destination / name).read_bytes(), content)
         for name in excluded:
             self.assertFalse((self.destination / name).exists())
+
+    def test_native_guest_failure_exports_case_evidence_but_excludes_private_neighbors(self):
+        prefix = 'run-test/native-evidence/cli/'
+        for name in ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
+                     'test-01.log', 'verification.json'):
+            self.fixture(prefix + name, b'actual captured case evidence')
+        for name in ('credentials.json', 'private/verification.json', 'config/config.toml'):
+            self.fixture(prefix + name, b'private neighbor')
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        expected = {prefix + name for name in ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
+                                              'test-01.log', 'verification.json')}
+        self.assertEqual(set(report['copied']), expected)
+        self.assertFalse((self.destination / prefix / 'credentials.json').exists())
+
+    def test_native_coverage_failure_exports_logs_without_inputs_or_profile_data(self):
+        content = b'actual native guest failure diagnostic\n'
+        self.fixture('run-test/native-coverage.log', content)
+        self.fixture('run-test/native-cli/bin/cli', b'private executable')
+        self.fixture('run-test/native-profiles/raw.profraw', b'private profile')
+        status, report = self.run_export()
+        self.assertEqual(status, 0, report)
+        self.assertEqual((self.destination / 'run-test/native-coverage.log').read_bytes(), content)
+        self.assertFalse((self.destination / 'run-test/native-cli').exists())
+        self.assertFalse((self.destination / 'run-test/native-profiles').exists())
 
     def test_private_state_is_never_opened_and_results_remain_readable(self):
         self.fixture("run-test/results.json", b"[]")

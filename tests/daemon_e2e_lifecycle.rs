@@ -433,8 +433,12 @@ async fn test_socket_cleanup_on_crash() -> Result<()> {
     // Force kill daemon (simulate crash)
     daemon.kill()?;
 
-    // Socket might remain initially, but new daemon should be able to start
+    // A forced exit leaves the socket for the next daemon to recover.
     sleep(Duration::from_millis(500)).await;
+    assert!(
+        fixture.socket_exists(),
+        "Crashed daemon should leave a stale socket for recovery"
+    );
 
     // New daemon should clean up stale socket and start successfully
     let mut daemon2 = fixture.start_daemon()?;
@@ -443,7 +447,11 @@ async fn test_socket_cleanup_on_crash() -> Result<()> {
         "New daemon should clean up stale socket, start, and become responsive"
     );
 
-    daemon2.kill()?;
+    daemon2.terminate_gracefully()?;
+    assert!(
+        !daemon2.is_running(),
+        "Recovered daemon should complete graceful shutdown"
+    );
     Ok(())
 }
 

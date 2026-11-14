@@ -296,6 +296,21 @@ omg update --fast
 3. Build and update AUR packages
 4. Record transaction in history
 
+On Omarchy, a full `omg update` coordinates Omarchy's system update commands,
+including snapshots, keyrings, migrations, service restarts, and boot checks.
+The official package stage uses Omarchy's system updater and the repositories
+already configured in `pacman.conf`, including the selected Omarchy channel.
+AUR updates use OMG's source review, build, and installation pipeline. OMG
+preserves Omarchy's `gcc14` and `gcc14-libs` update exclusions. Run the command
+as your session user; individual system stages request authorization.
+
+Omarchy full updates reject `--fast`, `--turbo`, and mutating `--no-sync`
+requests. `--check`, `--dry-run`, and `--aur-only` retain their scoped behavior.
+Pending Omarchy migrations with known external AUR helper calls stop the full
+update until a native equivalent is available. Omarchy's stage scripts and
+hooks remain trusted system code. The current run's transcript is stored in
+`/tmp/omarchy-update.log` with owner-only permissions.
+
 With `--aur-only`, steps 1 and 2 are omitted. AUR updates still use the normal
 policy screening, source review, sandboxed build, package archive inspection,
 and sealed privileged-install handoff. The flag cannot be combined with
@@ -919,6 +934,8 @@ omg audit [SUBCOMMAND]
 | `eol` | Check end-of-life status for installed Node.js, Python, Rust, Go, Ruby, Java, Bun, and Deno versions |
 
 `scan` prefers the Unix daemon but falls back to the direct package backend and shared scanner; findings only make the command fail with `--fail-on-findings`. The published v0.1.223 scan still requires the daemon. The newer system SBOM supports Arch, Debian, Ubuntu, and Fedora, with native advisory or OSV matching by default; the published release only completes this command on Arch. `--inventory-only` avoids advisory requests and marks the omission in the SBOM, so an empty vulnerability list is not a clean scan. The SBOM does not resolve dependency edges. `licenses` and vulnerability auto-fix require the Arch backend.
+
+Arch audits compare installed names and native versions against Arch tracker snapshots served by the OMG advisory service. The client checks the payload SHA-256, provenance, completeness and freshness before matching packages. Invalid or stale evidence fails the audit. These tracker comparisons do not establish upstream CVE applicability for AUR or local packages. The historical CVE import remains incomplete; missing CVE records do not mean that a package is unaffected.
 
 `omg audit export --framework soc2` requires a supported SBOM backend and advisory source. The newer CLI can scan directly without a daemon; v0.1.223 requires one. Other accepted framework names return unimplemented errors. `--period` labels the export; it does not filter history. Output is plaintext and can be partial on failure. See [security limits](./security.md).
 

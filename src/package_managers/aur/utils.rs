@@ -282,9 +282,303 @@ pub fn create_dir_as_user_sync(path: &Path) -> Result<()> {
     }
 }
 
+/// Open the stable inode shared by AUR builders, metadata and cleanup.
+pub(in crate::package_managers) fn open_build_lifecycle_lock(
+    build_dir: &Path,
+) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let lock_path = build_dir.with_added_extension("lifecycle.lock");
+    let parent = lock_path
+        .parent()
+        .context("AUR build directory has no parent")?;
+    create_dir_as_user_sync(parent)?;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let (file, created) = match options.create_new(true).open(&lock_path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            (options.create_new(false).open(&lock_path)?, false)
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to open AUR lifecycle lock {}", lock_path.display())
+            });
+        }
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "AUR lifecycle lock must be a single-link regular file"
+    );
+    if let Some(user) = original_user() {
+        let account = nix::unistd::User::from_name(&user)?
+            .with_context(|| format!("Original user '{user}' has no system account"))?;
+        if created {
+            nix::unistd::fchown(&file, Some(account.uid), Some(account.gid))
+                .context("Failed to set AUR lifecycle lock ownership")?;
+        } else {
+            anyhow::ensure!(
+                metadata.uid() == account.uid.as_raw(),
+                "Existing AUR lifecycle lock is not owned by the original user"
+            );
+        }
+    }
+    Ok(file)
+}
+
+/// Open an effective-user-owned coordination inode that is not group/other writable.
+pub(in crate::package_managers) fn open_effective_user_lock(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let file = match options.create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            options.create_new(false).open(path)?
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to open AUR lock {}", path.display()));
+        }
+    };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "AUR lock must be a single-link regular file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.uid() == nix::unistd::geteuid().as_raw() && metadata.mode() & 0o022 == 0,
+        "AUR lock must be owned by the effective user and not group/other writable: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an explicitly provisioned disposable native root fixture"]
+    fn native_lifecycle_original_user_ownership() -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        anyhow::ensure!(
+            crate::core::is_root()
+                && std::env::var("OMG_ARCH_INSTALL_FIXTURE").as_deref() == Ok("isolated-container"),
+            "lifecycle ownership fixture requires the disposable native root environment"
+        );
+        let account = nix::unistd::User::from_name("nobody")?
+            .context("disposable fixture requires the nobody account")?;
+        anyhow::ensure!(
+            account.uid.as_raw() != 0,
+            "fixture account must not be root"
+        );
+        let owner = tempfile::Builder::new()
+            .prefix("omg-root-lifecycle-")
+            .permissions(std::fs::Permissions::from_mode(0o755))
+            .tempdir_in("/var/tmp")?;
+        let build = owner.path().join("aur");
+        let path = build.with_added_extension("lifecycle.lock");
+        temp_env::with_vars(
+            [("SUDO_USER", Some("nobody")), ("DOAS_USER", None)],
+            || -> Result<()> {
+                let mut fresh = open_build_lifecycle_lock(&build)?;
+                let metadata = fresh.metadata()?;
+                assert_eq!(metadata.uid(), account.uid.as_raw());
+                assert_eq!(metadata.gid(), account.gid.as_raw());
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+                fresh.write_all(b"owned lifecycle")?;
+                drop(fresh);
+
+                let existing = open_build_lifecycle_lock(&build)?;
+                assert_eq!(existing.metadata()?.ino(), metadata.ino());
+                assert_eq!(existing.metadata()?.uid(), account.uid.as_raw());
+                nix::unistd::fchown(
+                    &existing,
+                    Some(nix::unistd::Uid::from_raw(0)),
+                    Some(nix::unistd::Gid::from_raw(0)),
+                )
+                .expect("root fixture restores lifecycle ownership before testing refusal");
+                drop(existing);
+                let error = open_build_lifecycle_lock(&build)
+                    .expect_err("an existing inode owned by root must not impersonate nobody");
+                assert_eq!(
+                    error.to_string(),
+                    "Existing AUR lifecycle lock is not owned by the original user"
+                );
+                assert_eq!(std::fs::read(&path)?, b"owned lifecycle");
+                assert_eq!(std::fs::metadata(&path)?.uid(), 0);
+                Ok(())
+            },
+        )?;
+
+        let missing = format!(
+            "omg-missing-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        assert!(nix::unistd::User::from_name(&missing)?.is_none());
+        let absent = owner.path().join("not-created/aur");
+        temp_env::with_vars(
+            [("SUDO_USER", Some(missing.as_str())), ("DOAS_USER", None)],
+            || {
+                let error = open_build_lifecycle_lock(&absent)
+                    .expect_err("an unknown original user must refuse before creating directories");
+                assert_eq!(
+                    error.to_string(),
+                    format!("Original user '{missing}' has no system account")
+                );
+            },
+        );
+        assert!(!owner.path().join("not-created").exists());
+        assert_eq!(std::fs::read(&path)?, b"owned lifecycle");
+        assert_eq!(owner.path().read_dir()?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn effective_user_locks_refuse_writable_existing_inodes_without_repair() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private coordination owner");
+        let path = owner.path().join("coordination.lock");
+        let mut file = open_effective_user_lock(&path).expect("fresh owned coordination file");
+        assert_eq!(
+            file.metadata()
+                .expect("coordination metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        file.write_all(b"owned coordination")
+            .expect("inert coordination content");
+        drop(file);
+        drop(open_effective_user_lock(&path).expect("existing safe coordination file"));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("private writable-inode fault");
+        let error = open_effective_user_lock(&path)
+            .expect_err("group/other writable coordination files must be refused");
+        assert!(
+            error.to_string().contains("not group/other writable"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("preserved inode content"),
+            b"owned coordination"
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("preserved inode metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o666,
+            "refusal must not silently repair an existing inode"
+        );
+    }
+
+    #[test]
+    fn effective_user_lock_open_errors_preserve_path_and_io_cause() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let owner = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private coordination owner");
+        let regular_parent = owner.path().join("regular");
+        std::fs::write(&regular_parent, b"unrelated parent").expect("private regular parent");
+        for (path, expected) in [
+            (
+                owner.path().join("missing/child.lock"),
+                std::io::ErrorKind::NotFound,
+            ),
+            (
+                regular_parent.join("child.lock"),
+                std::io::ErrorKind::NotADirectory,
+            ),
+        ] {
+            let error =
+                open_effective_user_lock(&path).expect_err("invalid parent must refuse opening");
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(expected),
+                "{error:#}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("Failed to open AUR lock {}", path.display())
+            );
+        }
+        assert_eq!(
+            std::fs::read(regular_parent).expect("preserved parent"),
+            b"unrelated parent"
+        );
+        assert!(!owner.path().join("missing").exists());
+    }
+
+    #[test]
+    fn lifecycle_lock_initial_open_errors_preserve_path_and_io_cause() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const TEST: &str = "package_managers::aur::utils::tests::lifecycle_lock_initial_open_errors_preserve_path_and_io_cause";
+        if crate::config::Settings::rerun_test_unprivileged(TEST) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "lifecycle fixture requires an ordinary UID"
+        );
+        let owner = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("private lifecycle owner");
+        drop(
+            open_build_lifecycle_lock(&owner.path().join("ordinary"))
+                .expect("ordinary lifecycle inode"),
+        );
+        let build = owner.path().join("x".repeat(4096));
+        let path = build.with_added_extension("lifecycle.lock");
+        let error = open_build_lifecycle_lock(&build).expect_err("oversized lock name must fail");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(nix::libc::ENAMETOOLONG),
+            "{error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to open AUR lifecycle lock {}", path.display())
+        );
+        assert_eq!(
+            owner
+                .path()
+                .read_dir()
+                .expect("private lifecycle owner entries")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn rust_x86_maps_to_arch_i686() {

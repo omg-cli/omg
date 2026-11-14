@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Every frame is `[u32 LE version][bitcode payload]`. Peers reject frames
 /// whose version differs instead of attempting a decode that could
 /// silently mis-map same-shaped variants.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Frame layout error for [`encode_frame`] / [`split_frame`].
 #[derive(Debug, thiserror::Error)]
@@ -198,7 +198,13 @@ pub enum ResponseResult {
     Status(StatusResult),
     Explicit(ExplicitResult),
     ExplicitCount(usize),
-    SecurityAudit(SecurityAuditResult),
+    SecurityAudit(
+        #[serde(
+            serialize_with = "serialize_security_audit",
+            deserialize_with = "deserialize_security_audit"
+        )]
+        SecurityAuditResult,
+    ),
     Ping(String),
     CacheStats {
         size: usize,
@@ -214,6 +220,136 @@ pub enum ResponseResult {
     DebianSearch(Vec<PackageInfo>),
     Health(HealthStatus),
     ListUpdates(Vec<UpdateEntry>),
+}
+
+#[derive(Serialize, Deserialize)]
+struct BinaryAuditResult<C, F> {
+    coverage: C,
+    total_vulnerabilities: usize,
+    high_severity: usize,
+    vulnerabilities: F,
+}
+
+#[derive(Serialize, Deserialize)]
+enum BinaryAuditCoverage<A, U, S> {
+    Unreported,
+    Reported {
+        assessed: A,
+        unassessed: U,
+        sources: S,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+enum BinaryAdvisoryProvenance<T> {
+    ArchSnapshot {
+        payload_sha256: T,
+        fetched_at: jiff::Timestamp,
+        checked_at: jiff::Timestamp,
+    },
+    Osv {
+        ecosystem: T,
+    },
+    NativeDnf,
+}
+
+fn serialize_security_audit<S: serde::Serializer>(
+    audit: &SecurityAuditResult,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use crate::core::security::scan::{AdvisoryProvenance, AuditCoverage};
+    if serializer.is_human_readable() {
+        return audit.serialize(serializer);
+    }
+    let coverage = match &audit.coverage {
+        AuditCoverage::Unreported => BinaryAuditCoverage::Unreported,
+        AuditCoverage::Reported {
+            assessed,
+            unassessed,
+            sources,
+        } => BinaryAuditCoverage::Reported {
+            assessed: assessed.as_slice(),
+            unassessed: unassessed.as_slice(),
+            sources: sources
+                .iter()
+                .map(|source| match source {
+                    AdvisoryProvenance::ArchSnapshot {
+                        payload_sha256,
+                        fetched_at,
+                        checked_at,
+                    } => BinaryAdvisoryProvenance::ArchSnapshot {
+                        payload_sha256: payload_sha256.as_str(),
+                        fetched_at: *fetched_at,
+                        checked_at: *checked_at,
+                    },
+                    AdvisoryProvenance::Osv { ecosystem } => BinaryAdvisoryProvenance::Osv {
+                        ecosystem: ecosystem.as_str(),
+                    },
+                    AdvisoryProvenance::NativeDnf => BinaryAdvisoryProvenance::NativeDnf,
+                })
+                .collect::<Vec<_>>(),
+        },
+    };
+    BinaryAuditResult {
+        coverage,
+        total_vulnerabilities: audit.total_vulnerabilities,
+        high_severity: audit.high_severity,
+        vulnerabilities: audit.vulnerabilities.as_slice(),
+    }
+    .serialize(serializer)
+}
+
+fn deserialize_security_audit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SecurityAuditResult, D::Error> {
+    use crate::core::security::scan::{
+        AdvisoryProvenance, AuditCoverage, InstalledIdentity, UnassessedPackage,
+    };
+    if deserializer.is_human_readable() {
+        return SecurityAuditResult::deserialize(deserializer);
+    }
+    type Coverage = BinaryAuditCoverage<
+        Vec<InstalledIdentity>,
+        Vec<UnassessedPackage>,
+        Vec<BinaryAdvisoryProvenance<String>>,
+    >;
+    let audit: BinaryAuditResult<Coverage, Vec<(String, Vec<Vulnerability>)>> =
+        Deserialize::deserialize(deserializer)?;
+    let coverage = match audit.coverage {
+        BinaryAuditCoverage::Unreported => AuditCoverage::Unreported,
+        BinaryAuditCoverage::Reported {
+            assessed,
+            unassessed,
+            sources,
+        } => AuditCoverage::Reported {
+            assessed,
+            unassessed,
+            sources: sources
+                .into_iter()
+                .map(|source| match source {
+                    BinaryAdvisoryProvenance::ArchSnapshot {
+                        payload_sha256,
+                        fetched_at,
+                        checked_at,
+                    } => AdvisoryProvenance::ArchSnapshot {
+                        payload_sha256,
+                        fetched_at,
+                        checked_at,
+                    },
+                    BinaryAdvisoryProvenance::Osv { ecosystem } => {
+                        AdvisoryProvenance::Osv { ecosystem }
+                    }
+                    BinaryAdvisoryProvenance::NativeDnf => AdvisoryProvenance::NativeDnf,
+                })
+                .collect(),
+        },
+    };
+    Ok(SecurityAuditResult {
+        coverage,
+        total_vulnerabilities: audit.total_vulnerabilities,
+        high_severity: audit.high_severity,
+        vulnerabilities: audit.vulnerabilities,
+    })
 }
 
 // Error codes
@@ -258,20 +394,31 @@ pub struct StatusResult {
     pub orphan_packages: usize,
     pub updates_available: usize,
     pub security_vulnerabilities: usize,
-    /// False when `security_vulnerabilities` was not produced by a scan.
+    /// True only while this status carries a reported current scan scope.
     pub vulnerabilities_scanned: bool,
+    /// Reported uncovered package count. Legacy peers omit coverage entirely.
+    #[serde(default)]
+    pub security_unknown_packages: Option<usize>,
     pub runtime_versions: Vec<(String, String)>,
 }
 
 impl StatusResult {
-    /// Vulnerability count from a completed scan. `None` means not scanned.
+    /// Findings and uncovered packages from an explicitly reported scan scope.
     #[must_use]
-    pub const fn scanned_vulnerability_count(&self) -> Option<usize> {
+    pub const fn scanned_vulnerability_summary(&self) -> Option<(usize, usize)> {
         if self.vulnerabilities_scanned {
-            Some(self.security_vulnerabilities)
+            match self.security_unknown_packages {
+                Some(unknown) => Some((self.security_vulnerabilities, unknown)),
+                None => None,
+            }
         } else {
             None
         }
+    }
+
+    pub(crate) fn invalidate_security_scope(&mut self) {
+        self.vulnerabilities_scanned = false;
+        self.security_unknown_packages = None;
     }
 }
 
@@ -492,11 +639,14 @@ mod tests {
         let response = Response::Success {
             id: 73,
             result: ResponseResult::SecurityAudit(SecurityAuditResult {
+                coverage: crate::core::security::scan::AuditCoverage::Unreported,
                 total_vulnerabilities: 1,
                 high_severity: 1,
                 vulnerabilities: vec![(
                     "package".into(),
                     vec![Vulnerability {
+                        applicability:
+                            crate::core::security::scan::FindingApplicability::Applicable,
                         affected_installed: vec![crate::core::security::scan::InstalledIdentity {
                             name: "package".into(),
                             version: "0:1-1".into(),
@@ -533,7 +683,10 @@ mod tests {
         old_frame[..4].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
             split_frame(&old_frame),
-            Err(FrameError::VersionMismatch { peer: 3, ours: 4 })
+            Err(FrameError::VersionMismatch {
+                peer: 3,
+                ours: PROTOCOL_VERSION
+            })
         ));
     }
 
@@ -549,5 +702,156 @@ mod tests {
                 ours: PROTOCOL_VERSION,
             })
         ));
+    }
+    #[test]
+    fn coverage17_legacy_status_and_failed_refresh_cannot_claim_clean() {
+        let mut status: StatusResult = serde_json::from_value(serde_json::json!({
+            "total_packages": 3, "explicit_packages": 1, "orphan_packages": 0,
+            "updates_available": 0, "security_vulnerabilities": 0,
+            "vulnerabilities_scanned": true, "runtime_versions": []
+        }))
+        .expect("legacy status remains decodable");
+        assert_eq!(status.scanned_vulnerability_summary(), None);
+        status.security_unknown_packages = Some(2);
+        assert_eq!(status.scanned_vulnerability_summary(), Some((0, 2)));
+        status.security_unknown_packages = Some(0);
+        assert_eq!(status.scanned_vulnerability_summary(), Some((0, 0)));
+        status.invalidate_security_scope();
+        assert_eq!(status.scanned_vulnerability_summary(), None);
+        assert_eq!(status.security_unknown_packages, None);
+        assert_eq!(
+            status.security_vulnerabilities, 0,
+            "numeric last-known value is not fresh coverage"
+        );
+    }
+
+    #[test]
+    fn coverage17_previous_wire_version_is_rejected_before_bitcode_decode() {
+        let response = Response::Success {
+            id: 17,
+            result: ResponseResult::Status(StatusResult {
+                total_packages: 7,
+                explicit_packages: 3,
+                orphan_packages: 0,
+                updates_available: 0,
+                security_vulnerabilities: 2,
+                vulnerabilities_scanned: true,
+                security_unknown_packages: Some(7),
+                runtime_versions: Vec::new(),
+            }),
+        };
+        let frame = encode_frame(&response).expect("encode current security status");
+        let (_, payload) = split_frame(&frame).expect("matching client and daemon protocol");
+        let decoded: Response = bitcode::deserialize(payload).expect("current payload decodes");
+        assert!(matches!(
+            decoded,
+            Response::Success {
+                id: 17,
+                result: ResponseResult::Status(status),
+            } if status.scanned_vulnerability_summary() == Some((2, 7))
+        ));
+
+        let mut previous = frame;
+        previous[..4].copy_from_slice(&4u32.to_le_bytes());
+        assert!(
+            matches!(
+                split_frame(&previous),
+                Err(FrameError::VersionMismatch {
+                    peer: 4,
+                    ours: PROTOCOL_VERSION
+                })
+            ),
+            "previous security semantics cannot decode as current coverage"
+        );
+
+        previous.truncate(4);
+        previous.extend_from_slice(b"not a bitcode response");
+        assert!(
+            matches!(
+                split_frame(&previous),
+                Err(FrameError::VersionMismatch {
+                    peer: 4,
+                    ours: PROTOCOL_VERSION
+                })
+            ),
+            "the version boundary must reject before attempting payload decoding"
+        );
+    }
+
+    #[test]
+    fn coverage17_binary_audit_roundtrip_preserves_all_sources_unknown_and_possible() {
+        use crate::core::security::scan::{
+            AdvisoryProvenance, AuditCoverage, FindingApplicability, InstalledIdentity,
+            UnassessedPackage,
+        };
+        let identity = |name: &str| InstalledIdentity {
+            name: name.into(),
+            version: "1:2.0-3".into(),
+            architecture: Some("x86_64".into()),
+        };
+        let now: jiff::Timestamp = "2026-11-13T12:00:00Z".parse().expect("fixture timestamp");
+        let audit = SecurityAuditResult {
+            coverage: AuditCoverage::Reported {
+                assessed: vec![identity("distribution")],
+                unassessed: vec![UnassessedPackage {
+                    package: identity("unknown"),
+                    reason:
+                        crate::core::security::vulnerability::UnknownCoverage::OriginUnestablished,
+                }],
+                sources: vec![
+                    AdvisoryProvenance::ArchSnapshot {
+                        payload_sha256: "ab".repeat(32),
+                        fetched_at: now,
+                        checked_at: now,
+                    },
+                    AdvisoryProvenance::Osv {
+                        ecosystem: "Debian:12".into(),
+                    },
+                    AdvisoryProvenance::NativeDnf,
+                ],
+            },
+            total_vulnerabilities: 1,
+            high_severity: 1,
+            vulnerabilities: vec![(
+                "unknown".into(),
+                vec![Vulnerability {
+                    applicability: FindingApplicability::Possible,
+                    id: "possible-advisory".into(),
+                    summary: "source review required".into(),
+                    score: Some("8.1".into()),
+                    advisory_severity: None,
+                    native_advisory: None,
+                    affected_installed: vec![identity("unknown")],
+                }],
+            )],
+        };
+        let json = serde_json::to_value(&audit).expect("public JSON audit");
+        assert_eq!(json["coverage"]["status"], "reported");
+        assert_eq!(json["coverage"]["sources"][0]["kind"], "arch_snapshot");
+        assert_eq!(json["coverage"]["sources"][1]["kind"], "osv");
+        assert_eq!(json["coverage"]["sources"][2]["kind"], "native_dnf");
+        assert_eq!(
+            json["vulnerabilities"][0][1][0]["applicability"],
+            "possible"
+        );
+        let response = Response::Success {
+            id: 1701,
+            result: ResponseResult::SecurityAudit(audit),
+        };
+        let frame = encode_frame(&response).expect("binary security audit frame");
+        let (_, payload) = split_frame(&frame).expect("current protocol frame");
+        let decoded: Response =
+            bitcode::deserialize(payload).expect("typed binary coverage and provenance decode");
+        let expected = serde_json::to_value(&response).expect("expected public response");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("decoded public response"),
+            expected
+        );
+        let json_decoded: Response = serde_json::from_value(expected.clone())
+            .expect("public JSON response remains decodable");
+        assert_eq!(
+            serde_json::to_value(json_decoded).expect("JSON roundtrip"),
+            expected
+        );
     }
 }

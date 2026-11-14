@@ -1879,30 +1879,54 @@ mod tests {
         const NAME: &str = "runtimes::rust::tests::incremental_fixture_child_respects_its_deadline";
         if std::env::var("OMG_ISOLATED_FIXTURE_TEST").as_deref() == Ok(NAME) {
             let ready = std::env::var_os("OMG_RUST_DEADLINE_READY").expect("ready marker path");
+            let delay_ms = std::env::var("OMG_RUST_DEADLINE_DELAY_MS")
+                .expect("child delay in milliseconds")
+                .parse::<u64>()
+                .expect("numeric child delay");
             std::fs::write(ready, b"child ready").expect("write ready marker");
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         } else {
             let directory = tempfile::tempdir().expect("deadline fixture directory");
-            let ready = directory.path().join("ready");
-            temp_env::with_var("OMG_RUST_DEADLINE_READY", Some(ready.as_os_str()), || {
-                let failure = std::panic::catch_unwind(|| {
-                    crate::core::testing::run_isolated_test_with_timeout(
-                        NAME,
-                        std::time::Duration::from_secs(5),
-                    );
-                })
-                .expect_err("the stalled child must exceed its deadline");
-                let message = failure
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| failure.downcast_ref::<&str>().copied())
-                    .expect("deadline failure must carry a message");
-                assert!(message.contains("exceeded its time or capture bound"));
-                assert_eq!(
-                    std::fs::read(&ready).expect("child became ready"),
-                    b"child ready"
+            for (delay_ms, expect_timeout, label) in
+                [("0", false, "completed"), ("30000", true, "stalled")]
+            {
+                let ready = directory.path().join(label);
+                temp_env::with_vars(
+                    [
+                        ("OMG_RUST_DEADLINE_READY", Some(ready.as_os_str())),
+                        (
+                            "OMG_RUST_DEADLINE_DELAY_MS",
+                            Some(std::ffi::OsStr::new(delay_ms)),
+                        ),
+                    ],
+                    || {
+                        let result = std::panic::catch_unwind(|| {
+                            crate::core::testing::run_isolated_test_with_timeout(
+                                NAME,
+                                std::time::Duration::from_secs(5),
+                            )
+                        });
+                        if expect_timeout {
+                            let failure =
+                                result.expect_err("the stalled child must exceed its deadline");
+                            let message = failure
+                                .downcast_ref::<String>()
+                                .map(String::as_str)
+                                .or_else(|| failure.downcast_ref::<&str>().copied())
+                                .expect("deadline failure must carry a message");
+                            assert!(message.contains("exceeded its time or capture bound"));
+                        } else {
+                            assert!(
+                                result.expect("the ready child must complete before its deadline")
+                            );
+                        }
+                        assert_eq!(
+                            std::fs::read(&ready).expect("child became ready"),
+                            b"child ready"
+                        );
+                    },
                 );
-            });
+            }
         }
     }
 

@@ -96,7 +96,7 @@ fn execute_recorded_system_update(
 #[cfg(feature = "arch")]
 fn split_elevated_invocation(args: &[String], parent_records: bool) -> Option<(&str, &[String])> {
     let command = args.get(1)?;
-    if matches!(command.as_str(), "install" | "remove") && !parent_records {
+    if matches!(command.as_str(), "install" | "install-plan" | "remove") && !parent_records {
         return None;
     }
     let separator_pos = args.iter().position(|a| a == "--")?;
@@ -189,6 +189,33 @@ fn try_fast_elevated(
 
     // Handle commands that may have packages
     match command {
+        omg_lib::package_managers::arch_install::ELEVATED_INSTALL => {
+            Some(if let [handoff] = packages.as_slice() {
+                omg_lib::package_managers::arch_install::execute_handoff(handoff)
+            } else {
+                Err(anyhow::anyhow!(
+                    "Private installation requires exactly one sealed descriptor"
+                ))
+            })
+        }
+        "omarchy-native" => Some((|| {
+            use omg_lib::package_managers::arch::{
+                NativeOmarchyInteraction, NativeOmarchyOperation,
+            };
+            let [operation, interaction] = packages.as_slice() else {
+                anyhow::bail!(
+                    "Native Omarchy stages require exactly one operation and interaction mode"
+                );
+            };
+            let operation = NativeOmarchyOperation::from_argument(operation)
+                .ok_or_else(|| anyhow::anyhow!("Unknown native Omarchy package operation"))?;
+            let interaction = NativeOmarchyInteraction::from_argument(interaction)
+                .ok_or_else(|| anyhow::anyhow!("Unknown native Omarchy interaction mode"))?;
+            omg_lib::package_managers::arch::execute_native_omarchy_operation(
+                operation,
+                interaction,
+            )
+        })()),
         "install" if !packages.is_empty() => {
             // Validate package names or local package files (security).
             omg_lib::core::security::validate_package_names_or_files(&packages).ok()?;
@@ -806,6 +833,11 @@ fn main() {
 
     let mut args: Vec<String> = std::env::args().collect();
 
+    #[cfg(feature = "arch")]
+    if let Err(error) = omg_lib::cli::packages::contain_inherited_transport(&args) {
+        finish(Err(error));
+    }
+
     if omg_lib::cli::update_notice::try_handle(&args) {
         std::process::exit(0);
     }
@@ -882,18 +914,34 @@ fn main() {
 /// whose anyhow `Termination` impl printed errors but could never show
 /// suggestions or differentiate exit codes.
 fn finish(result: Result<()>) -> ! {
+    let result = complete_audit(
+        result,
+        omg_lib::core::security::audit::flush_pending_audit_events(),
+    );
     match result {
         Ok(()) => {
             omg_lib::cli::update_notice::after_command();
             std::process::exit(0);
         }
         Err(error) => {
-            eprintln!("Error: {error:#}");
+            use std::io::Write;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "Error: {error:#}");
             if let Some(suggestion) = omg_lib::core::error::suggest_for_anyhow(&error) {
-                eprintln!("\nSuggestion: {suggestion}");
+                let _ = writeln!(stderr, "\nSuggestion: {suggestion}");
             }
             std::process::exit(1);
         }
+    }
+}
+
+fn complete_audit(operation: Result<()>, audit: Result<()>) -> Result<()> {
+    match (operation, audit) {
+        (result, Ok(())) => result,
+        (Ok(()), Err(error)) => Err(error.context("Failed to flush audit events before exit")),
+        (Err(error), Err(audit_error)) => Err(error.context(format!(
+            "Failed to flush audit events before exit: {audit_error:#}"
+        ))),
     }
 }
 
@@ -969,8 +1017,7 @@ async fn async_main(args: Vec<String>) -> Result<()> {
         // Use run_self_sudo directly — elevate_if_needed creates a nested tokio
         // runtime which panics with "Cannot start a runtime from within a runtime"
         let args_refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-        omg_lib::core::privilege::run_self_sudo(&args_refs).await?;
-        std::process::exit(0);
+        return omg_lib::core::privilege::run_self_sudo(&args_refs).await;
     }
 
     let ctx = omg_lib::cli::CliContext { json: cli.json };
@@ -1983,7 +2030,7 @@ mod fast_path_tests {
     #[cfg(feature = "arch")]
     #[test]
     fn unowned_elevated_mutations_defer_to_full_history_owner() {
-        for command in ["remove", "install"] {
+        for command in ["remove", "install", "install-plan"] {
             let argv = args(&["omg", command, "--", "ripgrep"]);
             assert!(
                 split_elevated_invocation(&argv, false).is_none(),
@@ -2000,6 +2047,38 @@ mod fast_path_tests {
                 split_elevated_invocation(&argv, false),
                 Some((command, &argv[3..]))
             );
+        }
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn private_install_plan_rejects_missing_or_invalid_descriptors() {
+        for argv in [
+            args(&["omg", "install-plan", "--"]),
+            args(&["omg", "install-plan", "--", "invalid"]),
+            args(&["omg", "install-plan", "--", "invalid", "extra"]),
+            args(&["omg", "omarchy-native", "--"]),
+            args(&["omg", "omarchy-native", "--", "cache-prune"]),
+            args(&[
+                "omg",
+                "omarchy-native",
+                "--",
+                "cache-prune",
+                "attended",
+                "extra",
+            ]),
+            args(&["omg", "omarchy-native", "--", "invalid", "attended"]),
+            args(&["omg", "omarchy-native", "--", "cache-prune", "invalid"]),
+        ] {
+            let result = super::try_fast_elevated(&argv, true, true);
+            if omg_lib::core::privilege::is_root() {
+                assert!(result.expect("private protocol dispatch").is_err());
+            } else {
+                assert!(
+                    result.is_none(),
+                    "unprivileged callers cannot dispatch root operations"
+                );
+            }
         }
     }
 
@@ -2120,6 +2199,211 @@ mod fast_path_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn audit_exit_fixture() -> anyhow::Result<()> {
+        use omg_lib::core::security::audit::{
+            AuditEventType, AuditSeverity, audit_log_nonblocking, init_audit_logger,
+        };
+        use std::io::{Read, Write};
+
+        let Some(outcome) = std::env::var_os("OMG_AUDIT_EXIT_FIXTURE") else {
+            return Ok(());
+        };
+        init_audit_logger()?;
+        println!("audit-ready");
+        std::io::stdout().flush()?;
+        std::io::stdin().read_exact(&mut [0])?;
+        audit_log_nonblocking(
+            AuditEventType::SecurityAudit,
+            AuditSeverity::Info,
+            "exit-fixture",
+            "accepted before exit\nretained intact",
+        );
+        super::finish(if outcome == "success" {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("inert audit exit failure"))
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_persists_pending_audit_on_success_and_failure() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use omg_lib::core::security::audit::AuditEntry;
+        use std::process::Stdio;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        use tokio::time::{sleep, timeout};
+
+        for (outcome, code, corrupt) in [
+            ("success", 0, false),
+            ("failure", 1, false),
+            ("success", 0, true),
+            ("failure", 1, true),
+        ] {
+            let directory = tempfile::tempdir()?;
+            let log = directory.path().join("audit/audit.jsonl");
+            if corrupt {
+                std::fs::create_dir_all(log.parent().context("audit directory")?)?;
+                std::fs::write(&log, b"{truncated historical event\n")?;
+            }
+            let mut child = tokio::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "tests::audit_exit_fixture", "--nocapture"])
+                .env("OMG_AUDIT_EXIT_FIXTURE", outcome)
+                .env("OMG_DATA_DIR", directory.path())
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
+                .env("OMG_NO_UPDATE_CHECK", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()?;
+            let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let line = lines
+                        .next_line()
+                        .await?
+                        .context("audit child exited before readiness")?;
+                    if line == "audit-ready" {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                }
+            })
+            .await??;
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(log.with_extension("lock"))?;
+            lock.lock()?;
+            child.stdin.take().unwrap().write_all(b"1").await?;
+            sleep(Duration::from_millis(200)).await;
+            let exited_before_unlock = child.try_wait()?.is_some();
+            lock.unlock()?;
+            let status = timeout(Duration::from_secs(5), child.wait()).await??;
+            assert!(
+                !exited_before_unlock,
+                "{outcome}: exited before accepted audit event was persisted"
+            );
+            let body = std::fs::read_to_string(&log)?;
+            assert!(
+                !body.is_empty(),
+                "{outcome}: accepted audit event was lost at exit"
+            );
+            assert_eq!(status.code(), Some(code), "{outcome}");
+            let entries = body
+                .lines()
+                .map(serde_json::from_str::<AuditEntry>)
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(entries.len(), 1, "{outcome}");
+            assert_eq!(entries[0].resource, "exit-fixture");
+            assert_eq!(
+                entries[0].description,
+                "accepted before exit\nretained intact"
+            );
+            assert!(entries[0].verify(), "{outcome}: audit integrity");
+            let marker = log.with_file_name("incomplete");
+            assert_eq!(
+                marker.exists(),
+                corrupt,
+                "{outcome}: recovery must preserve history loss"
+            );
+            let logger = omg_lib::core::security::audit::AuditLogger::new_in(&log)?;
+            assert!(logger.verify_integrity()?.chain_valid, "{outcome}");
+            if corrupt {
+                let error = omg_lib::core::security::audit::ensure_complete_collection(&marker)
+                    .expect_err("recovered history remains incomplete");
+                assert!(error.to_string().contains("incomplete"), "{error}");
+                let quarantined = std::fs::read_dir(log.parent().context("audit directory")?)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with("audit.jsonl.corrupt-")
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    quarantined.len(),
+                    1,
+                    "{outcome}: original corrupt history retained"
+                );
+                assert_eq!(
+                    std::fs::read(&quarantined[0])?,
+                    b"{truncated historical event\n"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn audit_completion_keeps_operation_and_durability_failures() {
+        assert!(super::complete_audit(Ok(()), Ok(())).is_ok());
+        let error =
+            super::complete_audit(Err(anyhow::anyhow!("operation failed")), Ok(())).unwrap_err();
+        assert_eq!(error.to_string(), "operation failed");
+        let error =
+            super::complete_audit(Ok(()), Err(anyhow::anyhow!("writer unavailable"))).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Failed to flush audit events before exit: writer unavailable"
+        );
+        let error = super::complete_audit(
+            Err(anyhow::anyhow!("operation failed")),
+            Err(anyhow::anyhow!("writer unavailable")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Failed to flush audit events before exit: writer unavailable: operation failed"
+        );
+    }
+
+    #[test]
+    fn error_reporting_fixture() {
+        if std::env::var_os("OMG_ERROR_REPORTING_FIXTURE").is_some() {
+            super::finish(Err(anyhow::anyhow!(
+                "package not found: inert error-reporting fixture"
+            )));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disconnected_error_output_preserves_failure_exit_status() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
+
+        for disconnected in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "tests::error_reporting_fixture", "--nocapture"])
+                .env("OMG_ERROR_REPORTING_FIXTURE", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            if disconnected {
+                let (writer, peer) = UnixStream::pair().unwrap();
+                drop(peer);
+                command.stderr(Stdio::from(OwnedFd::from(writer)));
+            } else {
+                command.stderr(Stdio::piped());
+            }
+            let output = command.output().expect("isolated error-reporting fixture");
+            assert_eq!(output.status.code(), Some(1), "disconnected={disconnected}");
+            if !disconnected {
+                let diagnostic = String::from_utf8(output.stderr).unwrap();
+                assert!(
+                    diagnostic.contains("Error: package not found: inert error-reporting fixture")
+                );
+                assert!(diagnostic.contains("Suggestion: Try: omg search"));
+            }
+        }
+    }
+
     #[test]
     fn privacy_commands_cannot_advertise_unimplemented_json() {
         use omg_lib::cli::PrivacyCommands;

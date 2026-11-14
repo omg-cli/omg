@@ -705,7 +705,7 @@ mod env_security {
         let result = run_omg(&["status"]);
         assert_status_reports_packages(&result);
         assert!(
-            result.contains("Not scanned"),
+            result.contains("Advisory coverage unreported"),
             "unscanned status must not look like a clean bill of health, got: {}",
             result.combined_output()
         );
