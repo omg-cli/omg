@@ -73,7 +73,8 @@ class OptimizationContracts(unittest.TestCase):
             producer.write_bytes(b'print("fixture producer")\n')
             producer.chmod(0o666)
             artifacts = {}
-            for role in ('coverage14', 'arch-contracts', 'comprehensive', 'cli-unit', 'cli', 'daemon'):
+            from test_native_cli_coverage import PRODUCER
+            for role in PRODUCER.ROLES:
                 artifact = root / (role + ' source')
                 artifact.write_bytes(('fixture executable ' + role).encode())
                 artifact.chmod(0o666)
@@ -151,18 +152,18 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
         script = script.split('python3 - "$binary"', 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            binary = root / 'target/llvm-cov-target/debug/deps/omg_lib-test'
+            binary = root / 'target/llvm-cov-target/debug/deps/omg_lib-1111111111111111'
             binary.parent.mkdir(parents=True)
             binary.write_text('fixture')
             binary.chmod(0o755)
             (root / 'scripts').mkdir()
             (root / 'scripts/native-cli-coverage.py').write_bytes(
                 (ROOT / 'scripts/native-cli-coverage.py').read_bytes())
-            for name in ('debug/omg', 'debug/omgd',
-                         'debug/deps/coverage_14-1111111111111111',
-                         'debug/deps/arch_cli_contracts-1111111111111111',
-                         'debug/deps/cli_comprehensive-1111111111111111',
-                         'debug/deps/omg-1111111111111111'):
+            from test_native_cli_coverage import PRODUCER
+            artifacts = ['debug/omg', 'debug/omgd'] + [
+                f'debug/deps/{harness.binary}-1111111111111111'
+                for harness in PRODUCER.HARNESSES.values()]
+            for name in artifacts:
                 artifact = root / 'target/llvm-cov-target' / name
                 artifact.write_text('fixture executable')
                 artifact.chmod(0o755)

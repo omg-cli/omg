@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -21,6 +22,71 @@ SPEC = importlib.util.spec_from_file_location('native_cli_coverage',
                                              ROOT / 'scripts/native-cli-coverage.py')
 PRODUCER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PRODUCER)
+
+
+@unittest.skipIf(os.name == 'nt', 'Native identity ownership requires POSIX metadata')
+class MachineIdentityFixture(unittest.TestCase):
+    def test_private_identity_and_restored_source_are_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            source = owner / 'system-machine-id'
+            source.write_text('original guest identity\n')
+            original = PRODUCER.sha(source)
+            data = owner / 'data'
+            data.mkdir(mode=0o700)
+            identity = data / 'machine-id'
+            value = '123e4567-e89b-42d3-a456-426614174000'
+            identity.write_text(value)
+            identity.chmod(0o600)
+            uid, gid = (os.getuid(), os.getgid()) if os.getuid() else (65534, 65534)
+            if os.getuid() == 0:
+                os.chown(data, uid, gid)
+                os.chown(identity, uid, gid)
+            def verify():
+                return PRODUCER.verify_machine_identity_fixture(owner, source, original, uid, gid)
+            receipt = verify()
+            self.assertEqual(receipt['status'], 'PASS_NATIVE_MACHINE_IDENTITY_FALLBACK')
+            self.assertEqual(receipt['persisted_sha256'], hashlib.sha256(value.encode()).hexdigest())
+            self.assertEqual((receipt['uid'], receipt['gid']), (uid, gid))
+            identity.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, 'metadata'):
+                verify()
+            identity.chmod(0o600)
+            data.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, 'directory'):
+                verify()
+            data.chmod(0o700)
+            link = data / 'extra-link'
+            os.link(identity, link)
+            with self.assertRaisesRegex(ValueError, 'metadata'):
+                verify()
+            link.unlink()
+            identity.write_text(value.replace('42d3', '12d3'))
+            with self.assertRaisesRegex(ValueError, 'canonical'):
+                verify()
+            identity.write_text(value)
+            source.write_text('source was not restored\n')
+            with self.assertRaisesRegex(ValueError, 'not restored'):
+                verify()
+
+    def test_identity_symlink_and_root_identity_are_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            source = owner / 'system-machine-id'
+            source.write_text('guest identity\n')
+            data = owner / 'data'
+            data.mkdir(mode=0o700)
+            target = owner / 'outside-identity'
+            target.write_text('123e4567-e89b-42d3-a456-426614174000')
+            target.chmod(0o600)
+            (data / 'machine-id').symlink_to(target)
+            uid, gid = (os.getuid(), os.getgid()) if os.getuid() else (65534, 65534)
+            if os.getuid() == 0:
+                os.chown(data, uid, gid)
+            with self.assertRaisesRegex(ValueError, 'metadata'):
+                PRODUCER.verify_machine_identity_fixture(owner, source, PRODUCER.sha(source), uid, gid)
+            with self.assertRaisesRegex(ValueError, 'ordinary'):
+                PRODUCER.verify_machine_identity_fixture(owner, source, PRODUCER.sha(source), 0, 0)
 
 
 class HostedProducer(unittest.TestCase):
@@ -648,11 +714,18 @@ def evidence_fixture(root):
         'actual_uid=65534 operation=clean-cache authorization=denied\n')
     (evidence / 'cli-authorization-denied.log').write_text(
         "nobody is not allowed to execute '/omg-extra-bin/cli __omg_elevated clean --cache --yes' as root\n")
+    (evidence / 'cli-fresh-mock-refused-exit.txt').write_text('1\n')
+    (evidence / 'cli-fresh-mock-refused-identity.txt').write_text(
+        'actual_uid=65534 test_mode=1 backend=mock fresh_snapshot=refused mock_state_created=no\n')
+    (evidence / 'cli-fresh-mock-refused.log').write_text(
+        '[fresh-mock-refusal] uid=65534 test_mode=1\n'
+        'FreshSnapshot requires the private native prepared admission owner\n')
     (evidence / 'artifacts.sha256').write_text(''.join(
         f"{a['sha256']}  /omg-extra-bin/{r}\n" for r, a in artifacts.items()))
     for role in PRODUCER.ROLES:
         (evidence / f'abi-{role}.txt').write_text('all dependencies present\n')
-    for role, names in PRODUCER.TESTS.items():
+    for role, harness in PRODUCER.HARNESSES.items():
+        names = harness.tests
         (evidence / f'registry-{role}.txt').write_text(''.join(name + ': test\n' for name in names))
     for stage in PRODUCER.STAGES:
         (profiles / f'omg-extra-{stage}-123-100_0.profraw').write_bytes(bytes.fromhex('8172666f72706cff') + b'fixture')
@@ -665,6 +738,13 @@ def evidence_fixture(root):
                         f"[omg-unprivileged-fixture-child] test={name} uid=65534 executable_sha256={artifacts[role]['sha256']}\n"
                         f'test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n')
                 (profiles / f'omg-extra-{stage}-124-100_0.profraw').write_bytes(bytes.fromhex('8172666f72706cff') + b'fixture')
+        elif role == 'coverage11':
+            log += '[native-machine-identity] uid=65534 system_source_bytes=0 test_mode=absent\n'
+            (evidence / f'{stage}-identity.json').write_text(json.dumps(dict(
+                status='PASS_NATIVE_MACHINE_IDENTITY_FALLBACK', uid=65534, gid=65534,
+                file_mode=0o600, directory_mode=0o700, persisted_bytes=36, uuid_version=4,
+                persisted_sha256='a' * 64, original_source_sha256='b' * 64,
+                system_source_restored=True)))
         else:
             log += '[native-arch-fixture] uid=65534 actual_id=arch\n'
             (profiles / f'omg-extra-{stage}-124-200_0.profraw').write_bytes(bytes.fromhex('8172666f72706cff') + b'fixture')
@@ -765,12 +845,54 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_debug_backend_cannot_claim_fresh_native_admission(self):
+        stage = 'cli-fresh-mock-refused'
+        self.assertIn(stage, PRODUCER.PROCESS_STAGES,
+                      'Fresh admission must also refuse the debug backend through the real CLI')
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            mutations = {
+                f'{stage}-exit.txt': '0\n',
+                f'{stage}-identity.txt': 'actual_uid=0 test_mode=1 backend=mock fresh_snapshot=refused mock_state_created=no\n',
+                f'{stage}.log': 'Failed to query advisory provider\n',
+            }
+            for name, value in mutations.items():
+                path = evidence / name
+                original = path.read_text()
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'fresh mock'):
+                    path.write_text(value)
+                    PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+                path.write_text(original)
+
+    def test_public_machine_identity_fallback_requires_native_private_persistence(self):
+        self.assertIn('coverage11', PRODUCER.HARNESSES,
+                      'The public machine identity consumer must exercise the native fallback')
+        self.assertEqual(PRODUCER.HARNESSES['coverage11'].tests,
+                         ('machine_id_is_stable_sixteen_lowercase_hex',))
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            stage = next(stage for stage, role, _ in PRODUCER.CASES if role == 'coverage11')
+            path = evidence / f'{stage}-identity.json'
+            original = json.loads(path.read_text())
+            for key, value in [('uid', 0), ('file_mode', 0o644), ('directory_mode', 0o755),
+                               ('system_source_restored', False), ('persisted_bytes', 0)]:
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'machine identity'):
+                    path.write_text(json.dumps(dict(original, **{key: value})))
+                    PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            path.write_text(json.dumps(original))
+            log = evidence / f'{stage}.log'
+            log.write_text(log.read_text().replace('system_source_bytes=0', 'system_source_bytes=33'))
+            with self.assertRaisesRegex(ValueError, 'machine identity'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_root_policy_ui_fixture_requires_an_unprivileged_child_witness(self):
         role = 'lib-unit'
         name = 'cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy'
-        self.assertIn(role, PRODUCER.TESTS,
+        self.assertIn(role, PRODUCER.HARNESSES,
                       'Native coverage must verify the policy fixture from an actual root harness')
-        self.assertIn(name, PRODUCER.TESTS[role])
+        self.assertIn(name, PRODUCER.HARNESSES[role].tests)
         with tempfile.TemporaryDirectory() as directory:
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
@@ -939,8 +1061,8 @@ class SupplementalEvidence(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
-            self.assertEqual(len(receipt['tests']), 17)
-            self.assertEqual(len(receipt['process_checks']), 38)
+            self.assertEqual(len(receipt['tests']), 18)
+            self.assertEqual(len(receipt['process_checks']), 39)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -1006,12 +1128,23 @@ class ArtifactAdmission(unittest.TestCase):
         deps = root / 'debug/deps'
         deps.mkdir(parents=True)
         paths = ['debug/omg', 'debug/omgd'] + [f'debug/deps/{prefix}-' + '1' * 16
-                 for prefix in ('coverage_14', 'arch_cli_contracts', 'cli_comprehensive', 'omg', 'omg_lib')]
+                 for prefix in (harness.binary for harness in PRODUCER.HARNESSES.values())]
         for name in paths:
             path = root / name
             path.write_bytes(name.encode())
             path.chmod(0o755)
         os.link(root / 'debug/omg', deps / ('omg-' + '2' * 16))
+
+    def test_every_registered_harness_is_required(self):
+        for role, harness in PRODUCER.HARNESSES.items():
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_target(root)
+                (root / 'debug/deps' / (harness.binary + '-' + '1' * 16)).unlink()
+                with patch.object(PRODUCER.subprocess, 'run', return_value=subprocess.CompletedProcess(
+                        [], 0, '__llvm_covmap __llvm_prf_cnts')):
+                    with self.assertRaisesRegex(ValueError, re.escape(role)):
+                        PRODUCER.prepare(root, 'b' * 40)
 
     def test_cli_unit_selection_excludes_the_normal_cli_inode(self):
         with tempfile.TemporaryDirectory() as directory:

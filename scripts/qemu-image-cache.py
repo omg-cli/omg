@@ -55,16 +55,22 @@ class CacheQuotaExceeded(Exception):
 def cache_bytes(directory_fd, lock_stat):
     """Account all flat-cache file bytes, including unknown files and leftovers."""
     total = 0
-    with os.scandir(directory_fd) as entries:
-        for entry in entries:
-            metadata = entry.stat(follow_symlinks=False)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise ValueError('cache entries must be regular files, not links or directories')
-            if entry.name == LOCK_NAME:
-                if (metadata.st_dev, metadata.st_ino) != (lock_stat.st_dev, lock_stat.st_ino):
-                    raise ValueError('cache writer lock changed')
-            else:
-                total += metadata.st_size
+    # Btrfs directory handles retain an index boundary from open time. Open a
+    # fresh view after acquiring the lock, anchored to the same owned directory.
+    scan_fd = os.open('.', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        with os.scandir(scan_fd) as entries:
+            for entry in entries:
+                metadata = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError('cache entries must be regular files, not links or directories')
+                if entry.name == LOCK_NAME:
+                    if (metadata.st_dev, metadata.st_ino) != (lock_stat.st_dev, lock_stat.st_ino):
+                        raise ValueError('cache writer lock changed')
+                else:
+                    total += metadata.st_size
+    finally:
+        os.close(scan_fd)
     return total
 
 

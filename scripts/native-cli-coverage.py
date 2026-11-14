@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import uuid
 from typing import NamedTuple
 import xml.etree.ElementTree as ET
 
@@ -30,6 +31,41 @@ def require(condition, message):
 def sha(path):
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def verify_machine_identity_fixture(owner, system_source, original_digest, uid, gid):
+    require(type(uid) is int and type(gid) is int and uid > 0 and gid > 0,
+            'Native machine identity requires an ordinary user')
+    require(re.fullmatch(r'[0-9a-f]{64}', original_digest) is not None,
+            'Invalid machine identity source digest')
+    require(system_source.is_file() and 0 < system_source.stat().st_size <= 4096
+            and sha(system_source) == original_digest, 'Native machine identity source was not restored')
+    directory = owner / 'data'
+    path = directory / 'machine-id'
+    parent = directory.lstat()
+    metadata = path.lstat()
+    require(stat.S_ISDIR(parent.st_mode) and stat.S_IMODE(parent.st_mode) == 0o700
+            and (parent.st_uid, parent.st_gid) == (uid, gid),
+            'Native machine identity directory is not private')
+    require(stat.S_ISREG(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o600
+            and (metadata.st_uid, metadata.st_gid, metadata.st_nlink, metadata.st_size) == (uid, gid, 1, 36),
+            'Native machine identity file metadata differs')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(descriptor, 'rb') as source:
+        current = os.fstat(source.fileno())
+        require((current.st_dev, current.st_ino, current.st_mode, current.st_size,
+                 current.st_uid, current.st_gid, current.st_nlink)
+                == (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+                    metadata.st_uid, metadata.st_gid, metadata.st_nlink),
+                'Native machine identity changed before reading')
+        value = source.read(37)
+    parsed = uuid.UUID(value.decode('ascii'))
+    require(str(parsed).encode() == value and parsed.version == 4,
+            'Native machine identity is not a canonical private UUID')
+    return dict(status='PASS_NATIVE_MACHINE_IDENTITY_FALLBACK', uid=uid, gid=gid,
+                file_mode=0o600, directory_mode=0o700, persisted_bytes=36, uuid_version=4,
+                persisted_sha256=hashlib.sha256(value).hexdigest(),
+                original_source_sha256=original_digest, system_source_restored=True)
 
 
 def fixture_tree_hashes(directory):
@@ -381,16 +417,21 @@ def controller_bind_path(path, mounts):
     return str(source / requested.relative_to(destination))
 
 
-TESTS = {
-    'coverage14': (
+class Harness(NamedTuple):
+    binary: str
+    tests: tuple[str, ...]
+
+
+HARNESSES = {
+    'coverage14': Harness('coverage_14', (
         'why_contracts::uninstalled_package_fails_naming_cause_and_remedy',
         'why_contracts::explicit_package_reports_reason_dependencies_and_safety',
         'why_contracts::orphan_dependency_is_flagged_safe_to_remove',
         'why_contracts::required_by_card_shows_dependent_and_dependency_path',
         'why_contracts::reverse_lists_dependents_with_safety_warning',
         'why_contracts::reverse_without_dependents_is_safe',
-    ),
-    'arch-contracts': (
+    )),
+    'arch-contracts': Harness('arch_cli_contracts', (
         'native_status_preserves_daemon_advisory_coverage',
         'native_status_without_daemon_preserves_unknown_security',
         'dependency_reports_bound_large_reverse_dependency_lists',
@@ -399,15 +440,17 @@ TESTS = {
         'native_size_tree_respects_virtual_provider_version_constraints',
         'native_size_tree_preserves_exact_name_dependency_totals',
         'native_size_tree_refuses_absent_root_without_changing_private_data',
-    ),
-    'comprehensive': ('behavior_inventory_runs_in_hermetic_state',),
-    'cli-unit': ('fast_path_tests::private_install_plan_rejects_missing_or_invalid_descriptors',),
-    'lib-unit': ('cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy',),
+    )),
+    'comprehensive': Harness('cli_comprehensive', ('behavior_inventory_runs_in_hermetic_state',)),
+    'cli-unit': Harness('omg', ('fast_path_tests::private_install_plan_rejects_missing_or_invalid_descriptors',)),
+    'lib-unit': Harness('omg_lib', ('cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy',)),
+    'coverage11': Harness('coverage_11', ('machine_id_is_stable_sixteen_lowercase_hex',)),
 }
-ROLES = ('cli', 'daemon', *TESTS)
+ROLES = ('cli', 'daemon', *HARNESSES)
 CASES = tuple((f'test-{index:02}', role, name)
               for index, (role, name) in enumerate(
-                  ((role, name) for role, names in TESTS.items() for name in names), 1))
+                  ((role, name) for role, harness in HARNESSES.items() for name in harness.tests), 1))
+
 OMARCHY_PREFIX = (
     'omarchy-update-requires-free-space', 'omarchy-snapshot\tcreate',
     'omarchy-update-stay-awake\tstart', 'omarchy-update-dev')
@@ -492,9 +535,9 @@ OMARCHY_CASES = {
 }
 
 ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
-PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'cli-elevation-denied', 'cli-authorization-denied',
+PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'cli-fresh-mock-refused', 'cli-elevation-denied', 'cli-authorization-denied',
                   'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES)
-STAGES = tuple('registry-' + role for role in TESTS) + tuple(row[0] for row in CASES) + PROCESS_STAGES
+STAGES = tuple('registry-' + role for role in HARNESSES) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
 
 
@@ -1056,7 +1099,7 @@ test "$(stat -c '%u:%a' /omg-extra-bin)" = 0:755
 printf '%s' ARTIFACTS > /evidence/cli/artifacts.sha256
 sha256sum -c /evidence/cli/artifacts.sha256 > /evidence/cli/artifact-check.txt
 printf '%s' SELECTION > /evidence/cli/expected-tests.tsv
-for role in cli daemon coverage14 arch-contracts comprehensive cli-unit lib-unit; do
+for role in NATIVE_ARTIFACT_ROLES; do
   test "$(stat -c '%u:%a' "/omg-extra-bin/$role")" = 0:755
   ldd "/omg-extra-bin/$role" > "/evidence/cli/abi-$role.txt" 2>&1
   ! grep -F 'not found' "/evidence/cli/abi-$role.txt"
@@ -1099,7 +1142,7 @@ ordinary() {
 }
 ordinary bash -c 'test "$(id -u)" -ne 0; umask 077; mkdir -p "$HOME/work" "$XDG_RUNTIME_DIR" "$OMG_CONFIG_DIR"; printf "telemetry_enabled = false\n" > "$OMG_CONFIG_DIR/config.toml"'
 ordinary bash -c 'missing=0; for tool in git make jq cmp; do if ! command -v "$tool"; then printf "Missing native fixture command: %s\n" "$tool" >&2; missing=1; fi; done; exit "$missing"' > /evidence/cli/prerequisites.txt
-for role in coverage14 arch-contracts comprehensive cli-unit lib-unit; do
+for role in NATIVE_HARNESS_ROLES; do
   LLVM_PROFILE_FILE="/profiles/omg-extra-registry-$role-%p-%m.profraw" \
     /omg-extra-bin/"$role" --list --format terse > /evidence/cli/registry-"$role".txt 2>&1
 done
@@ -1116,6 +1159,26 @@ while IFS=$'\t' read -r stage role name; do
       "${fixture_env[@]}" \
       bash -c 'cd "$HOME"; test "$(id -u)" = 0; printf "[extra-root-test] uid=%s\n" "$(id -u)"; exec "$@"' \
       bash /omg-extra-bin/"$role" "$name" --exact --nocapture --test-threads=1 < /dev/null > "$log" 2>&1
+  elif test "$role" = coverage11; then
+    identity_owner=/var/tmp/omg-machine-identity
+    test ! -e "$identity_owner"
+    install -d -m 755 "$identity_owner"
+    install -d -m 700 -o nobody -g nobody "$identity_owner/data"
+    : > "$identity_owner/empty-machine-id"
+    chmod 444 "$identity_owner/empty-machine-id"
+    test -s /etc/machine-id
+    read -r original_identity_digest _ < <(sha256sum /etc/machine-id)
+    mount --bind "$identity_owner/empty-machine-id" /etc/machine-id
+    mount -o remount,bind,ro /etc/machine-id
+    ordinary env OMG_DATA_DIR="$identity_owner/data" LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
+      timeout --signal=TERM --kill-after=3 45 bash -c \
+      'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test ! -s /etc/machine-id; printf "[native-machine-identity] uid=%s system_source_bytes=0 test_mode=absent\n" "$(id -u)"; exec "$@"' \
+      bash "/omg-extra-bin/$role" "$name" --exact --nocapture --test-threads=1 \
+      < /dev/null > "$log" 2>&1
+    umount /etc/machine-id
+    python3 /native-cli-coverage.py verify-machine-identity-fixture --owner "$identity_owner" \
+      --system-source /etc/machine-id --original-digest "$original_identity_digest" \
+      --uid "$(id -u nobody)" --gid "$(id -g nobody)" > "/evidence/cli/$stage-identity.json"
   else
     limit=45
     if test "$role" = comprehensive; then limit=360; fi
@@ -1125,7 +1188,7 @@ while IFS=$'\t' read -r stage role name; do
   fi
   grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"
   ! grep -E '\[omg-skip\]|\[native-arch-fixture-skip\]|\[native-inventory-unavailable\]|LLVM Profile (Error|Warning)' "$log"
-  if test "$role" != cli-unit && test "$role" != lib-unit; then
+  if test "$role" != cli-unit && test "$role" != lib-unit && test "$role" != coverage11; then
     grep -Eq '\[native-arch-fixture\] uid=[1-9][0-9]* actual_id=arch' "$log"
   fi
   printf '%s\t%s\t%s\tPASS\n' "$stage" "$role" "$name" >> /evidence/cli/passed.tsv
@@ -1136,6 +1199,28 @@ for flags in q v vv vvv; do
     > /evidence/cli/cli-"$flags".log 2>&1
   printf 'cli-%s\t0\n' "$flags" >> /evidence/cli/process-checks.tsv
 done
+stage=cli-fresh-mock-refused
+mock_owner=/var/tmp/omg-fresh-mock-refusal
+test ! -e "$mock_owner"
+install -d -m 700 -o nobody -g nobody "$mock_owner" "$mock_owner/data" "$mock_owner/config"
+printf '%s\n' 'advisory_requirement = "fresh_snapshot"' > "$mock_owner/config/policy.toml"
+chown nobody:nobody "$mock_owner/config/policy.toml"
+if ordinary env OMG_TEST_MODE=1 OMG_TEST_DISTRO=arch OMG_DATA_DIR="$mock_owner/data" \
+  OMG_CONFIG_DIR="$mock_owner/config" LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
+  timeout --signal=TERM --kill-after=3 45 bash -c \
+  'test "$(id -u)" -ne 0; test "$OMG_TEST_MODE" = 1; printf "[fresh-mock-refusal] uid=%s test_mode=1\n" "$(id -u)"; exec /omg-extra-bin/cli install git --yes' \
+  < /dev/null > "/evidence/cli/$stage.log" 2>&1; then
+  status=0
+else
+  status=$?
+fi
+printf '%s\n' "$status" > "/evidence/cli/$stage-exit.txt"
+test "$status" = 1
+grep -F 'FreshSnapshot requires the private native prepared admission owner' "/evidence/cli/$stage.log"
+test -z "$(find "$mock_owner/data" -maxdepth 1 -name 'mock_state_*.json' -print -quit)"
+printf 'actual_uid=%s test_mode=1 backend=mock fresh_snapshot=refused mock_state_created=no\n' "$(id -u nobody)" \
+  > "/evidence/cli/$stage-identity.txt"
+printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
 denial_policy=/etc/sudoers.d/zzzz-omg-elevation-denied
 test ! -e "$denial_policy"
 for stage in cli-elevation-denied cli-authorization-denied; do
@@ -1200,6 +1285,8 @@ cmp /evidence/cli/db-before.txt /evidence/cli/db-after.txt
 trap - EXIT
 printf 'PASS\n' > /evidence/cli/all-stages-pass.txt
 '''
+    script = script.replace('NATIVE_ARTIFACT_ROLES', ' '.join(map(quote, ROLES)))
+    script = script.replace('NATIVE_HARNESS_ROLES', ' '.join(map(quote, HARNESSES)))
     script = script.replace('RECEIPT', quote(receipt)).replace('ARTIFACTS', quote(artifact_lines))
     script = script.replace('SELECTION', quote(selection)).replace('COMPILED_CLI', quote(compiled_cli))
     script = script.replace('OMARCHY_CASE_BODY', omarchy_guest_script())
@@ -1251,7 +1338,25 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         require(len(re.findall(r'^test ' + re.escape(name) + r' \.\.\.', log, re.M)) == executions, 'Selected test execution missing/duplicated')
         require(not re.search(r'\[omg-skip\]|\[native-arch-fixture-skip\]|\[native-inventory-unavailable\]|LLVM Profile (Error|Warning)', log), 'Skip/LLVM diagnostic')
         modules = {PROFILE.fullmatch(p.name)[3] for p in grouped[stage]}
-        if role not in ('cli-unit', 'lib-unit'):
+        if role == 'coverage11':
+            uid = int(re.search(r'ordinary_uid=([1-9][0-9]*)', (evidence / 'identity.txt').read_text())[1])
+            require(f'[native-machine-identity] uid={uid} system_source_bytes=0 test_mode=absent' in log,
+                    'Missing native machine identity admission')
+            value = json.loads((evidence / f'{stage}-identity.json').read_text())
+            require(type(value) is dict and set(value) == {
+                'status', 'uid', 'gid', 'file_mode', 'directory_mode', 'persisted_bytes',
+                'uuid_version', 'persisted_sha256', 'original_source_sha256', 'system_source_restored'},
+                'Invalid native machine identity receipt schema')
+            require(value['status'] == 'PASS_NATIVE_MACHINE_IDENTITY_FALLBACK'
+                    and value['uid'] == uid and type(value['gid']) is int and value['gid'] > 0
+                    and value['file_mode'] == 0o600 and value['directory_mode'] == 0o700
+                    and value['persisted_bytes'] == 36 and value['uuid_version'] == 4
+                    and value['system_source_restored'] is True and len(modules) == 1,
+                    'Native machine identity persistence/restoration differs')
+            require(all(isinstance(value[key], str) and re.fullmatch(r'[0-9a-f]{64}', value[key])
+                        for key in ('persisted_sha256', 'original_source_sha256')),
+                    'Native machine identity digest differs')
+        elif role not in ('cli-unit', 'lib-unit'):
             require(re.search(r'\[native-arch-fixture\] uid=[1-9][0-9]* actual_id=arch', log), 'Missing native ordinary admission')
             require(cli_modules <= modules and len(modules) >= 2, 'Missing matching child CLI/harness raw profiles')
         else:
@@ -1279,6 +1384,17 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                 and matches[0][-1] != 'unavailable', 'Missing/failed native inventory row: ' + name)
     daemon = (evidence / 'daemon.log').read_text()
     require('[extra-daemon] startup_socket=ready uid=' in daemon and '[extra-daemon] sigterm_exit=0 socket_removed=yes' in daemon, 'Daemon lifecycle incomplete')
+    fresh = 'cli-fresh-mock-refused'
+    uid = re.search(r'ordinary_uid=([1-9][0-9]*)', (evidence / 'identity.txt').read_text())[1]
+    require((evidence / f'{fresh}-exit.txt').read_text() == '1\n'
+            and (evidence / f'{fresh}-identity.txt').read_text()
+                == f'actual_uid={uid} test_mode=1 backend=mock fresh_snapshot=refused mock_state_created=no\n',
+            'Invalid fresh mock refusal identity or exit')
+    log = (evidence / f'{fresh}.log').read_text()
+    require(f'[fresh-mock-refusal] uid={uid} test_mode=1' in log
+            and 'FreshSnapshot requires the private native prepared admission owner' in log
+            and {PROFILE.fullmatch(p.name)[3] for p in grouped[fresh]} == cli_modules,
+            'Missing fresh mock admission refusal or matching CLI profiles')
     elevation = 'cli-elevation-denied'
     require((evidence / f'{elevation}-exit.txt').read_text() == '1\n',
             'CLI elevation refusal exit status differs')
@@ -1446,8 +1562,8 @@ def prepare(target, commit):
     target = target.resolve(strict=True)
     require(target.is_dir(), 'Coverage target is absent')
     paths = {'cli': target / 'debug/omg', 'daemon': target / 'debug/omgd'}
-    for role, prefix in (('coverage14', 'coverage_14'), ('arch-contracts', 'arch_cli_contracts'),
-                         ('comprehensive', 'cli_comprehensive'), ('cli-unit', 'omg'), ('lib-unit', 'omg_lib')):
+    for role, harness in HARNESSES.items():
+        prefix = harness.binary
         matches = [path for path in (target / 'debug/deps').glob(prefix + '-*')
                    if re.fullmatch(re.escape(prefix) + r'-[0-9a-f]{16}', path.name)
                    and path.is_file() and not path.is_symlink() and os.access(path, os.X_OK)
@@ -1528,6 +1644,12 @@ def main():
     signed_check = commands.add_parser('verify-signed-fixture')
     signed_check.add_argument('--owner', required=True, type=Path)
     signed_check.add_argument('--phase', choices=tuple(NATIVE_PHASES), default='complete')
+    identity = commands.add_parser('verify-machine-identity-fixture')
+    identity.add_argument('--owner', required=True, type=Path)
+    identity.add_argument('--system-source', required=True, type=Path)
+    identity.add_argument('--original-digest', required=True)
+    identity.add_argument('--uid', required=True, type=int)
+    identity.add_argument('--gid', required=True, type=int)
     extraction = commands.add_parser('unpack')
     extraction.add_argument('--archive', required=True, type=Path)
     extraction.add_argument('--directory', required=True, type=Path)
@@ -1551,6 +1673,9 @@ def main():
         create_signed_fixture(args.owner, args.current_kernel)
     elif args.operation == 'verify-signed-fixture':
         print(json.dumps(verify_signed_fixture(args.owner, args.phase)))
+    elif args.operation == 'verify-machine-identity-fixture':
+        print(json.dumps(verify_machine_identity_fixture(
+            args.owner, args.system_source, args.original_digest, args.uid, args.gid)))
     elif args.operation == 'unpack':
         unpack_evidence(args.archive, args.directory)
     elif args.operation == 'controller-path':
