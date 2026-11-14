@@ -148,7 +148,7 @@ def fixture_local_package(root, database, name, version, payload_path, payload, 
     target.write_bytes(payload)
 
 
-def create_signed_fixture(owner):
+def create_signed_fixture(owner, current_kernel=False):
     if os.geteuid() != 0:
         raise RuntimeError('Guest root setup required')
     for kind in ('mnt', 'net'):
@@ -186,13 +186,24 @@ def create_signed_fixture(owner):
         raise RuntimeError('Updated public bundle must differ from initial bundle')
     initial = {}
     repositories = {'core': [], 'omarchy': []}
-    for name, repository, reason, depends in (
+    packages = [
         ('archlinux-keyring', 'core', 0, ()), ('omarchy-keyring', 'omarchy', 0, ()),
         ('omg-coverage-app', 'core', 0, ('omg-coverage-dep>=1-1',)),
-        ('omg-coverage-dep', 'core', 1, ()), ('omg-coverage-desktop', 'omarchy', 0, ())):
+        ('omg-coverage-dep', 'core', 1, ()), ('omg-coverage-desktop', 'omarchy', 0, ())]
+    running_modules = None
+    if current_kernel:
+        release = Path('/proc/sys/kernel/osrelease').read_text().strip()
+        require(release and release not in ('.', '..') and '/' not in release, 'Invalid running guest kernel release')
+        modules = Path('/usr/lib/modules') / release / 'modules.builtin'
+        require(modules.is_file(), 'Running guest kernel module inventory is absent')
+        running_modules = dict(path=str(modules.relative_to('/')), sha256=sha(modules))
+        packages.append(('omg-coverage-kernel', 'core', 0, ()))
+    for name, repository, reason, depends in packages:
         keyring = name.endswith('-keyring')
         payload_path = ('usr/share/pacman/keyrings/' + name.removesuffix('-keyring') + '.gpg'
                         if keyring else 'usr/share/omg-coverage/' + name + '.txt')
+        if name == 'omg-coverage-kernel':
+            payload_path = running_modules['path']
         old_payload = before_public if keyring else (name + ': installed1\n').encode()
         new_payload = updated_public if keyring else (name + ': upgraded3\n').encode()
         fixture_local_package(owner / 'root', owner / 'db', name, '1-1', payload_path, old_payload, reason, depends)
@@ -233,6 +244,7 @@ def create_signed_fixture(owner):
                'fixture_signer_fingerprint': fingerprint, 'signer_is_authored_throwaway_key': True,
                'host_or_publisher_secret_material_used': False, 'siglevel_weakened': False,
                'initial_packages': initial, 'config_sha256': sha(owner / 'pacman.conf'),
+               'running_kernel_modules': running_modules,
                'initial_database_sha256': fixture_tree_hashes(owner / 'db/local'),
                'initial_payload_sha256': fixture_tree_hashes(owner / 'root'),
                'public_before_sha256': hashlib.sha256(before_public).hexdigest(),
@@ -286,7 +298,15 @@ def verify_signed_fixture(owner, phase='complete'):
             require((owner / f'cache/omg-coverage-app-{retained}-any.pkg.tar.gz{suffix}').is_file(),
                     'Native cache pruning removed a retained version')
     require(not (owner / 'db/db.lck').exists(), 'Native transaction leaked its database lock')
-    return dict(status=NATIVE_PHASES[phase], packages=receipt['initial_packages'])
+    result = dict(status=NATIVE_PHASES[phase], packages=receipt['initial_packages'])
+    kernel = receipt.get('running_kernel_modules')
+    if kernel is not None:
+        require(sha(Path('/') / kernel['path']) == kernel['sha256'], 'Real guest kernel inventory was changed')
+        files = (owner / 'db/local' / ('omg-coverage-kernel-' + version) / 'files').read_text()
+        require(kernel['path'] in files.splitlines(), 'Current kernel module ownership was not installed')
+        require(receipt['initial_packages']['omg-coverage-kernel']['payload_path'] == kernel['path'], 'Current kernel package identity differs')
+        result['running_kernel_modules'] = kernel
+    return result
 
 
 def unpack_evidence(archive, directory):
@@ -412,6 +432,7 @@ class OmarchyCase(NamedTuple):
 
 OMARCHY_CASES = {
     'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
     'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
     'omarchy-optional-failures': OmarchyCase(0, tuple(
@@ -773,7 +794,9 @@ for stage in OMARCHY_STAGE_NAMES; do
     "$case_dir/checkout/bin" "$case_dir/checkout/migrations"
   printf 'telemetry_enabled = false\n[aur]\nsecurity_profile = "standard"\n' > "$case_dir/config/config.toml"
   signed_owner="/opt/omg-coverage-$stage"
-  python3 /native-cli-coverage.py signed-fixture --owner "$signed_owner"
+  signed_options=()
+  if test "$stage" = omarchy-current-kernel; then signed_options=(--current-kernel); fi
+  python3 /native-cli-coverage.py signed-fixture --owner "$signed_owner" "${signed_options[@]}"
   sed -i "s|file://$signed_owner/repos/|http://127.0.0.1:18080/${signed_owner##*/}/repos/|g" "$signed_owner/pacman.conf"
   cp "$signed_owner/pacman.conf" "$case_dir/pacman.conf"
   mount --bind "$signed_owner/pacman.conf" /etc/pacman.conf
@@ -1265,6 +1288,21 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             if case.authorization == 'denied':
                 require('Omarchy update authorization refresh stopped' in log,
                         'Authorization refusal was not visible')
+        if stage == 'omarchy-current-kernel':
+            state = json.loads((evidence / f'{stage}-native-state.json').read_text())
+            kernel = state.get('running_kernel_modules')
+            require(type(kernel) is dict and type(kernel.get('path')) is str
+                    and re.fullmatch(r'usr/lib/modules/[^/]+/modules\.builtin', kernel['path'])
+                    and type(kernel.get('sha256')) is str and re.fullmatch(r'[a-f0-9]{64}', kernel['sha256']),
+                    'Current kernel ownership evidence is missing')
+            module_path = PurePosixPath(kernel['path'])
+            require(str(module_path) == kernel['path'] and len(module_path.parts) == 5
+                    and module_path.parts[3] not in ('.', '..'),
+                    'Current kernel module path is not canonical')
+            package = state.get('packages', {}).get('omg-coverage-kernel', {})
+            require(package.get('payload_path') == kernel['path'], 'Current kernel package ownership differs')
+            require('Reboot now?' not in log and 'Run omarchy-system reboot when ready.' not in log,
+                    'Current kernel update unexpectedly requested reboot')
         if case.reboot_answer:
             interaction = json.loads((evidence / f'{stage}-interaction.json').read_text())
             require(interaction == dict(prompt_observed=True, answer=case.reboot_answer,
@@ -1402,6 +1440,7 @@ def main():
     commands.add_parser('run')
     signed = commands.add_parser('signed-fixture')
     signed.add_argument('--owner', required=True, type=Path)
+    signed.add_argument('--current-kernel', action='store_true')
     signed_check = commands.add_parser('verify-signed-fixture')
     signed_check.add_argument('--owner', required=True, type=Path)
     signed_check.add_argument('--phase', choices=tuple(NATIVE_PHASES), default='complete')
@@ -1425,7 +1464,7 @@ def main():
             json.dump(value, stream, indent=2)
             stream.write('\n')
     elif args.operation == 'signed-fixture':
-        create_signed_fixture(args.owner)
+        create_signed_fixture(args.owner, args.current_kernel)
     elif args.operation == 'verify-signed-fixture':
         print(json.dumps(verify_signed_fixture(args.owner, args.phase)))
     elif args.operation == 'unpack':

@@ -953,16 +953,29 @@ fn duplicate_inherited(raw: i32, expected: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn probe_existing_lock(probe: &File) -> Result<bool> {
+    match probe.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Ok(()) => {
+            // A concurrent fork may retain this open description after close.
+            probe
+                .unlock()
+                .context("Cannot release the Omarchy lock probe")?;
+            Ok(false)
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).context("Cannot verify the inherited Omarchy lock")
+        }
+    }
+}
+
 fn inherited_lock(raw: i32, path: &Path) -> Result<File> {
     let inherited = duplicate_inherited(raw, path)?;
     let independent = open_owned_file(path)?;
-    match independent.try_lock() {
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        result => {
-            result.context("Cannot verify the inherited Omarchy lock")?;
-            anyhow::bail!("Omarchy transport has no existing lock lease");
-        }
-    }
+    anyhow::ensure!(
+        probe_existing_lock(&independent)?,
+        "Omarchy transport has no existing lock lease"
+    );
     inherited
         .try_lock()
         .context("Omarchy transport does not own its lock")?;
@@ -1516,6 +1529,79 @@ mod tests {
                     .expect_err("empty runtime hint is rejected before helper discovery");
                 assert!(error.to_string().contains("OMARCHY_PATH must be non-empty"));
             }
+            "runtime-unset" => {
+                assert!(std::env::var_os("OMARCHY_PATH").is_none());
+                let discovered = OmarchyRuntime::discover();
+                assert!(discovered.as_ref().err().is_none_or(|error| {
+                    !error.to_string().contains("OMARCHY_PATH must be non-empty")
+                }));
+            }
+            "stage-grace" => {
+                let ready = owner.path().join("ready");
+                let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
+                let child = Command::new(shell)
+                    .args([
+                        "-c",
+                        "trap '' TERM; printf ready > \"$1\"; sleep 30",
+                        "fixture",
+                        ready.to_str().unwrap(),
+                    ])
+                    .process_group(0)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap());
+                let mut cleanup = FixtureGroup(Some(pid));
+                let mut commands = Commands::new(false, transport_runtime());
+                commands.active = Some(child);
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !ready.is_file() {
+                        assert!(
+                            commands
+                                .active
+                                .as_mut()
+                                .unwrap()
+                                .try_wait()
+                                .unwrap()
+                                .is_none()
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("TERM-ignore handler installed before cleanup");
+                let start = std::time::Instant::now();
+                commands.stop_active().await.unwrap();
+                assert!(start.elapsed() >= TERMINATION_GRACE);
+                assert!(commands.active.is_none());
+                assert_eq!(
+                    nix::sys::signal::kill(pid, None),
+                    Err(nix::errno::Errno::ESRCH)
+                );
+                cleanup.0 = None;
+            }
+            "lock-probe-denied" | "lock-probe-release-denied" => {
+                let probe = open_owned_file(&owner.path().join("probe")).unwrap();
+                let operation = if case == "lock-probe-denied" {
+                    libc::LOCK_EX | libc::LOCK_NB
+                } else {
+                    libc::LOCK_UN
+                };
+                deny_fixture_syscall_argument(
+                    libc::SYS_flock,
+                    1,
+                    u32::try_from(operation).unwrap(),
+                );
+                let error =
+                    probe_existing_lock(&probe).expect_err("kernel lock denial must propagate");
+                let expected = if case == "lock-probe-denied" {
+                    "Cannot verify the inherited Omarchy lock"
+                } else {
+                    "Cannot release the Omarchy lock probe"
+                };
+                assert!(error.to_string().contains(expected));
+                assert!(format!("{error:#}").contains("Operation not permitted"));
+            }
             "foreground-assignment" => {
                 let before = foreground_group()
                     .unwrap()
@@ -1575,16 +1661,24 @@ mod tests {
                 );
                 drop(restoration);
             }
-            "resize" => {
+            "resize" | "transport-nonblocking" => {
                 let before = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
                 let lock = open_owned_file(&owner.path().join("lock")).unwrap();
                 let log = open_owned_file(&owner.path().join("log")).unwrap();
                 let program = crate::core::privilege::root_controlled_program_path("true").unwrap();
-                deny_fixture_syscall_argument(
-                    libc::SYS_ioctl,
-                    1,
-                    u32::try_from(libc::TIOCSWINSZ).unwrap(),
-                );
+                if case == "resize" {
+                    deny_fixture_syscall_argument(
+                        libc::SYS_ioctl,
+                        1,
+                        u32::try_from(libc::TIOCSWINSZ).unwrap(),
+                    );
+                } else {
+                    deny_fixture_syscall_argument(
+                        libc::SYS_fcntl,
+                        1,
+                        u32::try_from(libc::F_SETFL).unwrap(),
+                    );
+                }
                 let error = execute_logged(&program, &[], &lock, &log, &transport_runtime())
                     .await
                     .expect_err("resize denied before spawn");
@@ -1678,7 +1772,10 @@ mod tests {
             }
             _ => {
                 assert!(
-                    matches!(case, "transcript-write" | "transcript-cleanup"),
+                    matches!(
+                        case,
+                        "transcript-write" | "transcript-cleanup" | "resize-during-update"
+                    ),
                     "unknown kernel fixture case"
                 );
                 let lock = open_owned_file(&owner.path().join("lock")).unwrap();
@@ -1690,11 +1787,24 @@ mod tests {
                     while log.metadata().unwrap().len() == 0 {
                         tokio::task::yield_now().await;
                     }
-                    deny_fixture_syscall_argument(
-                        libc::SYS_write,
-                        0,
-                        u32::try_from(log.as_raw_fd()).unwrap(),
-                    );
+                    if case == "resize-during-update" {
+                        deny_fixture_syscall_argument(
+                            libc::SYS_ioctl,
+                            1,
+                            u32::try_from(libc::TIOCSWINSZ).unwrap(),
+                        );
+                        nix::sys::signal::kill(
+                            nix::unistd::getpid(),
+                            nix::sys::signal::Signal::SIGWINCH,
+                        )
+                        .unwrap();
+                    } else {
+                        deny_fixture_syscall_argument(
+                            libc::SYS_write,
+                            0,
+                            u32::try_from(log.as_raw_fd()).unwrap(),
+                        );
+                    }
                     if case == "transcript-cleanup" {
                         deny_fixture_syscall_argument(
                             libc::SYS_kill,
@@ -1718,10 +1828,13 @@ mod tests {
                 } else {
                     assert!(!format!("{error:#}").contains("Transport cleanup failed"));
                 }
-                assert_eq!(
-                    std::fs::read(owner.path().join("log")).unwrap(),
-                    b"OMG Omarchy update started\n"
-                );
+                let transcript = std::fs::read_to_string(owner.path().join("log")).unwrap();
+                if case == "resize-during-update" {
+                    assert!(transcript.starts_with("OMG Omarchy update started\n"));
+                    assert!(transcript.contains("OMG Omarchy update finished:"));
+                } else {
+                    assert_eq!(transcript, "OMG Omarchy update started\n");
+                }
             }
         }
         println!("kernel boundary verified: {case}");
@@ -1733,6 +1846,12 @@ mod tests {
         let launcher = crate::core::privilege::root_controlled_program_path("setsid").unwrap();
         for (case, diagnostic) in [
             ("empty-runtime", None),
+            ("runtime-unset", None),
+            ("stage-grace", None),
+            ("lock-probe-denied", None),
+            ("lock-probe-release-denied", None),
+            ("transport-nonblocking", None),
+            ("resize-during-update", None),
             ("foreground-assignment", None),
             ("foreground-detached", Some("Update terminal detached")),
             (
@@ -1753,9 +1872,20 @@ mod tests {
             ("transcript-cleanup", None),
         ] {
             let (master, slave) = open_transport_pty(None).unwrap();
+            let mut command = Command::new(&launcher);
+            if case == "runtime-unset" {
+                command.env_remove("OMARCHY_PATH");
+            } else {
+                command.env("OMARCHY_PATH", "");
+            }
+            let deadline = if case == "stage-grace" {
+                TERMINATION_GRACE + Duration::from_secs(3)
+            } else {
+                Duration::from_secs(10)
+            };
             let output = tokio::time::timeout(
-                Duration::from_secs(10),
-                Command::new(&launcher)
+                deadline,
+                command
                     .args(["--ctty", "--"])
                     .arg(std::env::current_exe().unwrap())
                     .args([
@@ -1764,7 +1894,6 @@ mod tests {
                         "--nocapture",
                     ])
                     .env("OMG_OMARCHY_KERNEL_BOUNDARY_FIXTURE", case)
-                    .env("OMARCHY_PATH", "")
                     .stdin(Stdio::from(slave))
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -1775,11 +1904,8 @@ mod tests {
             .expect("kernel fixture deadline")
             .expect("owned kernel fixture runs");
             drop(master);
-            assert!(
-                output.status.success(),
-                "kernel boundary {case}: {}",
-                FixtureOutput(&output)
-            );
+            fixture_success(&output, format_args!("kernel boundary {case}: "))
+                .expect("owned fixture must succeed");
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -1809,6 +1935,16 @@ mod tests {
         }
     }
 
+    fn fixture_success(
+        output: &std::process::Output,
+        context: std::fmt::Arguments<'_>,
+    ) -> Result<()> {
+        if output.status.success() {
+            return Ok(());
+        }
+        anyhow::bail!("{context}{}", FixtureOutput(output));
+    }
+
     #[test]
     fn fixture_diagnostics_preserve_status_and_non_utf8_output() {
         use std::os::unix::process::ExitStatusExt;
@@ -1818,6 +1954,15 @@ mod tests {
                 stdout: b"out\xff".to_vec(),
                 stderr: b"err\xfe".to_vec(),
             };
+            let result = fixture_success(&output, format_args!("probe: "));
+            if code == 0 {
+                result.expect("successful fixture accepted");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    format!("probe: exit status: {code}; stdout: out\u{fffd}; stderr: err\u{fffd}")
+                );
+            }
             assert_eq!(
                 FixtureOutput(&output).to_string(),
                 format!("exit status: {code}; stdout: out\u{fffd}; stderr: err\u{fffd}")
@@ -2404,11 +2549,8 @@ mod tests {
             let output = command
                 .output()
                 .expect("isolated checkout migration preflight");
-            assert!(
-                output.status.success(),
-                "empty variable {empty_variable:?}: {}",
-                FixtureOutput(&output)
-            );
+            fixture_success(&output, format_args!("empty variable {empty_variable:?}: "))
+                .expect("owned fixture must succeed");
         }
     }
 
@@ -2445,11 +2587,11 @@ mod tests {
             .env("OMARCHY_MIGRATION_STATE", markers)
             .output()
             .expect("isolated Standard migration admission test");
-        assert!(
-            output.status.success(),
-            "Standard migration admission failed: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(
+            &output,
+            format_args!("Standard migration admission failed: "),
+        )
+        .expect("owned fixture must succeed");
     }
 
     #[test]
@@ -2744,11 +2886,8 @@ mod tests {
         .await
         .expect("isolated auto-reaping fixture finishes within its deadline")
         .expect("isolated auto-reaping fixture status");
-        assert!(
-            output.status.success(),
-            "auto-reaping fixture failed: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(&output, format_args!("auto-reaping fixture failed: "))
+            .expect("owned fixture must succeed");
     }
 
     #[tokio::test]
@@ -2875,11 +3014,8 @@ mod tests {
         .await
         .expect("absent input fixture stays bounded")
         .expect("absent input fixture output");
-        assert!(
-            output.status.success(),
-            "closed-input fixture failed: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(&output, format_args!("closed-input fixture failed: "))
+            .expect("owned fixture must succeed");
     }
 
     #[tokio::test]
@@ -2965,11 +3101,8 @@ mod tests {
             .await
             .expect("pipe EOF must not strand the coordinator")
             .expect("pipe fixture status");
-        assert!(
-            output.status.success(),
-            "pipe fixture failed: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(&output, format_args!("pipe fixture failed: "))
+            .expect("owned fixture must succeed");
     }
 
     #[tokio::test]
@@ -3007,11 +3140,8 @@ mod tests {
         .await
         .expect("socket rejection is bounded")
         .expect("socket fixture status");
-        assert!(
-            output.status.success(),
-            "socket fixture failed: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(&output, format_args!("socket fixture failed: "))
+            .expect("owned fixture must succeed");
     }
 
     #[test]
@@ -3235,6 +3365,57 @@ mod tests {
             assert!(inherited_transport(Some(lock), Some(log)).is_err());
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_lock_probe_releases_its_lease_while_child_retains_descriptor() {
+        use tokio::io::AsyncReadExt;
+        let owner = private_directory();
+        let path = owner.path().join("probe");
+        let probe = open_owned_file(&path).unwrap();
+        let raw = probe.as_raw_fd();
+        let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
+        let mut command = Command::new(shell);
+        command
+            .args(["-c", "printf ready; IFS= read -r line || :"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        // SAFETY: the owned probe stays open until spawn completes. Only the
+        // async-signal-safe integer fcntl helper runs in the child after fork.
+        #[expect(
+            unsafe_code,
+            reason = "inherit one inert descriptor in the owned regression fixture"
+        )]
+        unsafe {
+            command.pre_exec(move || set_descriptor_inheritance(raw, true));
+        }
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        let mut ready = [0_u8; 5];
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            child.stdout.as_mut().unwrap().read_exact(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&ready, b"ready");
+        assert!(!probe_existing_lock(&probe).unwrap());
+        drop(probe);
+        assert!(child.try_wait().unwrap().is_none());
+        let independent = open_owned_file(&path).unwrap();
+        let result = independent.try_lock();
+        drop(child.stdin.take());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        result.expect("rejected probe must release its lease before an inherited copy closes");
+        independent.unlock().unwrap();
     }
 
     #[test]
@@ -3612,11 +3793,8 @@ mod tests {
             .await
             .expect("disconnected fixture exits")
             .expect("fixture exit status");
-        assert!(
-            output.status.success(),
-            "disconnected fixture failed: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(&output, format_args!("disconnected fixture failed: "))
+            .expect("owned fixture must succeed");
         assert_eq!(
             std::fs::read(owner.path().join("complete")).expect("cleanup receipt survives hangup"),
             b"cleaned"
@@ -3883,11 +4061,11 @@ mod tests {
         .await
         .expect("isolated outer cancellation is bounded")
         .expect("outer fixture runs");
-        assert!(
-            output.status.success(),
-            "outer transport abandoned inner cleanup: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(
+            &output,
+            format_args!("outer transport abandoned inner cleanup: "),
+        )
+        .expect("owned fixture must succeed");
     }
 
     #[tokio::test]
@@ -3929,11 +4107,11 @@ mod tests {
             .await
             .expect("physical outer disconnect completes")
             .expect("outer disconnect status");
-        assert!(
-            output.status.success(),
-            "outer terminal hangup abandoned inner cleanup: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(
+            &output,
+            format_args!("outer terminal hangup abandoned inner cleanup: "),
+        )
+        .expect("owned fixture must succeed");
         assert_eq!(
             std::fs::read(owner.path().join("complete"))
                 .expect("inner cleanup complete before outer exit"),
@@ -4568,11 +4746,7 @@ mod tests {
                 .await
                 .expect("startup fixture finishes within its deadline")
                 .expect("startup fixture output");
-            assert!(
-                output.status.success(),
-                "{mode}: {}",
-                FixtureOutput(&output)
-            );
+            fixture_success(&output, format_args!("{mode}: ")).expect("owned fixture must succeed");
         }
         for file in [&lock, &log] {
             assert!(
@@ -4693,11 +4867,11 @@ mod tests {
             !checkout.join("executed").exists(),
             "caller checkout executable must never run"
         );
-        assert!(
-            output.status.success(),
-            "{mode} runtime environment observation failed: {}",
-            FixtureOutput(&output)
-        );
+        fixture_success(
+            &output,
+            format_args!("{mode} runtime environment observation failed: "),
+        )
+        .expect("owned fixture must succeed");
     }
 
     #[test]
@@ -4900,11 +5074,11 @@ mod tests {
             let output = command
                 .output()
                 .expect("isolated split-runtime migration data check");
-            assert!(
-                output.status.success(),
-                "selected_forbidden={selected_forbidden}, empty={empty:?}: {}",
-                FixtureOutput(&output)
-            );
+            fixture_success(
+                &output,
+                format_args!("selected_forbidden={selected_forbidden}, empty={empty:?}: "),
+            )
+            .expect("owned fixture must succeed");
             assert!(
                 !caller.join("executed").exists(),
                 "caller checkout program must never execute"

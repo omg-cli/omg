@@ -484,7 +484,7 @@ macro_rules! sync_pkg_from_desc {
     ($desc:expr, $repo:expr) => {
         SyncDbPackage {
             name: $desc.name.to_string(),
-            version: require_package_version(&$desc.version.to_string())?,
+            version: Version::from($desc.version),
             desc: $desc.description.to_string(),
             filename: $desc.file_name.to_string(),
             csize: $desc.compressed_size,
@@ -2210,6 +2210,30 @@ pub fn get_explicit_count() -> Result<usize> {
 mod tests {
     use super::*;
     use std::fs::File;
+
+    #[test]
+    fn official_full_version_conversion_preserves_catalog_versions() {
+        for text in [
+            "foo-1",
+            "1:foo-1",
+            "0:1.0-1",
+            "2:1.0-01",
+            "2026.11.13-1",
+            "1.2.3.r45.gabcdef-2.1",
+            "42:1.0+git.20261113-3",
+        ] {
+            let full =
+                alpm_types::FullVersion::from_str(text).expect("valid official version fixture");
+            let round_trip = require_package_version(&full.to_string()).unwrap();
+            let converted = Version::from(full);
+            assert_eq!(converted, round_trip, "version {text}");
+            assert_eq!(
+                converted.to_string(),
+                round_trip.to_string(),
+                "version {text}"
+            );
+        }
+    }
 
     fn batch2_write_sync(path: &Path, version: &str) {
         let content = format!("%NAME%\nwidget\n\n%VERSION%\n{version}\n\n");

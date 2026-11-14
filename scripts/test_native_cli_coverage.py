@@ -402,6 +402,14 @@ with socket.socket(socket.AF_UNIX) as server:
         self.assertEqual(case.native_phase, 'complete')
         self.assertNotIn('omarchy-system\treboot', case.helpers)
 
+    def test_current_kernel_update_requires_signed_ownership_without_reboot(self):
+        self.assertTrue('omarchy-current-kernel' in PRODUCER.OMARCHY_CASES, 'Missing current-kernel update scenario')
+        case = PRODUCER.OMARCHY_CASES['omarchy-current-kernel']
+        self.assertEqual(case.exit_status, 0)
+        self.assertEqual(case.native_phase, 'complete')
+        self.assertIsNone(case.reboot_answer)
+        self.assertIn('--current-kernel', PRODUCER.omarchy_guest_script())
+
     def test_attended_reboot_cases_require_prompt_and_terminal_receipts(self):
         names = {'omarchy-reboot-decline', 'omarchy-reboot-accept', 'omarchy-reboot-failure'}
         self.assertTrue(names <= PRODUCER.OMARCHY_CASES.keys(),
@@ -628,6 +636,12 @@ def evidence_fixture(root):
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status=PRODUCER.NATIVE_PHASES[case.native_phase])))
+        if stage == 'omarchy-current-kernel':
+            path = 'usr/lib/modules/fixture/modules.builtin'
+            (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(
+                status=PRODUCER.NATIVE_PHASES[case.native_phase],
+                running_kernel_modules=dict(path=path, sha256='a' * 64),
+                packages={'omg-coverage-kernel': dict(payload_path=path)})))
         if case.control:
             (evidence / f'{stage}-control.json').write_text(json.dumps(dict(
                 mode=case.control, ready_observed=True, cli_exit_code=1, unrelated_pid=600,
@@ -664,6 +678,7 @@ def evidence_fixture(root):
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': '| System is up to date',
+            'omarchy-current-kernel': '| System is up to date',
             'omarchy-interrupted': 'Omarchy update interrupted',
             'omarchy-output-closed': 'Update output disconnected',
             'omarchy-runtime-fallback': '| System is up to date',
@@ -698,6 +713,30 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_current_kernel_requires_ownership_evidence_and_no_reboot_reason(self):
+        self.assertTrue('omarchy-current-kernel' in PRODUCER.OMARCHY_CASES, 'Missing current-kernel update scenario')
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            state = evidence / 'omarchy-current-kernel-native-state.json'
+            original = state.read_text()
+            value = json.loads(original)
+            value.pop('running_kernel_modules')
+            state.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, 'Current kernel'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            value = json.loads(original)
+            path = 'usr/lib/modules/../modules.builtin'
+            value['running_kernel_modules']['path'] = path
+            value['packages']['omg-coverage-kernel']['payload_path'] = path
+            state.write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, 'Current kernel'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            state.write_text(original)
+            (evidence / 'omarchy-current-kernel.log').write_text('System is up to date\nRun omarchy-system reboot when ready.')
+            with self.assertRaisesRegex(ValueError, 'Current kernel'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_missing_reboot_helper_requires_the_actual_refusal_diagnostic(self):
         self.assertIn('omarchy-reboot-helper-missing', PRODUCER.OMARCHY_CASES)
         with tempfile.TemporaryDirectory() as directory:
@@ -733,7 +772,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 33)
+            self.assertEqual(len(receipt['process_checks']), 34)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
