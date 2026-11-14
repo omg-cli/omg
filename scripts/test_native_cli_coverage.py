@@ -393,6 +393,15 @@ with socket.socket(socket.AF_UNIX) as server:
         self.assertIn("producer['authorization_audit']", script)
         self.assertIn('!/usr/bin/true', script)
 
+    def test_missing_reboot_helper_is_required_after_a_completed_native_update(self):
+        self.assertIn('omarchy-reboot-helper-missing', PRODUCER.OMARCHY_CASES)
+        case = PRODUCER.OMARCHY_CASES['omarchy-reboot-helper-missing']
+        self.assertEqual(case.exit_status, 1)
+        self.assertEqual(case.absent_helper, 'omarchy-system')
+        self.assertEqual(case.reboot_answer, 'y')
+        self.assertEqual(case.native_phase, 'complete')
+        self.assertNotIn('omarchy-system\treboot', case.helpers)
+
     def test_attended_reboot_cases_require_prompt_and_terminal_receipts(self):
         names = {'omarchy-reboot-decline', 'omarchy-reboot-accept', 'omarchy-reboot-failure'}
         self.assertTrue(names <= PRODUCER.OMARCHY_CASES.keys(),
@@ -664,6 +673,7 @@ def evidence_fixture(root):
             'omarchy-reboot-decline': '| System is up to date\nReboot now?',
             'omarchy-reboot-accept': '| System is up to date\nReboot now?',
             'omarchy-reboot-failure': '| System is up to date\nReboot now?\nOmarchy reboot failed',
+            'omarchy-reboot-helper-missing': '| System is up to date\nReboot now?\nNo root-controlled system executable found for omarchy-system',
             'omarchy-snapshot-missing': '| System is up to date',
             'omarchy-snapshot-unsupported': '| System is up to date',
             'omarchy-required-helper-missing': 'Omarchy update did not complete: omarchy-update-dev',
@@ -688,6 +698,15 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_missing_reboot_helper_requires_the_actual_refusal_diagnostic(self):
+        self.assertIn('omarchy-reboot-helper-missing', PRODUCER.OMARCHY_CASES)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            (evidence / 'omarchy-reboot-helper-missing.log').write_text('System is up to date\nReboot now?')
+            with self.assertRaisesRegex(ValueError, 'Missing reboot helper'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_authorization_audit_requires_initial_success_and_one_real_interval(self):
         initial = 'Nov 13 23:59:30 : nobody : USER=root ;\n    COMMAND=/usr/bin/true\n'
         refresh = 'Nov 14 00:00:30 : nobody : USER=root ;\n    COMMAND=/usr/bin/true\n'
@@ -714,7 +733,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 14)
-            self.assertEqual(len(receipt['process_checks']), 32)
+            self.assertEqual(len(receipt['process_checks']), 33)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):

@@ -437,6 +437,9 @@ OMARCHY_CASES = {
     'omarchy-reboot-failure': OmarchyCase(1, OMARCHY_PREFIX[:1] +
         ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX + ('omarchy-system\treboot',),
         scene='reboot-failure', native_phase='complete', reboot_answer='y'),
+    'omarchy-reboot-helper-missing': OmarchyCase(1, OMARCHY_PREFIX[:1] +
+        ('omarchy-update-confirm',) + OMARCHY_PREFIX[1:] + OMARCHY_SUFFIX,
+        absent_helper='omarchy-system', native_phase='complete', reboot_answer='y'),
     'omarchy-authorization-refresh': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
         scene='authorization-hold', native_phase='complete', authorization='refresh'),
     'omarchy-authorization-denied': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
@@ -1277,6 +1280,9 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         if stage == 'omarchy-required-helper-missing':
             require('omarchy-update-dev' in log and 'Omarchy update did not complete' in log,
                     'Missing required helper was not reported')
+        if stage == 'omarchy-reboot-helper-missing':
+            require('No root-controlled system executable found for omarchy-system' in log,
+                    'Missing reboot helper was not reported')
         if stage == 'omarchy-optional-failures':
             require((evidence / f'{stage}-layout.txt').read_text()
                     == 'foreign optional helpers never executed; original helpers restored\n',

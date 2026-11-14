@@ -1432,6 +1432,455 @@ pub(super) async fn maybe_coordinate(intent: UpdateIntent) -> Result<bool> {
 mod tests {
     use super::*;
 
+    // Only the private x86-64 fixture thread receives these kernel fault filters.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn deny_fixture_syscall_argument(syscall: nix::libc::c_long, argument: usize, value: u32) {
+        use nix::libc::{seccomp_data, sock_filter, sock_fprog};
+        assert!(argument < 6);
+        // Linux classic BPF: load a word, compare a constant, return an action.
+        const LOAD: u16 = 0x20;
+        const EQUAL: u16 = 0x15;
+        const RETURN: u16 = 0x06;
+        // Linux audit.h: ELF machine 62, 64-bit and little-endian ABI flags.
+        const X86_64_AUDIT_ARCH: u32 = 0xc000_003e;
+        let instruction = |code, jt, jf, k| sock_filter { code, jt, jf, k };
+        let argument_offset = std::mem::offset_of!(seccomp_data, args) + argument * 8;
+        let mut filter = [
+            instruction(
+                LOAD,
+                0,
+                0,
+                u32::try_from(std::mem::offset_of!(seccomp_data, arch)).unwrap(),
+            ),
+            instruction(EQUAL, 0, 5, X86_64_AUDIT_ARCH),
+            instruction(
+                LOAD,
+                0,
+                0,
+                u32::try_from(std::mem::offset_of!(seccomp_data, nr)).unwrap(),
+            ),
+            instruction(EQUAL, 0, 3, u32::try_from(syscall).unwrap()),
+            instruction(LOAD, 0, 0, u32::try_from(argument_offset).unwrap()),
+            instruction(EQUAL, 0, 1, value),
+            instruction(
+                RETURN,
+                0,
+                0,
+                nix::libc::SECCOMP_RET_ERRNO | u32::try_from(nix::libc::EPERM).unwrap(),
+            ),
+            instruction(RETURN, 0, 0, nix::libc::SECCOMP_RET_ALLOW),
+        ];
+        let program = sock_fprog {
+            len: u16::try_from(filter.len()).unwrap(),
+            filter: filter.as_mut_ptr(),
+        };
+        nix::sys::prctl::set_no_new_privs().unwrap();
+        // SAFETY: program and every instruction remain valid for prctl, which
+        // copies them. This runs only in a disposable child fixture thread.
+        #[expect(
+            unsafe_code,
+            reason = "install a kernel fault in the owned fixture only"
+        )]
+        let result = unsafe {
+            nix::libc::prctl(
+                nix::libc::PR_SET_SECCOMP,
+                nix::libc::SECCOMP_MODE_FILTER,
+                &raw const program,
+            )
+        };
+        assert_eq!(result, 0, "private seccomp fault installation");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn kernel_boundary_fixture() {
+        use nix::libc;
+        use std::sync::{Arc, Barrier, atomic::AtomicBool};
+        let Some(case) = std::env::var_os("OMG_OMARCHY_KERNEL_BOUNDARY_FIXTURE") else {
+            return;
+        };
+        let case = case.to_str().expect("known kernel fixture case");
+        let _tracing = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        let owner = private_directory();
+        match case {
+            "empty-runtime" => {
+                assert_eq!(
+                    std::env::var_os("OMARCHY_PATH"),
+                    Some(std::ffi::OsString::new())
+                );
+                let error = OmarchyRuntime::discover()
+                    .expect_err("empty runtime hint is rejected before helper discovery");
+                assert!(error.to_string().contains("OMARCHY_PATH must be non-empty"));
+            }
+            "foreground-assignment" => {
+                let before = foreground_group()
+                    .unwrap()
+                    .expect("private controlling terminal");
+                let sleep = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+                let mut command = Command::new(sleep);
+                command.arg("30").process_group(0).kill_on_drop(true);
+                let mut commands = Commands::new(false, transport_runtime());
+                deny_fixture_syscall_argument(
+                    libc::SYS_ioctl,
+                    1,
+                    u32::try_from(libc::TIOCSPGRP).unwrap(),
+                );
+                let error = commands
+                    .start(&mut command)
+                    .await
+                    .expect_err("foreground denied");
+                assert_eq!(
+                    error.downcast_ref::<nix::errno::Errno>(),
+                    Some(&nix::errno::Errno::EPERM)
+                );
+                assert!(commands.active.is_none());
+                assert!(commands.foreground.is_none());
+                assert_eq!(foreground_group().unwrap(), Some(before));
+            }
+            "foreground-detached" => {
+                let mut commands = Commands::new(false, transport_runtime());
+                commands.foreground = foreground_group().unwrap();
+                assert!(commands.foreground.is_some());
+                nix::unistd::dup2_stdin(File::open("/dev/null").unwrap()).unwrap();
+                commands
+                    .restore_foreground()
+                    .expect("detached terminal is benign");
+                assert!(commands.foreground.is_none());
+            }
+            "terminal-restore" => {
+                let (_input, restoration) = terminal_input().unwrap();
+                let restoration = restoration.expect("private terminal restoration guard");
+                deny_fixture_syscall_argument(
+                    libc::SYS_ioctl,
+                    1,
+                    u32::try_from(libc::TCSETS).unwrap(),
+                );
+                // glibc 2.42 and later use the termios2 ioctl ABI.
+                deny_fixture_syscall_argument(
+                    libc::SYS_ioctl,
+                    1,
+                    u32::try_from(libc::TCSETS2).unwrap(),
+                );
+                assert_eq!(
+                    nix::sys::termios::tcsetattr(
+                        &restoration.file,
+                        nix::sys::termios::SetArg::TCSANOW,
+                        &restoration.saved
+                    ),
+                    Err(nix::errno::Errno::EPERM)
+                );
+                drop(restoration);
+            }
+            "resize" => {
+                let before = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+                let lock = open_owned_file(&owner.path().join("lock")).unwrap();
+                let log = open_owned_file(&owner.path().join("log")).unwrap();
+                let program = crate::core::privilege::root_controlled_program_path("true").unwrap();
+                deny_fixture_syscall_argument(
+                    libc::SYS_ioctl,
+                    1,
+                    u32::try_from(libc::TIOCSWINSZ).unwrap(),
+                );
+                let error = execute_logged(&program, &[], &lock, &log, &transport_runtime())
+                    .await
+                    .expect_err("resize denied before spawn");
+                assert!(error.to_string().contains("Operation not permitted"));
+                assert_eq!(
+                    nix::sys::termios::tcgetattr(std::io::stdin()).unwrap(),
+                    before
+                );
+                assert_eq!(log.metadata().unwrap().len(), 0);
+            }
+            "descriptor-inspection" => {
+                let file = Arc::new(open_owned_file(&owner.path().join("probe")).unwrap());
+                deny_fixture_syscall_argument(
+                    libc::SYS_fcntl,
+                    1,
+                    u32::try_from(libc::F_GETFD).unwrap(),
+                );
+                let observed = observe_coordination_descriptors(
+                    &[Arc::clone(&file), Arc::clone(&file)],
+                    &Barrier::new(1),
+                    &AtomicBool::new(true),
+                    std::time::Instant::now(),
+                );
+                assert_eq!(
+                    observed.inspection_error,
+                    Some((0, nix::errno::Errno::EPERM))
+                );
+                assert_eq!(observed.inherited, [0, 0]);
+                assert_eq!(observed.samples, 1);
+                assert!(!observed.expired);
+                assert!(fcntl(file.as_ref(), FcntlArg::F_GETFL).is_ok());
+            }
+            "coordinator-interrupt" | "stage-stop" => {
+                let program =
+                    crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+                let mut unrelated = Command::new(&program)
+                    .arg("30")
+                    .process_group(0)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let mut child = Command::new(program)
+                    .arg("0.2")
+                    .process_group(0)
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let pid = i32::try_from(child.id().unwrap()).unwrap();
+                if case == "coordinator-interrupt" {
+                    deny_fixture_syscall_argument(
+                        libc::SYS_kill,
+                        1,
+                        u32::try_from(libc::SIGTERM).unwrap(),
+                    );
+                    let error =
+                        interrupt_coordinator(&child).expect_err("owned coordinator signal denied");
+                    assert_eq!(
+                        error.downcast_ref::<nix::errno::Errno>(),
+                        Some(&nix::errno::Errno::EPERM)
+                    );
+                    tokio::time::timeout(Duration::from_secs(3), child.wait())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                } else {
+                    deny_fixture_syscall_argument(
+                        libc::SYS_kill,
+                        0,
+                        u32::from_ne_bytes((-pid).to_ne_bytes()),
+                    );
+                    let mut commands = Commands::new(false, transport_runtime());
+                    commands.active = Some(child);
+                    tokio::time::timeout(Duration::from_secs(3), commands.stop_active())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(commands.active.is_none());
+                    assert_eq!(
+                        nix::sys::wait::waitpid(
+                            nix::unistd::Pid::from_raw(pid),
+                            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+                        ),
+                        Err(nix::errno::Errno::ECHILD)
+                    );
+                }
+                assert!(unrelated.try_wait().unwrap().is_none());
+                unrelated
+                    .kill()
+                    .await
+                    .expect("unrelated owned control remains manageable");
+            }
+            _ => {
+                assert!(
+                    matches!(case, "transcript-write" | "transcript-cleanup"),
+                    "unknown kernel fixture case"
+                );
+                let lock = open_owned_file(&owner.path().join("lock")).unwrap();
+                let log = open_owned_file(&owner.path().join("log")).unwrap();
+                let ready = owner.path().join("go");
+                let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
+                let runtime = transport_runtime();
+                let fault = async {
+                    while log.metadata().unwrap().len() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    deny_fixture_syscall_argument(
+                        libc::SYS_write,
+                        0,
+                        u32::try_from(log.as_raw_fd()).unwrap(),
+                    );
+                    if case == "transcript-cleanup" {
+                        deny_fixture_syscall_argument(
+                            libc::SYS_kill,
+                            1,
+                            u32::try_from(libc::SIGTERM).unwrap(),
+                        );
+                    }
+                    std::fs::write(&ready, b"ready").unwrap();
+                };
+                let arguments = [
+                    "-c",
+                    "until test -f \"$1\"; do sleep 0.01; done; printf payload; sleep 1",
+                    "fixture",
+                    ready.to_str().unwrap(),
+                ];
+                let execution = execute_logged(&shell, &arguments, &lock, &log, &runtime);
+                let ((), result) = tokio::join!(fault, execution);
+                let error = result.expect_err("private transcript write denied");
+                if case == "transcript-cleanup" {
+                    assert!(format!("{error:#}").contains("Transport cleanup failed"));
+                } else {
+                    assert!(!format!("{error:#}").contains("Transport cleanup failed"));
+                }
+                assert_eq!(
+                    std::fs::read(owner.path().join("log")).unwrap(),
+                    b"OMG Omarchy update started\n"
+                );
+            }
+        }
+        println!("kernel boundary verified: {case}");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[tokio::test]
+    async fn kernel_failures_preserve_owned_cleanup_and_diagnostics() {
+        let launcher = crate::core::privilege::root_controlled_program_path("setsid").unwrap();
+        for (case, diagnostic) in [
+            ("empty-runtime", None),
+            ("foreground-assignment", None),
+            ("foreground-detached", Some("Update terminal detached")),
+            (
+                "terminal-restore",
+                Some("Cannot restore update terminal settings"),
+            ),
+            ("resize", None),
+            ("descriptor-inspection", None),
+            ("coordinator-interrupt", None),
+            (
+                "stage-stop",
+                Some("Unable to kill owned Omarchy stage group"),
+            ),
+            (
+                "transcript-write",
+                Some("Cannot finish interrupted update transcript"),
+            ),
+            ("transcript-cleanup", None),
+        ] {
+            let (master, slave) = open_transport_pty(None).unwrap();
+            let output = tokio::time::timeout(
+                Duration::from_secs(10),
+                Command::new(&launcher)
+                    .args(["--ctty", "--"])
+                    .arg(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "cli::packages::update::omarchy::tests::kernel_boundary_fixture",
+                        "--nocapture",
+                    ])
+                    .env("OMG_OMARCHY_KERNEL_BOUNDARY_FIXTURE", case)
+                    .env("OMARCHY_PATH", "")
+                    .stdin(Stdio::from(slave))
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("kernel fixture deadline")
+            .expect("owned kernel fixture runs");
+            drop(master);
+            assert!(
+                output.status.success(),
+                "kernel boundary {case}: {}",
+                FixtureOutput(&output)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stdout.contains(&format!("kernel boundary verified: {case}")),
+                "{stdout}"
+            );
+            if let Some(diagnostic) = diagnostic {
+                assert!(
+                    stdout.contains(diagnostic) || stderr.contains(diagnostic),
+                    "{case}: {stdout}{stderr}"
+                );
+            }
+        }
+    }
+
+    struct FixtureOutput<'a>(&'a std::process::Output);
+
+    impl std::fmt::Display for FixtureOutput<'_> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "{}; stdout: {}; stderr: {}",
+                self.0.status,
+                String::from_utf8_lossy(&self.0.stdout),
+                String::from_utf8_lossy(&self.0.stderr)
+            )
+        }
+    }
+
+    #[test]
+    fn fixture_diagnostics_preserve_status_and_non_utf8_output() {
+        use std::os::unix::process::ExitStatusExt;
+        for code in [0, 7] {
+            let output = std::process::Output {
+                status: ExitStatus::from_raw(code << 8),
+                stdout: b"out\xff".to_vec(),
+                stderr: b"err\xfe".to_vec(),
+            };
+            assert_eq!(
+                FixtureOutput(&output).to_string(),
+                format!("exit status: {code}; stdout: out\u{fffd}; stderr: err\u{fffd}")
+            );
+        }
+    }
+
+    async fn finish_fixture_prompt(
+        child: &mut tokio::process::Child,
+        prompt: std::result::Result<Result<()>, tokio::time::error::Elapsed>,
+        observed: &[u8],
+    ) -> Result<()> {
+        if matches!(prompt, Ok(Ok(()))) {
+            return Ok(());
+        }
+        child.kill().await?;
+        anyhow::bail!(
+            "partial prompt was not visible before input: {prompt:?}; observed {:?}",
+            String::from_utf8_lossy(observed)
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_failure_reaps_the_owned_fixture_and_keeps_diagnostics() {
+        let program = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+        for expired in [false, true] {
+            let mut child = Command::new(&program)
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            finish_fixture_prompt(&mut child, Ok(Ok(())), b"Enter value: ")
+                .await
+                .unwrap();
+            assert!(child.try_wait().unwrap().is_none());
+            let prompt = if expired {
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    std::future::pending::<Result<()>>(),
+                )
+                .await
+            } else {
+                Ok(Err(anyhow::anyhow!(
+                    "fixture closed output before its prompt"
+                )))
+            };
+            let error = finish_fixture_prompt(&mut child, prompt, b"partial\xff")
+                .await
+                .expect_err("failed prompt must stop its owned child");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("partial\u{fffd}"), "{diagnostic}");
+            assert!(
+                diagnostic.contains(if expired {
+                    "Elapsed"
+                } else {
+                    "fixture closed output"
+                }),
+                "{diagnostic}"
+            );
+            assert!(child.id().is_none());
+        }
+    }
+
     struct FixtureGroup(Option<nix::unistd::Pid>);
 
     impl Drop for FixtureGroup {
@@ -1440,6 +1889,65 @@ mod tests {
                 let _ = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
             }
         }
+    }
+
+    struct PendingFixtureGroup(Option<PathBuf>);
+
+    fn pending_fixture_group(root: &Path) -> Option<nix::unistd::Pid> {
+        let pid: i32 = std::fs::read_to_string(root.join("ready"))
+            .ok()?
+            .parse()
+            .ok()?;
+        (pid > 1 && pid != nix::unistd::getpgrp().as_raw()).then(|| nix::unistd::Pid::from_raw(pid))
+    }
+
+    impl Drop for PendingFixtureGroup {
+        fn drop(&mut self) {
+            if let Some(root) = &self.0 {
+                drop(FixtureGroup(pending_fixture_group(root)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_group_guard_rejects_invalid_ids_and_reaps_its_owned_fixture() {
+        let owner = private_directory();
+        assert_eq!(pending_fixture_group(owner.path()), None);
+        for value in [
+            String::new(),
+            "not-a-pid".to_owned(),
+            "0".to_owned(),
+            "-1".to_owned(),
+            "1".to_owned(),
+            nix::unistd::getpgrp().to_string(),
+        ] {
+            std::fs::write(owner.path().join("ready"), value).unwrap();
+            assert_eq!(pending_fixture_group(owner.path()), None);
+        }
+        let program = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+        let mut child = Command::new(program)
+            .arg("30")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        std::fs::write(owner.path().join("ready"), pid.to_string()).unwrap();
+        assert_eq!(
+            pending_fixture_group(owner.path()).unwrap().as_raw(),
+            i32::try_from(pid).unwrap()
+        );
+        let mut disarmed = PendingFixtureGroup(Some(owner.path().to_owned()));
+        disarmed.0 = None;
+        drop(disarmed);
+        assert!(child.try_wait().unwrap().is_none());
+        drop(PendingFixtureGroup(Some(owner.path().to_owned())));
+        let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL));
     }
 
     #[derive(Debug, Default)]
@@ -1874,7 +2382,6 @@ mod tests {
         .expect("checkout executable sentinel");
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
             .expect("user checkout executable permissions");
-        let mut failures = Vec::new();
         for empty_variable in [None, Some("OMARCHY_PATH"), Some("OMARCHY_MIGRATION_STATE")] {
             let mut command =
                 std::process::Command::new(std::env::current_exe().expect("test executable"));
@@ -1897,19 +2404,12 @@ mod tests {
             let output = command
                 .output()
                 .expect("isolated checkout migration preflight");
-            if !output.status.success() {
-                failures.push(format!(
-                    "empty variable {empty_variable:?}: {}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
+            assert!(
+                output.status.success(),
+                "empty variable {empty_variable:?}: {}",
+                FixtureOutput(&output)
+            );
         }
-        assert!(
-            failures.is_empty(),
-            "Checkout migration preflight failed: {}",
-            failures.join("\n")
-        );
     }
 
     #[test]
@@ -1947,9 +2447,8 @@ mod tests {
             .expect("isolated Standard migration admission test");
         assert!(
             output.status.success(),
-            "Standard migration admission failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "Standard migration admission failed: {}",
+            FixtureOutput(&output)
         );
     }
 
@@ -2247,9 +2746,8 @@ mod tests {
         .expect("isolated auto-reaping fixture status");
         assert!(
             output.status.success(),
-            "auto-reaping fixture failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "auto-reaping fixture failed: {}",
+            FixtureOutput(&output)
         );
     }
 
@@ -2379,9 +2877,8 @@ mod tests {
         .expect("absent input fixture output");
         assert!(
             output.status.success(),
-            "closed-input fixture failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "closed-input fixture failed: {}",
+            FixtureOutput(&output)
         );
     }
 
@@ -2419,13 +2916,7 @@ mod tests {
             }
         })
         .await;
-        if !matches!(prompt, Ok(Ok(()))) {
-            child.kill().await?;
-            anyhow::bail!(
-                "partial prompt was not visible before input: {prompt:?}; observed {:?}",
-                String::from_utf8_lossy(&observed)
-            );
-        }
+        finish_fixture_prompt(&mut child, prompt, &observed).await?;
         child
             .stdin
             .take()
@@ -2476,9 +2967,8 @@ mod tests {
             .expect("pipe fixture status");
         assert!(
             output.status.success(),
-            "pipe fixture failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "pipe fixture failed: {}",
+            FixtureOutput(&output)
         );
     }
 
@@ -2487,9 +2977,9 @@ mod tests {
         if std::env::var_os("OMG_OMARCHY_SOCKET_FIXTURE").is_none() {
             return;
         }
-        let Err(error) = terminal_input() else {
-            panic!("socket stdin cannot be reopened as terminal input");
-        };
+        let error = terminal_input()
+            .err()
+            .expect("socket stdin cannot be reopened as terminal input");
         assert!(error.to_string().contains("Cannot open update input"));
         assert!(error.downcast_ref::<std::io::Error>().is_some());
     }
@@ -2519,9 +3009,8 @@ mod tests {
         .expect("socket fixture status");
         assert!(
             output.status.success(),
-            "socket fixture failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "socket fixture failed: {}",
+            FixtureOutput(&output)
         );
     }
 
@@ -2617,11 +3106,13 @@ mod tests {
         std::fs::write(
             processes.join(std::ffi::OsString::from_vec(vec![0xff])),
             "ignored",
-        )?;
+        )
+        .expect("non-UTF8 process fixture entry");
         std::os::unix::fs::symlink(
             owner.path().join("disappeared-process"),
             processes.join("123"),
-        )?;
+        )
+        .expect("disappearing process fixture entry");
         assert_eq!(reboot_reason_at(&paths, owns)?, None);
         assert_eq!(queries.get(), 1);
         let result = reboot_reason_at(&paths, |_| {
@@ -2657,11 +3148,7 @@ mod tests {
             .env("HOME", owner.path())
             .env_remove("OMARCHY_MIGRATION_STATE")
             .output()?;
-        let diagnostic = format!(
-            "default migration state: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let diagnostic = format!("default migration state: {}", FixtureOutput(&output));
         assert!(output.status.success(), "{diagnostic}");
         Ok(())
     }
@@ -3128,7 +3615,7 @@ mod tests {
         assert!(
             output.status.success(),
             "disconnected fixture failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            FixtureOutput(&output)
         );
         assert_eq!(
             std::fs::read(owner.path().join("complete")).expect("cleanup receipt survives hangup"),
@@ -3398,30 +3885,15 @@ mod tests {
         .expect("outer fixture runs");
         assert!(
             output.status.success(),
-            "outer transport abandoned inner cleanup: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "outer transport abandoned inner cleanup: {}",
+            FixtureOutput(&output)
         );
     }
 
     #[tokio::test]
     async fn outer_terminal_disconnect_waits_for_inner_cleanup() {
-        struct KillInner(Option<PathBuf>);
-        impl Drop for KillInner {
-            fn drop(&mut self) {
-                if let Some(root) = &self.0
-                    && let Ok(value) = std::fs::read_to_string(root.join("ready"))
-                    && let Ok(pid) = value.parse()
-                {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(pid),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
-                }
-            }
-        }
         let owner = private_directory();
-        let mut cleanup = KillInner(Some(owner.path().to_owned()));
+        let mut cleanup = PendingFixtureGroup(Some(owner.path().to_owned()));
         let (master, slave) = open_transport_pty(None).expect("private outer terminal");
         let launcher = crate::core::privilege::root_controlled_program_path("setsid")
             .expect("system session launcher");
@@ -3460,7 +3932,7 @@ mod tests {
         assert!(
             output.status.success(),
             "outer terminal hangup abandoned inner cleanup: {}",
-            String::from_utf8_lossy(&output.stderr)
+            FixtureOutput(&output)
         );
         assert_eq!(
             std::fs::read(owner.path().join("complete"))
@@ -4098,9 +4570,8 @@ mod tests {
                 .expect("startup fixture output");
             assert!(
                 output.status.success(),
-                "{mode}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                "{mode}: {}",
+                FixtureOutput(&output)
             );
         }
         for file in [&lock, &log] {
@@ -4224,9 +4695,8 @@ mod tests {
         );
         assert!(
             output.status.success(),
-            "{mode} runtime environment observation failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "{mode} runtime environment observation failed: {}",
+            FixtureOutput(&output)
         );
     }
 
@@ -4338,7 +4808,8 @@ mod tests {
             std::fs::write(
                 commands.runtime.migration_state.join("0001.sh"),
                 b"complete",
-            )?;
+            )
+            .expect("completed selected-runtime migration fixture");
             commands.runtime.check_pending_migrations()?;
         } else {
             commands.runtime.check_pending_migrations()?;
@@ -4431,9 +4902,8 @@ mod tests {
                 .expect("isolated split-runtime migration data check");
             assert!(
                 output.status.success(),
-                "selected_forbidden={selected_forbidden}, empty={empty:?}: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                "selected_forbidden={selected_forbidden}, empty={empty:?}: {}",
+                FixtureOutput(&output)
             );
             assert!(
                 !caller.join("executed").exists(),
