@@ -1529,9 +1529,18 @@ mod tests {
                     .expect_err("empty runtime hint is rejected before helper discovery");
                 assert!(error.to_string().contains("OMARCHY_PATH must be non-empty"));
             }
-            "runtime-unset" => {
+            "runtime-unset" | "runtime-unset-invalid-state" => {
                 assert!(std::env::var_os("OMARCHY_PATH").is_none());
                 let discovered = OmarchyRuntime::discover();
+                if case == "runtime-unset-invalid-state" {
+                    assert!(
+                        discovered
+                            .as_ref()
+                            .expect_err("empty migration state must be rejected")
+                            .to_string()
+                            .contains("OMARCHY_MIGRATION_STATE must be non-empty")
+                    );
+                }
                 assert!(discovered.as_ref().err().is_none_or(|error| {
                     !error.to_string().contains("OMARCHY_PATH must be non-empty")
                 }));
@@ -1592,8 +1601,8 @@ mod tests {
                     1,
                     u32::try_from(operation).unwrap(),
                 );
-                let error =
-                    probe_existing_lock(&probe).expect_err("kernel lock denial must propagate");
+                let error = inherited_lock(probe.as_raw_fd(), &owner.path().join("probe"))
+                    .expect_err("kernel lock denial must propagate through inherited handoff");
                 let expected = if case == "lock-probe-denied" {
                     "Cannot verify the inherited Omarchy lock"
                 } else {
@@ -1774,7 +1783,10 @@ mod tests {
                 assert!(
                     matches!(
                         case,
-                        "transcript-write" | "transcript-cleanup" | "resize-during-update"
+                        "transcript-write"
+                            | "transcript-cleanup"
+                            | "resize-during-update"
+                            | "resize-forwarded"
                     ),
                     "unknown kernel fixture case"
                 );
@@ -1782,12 +1794,30 @@ mod tests {
                 let log = open_owned_file(&owner.path().join("log")).unwrap();
                 let ready = owner.path().join("go");
                 let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
+                let sleep = crate::core::privilege::root_controlled_program_path("sleep").unwrap();
+                let stty = crate::core::privilege::root_controlled_program_path("stty").unwrap();
                 let runtime = transport_runtime();
                 let fault = async {
                     while log.metadata().unwrap().len() == 0 {
                         tokio::task::yield_now().await;
                     }
-                    if case == "resize-during-update" {
+                    if case == "resize-forwarded" {
+                        rustix::termios::tcsetwinsize(
+                            std::io::stdin(),
+                            rustix::termios::Winsize {
+                                ws_row: 37,
+                                ws_col: 111,
+                                ws_xpixel: 0,
+                                ws_ypixel: 0,
+                            },
+                        )
+                        .unwrap();
+                        nix::sys::signal::kill(
+                            nix::unistd::getpid(),
+                            nix::sys::signal::Signal::SIGWINCH,
+                        )
+                        .unwrap();
+                    } else if case == "resize-during-update" {
                         deny_fixture_syscall_argument(
                             libc::SYS_ioctl,
                             1,
@@ -1814,22 +1844,36 @@ mod tests {
                     }
                     std::fs::write(&ready, b"ready").unwrap();
                 };
+                let script = if case == "resize-forwarded" {
+                    "until test -f \"$1\"; do \"$2\" 0.01; done; until test \"$(\"$3\" size)\" = '37 111'; do \"$2\" 0.01; done; printf resized"
+                } else {
+                    "until test -f \"$1\"; do sleep 0.01; done; printf payload; sleep 1"
+                };
                 let arguments = [
                     "-c",
-                    "until test -f \"$1\"; do sleep 0.01; done; printf payload; sleep 1",
+                    script,
                     "fixture",
                     ready.to_str().unwrap(),
+                    sleep.to_str().unwrap(),
+                    stty.to_str().unwrap(),
                 ];
                 let execution = execute_logged(&shell, &arguments, &lock, &log, &runtime);
                 let ((), result) = tokio::join!(fault, execution);
-                let error = result.expect_err("private transcript write denied");
-                if case == "transcript-cleanup" {
-                    assert!(format!("{error:#}").contains("Transport cleanup failed"));
+                if case == "resize-forwarded" {
+                    result.expect("successful window forwarding completes the coordinator");
                 } else {
-                    assert!(!format!("{error:#}").contains("Transport cleanup failed"));
+                    let error = result.expect_err("private transcript write denied");
+                    if case == "transcript-cleanup" {
+                        assert!(format!("{error:#}").contains("Transport cleanup failed"));
+                    } else {
+                        assert!(!format!("{error:#}").contains("Transport cleanup failed"));
+                    }
                 }
                 let transcript = std::fs::read_to_string(owner.path().join("log")).unwrap();
-                if case == "resize-during-update" {
+                if matches!(case, "resize-during-update" | "resize-forwarded") {
+                    if case == "resize-forwarded" {
+                        assert!(transcript.contains("resized"));
+                    }
                     assert!(transcript.starts_with("OMG Omarchy update started\n"));
                     assert!(transcript.contains("OMG Omarchy update finished:"));
                 } else {
@@ -1847,6 +1891,8 @@ mod tests {
         for (case, diagnostic) in [
             ("empty-runtime", None),
             ("runtime-unset", None),
+            ("runtime-unset-invalid-state", None),
+            ("resize-forwarded", None),
             ("stage-grace", None),
             ("lock-probe-denied", None),
             ("lock-probe-release-denied", None),
@@ -1873,10 +1919,13 @@ mod tests {
         ] {
             let (master, slave) = open_transport_pty(None).unwrap();
             let mut command = Command::new(&launcher);
-            if case == "runtime-unset" {
+            if case.starts_with("runtime-unset") {
                 command.env_remove("OMARCHY_PATH");
             } else {
                 command.env("OMARCHY_PATH", "");
+            }
+            if case == "runtime-unset-invalid-state" {
+                command.env("OMARCHY_MIGRATION_STATE", "");
             }
             let deadline = if case == "stage-grace" {
                 TERMINATION_GRACE + Duration::from_secs(3)
@@ -1968,6 +2017,48 @@ mod tests {
                 format!("exit status: {code}; stdout: out\u{fffd}; stderr: err\u{fffd}")
             );
         }
+    }
+
+    async fn fixture_ready<T: std::fmt::Debug>(
+        operation: impl std::future::Future<Output = T>,
+        ready: impl std::future::Future<Output = ()>,
+        context: &str,
+    ) -> Result<()> {
+        tokio::select! {
+            result = operation => anyhow::bail!("{context}: {result:?}"),
+            () = ready => Ok(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_readiness_preserves_early_completion_and_success() {
+        use std::os::unix::process::ExitStatusExt;
+        fixture_ready(
+            std::future::pending::<Result<()>>(),
+            std::future::ready(()),
+            "ready",
+        )
+        .await
+        .unwrap();
+        let error = fixture_ready(
+            std::future::ready(Err::<(), _>(anyhow::anyhow!("inert failure"))),
+            std::future::pending(),
+            "early failure",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("early failure"));
+        assert!(error.to_string().contains("inert failure"));
+        let status = ExitStatus::from_raw(7 << 8);
+        let error = fixture_ready(
+            std::future::ready(Ok::<_, anyhow::Error>(status)),
+            std::future::pending(),
+            "early exit",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("early exit"));
+        assert!(error.to_string().contains(&format!("{status:?}")));
     }
 
     async fn finish_fixture_prompt(
@@ -3374,6 +3465,7 @@ mod tests {
         let path = owner.path().join("probe");
         let probe = open_owned_file(&path).unwrap();
         let raw = probe.as_raw_fd();
+        let inert_log = open_owned_file(&owner.path().join("inert-log")).unwrap();
         let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
         let mut command = Command::new(shell);
         command
@@ -3388,10 +3480,11 @@ mod tests {
             reason = "inherit one inert descriptor in the owned regression fixture"
         )]
         unsafe {
-            command.pre_exec(move || set_descriptor_inheritance(raw, true));
+            command.pre_exec(transport_inheritance_action(raw, inert_log.as_raw_fd()));
         }
         let mut child = command.spawn().unwrap();
         drop(command);
+        drop(inert_log);
         let mut ready = [0_u8; 5];
         tokio::time::timeout(
             Duration::from_secs(3),
@@ -3595,10 +3688,13 @@ mod tests {
             .await
             .expect("owned child started");
         };
-        tokio::select! {
-            result = &mut operation => panic!("owned child finished before cancellation: {result:?}"),
-            () = started => {},
-        }
+        fixture_ready(
+            &mut operation,
+            started,
+            "owned child finished before cancellation",
+        )
+        .await
+        .expect("fixture must reach readiness");
         drop(operation);
         let pid = commands
             .active
@@ -3640,16 +3736,24 @@ mod tests {
             ready.to_str().expect("private descendant path"),
         ];
         let mut operation = Box::pin(commands.run_program(&program, &arguments));
-        tokio::select! {
-            result = &mut operation => panic!("stage ended before cancellation: {result:?}"),
-            () = async {
+        fixture_ready(
+            &mut operation,
+            async {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while std::fs::read_to_string(&ready).unwrap_or_default().is_empty() {
+                    while std::fs::read_to_string(&ready)
+                        .unwrap_or_default()
+                        .is_empty()
+                    {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                }).await.expect("descendant installed its TERM handler");
-            } => {},
-        }
+                })
+                .await
+                .expect("descendant installed its TERM handler");
+            },
+            "stage ended before cancellation",
+        )
+        .await
+        .expect("fixture must reach readiness");
         drop(operation);
         let leader = commands
             .active
@@ -3688,10 +3792,13 @@ mod tests {
         let mut commands = Commands::new(false, transport_runtime());
         commands.authorization = Some(tokio::spawn(std::future::pending()));
         let mut interrupted = Box::pin(interrupt());
-        tokio::select! {
-            result = &mut interrupted => panic!("signal preceded fixture: {result:?}"),
-            () = tokio::task::yield_now() => {},
-        }
+        fixture_ready(
+            &mut interrupted,
+            tokio::task::yield_now(),
+            "signal preceded fixture",
+        )
+        .await
+        .expect("fixture must reach readiness");
         nix::sys::signal::kill(nix::unistd::getpid(), nix::sys::signal::Signal::SIGHUP)
             .expect("private subprocess hangup signal");
         tokio::time::timeout(Duration::from_secs(5), interrupted)
@@ -3719,10 +3826,13 @@ mod tests {
         );
         commands.authorization = Some(tokio::spawn(std::future::pending()));
         let mut interrupted = Box::pin(interrupt());
-        tokio::select! {
-            result = &mut interrupted => panic!("signal preceded disconnect fixture: {result:?}"),
-            () = tokio::task::yield_now() => {},
-        }
+        fixture_ready(
+            &mut interrupted,
+            tokio::task::yield_now(),
+            "signal preceded disconnect fixture",
+        )
+        .await
+        .expect("fixture must reach readiness");
         std::fs::write(
             root.join("ready"),
             nix::unistd::getpid().as_raw().to_string(),
@@ -3810,10 +3920,13 @@ mod tests {
         };
         let root = PathBuf::from(root);
         let mut interrupted = Box::pin(interrupt());
-        tokio::select! {
-            result = &mut interrupted => panic!("signal preceded output readiness: {result:?}"),
-            () = tokio::task::yield_now() => {},
-        }
+        fixture_ready(
+            &mut interrupted,
+            tokio::task::yield_now(),
+            "signal preceded output readiness",
+        )
+        .await
+        .expect("fixture must reach readiness");
         std::fs::write(root.join("ready"), b"ready").expect("private signal readiness");
         tokio::time::timeout(Duration::from_secs(5), async {
             while !root.join("sealed").is_file() {
@@ -3970,10 +4083,13 @@ mod tests {
         };
         let root = PathBuf::from(root);
         let mut interrupted = Box::pin(interrupt());
-        tokio::select! {
-            result = &mut interrupted => panic!("signal preceded inner readiness: {result:?}"),
-            () = tokio::task::yield_now() => {},
-        }
+        fixture_ready(
+            &mut interrupted,
+            tokio::task::yield_now(),
+            "signal preceded inner readiness",
+        )
+        .await
+        .expect("fixture must reach readiness");
         std::fs::write(
             root.join("ready"),
             nix::unistd::getpid().as_raw().to_string(),
@@ -4423,10 +4539,13 @@ mod tests {
             Some(initial)
         );
         let mut operation = Box::pin(commands.run_program(&program, &["-c", "exec sleep 30"]));
-        tokio::select! {
-            result = &mut operation => panic!("foreground child finished unexpectedly: {result:?}"),
-            () = tokio::time::sleep(Duration::from_millis(100)) => {},
-        }
+        fixture_ready(
+            &mut operation,
+            tokio::time::sleep(Duration::from_millis(100)),
+            "foreground child finished unexpectedly",
+        )
+        .await
+        .expect("fixture must reach readiness");
         drop(operation);
         assert_ne!(
             foreground_group().expect("active foreground"),

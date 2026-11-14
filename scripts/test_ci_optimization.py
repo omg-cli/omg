@@ -310,7 +310,12 @@ git() { printf '%040d\\n' 1; }
         self.assertIn('package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason', selected)
         self.assertIn('package_managers::aur::utils::tests::native_lifecycle_original_user_ownership', selected)
         self.assertEqual(len(selected), len(set(selected)))
-        self.assertEqual(len(selected), 22)
+        self.assertEqual(len(selected), 24)
+        for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
+            name = 'package_managers::arch_install::native_tests::' + test
+            self.assertIn(name, selected)
+            self.assertIn('"$test_name" == ' + name, script)
+
         self.assertIn("package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents", selected)
         self.assertIn('package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes', selected)
         self.assertIn('package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing', selected)

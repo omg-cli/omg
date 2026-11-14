@@ -303,6 +303,8 @@ jobs:
                 local log="$fixture_evidence/$case_id.log"
                 local runner=()
                 if [[ "$test_name" == package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents ||
+                      "$test_name" == package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff ||
+                      "$test_name" == package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff ||
                       "$test_name" == package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason ||
                       "$test_name" == package_managers::aur::utils::tests::native_lifecycle_original_user_ownership ]]; then
                   runner=(env OMG_ARCH_INSTALL_FIXTURE=isolated-container)
@@ -347,6 +349,8 @@ jobs:
                 config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options
                 package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation
                 package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents
+                package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff
+                package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff
                 package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason
                 package_managers::aur::utils::tests::native_lifecycle_original_user_ownership
                 core::usage::tests::elevated_state_roundtrip_preserves_caller_files
