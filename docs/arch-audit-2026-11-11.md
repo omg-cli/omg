@@ -1597,3 +1597,47 @@ requirements are unchanged. A fresh complete hosted coverage verdict and a
 new optimized native build remain required for this batch. The previous
 `91fd5203` optimized bundle remains the latest verified installable artifact;
 it does not contain this audit-exit fix.
+
+
+## Derived database cache boundary batch, November 14
+
+Five focused checks failed against the old cache I/O: persistence followed a
+symlinked parent; loads accepted redirected files, shared writable directories,
+writable or hard-linked files, and FIFO bytes after waiting for a writer. The
+FIFO fixture supplies bounded valid bytes to release the old reader and joins
+its thread, so the failing-before check leaves no active reader behind.
+
+Read and write paths now share descriptor-based directory traversal. They
+reject symlinks, foreign owners and writable ancestors; root-owned sticky
+system temporary directories are allowed as ancestors, but never as the cache
+itself. New directories use mode 0700. Loads require a singly linked regular
+file owned by the effective user, disallow group/other write permissions, use
+nonblocking no-follow opens, enforce a 512 MiB encoded-data bound and recheck
+file identity after reading. This bounds encoded reads, not every allocation
+inside serialization or deserialization.
+
+Persistence creates a mode-0600 exclusive temporary file in the pinned
+directory, writes and syncs it, renames relative to that same descriptor and
+syncs the directory. Failure cleanup also stays descriptor-relative. Rejected
+or unusable derived caches continue to fall back to source database parsing;
+no existing directory permissions are rewritten. Legacy symlinked or shared
+writable cache locations consequently lose the disk-cache fast path.
+
+The unchanged-source local receipt `arch-cache-batch42-validation2-receipt.json`
+records 112 passing database tests (one existing native-only test remains
+ignored), 34 CLI tests, rustfmt and scoped Clippy with warnings denied. The
+existing guest-selected private-protocol test also gains malformed Omarchy
+arity, operation and interaction inputs. Its root execution and the current
+cache source still require fresh native/instrumented evidence. This batch is
+held locally for the next consolidated CI push; the latest installable bundle
+remains the independently verified `c43517d8` pair.
+
+That prior head now has a passing complete instrumented producer with valid
+counters. The unmodified comparison fails first at malformed Omarchy argument
+handling in `src/bin/omg.rs:206`. A diagnostic copy of its per-file loop records
+37 first common-file failures, including actual uncovered paths, compiled-copy
+completion differences and unproved source correspondence. Twenty first
+replaced-construct failures have positive counters on both sides. These are
+not automatically classified as test losses or accepted correspondences.
+The diagnostic skips aggregate acceptance and cannot supply a passing verdict.
+No checker, source rule, coverage threshold, counter or exclusion was changed.

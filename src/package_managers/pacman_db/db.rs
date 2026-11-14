@@ -34,6 +34,7 @@ use crate::runtimes::common::{BudgetedReader, BudgetedSink, BudgetedWriter, deco
 const CACHE_TTL_SECS: u64 = 30 * 60;
 const MAX_DESC_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SYNC_ENTRIES: usize = 100_000;
+const MAX_DERIVED_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Sync database cache, validated against its source identity on reuse.
 static SYNC_DB_CACHE: std::sync::LazyLock<RwLock<DbCache>> =
@@ -1164,27 +1165,86 @@ fn save_cache_to_disk<T: Serialize>(cache: &T, name: &str) -> Result<()> {
     save_cache_to_disk_in(cache, &paths::cache_dir(), name)
 }
 
+fn open_package_cache_directory(path: &Path, create: bool) -> Result<fs::File> {
+    use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
+    use std::path::Component;
+
+    anyhow::ensure!(
+        path.is_absolute(),
+        "Package cache directory must be absolute"
+    );
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let owner = nix::unistd::geteuid().as_raw();
+    let mut directory = fs::File::from(open("/", flags, Mode::empty())?);
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let next = match openat(&directory, name, flags, Mode::empty()) {
+                    Ok(next) => next,
+                    Err(rustix::io::Errno::NOENT) if create => {
+                        match mkdirat(&directory, name, Mode::RWXU) {
+                            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        openat(&directory, name, flags, Mode::empty())?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let next = fs::File::from(next);
+                let metadata = next.metadata()?;
+                // Root-owned sticky temporary directories are safe ancestors,
+                // but the cache itself must have an exclusive writer below them.
+                let sticky_root = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
+                anyhow::ensure!(
+                    (metadata.uid() == owner || metadata.uid() == 0)
+                        && (metadata.mode() & 0o022 == 0 || sticky_root),
+                    "Package cache has an untrusted ancestor: {}",
+                    path.display()
+                );
+                directory = next;
+            }
+            _ => anyhow::bail!("Package cache path must not traverse parent directories"),
+        }
+    }
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(
+        metadata.uid() == owner && metadata.mode() & 0o022 == 0,
+        "Package cache must be owned by the effective user and not writable by others"
+    );
+    Ok(directory)
+}
+
 fn save_cache_to_disk_in<T: Serialize>(cache: &T, cache_dir: &Path, name: &str) -> Result<()> {
-    fs::create_dir_all(cache_dir).with_context(|| {
-        format!(
-            "Failed to create package cache directory: {}",
-            cache_dir.display()
-        )
-    })?;
-    let path = cache_dir.join(format!("{name}.bin"));
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+
+    let directory = open_package_cache_directory(cache_dir, true)?;
     let data = bitcode::serialize(cache)?;
-    let mut file = tempfile::NamedTempFile::new_in(cache_dir).with_context(|| {
-        format!(
-            "Failed to create temporary package cache in {}",
-            cache_dir.display()
-        )
-    })?;
-    file.write_all(&data)?;
-    file.as_file_mut().sync_all()?;
-    file.persist(&path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("Failed to persist package cache at {}", path.display()))?;
-    Ok(())
+    anyhow::ensure!(
+        data.len() as u64 <= MAX_DERIVED_CACHE_BYTES,
+        "Package cache exceeds size limit"
+    );
+    let temporary = format!(".{name}-{}.tmp", uuid::Uuid::new_v4());
+    let mut file = fs::File::from(openat(
+        &directory,
+        &temporary,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    let result = (|| {
+        file.write_all(&data)?;
+        file.sync_all()?;
+        renameat(&directory, &temporary, &directory, format!("{name}.bin"))?;
+        directory.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err()
+        && let Err(error) = unlinkat(&directory, &temporary, AtFlags::empty())
+        && error != rustix::io::Errno::NOENT
+    {
+        tracing::warn!("Failed to remove temporary package cache: {error}");
+    }
+    result
 }
 
 fn persist_cache_best_effort<T: Serialize>(cache: &T, name: &str) {
@@ -1193,30 +1253,8 @@ fn persist_cache_best_effort<T: Serialize>(cache: &T, name: &str) {
     }
 }
 
-/// Load cache from disk.
-///
-/// SECURITY (audit sec04 F1): when omg runs elevated (root via sudo), the
-/// cache directory still belongs to the ORIGINAL user, who is fully
-/// adversarial relative to the root process. Parsing attacker-writable
-/// bytes as trusted derived state lets them poison what root reads/writes.
-/// Elevated runs therefore bypass user-owned derived caches entirely and go
-/// to ground truth (ALPM/dpkg); the cache remains a fast path for the
-/// unprivileged user's own sessions.
+/// Load derived state only through the effective user's trusted cache directory.
 fn load_cache_from_disk<T: for<'de> Deserialize<'de>>(name: &str) -> Result<T> {
-    #[cfg(unix)]
-    if crate::core::is_root() {
-        use std::os::unix::fs::MetadataExt as _;
-        let dir = paths::cache_dir();
-        if let Ok(meta) = std::fs::metadata(&dir)
-            && meta.uid() != 0
-        {
-            tracing::debug!(
-                "Elevated run: ignoring user-owned derived cache {}",
-                dir.display()
-            );
-            anyhow::bail!("derived cache skipped under elevation");
-        }
-    }
     load_cache_from_disk_in(&paths::cache_dir(), name)
 }
 
@@ -1224,8 +1262,39 @@ fn load_cache_from_disk_in<T: for<'de> Deserialize<'de>>(
     cache_dir: &Path,
     name: &str,
 ) -> Result<T> {
-    let path = cache_dir.join(format!("{name}.bin"));
-    let data = fs::read(&path)?;
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let directory = open_package_cache_directory(cache_dir, false)?;
+    let file = fs::File::from(openat(
+        &directory,
+        format!("{name}.bin"),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
+    let before = file.metadata()?;
+    anyhow::ensure!(
+        before.is_file()
+            && before.uid() == nix::unistd::geteuid().as_raw()
+            && before.mode() & 0o022 == 0
+            && before.nlink() == 1,
+        "Derived package cache must be a regular, singly linked file owned by the effective user and not writable by others"
+    );
+    anyhow::ensure!(
+        before.len() <= MAX_DERIVED_CACHE_BYTES,
+        "Package cache exceeds size limit"
+    );
+    let mut data = Vec::new();
+    (&file)
+        .take(MAX_DERIVED_CACHE_BYTES + 1)
+        .read_to_end(&mut data)?;
+    anyhow::ensure!(
+        data.len() as u64 <= MAX_DERIVED_CACHE_BYTES,
+        "Package cache exceeds size limit"
+    );
+    anyhow::ensure!(
+        health_identity(&before) == health_identity(&file.metadata()?),
+        "Package cache changed while reading"
+    );
     let cache: T = bitcode::deserialize(&data)?;
     Ok(cache)
 }
@@ -5407,6 +5476,132 @@ mod tests {
         let fresh = now - std::time::Duration::from_secs(1);
 
         assert!(!is_cache_reusable(Some(now), now, false, Some(fresh)));
+    }
+
+    #[test]
+    fn package_cache_refuses_symlinked_parent_directories() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let owner = tempfile::tempdir()?;
+        let destination = owner.path().join("destination");
+        fs::create_dir(&destination)?;
+        symlink(&destination, owner.path().join("redirect"))?;
+        let cache = owner.path().join("redirect/cache");
+        let result = save_cache_to_disk_in(&LocalDbCache::default(), &cache, "fixture");
+        assert!(
+            result.is_err(),
+            "cache persistence followed a symlinked parent"
+        );
+        assert!(!destination.join("cache/fixture.bin").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_symlinked_cache_files() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let owner = tempfile::tempdir()?;
+        let target = owner.path().join("target.bin");
+        fs::write(&target, bitcode::serialize(&LocalDbCache::default())?)?;
+        symlink(&target, owner.path().join("fixture.bin"))?;
+        let loaded = load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture");
+        assert!(loaded.is_err(), "derived cache accepted a redirected file");
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_shared_writable_directories() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = tempfile::tempdir()?;
+        let cache = owner.path().join("shared");
+        fs::create_dir(&cache)?;
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o777))?;
+        fs::write(
+            cache.join("fixture.bin"),
+            bitcode::serialize(&LocalDbCache::default())?,
+        )?;
+        let loaded = load_cache_from_disk_in::<LocalDbCache>(&cache, "fixture");
+        let saved = save_cache_to_disk_in(&LocalDbCache::default(), &cache, "other");
+        assert!(
+            loaded.is_err(),
+            "derived cache trusted a shared writable directory"
+        );
+        assert!(
+            saved.is_err(),
+            "derived cache wrote into a shared writable directory"
+        );
+        assert!(!cache.join("other.bin").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_writable_and_hardlinked_files() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let owner = tempfile::tempdir()?;
+        let path = owner.path().join("fixture.bin");
+        fs::write(&path, bitcode::serialize(&LocalDbCache::default())?)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        let writable_accepted =
+            load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture").is_ok();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        fs::hard_link(&path, owner.path().join("alias.bin"))?;
+        let hardlink_accepted =
+            load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture").is_ok();
+        assert_eq!(
+            [writable_accepted, hardlink_accepted],
+            [false, false],
+            "unsafe cache files were accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_refuses_fifo_without_waiting_for_its_writer() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let path = owner.path().join("fixture.bin");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let directory = owner.path().to_owned();
+        let (done, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = load_cache_from_disk_in::<LocalDbCache>(&directory, "fixture");
+            done.send(result.map(|_| ())).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            if let Ok(result) = received.try_recv() {
+                break result;
+            }
+            match fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&path)
+            {
+                Ok(mut writer) => {
+                    // Release a blocked old reader so failing-before proof leaves no live thread.
+                    if let Err(error) =
+                        writer.write_all(&bitcode::serialize(&LocalDbCache::default())?)
+                    {
+                        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+                    }
+                    drop(writer);
+                    break received.recv_timeout(std::time::Duration::from_secs(5))?;
+                }
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {}
+                Err(error) => return Err(error.into()),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "FIFO reader did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        reader.join().unwrap();
+        assert!(
+            result.is_err(),
+            "cache reader waited for and accepted FIFO bytes"
+        );
+        Ok(())
     }
 
     #[test]

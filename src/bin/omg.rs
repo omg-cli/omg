@@ -2053,6 +2053,18 @@ mod fast_path_tests {
             args(&["omg", "install-plan", "--"]),
             args(&["omg", "install-plan", "--", "invalid"]),
             args(&["omg", "install-plan", "--", "invalid", "extra"]),
+            args(&["omg", "omarchy-native", "--"]),
+            args(&["omg", "omarchy-native", "--", "cache-prune"]),
+            args(&[
+                "omg",
+                "omarchy-native",
+                "--",
+                "cache-prune",
+                "attended",
+                "extra",
+            ]),
+            args(&["omg", "omarchy-native", "--", "invalid", "attended"]),
+            args(&["omg", "omarchy-native", "--", "cache-prune", "invalid"]),
         ] {
             let result = super::try_fast_elevated(&argv, true, true);
             if omg_lib::core::privilege::is_root() {
