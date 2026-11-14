@@ -143,7 +143,7 @@ function largeCveFixture(id = "CVE-2026-1234", bytes = 2_402_038): string {
 }
 
 test("real workerd route roundtrips a structured 2.4 MB CVE through private R2 and small D1 rows", async () => {
-    const {sha256, string} = await import("../src/domain");
+    const {sha256, string, parseCve} = await import("../src/domain");
     const build = await Bun.build({entrypoints: [new URL("../src/index.ts", import.meta.url).pathname], target: "browser"});
     expect(build.success).toBe(true);
     const output = build.outputs[0];
@@ -185,6 +185,30 @@ test("real workerd route roundtrips a structured 2.4 MB CVE through private R2 a
         expect(row.scalar_bytes).toBeLessThan(1024);
         const bucket = await runtime.getR2Bucket("RAW");
         expect(await (await bucket.get(row.object_key))?.text()).toBe(raw);
+        const bulkRecords = [largeCveFixture("CVE-2026-1240"),
+            ...Array.from({length: 7}, (_, index) => JSON.stringify({
+                dataType: "CVE_RECORD", dataVersion: "5.2",
+                cveMetadata: {cveId: `CVE-2026-${2000+index}`, state: "PUBLISHED",
+                    dateUpdated: now, datePublished: now},
+                containers: {cna: {}},
+            }))];
+        const bulkWire = JSON.stringify({source: "cve", records: bulkRecords});
+        expect(Buffer.byteLength(bulkWire)).toBeLessThanOrEqual(4 * 1024 ** 2);
+        const bulk = await worker.fetch("https://advisories.example/internal/ingest", {
+            method: "POST", headers: {authorization: `Bearer ${token}`}, body: bulkWire,
+        });
+        expect(bulk.status).toBe(200);
+        expect(object(await bulk.json()).accepted).toBe(8);
+        for (const expected of bulkRecords) {
+            const response = await worker.fetch(`https://advisories.example/v1/cves/${parseCve(expected).id}`);
+            expect(response.status).toBe(200);
+            const body = object(await response.json());
+            expect(string(body.payload_json)).toBe(expected);
+            expect(object(body.provenance).payload_sha256).toBe(await sha256(expected));
+            expect(body.package_applicability).toBe("unknown");
+        }
+        expect(await db.prepare("SELECT COUNT(*) AS count FROM source_record").first<{count: number}>())
+            .toEqual({count: 9});
         const over = JSON.stringify({source: "cve", records: [largeCveFixture("CVE-2026-1235", 3 * 1024 ** 2 + 1)]});
         expect(Buffer.byteLength(over)).toBeLessThan(4 * 1024 ** 2);
         const refused = await worker.fetch("https://advisories.example/internal/ingest", {method: "POST", headers: {authorization: `Bearer ${token}`}, body: over});

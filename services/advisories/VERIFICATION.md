@@ -1,5 +1,11 @@
 # Local verification receipt
 
+## Bounded concurrent imports, November 14
+
+The new gated import test first failed with one started write where four were required. The route now groups records by CVE ID and runs at most four groups concurrently. Each group's revisions remain serial. All started promises settle before the lease is released, preserving fenced writes when another group fails. New tests check the concurrency bound, lease retention through failure, rejected-version ordering and conflicting equal revisions.
+
+All 43 service tests and 327 assertions pass, along with type checking and deployment dry run. The real workerd/D1/R2 test additionally imports eight records in one request, including a structured 2.4 MB CVE, and verifies each returned payload and SHA-256. Existing row-read, request-size, lease-expiry and incomplete-baseline checks remain. No request limit, retry count, timeout or bootstrap acceptance rule changed. Production deployment and further backfill verification are recorded separately; these local checks do not certify a complete corpus.
+
 Run date 2026-11-13 UTC. Owner is the advisory-service implementation agent. Scope is `services/advisories/**`. No Cloudflare resources, secrets, deployed Workers or remote databases were changed. The full corpus ZIP was not downloaded.
 
 TDD first failed on the public status contract. Expected HTTP 200, received 503. The implementation then passed that behavior against the real SQLite migration. A subsequent actual workerd run exposed unsupported `redirect:'error'`; source fetches now use Workers-supported `manual` and reject redirect responses, with a regression test.

@@ -59,12 +59,13 @@ function cve(
     state = "PUBLISHED",
     modified = "2026-11-12T00:00:00.000Z",
     schema = "5.2",
+    id = "CVE-2026-1234",
 ) {
     return JSON.stringify({
         dataType: "CVE_RECORD",
         dataVersion: schema,
         cveMetadata: {
-            cveId: "CVE-2026-1234",
+            cveId: id,
             state,
             dateUpdated: modified,
             datePublished: "2026-11-11T00:00:00Z",
@@ -95,6 +96,132 @@ const req = (path: string, method = "GET", body?: string, auth?: string) =>
         body,
         headers: auth ? { authorization: `Bearer ${auth}` } : {},
     });
+function gate() {
+    let release: () => void = () => { throw new Error("gate not initialized"); };
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    return { blocked, release: () => release() };
+}
+
+test("independent CVE imports use at most four concurrent fenced writes", async () => {
+    const { store, db, objects } = setup();
+    const started = gate(), finish = gate();
+    let launched = 0, active = 0, peak = 0;
+    const original = store.writer.bind(store);
+    store.writer = (...args: Parameters<Store["writer"]>) => {
+        const writer = original(...args), write = writer.cve.bind(writer);
+        writer.cve = async (...values: Parameters<Store["cve"]>) => {
+            launched++;
+            active++;
+            peak = Math.max(peak, active);
+            started.release();
+            try {
+                await finish.blocked;
+                await write(...values);
+            } finally { active--; }
+        };
+        return writer;
+    };
+    const records = Array.from({ length: 8 }, (_, i) => cve("PUBLISHED", now, "5.2", `CVE-2026-${2000+i}`));
+    const pending = handle(req("/internal/ingest", "POST", JSON.stringify({ source: "cve", records }), token), store, token, now);
+    try {
+        await started.blocked;
+        expect(launched).toBe(4);
+        finish.release();
+        expect((await pending).status).toBe(200);
+        expect(peak).toBe(4);
+        expect(objects.size).toBe(8);
+        expect(db.query("SELECT COUNT(*) AS count FROM source_record").get()).toEqual({ count: 8 });
+        expect(db.query("SELECT COUNT(*) AS count FROM ingestion_lease").get()).toEqual({ count: 0 });
+    } finally {
+        finish.release();
+        await Promise.allSettled([pending]);
+        db.close();
+    }
+});
+
+test("failed CVE groups drain started writes before releasing the lease", async () => {
+    const { store, db } = setup();
+    const started = gate(), fail = gate(), finish = gate();
+    const writes: Promise<void>[] = [];
+    const original = store.writer.bind(store);
+    store.writer = (...args: Parameters<Store["writer"]>) => {
+        const writer = original(...args), write = writer.cve.bind(writer);
+        writer.cve = (...values: Parameters<Store["cve"]>) => {
+            const pending = (async () => {
+                if (parseCve(values[0]).id === "CVE-2026-2000") {
+                    started.release();
+                    await fail.blocked;
+                    throw new Error("R2 failure");
+                }
+                await finish.blocked;
+                await write(...values);
+            })();
+            writes.push(pending);
+            return pending;
+        };
+        return writer;
+    };
+    const records = [2000, 2001].map((id) => cve("PUBLISHED", now, "5.2", `CVE-2026-${id}`));
+    const pending = handle(req("/internal/ingest", "POST", JSON.stringify({ source: "cve", records }), token), store, token, now);
+    try {
+        await started.blocked;
+        fail.release();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(db.query("SELECT COUNT(*) AS count FROM ingestion_lease").get()).toEqual({ count: 1 });
+        finish.release();
+        expect((await pending).status).toBe(503);
+        await Promise.allSettled(writes);
+        expect(db.query("SELECT id FROM source_record").all()).toEqual([{ id: "CVE-2026-2001" }]);
+        expect(db.query("SELECT COUNT(*) AS count FROM ingestion_lease").get()).toEqual({ count: 0 });
+    } finally {
+        fail.release(); finish.release();
+        await Promise.allSettled([pending, ...writes]);
+        db.close();
+    }
+});
+
+test("concurrent imports preserve serial revision checks for each CVE identity", async () => {
+    const { store, db } = setup();
+    const active = new Set<string>();
+    let overlap = false;
+    const original = store.writer.bind(store);
+    store.writer = (...args: Parameters<Store["writer"]>) => {
+        const writer = original(...args), write = writer.cve.bind(writer);
+        writer.cve = async (...values: Parameters<Store["cve"]>) => {
+            const id = parseCve(values[0]).id;
+            overlap ||= active.has(id);
+            active.add(id);
+            try { await write(...values); }
+            finally { active.delete(id); }
+        };
+        return writer;
+    };
+    const records = [2000, 2001].map((id) => cve("PUBLISHED", "2026-11-12T00:00:00Z", "5.2", `CVE-2026-${id}`));
+    records.push(...[2000, 2001].map((id) => cve("REJECTED", now, "5.2", `CVE-2026-${id}`)), ...records);
+    try {
+        const response = await handle(req("/internal/ingest", "POST", JSON.stringify({ source: "cve", records }), token), store, token, now);
+        expect(response.status).toBe(200);
+        expect(overlap).toBe(false);
+        expect(db.query("SELECT id,state FROM cve ORDER BY id").all()).toEqual([
+            { id: "CVE-2026-2000", state: "REJECTED" }, { id: "CVE-2026-2001", state: "REJECTED" },
+        ]);
+    } finally { db.close(); }
+});
+
+test("conflicting equal revisions still refuse within a concurrent import", async () => {
+    const { store, db } = setup();
+    const original = cve();
+    const records = [original, cve("PUBLISHED", now, "5.2", "CVE-2026-2000"),
+        original.replace('"original"', '"different"')];
+    try {
+        const response = await handle(req("/internal/ingest", "POST", JSON.stringify({ source: "cve", records }), token), store, token, now);
+        expect(response.status).toBe(503);
+        expect(db.query("SELECT payload_sha256 FROM source_record WHERE id='CVE-2026-1234'").get())
+            .toEqual({ payload_sha256: await sha256(original) });
+        expect(db.query("SELECT COUNT(*) AS count FROM ingestion_lease").get()).toEqual({ count: 0 });
+    } finally { db.close(); }
+});
+
 async function json(response: Response) {
     return object(await response.json());
 }

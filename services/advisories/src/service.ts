@@ -10,6 +10,7 @@ import {
 } from "./domain";
 import { parseBatch } from "./ingestion";
 import { Store, type Checkpoint, type RecordRow } from "./storage";
+const INGEST_CONCURRENCY = 4;
 async function authorized(
     request: Request,
     token: string | undefined,
@@ -108,19 +109,35 @@ export async function handle(
                 const baseline = binding
                     ? await baselineSession(writer, binding, url.origin)
                     : null;
+                const byId = new Map<string, string[]>();
                 for (const raw of records) {
-                    await writer.cve(raw, now);
-                    if (baseline)
-                        await writer.sql.batch([
-                            {
-                                sql: "INSERT INTO baseline_member(session_id,cve_id,payload_sha256) VALUES(?,?,?) ON CONFLICT(session_id,cve_id) DO NOTHING",
-                                values: [baseline.session_id, parseCve(raw).id, await sha256(raw)],
-                            },
-                            {
-                                sql: "UPDATE baseline_receipt SET caught_up=0,completed_at=NULL WHERE session_id=?",
-                                values: [baseline.session_id],
-                            },
-                        ]);
+                    const id = parseCve(raw).id;
+                    const group = byId.get(id);
+                    if (group) group.push(raw);
+                    else byId.set(id, [raw]);
+                }
+                const groups = [...byId.values()];
+                for (let start = 0; start < groups.length; start += INGEST_CONCURRENCY) {
+                    const outcomes = await Promise.allSettled(
+                        groups.slice(start, start + INGEST_CONCURRENCY).map(async (group) => {
+                            for (const raw of group) {
+                                await writer.cve(raw, now);
+                                if (baseline)
+                                    await writer.sql.batch([
+                                        {
+                                            sql: "INSERT INTO baseline_member(session_id,cve_id,payload_sha256) VALUES(?,?,?) ON CONFLICT(session_id,cve_id) DO NOTHING",
+                                            values: [baseline.session_id, parseCve(raw).id, await sha256(raw)],
+                                        },
+                                        {
+                                            sql: "UPDATE baseline_receipt SET caught_up=0,completed_at=NULL WHERE session_id=?",
+                                            values: [baseline.session_id],
+                                        },
+                                    ]);
+                            }
+                        }),
+                    );
+                    const failed = outcomes.find((outcome) => outcome.status === "rejected");
+                    if (failed) throw failed.reason;
                 }
             } finally {
                 await store.release("cve", owner);
