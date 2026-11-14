@@ -30,6 +30,52 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'Ubuntu dependency bootstrap uses POSIX shell tools')
+    def test_python_workflow_bootstrap_avoids_unreachable_azure_mirrors(self):
+        script = step_script('ci.yml', 'Install Python workflow test dependencies')
+        for scenario in ('azure', 'healthy', 'missing'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'private fixture'
+                root.mkdir()
+                mirrors, calls = root / 'mirrors.txt', root / 'calls.jsonl'
+                if scenario != 'missing':
+                    mirrors.write_text(('http://azure.archive.ubuntu.com/ubuntu\n' if scenario == 'azure' else '')
+                                       + 'https://archive.ubuntu.com/ubuntu\n')
+                helper = root / 'apt.py'
+                helper.write_text(
+                    'import json,os,sys\nfrom pathlib import Path\n'
+                    'mirror=Path(os.environ["APT_MIRROR_FIXTURE"])\n'
+                    'if sys.argv[1]=="update" and mirror.exists() and "http://azure.archive.ubuntu.com" in mirror.read_text():\n'
+                    '    sys.exit("unreachable Azure mirror retained")\n'
+                    'with open(os.environ["APT_CALLS"],"a") as output: output.write(json.dumps(sys.argv[1:])+"\\n")\n')
+                prefix = '''sudo() {
+  case "$1" in
+    sed)
+      test "${@: -1}" = "$APT_MIRROR_FIXTURE"
+      command "$@"
+      ;;
+    apt-get)
+      shift
+      "$TEST_PYTHON" "$APT_HELPER" "$@"
+      ;;
+    *) return 97 ;;
+  esac
+}
+'''
+                relocated = script.replace('/etc/apt/apt-mirrors.txt', shlex.quote(str(mirrors)))
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', prefix + relocated],
+                    env=dict(os.environ, APT_MIRROR_FIXTURE=str(mirrors), APT_CALLS=str(calls),
+                             APT_HELPER=str(helper), TEST_PYTHON=sys.executable),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()], [
+                    ['update', '--error-on=any'],
+                    ['install', '-y', '--no-install-recommends', 'python3-venv'],
+                ])
+                if mirrors.exists():
+                    self.assertNotIn('http://azure.archive.ubuntu.com', mirrors.read_text())
+                    self.assertIn('https://archive.ubuntu.com/ubuntu', mirrors.read_text())
+
     @unittest.skipIf(os.name == "nt", "The hosted service workflow uses POSIX executable scripts")
     def test_advisory_service_is_verified_without_remote_deployment(self):
         workflow = job_block((WORKFLOWS / 'ci.yml').read_text(), 'workflow-checks')

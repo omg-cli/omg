@@ -120,6 +120,10 @@ jobs:
       - name: Install Python workflow test dependencies
         if: needs.quick-gate.outputs.checks-required == 'true'
         run: |
+          workflow_apt_mirrors=/etc/apt/apt-mirrors.txt
+          if test -f "$workflow_apt_mirrors"; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$workflow_apt_mirrors"
+          fi
           sudo apt-get update --error-on=any
           sudo apt-get install -y --no-install-recommends python3-venv
 

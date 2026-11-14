@@ -1553,19 +1553,22 @@ mod tests {
                 }));
             }
             "stage-grace" => {
+                use tokio::io::AsyncWriteExt;
                 let ready = owner.path().join("ready");
                 let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
-                let child = Command::new(shell)
+                let mut child = Command::new(shell)
                     .args([
                         "-c",
-                        "trap '' TERM; printf ready > \"$1\"; sleep 30",
+                        "trap '' TERM; read -r gate && test \"$gate\" = ready || exit 1; printf ready > \"$1\"; sleep 30",
                         "fixture",
                         ready.to_str().unwrap(),
                     ])
+                    .stdin(Stdio::piped())
                     .process_group(0)
                     .kill_on_drop(true)
                     .spawn()
                     .unwrap();
+                let mut readiness_gate = Some(child.stdin.take().expect("private readiness pipe"));
                 let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap());
                 let mut cleanup = FixtureGroup(Some(pid));
                 let mut commands = Commands::new(false, transport_runtime());
@@ -1581,10 +1584,13 @@ mod tests {
                                 .unwrap()
                                 .is_none()
                         );
-                        tokio::task::yield_now().await;
-                        if ready.is_file() {
+                        if let Some(mut gate) = readiness_gate.take() {
+                            assert!(!ready.is_file(), "child waits for the initial parent probe");
+                            gate.write_all(b"ready\n").await.unwrap();
+                        } else if ready.is_file() {
                             break;
                         }
+                        tokio::task::yield_now().await;
                     }
                 })
                 .await
