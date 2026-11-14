@@ -1307,3 +1307,32 @@ verification receipt. Both archived binary hashes were independently checked
 against the optimized build and guest receipts. Host installation was not
 changed. This proves the candidate runtime, not full coverage or completion of
 the broader Arch/AUR/Cloudflare security audit.
+
+
+The next coverage-led Omarchy batch inspected the exact hosted artifact before
+editing. Its 61 uncovered mapped lines divide into 27 production lines and 34
+test-fixture/failure-diagnostic lines; all 234 function entries were hit. This
+contradicts the premise that more happy-path scenarios alone will clear the
+gate. The retained `native28-coverage-triage.json` records exact artifact/source
+hashes and each uncovered line without changing evidence or acceptance rules.
+
+Two behavioral regressions reproduced failures before the fix. Startup
+containment admitted the supported `omg u` alias with inherited transport
+handles still missing FD_CLOEXEC. The expanded matrix also covers global flags
+before the command and clustered short options against the actual CLI parser,
+plus malformed/non-UTF-8 log descriptors. Startup now uses that parser for
+noncanonical update invocations, before unrelated helpers can inherit the
+claimed transport. Ordinary commands with no transport retain a cheap return.
+
+The existing isolated pipe fixture also reproduced absent input leaving its
+owned coordinator waiting past the three-second deadline: “closed stdin must
+forward EOF instead of stranding the coordinator: Elapsed(())”. The input model
+now distinguishes EOF awaiting forwarding from a stream whose EOF has already
+been forwarded. Real PTY tests verify one EOF, successful coordinator exit and
+the durable completion footer; the parent test's stdin is never closed.
+
+Both regressions pass. Final normal checks pass 2415 library tests (13 existing
+ignores), all 32 CLI unit tests, default/minimal/Debian-pure all-target Clippy
+with warnings denied and normal binaries. Instrumented, guest and optimized
+verification of this new runtime remain required before publication. Coverage
+thresholds, exclusions, source identity and counters remain unchanged.

@@ -883,13 +883,20 @@ fn transport_descriptor(value: &str) -> Result<i32> {
 /// Restrict update transport inheritance before CLI initialization can launch helpers.
 #[doc(hidden)]
 pub fn contain_inherited_transport(args: &[String]) -> Result<()> {
-    if args.get(1).map(String::as_str) != Some("update") {
+    use clap::Parser;
+    let lock = std::env::var_os(LOCK_FD);
+    let log = std::env::var_os(LOG_FD);
+    if lock.is_none() && log.is_none() {
         return Ok(());
     }
-    let (lock, log) = match (std::env::var_os(LOCK_FD), std::env::var_os(LOG_FD)) {
-        (None, None) => return Ok(()),
-        (Some(lock), Some(log)) => (lock, log),
-        _ => anyhow::bail!("Incomplete Omarchy update transport"),
+    if args.get(1).map(String::as_str) != Some("update")
+        && !crate::cli::Cli::try_parse_from(args)
+            .is_ok_and(|cli| matches!(cli.command, crate::cli::Commands::Update { .. }))
+    {
+        return Ok(());
+    }
+    let (Some(lock), Some(log)) = (lock, log) else {
+        anyhow::bail!("Incomplete Omarchy update transport");
     };
     let lock = transport_descriptor(
         lock.to_str()
@@ -1004,6 +1011,8 @@ impl Drop for TerminalMode {
 enum PtyInput {
     Pollable(tokio::io::unix::AsyncFd<File>),
     Regular(tokio::fs::File),
+    Eof,
+    // EOF has already been forwarded to the coordinator.
     Closed,
 }
 
@@ -1013,6 +1022,7 @@ impl PtyInput {
         match self {
             Self::Pollable(input) => read_pty(input, buffer).await,
             Self::Regular(input) => input.read(buffer).await,
+            Self::Eof => Ok(0),
             Self::Closed => std::future::pending().await,
         }
     }
@@ -1038,7 +1048,7 @@ fn terminal_input() -> Result<(PtyInput, Option<TerminalMode>)> {
     {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((PtyInput::Closed, None));
+            return Ok((PtyInput::Eof, None));
         }
         Err(error) => return Err(error).context("Cannot open update input"),
     };
@@ -2213,6 +2223,32 @@ mod tests {
         let log = open_owned_file(&root.join("log")).expect("private pipe transcript");
         let shell =
             crate::core::privilege::root_controlled_program_path("sh").expect("system shell");
+        if std::env::var_os("OMG_OMARCHY_MISSING_STDIN_FIXTURE").is_some() {
+            let _signals = Interruptions::new().expect("register signals before closing stdin");
+            nix::unistd::close(nix::libc::STDIN_FILENO)
+                .expect("close input only in isolated fixture");
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                execute_logged(
+                    &shell,
+                    &[
+                        "-c",
+                        "if IFS= read -r answer; then exit 19; fi; printf 'EOF received\\n'",
+                    ],
+                    &lock,
+                    &log,
+                    &transport_runtime(),
+                ),
+            )
+            .await
+            .expect("closed stdin must forward EOF instead of stranding the coordinator")
+            .expect("coordinator accepts absent input as EOF");
+            let transcript =
+                std::fs::read_to_string(root.join("log")).expect("absent-input transcript");
+            assert!(transcript.contains("EOF received"));
+            assert!(transcript.contains("OMG Omarchy update finished: exit status: 0"));
+            return;
+        }
         execute_logged(
             &shell,
             &["-c", "printf 'Enter value: '; IFS= read -r value; printf 'received:<%s>\\n' \"$value\"; if IFS= read -r extra; then exit 19; fi"],
@@ -2226,6 +2262,36 @@ mod tests {
         assert!(
             transcript.contains("OMG Omarchy update finished: exit status: 0"),
             "{transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_closed_input_forwards_eof_to_the_owned_coordinator() {
+        let owner = private_directory();
+        let output = tokio::time::timeout(
+            Duration::from_secs(8),
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "cli::packages::update::omarchy::tests::terminal_input_pipe_fixture",
+                    "--nocapture",
+                ])
+                .env("OMG_OMARCHY_PIPE_FIXTURE", owner.path())
+                .env("OMG_OMARCHY_MISSING_STDIN_FIXTURE", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("absent input fixture stays bounded")
+        .expect("absent input fixture output");
+        assert!(
+            output.status.success(),
+            "closed-input fixture failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -3601,15 +3667,38 @@ mod tests {
         };
         let mode = mode.to_str().expect("fixture mode");
         let command = if mode == "other" { "status" } else { "update" };
-        let args = vec!["omg".to_owned(), command.to_owned()];
+        let args = match mode {
+            "alias" => vec!["omg", "u"],
+            "global-prefix" => vec!["omg", "--verbose", "--json", "update"],
+            "clustered-prefix" => vec!["omg", "-vvq", "u"],
+            _ => vec!["omg", command],
+        }
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        if matches!(mode, "alias" | "global-prefix" | "clustered-prefix") {
+            use clap::Parser;
+            assert!(matches!(
+                crate::cli::Cli::try_parse_from(&args)
+                    .expect("supported update invocation")
+                    .command,
+                crate::cli::Commands::Update { .. }
+            ));
+        }
         let result = contain_inherited_transport(&args);
-        if matches!(mode, "valid" | "absent" | "other") {
+        if matches!(
+            mode,
+            "valid" | "alias" | "global-prefix" | "clustered-prefix" | "absent" | "other"
+        ) {
             result.expect("valid transport or unrelated command is admitted");
         } else {
             result.expect_err("malformed transport is refused before initialization");
             return;
         }
-        if mode != "valid" {
+        if !matches!(
+            mode,
+            "valid" | "alias" | "global-prefix" | "clustered-prefix"
+        ) {
             return;
         }
         contain_inherited_transport(&args).expect("containment is idempotent");
@@ -3663,6 +3752,9 @@ mod tests {
         let lock_fd = lock.as_raw_fd();
         let log_fd = log.as_raw_fd();
         for mode in [
+            "alias",
+            "global-prefix",
+            "clustered-prefix",
             "valid",
             "absent",
             "other",
@@ -3674,6 +3766,9 @@ mod tests {
             "stdio",
             "overlap",
             "encoding",
+            "log-encoding",
+            "log-malformed",
+            "both-encoding",
             "closed",
         ] {
             let mut command = Command::new(std::env::current_exe().expect("test executable"));
@@ -3699,7 +3794,7 @@ mod tests {
                         "negative" => OsString::from("-3"),
                         "overflow" => OsString::from("2147483648"),
                         "stdio" => OsString::from("0"),
-                        "encoding" => OsString::from_vec(vec![0xff]),
+                        "encoding" | "both-encoding" => OsString::from_vec(vec![0xff]),
                         "closed" => OsString::from(i32::MAX.to_string()),
                         _ => OsString::from(lock_fd.to_string()),
                     };
@@ -3708,10 +3803,11 @@ mod tests {
                 if mode != "missing-log" && mode != "other" {
                     command.env(
                         LOG_FD,
-                        if mode == "overlap" {
-                            format!("0{lock_fd}")
-                        } else {
-                            log_fd.to_string()
+                        match mode {
+                            "overlap" => OsString::from(format!("0{lock_fd}")),
+                            "log-encoding" | "both-encoding" => OsString::from_vec(vec![0xff]),
+                            "log-malformed" => OsString::from("invalid"),
+                            _ => OsString::from(log_fd.to_string()),
                         },
                     );
                 }
