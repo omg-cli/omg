@@ -1318,10 +1318,8 @@ async fn execute_logged(
                     cancellation = Some(anyhow::anyhow!("Omarchy update interrupted; inspect the update log before retrying"));
                     interrupt_coordinator(&child)?;
                 }
-                _ = resized.recv(), if resize_terminal.is_some() => {
-                    if let Some(terminal) = &resize_terminal {
-                        rustix::termios::tcsetwinsize(master.get_ref(), rustix::termios::tcgetwinsize(terminal)?)?;
-                    }
+                Some(terminal) = async { resized.recv().await.and(resize_terminal.as_ref()) }, if resize_terminal.is_some() => {
+                    rustix::termios::tcsetwinsize(master.get_ref(), rustix::termios::tcgetwinsize(terminal)?)?;
                 }
             }
         }
