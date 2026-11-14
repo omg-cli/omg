@@ -410,7 +410,8 @@ mod tests {
                     &existing,
                     Some(nix::unistd::Uid::from_raw(0)),
                     Some(nix::unistd::Gid::from_raw(0)),
-                )?;
+                )
+                .expect("root fixture restores lifecycle ownership before testing refusal");
                 drop(existing);
                 let error = open_build_lifecycle_lock(&build)
                     .expect_err("an existing inode owned by root must not impersonate nobody");

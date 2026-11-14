@@ -1562,7 +1562,7 @@ mod tests {
                 let mut commands = Commands::new(false, transport_runtime());
                 commands.active = Some(child);
                 tokio::time::timeout(Duration::from_secs(3), async {
-                    while !ready.is_file() {
+                    loop {
                         assert!(
                             commands
                                 .active
@@ -1573,6 +1573,9 @@ mod tests {
                                 .is_none()
                         );
                         tokio::task::yield_now().await;
+                        if ready.is_file() {
+                            break;
+                        }
                     }
                 })
                 .await

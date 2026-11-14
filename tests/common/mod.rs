@@ -747,9 +747,13 @@ impl TestProject {
     }
 
     #[cfg(feature = "arch")]
-    pub fn run_native_arch_status(&self, socket: &Path) -> CommandResult {
+    pub fn run_native_arch_status(&self, socket: &Path, args: &[&str]) -> CommandResult {
+        assert!(matches!(
+            args,
+            ["status" | "daemon-status"] | ["status", "--fast"]
+        ));
         self.run_native_arch_readonly_report(
-            &["status"],
+            args,
             &[
                 ("OMG_DISABLE_DAEMON", "0"),
                 ("OMG_SOCKET_PATH", Self::utf8_path(socket)),
@@ -1061,7 +1065,7 @@ pub fn assert_empty_daemon_status(response: omg_lib::daemon::protocol::Response,
                 (0, 0, 0, 0)
             );
             assert!(!status.vulnerabilities_scanned);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
             assert!(status.runtime_versions.is_empty());
         }
         other => panic!("empty isolated status returned {other:?}"),

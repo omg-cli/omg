@@ -2136,16 +2136,6 @@ fn validate_health_relations(packages: &HashMap<String, LocalDbPackage>) -> Resu
     Ok(())
 }
 
-/// Identify potential AUR packages (installed but not in any sync database).
-///
-/// Excludes packages from ALL sync databases (official + custom repos).
-pub fn get_potential_aur_packages() -> Result<Vec<String>> {
-    Ok(get_potential_aur_package_records()?
-        .into_iter()
-        .map(|package| package.name)
-        .collect())
-}
-
 /// Read foreign identities and metadata from the same epoch-checked cached catalogs.
 pub(crate) fn get_potential_aur_package_records() -> Result<Vec<LocalDbPackage>> {
     let before = AlpmCatalogEpoch::observe()?;
@@ -2384,7 +2374,14 @@ mod tests {
             |db| {
                 batch2_write_sync(&db.join("sync/unconfigured.db"), "99-1");
                 assert!(check_updates_cached().unwrap().is_empty());
-                assert_eq!(get_potential_aur_packages().unwrap(), ["widget"]);
+                assert_eq!(
+                    get_potential_aur_package_records()
+                        .unwrap()
+                        .into_iter()
+                        .map(|package| package.name)
+                        .collect::<Vec<_>>(),
+                    ["widget"]
+                );
             },
         );
     }
@@ -2407,7 +2404,14 @@ mod tests {
                 assert_eq!(held[0].name, "widget");
                 assert_eq!(held[0].version.to_string(), "1-1");
                 assert_eq!(held[0].groups, ["reviewed-group"]);
-                assert_eq!(get_potential_aur_packages().unwrap(), ["widget"]);
+                assert_eq!(
+                    get_potential_aur_package_records()
+                        .unwrap()
+                        .into_iter()
+                        .map(|package| package.name)
+                        .collect::<Vec<_>>(),
+                    ["widget"]
+                );
 
                 fs::write(
                     &desc,
@@ -2420,7 +2424,14 @@ mod tests {
                 assert_eq!(fresh[0].name, "widget");
                 assert_eq!(fresh[0].version.to_string(), "2-1");
                 assert_eq!(fresh[0].groups, ["new-group"]);
-                assert_eq!(get_potential_aur_packages().unwrap(), ["widget"]);
+                assert_eq!(
+                    get_potential_aur_package_records()
+                        .unwrap()
+                        .into_iter()
+                        .map(|package| package.name)
+                        .collect::<Vec<_>>(),
+                    ["widget"]
+                );
 
                 assert_eq!(held[0].name, "widget");
                 assert_eq!(held[0].version.to_string(), "1-1");
@@ -2511,14 +2522,14 @@ mod tests {
                     updates.is_err(),
                     "incomplete update catalog succeeded: {updates:?}"
                 );
-                let foreign = get_potential_aur_packages();
+                let foreign = get_potential_aur_package_records();
                 assert!(
                     foreign.is_err(),
                     "incomplete foreign catalog succeeded: {foreign:?}"
                 );
                 batch2_write_sync(&db.join("sync/extra.db"), "3-1");
                 assert_eq!(check_updates_cached().unwrap()[0].repo, "core");
-                assert!(get_potential_aur_packages().unwrap().is_empty());
+                assert!(get_potential_aur_package_records().unwrap().is_empty());
             },
         );
     }
@@ -2532,7 +2543,7 @@ mod tests {
             |db| {
                 batch2_write_sync(&db.join("sync/stable.db"), "2-1");
                 assert_eq!(check_updates_cached().unwrap()[0].repo, "stable");
-                let foreign = get_potential_aur_packages();
+                let foreign = get_potential_aur_package_records();
                 assert!(
                     foreign.is_err(),
                     "foreign requires every configured repository: {foreign:?}"

@@ -5,7 +5,7 @@ use crate::cli::{modern_ui, style, ui};
 use crate::core::security::{PolicyError, SecurityPolicy};
 use crate::package_managers::{
     get_package_manager,
-    types::{UpdateInfo, Version},
+    types::{SecurityOrigin, UpdateInfo, Version},
 };
 
 /// Hard bounds for `OMG_AUR_PARALLEL`: builds are process-heavy (makepkg
@@ -85,7 +85,7 @@ fn screen_aur_updates_against_policy(
         skipped: Vec::new(),
     };
     for (name, old_version, new_version) in candidates {
-        if let Err(violation) = policy.check_source(&name, true, None) {
+        if let Err(violation) = policy.check_source(&name, &SecurityOrigin::AurArchive, None) {
             tracing::warn!("Security policy blocks AUR update for {name}: {violation}");
             screened.skipped.push((name, violation));
             continue;

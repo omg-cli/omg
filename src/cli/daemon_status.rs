@@ -194,7 +194,11 @@ pub async fn run() -> Result<()> {
                 println!();
                 println!("  {}", style::header("Runtime Versions"));
                 for (name, version) in &status.runtime_versions {
-                    println!("    {}: {}", style::runtime(name), style::version(version));
+                    println!(
+                        "    {}: {}",
+                        style::runtime(&style::sanitize_terminal_text(name)),
+                        style::version(&style::sanitize_terminal_text(version))
+                    );
                 }
             }
         } else {

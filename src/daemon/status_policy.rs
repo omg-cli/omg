@@ -79,7 +79,7 @@ mod tests {
         let (status, cacheable) = status_snapshot(10, 4, 1, 2, vec![], None);
         assert!(!cacheable);
         assert!(!status.vulnerabilities_scanned);
-        assert_eq!(status.scanned_vulnerability_count(), None);
+        assert_eq!(status.scanned_vulnerability_summary(), None);
         assert_eq!(status.security_vulnerabilities, 0);
         assert_eq!(status.total_packages, 10);
     }
@@ -89,7 +89,7 @@ mod tests {
         let (status, cacheable) = status_snapshot(10, 4, 1, 2, vec![], Some((7, 0)));
         assert!(cacheable);
         assert!(status.vulnerabilities_scanned);
-        assert_eq!(status.scanned_vulnerability_count(), Some(7));
+        assert_eq!(status.scanned_vulnerability_summary(), Some((7, 0)));
         assert_eq!(status.security_vulnerabilities, 7);
     }
 }

@@ -1740,3 +1740,66 @@ All four formerly failing tests execute and pass. The guard receipts are
 provenance is `native43-tools/zsh-receipt.json` in the proof owner.
 A fresh complete instrumented run and strict comparison are still required;
 these focused passing checks do not clear PR #1057 or certify a new release.
+
+
+## Typed source policy and status boundary batch, November 14
+
+The exact a6794aa2 full local instrumented producer passes 3,984 tests across
+98 binaries, with 52 existing skips, followed by genuine Node installation,
+24 privileged Arch cases and the protected 15-test/35-process CLI producer.
+The normal optimized pair passes its signed native update and all 28 Omarchy
+scenarios in 176 seconds. Its installable bundle hash is
+433dce480f2eb44d4ded1bee3a690812964b9ff9f9145a9f7cca2cdee1f4a371.
+The immutable-base comparison still fails; none of these checks establish
+merge readiness or performance acceptance.
+
+The expanded private-daemon contract now exercises status, status --fast and
+daemon-status against the same five scan scopes, preserving the fixture DB.
+It first failed because daemon-status emitted raw ESC, CR and bidi controls
+from runtime names and versions. That path now uses the existing sanitizer,
+and all three commands pass. TUI dashboard and security-tab assertions cover
+reported zero findings, findings, partial coverage, legacy omitted coverage
+and an unscanned last-known count. Count-only compatibility getters have no
+production callers and their tests now exercise the findings/coverage pair.
+
+SecurityPolicy::check_source takes SecurityOrigin rather than a boolean.
+Install preflight, complete-assessment policy and AUR update screening share
+the same source grading; Unknown and local archives retain Community grade.
+The six-origin policy table preserves repository admission and refuses the
+three non-repository sources at Verified minimum. The names-only foreign
+package shim was removed after migrating every caller to epoch-checked
+records. Identity, groups, version and incomplete-catalog tests remain.
+
+Hosted a6794aa2 producer job 132438203065 succeeds. Comparison job
+132441610956 refuses Omarchy summary coverage: five readiness-probe lines
+have zero mapped counts and summary coverage is 4,961/4,970. A fast child can
+publish its marker before the first while condition. The test now probes
+liveness and yields at least once before accepting readiness, within the
+same three-second timeout. This removes scheduling-dependent coverage
+without retries, sleeps, deadline changes or altered counters.
+
+The native CLI producer adds a genuine ordinary-user sudo refusal case,
+using a temporary explicit deny rule inside the disposable guest. Its
+validator requires the actual exit status, UID, authentication diagnostic
+and matching CLI module profiles, and the package DB fingerprint must remain
+unchanged. The new validator regression first failed because the case was
+absent; all 42 producer tests pass after implementation. This raises process
+checks from 35 to 36. Actual current-source guest acceptance remains pending.
+
+Five portable/Debian CI jobs fail the same stale Not scanned assertion in
+test_cli_status_shows_debian_info. A local debian-pure build reproduces that
+failure before updating the expected truthful label and adding a rejection
+of false clean claims. The initial no-feature attempt ran zero tests and was
+rejected as evidence; the corrected debian-pure run executes the case.
+Two Debian QEMU jobs then time out waiting for the failed native build's
+artifact; their small preserved harness-error artifacts identify that
+upstream dependency, not a guest runtime failure. No timeout was increased.
+
+Current working-source normal validation passes the targeted security,
+database, AUR, package-policy, protocol, dashboard and Omarchy tests, the
+expanded real CLI status contract, TUI rendering assertions and all-target
+Clippy with warnings denied. Fresh full instrumented and native proof is
+still required for this batch. Coverage correspondence work remains open;
+tracing confirms that changed grouped imports and unsupported retained
+fragments can prevent matching even when aggregate counts are positive.
+No comparator acceptance rule was changed in this batch.

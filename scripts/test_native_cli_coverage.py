@@ -638,6 +638,11 @@ def evidence_fixture(root):
     for name in ('db-before.txt', 'db-after.txt'):
         (evidence / name).write_text('unchanged private guest DB\n')
     (evidence / 'identity.txt').write_text('actual_id=arch ordinary_uid=65534 root_uid=0\n')
+    (evidence / 'cli-elevation-denied-exit.txt').write_text('1\n')
+    (evidence / 'cli-elevation-denied-identity.txt').write_text(
+        'actual_uid=65534 operation=clean-cache authorization=denied\n')
+    (evidence / 'cli-elevation-denied.log').write_text(
+        'Privilege elevation failed (--yes flag prevents password prompt)\n')
     (evidence / 'artifacts.sha256').write_text(''.join(
         f"{a['sha256']}  /omg-extra-bin/{r}\n" for r, a in artifacts.items()))
     for role in PRODUCER.ROLES:
@@ -749,6 +754,30 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_elevation_refusal_requires_identity_exit_diagnostic_and_cli_profiles(self):
+        stage = 'cli-elevation-denied'
+        self.assertIn(stage, PRODUCER.PROCESS_STAGES,
+                      'Native coverage must exercise a genuine denied CLI elevation')
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            changes = {
+                f'{stage}-exit.txt': '0\n',
+                f'{stage}-identity.txt': 'actual_uid=0 operation=clean-cache authorization=denied\n',
+                f'{stage}.log': 'unrelated command failed\n',
+            }
+            for name, value in changes.items():
+                path = evidence / name
+                original = path.read_text()
+                path.write_text(value)
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'elevation'):
+                    PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+                path.write_text(original)
+            original = next(profiles.glob(f'omg-extra-{stage}-*.profraw'))
+            original.rename(profiles / f'omg-extra-{stage}-123-999_0.profraw')
+            with self.assertRaisesRegex(ValueError, 'elevation'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_unset_runtime_hint_completes_native_update_and_requires_a_witness(self):
         stage = 'omarchy-runtime-unset'
         self.assertIn(stage, PRODUCER.OMARCHY_CASES,
@@ -843,7 +872,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 15)
-            self.assertEqual(len(receipt['process_checks']), 35)
+            self.assertEqual(len(receipt['process_checks']), 36)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):

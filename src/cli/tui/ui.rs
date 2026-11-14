@@ -1485,6 +1485,93 @@ mod tests {
         assert!(text.contains("PGP: Not required"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_and_security_tab_preserve_reported_advisory_scope() {
+        for (findings, unknown, scanned, card, detail, security) in [
+            (
+                0,
+                Some(0),
+                true,
+                "No matches",
+                "Reported coverage",
+                "NO REPORTED MATCHES",
+            ),
+            (
+                2,
+                Some(0),
+                true,
+                "2 findings",
+                "Reported coverage",
+                "FINDINGS",
+            ),
+            (
+                0,
+                Some(3),
+                true,
+                "0 findings",
+                "3 unassessed",
+                "PARTIAL COVERAGE",
+            ),
+            (
+                2,
+                None,
+                true,
+                "Unreported",
+                "Advisory coverage",
+                "UNREPORTED",
+            ),
+            (
+                2,
+                Some(0),
+                false,
+                "Unreported",
+                "Advisory coverage",
+                "UNREPORTED",
+            ),
+        ] {
+            for tab in [Tab::Dashboard, Tab::Security] {
+                let mut app = app_on(tab);
+                app.status = Some(crate::daemon::protocol::StatusResult {
+                    total_packages: 9,
+                    explicit_packages: 5,
+                    orphan_packages: 0,
+                    updates_available: 2,
+                    security_vulnerabilities: findings,
+                    vulnerabilities_scanned: scanned,
+                    security_unknown_packages: unknown,
+                    runtime_versions: vec![],
+                });
+                let mut terminal = Terminal::new(TestBackend::new(160, 45)).expect("test terminal");
+                terminal
+                    .draw(|frame| draw(frame, &app))
+                    .expect("draw advisory scope");
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect();
+                if tab == Tab::Dashboard {
+                    assert!(text.contains(card) && text.contains(detail), "{text}");
+                } else {
+                    assert!(text.contains(security), "{text}");
+                    if scanned && let Some(unknown) = unknown {
+                        assert!(text.contains(&format!("Findings: {findings}")), "{text}");
+                        assert!(text.contains(&format!("Unassessed: {unknown}")), "{text}");
+                    } else {
+                        assert!(
+                            text.contains("Findings: n/a") && text.contains("Unassessed: n/a"),
+                            "{text}"
+                        );
+                    }
+                }
+                assert!(!text.contains("SECURE"), "{text}");
+            }
+        }
+    }
+
     fn app_on(tab: Tab) -> App {
         App::new_detached().with_tab(tab)
     }

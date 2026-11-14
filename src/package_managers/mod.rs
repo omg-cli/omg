@@ -496,9 +496,7 @@ pub use arch::{ArchPackageManager, is_installed, list_explicit, list_orphans, re
 #[cfg(feature = "arch")]
 pub use aur::{AurClient, AurPackageDetail, search_detailed};
 #[cfg(feature = "arch")]
-pub use pacman_db::{
-    check_updates_cached, get_local_package, get_potential_aur_packages, invalidate_caches,
-};
+pub use pacman_db::{check_updates_cached, get_local_package, invalidate_caches};
 #[cfg(feature = "arch")]
 pub use parallel_sync::sync_databases_parallel;
 pub use traits::{InstalledCatalogObservation, PackageManager};

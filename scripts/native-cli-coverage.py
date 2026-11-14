@@ -489,7 +489,8 @@ OMARCHY_CASES = {
 }
 
 ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
-PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES)
+PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'cli-elevation-denied',
+                  'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES)
 STAGES = tuple('registry-' + role for role in TESTS) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
 
@@ -1128,6 +1129,26 @@ for flags in q v vv vvv; do
     > /evidence/cli/cli-"$flags".log 2>&1
   printf 'cli-%s\t0\n' "$flags" >> /evidence/cli/process-checks.tsv
 done
+denial_policy=/etc/sudoers.d/zzzz-omg-elevation-denied
+test ! -e "$denial_policy"
+printf 'nobody ALL=(root) NOPASSWD: !ALL\n' > "$denial_policy"
+chmod 440 "$denial_policy"
+visudo -cf "$denial_policy" > /evidence/cli/cli-elevation-policy.txt 2>&1
+ordinary sudo -k
+if ordinary env LLVM_PROFILE_FILE='/profiles/omg-extra-cli-elevation-denied-%p-%m.profraw' \
+  timeout --signal=TERM --kill-after=3 40 /omg-extra-bin/cli clean --cache --yes \
+  < /dev/null > /evidence/cli/cli-elevation-denied.log 2>&1; then
+  elevation_status=0
+else
+  elevation_status=$?
+fi
+rm -- "$denial_policy"
+test "$elevation_status" = 1
+grep -F 'Privilege elevation failed (--yes flag prevents password prompt)' /evidence/cli/cli-elevation-denied.log
+printf '%s\n' "$elevation_status" > /evidence/cli/cli-elevation-denied-exit.txt
+ordinary bash -c 'printf "actual_uid=%s operation=clean-cache authorization=denied\n" "$(id -u)"' \
+  > /evidence/cli/cli-elevation-denied-identity.txt
+printf 'cli-elevation-denied\t0\n' >> /evidence/cli/process-checks.tsv
 ordinary env LLVM_PROFILE_FILE='/profiles/omg-extra-daemon-%p-%m.profraw' RUST_LOG='[' \
   timeout --signal=TERM --kill-after=3 40 bash -c '
     set -euo pipefail
@@ -1229,6 +1250,17 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                 and matches[0][-1] != 'unavailable', 'Missing/failed native inventory row: ' + name)
     daemon = (evidence / 'daemon.log').read_text()
     require('[extra-daemon] startup_socket=ready uid=' in daemon and '[extra-daemon] sigterm_exit=0 socket_removed=yes' in daemon, 'Daemon lifecycle incomplete')
+    elevation = 'cli-elevation-denied'
+    require((evidence / f'{elevation}-exit.txt').read_text() == '1\n',
+            'CLI elevation refusal exit status differs')
+    require((evidence / f'{elevation}-identity.txt').read_text()
+            == 'actual_uid=65534 operation=clean-cache authorization=denied\n',
+            'CLI elevation refusal did not run as the ordinary fixture user')
+    require('Privilege elevation failed (--yes flag prevents password prompt)'
+            in (evidence / f'{elevation}.log').read_text(),
+            'CLI elevation refusal lacks the real authentication diagnostic')
+    require({PROFILE.fullmatch(p.name)[3] for p in grouped[elevation]} == cli_modules,
+            'CLI elevation profiles do not match the actual CLI')
     for stage, case in OMARCHY_CASES.items():
         status, helpers = case.exit_status, case.helpers
         require((evidence / f'{stage}-exit.txt').read_text() == f'{status}\n',

@@ -14,6 +14,7 @@ use thiserror::Error;
 use std::os::unix::fs::OpenOptionsExt;
 
 use crate::core::paths;
+use crate::package_managers::types::SecurityOrigin;
 
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 
@@ -351,14 +352,8 @@ impl SecurityPolicy {
         use crate::package_managers::types::SecurityOrigin;
         for assessment in assessments {
             let package = &assessment.package;
-            let is_aur = matches!(package.origin, SecurityOrigin::AurArchive);
             let license = combined_license_expression(package.licenses.iter().map(String::as_str));
-            self.check_package(
-                &package.name,
-                is_aur,
-                license.as_deref(),
-                Self::source_grade(&package.origin),
-            )?;
+            self.check_source(&package.name, &package.origin, license.as_deref())?;
             if assessment
                 .findings
                 .iter()
@@ -366,7 +361,7 @@ impl SecurityPolicy {
             {
                 self.check_package(
                     &package.name,
-                    is_aur,
+                    matches!(package.origin, SecurityOrigin::AurArchive),
                     license.as_deref(),
                     SecurityGrade::Risk,
                 )?;
@@ -387,15 +382,15 @@ impl SecurityPolicy {
     pub fn check_source(
         &self,
         name: &str,
-        is_aur: bool,
+        origin: &SecurityOrigin,
         license: Option<&str>,
     ) -> Result<(), PolicyError> {
-        let grade = if is_aur {
-            SecurityGrade::Community
-        } else {
-            SecurityGrade::Verified
-        };
-        self.check_package(name, is_aur, license, grade)
+        self.check_package(
+            name,
+            matches!(origin, SecurityOrigin::AurArchive),
+            license,
+            Self::source_grade(origin),
+        )
     }
 
     /// Check if a package is allowed by policy
@@ -1267,19 +1262,31 @@ mod tests {
         let licenses = combined_license_expression(["MIT", "GPL-3.0"]);
         assert!(
             policy
-                .check_source("multi", false, licenses.as_deref())
+                .check_source(
+                    "multi",
+                    &SecurityOrigin::DistributionPackage,
+                    licenses.as_deref()
+                )
                 .is_err()
         );
         let alternatives = combined_license_expression(["MIT OR Apache-2.0", "GPL-3.0"]);
         assert!(
             policy
-                .check_source("multi", false, alternatives.as_deref())
+                .check_source(
+                    "multi",
+                    &SecurityOrigin::DistributionPackage,
+                    alternatives.as_deref()
+                )
                 .is_err()
         );
         let allowed = combined_license_expression(["MIT"]);
         assert!(
             policy
-                .check_source("single", false, allowed.as_deref())
+                .check_source(
+                    "single",
+                    &SecurityOrigin::DistributionPackage,
+                    allowed.as_deref()
+                )
                 .is_ok()
         );
         assert!(combined_license_expression(std::iter::empty()).is_none());
@@ -1562,11 +1569,31 @@ mod tests {
             minimum_grade: SecurityGrade::Verified,
             ..SecurityPolicy::default()
         };
-        assert!(policy.check_source("system", false, None).is_ok());
-        assert!(matches!(
-            policy.check_source("community", true, None),
-            Err(PolicyError::GradeTooLow { .. })
-        ));
+        for origin in [
+            SecurityOrigin::ArchRepository {
+                repository: "core".into(),
+            },
+            SecurityOrigin::OtherRepository {
+                repository: "fixture".into(),
+            },
+            SecurityOrigin::DistributionPackage,
+        ] {
+            assert!(policy.check_source("system", &origin, None).is_ok());
+        }
+        for origin in [
+            SecurityOrigin::AurArchive,
+            SecurityOrigin::LocalArchive,
+            SecurityOrigin::Unknown,
+        ] {
+            assert!(matches!(
+                policy.check_source("community", &origin, None),
+                Err(PolicyError::GradeTooLow {
+                    grade: SecurityGrade::Community,
+                    minimum: SecurityGrade::Verified,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

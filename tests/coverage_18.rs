@@ -443,7 +443,7 @@ async fn package_inventory_and_updates_survive_the_production_transport() -> Res
             assert_eq!(status.explicit_packages, 2);
             assert_eq!(status.orphan_packages, 0);
             assert_eq!(status.updates_available, 1);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
         }
         other => panic!("status returned {other:?}"),
     }
@@ -595,7 +595,7 @@ async fn status_reports_backend_corruption_without_cached_success_and_recovers_o
         } => {
             assert_eq!(status.total_packages, 2);
             assert_eq!(status.updates_available, 1);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
         }
         other => panic!("initial status returned {other:?}"),
     }
@@ -628,7 +628,7 @@ async fn status_reports_backend_corruption_without_cached_success_and_recovers_o
             assert_eq!(status.explicit_packages, 2);
             assert_eq!(status.orphan_packages, 0);
             assert_eq!(status.updates_available, 1);
-            assert_eq!(status.scanned_vulnerability_count(), None);
+            assert_eq!(status.scanned_vulnerability_summary(), None);
         }
         other => panic!("recovered status returned {other:?}"),
     }

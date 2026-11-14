@@ -686,16 +686,6 @@ impl App {
         0
     }
 
-    pub fn get_security_vulnerabilities(&self) -> Option<usize> {
-        #[cfg(unix)]
-        return self
-            .status
-            .as_ref()
-            .and_then(crate::daemon::protocol::StatusResult::scanned_vulnerability_count);
-        #[cfg(not(unix))]
-        None
-    }
-
     /// Findings and uncovered package counts from a reported daemon scan.
     pub fn get_security_findings_summary(&self) -> Option<(usize, usize)> {
         #[cfg(unix)]

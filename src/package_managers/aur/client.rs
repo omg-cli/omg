@@ -46,8 +46,6 @@ use crate::core::{Package, PackageSource, paths};
 use crate::package_managers::arch_install::{
     InstallIntent, InstallItem, InstallRequest, InstallTarget, OfficialTarget,
 };
-#[cfg(test)]
-use crate::package_managers::get_potential_aur_packages;
 use crate::package_managers::pacman_db;
 use crate::runtimes::common::MAX_DECOMPRESSED_BYTES;
 
@@ -5202,7 +5200,7 @@ mod tests {
         let fixture = S72Fixture::new(&[])?;
         std::fs::create_dir(fixture.db.join("local"))?;
         fixture.with_environment(async {
-            assert!(get_potential_aur_packages()?.is_empty());
+            assert!(pacman_db::get_potential_aur_package_records()?.is_empty());
             assert!(!metadata_path().exists() && !index_path().exists());
             let updates =
                 tokio::time::timeout(Duration::from_secs(2), fixture.client().get_update_list())
@@ -5272,7 +5270,10 @@ mod tests {
                 "[options]\n[core]\nServer = https://example.invalid/$repo/$arch\n",
             )?;
             pacman_db::invalidate_caches()?;
-            let foreign = get_potential_aur_packages()?;
+            let foreign: Vec<String> = pacman_db::get_potential_aur_package_records()?
+                .into_iter()
+                .map(|package| package.name)
+                .collect();
             assert_eq!(
                 foreign,
                 ["aur-demo"],

@@ -761,7 +761,7 @@ mod app_getter_tests {
         assert_eq!(app.get_total_packages(), 120);
         assert_eq!(app.get_orphan_packages(), 3);
         assert_eq!(app.get_updates_available(), 7);
-        assert_eq!(app.get_security_vulnerabilities(), Some(2));
+        assert_eq!(app.get_security_findings_summary(), Some((2, 0)));
         assert_eq!(
             app.get_runtime_versions(),
             [("node".to_string(), "22.4.0".to_string())]
@@ -777,7 +777,7 @@ mod app_getter_tests {
         assert_eq!(app.get_total_packages(), 0);
         assert_eq!(app.get_orphan_packages(), 0);
         assert_eq!(app.get_updates_available(), 0);
-        assert_eq!(app.get_security_vulnerabilities(), None);
+        assert_eq!(app.get_security_findings_summary(), None);
         assert!(app.get_runtime_versions().is_empty());
     }
 
@@ -789,9 +789,8 @@ mod app_getter_tests {
         status.vulnerabilities_scanned = false;
         app.status = Some(status);
 
-        // An unscanned raw count must not surface as a real vulnerability
-        // count (StatusResult::scanned_vulnerability_count contract).
-        assert_eq!(app.get_security_vulnerabilities(), None);
+        // An unscanned raw count cannot supply findings or coverage.
+        assert_eq!(app.get_security_findings_summary(), None);
     }
 }
 

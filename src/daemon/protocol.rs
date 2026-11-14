@@ -403,15 +403,6 @@ pub struct StatusResult {
 }
 
 impl StatusResult {
-    /// Findings from a completed scan with no uncovered packages.
-    #[must_use]
-    pub const fn scanned_vulnerability_count(&self) -> Option<usize> {
-        match self.scanned_vulnerability_summary() {
-            Some((count, 0)) => Some(count),
-            _ => None,
-        }
-    }
-
     /// Findings and uncovered packages from an explicitly reported scan scope.
     #[must_use]
     pub const fn scanned_vulnerability_summary(&self) -> Option<(usize, usize)> {
@@ -720,14 +711,13 @@ mod tests {
             "vulnerabilities_scanned": true, "runtime_versions": []
         }))
         .expect("legacy status remains decodable");
-        assert_eq!(status.scanned_vulnerability_count(), None);
+        assert_eq!(status.scanned_vulnerability_summary(), None);
         status.security_unknown_packages = Some(2);
-        assert_eq!(status.scanned_vulnerability_count(), None);
         assert_eq!(status.scanned_vulnerability_summary(), Some((0, 2)));
         status.security_unknown_packages = Some(0);
-        assert_eq!(status.scanned_vulnerability_count(), Some(0));
+        assert_eq!(status.scanned_vulnerability_summary(), Some((0, 0)));
         status.invalidate_security_scope();
-        assert_eq!(status.scanned_vulnerability_count(), None);
+        assert_eq!(status.scanned_vulnerability_summary(), None);
         assert_eq!(status.security_unknown_packages, None);
         assert_eq!(
             status.security_vulnerabilities, 0,
@@ -753,14 +743,13 @@ mod tests {
         let frame = encode_frame(&response).expect("encode current security status");
         let (_, payload) = split_frame(&frame).expect("matching client and daemon protocol");
         let decoded: Response = bitcode::deserialize(payload).expect("current payload decodes");
-        let Response::Success {
-            result: ResponseResult::Status(status),
-            ..
-        } = decoded
-        else {
-            panic!("security status response changed kind");
-        };
-        assert_eq!(status.scanned_vulnerability_summary(), Some((2, 7)));
+        assert!(matches!(
+            decoded,
+            Response::Success {
+                id: 17,
+                result: ResponseResult::Status(status),
+            } if status.scanned_vulnerability_summary() == Some((2, 7))
+        ));
 
         let mut previous = frame;
         previous[..4].copy_from_slice(&4u32.to_le_bytes());

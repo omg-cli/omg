@@ -18,6 +18,5 @@ pub use db::{UnsatisfiedDependency, unsatisfied_local_dependencies};
 pub use db::{
     AlpmCatalogEpoch, CachedUpdate, LocalDbEpoch, LocalDbPackage, SyncDbEpoch, SyncDbPackage,
     check_updates_cached, get_counts_fast, get_detailed_packages, get_explicit_count,
-    get_local_package, get_potential_aur_packages, get_sync_package, invalidate_caches,
-    list_local_cached,
+    get_local_package, get_sync_package, invalidate_caches, list_local_cached,
 };
