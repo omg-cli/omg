@@ -892,4 +892,100 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn update_assesses_repository_origins_before_backend_mutation() -> Result<()> {
+        struct CapturedSubjects(std::sync::Mutex<Vec<SecurityPackage>>);
+        impl VulnerabilitySource for CapturedSubjects {
+            fn assess_packages<'a>(
+                &'a self,
+                packages: &'a [SecurityPackage],
+                _evidence_use: crate::core::security::vulnerability::AssessmentUse,
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<
+                                Vec<crate::core::security::vulnerability::PackageAssessment>,
+                                crate::core::security::vulnerability::VulnerabilityError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    self.0
+                        .lock()
+                        .expect("captured subjects")
+                        .extend_from_slice(packages);
+                    Ok(Vec::new())
+                })
+            }
+        }
+        let directory = tempfile::tempdir()?;
+        for (ordinal, (distro, repository, expected)) in [
+            ("arch", "aur", SecurityOrigin::AurArchive),
+            ("arch", "AuR", SecurityOrigin::AurArchive),
+            ("arch", "", SecurityOrigin::Unknown),
+            (
+                "arch",
+                "core",
+                SecurityOrigin::ArchRepository {
+                    repository: "core".into(),
+                },
+            ),
+            (
+                "arch",
+                "Core",
+                SecurityOrigin::OtherRepository {
+                    repository: "Core".into(),
+                },
+            ),
+            ("debian", "", SecurityOrigin::Unknown),
+            ("debian", "main", SecurityOrigin::DistributionPackage),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+                distro,
+                directory.path().join(ordinal.to_string()).as_path(),
+            ));
+            backend.db.add_package(
+                "fixture",
+                "2.0.0",
+                "Repository identity fixture",
+                repository,
+            );
+            backend.set_installed_version("fixture", "1.0.0")?;
+            backend.set_available_version("fixture", "2.0.0")?;
+            let source = Arc::new(CapturedSubjects(std::sync::Mutex::new(Vec::new())));
+            let service = PackageService::builder(backend.clone())
+                .policy(SecurityPolicy {
+                    advisory_requirement:
+                        crate::core::security::policy::AdvisoryRequirement::Review,
+                    arch_advisory_repositories: ["core".to_owned()].into(),
+                    ..SecurityPolicy::default()
+                })
+                .vulnerability_source(source.clone())
+                .without_history()
+                .build()?;
+            let error = service
+                .update()
+                .await
+                .expect_err("missing assessment must stop the update");
+            assert!(error.to_string().contains("inventory differs"), "{error:#}");
+            {
+                let captured = source.0.lock().expect("captured subjects");
+                assert_eq!(captured.len(), 1);
+                assert_eq!(captured[0].origin, expected, "{distro}/{repository}");
+                assert_eq!(captured[0].name, "fixture");
+                assert_eq!(captured[0].version, "2.0.0");
+            }
+            let installed = backend.list_installed().await?;
+            assert_eq!(installed.len(), 1);
+            assert_eq!(installed[0].name, "fixture");
+            assert_eq!(installed[0].version.version_string(), "1.0.0");
+        }
+        Ok(())
+    }
 }
