@@ -2047,3 +2047,57 @@ No debug companions were deleted or clocks changed. This is local behavior and
 coverage evidence; a fresh complete hosted comparison remains required. Later
 source correspondence, the shared work limit, release/VM/performance acceptance
 and CVE archive completeness remain open.
+
+### Windows continuation: warning ownership and guarded async helpers
+
+All `569c8616` workflows completed successfully except Code Coverage. Its
+producer passed; comparison cleared both TUI repairs and refused the extra
+borrowed-string warning formatter copies. Both warning callers now retain the
+incomplete-coverage boolean and move their owned message into the existing
+`String` formatter. No cloning or output change is required. The final local
+unit and CLI exports contain only that formatter instance, with counts 12 and
+4. Both new boolean rows are positive. The audit-report test passes in both
+color modes, and all eight native Arch dry-run cases pass as UID 65534.
+
+The IPC fixture and CLI profiles have different module signatures. Merging
+them for a single-object local export produced mismatches; separating all eight
+CLI profiles from the one harness profile gives clean exports for both subjects.
+A separate CLI identity probe establishes the signature and supplies no behavior
+counters. The three unit-report profiles remain a separate subject too. This
+local separation does not waive the complete hosted comparison.
+
+The next correspondence diagnostic found an async helper under `cfg(test)` and
+`cfg(feature = "arch")`. Discovery now preserves exact module headers and
+function guards, binds the explicit module path to the raw namespace, and starts
+the constructor after its attributes. Existing complete constructor/poll-copy,
+geometry and joint-matching checks still apply. Attribute macros, changed or
+duplicated guards, foreign modules, missing/cold phases and exhausted work are
+refused. Five new regression methods bring the comparator suite to 335 tests;
+all 488 adjacent Python tests pass. The original 64,000,000-unit capacity remains.
+
+With the full raw global inventories, the non-accepting first-refusal diagnostic
+binds all four retained helper pairs and its one constructor/poll copy on each
+side. It leaves 22,673,055 work units at that proof, then finds uncovered candidate
+admission code at `service.rs:54`. This diagnostic continues past other files'
+refusals and grants no global acceptance.
+
+The existing admission fixture now checks Arch and Debian mock backends in the
+Arch-feature build: only the prepared Arch path may defer advisory assessment,
+and source-policy bans still apply there. Disabling deferral and incorrectly
+granting it to Debian each fail the final test; the intact production guard
+passes. All 24 mapped candidate-helper rows and 78 fixture rows are positive.
+The fixture borrows its path through the existing constructor type. Its final
+unit binary SHA-256 is
+`c00851891ae88d84dff137856395e9108ff22f2188e35a9125c2e5e225efc14e`.
+This verifies candidate policy behavior, not a prepared native transaction.
+
+Arch all-target Clippy passes with warnings denied; formatting and diff checks
+pass. The temporary target's growth allowance was admitted at 20 GiB and then
+24 GiB before the respective waves, with a 20 GiB C: reserve and unchanged
+debug/split-debug/incremental and coverage settings. VHD length also grew after
+a preceding build ended; the final admission used that fresh readback. After
+final Clippy, VHD file length was 33,042,726,912 bytes, guest use 30,668,873,728
+bytes and C: free space 609,067,581,440 bytes. No debug companions were deleted
+or clocks changed. Fresh hosted coverage and portable checks, later source/work
+obligations, full release/VM/performance acceptance, independent security review
+and private CVE archive completeness remain open.
