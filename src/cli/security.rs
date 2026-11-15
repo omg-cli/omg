@@ -189,11 +189,12 @@ fn display_security_audit(
 ) -> Result<()> {
     let total_findings = res.total_vulnerabilities;
     let coverage_warning = audit_coverage_warning(&res.coverage);
-    if let Some(warning) = &coverage_warning {
+    let incomplete_coverage = coverage_warning.is_some();
+    if let Some(warning) = coverage_warning {
         ui::print_warning(warning);
     }
     if total_findings == 0 {
-        if coverage_warning.is_some() {
+        if incomplete_coverage {
             crate::cli::modern_ui::print_info(
                 "No findings were reported; advisory coverage is incomplete.",
             );
@@ -1278,11 +1279,12 @@ pub async fn fix_vulnerabilities(
     #[cfg(unix)]
     {
         let coverage_warning = audit_coverage_warning(&scan_result.coverage);
-        if let Some(warning) = &coverage_warning {
+        let incomplete_coverage = coverage_warning.is_some();
+        if let Some(warning) = coverage_warning {
             ui::print_warning(warning);
         }
         if scan_result.total_vulnerabilities == 0 {
-            if coverage_warning.is_some() {
+            if incomplete_coverage {
                 println!(
                     "{} No findings were reported; advisory coverage is incomplete.",
                     style::warning("⚠")
