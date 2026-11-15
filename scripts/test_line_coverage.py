@@ -1043,6 +1043,108 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertEqual(len(receipts[0]['async_copies']['base']), 2)
         self.assertEqual(len(receipts[0]['async_copies']['head']), 2)
 
+    def guarded_async_compare(self, mutation=None, modules=('tests',), feature_guard=True,
+                              joint=False, exhausted=False):
+        original = coverage.positive_source_fragments
+        def scoped(name, old, new, before, after, base, head, base_files, head_files, fragments):
+            prefix = []
+            for depth, module in enumerate(modules):
+                if depth == 0:
+                    prefix.append('#[cfg(test)]')
+                prefix.append('    ' * depth + f'mod {module} {{')
+            indent = '    ' * len(modules)
+            if feature_guard:
+                prefix.append(indent + '#[cfg(feature = "arch")]')
+            shift = len(prefix)
+            sources = [prefix + [indent + line for line in source]
+                       + ['    ' * depth + '}' for depth in reversed(range(len(modules)))]
+                       for source in (old, new)]
+            documents = copy.deepcopy([base, head])
+            for owners in documents:
+                for owner in owners:
+                    owner['name'] = owner['name'].replace('NvCs', 'Nv' + 'Nt' * len(modules) + 'Cs')
+                    owner['name'] = owner['name'].replace('7example7checked', '7example'
+                        + ''.join(f'{len(module)}{module}' for module in modules) + '7checked')
+                    if owner['name'].endswith('B3_'):
+                        owner['name'] = owner['name'][:-3] + 'B' + str(3 + 2 * len(modules)) + '_'
+                    for row in owner['regions']:
+                        row[0] += shift; row[2] += shift
+                        row[1] += len(indent); row[3] += len(indent)
+            if mutation:
+                mutation(sources, documents)
+            mapped = [{line + shift: count for line, count in counts.items()} for counts in (before, after)]
+            pending = [(a+shift, b+shift, c+shift, d+shift, [line+shift for line in lines])
+                       for a, b, c, d, lines in fragments]
+            return original(name, *sources, *mapped, *documents, base_files, head_files, pending,
+                            work=[0] if exhausted else None)
+        with patch.object(coverage, 'positive_source_fragments', side_effect=scoped):
+            return self.async_positive_fragment_compare(joint=joint)
+
+    def test_guarded_async_functions_bind_module_and_feature_context(self):
+        for modules, guard in (((), True), (('tests',), True), (('tests',), False),
+                               (('outer', 'tests'), True)):
+            with self.subTest(modules=modules, feature_guard=guard):
+                pairs, receipts = self.guarded_async_compare(modules=modules, feature_guard=guard)
+                self.assertEqual(len(pairs), 1)
+                self.assertEqual(len(receipts[0]['async_copies']['base']), 2)
+                self.assertEqual(len(receipts[0]['async_copies']['head']), 2)
+        def test_guard(sources, documents):
+            for source in sources:
+                source[:] = [line.replace('#[cfg(feature = "arch")]', '#[cfg(test)]') for line in source]
+        pairs, _ = self.guarded_async_compare(test_guard, modules=())
+        self.assertEqual(len(pairs), 1)
+
+    def test_guarded_async_functions_refuse_changed_guards_and_foreign_modules(self):
+        def mutate(sources, documents, mode):
+            replacements = {
+                'feature': ('#[cfg(feature = "arch")]', '#[cfg(feature = "debian")]'),
+                'module-guard': ('#[cfg(test)]', '#[cfg(feature = "arch")]'),
+                'duplicate-module-guard': ('#[cfg(test)]', '#[cfg(test)] #[cfg(test)]'),
+                'module': ('mod tests {', 'mod other {'),
+                'attribute': ('#[cfg(feature = "arch")]', '#[trace]'),
+                'cfg-attribute-macro': ('#[cfg(feature = "arch")]', '#[cfg_attr(feature = "arch", trace)]'),
+            }
+            if mode in replacements:
+                old, new = replacements[mode]
+                sources[1][:] = [line.replace(old, new) for line in sources[1]]
+            else:
+                for owner in documents[1]:
+                    owner['name'] = owner['name'].replace('5tests', '5other')
+        for mode in ('feature', 'module-guard', 'duplicate-module-guard', 'module', 'attribute',
+                     'cfg-attribute-macro', 'raw-module'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.guarded_async_compare(lambda sources, documents: mutate(sources, documents, mode))
+
+    def test_guarded_async_functions_keep_every_constructor_and_poll_copy(self):
+        def mutate(sources, documents, mode):
+            owners = documents[1]
+            if mode == 'missing-constructor':
+                owners.pop(0)
+            elif mode == 'missing-poll':
+                owners.pop(1)
+            elif mode == 'duplicate-poll':
+                owners.append(copy.deepcopy(owners[1]))
+            elif mode == 'cold-constructor':
+                owners[0]['regions'][0][4] = 0
+            else:
+                owners[1]['regions'][0][4] = 0
+        for mode in ('missing-constructor', 'missing-poll', 'duplicate-poll', 'cold-constructor', 'cold-poll'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.guarded_async_compare(lambda sources, documents: mutate(sources, documents, mode))
+
+    def test_guarded_async_fragments_require_one_joint_copy_matching(self):
+        pairs, _ = self.guarded_async_compare(joint=True)
+        self.assertEqual(len(pairs), 2)
+        def split(sources, documents):
+            documents[1][1]['regions'][2][4] = 0
+            documents[1][3]['regions'][2][4] = 1
+        with self.assertRaises(ValueError):
+            self.guarded_async_compare(split, joint=True)
+
+    def test_guarded_async_discovery_obeys_the_shared_work_budget(self):
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            self.guarded_async_compare(exhausted=True)
+
     def test_async_positive_fragment_refuses_incomplete_or_cold_phase_evidence(self):
         def mutate(owners, mode):
             head = owners[1]

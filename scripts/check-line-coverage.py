@@ -1115,6 +1115,35 @@ class AsyncFunctionGroup:
     span: tuple[int, int]
     copies: tuple[AsyncCompiledCopy, ...]
     closing_kinds: dict[int, str]
+    source_context: tuple = ()
+
+
+def guarded_async_context(code, row, modules, work):
+    """Bind explicit module scopes and pure cfg guards before the async header."""
+    # shortcut: cfg(test) module gates and simple test/feature function gates only; extend with phase fixtures.
+    header = row['header']; _construct_charge(work, len(header) + 1)
+    fn = header.index('fn')
+    if fn == 0 or header[fn - 1] != 'async':
+        return None
+    start = row['first'] + fn - 1
+    if fn > 1 and header[fn - 2] == 'pub':
+        start -= 1
+    attributes = _boolean_attributes(code, start)
+    if attributes is None or any(attribute != ['cfg', '(', 'test', ')'] and not (
+            len(attribute) == 6 and attribute[:3] == ['cfg', '(', 'feature']
+            and attribute[3] == '=' and attribute[5] == ')'
+            and re.fullmatch(r'"[A-Za-z_][A-Za-z0-9_-]{0,63}"', attribute[4])) for attribute in attributes):
+        return None
+    ancestors = _construct_ancestors(code, start, work)
+    if any(opening not in modules for opening in ancestors):
+        return None
+    _construct_charge(work, sum(len(modules[opening]['header']) + 1 for opening in ancestors))
+    scope = _boolean_module(code, {'start': start})
+    if scope is None:
+        return None
+    path, _, _ = scope
+    return start, (tuple(path), tuple(tuple(modules[opening]['header']) for opening in reversed(ancestors)),
+                   tuple(tuple(attribute) for attribute in attributes))
 
 
 def compiled_async_function_groups(name, owners, files, source, work=None, inventory=None):
@@ -1129,6 +1158,8 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
                 if source_owner_span(owner, name, files, source) is not None]
     result = {}; declarations = []
     closing_kinds = {}
+    _construct_charge(work, len(inventory[1]))
+    modules = {row['opening']: row for row in inventory[1] if row['kind'] == 'mod'}
     for line, rows in inventory[2].items():
         if len(rows) == 1 and rows[0]['supported']:
             row = rows[0]
@@ -1138,24 +1169,30 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
                 closing_kinds[line] = row['kind']
     for row in inventory[1]:
         header = row.get('header', ())
-        if (row['kind'] != 'fn' or not row['supported'] or 'async' not in header
-                or code.parents[row['opening']] is not None or 'fn' not in header):
+        if row['kind'] != 'fn' or 'async' not in header or 'fn' not in header:
             continue
+        context = (); start = row['first']
+        if header[0] == '#' or not row['supported'] or code.parents[row['opening']] is not None:
+            scoped = guarded_async_context(code, row, modules, work)
+            if scoped is None:
+                continue
+            start, context = scoped
         declaration = header[header.index('fn') + 1]
-        first = code.position(code.starts[row['first']])
+        first = code.position(code.starts[start])
         opening = code.position(code.starts[row['opening']])
         closing = code.position(code.ends[row['end']])
         span = first[0], closing[0]
-        declarations.append((declaration, first, opening, closing, span))
-    prefixes = source_function_prefixes(source, [row[-1] for row in declarations], work)
-    for declaration, first, opening, closing, span in declarations:
+        declarations.append((declaration, first, opening, closing, span, context))
+    prefixes = source_function_prefixes(source, [row[4] for row in declarations], work)
+    for declaration, first, opening, closing, span, context in declarations:
         if span not in prefixes:
             continue
-        parents = []
+        parents = []; module_path = context[0] if context else ()
+        qualified_name = (*module_path, declaration)
         for owner in eligible:
             _construct_charge(work, len(owner['name']) + len(owner['regions']))
             shape = plain_rust_function_symbol(owner['name'])
-            if (shape is not None and shape.identifiers[-1] == declaration
+            if (shape is not None and shape.identifiers[-len(qualified_name):] == qualified_name
                     and len(owner['regions']) == 1
                     and tuple(owner['regions'][0][:4]) == (*first, opening[0], opening[1] - 1)):
                 parents.append((owner, shape))
@@ -1184,10 +1221,10 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
                     for copy in copies}
         if len(geometry) != 1:
             continue
-        key = 'async:' + repr(parents[0][1].identity)
+        key = 'async:' + repr((parents[0][1].identity, context))
         if key in result:
             return {}
-        result[key] = AsyncFunctionGroup(prefixes[span], span, tuple(copies), closing_kinds)
+        result[key] = AsyncFunctionGroup(prefixes[span], span, tuple(copies), closing_kinds, context)
     return result
 
 
@@ -1570,6 +1607,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 entry['async_owner_namespace_sha256'] = hashlib.sha256(prefix.encode()).hexdigest()
                 entry['async_declarations_sha256'] = [hashlib.sha256(
                     side[prefix].declaration.encode()).hexdigest() for side in async_groups]
+                entry['async_source_contexts'] = [side[prefix].source_context for side in async_groups]
                 entry['async_copies'] = {}
                 for side, label in enumerate(('base', 'head')):
                     phase = async_groups[side][prefix]
