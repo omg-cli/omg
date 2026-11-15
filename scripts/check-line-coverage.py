@@ -2010,6 +2010,20 @@ def nominal_method_parent(symbol, declaration=None, *, inventory=False):
     return ('method:' + repr((*shape.parent_scope, shape.method[1])), 'method:' + repr(shape.parent_scope))
 
 
+def compiled_method_parent_files(owners, files, work):
+    _construct_charge(work, len(owners))
+    scopes = {}; unknown = set()
+    for owner in owners:
+        _construct_charge(work, len(owner['name']) + 1)
+        parent = nominal_method_parent(owner['name'], inventory=True)
+        if parent is None and owner['name'].startswith(('_R', '_ZN')):
+            continue
+        _construct_charge(work, len(owner['filenames']))
+        locations = unknown if parent is None else scopes.setdefault(parent[1], set())
+        locations.update(files.get(path, '<unattributed source>') for path in owner['filenames'])
+    return scopes, unknown
+
+
 def replacement_raw_parent(symbol, declaration=None):
     if type(symbol) is not str or len(symbol) > 4096:
         return None
@@ -4456,21 +4470,29 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
-    parent_file_cache = {}
+    parent_file_cache = {}; method_parent_files = None
     def parent_files(parent):
-        if parent[1] not in parent_file_cache:
-            locations = set()
-            _construct_charge(construct_work, len(bf))
-            for owner in bf:
-                _construct_charge(construct_work, len(owner['name']) + 1)
-                method_scope = parent[0].startswith('method:')
-                decoded = nominal_method_parent(owner['name'], inventory=True) if method_scope else None
-                matches = (decoded is not None and decoded[1] == parent[1]) if method_scope else parent[1] in owner['name']
-                if matches or not owner['name'].startswith(('_R', '_ZN')):
-                    _construct_charge(construct_work, len(owner['filenames']))
-                    locations.update(base_files.get(path, '<unattributed source>') for path in owner['filenames'])
-            parent_file_cache[parent[1]] = locations
-        return parent_file_cache[parent[1]]
+        nonlocal method_parent_files
+        method_scope = parent[0].startswith('method:')
+        key = method_scope, parent[1]
+        if key not in parent_file_cache:
+            if method_scope:
+                if method_parent_files is None:
+                    method_parent_files = compiled_method_parent_files(bf, base_files, construct_work)
+                scopes, unknown = method_parent_files
+                locations = scopes.get(parent[1], set())
+                _construct_charge(construct_work, len(parent[1]) + len(locations) + len(unknown))
+                parent_file_cache[key] = locations | unknown
+            else:
+                locations = set()
+                _construct_charge(construct_work, len(bf))
+                for owner in bf:
+                    _construct_charge(construct_work, len(owner['name']) + 1)
+                    if parent[1] in owner['name'] or not owner['name'].startswith(('_R', '_ZN')):
+                        _construct_charge(construct_work, len(owner['filenames']))
+                        locations.update(base_files.get(path, '<unattributed source>') for path in owner['filenames'])
+                parent_file_cache[key] = locations
+        return parent_file_cache[key]
     def head_constructs(name):
         if name not in head_inventories:
             head_inventories[name] = _construct_inventory(

@@ -123,6 +123,48 @@ class LineCoverageTests(unittest.TestCase):
 
 
 
+class CompiledMethodParentFilesTests(unittest.TestCase):
+    symbol = ('_RNvXNtNtNtNtNtCs40j12eeWnis_7omg_lib3cli8packages7install4arch5tests'
+              'NtB2_13FixtureSourceNtNtNtNtBc_4core8security13vulnerability'
+              '19VulnerabilitySource12scan_package')
+
+    def test_complete_index_keeps_cross_file_copies_callbacks_and_impl_identity(self):
+        child = '_RNC' + self.symbol[2:].replace('B2_', 'B4_').replace('Bc_', 'Be_') + '0Be_'
+        foreign = self.symbol.replace('13FixtureSource', '13AnotherSource')
+        owners = [dict(name=name, filenames=paths) for name, paths in (
+            (self.symbol, ['/src/first.rs']),
+            (self.symbol.replace('s40j12eeWnis_', 's99_'), ['/src/second.rs']),
+            (child, ['/src/callback.rs']),
+            (self.symbol, ['/unattributed.rs']),
+            (foreign, ['/src/foreign.rs']),
+            (self.symbol + '.llvm.1', ['/src/suffixed.rs']),
+            ('_Rinvalid', ['/src/malformed.rs']),
+            ('_ZNlegacy', ['/src/legacy.rs']))]
+        files = {path: path[5:] for owner in owners for path in owner['filenames']
+                 if path.startswith('/src/')}
+        index, unknown = coverage.compiled_method_parent_files(owners, files, [64_000_000])
+        key = coverage.nominal_method_parent(self.symbol, inventory=True)[1]
+        other = coverage.nominal_method_parent(foreign, inventory=True)[1]
+        self.assertEqual(index[key], {'first.rs', 'second.rs', 'callback.rs', 'suffixed.rs', '<unattributed source>'})
+        self.assertEqual(index[other], {'foreign.rs'})
+        self.assertEqual(set(index), {key, other})
+        self.assertEqual(unknown, set())
+
+    def test_unrecognized_owner_locations_remain_conservative_for_every_scope(self):
+        owners = [dict(name='unknown', filenames=['/src/opaque.rs', '/unattributed.rs'])]
+        index, unknown = coverage.compiled_method_parent_files(
+            owners, {'/src/opaque.rs': 'opaque.rs'}, [64_000_000])
+        self.assertEqual(index, {})
+        self.assertEqual(unknown, {'opaque.rs', '<unattributed source>'})
+
+    def test_index_refuses_exhaustion_before_symbol_decoding(self):
+        owners = [dict(name=self.symbol, filenames=['/src/example.rs'])]
+        with patch.object(coverage, 'nominal_method_parent',
+                          side_effect=AssertionError('decode before admission')):
+            with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                coverage.compiled_method_parent_files(owners, {}, [len(owners)])
+
+
 class SourceConstructCapacityTests(unittest.TestCase):
     @contextlib.contextmanager
     def fixture(self):
@@ -431,6 +473,36 @@ class SourceAwareCoverageTests(unittest.TestCase):
         return self.compare(before=[(line, 2) for line in mapped],
             after=[(line, 2) for line in mapped], mutate=owners,
             sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_distinct_method_scope_queries_decode_the_complete_inventory_once(self):
+        original = coverage.retained_replacement_obligations
+        observed = []
+        def inspect(*arguments, **keywords):
+            lookup = arguments[-1]
+            shapes = [coverage.nominal_method_parent(owner['name'], inventory=True)
+                      for owner in arguments[6][0][0]]
+            parent = next(shape for shape in shapes if shape is not None)
+            foreign = (parent[0], parent[1] + ':foreign')
+            with patch.object(coverage, 'nominal_method_parent',
+                              wraps=coverage.nominal_method_parent) as decode:
+                self.assertEqual(lookup(parent), {'example.rs'})
+                self.assertEqual(lookup(foreign), set())
+                self.assertEqual(lookup(('raw-parent', parent[1])), set())
+                self.assertEqual(lookup(parent), {'example.rs'})
+            observed.append((decode.call_count, len(arguments[6][0][0])))
+            return original(*arguments, **keywords)
+        with patch.object(coverage, 'retained_replacement_obligations', side_effect=inspect):
+            self.unseeded_nominal_compare()
+        self.assertTrue(observed)
+        for calls, owners in observed:
+            self.assertEqual(calls, owners, 'Each raw owner should be decoded once across method scopes')
+
+    def test_method_migration_refuses_unrecognized_owner_in_unattributed_source(self):
+        def unknown(base, head):
+            base['data'][0]['functions'].append(dict(name='opaque', count=1,
+                filenames=['/external/unknown.rs'], regions=[[100, 1, 100, 2, 1, 0, 0, 0]]))
+        with self.assertRaises(ValueError):
+            self.unseeded_nominal_compare(unknown)
 
     def test_fully_covered_public_method_migration_needs_no_unchanged_statement_seed(self):
         receipt = self.unseeded_nominal_compare()
