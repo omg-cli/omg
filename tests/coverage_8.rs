@@ -438,6 +438,102 @@ fn security_audit_rejects_false_clean_totals_without_losing_the_connection() {
     assert_eq!(requests[1].id(), 2);
 }
 
+#[test]
+#[serial]
+fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
+    use omg_lib::core::security::scan::{
+        AdvisorySeverity, FindingApplicability, SecurityAuditResult,
+    };
+    let _colors = pin_env(&[("NO_COLOR", None)]);
+    let findings = serde_json::json!([["fixture\u{1b}]52;c;PKG\u{7}", [
+        {"id":"CVE-2026-1234\u{1b}]52;c;ID\u{7}", "summary":"issue\u{1b}]52;c;SUMMARY\u{7}", "score":"9.8"},
+        {"id":"CVE-2026-1235", "summary":"published severity", "advisory_severity":AdvisorySeverity::Important},
+        {"id":"CVE-2026-1236", "summary":"possible issue", "applicability":FindingApplicability::Possible}
+    ]]]);
+    for colors in ["never", "always"] {
+        for case in [
+            "findings",
+            "fail-on-findings",
+            "empty",
+            "partial",
+            "false-clean",
+        ] {
+            let partial = case == "partial";
+            let has_findings = matches!(case, "findings" | "fail-on-findings" | "false-clean");
+            let audit: SecurityAuditResult = serde_json::from_value(serde_json::json!({
+                "coverage": { "status":"reported", "assessed":[], "sources":[],
+                    "unassessed": if partial { serde_json::json!([{
+                        "package":{"name":"custom","version":"1-1","architecture":null},
+                        "reason":omg_lib::core::security::vulnerability::UnknownCoverage::OriginUnestablished
+                    }]) } else { serde_json::json!([]) }
+                },
+                "total_vulnerabilities": if has_findings && case != "false-clean" {3} else {0},
+                "high_severity": if has_findings && case != "false-clean" {2} else {0},
+                "vulnerabilities": if has_findings {findings.clone()} else {serde_json::json!([])}
+            })).expect("valid audit wire shape");
+            let mut daemon = MockDaemon::spawn(Box::new(move |request| {
+                assert!(matches!(request, Request::SecurityAudit { .. }));
+                Some(echo_frame(
+                    request,
+                    &ResponseResult::SecurityAudit(audit.clone()),
+                ))
+            }));
+            let project = TestProject::new();
+            let mut args = vec!["audit", "scan"];
+            if case == "fail-on-findings" {
+                args.push("--fail-on-findings");
+            }
+            let result = project.run_with_env(
+                &args,
+                &[
+                    ("OMG_TEST_MODE", "0"),
+                    ("OMG_DISABLE_DAEMON", "0"),
+                    (
+                        "OMG_SOCKET_PATH",
+                        daemon.socket_path.to_str().expect("UTF-8 fixture path"),
+                    ),
+                    ("OMG_COLORS", colors),
+                ],
+            );
+            // Wake the private accept loop if the CLI failed before connecting.
+            drop(std::os::unix::net::UnixStream::connect(&daemon.socket_path));
+            let requests = daemon.take_requests();
+            assert_eq!(requests.len(), 1, "case={case}: {result:?}");
+            let text = console::strip_ansi_codes(&result.stdout);
+            assert_eq!(
+                result.success,
+                !matches!(case, "fail-on-findings" | "false-clean"),
+                "case={case}: {result:?}"
+            );
+            assert_eq!(
+                text.contains("No vulnerabilities found in assessed packages."),
+                case == "empty",
+                "case={case}: {result:?}"
+            );
+            if case == "false-clean" {
+                assert!(result.stderr.contains("mismatch"), "{result:?}");
+            } else if has_findings {
+                assert!(text.contains("Found 3 vulnerabilities (2 high severity)"));
+                assert!(text.contains("[Score: 9.8]"));
+                assert!(text.contains("[Advisory severity: Important]"));
+                assert!(text.contains("[possible match; applicability unverified]"));
+                for marker in ["PKG", "ID", "SUMMARY"] {
+                    assert!(text.contains(marker));
+                }
+                assert!(!result.stdout.contains("\u{1b}]"));
+                assert!(!result.stdout.contains('\u{7}'));
+                assert_eq!(result.stdout.contains('\u{1b}'), colors == "always");
+            } else if partial {
+                assert!(text.contains("1 package(s) with unknown coverage"));
+                assert!(
+                    text.contains("No findings were reported; advisory coverage is incomplete.")
+                );
+            }
+            project.close_checked();
+        }
+    }
+}
+
 /// Contract: a Success response carrying a foreign id is rejected with the
 /// exact message naming both ids.
 #[test]
