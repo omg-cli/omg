@@ -502,10 +502,13 @@ mod tests {
             (1, 2, false),
             (1, 1, true),
         ] {
+            let identity =
+                serde_json::json!({"name":"fixture", "version":"1-1", "architecture":null});
             let audit = serde_json::from_value(serde_json::json!({
-                "coverage": { "status": "reported", "assessed": [], "unassessed": [], "sources": [] },
+                "coverage": { "status": "reported", "assessed": [identity], "unassessed": [],
+                    "sources": [{"kind":"osv", "ecosystem":"Arch Linux:fixture"}] },
                 "total_vulnerabilities": total, "high_severity": high,
-                "vulnerabilities": [["fixture", [{ "id": "CVE-2026-1234", "summary": "known issue", "score": "9.8" }]]]
+                "vulnerabilities": [["fixture", [{ "id": "CVE-2026-1234", "summary": "known issue", "score": "9.8", "affected_installed": [identity] }]]]
             })).expect("valid audit wire shape");
             let (mut client, mut server) = stream_pair();
             let responder = async move {
