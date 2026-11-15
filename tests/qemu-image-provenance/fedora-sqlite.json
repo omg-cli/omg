@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "scope": "Fedora 44 CI guest SQLite WAL backport; not an official Fedora update",
+  "scope": "Fedora 44 CI guest SQLite WAL and EXPLAIN repairs; not an official Fedora update",
   "version": "3.51.2",
-  "release": "2.omgci.walreset2.fc44",
+  "release": "2.omgci.walreset3.fc44",
   "base_image": "fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80",
   "source_url": "https://kojipkgs.fedoraproject.org/packages/sqlite/3.51.2/2.fc44/data/signed/6d9f90a6/src/sqlite-3.51.2-2.fc44.src.rpm",
   "source_sha256": "f625466bdc4fefb2ba4dbb8b8a5b675d06a122a6bccb6cd0dfe5c4d1f68bf858",
   "patch": "sqlite-3.51.2-wal-reset.patch",
-  "patch_sha256": "ab36c2fe44d421ae2b3bc22f21af0eb3c13179a3979cfc7ffa16b7cb9fe27bb9",
+  "patch_sha256": "cf643573e0f84cd638f370e2022bf91248f355b73ca0fd0422b0eaa42b51ffe2",
   "upstream_fix": "fe57e14b49f9189b56da8233ab3415ce5ff6b1ff",
   "keyring": "fedora.gpg",
   "keyring_sha256": "ee42b9c07cf45061e59446506442fed9a68270e2a65b775d41b2549501fc4dbc",
@@ -31,6 +31,7 @@
     "walrestart-1.4": 1,
     "walrestart-1.5": 1,
     "walrestart.test-closeallfiles": 1,
-    "walrestart.test-sharedcachesetting": 1
+    "walrestart.test-sharedcachesetting": 1,
+    "fts5integrity-12.2.1": 1
   }
 }

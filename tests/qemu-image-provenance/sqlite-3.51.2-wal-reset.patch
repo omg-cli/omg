@@ -236,3 +236,32 @@
 +sqlite3_test_control_fault_install
 +
 +finish_test
+--- a/src/vdbeaux.c
++++ b/src/vdbeaux.c
+@@ -1999,6 +1999,7 @@
+       zP4 = "program";
+       break;
+     }
++    case P4_TABLEREF:
+     case P4_TABLE: {
+       zP4 = pOp->p4.pTab->zName;
+       break;
+--- a/ext/fts5/test/fts5integrity.test
++++ b/ext/fts5/test/fts5integrity.test
+@@ -379,6 +379,16 @@
+ db close
+ sqlite3 db test.db -readonly 1
+ 
++do_test 12.2.1 {
++  set vcheck {}
++  db eval {EXPLAIN PRAGMA integrity_check} row {
++    if {$row(opcode) eq "VCheck"} {
++      lappend vcheck [expr {$row(p4) eq "x1"}]
++    }
++  }
++  set vcheck
++} {1}
++
+ explain_i {
+   PRAGMA integrity_check
+   }

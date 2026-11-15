@@ -159,13 +159,13 @@ class FedoraSQLiteTests(unittest.TestCase):
         self.assertEqual(receipt['library_sha256'], 'd'*64)
 
     def test_every_unpatched_fedora_identity_is_refused(self):
-        for release in ['1.fc44', '2.fc44']:
+        for release in ['1.fc44', '2.fc44', '2.omgci.walreset2.fc44']:
             with self.subTest(release=release), self.assertRaises(ValueError):
                 sqlite.validate_installed({'name': 'sqlite-libs', 'version': '3.51.2',
                     'release': release, 'architecture': 'x86_64', 'library_sha256': 'd'*64}, self.manifest)
 
     def test_matching_version_without_matching_native_library_is_refused(self):
-        record = {'name': 'sqlite-libs', 'version': '3.51.2', 'release': '2.omgci.walreset2.fc44',
+        record = {'name': 'sqlite-libs', 'version': '3.51.2', 'release': self.policy['release'],
                   'architecture': 'x86_64', 'library_sha256': 'd'*64}
         sqlite.validate_installed(record, self.manifest)
         for field, value in [('library_sha256', 'e'*64), ('architecture', 'aarch64'), ('name', 'other')]:
@@ -218,6 +218,19 @@ class FedoraSQLiteTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256((material/self.policy[path_key]).read_bytes()).hexdigest(), self.policy[hash_key])
         self.assertNotIn(b'\r', (material/self.policy['patch']).read_bytes())
 
+    def test_explain_table_reference_regression_must_execute_once(self):
+        name = 'fts5integrity-12.2.1'
+        self.assertEqual(self.policy['required_assertions'].get(name), 1)
+        path = self.bundle/'test-details.txt'
+        original = path.read_text()
+        for count in (0, 2):
+            with self.subTest(executions=count):
+                path.write_text(original.replace(name+'... Ok\n', (name+'... Ok\n')*count))
+                self.manifest['files']['test-details.txt'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.save()
+                with self.assertRaisesRegex(ValueError, 'required .* assertions'):
+                    sqlite.verify_bundle(self.bundle, self.policy, 'x86_64', REVISION)
+
     def test_supply_container_matches_the_reviewed_builder_identity(self):
         workflow = (ROOT/'.github/workflows/fedora-sqlite.yml').read_text()
         import re
@@ -242,7 +255,7 @@ class FedoraSQLiteTests(unittest.TestCase):
         record = {'schema_version': 1, 'source_sha': REVISION,
             'manifest_sha256': hashlib.sha256((self.bundle/'manifest.json').read_bytes()).hexdigest(),
             'native_package_verification': True,
-            'installed': {'name': 'sqlite-libs', 'version': '3.51.2', 'release': '2.omgci.walreset2.fc44',
+            'installed': {'name': 'sqlite-libs', 'version': '3.51.2', 'release': self.policy['release'],
                 'architecture': 'x86_64', 'library_sha256': 'd'*64},
             'before': {'version': '3.51.2', 'release': '1.fc44'}, 'before_admitted': False,
             'package_sha256': {n: self.manifest['files'][n] for n in sqlite.package_names(self.policy, 'x86_64')}}
