@@ -446,7 +446,7 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
     };
     let _colors = pin_env(&[("NO_COLOR", None)]);
     let findings = serde_json::json!([["fixture\u{1b}]52;c;PKG\u{7}", [
-        {"id":"CVE-2026-1234\u{1b}]52;c;ID\u{7}", "summary":"issue\u{1b}]52;c;SUMMARY\u{7}", "score":"9.8"},
+        {"id":"CVE-2026-1234\u{1b}]52;c;ID\u{7}", "summary":"issue\u{1b}]52;c;SUMMARY\u{7}", "score":"9.8", "applicability":FindingApplicability::Applicable},
         {"id":"CVE-2026-1235", "summary":"published severity", "advisory_severity":AdvisorySeverity::Important},
         {"id":"CVE-2026-1236", "summary":"possible issue", "applicability":FindingApplicability::Possible}
     ]]]);
@@ -516,7 +516,11 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
                 assert!(text.contains("Found 3 vulnerabilities (2 high severity)"));
                 assert!(text.contains("[Score: 9.8]"));
                 assert!(text.contains("[Advisory severity: Important]"));
-                assert!(text.contains("[possible match; applicability unverified]"));
+                assert_eq!(
+                    text.matches("[possible match; applicability unverified]")
+                        .count(),
+                    2
+                );
                 for marker in ["PKG", "ID", "SUMMARY"] {
                     assert!(text.contains(marker));
                 }

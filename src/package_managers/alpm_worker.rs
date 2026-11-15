@@ -5,11 +5,11 @@ use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
 use super::alpm_ops::{
-    collect_updates, configure_package_filters, configure_signature_policy, get_pkg_info_from_db,
-    open_default_alpm, register_configured_syncdbs,
+    collect_updates, configure_package_filters, configure_signature_policy, open_default_alpm,
+    register_configured_syncdbs,
 };
 use super::pacman_db::AlpmCatalogEpoch;
-use super::types::{PackageInfo, UpdateInfo};
+use super::types::UpdateInfo;
 use crate::core::paths;
 
 struct LoadedAlpm {
@@ -17,21 +17,18 @@ struct LoadedAlpm {
     epoch: AlpmCatalogEpoch,
 }
 
-enum AlpmRequest {
-    Info(String, oneshot::Sender<Result<Option<PackageInfo>>>),
-    ListUpdates(oneshot::Sender<Result<Vec<UpdateInfo>>>),
-}
+type UpdateReply = oneshot::Sender<Result<Vec<UpdateInfo>>>;
 
 pub struct AlpmWorker {
-    tx: Option<tokio::sync::mpsc::Sender<AlpmRequest>>,
+    tx: Option<tokio::sync::mpsc::Sender<UpdateReply>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 const ALPM_REQUEST_QUEUE_CAPACITY: usize = 128;
 
 fn request_channel() -> (
-    tokio::sync::mpsc::Sender<AlpmRequest>,
-    tokio::sync::mpsc::Receiver<AlpmRequest>,
+    tokio::sync::mpsc::Sender<UpdateReply>,
+    tokio::sync::mpsc::Receiver<UpdateReply>,
 ) {
     tokio::sync::mpsc::channel(ALPM_REQUEST_QUEUE_CAPACITY)
 }
@@ -85,23 +82,12 @@ impl AlpmWorker {
                 return;
             }
 
-            while let Some(req) = rx.blocking_recv() {
-                match req {
-                    AlpmRequest::Info(name, reply) => {
-                        let res = match refresh_if_catalog_changed(&mut loaded) {
-                            Ok(()) => get_pkg_info_from_db(&loaded.handle, &name),
-                            Err(error) => Err(error),
-                        };
-                        let _ = reply.send(res);
-                    }
-                    AlpmRequest::ListUpdates(reply) => {
-                        let res = match refresh_if_catalog_changed(&mut loaded) {
-                            Ok(()) => collect_updates(&loaded.handle),
-                            Err(error) => Err(error),
-                        };
-                        let _ = reply.send(res);
-                    }
-                }
+            while let Some(reply) = rx.blocking_recv() {
+                let result = match refresh_if_catalog_changed(&mut loaded) {
+                    Ok(()) => collect_updates(&loaded.handle),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             tracing::debug!("ALPM worker shutting down");
         });
@@ -116,25 +102,12 @@ impl AlpmWorker {
         })
     }
 
-    pub async fn get_info(&self, name: String) -> Result<Option<PackageInfo>> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .as_ref()
-            .context("ALPM worker is shutting down")?
-            .send(AlpmRequest::Info(name, tx))
-            .await
-            .context("ALPM worker request queue closed")?;
-
-        rx.await
-            .context("ALPM worker disconnected (it may have failed to initialize)")?
-    }
-
     pub async fn list_updates(&self) -> Result<Vec<UpdateInfo>> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .as_ref()
             .context("ALPM worker is shutting down")?
-            .send(AlpmRequest::ListUpdates(tx))
+            .send(tx)
             .await
             .context("ALPM worker request queue closed")?;
 
@@ -178,7 +151,7 @@ pub(crate) fn worker_with_shutdown_gate(
 
 #[cfg(test)]
 mod tests {
-    use super::{AlpmRequest, AlpmWorker, request_channel};
+    use super::{AlpmWorker, request_channel};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::oneshot;
@@ -209,15 +182,15 @@ mod tests {
     #[test]
     fn request_queue_applies_backpressure_at_its_capacity() {
         let (tx, _rx) = request_channel();
-        for index in 0..128 {
+        for _ in 0..128 {
             let (reply, _response) = oneshot::channel();
-            tx.try_send(AlpmRequest::Info(index.to_string(), reply))
+            tx.try_send(reply)
                 .expect("request within the daemon connection cap must fit");
         }
         let (reply, _response) = oneshot::channel();
         assert!(
             matches!(
-                tx.try_send(AlpmRequest::Info("overflow".to_owned(), reply)),
+                tx.try_send(reply),
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_))
             ),
             "the worker queue must not grow beyond the daemon connection cap"
