@@ -530,6 +530,16 @@ def require_rustfmt_syntax(excerpts):
                 raise ValueError("Ambiguous unchanged source correspondence: rustfmt 1.95.0 did not validate source syntax")
 
 
+@dataclass(frozen=True)
+class SourceStructure:
+    braces: dict
+    names: Counter
+    modules: list
+    offsets: list
+    code: bytearray
+    text: str
+
+
 def _source_structural_map(source):
     """Find lexical brace pairs and names while ignoring comments and literals."""
     text = "\n".join(source)
@@ -606,16 +616,16 @@ def _source_structural_map(source):
     offsets = [0]
     for line in source:
         offsets.append(offsets[-1] + len(line) + 1)
-    return braces, names, modules, offsets, code
+    return SourceStructure(braces, names, modules, offsets, code, text)
 
 
-def source_function_prefixes(source, spans, work=None):
+def source_function_prefixes(source, spans, work=None, structure=None):
     """Recognize bounded signatures and their actual lexical body boundaries."""
-    structure = _source_structural_map(source)
+    structure = _source_structural_map(source) if structure is None else structure
     if not structure:
         return {}
-    braces, names, modules, offsets, _ = structure
-    text = '\n'.join(source)
+    braces, names = structure.braces, structure.names
+    modules, offsets, text = structure.modules, structure.offsets, structure.text
     if work is not None:
         _construct_charge(work, len(braces) * (len(braces).bit_length() + 1))
     openings = sorted(braces)
@@ -1065,11 +1075,12 @@ def nested_map_err_states(source, group, inventory, name_counts, first, last, co
     return states, (tuple(body), bindings[0], geometry[0], parents[0].disambiguators), proof
 
 
-def _compiled_function_groups(name, owners, files, source, work=None):
+def _compiled_function_groups(name, owners, files, source, work=None, source_structure=None):
     if work is not None:
         _construct_charge(work, len(source) + len(owners))
-        _construct_charge(work, sum(len(line) + 1 for line in source)
-                          + sum(len(owner['filenames']) + 3 * len(owner['regions']) for owner in owners))
+        if source_structure is None:
+            _construct_charge(work, sum(len(line) + 1 for line in source))
+        _construct_charge(work, sum(len(owner['filenames']) + 3 * len(owner['regions']) for owner in owners))
     names = Counter(owner['name'] for owner in owners)
     inventory = [owner for owner in owners if any(
         files.get(path) == name or path.endswith('/' + name) for path in owner['filenames'])]
@@ -1080,7 +1091,7 @@ def _compiled_function_groups(name, owners, files, source, work=None):
             return None
         by_span.setdefault(span[:2], []).append(owner)
     valid = {}
-    for span, prefix in source_function_prefixes(source, by_span, work).items():
+    for span, prefix in source_function_prefixes(source, by_span, work, source_structure).items():
         members = by_span[span]
         shapes = {tuple(sorted(tuple(row[:4] + row[5:]) for row in owner['regions']))
                   for owner in members}
@@ -3162,7 +3173,7 @@ def retained_block_endpoint_paint(name, old, new, before, after, base, head, bas
         positions = []
         valid = True
         for source, line, info, bounds in ((old, oldline, old_info, span), (new, newline, new_info, target)):
-            braces, _, _, offsets, _ = info[3]
+            braces, offsets = info[3].braces, info[3].offsets
             closing = offsets[line - 1] + source[line - 1].index('}')
             openings = [opening for opening, end in braces.items() if end == closing]
             if len(openings) != 1:
@@ -3196,7 +3207,7 @@ def retained_block_endpoint_paint(name, old, new, before, after, base, head, bas
             continue
         opening, closing, _, _, _, offsets = positions[1]
         text = "\n".join(new)
-        braces, _, _, _, code = new_info[3]
+        braces, code = new_info[3].braces, new_info[3].code
         semicolons = [i for i in range(opening + 1, closing) if text[i] == ';' and code[i]]
         tail_end = semicolons[-1] if semicolons else -1
         if tail_end < 0 or text[tail_end + 1:closing].strip():
@@ -4278,7 +4289,11 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             scope != other and (max(scope[0], other[0]) <= min(scope[1], other[1])
                                 or max(scope[2], other[2]) <= min(scope[3], other[3]))
             for other in function_scopes)]
-        grouped = [_compiled_function_groups(name, owners, files, source, construct_work) for owners, files, source in (
+        source_structure = None
+        if base_sources[name] == head_sources[name]:
+            _construct_charge(construct_work, sum(len(line) + 1 for line in old))
+            source_structure = _source_structural_map(old)
+        grouped = [_compiled_function_groups(name, owners, files, source, construct_work, source_structure) for owners, files, source in (
             (owners_by_file.get(name, []), base_files, old), (head_owners_by_file.get(name, []), head_files, new))]
         base_groups, head_groups = (value[1] if value is not None else {} for value in grouped)
         for prefix, group in base_groups.items():

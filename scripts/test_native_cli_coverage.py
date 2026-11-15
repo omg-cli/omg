@@ -874,7 +874,9 @@ def evidence_fixture(root):
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status=PRODUCER.NATIVE_PHASES[case.native_phase])))
-        if stage.startswith('omarchy-native-migrations'):
+        if stage == 'omarchy-native-migrations-script-failure':
+            (evidence / f'{stage}-migrations.txt').write_text('failed_configuration=before completion_markers=0\n')
+        elif stage.startswith('omarchy-native-migrations'):
             (evidence / f'{stage}-migrations.txt').write_text(
                 'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n')
         if stage == 'omarchy-current-kernel':
@@ -921,6 +923,10 @@ def evidence_fixture(root):
             'omarchy-success': '| System is up to date',
             'omarchy-native-migrations': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
             'omarchy-native-migrations-unmatched': '| System is up to date\nNative Omarchy migration-xrandr completed',
+            'omarchy-native-migrations-notification-error': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed\nCannot dismiss the Omarchy migration notification:',
+            'omarchy-native-migrations-notification-missing': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
+            'omarchy-native-migrations-installed-audio': '| System is up to date\nNative Omarchy migration-xrandr completed',
+            'omarchy-native-migrations-script-failure': '0000000000.sh failed: exit status: 7',
             'omarchy-current-kernel': '| System is up to date',
             'omarchy-runtime-unset': 'caller_runtime_hint=unset\n| System is up to date',
             'omarchy-interrupted': 'Omarchy update interrupted',
@@ -1175,7 +1181,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 20)
-            self.assertEqual(len(receipt['process_checks']), 62)
+            self.assertEqual(len(receipt['process_checks']), 66)
             self.assertEqual(len(receipt['fresh_admission']), 20)
             self.assertEqual(len(files), len(receipt['profiles']))
 
@@ -1328,6 +1334,32 @@ class FreshAdmissionFixture(unittest.TestCase):
             log.write_text(log.read_text().replace('Native Omarchy migration-xrandr completed', ''))
             with self.assertRaisesRegex(ValueError, 'migration package operations'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
+    def test_native_migration_failure_cases_are_mandatory_and_cannot_forge_completion(self):
+        required = {'omarchy-native-migrations-notification-error',
+                    'omarchy-native-migrations-notification-missing',
+                    'omarchy-native-migrations-script-failure',
+                    'omarchy-native-migrations-installed-audio'}
+        self.assertTrue(required <= PRODUCER.OMARCHY_CASES.keys())
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            for filename, original, replacement, diagnostic in (
+                    ('omarchy-native-migrations-notification-error.log',
+                     'Cannot dismiss the Omarchy migration notification:', '', 'notification'),
+                    ('omarchy-native-migrations-script-failure-migrations.txt',
+                     'completion_markers=0', 'completion_markers=1', 'completion marker'),
+                    ('omarchy-native-migrations-installed-audio.log',
+                     'Native Omarchy migration-xrandr completed',
+                     'Native Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
+                     'unnecessary package transaction')):
+                path = evidence / filename
+                contents = path.read_text()
+                self.assertIn(original, contents)
+                path.write_text(contents.replace(original, replacement))
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+                path.write_text(contents)
 
     def test_native_migrations_are_a_required_signed_full_update_case(self):
         case = PRODUCER.OMARCHY_CASES['omarchy-native-migrations']

@@ -4982,6 +4982,23 @@ class DiagnosticCoverageTests(unittest.TestCase):
 
 
 class ConstructBudgetAndConstructorRegressions(unittest.TestCase):
+    def test_unchanged_source_reuses_lexical_work_without_sharing_changed_inputs(self):
+        source = b'fn retained() {\n  step(); /*' + b'a' * 100_000 + b'*/\n}\n'
+        rows = [(1, 1), (2, 1), (3, 1)]
+        def owners(base, head):
+            for document in (base, head):
+                document['data'][0]['functions'] = [dict(name='retained', filenames=['/src/example.rs'],
+                    regions=[[1, 15, 3, 2, 1, 0, 0, 0]])]
+        with patch.object(coverage, 'SOURCE_CONSTRUCT_WORK_CAPACITY', 150_000):
+            SourceAwareCoverageTests().compare(before=rows, after=rows, mutate=owners,
+                sources=({'example.rs': source}, {'example.rs': source}))
+            for changed in (source.replace(b'a' * 100_000, b'b' * 100_000),
+                            source.replace(b'\n', b'\r\n')):
+                with self.subTest(source_sha256=coverage.hashlib.sha256(changed).hexdigest()):
+                    with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                        SourceAwareCoverageTests().compare(before=rows, after=rows, mutate=owners,
+                            sources=({'example.rs': source}, {'example.rs': changed}))
+
     def test_side_effecting_local_Ok_keeps_hot_copy_obligation(self):
         old = b'fn obsolete() -> Result<()> {\n    old();\n    Ok(())\n}\nfn retained() -> Result<()> {\n    same();\n    Ok(())\n}\nfn Ok(value: ()) -> Result<()> {\n    verify();\n    std::result::Result::Ok(value)\n}\n'
         new = old.replace(b'fn obsolete(', b'fn replacement(').replace(b'old();', b'new();')

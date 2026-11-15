@@ -3068,7 +3068,49 @@ omarchy-state set reboot-required
             executor.calls, 0,
             "invalid state must not permit a partial update"
         );
-        assert_eq!(std::fs::read_to_string(state)?, "preserve state file\n");
+        assert_eq!(std::fs::read_to_string(&state)?, "preserve state file\n");
+        std::fs::remove_file(&state)?;
+        run_migration_plan(&plan, &state, &mut executor).await?;
+        assert_eq!(
+            executor.calls, 1,
+            "repairing state permits exactly one action"
+        );
+        assert!(state.join("0001.sh").is_file());
+        run_migration_plan(&plan, &state, &mut executor).await?;
+        assert_eq!(executor.calls, 1, "the repaired migration remains complete");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_migration_commands_reject_untrusted_inventory_without_spawning() -> Result<()> {
+        let owner = private_directory();
+        let runtime = OmarchyRuntime {
+            root: owner.path().join("runtime"),
+            migration_state: owner.path().join("markers"),
+        };
+        std::fs::create_dir(&runtime.root)?;
+        std::fs::write(runtime.root.join("migrations"), "invalid directory\n")?;
+        let mut commands = Commands::new(true, runtime);
+        let error = commands
+            .execute(Stage::Migrations)
+            .await
+            .expect_err("invalid inventory");
+        assert!(format!("{error:#}").contains("Cannot inspect pending Omarchy migrations"));
+        let script = owner.path().join("0001.sh");
+        std::fs::write(&script, "echo must-not-run > observed\n")?;
+        let migration = PendingMigration {
+            path: script,
+            digest: migration_digest("echo must-not-run > observed\n"),
+            native: None,
+        };
+        let error = commands
+            .execute_migration(&migration)
+            .await
+            .expect_err("user-owned runtime");
+        assert!(format!("{error:#}").contains("root-controlled"));
+        assert!(commands.active.is_none());
+        assert!(!owner.path().join("observed").exists());
+        assert!(!owner.path().join("markers").exists());
         Ok(())
     }
 
