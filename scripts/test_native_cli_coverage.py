@@ -90,6 +90,38 @@ class MachineIdentityFixture(unittest.TestCase):
 
 
 class HostedProducer(unittest.TestCase):
+    def test_generated_fresh_stage_receipt_block_executes_without_template_corruption(self):
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
+        first = script.index("python3 - <<'OMG_FRESH_STAGE_")
+        last = script.index('\nstage=native-preflight-isolation', first)
+        block = script[first:last]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'fresh-admission.json').write_text(json.dumps({'profile_stages': ['fresh-one', 'fresh-two']}))
+            block = block.replace('/evidence/cli/', str(root) + '/')
+            result = subprocess.run([BASH, '-euo', 'pipefail', '-c', block],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / 'process-checks.tsv').read_text(), 'fresh-one\t0\nfresh-two\t0\n')
+            self.assertEqual(result.stderr, '')
+
+    def test_generated_cli_identity_preserves_literal_template_words(self):
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        compiled = '/workspace/RECEIPT/ARTIFACTS/SELECTION/COMPILED_CLI/NATIVE_PREFLIGHT_TEST/@@ARTIFACTS@@/omg'
+        script = PRODUCER.guest_script(artifacts, compiled)
+        first = script.index("printf '%s' ")
+        marker = ' > /omg-extra-bin/cli-receipt.json'
+        last = script.index(marker, first) + len(marker)
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / 'identity.json'
+            block = script[first:last].replace('/omg-extra-bin/cli-receipt.json', shlex.quote(str(receipt)))
+            result = subprocess.run([BASH, '-euo', 'pipefail', '-c', block],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(receipt.read_text()),
+                             dict(original=compiled, copy='/omg-extra-bin/cli', sha256='a' * 64))
+
     @unittest.skipIf(os.name == 'nt', 'Native cloud-init preparation requires POSIX Bash')
     def test_native_dependencies_are_queued_before_the_existing_boot_reboot(self):
         driver = (ROOT / 'scripts/benchmark-qemu.sh').read_text()

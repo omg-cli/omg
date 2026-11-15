@@ -1648,13 +1648,13 @@ test "$(stat -c '%u:%a' /profiles)" = 0:1777
 install -d -m 755 -o nobody -g nobody /evidence/cli/inventory
 install -d -m 700 -o nobody -g nobody /var/tmp/omg-extra-nobody
 install -d -m 700 /var/tmp/omg-extra-root /var/tmp/omg-extra-root/data
-printf '%s' RECEIPT > /omg-extra-bin/cli-receipt.json
+printf '%s' @@CLI_RECEIPT@@ > /omg-extra-bin/cli-receipt.json
 chmod 644 /omg-extra-bin/cli-receipt.json
 test "$(stat -c '%u:%a' /omg-extra-bin)" = 0:755
-printf '%s' ARTIFACTS > /evidence/cli/artifacts.sha256
+printf '%s' @@ARTIFACTS@@ > /evidence/cli/artifacts.sha256
 sha256sum -c /evidence/cli/artifacts.sha256 > /evidence/cli/artifact-check.txt
-printf '%s' SELECTION > /evidence/cli/expected-tests.tsv
-for role in NATIVE_ARTIFACT_ROLES; do
+printf '%s' @@SELECTION@@ > /evidence/cli/expected-tests.tsv
+for role in @@ARTIFACT_ROLES@@; do
   test "$(stat -c '%u:%a' "/omg-extra-bin/$role")" = 0:755
   ldd "/omg-extra-bin/$role" > "/evidence/cli/abi-$role.txt" 2>&1
   ! grep -F 'not found' "/evidence/cli/abi-$role.txt"
@@ -1691,13 +1691,14 @@ ordinary() {
     OMG_CONFIG_DIR=/var/tmp/omg-extra-nobody/config/omg OMG_CACHE_DIR=/var/tmp/omg-extra-nobody/cache/omg \
     OMG_DATA_DIR=/var/tmp/omg-extra-nobody/data/omg OMG_DAEMON_DATA_DIR=/var/tmp/omg-extra-nobody/daemon \
     OMG_DISABLE_TELEMETRY=1 OMG_DISABLE_DAEMON=1 \
-    OMG_CONTRACT_REQUIRE_NATIVE_ARCH=1 OMG_CONTRACT_EXPECTED_CLI=COMPILED_CLI \
+    OMG_CONTRACT_REQUIRE_NATIVE_ARCH=1 OMG_CONTRACT_EXPECTED_CLI=@@COMPILED_CLI@@ \
     OMG_CONTRACT_CLI_ROOT_FIXTURE=/omg-extra-bin/cli-receipt.json \
     OMG_CLI_BEHAVIOR_EVIDENCE_DIR=/evidence/cli/inventory "$@"
 }
+export -f ordinary
 ordinary bash -c 'test "$(id -u)" -ne 0; umask 077; mkdir -p "$HOME/work" "$XDG_RUNTIME_DIR" "$OMG_CONFIG_DIR"; printf "telemetry_enabled = false\n" > "$OMG_CONFIG_DIR/config.toml"'
 ordinary bash -c 'missing=0; for tool in git make jq cmp; do if ! command -v "$tool"; then printf "Missing native fixture command: %s\n" "$tool" >&2; missing=1; fi; done; exit "$missing"' > /evidence/cli/prerequisites.txt
-for role in NATIVE_HARNESS_ROLES; do
+for role in @@HARNESS_ROLES@@; do
   LLVM_PROFILE_FILE="/profiles/omg-extra-registry-$role-%p-%m.profraw" \
     /omg-extra-bin/"$role" --list --format terse > /evidence/cli/registry-"$role".txt 2>&1
 done
@@ -1833,7 +1834,7 @@ ordinary env LLVM_PROFILE_FILE='/profiles/omg-extra-daemon-%p-%m.profraw' RUST_L
     printf "[extra-daemon] sigterm_exit=0 socket_removed=yes\n"
   ' > /evidence/cli/daemon.log 2>&1
 printf 'daemon\t0\n' >> /evidence/cli/process-checks.tsv
-OMARCHY_CASE_BODY
+@@OMARCHY_CASE_BODY@@
 python3 /native-cli-coverage.py fresh-admission-fixture --owner /opt/omg-coverage-fresh-ci \
   --cli /omg-extra-bin/cli --profiles /profiles > /evidence/cli/fresh-admission.json
 python3 - <<'OMG_FRESH_STAGE_RECEIPTS'
@@ -1848,7 +1849,7 @@ stage=native-preflight-isolation
 ordinary env LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
   timeout --signal=TERM --kill-after=3 45 bash -c \
   'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${OMG_ISOLATED_FIXTURE_TEST+x}"; printf "[native-preflight-isolation] uid=%s test_mode=absent\n" "$(id -u)"; exec "$@"' \
-  bash /omg-extra-bin/lib-unit NATIVE_PREFLIGHT_TEST --exact --include-ignored --nocapture --test-threads=1 \
+  bash /omg-extra-bin/lib-unit @@PREFLIGHT_TEST@@ --exact --include-ignored --nocapture --test-threads=1 \
   < /dev/null > /evidence/cli/native-preflight-isolation.log 2>&1
 printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
 OMG_EXTRA_NAMESPACE
@@ -1857,15 +1858,17 @@ cmp /evidence/cli/db-before.txt /evidence/cli/db-after.txt
 trap - EXIT
 printf 'PASS\n' > /evidence/cli/all-stages-pass.txt
 '''
-    script = script.replace('NATIVE_ARTIFACT_ROLES', ' '.join(map(quote, ROLES)))
-    script = script.replace('NATIVE_HARNESS_ROLES', ' '.join(map(quote, HARNESSES)))
-    script = script.replace('RECEIPT', quote(receipt)).replace('ARTIFACTS', quote(artifact_lines))
-    script = script.replace('SELECTION', quote(selection)).replace('COMPILED_CLI', quote(compiled_cli))
-    script = script.replace('OMARCHY_CASE_BODY', omarchy_guest_script())
-    script = script.replace('NATIVE_PREFLIGHT_TEST', shlex.quote(NATIVE_PREFLIGHT_TEST))
-    # The timeout shell inherits this function, never a caller-supplied environment.
-    script = script.replace('ordinary bash -c', 'export -f ordinary\nordinary bash -c', 1)
-    return script
+    replacements = {
+        'ARTIFACT_ROLES': ' '.join(map(quote, ROLES)),
+        'HARNESS_ROLES': ' '.join(map(quote, HARNESSES)),
+        'CLI_RECEIPT': quote(receipt),
+        'ARTIFACTS': quote(artifact_lines),
+        'SELECTION': quote(selection),
+        'COMPILED_CLI': quote(compiled_cli),
+        'OMARCHY_CASE_BODY': omarchy_guest_script(),
+        'PREFLIGHT_TEST': quote(NATIVE_PREFLIGHT_TEST),
+    }
+    return re.sub(r'@@([A-Z_]+)@@', lambda match: replacements[match[1]], script)
 
 
 def validate_evidence(evidence, profiles, artifacts, commit):
