@@ -1016,6 +1016,177 @@ mod tests {
             Some(crate::core::security::policy::PolicyError::Banned { name }) if name == "banned-official"
         ));
         assert!(backend.list_installed().await?.is_empty());
+        let service = PackageService::builder(backend.clone())
+            .policy(SecurityPolicy::default())
+            .without_history()
+            .build()?;
+        service.install(&["banned-official".into()], true).await?;
+        let installed = backend.list_installed().await?;
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].name, "banned-official");
+        assert_eq!(installed[0].version.version_string(), "2.0.0");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn distribution_install_retains_verified_source_grade() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+            "debian",
+            directory.path(),
+        ));
+        backend.db.add_package(
+            "distribution-fixture",
+            "2.0.0",
+            "Distribution candidate",
+            "main",
+        );
+        let service = PackageService::builder(backend.clone())
+            .policy(SecurityPolicy {
+                minimum_grade: crate::core::security::SecurityGrade::Verified,
+                ..SecurityPolicy::default()
+            })
+            .without_history()
+            .build()?;
+        service
+            .install(&["distribution-fixture".into()], true)
+            .await?;
+        let installed = backend.list_installed().await?;
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].name, "distribution-fixture");
+        assert_eq!(installed[0].version.version_string(), "2.0.0");
+        Ok(())
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn aur_install_assesses_source_and_refuses_before_build_or_backend_mutation() -> Result<()> {
+        const TEST: &str = "core::packages::service::tests::aur_install_assesses_source_and_refuses_before_build_or_backend_mutation";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !crate::core::is_root(),
+            "AUR fixture receiver must be unprivileged"
+        );
+        struct CapturedSubjects(std::sync::Mutex<Vec<SecurityPackage>>);
+        impl VulnerabilitySource for CapturedSubjects {
+            fn assess_packages<'a>(
+                &'a self,
+                packages: &'a [SecurityPackage],
+                _evidence_use: crate::core::security::vulnerability::AssessmentUse,
+            ) -> Pin<
+                Box<
+                    dyn Future<
+                            Output = Result<
+                                Vec<crate::core::security::vulnerability::PackageAssessment>,
+                                crate::core::security::vulnerability::VulnerabilityError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    self.0
+                        .lock()
+                        .expect("captured subjects")
+                        .extend_from_slice(packages);
+                    Ok(Vec::new())
+                })
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp")?;
+        let cache = directory.path().join("cache");
+        let config = directory.path().join("config");
+        let home = directory.path().join("home");
+        let data = directory.path().join("data");
+        std::fs::create_dir(&home)?;
+        temp_env::with_vars(
+            [
+                ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("HOME", Some(home.as_os_str())),
+                ("OMG_TEST_MODE", None),
+                ("OMG_TEST_DISTRO", None),
+                ("SUDO_USER", None),
+                ("SUDO_HOME", None),
+                ("DOAS_USER", None),
+            ],
+            || -> Result<()> {
+                assert_eq!(crate::core::paths::cache_dir(), cache);
+                assert_eq!(crate::core::paths::config_dir(), config);
+                let mut settings = crate::config::Settings::default();
+                settings.aur.use_metadata_archive = true;
+                settings.aur.metadata_cache_ttl_secs = 3600;
+                settings.save()?;
+                let archive = crate::package_managers::aur_metadata::metadata_path();
+                std::fs::create_dir_all(archive.parent().expect("metadata parent"))?;
+                let mut gzip = flate2::write::GzEncoder::new(
+                    std::fs::File::create(&archive)?,
+                    flate2::Compression::default(),
+                );
+                let metadata = serde_json::to_vec(&serde_json::json!([
+                    {"Name":"aur-fixture", "Version":"2.0-1", "Description":"AUR candidate",
+                     "Maintainer":null, "NumVotes":0, "Popularity":0.0, "OutOfDate":null, "LastModified":1}
+                ])).expect("serialize local AUR metadata fixture");
+                std::io::Write::write_all(&mut gzip, &metadata)
+                    .expect("write local AUR metadata fixture");
+                gzip.finish()?;
+                crate::package_managers::aur_metadata::publish_test_metadata(&archive)?;
+                let index = crate::package_managers::aur_metadata::open_fresh_metadata_index(
+                    std::time::Duration::from_hours(1),
+                )
+                .expect("read published AUR metadata")
+                .expect("fresh local metadata");
+                assert!(index.get("aur-fixture")?.is_some());
+                let mut before = std::fs::read_dir(cache.join("aur"))?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                before.sort();
+                tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+                let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+                    "arch", directory.path().join("backend").as_path(),
+                ));
+                let source = Arc::new(CapturedSubjects(std::sync::Mutex::new(Vec::new())));
+                let service = PackageService::builder(backend.clone())
+                    .policy(SecurityPolicy {
+                        advisory_requirement: crate::core::security::policy::AdvisoryRequirement::Review,
+                        ..SecurityPolicy::default()
+                    })
+                    .vulnerability_source(source.clone()).without_history().build()?;
+                let error = service.install(&["aur-fixture".into()], true).await
+                    .expect_err("missing AUR assessment must stop before build");
+                assert!(error.to_string().contains("inventory differs"), "{error:#}");
+                {
+                    let captured = source.0.lock().expect("captured subjects");
+                    assert_eq!(captured.len(), 1);
+                    assert_eq!(captured[0].origin, SecurityOrigin::AurArchive);
+                    assert_eq!(captured[0].name, "aur-fixture");
+                    assert_eq!(captured[0].version, "2.0-1");
+                }
+                let service = PackageService::builder(backend.clone())
+                    .policy(SecurityPolicy {allow_aur: false, ..SecurityPolicy::default()})
+                    .without_history().build()?;
+                let error = service.install(&["aur-fixture".into()], true).await
+                    .expect_err("disabled AUR must stop before build");
+                assert!(matches!(error.downcast_ref::<crate::core::security::policy::PolicyError>(),
+                    Some(crate::core::security::policy::PolicyError::AurDisabled {name}) if name=="aur-fixture"));
+                assert!(backend.list_installed().await?.is_empty());
+                Ok::<(), anyhow::Error>(())
+            })?;
+                let mut after = std::fs::read_dir(cache.join("aur"))?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                after.sort();
+                assert_eq!(
+                    after, before,
+                    "refused AUR candidate must not create build storage"
+                );
+                Ok(())
+            },
+        )
     }
 }
