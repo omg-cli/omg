@@ -391,6 +391,105 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 self.assertEqual(receipt['deleted_mapped'], 0)
                 self.assertEqual(receipt['deleted_summary_found'], 0)
 
+    def unseeded_nominal_compare(self, mutation=None, callback=False, ambiguous=False):
+        body = ('        #[cfg(unix)]\n        return self\n            .status\n'
+                '            .as_ref()\n            .and_then(CALL);\n'
+                '        #[cfg(not(unix))]\n        None\n    }\n')
+        old = ('impl App {\n    pub fn old_count(&self) -> Option<usize> {\n'
+               + body.replace('CALL', 'old_value')
+               + '    pub fn stable_count(&self) -> Option<usize> {\n'
+               + body.replace('CALL', 'stable_value') + '}\n').encode()
+        new = old.replace(b'old_count', b'new_summary').replace(
+            b'old_value', b'new_value').replace(
+            b'new_summary(&self) -> Option<usize>', b'new_summary(&self) -> Option<(usize, usize)>')
+        if callback:
+            new = new.replace(b'return self', b'return (|| self', 1).replace(
+                b'.and_then(new_value);', b'.and_then(new_value))();', 1)
+        if ambiguous:
+            new = new.replace(b'stable_count', b'other_count')
+        def owners(base, head):
+            for document, source, method in ((base, old, 'old_count'), (head, new, 'new_summary')):
+                lines = source.decode().splitlines()
+                document['data'][0]['functions'] = []
+                stable = 'other_count' if ambiguous and document is head else 'stable_count'
+                for name, first in ((method, 2), (stable, 11)):
+                    last = first + 8
+                    rows = [[first, 5, first, len(lines[first - 1]) + 1, 1, 0, 0, 0],
+                            [first + 2, 16, first + 3, 20, 1, 0, 0, 0],
+                            [first + 4, 14, first + 4, 20, 1, 0, 0, 0],
+                            [first + 5, 14, first + 5, 22, 1, 0, 0, 0],
+                            [last, 5, last, 6, 1, 0, 0, 0]]
+                    for instance in (1, 2):
+                        crate = f'Cs{instance}_7example'
+                        document['data'][0]['functions'].append(dict(
+                            name=f'_RNvM{crate}Nt{crate}3App{len(name)}{name}', count=1,
+                            filenames=['/src/example.rs'], regions=copy.deepcopy(rows)))
+            if mutation:
+                mutation(base, head)
+        mapped = [line for first in (2, 11) for line in
+                  (first, first + 2, first + 3, first + 4, first + 5, first + 8)]
+        return self.compare(before=[(line, 2) for line in mapped],
+            after=[(line, 2) for line in mapped], mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_fully_covered_public_method_migration_needs_no_unchanged_statement_seed(self):
+        receipt = self.unseeded_nominal_compare()
+        proof, = receipt['retained_replacement_obligations']
+        self.assertEqual([len(side) for side in proof['fully_covered_replacement_owners']], [2, 2])
+        self.assertEqual(receipt['deleted_mapped'], 0)
+        self.assertEqual(receipt['deleted_summary_found'], 0)
+        self.assertTrue(all([line, line] in proof['pairs'] for line in (4, 5, 6, 10)))
+
+    def test_unseeded_method_migration_refuses_incomplete_or_cold_owner_inventory(self):
+        def mutate(base, head, mode):
+            owners = head['data'][0]['functions']
+            owner = owners[0]
+            if mode == 'cold-entry':
+                owner['count'] = 0
+            elif mode == 'cold-base-entry':
+                base['data'][0]['functions'][0]['count'] = 0
+            elif mode == 'cold-region':
+                owner['regions'][2][4] = 0
+            elif mode == 'missing-copy':
+                owners.pop(0)
+            elif mode == 'duplicate-copy':
+                owners.append(copy.deepcopy(owner))
+            elif mode == 'foreign-owner':
+                extra = copy.deepcopy(owner); extra['name'] = 'foreign'
+                owners.append(extra)
+            elif mode == 'extra-callback':
+                extra = copy.deepcopy(owner)
+                extra['name'] = extra['name'].replace('_RNvM', '_RNCNvM') + '0'
+                extra['regions'] = extra['regions'][1:2]
+                owners.append(extra)
+            elif mode == 'wrong-implementation':
+                for item in owners[:2]:
+                    item['name'] = item['name'].replace('_RNvM', '_RNvMs0_')
+            elif mode == 'wrong-self-type':
+                for item in owners[:2]:
+                    item['name'] = item['name'].replace('3App', '5Other')
+        for mode in ('cold-entry', 'cold-base-entry', 'cold-region', 'missing-copy', 'duplicate-copy',
+                     'foreign-owner', 'extra-callback', 'wrong-implementation', 'wrong-self-type'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.unseeded_nominal_compare(lambda base, head: mutate(base, head, mode))
+
+    def test_unseeded_migration_does_not_infer_a_missing_callback_owner(self):
+        with self.assertRaises(ValueError):
+            self.unseeded_nominal_compare(callback=True)
+
+    def test_unseeded_migration_does_not_select_between_renamed_siblings(self):
+        with self.assertRaises(ValueError):
+            self.unseeded_nominal_compare(ambiguous=True)
+
+    def test_unseeded_migration_spends_the_original_shared_work_budget(self):
+        original = coverage.fully_covered_replacement
+        def exhausted(*args):
+            arguments = list(args); arguments[-1] = [0]
+            return original(*arguments)
+        with patch.object(coverage, 'fully_covered_replacement', side_effect=exhausted), \
+                self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            self.unseeded_nominal_compare()
+
     def test_nominal_method_migration_cannot_borrow_coverage_from_another_copy(self):
         def mutate(base, head, mode):
             child = head['data'][0]['functions'][1]

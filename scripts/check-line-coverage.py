@@ -2395,7 +2395,10 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
             seeds = []; parent = None
             renamed = left_prefix != right_prefix
             if renamed:
-                if left['attributes'] not in ([], ['#', '[', 'test', ']']) and not complete_test_rewrite:
+                public_method = method_migration and left['attributes'] in (
+                    ['pub'], ['pub', '(', 'crate', ')'])
+                if (left['attributes'] not in ([], ['#', '[', 'test', ']'])
+                        and not public_method and not complete_test_rewrite):
                     continue
                 if left_prefix in descriptors[1] or right_prefix in descriptors[0]:
                     continue
@@ -2417,8 +2420,16 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                                 ('let', 'Ok', 'Err', 'return', 'fn', 'struct', 'enum', 'impl', 'mod',
                                  'static', 'const', 'type', 'use', 'extern', '#')):
                         seeds.append((rows[0], targets[0]))
-                if not seeds or parent_files is not None and parent_files(parent) != {name}:
+                if (not seeds and not method_migration
+                        or parent_files is not None and parent_files(parent) != {name}):
                     continue
+                if not seeds:
+                    _construct_charge(work, sum(descriptor['row']['end'] - descriptor['row']['opening']
+                        for descriptor in (left, right)))
+                    if any(any(word in ('async', 'fn', '|', '||', '!') for word in
+                            inventory[0].words[descriptor['row']['opening'] + 1:descriptor['row']['end']])
+                            for descriptor, inventory in zip((left, right), inventories)):
+                        continue
             candidates.append((left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite))
     left_counts = Counter(row[0] for row in candidates); right_counts = Counter(row[1] for row in candidates)
     pairs = {}; receipts = []; proved_functions = set(); excerpts = []
@@ -2439,10 +2450,12 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     and groups[1][0] <= row['head_line'] <= groups[1][1]]
         if not selected:
             continue
-        if complete_test_rewrite or parent is not None and parent[0].startswith('method:') and left['signature'] != right['signature']:
+        if (complete_test_rewrite or parent is not None and parent[0].startswith('method:')
+                and (left['signature'] != right['signature'] or not seeds)):
             covered = fully_covered_replacement(name, old, new, before, after, (left, right),
                 grouped, selected, equal_rows, work)
-            if covered is not None:
+            if covered is not None and (seeds or all(len(owners) == len(group[2])
+                    for owners, group in zip(covered[1]['fully_covered_replacement_owners'], groups))):
                 mapped, receipt = covered
                 if any(line in pairs and pairs[line] != target for line, target in mapped.items()):
                     raise ValueError('Ambiguous fully covered replacement correspondence')
@@ -2451,7 +2464,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 excerpts.extend(('\n'.join(source[group[0] - 1:group[1]]) + '\n').encode()
                                 for source, group in zip((old, new), groups))
                 continue
-            if complete_test_rewrite:
+            if complete_test_rewrite or not seeds:
                 continue
         mapped = {}; spans = []; needed = set(); failed = False
         for old_row, new_row in seeds:
