@@ -950,6 +950,10 @@ def evidence_fixture(root):
             'omarchy-vendor-failure': 'Omarchy update did not complete',
             'omarchy-declined': 'declined',
             'omarchy-migration-refusal': 'external package helper',
+            'omarchy-migration-helper-tabs': 'external package helper',
+            'omarchy-migration-helper-quoted': 'external package helper',
+            'omarchy-migration-helper-bare': 'external package helper',
+            'omarchy-migration-helper-substitution': 'external package helper',
             'omarchy-unsupported-mode': 'complete update lifecycle',
             'omarchy-unsupported-turbo-mode': 'complete update lifecycle',
             'omarchy-invalid-transport': 'Incomplete Omarchy update transport',
@@ -1185,7 +1189,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 22)
-            self.assertEqual(len(receipt['process_checks']), 68)
+            self.assertEqual(len(receipt['process_checks']), 72)
             self.assertEqual(len(receipt['fresh_admission']), 20)
             self.assertEqual(len(files), len(receipt['profiles']))
 
@@ -1364,6 +1368,24 @@ class FreshAdmissionFixture(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, diagnostic):
                     PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
                 path.write_text(contents)
+
+    def test_helper_spacing_refusals_are_mandatory_before_any_native_phase(self):
+        cases = ('omarchy-migration-helper-tabs', 'omarchy-migration-helper-quoted',
+                 'omarchy-migration-helper-bare', 'omarchy-migration-helper-substitution')
+        for stage in cases:
+            self.assertIn(stage, PRODUCER.OMARCHY_CASES)
+            case = PRODUCER.OMARCHY_CASES[stage]
+            self.assertEqual((case.exit_status, case.helpers, case.native_phase), (1, (), 'initial'))
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            for stage in cases:
+                path = evidence / f'{stage}.log'
+                old = path.read_text()
+                path.write_text('an unrelated failure\n')
+                with self.assertRaisesRegex(ValueError, 'native package migration refusal'):
+                    PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+                path.write_text(old)
 
     def test_native_migration_boundary_refusals_require_actual_control_and_no_markers(self):
         names = {'omarchy-native-migrations-inventory-error',

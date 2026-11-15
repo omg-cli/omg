@@ -778,11 +778,14 @@ fn pending_migrations(migrations: &Path, state: &Path) -> Result<Vec<PendingMigr
             "omarchy-pkg-present",
             "omarchy-pkg-missing",
         ];
+        let references_external_helper = known_external_aur
+            .iter()
+            .any(|command| contents.contains(command))
+            || contents
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .any(|word| matches!(word, "yay" | "aura" | "paru"));
         anyhow::ensure!(
-            native.is_some()
-                || !known_external_aur
-                    .iter()
-                    .any(|command| contents.contains(command)),
+            native.is_some() || !references_external_helper,
             "Native AUR integration refuses pending Omarchy migration {} because it references an external package helper. A native migration equivalent is required before continuing.",
             path.display()
         );
@@ -3215,6 +3218,58 @@ omarchy-state set reboot-required
     }
 
     #[test]
+    fn pending_migration_helper_names_do_not_depend_on_shell_spacing() -> Result<()> {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let state = owner.path().join("markers");
+        std::fs::create_dir(&migrations)?;
+        let source = migrations.join("0001.sh");
+        for contents in [
+            "aura",
+            "paru",
+            "yay",
+            "aura\n",
+            "paru\n",
+            "yay\t-Syu\n",
+            "aura\t-Au\n",
+            "paru\t-Sua\n",
+            "sudo /usr/bin/yay\n",
+            "\"/usr/bin/aura\" -Au\n",
+            "'paru' -Sua\n",
+            "yay;-Sua\n",
+            "$(aura)\n",
+            "exec yay\r\n",
+        ] {
+            std::fs::write(&source, contents)?;
+            let result = pending_migrations(&migrations, &state);
+            assert!(
+                result.is_err(),
+                "external helper must be refused: {contents:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&source)?, contents);
+            assert!(
+                !state.exists(),
+                "inspection must not create completion markers"
+            );
+        }
+        for contents in [
+            "echo 'railway configuration'\n",
+            "printf 'aurora'\n",
+            "echo not_yay_helper\n",
+        ] {
+            std::fs::write(&source, contents)?;
+            let pending = pending_migrations(&migrations, &state)?;
+            assert_eq!(
+                pending.len(),
+                1,
+                "unrelated words are not package helper names"
+            );
+            assert_eq!(pending[0].native, None);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn coordination_refuses_aliases_writable_files_and_replaced_names() {
         use std::os::unix::fs::PermissionsExt;
         let owner = private_directory();
@@ -4259,20 +4314,30 @@ omarchy-state set reboot-required
             .expect("descendant identity")
             .parse()
             .expect("descendant PID");
-        commands
-            .cleanup()
-            .await
-            .expect("cancel complete stage group");
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let running = tokio::sync::Notify::new();
+        let mut stopped = Box::pin(async {
             while std::fs::read_to_string(format!("/proc/{descendant}/stat")).is_ok_and(|stat| {
                 stat.rsplit_once(')')
                     .is_some_and(|(_, fields)| !fields.trim_start().starts_with('Z'))
             }) {
+                running.notify_one();
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        })
+        });
+        fixture_ready(
+            &mut stopped,
+            running.notified(),
+            "descendant stopped before cleanup could be tested",
+        )
         .await
-        .expect("TERM-ignoring stage descendant must stop after cleanup");
+        .expect("a live descendant must be observed before cancellation");
+        commands
+            .cleanup()
+            .await
+            .expect("cancel complete stage group");
+        tokio::time::timeout(Duration::from_secs(5), stopped)
+            .await
+            .expect("TERM-ignoring stage descendant must stop after cleanup");
         cleanup.0 = None;
     }
 

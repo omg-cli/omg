@@ -1023,6 +1023,10 @@ OMARCHY_CASES = {
         if item.split('\t')[0] not in ('omarchy-snapshot', 'omarchy-restart-shell', 'omarchy-update-mise')),
         native_phase='complete'),
     'omarchy-migration-refusal': OmarchyCase(1, ()),
+    'omarchy-migration-helper-tabs': OmarchyCase(1, ()),
+    'omarchy-migration-helper-quoted': OmarchyCase(1, ()),
+    'omarchy-migration-helper-bare': OmarchyCase(1, ()),
+    'omarchy-migration-helper-substitution': OmarchyCase(1, ()),
     'omarchy-unsupported-mode': OmarchyCase(1, ()),
     'omarchy-unsupported-turbo-mode': OmarchyCase(1, ()),
     'omarchy-invalid-transport': OmarchyCase(1, ()),
@@ -1446,6 +1450,18 @@ OMG_NATIVE_MIGRATION_1794675791
       ;;
     omarchy-migration-refusal)
       printf 'omarchy-pkg-aur-add forbidden-installed-fixture\n' > "$fixture/runtime/migrations/1.sh"
+      ;;
+    omarchy-migration-helper-tabs)
+      printf 'unused_flag=1\naura\t-Au\n' > "$fixture/runtime/migrations/1.sh"
+      ;;
+    omarchy-migration-helper-quoted)
+      printf '%s\n' '_omg_fixture=1' '"/usr/bin/yay" -Sua' > "$fixture/runtime/migrations/1.sh"
+      ;;
+    omarchy-migration-helper-bare)
+      printf 'paru' > "$fixture/runtime/migrations/1.sh"
+      ;;
+    omarchy-migration-helper-substitution)
+      printf '%s\n' '$(paru)' > "$fixture/runtime/migrations/1.sh"
       ;;
   esac
   args=(--yes)
@@ -2221,7 +2237,7 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     'Optional Omarchy update failures were not visible: ' + stage)
         elif stage == 'omarchy-vendor-failure':
             require('Omarchy update did not complete' in log, 'Missing vendor failure diagnostic')
-        elif stage == 'omarchy-migration-refusal':
+        elif stage == 'omarchy-migration-refusal' or stage.startswith('omarchy-migration-helper-'):
             require('external package helper' in log, 'Missing native package migration refusal')
         elif stage in ('omarchy-unsupported-mode', 'omarchy-unsupported-turbo-mode'):
             require('complete update lifecycle' in log, 'Unsupported Omarchy scope accepted')

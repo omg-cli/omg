@@ -1820,3 +1820,42 @@ producer boundary suite now passes 104 tests. The total process checks are 37.
 Only producer Python and this evidence note change after 01c2c09f; fresh full
 source-identity and native verification will still be collected rather than
 relabeling the prior binary's compilation epoch.
+
+## Resume checkpoint: November 15, 2026
+
+The current code is on PR #1057's existing remote `codex/arch-hardening`
+branch. Continue on local `main`, without new branches or worktrees. Work
+solo and defensively; preserve the user's Git identity and selected model.
+
+The last installed and fully runtime-verified build is `21fc70a3`, version
+0.1.224, IPC protocol 5. Its matching pair passed 37 Omarchy scenarios,
+four terminal interactions, two normal Arch checks, six signed refusals,
+20 native admission cases and two root-to-ordinary receiver checks. The
+final resource check passed. The installed CLI SHA-256 is
+`91dfca72214d697e4a5866e98998105b27ceebd8d1201084240076ce11765b22`;
+the daemon SHA-256 is
+`d5cf92a422f541e98518b89ccf5d771837e7e13e0b4071410847b02dee15f073`.
+
+The following checkpoint adds whitespace/quote/EOF-independent detection of
+known external migration helpers, 14 inert spelling regressions, four
+mandatory CLI refusal scenarios, and deterministic live-before-cleanup
+observation in the descendant cancellation test. It passes 2,477 library
+tests (14 explicitly ignored), 383 producer/comparator tests and all-target
+Clippy with warnings denied. Its release rebuild and expanded native VM
+verification remain required; do not relabel the installed build as this
+checkpoint's binary.
+
+The `21fc70a3` instrumented producer passed. Its coverage comparison still
+refused Omarchy's 5363/5362 summary. Independent raw-observer reconciliation
+located the remaining cold row in the cancellation test's polling loop.
+The checkpoint fixes that test precondition; fresh coverage must verify it.
+Other retained-source correspondence and comparison-work-budget obligations
+remain open. Do not weaken counters, thresholds, producer admission or limits.
+
+CVE archive ingestion is incomplete. Its operator coordinator runs locally,
+so a reboot stops the backfill; GitHub CI and deployed Cloudflare schedules
+run remotely. Retain the private Linux checkpoint and credentials outside
+Git. Before resuming the same fenced session, confirm the old process is
+terminal, inspect the writer lease, reconcile server membership/counters
+with the checkpoint, and replay any acknowledged-but-unsaved batch. Never
+manually advance the cursor or claim exhaustive certification from progress.
