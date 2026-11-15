@@ -272,11 +272,19 @@ pub async fn generate_sbom(
     // The format string mirrors what `SbomGenerator` actually emits; keep the
     // two in sync when bumping spec versions.
     // Spec registry: https://cyclonedx.org/spec-version/
-    let mut sbom = generator
+    let sbom = generator
         .generate_system_sbom()
         .await
         .context("Failed to generate system SBOM")?;
+    export_sbom_report(&generator, sbom, output, include_vulns)
+}
 
+fn export_sbom_report(
+    generator: &SbomGenerator,
+    mut sbom: crate::core::security::Sbom,
+    output: Option<String>,
+    include_vulns: bool,
+) -> Result<()> {
     if !include_vulns {
         mark_inventory_only(&mut sbom)?;
         println!(
@@ -2177,6 +2185,128 @@ mod tests {
             value["metadata"]["component"]["properties"][0],
             serde_json::json!({ "name": "omg:advisory-scan", "value": "not-performed" })
         );
+    }
+
+    #[test]
+    fn sbom_export_keeps_unknown_scope_visible_and_writes_only_private_reports() -> Result<()> {
+        const NAME: &str = "cli::security::tests::sbom_export_keeps_unknown_scope_visible_and_writes_only_private_reports";
+        if let Some(case) = std::env::var_os("OMG_SBOM_EXPORT_CASE") {
+            let case = case.to_str().context("fixture case")?;
+            let path = std::path::PathBuf::from(
+                std::env::var_os("OMG_SBOM_EXPORT_PATH").context("fixture path")?,
+            );
+            let mut value = serde_json::json!({
+                "bomFormat":"CycloneDX", "specVersion":"1.5", "version":1,
+                "serialNumber":"urn:uuid:00000000-0000-0000-0000-000000000000",
+                "metadata":{"timestamp":"2026-09-22T00:00:00Z", "tools":[],
+                    "component":{"type":"operating-system", "name":"Arch Linux", "version":"rolling"}},
+                "components":[{"type":"library", "name":"unestablished", "version":"1-1",
+                    "bom-ref":"pkg:alpm/arch/unestablished@1-1"}]
+            });
+            if case == "findings" {
+                value["vulnerabilities"] = serde_json::json!([{"id":"CVE-2026-1234",
+                    "affects":[{"ref":"pkg:alpm/arch/unestablished@1-1"}]}]);
+            }
+            if case == "inventory-only" {
+                value["metadata"]["component"]["properties"] = serde_json::json!([
+                    {"name":"omg:advisory-coverage", "value":"not-performed"}
+                ]);
+            } else if case != "unreported" {
+                value["metadata"]["component"]["properties"] = serde_json::json!([
+                    {"name":"omg:advisory-coverage", "value":"reported"},
+                    {"name":"omg:advisory-unknown-count", "value":if matches!(case,"complete"|"findings") {"0"} else {"1"}}
+                ]);
+            }
+            let expected_scope = value["metadata"]["component"]["properties"].clone();
+            let sbom = serde_json::from_value(value)?;
+            let result = export_sbom_report(
+                &SbomGenerator::new(),
+                sbom,
+                Some(path.to_string_lossy().into_owned()),
+                case != "inventory-only",
+            );
+            if case == "write-failure" {
+                result.expect_err("a directory is not a report destination");
+                anyhow::ensure!(path.is_dir(), "invalid destination must survive");
+            } else {
+                result?;
+                let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+                anyhow::ensure!(
+                    report["components"][0]["name"] == "unestablished",
+                    "installed identity was lost"
+                );
+                let properties = report["metadata"]["component"]["properties"].as_array();
+                if case == "inventory-only" {
+                    anyhow::ensure!(
+                        properties.is_some_and(|rows| rows
+                            .iter()
+                            .any(|row| row["name"] == "omg:advisory-scan"
+                                && row["value"] == "not-performed")),
+                        "inventory-only marker was lost"
+                    );
+                }
+                if case != "inventory-only" {
+                    anyhow::ensure!(
+                        report["metadata"]["component"]["properties"] == expected_scope,
+                        "export changed the recorded advisory scope"
+                    );
+                }
+                anyhow::ensure!(
+                    (report["vulnerabilities"][0]["id"] == "CVE-2026-1234") == (case == "findings"),
+                    "export changed the recorded findings"
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    anyhow::ensure!(
+                        std::fs::metadata(&path)?.permissions().mode() & 0o777 == 0o600,
+                        "SBOM report must remain private"
+                    );
+                }
+            }
+            return Ok(());
+        }
+        let owner = tempfile::tempdir()?;
+        for (case, warning) in [
+            ("unreported", Some("advisory coverage was not reported")),
+            ("partial", Some("1 package(s) with unknown coverage")),
+            ("complete", None),
+            ("findings", None),
+            ("inventory-only", Some("advisory matching was skipped")),
+            ("write-failure", Some("1 package(s) with unknown coverage")),
+        ] {
+            let path = owner.path().join(case);
+            if case == "write-failure" {
+                std::fs::create_dir(&path)?;
+            }
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", NAME, "--nocapture"])
+                .env("OMG_SBOM_EXPORT_CASE", case)
+                .env("OMG_SBOM_EXPORT_PATH", &path)
+                .env("NO_COLOR", "1")
+                .output()?;
+            let diagnostic = format!(
+                "{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            anyhow::ensure!(output.status.success(), "{diagnostic}");
+            let text = console::strip_ansi_codes(std::str::from_utf8(&output.stdout)?);
+            anyhow::ensure!(
+                text.contains("SBOM generated with 1 components") == (case != "write-failure"),
+                "{diagnostic}"
+            );
+            anyhow::ensure!(
+                text.contains("1 vulnerabilities included") == (case == "findings"),
+                "{diagnostic}"
+            );
+            if let Some(warning) = warning {
+                anyhow::ensure!(text.contains(warning), "{diagnostic}");
+            } else {
+                anyhow::ensure!(!text.contains("does not establish safety"), "{diagnostic}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

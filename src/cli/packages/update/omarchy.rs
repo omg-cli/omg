@@ -3118,11 +3118,14 @@ omarchy-state set reboot-required
     async fn migration_source_changes_never_create_a_completion_marker() -> Result<()> {
         struct ChangingExecutor {
             calls: usize,
+            rewrite: bool,
         }
         impl MigrationExecutor for ChangingExecutor {
             async fn execute_migration(&mut self, migration: &PendingMigration) -> Result<()> {
                 self.calls += 1;
-                std::fs::write(&migration.path, "echo changed during execution\n")?;
+                if self.rewrite {
+                    std::fs::write(&migration.path, "echo changed during execution\n")?;
+                }
                 Ok(())
             }
         }
@@ -3133,7 +3136,10 @@ omarchy-state set reboot-required
         let path = migrations.join("0001.sh");
         std::fs::write(&path, "echo initial\n")?;
         let plan = pending_migrations(&migrations, &markers)?;
-        let mut executor = ChangingExecutor { calls: 0 };
+        let mut executor = ChangingExecutor {
+            calls: 0,
+            rewrite: true,
+        };
         std::fs::write(&path, "echo changed before execution\n")?;
         let error = run_migration_plan(&plan, &markers, &mut executor)
             .await
@@ -3149,6 +3155,19 @@ omarchy-state set reboot-required
         assert!(
             !markers.join("0001.sh").exists(),
             "neither changed script is marked complete"
+        );
+        let repaired = pending_migrations(&migrations, &markers)?;
+        executor.rewrite = false;
+        run_migration_plan(&repaired, &markers, &mut executor).await?;
+        assert_eq!(
+            executor.calls, 2,
+            "freshly reviewed source may complete once"
+        );
+        assert!(markers.join("0001.sh").is_file());
+        run_migration_plan(&repaired, &markers, &mut executor).await?;
+        assert_eq!(
+            executor.calls, 2,
+            "completed repaired migration is not repeated"
         );
         Ok(())
     }

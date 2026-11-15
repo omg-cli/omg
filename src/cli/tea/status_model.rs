@@ -348,6 +348,130 @@ mod tests {
         assert_eq!(model.state, StatusState::Loading);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn daemon_load_executes_status_request_and_preserves_reported_scope() -> anyhow::Result<()> {
+        const NAME: &str = "cli::tea::status_model::tests::daemon_load_executes_status_request_and_preserves_reported_scope";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
+            return Ok(());
+        }
+        use crate::daemon::protocol::{self, Response, StatusResult};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, Instant};
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let owner = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        for (scanned, unknown, expected) in [
+            (true, Some(2), Some((0, 2))),
+            (true, None, None),
+            (false, Some(0), None),
+        ] {
+            let socket = owner.path().join("status.sock");
+            let listener = UnixListener::bind(&socket)?;
+            listener.set_nonblocking(true)?;
+            let server = std::thread::spawn(move || -> anyhow::Result<()> {
+                let started = Instant::now();
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            anyhow::ensure!(
+                                started.elapsed() < Duration::from_secs(3),
+                                "status client did not connect"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+                let frame = protocol::read_frame(&mut stream)?;
+                let (_, payload) = protocol::split_frame(&frame)?;
+                let request: Request = bitcode::deserialize(payload)?;
+                anyhow::ensure!(
+                    matches!(request, Request::Status { .. }),
+                    "unexpected status request"
+                );
+                let status = StatusResult {
+                    total_packages: 42,
+                    explicit_packages: 17,
+                    orphan_packages: 3,
+                    updates_available: 5,
+                    security_vulnerabilities: 0,
+                    vulnerabilities_scanned: scanned,
+                    security_unknown_packages: unknown,
+                    runtime_versions: Vec::new(),
+                };
+                protocol::write_frame(
+                    &mut stream,
+                    &protocol::encode_frame(&Response::Success {
+                        id: request.id(),
+                        result: ResponseResult::Status(status),
+                    })?,
+                )?;
+                Ok(())
+            });
+            let observed = temp_env::with_vars(
+                [
+                    ("OMG_TEST_MODE", Some("0")),
+                    ("OMG_DISABLE_DAEMON", Some("0")),
+                    ("OMG_SOCKET_PATH", socket.to_str()),
+                ],
+                || -> anyhow::Result<()> {
+                    let mut model = StatusModel::new().with_fast_mode(true);
+                    let Cmd::Exec(load) = model.update(StatusMsg::Load) else {
+                        anyhow::bail!("load must return an executable command");
+                    };
+                    let message = load();
+                    let StatusMsg::Loaded(data) = &message else {
+                        anyhow::bail!("status request did not load: {message:?}");
+                    };
+                    anyhow::ensure!(
+                        (
+                            data.total_packages,
+                            data.explicit_packages,
+                            data.orphan_packages,
+                            data.updates_available
+                        ) == (42, 17, 3, 5),
+                        "daemon inventory counters were lost"
+                    );
+                    anyhow::ensure!(
+                        data.advisory_coverage == expected && data.fast_mode,
+                        "daemon scope or requested mode was lost"
+                    );
+                    let _ = model.update(message);
+                    anyhow::ensure!(
+                        model.state == StatusState::Complete,
+                        "load did not complete"
+                    );
+                    let view = model.view();
+                    anyhow::ensure!(
+                        view.contains("Advisory coverage unreported") == expected.is_none(),
+                        "status view hid unreported scope"
+                    );
+                    anyhow::ensure!(
+                        view.contains("2 packages have unknown advisory applicability")
+                            == expected.is_some(),
+                        "status view hid unknown applicability"
+                    );
+                    Ok(())
+                },
+            );
+            let served = server
+                .join()
+                .map_err(|_| anyhow::anyhow!("status fixture panicked"))?;
+            observed?;
+            served?;
+            std::fs::remove_file(socket)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_status_model_loaded() {
         let mut model = StatusModel::new();

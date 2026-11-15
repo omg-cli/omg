@@ -951,6 +951,8 @@ HARNESSES = {
     'lib-unit': Harness('omg_lib', (
         'cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy',
         'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy',
+        'cli::tea::status_model::tests::daemon_load_executes_status_request_and_preserves_reported_scope',
+        'package_managers::aur::utils::tests::lifecycle_lock_initial_open_errors_preserve_path_and_io_cause',
     )),
     'coverage11': Harness('coverage_11', ('machine_id_is_stable_sixteen_lowercase_hex',)),
     'ipc': Harness('coverage_8', ('native_audit_fix_dry_runs_preserve_unknown_scope_and_inert_advisory_text',)),
@@ -1008,6 +1010,10 @@ OMARCHY_CASES = {
         'omarchy-hw-aarch64-qualcomm', 'omarchy-hw-match\tOmniBook 3 Laptop',
         'omarchy-notification-dismiss\tOmarchy Migrations',
     ) + OMARCHY_SUFFIX[3:], native_phase='migrated'),
+    'omarchy-native-migrations-inventory-error': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
+        'omarchy-update-stay-awake\tstop',), scene='migration-inventory-error', native_phase='repository-upgraded'),
+    'omarchy-native-migrations-directory-untrusted': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
+        'omarchy-update-stay-awake\tstop',), scene='migration-directory-untrusted', native_phase='repository-upgraded'),
     'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-runtime-unset': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
@@ -1136,6 +1142,16 @@ case "$name:${OMARCHY_FIXTURE_SCENE:-none}:${1:-}" in
   omarchy-update-dev:development-failure:*) exit 7 ;;
   omarchy-update-stay-awake:inhibitor-start-failure:start) exit 7 ;;
   omarchy-update-stay-awake:inhibitor-stop-failure:stop) exit 7 ;;
+esac
+case "$name:${OMARCHY_FIXTURE_SCENE:-none}" in
+  omarchy-restart-shell:migration-inventory-error|omarchy-restart-shell:migration-directory-untrusted)
+    : > "$OMARCHY_HELPER_TRACE.boundary-ready"
+    for ((attempt=0; attempt<4000; attempt++)); do
+      test ! -f "$OMARCHY_HELPER_TRACE.boundary-done" || break
+      sleep 0.01
+    done
+    test -f "$OMARCHY_HELPER_TRACE.boundary-done"
+    ;;
 esac
 case "$name:${OMARCHY_FIXTURE_SCENE:-none}" in
   omarchy-snapshot:snapshot-unsupported) exit 127 ;;
@@ -1364,7 +1380,7 @@ install -d -m 700 -o nobody -g nobody "$case_root"
 ip link set lo up
 python3 -m http.server 18080 --bind 127.0.0.1 --directory /opt > "$fixture/repository-server.log" 2>&1 &
 repository_server=$!
-trap 'kill "$repository_server"; wait "$repository_server" || true; for path in "${created[@]}"; do rm -f -- "$path"; done; rm -rf -- "$fixture"' EXIT
+trap 'for child in $(jobs -pr); do if test "$child" = "${boundary_job:-}"; then kill "$child"; wait "$child" || true; fi; done; kill "$repository_server"; wait "$repository_server" || true; for path in "${created[@]}"; do rm -f -- "$path"; done; rm -rf -- "$fixture"' EXIT
 for ((attempt=0; attempt<50; attempt++)); do
   if python3 -c 'import socket; socket.create_connection(("127.0.0.1", 18080), 1).close()' 2>/dev/null; then break; fi
   kill -0 "$repository_server"
@@ -1517,6 +1533,24 @@ OMARCHY_CASE_SETUP
       authorization_job=$!
     fi
   fi
+  boundary_job=
+  if [[ $scene == migration-inventory-error || $scene == migration-directory-untrusted ]]; then
+    (
+      for ((attempt=0; attempt<4000; attempt++)); do
+        test ! -f "$case_dir/helpers.tsv.boundary-ready" || break
+        sleep 0.01
+      done
+      test -f "$case_dir/helpers.tsv.boundary-ready"
+      if test "$scene" = migration-inventory-error; then
+        mv "$fixture/runtime/migrations" "$fixture/runtime/saved-migrations"
+        printf 'invalid migration inventory\n' > "$fixture/runtime/migrations"
+      else
+        chmod 777 "$fixture/runtime/migrations"
+      fi
+      printf '%s\n' "$scene" > "$case_dir/helpers.tsv.boundary-done"
+    ) &
+    boundary_job=$!
+  fi
   result=0
   timeout --signal=TERM --kill-after=3 "$stage_timeout" runuser -u nobody -- env -i \
     PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
@@ -1529,6 +1563,26 @@ OMARCHY_CASE_SETUP
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  if test -n "$boundary_job"; then
+    if test ! -f "$case_dir/helpers.tsv.boundary-done"; then
+      kill "$boundary_job" 2>/dev/null || true
+      wait "$boundary_job" 2>/dev/null || true
+      echo 'Migration boundary control did not complete' >&2
+      exit 1
+    fi
+    wait "$boundary_job"
+    test "$(cat "$case_dir/helpers.tsv.boundary-done")" = "$scene"
+    test -z "$(find "$case_dir/migrations" -mindepth 1 -print -quit)"
+    if test "$scene" = migration-inventory-error; then
+      test -f "$fixture/runtime/migrations" && test ! -L "$fixture/runtime/migrations"
+      rm "$fixture/runtime/migrations"
+      mv "$fixture/runtime/saved-migrations" "$fixture/runtime/migrations"
+    else
+      test "$(stat -c '%u:%a' "$fixture/runtime/migrations")" = 0:777
+      chmod 755 "$fixture/runtime/migrations"
+    fi
+    printf 'boundary_control=%s completion_markers=0\n' "$scene" > "/evidence/cli/$stage-migrations.txt"
+  fi
   if test -n "$authorization"; then
     if test -n "$authorization_job"; then wait "$authorization_job"; fi
     rm -f /etc/sudoers.d/zzzz-omg-authorization-denied /etc/sudoers.d/zz-omg-authorization-log
@@ -1562,7 +1616,9 @@ OMG_AUTHORIZATION_RECEIPT
   if test "$scene" = notification-spawn-error; then
     install -m 755 "$fixture/stage" /usr/bin/omarchy-notification-dismiss
   fi
-  if test "$stage" = omarchy-native-migrations-script-failure; then
+  if test -n "$boundary_job"; then
+    test ! -e "$case_dir/native-migration-order"
+  elif test "$stage" = omarchy-native-migrations-script-failure; then
     test "$(cat "$case_dir/native-migration-order")" = before
     test -z "$(find "$case_dir/migrations" -mindepth 1 -print -quit)"
     printf 'failed_configuration=before completion_markers=0\n' > "/evidence/cli/$stage-migrations.txt"
@@ -2050,7 +2106,14 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         if case.native_phase in ('complete', 'migrated', 'migrated-unmatched'):
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
-        if stage == 'omarchy-native-migrations-script-failure':
+        if case.scene in ('migration-inventory-error', 'migration-directory-untrusted'):
+            require((evidence / f'{stage}-migrations.txt').read_text()
+                    == f'boundary_control={case.scene} completion_markers=0\n',
+                    'Migration boundary control or marker state differs')
+            diagnostic = ('Cannot inspect pending Omarchy migrations' if case.scene=='migration-inventory-error'
+                          else 'Selected Omarchy runtime directory is not root-controlled')
+            require(diagnostic in log, 'Migration boundary refusal was hidden')
+        elif stage == 'omarchy-native-migrations-script-failure':
             require((evidence / f'{stage}-migrations.txt').read_text()
                     == 'failed_configuration=before completion_markers=0\n',
                     'Failed migration acquired a completion marker')

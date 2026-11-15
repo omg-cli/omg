@@ -874,7 +874,9 @@ def evidence_fixture(root):
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status=PRODUCER.NATIVE_PHASES[case.native_phase])))
-        if stage == 'omarchy-native-migrations-script-failure':
+        if case.scene in ('migration-inventory-error', 'migration-directory-untrusted'):
+            (evidence / f'{stage}-migrations.txt').write_text(f'boundary_control={case.scene} completion_markers=0\n')
+        elif stage == 'omarchy-native-migrations-script-failure':
             (evidence / f'{stage}-migrations.txt').write_text('failed_configuration=before completion_markers=0\n')
         elif stage.startswith('omarchy-native-migrations'):
             (evidence / f'{stage}-migrations.txt').write_text(
@@ -927,6 +929,8 @@ def evidence_fixture(root):
             'omarchy-native-migrations-notification-missing': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
             'omarchy-native-migrations-installed-audio': '| System is up to date\nNative Omarchy migration-xrandr completed',
             'omarchy-native-migrations-script-failure': '0000000000.sh failed: exit status: 7',
+            'omarchy-native-migrations-inventory-error': 'Cannot inspect pending Omarchy migrations',
+            'omarchy-native-migrations-directory-untrusted': 'Selected Omarchy runtime directory is not root-controlled',
             'omarchy-current-kernel': '| System is up to date',
             'omarchy-runtime-unset': 'caller_runtime_hint=unset\n| System is up to date',
             'omarchy-interrupted': 'Omarchy update interrupted',
@@ -1180,8 +1184,8 @@ class SupplementalEvidence(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
-            self.assertEqual(len(receipt['tests']), 20)
-            self.assertEqual(len(receipt['process_checks']), 66)
+            self.assertEqual(len(receipt['tests']), 22)
+            self.assertEqual(len(receipt['process_checks']), 68)
             self.assertEqual(len(receipt['fresh_admission']), 20)
             self.assertEqual(len(files), len(receipt['profiles']))
 
@@ -1361,6 +1365,25 @@ class FreshAdmissionFixture(unittest.TestCase):
                     PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
                 path.write_text(contents)
 
+    def test_native_migration_boundary_refusals_require_actual_control_and_no_markers(self):
+        names = {'omarchy-native-migrations-inventory-error',
+                 'omarchy-native-migrations-directory-untrusted'}
+        self.assertTrue(names <= PRODUCER.OMARCHY_CASES.keys())
+        for name in names:
+            case = PRODUCER.OMARCHY_CASES[name]
+            self.assertEqual(case.exit_status, 1)
+            self.assertEqual(case.native_phase, 'repository-upgraded')
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            for name in names:
+                path = evidence / f'{name}-migrations.txt'
+                data = path.read_text()
+                path.write_text(data.replace('completion_markers=0', 'completion_markers=1'))
+                with self.assertRaisesRegex(ValueError, 'boundary'):
+                    PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+                path.write_text(data)
+
     def test_native_migrations_are_a_required_signed_full_update_case(self):
         case = PRODUCER.OMARCHY_CASES['omarchy-native-migrations']
         self.assertEqual(case.exit_status, 0)
@@ -1372,6 +1395,12 @@ class FreshAdmissionFixture(unittest.TestCase):
         self.assertIn('--native-migrations', script)
         self.assertIn('1794518371.sh', script)
         self.assertIn('1794675791.sh', script)
+
+    def test_daemon_scope_and_lifecycle_open_errors_are_mandatory_root_receivers(self):
+        for name in (
+                'cli::tea::status_model::tests::daemon_load_executes_status_request_and_preserves_reported_scope',
+                'package_managers::aur::utils::tests::lifecycle_lock_initial_open_errors_preserve_path_and_io_cause'):
+            self.assertIn(name, PRODUCER.HARNESSES['lib-unit'].tests)
 
     def test_native_remediation_dry_run_is_a_mandatory_ipc_fixture(self):
         name = 'native_audit_fix_dry_runs_preserve_unknown_scope_and_inert_advisory_text'
