@@ -851,6 +851,39 @@ mod tests {
             .await
             .expect_err("review requires an assessment for every subject");
         assert!(error.to_string().contains("inventory differs"), "{error:#}");
+        let directory = tempfile::tempdir()?;
+        for distro in ["arch", "debian"] {
+            let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+                distro,
+                directory.path().join(distro).as_path(),
+            ));
+            let service = PackageService::builder(backend)
+                .policy(SecurityPolicy::default())
+                .vulnerability_source(Arc::new(MissingSubjects))
+                .without_history()
+                .build()?;
+            let mut fresh = SecurityPolicy {
+                advisory_requirement:
+                    crate::core::security::policy::AdvisoryRequirement::FreshSnapshot,
+                ..SecurityPolicy::default()
+            };
+            let result = service.check_candidate(&fresh, package.clone()).await;
+            if cfg!(feature = "arch") && distro == "arch" {
+                result.expect("native Arch admission is checked on the prepared transaction");
+                fresh.banned_packages.push(package.name.clone());
+                let error = service
+                    .check_candidate(&fresh, package.clone())
+                    .await
+                    .expect_err("prepared admission must still enforce source policy");
+                assert!(matches!(
+                    error.downcast_ref::<crate::core::security::policy::PolicyError>(),
+                    Some(crate::core::security::policy::PolicyError::Banned { name }) if name == "fixture"
+                ));
+            } else {
+                let error = result.expect_err("other backends must assess every candidate now");
+                assert!(error.to_string().contains("inventory differs"), "{error:#}");
+            }
+        }
         let mut verified = service.policy.clone();
         verified.minimum_grade = crate::core::security::SecurityGrade::Verified;
         assert!(
