@@ -243,7 +243,7 @@ mod tests {
     fn run_status_load(command: Cmd<StatusMsg>) -> anyhow::Result<StatusMsg> {
         match command {
             Cmd::Exec(load) => Ok(load()),
-            other => anyhow::bail!("load must return an executable command: {other:?}"),
+            _ => anyhow::bail!("load must return an executable command"),
         }
     }
 
