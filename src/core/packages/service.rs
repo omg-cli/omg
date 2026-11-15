@@ -988,4 +988,34 @@ mod tests {
         }
         Ok(())
     }
+
+    #[cfg(feature = "arch")]
+    #[tokio::test]
+    async fn official_install_candidate_policy_precedes_backend_mutation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let backend = Arc::new(crate::package_managers::mock::MockPackageManager::new_in(
+            "arch",
+            directory.path(),
+        ));
+        backend
+            .db
+            .add_package("banned-official", "2.0.0", "Official candidate", "core");
+        let service = PackageService::builder(backend.clone())
+            .policy(SecurityPolicy {
+                banned_packages: vec!["banned-official".into()],
+                ..SecurityPolicy::default()
+            })
+            .without_history()
+            .build()?;
+        let error = service
+            .install(&["banned-official".into()], true)
+            .await
+            .expect_err("banned official candidate must stop before backend install");
+        assert!(matches!(
+            error.downcast_ref::<crate::core::security::policy::PolicyError>(),
+            Some(crate::core::security::policy::PolicyError::Banned { name }) if name == "banned-official"
+        ));
+        assert!(backend.list_installed().await?.is_empty());
+        Ok(())
+    }
 }
