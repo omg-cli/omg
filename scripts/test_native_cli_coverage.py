@@ -1098,7 +1098,7 @@ class SupplementalEvidence(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
-            self.assertEqual(len(receipt['tests']), 19)
+            self.assertEqual(len(receipt['tests']), 20)
             self.assertEqual(len(receipt['process_checks']), 60)
             self.assertEqual(len(receipt['fresh_admission']), 20)
             self.assertEqual(len(files), len(receipt['profiles']))
@@ -1238,6 +1238,13 @@ class ArtifactAdmission(unittest.TestCase):
 
 
 class FreshAdmissionFixture(unittest.TestCase):
+    def test_native_remediation_dry_run_is_a_mandatory_ipc_fixture(self):
+        name = 'native_audit_fix_dry_runs_preserve_unknown_scope_and_inert_advisory_text'
+        self.assertIn(name, PRODUCER.HARNESSES['ipc'].tests)
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
+        self.assertIn('"$name" --exact --include-ignored --nocapture', script)
+
     def test_native_preflight_is_mandatory_even_when_ordinary_runs_ignore_it(self):
         name = 'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy'
         self.assertIn(name, PRODUCER.HARNESSES['lib-unit'].tests)

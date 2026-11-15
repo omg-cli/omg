@@ -182,7 +182,7 @@ pub(crate) async fn scan_installed_in(
 }
 
 impl SecurityAuditResult {
-    pub(crate) fn validate_counts(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let (total, high) = self
             .vulnerabilities
             .iter()
@@ -203,6 +203,58 @@ impl SecurityAuditResult {
             "Audit high-severity total mismatch: reported {}, actual {high}",
             self.high_severity
         );
+        if let AuditCoverage::Reported {
+            assessed,
+            unassessed,
+            sources,
+        } = &self.coverage
+        {
+            anyhow::ensure!(
+                assessed.is_empty() || !sources.is_empty(),
+                "Audit coverage claims assessed packages without source provenance"
+            );
+            let mut scope = std::collections::BTreeSet::new();
+            for identity in assessed
+                .iter()
+                .chain(unassessed.iter().map(|package| &package.package))
+            {
+                anyhow::ensure!(
+                    !identity.name.is_empty()
+                        && !identity.version.is_empty()
+                        && identity
+                            .architecture
+                            .as_ref()
+                            .is_none_or(|architecture| !architecture.is_empty()),
+                    "Audit coverage has an incomplete package identity"
+                );
+                anyhow::ensure!(
+                    scope.insert(identity),
+                    "Audit coverage repeats or contradicts a package identity"
+                );
+            }
+            let mut groups = std::collections::BTreeSet::new();
+            for (name, findings) in &self.vulnerabilities {
+                anyhow::ensure!(
+                    !name.is_empty() && groups.insert(name),
+                    "Audit coverage repeats or omits a finding group identity"
+                );
+                for finding in findings {
+                    anyhow::ensure!(
+                        !finding.id.is_empty() && !finding.affected_installed.is_empty(),
+                        "Audit coverage finding lacks advisory or installed identity"
+                    );
+                    let mut affected = std::collections::BTreeSet::new();
+                    for identity in &finding.affected_installed {
+                        anyhow::ensure!(
+                            identity.name == *name
+                                && scope.contains(identity)
+                                && affected.insert(identity),
+                            "Audit coverage finding has an undeclared, conflicting or repeated installed identity"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -266,7 +318,7 @@ async fn scan_inventory_in(
 }
 
 async fn log_completed_scan(result: &SecurityAuditResult, path: &std::path::Path) -> Result<()> {
-    result.validate_counts()?;
+    result.validate()?;
     // A successful CLI/TUI/daemon scan must not outlive its completion record.
     // Capture the destination now and keep filesystem locking/fsync off Tokio.
     let path = path.to_path_buf();
@@ -303,6 +355,128 @@ async fn log_completed_scan(result: &SecurityAuditResult, path: &std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_audit_scope_must_bind_every_finding_to_one_declared_identity() {
+        let identity =
+            serde_json::json!({"name":"fixture", "version":"1-1", "architecture":"x86_64"});
+        let valid = serde_json::json!({
+            "coverage":{"status":"reported", "assessed":[identity], "unassessed":[],
+                "sources":[{"kind":"osv", "ecosystem":"Arch Linux:fixture"}]},
+            "total_vulnerabilities":1, "high_severity":1,
+            "vulnerabilities":[["fixture", [{"id":"CVE-2026-1234", "summary":"fixture issue", "score":"9.8",
+                "applicability":"applicable", "affected_installed":[identity]}]]]
+        });
+        let result: SecurityAuditResult =
+            serde_json::from_value(valid.clone()).expect("valid scoped audit");
+        result
+            .validate()
+            .expect("complete scope and matching totals");
+        let corruptions: [(&str, fn(&mut serde_json::Value)); 12] = [
+            ("duplicate assessed identity", |v| {
+                let identity = v["coverage"]["assessed"][0].clone();
+                v["coverage"]["assessed"] = serde_json::json!([identity.clone(), identity]);
+            }),
+            ("overlapping coverage", |v| {
+                v["coverage"]["unassessed"] = serde_json::json!([{
+                    "package":v["coverage"]["assessed"][0].clone(), "reason":"origin_unestablished"}]);
+            }),
+            ("duplicate unknown identity", |v| {
+                let unknown = serde_json::json!({"package":v["coverage"]["assessed"][0].clone(), "reason":"origin_unestablished"});
+                v["coverage"]["assessed"] = serde_json::json!([]);
+                v["coverage"]["unassessed"] = serde_json::json!([unknown.clone(), unknown]);
+            }),
+            ("missing provenance", |v| {
+                v["coverage"]["sources"] = serde_json::json!([]);
+            }),
+            ("finding outside scope", |v| {
+                v["vulnerabilities"][0][1][0]["affected_installed"][0]["version"] = "2-1".into();
+            }),
+            ("finding in foreign group", |v| {
+                v["vulnerabilities"][0][0] = "other-package".into();
+            }),
+            ("finding lacks identity", |v| {
+                v["vulnerabilities"][0][1][0]["affected_installed"] = serde_json::json!([]);
+            }),
+            ("duplicate affected identity", |v| {
+                let identity = v["coverage"]["assessed"][0].clone();
+                v["vulnerabilities"][0][1][0]["affected_installed"] =
+                    serde_json::json!([identity.clone(), identity]);
+            }),
+            ("empty version", |v| {
+                v["coverage"]["assessed"][0]["version"] = "".into();
+                v["vulnerabilities"][0][1][0]["affected_installed"][0]["version"] = "".into();
+            }),
+            ("empty architecture", |v| {
+                v["coverage"]["assessed"][0]["architecture"] = "".into();
+                v["vulnerabilities"][0][1][0]["affected_installed"][0]["architecture"] = "".into();
+            }),
+            ("duplicate finding group", |v| {
+                let group = v["vulnerabilities"][0].clone();
+                v["vulnerabilities"] = serde_json::json!([group.clone(), group]);
+                v["total_vulnerabilities"] = 2.into();
+                v["high_severity"] = 2.into();
+            }),
+            ("empty advisory identity", |v| {
+                v["vulnerabilities"][0][1][0]["id"] = "".into();
+            }),
+        ];
+        for (name, corrupt) in corruptions {
+            let mut value = valid.clone();
+            corrupt(&mut value);
+            let result: SecurityAuditResult =
+                serde_json::from_value(value).expect("valid wire shape");
+            result.validate().expect_err(name);
+        }
+    }
+
+    #[tokio::test]
+    async fn contradictory_reported_scope_is_not_logged_as_a_completed_scan() {
+        let directory = tempfile::tempdir().expect("private audit directory");
+        let path = directory.path().join("audit.jsonl");
+        let identity = InstalledIdentity {
+            name: "fixture".into(),
+            version: "1-1".into(),
+            architecture: None,
+        };
+        let result = SecurityAuditResult {
+            coverage: AuditCoverage::Reported {
+                assessed: vec![identity.clone(), identity],
+                unassessed: Vec::new(),
+                sources: vec![AdvisoryProvenance::Osv {
+                    ecosystem: "Arch Linux:fixture".into(),
+                }],
+            },
+            total_vulnerabilities: 0,
+            high_severity: 0,
+            vulnerabilities: Vec::new(),
+        };
+        log_completed_scan(&result, &path)
+            .await
+            .expect_err("contradictory scope cannot be completed");
+        assert!(
+            !path.exists(),
+            "invalid evidence must not create a completed audit record"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_audit_completion_keeps_coverage_explicitly_unreported() {
+        let directory = tempfile::tempdir().expect("private legacy audit directory");
+        let path = directory.path().join("audit.jsonl");
+        let result = SecurityAuditResult {
+            coverage: AuditCoverage::Unreported,
+            total_vulnerabilities: 0,
+            high_severity: 0,
+            vulnerabilities: Vec::new(),
+        };
+        log_completed_scan(&result, &path)
+            .await
+            .expect("persist legacy audit scope");
+        let record = std::fs::read_to_string(path).expect("completed legacy audit record");
+        assert!(record.contains("coverage: unreported"));
+        assert!(!record.contains("coverage: reported"));
+    }
 
     #[tokio::test]
     async fn inconsistent_audit_totals_are_not_logged_as_a_completed_scan() -> Result<()> {

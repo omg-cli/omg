@@ -1343,7 +1343,12 @@ pub async fn fix_vulnerabilities(
                     style::warning("⚠")
                 );
                 for (pkg, vuln) in &unfixable {
-                    println!("    {} {} - {}", style::error("✗"), pkg, vuln);
+                    println!(
+                        "    {} {} - {}",
+                        style::error("✗"),
+                        style::sanitize_terminal_text(pkg),
+                        style::sanitize_terminal_text(vuln)
+                    );
                 }
                 println!(
                     "\n  {} These may require manual intervention or upstream patches.",
@@ -1760,7 +1765,7 @@ mod tests {
             SecurityAuditResult, UnassessedPackage, Vulnerability,
         };
         let identity = InstalledIdentity {
-            name: "fixture".into(),
+            name: "fixture\u{1b}]52;c;PKG-INJECT\u{7}".into(),
             version: "1-1".into(),
             architecture: None,
         };
@@ -1773,15 +1778,19 @@ mod tests {
                 },
                 reason: crate::core::security::vulnerability::UnknownCoverage::OriginUnestablished,
             }],
-            sources: Vec::new(),
+            sources: vec![crate::core::security::scan::AdvisoryProvenance::Osv {
+                ecosystem: "Arch Linux:fixture".into(),
+            }],
         };
         for coverage in [
             AuditCoverage::Unreported,
             partial.clone(),
             AuditCoverage::Reported {
-                assessed: vec![identity],
+                assessed: vec![identity.clone()],
                 unassessed: Vec::new(),
-                sources: Vec::new(),
+                sources: vec![crate::core::security::scan::AdvisoryProvenance::Osv {
+                    ecosystem: "Arch Linux:fixture".into(),
+                }],
             },
         ] {
             display_security_audit(
@@ -1802,7 +1811,7 @@ mod tests {
                 advisory_severity,
                 applicability,
                 native_advisory: None,
-                affected_installed: Vec::new(),
+                affected_installed: vec![identity.clone()],
             };
         let result = SecurityAuditResult {
             coverage: partial,
@@ -1832,7 +1841,7 @@ mod tests {
                 ],
             )],
         };
-        result.validate_counts()?;
+        result.validate()?;
         display_security_audit(result.clone(), false)?;
         let error = display_security_audit(result, true)
             .expect_err("findings must fail only when requested");

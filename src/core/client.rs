@@ -274,9 +274,7 @@ impl DaemonClient {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
         let response = self.call(Request::SecurityAudit { id }).await?;
         let result = extract_response(response, id, as_audit)?;
-        result
-            .validate_counts()
-            .context("Invalid daemon security audit")?;
+        result.validate().context("Invalid daemon security audit")?;
         Ok(result)
     }
 

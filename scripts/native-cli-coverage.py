@@ -930,6 +930,7 @@ HARNESSES = {
         'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy',
     )),
     'coverage11': Harness('coverage_11', ('machine_id_is_stable_sixteen_lowercase_hex',)),
+    'ipc': Harness('coverage_8', ('native_audit_fix_dry_runs_preserve_unknown_scope_and_inert_advisory_text',)),
 }
 ROLES = ('cli', 'daemon', *HARNESSES)
 CASES = tuple((f'test-{index:02}', role, name)
@@ -1670,7 +1671,7 @@ while IFS=$'\t' read -r stage role name; do
     limit=45
     if test "$role" = comprehensive; then limit=360; fi
     timeout --signal=TERM --kill-after=3 "$limit" \
-      bash -c 'ordinary env LLVM_PROFILE_FILE="$1" bash -c '\''cd "$HOME/work"; test "$(id -u)" -ne 0; exec "$@"'\'' bash "$2" "$3" --exact --nocapture --test-threads=1' \
+      bash -c 'ordinary env LLVM_PROFILE_FILE="$1" bash -c '\''cd "$HOME/work"; test "$(id -u)" -ne 0; exec "$@"'\'' bash "$2" "$3" --exact --include-ignored --nocapture --test-threads=1' \
       bash "/profiles/omg-extra-$stage-%p-%m.profraw" "/omg-extra-bin/$role" "$name" < /dev/null > "$log" 2>&1
   fi
   grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log"

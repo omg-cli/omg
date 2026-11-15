@@ -99,6 +99,9 @@ pub(super) fn compose(
     audit: Option<&SecurityAuditResult>,
     distro: Distro,
 ) -> anyhow::Result<Sbom> {
+    if let Some(audit) = audit {
+        audit.validate()?;
+    }
     let os_name = match distro {
         Distro::Arch => "Arch Linux",
         Distro::Debian => "Debian",
@@ -441,6 +444,151 @@ mod tests {
     use crate::core::security::scan::{InstalledIdentity, Vulnerability};
 
     #[test]
+    fn sbom_refuses_false_clean_finding_totals_before_export() {
+        let audit = SecurityAuditResult {
+            coverage: AuditCoverage::Unreported,
+            total_vulnerabilities: 1,
+            high_severity: 0,
+            vulnerabilities: Vec::new(),
+        };
+        compose(&[], Some(&audit), Distro::Arch)
+            .expect_err("contradictory totals must not enter an SBOM");
+    }
+
+    #[test]
+    fn arch_sbom_roundtrip_retains_assessed_and_unknown_components_and_applicability() {
+        use crate::core::security::scan::{AdvisoryProvenance, FindingApplicability};
+        use crate::core::security::vulnerability::{
+            PackageAssessment, PackageCoverage, UnknownCoverage,
+        };
+        use crate::package_managers::types::SecurityOrigin;
+        let official = SecurityPackage {
+            origin: SecurityOrigin::ArchRepository {
+                repository: "core".into(),
+            },
+            name: "official-fixture".into(),
+            version: "2:1.0-1".into(),
+            architecture: Some("x86_64".into()),
+            advisory_source: None,
+            description: String::new(),
+            licenses: vec!["MIT".into()],
+        };
+        let archive = SecurityPackage {
+            origin: SecurityOrigin::AurArchive,
+            name: "aur-fixture".into(),
+            ..official.clone()
+        };
+        let assessments = vec![
+            PackageAssessment {
+                package: official.clone(),
+                coverage: PackageCoverage::Assessed {
+                    provenance: AdvisoryProvenance::Osv {
+                        ecosystem: "Arch Linux:fixture".into(),
+                    },
+                },
+                findings: vec![Vulnerability {
+                    id: "CVE-2026-1234".into(),
+                    summary: "Applicable repository issue".into(),
+                    score: Some("8.0".into()),
+                    advisory_severity: None,
+                    native_advisory: None,
+                    applicability: FindingApplicability::Applicable,
+                    affected_installed: vec![InstalledIdentity::from(&official)],
+                }],
+            },
+            PackageAssessment {
+                package: archive.clone(),
+                coverage: PackageCoverage::Unknown {
+                    reason: UnknownCoverage::OriginUnestablished,
+                    provenance: None,
+                },
+                findings: vec![Vulnerability {
+                    id: "CVE-2026-1235".into(),
+                    summary: "Source review required".into(),
+                    score: None,
+                    advisory_severity: None,
+                    native_advisory: None,
+                    applicability: FindingApplicability::Possible,
+                    affected_installed: vec![InstalledIdentity::from(&archive)],
+                }],
+            },
+        ];
+        let audit = SecurityAuditResult::from_assessments(assessments);
+        let sbom = compose(&[official, archive], Some(&audit), Distro::Arch)
+            .expect("complete Arch inventory join");
+        let roundtrip: Sbom =
+            serde_json::from_str(&serde_json::to_string(&sbom).expect("serialize Arch SBOM"))
+                .expect("deserialize Arch SBOM");
+        assert_eq!(roundtrip.components.len(), 2);
+        assert_eq!(roundtrip.vulnerabilities.len(), 2);
+        for (name, expected) in [("official-fixture", "assessed"), ("aur-fixture", "unknown")] {
+            let component = roundtrip
+                .components
+                .iter()
+                .find(|component| component.name == name)
+                .expect("installed component");
+            assert!(
+                component
+                    .properties
+                    .as_ref()
+                    .expect("component provenance")
+                    .iter()
+                    .any(|property| property.name == "omg:advisory-coverage"
+                        && property.value == expected)
+            );
+            assert_eq!(component.version, "2:1.0-1");
+        }
+        for (id, applicability, reference) in [
+            (
+                "CVE-2026-1234",
+                "applicable",
+                "pkg:alpm/arch/official-fixture@2%3A1.0-1?arch=x86_64",
+            ),
+            (
+                "CVE-2026-1235",
+                "possible",
+                "pkg:alpm/arch/aur-fixture@2%3A1.0-1?arch=x86_64",
+            ),
+        ] {
+            let finding = roundtrip
+                .vulnerabilities
+                .iter()
+                .find(|finding| finding.id == id)
+                .expect("joined advisory");
+            assert_eq!(finding.affects.len(), 1);
+            assert_eq!(finding.affects[0].affects_ref, reference);
+            assert!(
+                finding
+                    .properties
+                    .iter()
+                    .any(|property| property.name == "omg:advisory-applicability"
+                        && property.value == applicability)
+            );
+        }
+        let metadata = roundtrip
+            .metadata
+            .component
+            .expect("system component")
+            .properties
+            .expect("audit scope");
+        assert!(
+            metadata
+                .iter()
+                .any(|property| property.name == "omg:advisory-unknown-count"
+                    && property.value == "1")
+        );
+        assert!(metadata.iter().any(
+            |property| property.name == "omg:advisory-assessed-count" && property.value == "1"
+        ));
+        let mut invalid = audit;
+        invalid.high_severity = 0;
+        assert!(
+            compose(&[], Some(&invalid), Distro::Arch).is_err(),
+            "counter refusal precedes any SBOM export"
+        );
+    }
+
+    #[test]
     fn exports_preserve_each_distribution_identity_and_native_version() {
         let package = SecurityPackage {
             origin: crate::package_managers::types::SecurityOrigin::Unknown,
@@ -545,6 +693,7 @@ mod tests {
         assert!(sbom.vulnerabilities[0].ratings.is_empty());
         assert_eq!(sbom.metadata.component.as_ref().unwrap().name, "Fedora");
         let mut native_audit = audit.clone();
+        native_audit.high_severity = 1;
         let finding = &mut native_audit.vulnerabilities[0].1[0];
         finding.advisory_severity = Some(AdvisorySeverity::Important);
         finding.native_advisory = Some(crate::core::security::scan::NativeAdvisory {
