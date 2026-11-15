@@ -1191,5 +1191,44 @@ class ArtifactAdmission(unittest.TestCase):
                         PRODUCER.read_manifest(path)
 
 
+class FreshAdmissionFixture(unittest.TestCase):
+    def test_matrix_covers_attended_refusal_and_precommit_authority_changes(self):
+        cases = PRODUCER.FRESH_ADMISSION_CASES
+        by_name = {case.name: case for case in cases}
+        self.assertEqual(len(by_name), len(cases))
+        self.assertTrue({'archive-accept', 'archive-noninteractive', 'archive-decline',
+                         'archive-eof', 'archive-foreground-loss', 'archive-interrupt',
+                         'archive-terminal-disconnect', 'archive-policy-changed',
+                         'archive-profile-changed', 'archive-staged-bytes-changed',
+                         'archive-source-replaced', 'archive-identity-changed',
+                         'archive-stale-evidence', 'archive-minimum-verified',
+                         'repository-accept', 'repository-stale-evidence',
+                         'archive-long-input', 'archive-timeout', 'archive-batch-limit'} <= by_name.keys())
+        self.assertEqual({case.name for case in cases if case.commits},
+                         {'archive-accept', 'archive-source-replaced', 'repository-accept'})
+        self.assertTrue(all(case.diagnostic for case in cases if not case.commits))
+
+    def test_snapshot_fixture_preserves_digest_and_explicit_staleness(self):
+        fresh = json.loads(PRODUCER.fresh_admission_snapshot('fresh', 1_800_000_000))
+        self.assertEqual(fresh['source_url'], 'https://security.archlinux.org/issues/all.json')
+        self.assertEqual(fresh['payload_sha256'], hashlib.sha256(fresh['payload_json'].encode()).hexdigest())
+        issues = json.loads(fresh['payload_json'])
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]['packages'], ['omg-unrelated-fixture'])
+        self.assertEqual(issues[0]['status'], 'Fixed')
+        self.assertTrue(fresh['complete'])
+        stale = json.loads(PRODUCER.fresh_admission_snapshot('stale', 1_800_000_000))
+        self.assertLess(stale['checked_at'], fresh['checked_at'])
+        self.assertEqual(stale['payload_sha256'], fresh['payload_sha256'])
+        with self.assertRaisesRegex(ValueError, 'snapshot mode'):
+            PRODUCER.fresh_admission_snapshot('unrecognized', 1_800_000_000)
+
+    def test_native_matrix_refuses_an_ordinary_process_before_creating_fixtures(self):
+        with patch.object(PRODUCER.os, 'geteuid', return_value=1000), \
+             patch.object(PRODUCER.Path, 'mkdir', side_effect=AssertionError('fixture created before admission')):
+            with self.assertRaisesRegex(RuntimeError, 'Guest root'):
+                PRODUCER.run_fresh_admission_fixture(Path('/opt/omg-coverage-fresh-test'), Path('/unused'))
+
+
 if __name__ == '__main__':
     unittest.main()

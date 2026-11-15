@@ -2367,7 +2367,7 @@ fn confirm_unknown_archives(
         unknown.len() <= 64,
         "Split FreshSnapshot archive acknowledgements into batches of at most 64 archives"
     );
-    let mut tty = std::fs::OpenOptions::new().read(true).write(true)
+    let tty = std::fs::OpenOptions::new().read(true).write(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
         .open("/dev/tty").context("FreshSnapshot unknown archives require an attended controlling terminal; --yes cannot acknowledge unknown coverage")?;
     anyhow::ensure!(
@@ -2448,6 +2448,10 @@ fn confirm_unknown_archives(
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
         loop {
             signals.check()?;
+            anyhow::ensure!(
+                nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+                "FreshSnapshot terminal foreground changed during acknowledgement"
+            );
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .context("FreshSnapshot acknowledgement timed out")?;
@@ -2457,6 +2461,10 @@ fn confirm_unknown_archives(
             let result = poll(&mut items, Some(&timeout))
                 .context("FreshSnapshot acknowledgement interrupted")?;
             signals.check()?;
+            anyhow::ensure!(
+                nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+                "FreshSnapshot terminal foreground changed during acknowledgement"
+            );
             if result == 0 {
                 continue;
             }
@@ -2473,10 +2481,31 @@ fn confirm_unknown_archives(
             return Ok(());
         }
     }
+    fn foreground_io<T>(
+        tty: &std::fs::File,
+        operation: impl FnOnce(&std::fs::File) -> std::io::Result<T>,
+    ) -> Result<std::io::Result<T>> {
+        use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+        // Foreground ownership can change between the check and the syscall.
+        // Blocking job-control signals makes that race return EIO rather than
+        // suspending the privileged transaction with its database lock held.
+        let mut blocked = SigSet::empty();
+        blocked.add(Signal::SIGTTIN);
+        blocked.add(Signal::SIGTTOU);
+        let mut previous = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&blocked), Some(&mut previous))?;
+        let result = operation(tty);
+        previous.thread_set_mask()?;
+        anyhow::ensure!(
+            nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+            "FreshSnapshot terminal foreground changed during acknowledgement"
+        );
+        Ok(result)
+    }
     let mut remaining = prompt.as_bytes();
     while !remaining.is_empty() {
         ready(&tty, rustix::event::PollFlags::OUT, deadline, signals)?;
-        match tty.write(remaining) {
+        match foreground_io(&tty, |mut tty| tty.write(remaining))? {
             Ok(0) => anyhow::bail!("FreshSnapshot acknowledgement terminal closed"),
             Ok(count) => remaining = &remaining[count..],
             Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {}
@@ -2487,7 +2516,7 @@ fn confirm_unknown_archives(
     loop {
         ready(&tty, rustix::event::PollFlags::IN, deadline, signals)?;
         let mut buffer = [0_u8; 128];
-        let count = match tty.read(&mut buffer) {
+        let count = match foreground_io(&tty, |mut tty| tty.read(&mut buffer))? {
             Ok(0) => anyhow::bail!("FreshSnapshot acknowledgement terminal closed"),
             Ok(count) => count,
             Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {

@@ -298,6 +298,425 @@ NATIVE_PHASES = {
 }
 
 
+class FreshAdmissionCase(NamedTuple):
+    name: str
+    interaction: str
+    mutation: str
+    commits: bool
+    diagnostic: str
+
+
+FRESH_ADMISSION_CASES = (
+    FreshAdmissionCase('archive-accept', 'accept', '', True, ''),
+    FreshAdmissionCase('archive-decline', 'decline', '', False, 'acknowledgement declined'),
+    FreshAdmissionCase('archive-eof', 'eof', '', False, 'terminal closed'),
+    FreshAdmissionCase('archive-long-input', 'long-input', '', False, 'input exceeds limit'),
+    FreshAdmissionCase('archive-wrong-digest', 'wrong-digest', '', False, 'acknowledgement declined'),
+    FreshAdmissionCase('archive-noninteractive', 'noninteractive', '', False, 'controlling terminal'),
+    FreshAdmissionCase('archive-interrupt', 'interrupt', '', False, 'interrupted'),
+    FreshAdmissionCase('archive-foreground-loss', 'foreground-loss', '', False, 'foreground'),
+    FreshAdmissionCase('archive-terminal-disconnect', 'disconnect', '', False, 'UNKNOWN'),
+    FreshAdmissionCase('archive-timeout', 'timeout', '', False, 'timed out'),
+    FreshAdmissionCase('archive-policy-changed', 'accept', 'policy', False, 'changed before commit'),
+    FreshAdmissionCase('archive-profile-changed', 'accept', 'profile', False, 'changed before commit'),
+    FreshAdmissionCase('archive-staged-bytes-changed', 'accept', 'stage', False, 'changed after advisory admission'),
+    FreshAdmissionCase('archive-source-replaced', 'accept', 'source', True, ''),
+    FreshAdmissionCase('archive-identity-changed', 'accept', 'identity', False, 'changed before commit'),
+    FreshAdmissionCase('archive-stale-evidence', 'accept', 'stale', False, 'stale Arch snapshot'),
+    FreshAdmissionCase('archive-minimum-verified', 'none', '', False, 'below required minimum'),
+    FreshAdmissionCase('archive-batch-limit', 'none', '', False, 'at most 64 archives'),
+    FreshAdmissionCase('repository-accept', 'none', '', True, ''),
+    FreshAdmissionCase('repository-stale-evidence', 'none', 'stale', False, 'stale Arch snapshot'),
+)
+
+
+def fresh_admission_snapshot(mode, now=None):
+    from datetime import datetime, timezone
+
+    require(mode in ('fresh', 'stale'), 'Unknown snapshot mode')
+    at = time.time() if now is None else now
+    if mode == 'stale':
+        at -= 7200
+    timestamp = datetime.fromtimestamp(at, timezone.utc).isoformat().replace('+00:00', 'Z')
+    payload = json.dumps([dict(name='AVG-fresh-unrelated', packages=['omg-unrelated-fixture'],
+        status='Fixed', severity='Low', affected='1-1', fixed='2-1',
+        issues=['CVE-2026-1234'], type='denial of service')], separators=(',', ':'))
+    return json.dumps(dict(schema_version=1, source='arch-security',
+        source_url='https://security.archlinux.org/issues/all.json', fetched_at=timestamp,
+        checked_at=timestamp, complete=True, payload_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+        payload_json=payload)).encode()
+
+
+def fresh_admission_terminal(cli, arguments, environment, case, directory, state, uid, gid):
+    import errno
+    import pty
+    import select
+    import signal
+
+    def identity(pid):
+        try:
+            fields = (Path('/proc') / str(pid) / 'stat').read_text().rsplit(')', 1)[1].split()
+            return dict(pid=pid, start=fields[19], group=int(fields[2]))
+        except (FileNotFoundError, ProcessLookupError):
+            return None
+
+    def terminate(subject):
+        if subject is not None and identity(subject['pid']) == subject:
+            os.killpg(subject['group'], signal.SIGKILL)
+
+    control_in, control_out = os.pipe()
+    controller, terminal = pty.fork()
+    if controller == 0:
+        try:
+            os.close(control_out)
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            os.fchown(0, uid, gid)
+            child = os.fork()
+            if child == 0:
+                os.setpgid(0, 0)
+                for item in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGTTOU):
+                    signal.signal(item, signal.SIG_DFL)
+                # The controller publishes foreground ownership before exec.
+                while os.tcgetpgrp(0) != os.getpgrp():
+                    time.sleep(0.005)
+                os.execve(str(cli), [str(cli), *arguments], environment)
+            os.setpgid(child, child)
+            os.tcsetpgrp(0, child)
+            (directory / 'process.json').write_text(json.dumps(identity(child)))
+            stopped = None
+            while True:
+                observed, status = os.waitpid(child, os.WNOHANG | os.WUNTRACED)
+                if observed:
+                    if os.WIFSTOPPED(status):
+                        stopped = os.WSTOPSIG(status)
+                        os.killpg(child, signal.SIGKILL)
+                        _, status = os.waitpid(child, 0)
+                    (directory / 'process-result.json').write_text(json.dumps(dict(
+                        exit_code=os.waitstatus_to_exitcode(status), stopped_signal=stopped)))
+                    os._exit(0)
+                if select.select([control_in], [], [], 0.02)[0]:
+                    command = os.read(control_in, 16)
+                    if command == b'f':
+                        os.tcsetpgrp(0, os.getpgrp())
+                        (directory / 'foreground-moved').write_text('owned controller foreground\n')
+        except BaseException:
+            import traceback
+            (directory / 'controller-error.txt').write_text(traceback.format_exc())
+            os._exit(1)
+    os.close(control_in)
+    controller_identity = identity(controller)
+    transcript = bytearray()
+    answered = False
+    moved = False
+    controller_status = None
+    deadline = time.monotonic() + (75 if case.interaction == 'timeout' else 30)
+    started = time.monotonic()
+    try:
+        while time.monotonic() < deadline:
+            if terminal is not None and select.select([terminal], [], [], 0.02)[0]:
+                try:
+                    data = os.read(terminal, 4096)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    data = b''
+                transcript.extend(data)
+                require(len(transcript) <= 1024 * 1024, 'Fresh admission transcript exceeds budget')
+            if not answered and b'seconds to continue: ' in transcript:
+                found = re.search(rb'Full prepared batch SHA-256: ([a-f0-9]{64})', transcript)
+                require(found is not None, 'Native acknowledgement must publish its exact batch digest')
+                state['prompt_seen'] = True
+                answered = True
+                digest = found[1]
+                if case.interaction == 'accept':
+                    time.sleep(0.25)
+                    os.write(terminal, b'accept ' + digest + b'\n')
+                elif case.interaction == 'decline':
+                    os.write(terminal, b'decline\n')
+                elif case.interaction == 'wrong-digest':
+                    require(digest != b'0' * 64, 'Distinct wrong digest control required')
+                    os.write(terminal, b'accept ' + b'0' * 64 + b'\n')
+                elif case.interaction == 'long-input':
+                    os.write(terminal, b'x' * 100 + b'\n')
+                elif case.interaction == 'eof':
+                    os.write(terminal, b'\x04')
+                elif case.interaction == 'interrupt':
+                    subject = json.loads((directory / 'process.json').read_text())
+                    require(identity(subject['pid']) == subject, 'Native process identity changed')
+                    os.killpg(subject['group'], signal.SIGINT)
+                elif case.interaction == 'foreground-loss':
+                    os.write(control_out, b'f')
+                    deadline = min(deadline, time.monotonic() + 5)
+                elif case.interaction == 'disconnect':
+                    os.close(terminal)
+                    terminal = None
+                else:
+                    require(case.interaction == 'timeout', 'Unexpected acknowledgement prompt')
+            if case.interaction == 'foreground-loss' and answered and not moved \
+                    and (directory / 'foreground-moved').exists():
+                os.write(terminal, b'accept ' + digest + b'\n')
+                moved = True
+            observed, status = os.waitpid(controller, os.WNOHANG)
+            if observed:
+                controller_status = status
+                # Reap first, then retain the final diagnostic still buffered
+                # on the master after the last child closed its slave.
+                while terminal is not None and select.select([terminal], [], [], 0)[0]:
+                    try:
+                        data = os.read(terminal, 4096)
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        break
+                    if not data:
+                        break
+                    transcript.extend(data)
+                    require(len(transcript) <= 1024 * 1024, 'Fresh admission transcript exceeds budget')
+                break
+        require(controller_status is not None, 'Fresh admission did not finish within its owned deadline')
+        require(os.waitstatus_to_exitcode(controller_status) == 0,
+                'Fresh admission terminal controller failed')
+        result = json.loads((directory / 'process-result.json').read_text())
+        result.update(output=transcript.decode(errors='replace'), prompt_seen=answered,
+                      elapsed_seconds=time.monotonic() - started, foreground_moved=moved)
+        return result
+    finally:
+        (directory / 'terminal-output.txt').write_bytes(transcript)
+        process_file = directory / 'process.json'
+        if process_file.exists():
+            terminate(json.loads(process_file.read_text()))
+        if controller_status is None:
+            terminate(controller_identity)
+            os.waitpid(controller, 0)
+        os.close(control_out)
+        if terminal is not None:
+            os.close(terminal)
+
+
+def run_fresh_admission_fixture(owner, cli, names=None):
+    import pwd
+    import signal
+    import ssl
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    if os.geteuid() != 0:
+        raise RuntimeError('Guest root setup required')
+    require(sys.platform == 'linux', 'Fresh admission requires Linux')
+    require(all(os.readlink('/proc/self/ns/' + item) != os.readlink('/proc/1/ns/' + item)
+                for item in ('mnt', 'net')), 'Private guest namespaces required')
+    require(fixture_command(['systemd-detect-virt', '--vm'], text=True).stdout.strip() in ('qemu', 'kvm'),
+            'Disposable QEMU guest required')
+    require(owner.parent == Path('/opt') and owner.name.startswith('omg-coverage-fresh-') and not owner.exists(),
+            'New exact fresh-admission owner required')
+    binary = cli.lstat()
+    require(stat.S_ISREG(binary.st_mode) and binary.st_uid == 0 and not binary.st_mode & 0o022,
+            'Root-controlled native CLI required')
+    selected = [case for case in FRESH_ADMISSION_CASES if names is None or case.name in names]
+    require(selected and (names is None or set(names) == {case.name for case in selected}), 'Unknown fresh admission case')
+    owner.mkdir(mode=0o700)
+    user = pwd.getpwnam('bench')
+    require(user.pw_uid != 0 and Path(user.pw_dir).is_absolute(), 'Ordinary owned guest user required')
+    config = owner / 'caller-config'
+    config.mkdir(mode=0o700)
+    destination = Path(user.pw_dir) / '.config/omg'
+    destination.mkdir(parents=True, exist_ok=True)
+    fixture_command(['mount', '--bind', str(config), str(destination)])
+    passwd = owner / 'passwd'
+    original_passwd = Path('/etc/passwd').read_text()
+    passwd.write_text(original_passwd)
+    fixture_command(['mount', '--bind', str(passwd), '/etc/passwd'])
+    hosts = owner / 'hosts'
+    hosts.write_text('127.0.0.1 localhost omg-advisories.latham.workers.dev\n::1 localhost\n')
+    fixture_command(['mount', '--bind', str(hosts), '/etc/hosts'])
+    nss = owner / 'nsswitch.conf'
+    value, count = re.subn(r'^hosts\s*:.*$', 'hosts: files', Path('/etc/nsswitch.conf').read_text(), flags=re.M)
+    require(count == 1, 'One NSS hosts policy required')
+    nss.write_text(value)
+    fixture_command(['mount', '--bind', str(nss), '/etc/nsswitch.conf'])
+    ca, key = owner / 'ca.pem', owner / 'ca.key'
+    fixture_command(['openssl', 'req', '-x509', '-newkey', 'ed25519', '-nodes', '-days', '1',
+                     '-subj', '/CN=OMG disposable advisory fixture', '-keyout', str(key), '-out', str(ca),
+                     '-addext', 'basicConstraints=critical,CA:TRUE',
+                     '-addext', 'keyUsage=critical,keyCertSign,cRLSign'])
+    server_key, request, certificate = owner / 'server.key', owner / 'server.csr', owner / 'server.pem'
+    extensions = owner / 'server.ext'
+    extensions.write_text('basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\n'
+                          'extendedKeyUsage=serverAuth\n'
+                          'subjectAltName=DNS:omg-advisories.latham.workers.dev\n')
+    fixture_command(['openssl', 'req', '-new', '-newkey', 'ed25519', '-nodes',
+                     '-subj', '/CN=omg-advisories.latham.workers.dev',
+                     '-keyout', str(server_key), '-out', str(request)])
+    fixture_command(['openssl', 'x509', '-req', '-in', str(request), '-CA', str(ca),
+                     '-CAkey', str(key), '-CAcreateserial', '-days', '1',
+                     '-extfile', str(extensions), '-out', str(certificate)])
+    (owner / 'empty-certs').mkdir()
+    state = {'case': None}
+
+    class Advisory(BaseHTTPRequestHandler):
+        def do_GET(self):
+            current = state['case']
+            if current is None or self.path != '/v1/arch/advisories':
+                self.send_error(404)
+                return
+            current['requests'].append(dict(path=self.path, prompt_seen=current['prompt_seen']))
+            try:
+                case, fixture, archive = current['definition'], current['fixture'], current['archive']
+                require(case.interaction == 'none' or current['prompt_seen'],
+                        'Advisory fetch preceded mandatory archive acknowledgement')
+                if case.mutation == 'policy':
+                    (config / 'policy.toml').write_text(current['policy'] + 'banned_packages = ["omg-fresh-archive"]\n')
+                elif case.mutation == 'profile':
+                    (config / 'config.toml').write_text('telemetry_enabled = false\n[aur]\nreview_pkgbuild = false\n')
+                elif case.mutation == 'identity':
+                    records = original_passwd.splitlines()
+                    matches = [i for i, line in enumerate(records) if line.startswith('bench:')]
+                    require(len(matches) == 1, 'One invoking guest account required')
+                    fields = records[matches[0]].split(':')
+                    require('1000000' not in [row.split(':')[2] for row in records], 'Unused fixture UID required')
+                    fields[2] = '1000000'
+                    records[matches[0]] = ':'.join(fields)
+                    passwd.write_text('\n'.join(records) + '\n')
+                elif case.mutation in ('stage', 'source'):
+                    path = archive
+                    if case.mutation == 'stage':
+                        paths = [path for path in Path('/var/tmp').glob('omg-package-*/' + archive.name)
+                                 if path not in current['old_stages']]
+                        require(len(paths) == 1, 'One exact private staged archive required')
+                        path = paths[0]
+                    with path.open('ab') as output:
+                        output.write(b'fixture changed after acknowledgement\n')
+                        output.flush()
+                        os.fsync(output.fileno())
+                body = fresh_admission_snapshot('stale' if case.mutation == 'stale' else 'fresh')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as error:
+                current['server_errors'].append(str(error))
+                self.send_error(500)
+
+        def log_message(self, *_args):
+            return
+
+    server = ThreadingHTTPServer(('127.0.0.1', 443), Advisory)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate, server_key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    real_database = fixture_tree_hashes(Path('/var/lib/pacman/local'))
+    results = []
+    try:
+        for case in selected:
+            directory = owner / case.name
+            directory.mkdir()
+            fixture = owner.parent / (owner.name + '-' + case.name)
+            prepared = create_signed_fixture(fixture)
+            for repository in ('core', 'omarchy'):
+                for suffix in ('.db', '.db.sig'):
+                    name = repository + suffix
+                    (fixture / 'db/sync' / name).write_bytes((fixture / 'repos' / repository / name).read_bytes())
+            (fixture / 'inputs').mkdir()
+            archive = fixture_package(fixture / 'inputs', 'omg-fresh-archive', '1-1',
+                                      'usr/share/omg-fresh-archive.txt', b'approved inert archive\n')
+            fixture_command(['gpg', '--batch', '--homedir', str(fixture / 'signing'), '--pinentry-mode',
+                             'loopback', '--passphrase', '', '--local-user', prepared['fixture_signer_fingerprint'],
+                             '--detach-sign', '--output', str(archive) + '.sig', str(archive)])
+            policy = ('advisory_requirement = "fresh_snapshot"\narch_advisory_repositories = ["core", "omarchy"]\n'
+                      + ('minimum_grade = "Verified"\n' if case.name == 'archive-minimum-verified' else ''))
+            (config / 'policy.toml').write_text(policy)
+            (config / 'config.toml').write_text('telemetry_enabled = false\n[aur]\nreview_pkgbuild = true\n')
+            fixture_command(['mount', '--bind', str(fixture / 'pacman.conf'), '/etc/pacman.conf'])
+            before = fixture_tree_hashes(fixture / 'db/local')
+            payload_before = fixture_tree_hashes(fixture / 'root')
+            arguments = ['install', str(archive), '--allow-local-file', '--yes']
+            if case.name.startswith('repository-'):
+                arguments = ['install', 'omg-coverage-app', '--yes']
+            if case.name == 'archive-batch-limit':
+                targets = [archive]
+                for index in range(64):
+                    target = fixture_package(fixture / 'inputs', 'omg-fresh-extra-' + str(index), '1-1',
+                                             f'usr/share/omg-fresh-extra-{index}.txt', b'inert\n')
+                    fixture_command(['gpg', '--batch', '--homedir', str(fixture / 'signing'), '--pinentry-mode',
+                        'loopback', '--passphrase', '', '--local-user', prepared['fixture_signer_fingerprint'],
+                        '--detach-sign', '--output', str(target) + '.sig', str(target)])
+                    targets.append(target)
+                arguments = ['install', *map(str, targets), '--allow-local-file', '--yes']
+            current = dict(definition=case, fixture=fixture, archive=archive, policy=policy,
+                prompt_seen=False, requests=[], server_errors=[],
+                old_stages=set(Path('/var/tmp').glob('omg-package-*/' + archive.name)))
+            state['case'] = current
+            environment = dict(PATH='/usr/bin:/bin', LANG='C.UTF-8', HOME='/root', SUDO_USER='bench',
+                OMG_DISABLE_DAEMON='1', OMG_DISABLE_TELEMETRY='1', OMG_COLORS='never', RUST_LOG='warn',
+                SSL_CERT_FILE=str(ca), SSL_CERT_DIR=str(owner / 'empty-certs'))
+            row = dict(name=case.name, expected_commit=case.commits, status='FAIL')
+            try:
+                if case.interaction == 'noninteractive':
+                    child = subprocess.Popen([str(cli), *arguments], env=environment,
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        start_new_session=True)
+                    try:
+                        output, _ = child.communicate(timeout=30)
+                    finally:
+                        if child.poll() is None:
+                            os.killpg(child.pid, signal.SIGKILL)
+                            child.wait()
+                    result = dict(exit_code=child.returncode, output=output.decode(errors='replace'), prompt_seen=False)
+                    (directory / 'terminal-output.txt').write_bytes(output)
+                else:
+                    result = fresh_admission_terminal(cli, arguments, environment, case, directory,
+                                                      current, user.pw_uid, user.pw_gid)
+                row.update(result)
+                require(result['exit_code'] == (0 if case.commits else 1),
+                        'Native fresh admission returned an unexpected status')
+                require(not result.get('stopped_signal'), 'Native foreground loss stopped the transaction')
+                require(not current['server_errors'], 'Controlled advisory fixture failed')
+                if case.diagnostic:
+                    require(case.diagnostic in result['output'], 'Native refusal diagnostic missing: ' + case.diagnostic)
+                after = fixture_tree_hashes(fixture / 'db/local')
+                payload_after = fixture_tree_hashes(fixture / 'root')
+                if case.commits:
+                    if case.name.startswith('repository-'):
+                        require((fixture / 'db/local/omg-coverage-app-3-1/desc').is_file(), 'Prepared repository transaction did not commit')
+                    else:
+                        require((fixture / 'db/local/omg-fresh-archive-1-1/desc').is_file(), 'Prepared archive transaction did not commit')
+                        require((fixture / 'root/usr/share/omg-fresh-archive.txt').read_bytes() == b'approved inert archive\n',
+                                'Native commit did not preserve the approved archive bytes')
+                        require('applicability is UNKNOWN' in result['output'], 'Archive acknowledgement lost Unknown coverage')
+                else:
+                    require(after == before and payload_after == payload_before, 'Refused admission changed its private package state')
+                require(not (fixture / 'db/db.lck').exists(), 'Native admission left its transaction lock')
+                if case.interaction == 'timeout':
+                    require(result['elapsed_seconds'] >= 59, 'Native acknowledgement timed out prematurely')
+                row.update(status='PASS', database_before=before, database_after=after)
+            except Exception as error:
+                row['failure'] = str(error)
+            finally:
+                passwd.write_text(original_passwd)
+                row.update(requests=current['requests'], server_errors=current['server_errors'],
+                           transaction_lock_remains=(fixture / 'db/db.lck').exists())
+                (directory / 'receipt.json').write_text(json.dumps(row, indent=2) + '\n')
+                results.append(row)
+                state['case'] = None
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        passwd.write_text(original_passwd)
+    unchanged = fixture_tree_hashes(Path('/var/lib/pacman/local')) == real_database
+    result = dict(status='PASS' if unchanged and all(row['status'] == 'PASS' for row in results) else 'FAIL',
+        cli_sha256=sha(cli), selected=[case.name for case in selected], cases=results,
+        real_guest_database_unchanged=unchanged,
+        complete_matrix=len(selected) == len(FRESH_ADMISSION_CASES), coverage_acceptance=False)
+    (owner / 'receipt.json').write_text(json.dumps(result, indent=2) + '\n')
+    require(result['status'] == 'PASS', 'Native fresh admission matrix failed; inspect per-case receipts')
+    return result
+
+
 def verify_signed_fixture(owner, phase='complete'):
     require(phase in NATIVE_PHASES, 'Unknown native fixture phase')
     receipt = json.loads((owner / 'data-receipt.json').read_text())
@@ -1641,6 +2060,10 @@ def main():
     signed = commands.add_parser('signed-fixture')
     signed.add_argument('--owner', required=True, type=Path)
     signed.add_argument('--current-kernel', action='store_true')
+    fresh = commands.add_parser('fresh-admission-fixture')
+    fresh.add_argument('--owner', required=True, type=Path)
+    fresh.add_argument('--cli', required=True, type=Path)
+    fresh.add_argument('--case', action='append', choices=tuple(case.name for case in FRESH_ADMISSION_CASES))
     signed_check = commands.add_parser('verify-signed-fixture')
     signed_check.add_argument('--owner', required=True, type=Path)
     signed_check.add_argument('--phase', choices=tuple(NATIVE_PHASES), default='complete')
@@ -1671,6 +2094,8 @@ def main():
             stream.write('\n')
     elif args.operation == 'signed-fixture':
         create_signed_fixture(args.owner, args.current_kernel)
+    elif args.operation == 'fresh-admission-fixture':
+        print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case)))
     elif args.operation == 'verify-signed-fixture':
         print(json.dumps(verify_signed_fixture(args.owner, args.phase)))
     elif args.operation == 'verify-machine-identity-fixture':
