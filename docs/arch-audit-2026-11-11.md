@@ -1998,3 +1998,52 @@ The Arch target retains its separately recorded 16 GiB growth allowance. No
 services were deliberately stopped or distros shut down. Fresh hosted checks,
 later coverage correspondence/work-budget, product release/VM/performance and
 CVE archive certification remain open.
+
+### Windows continuation: fully covered method migration and TUI refusal
+
+All `8cec97cc` workflows completed successfully except Code Coverage. The
+producer passed, and the sealed comparison now clears the extra command
+formatter and refuses TUI summary lines 685–688 -> 700–703. The pinned Fedora
+SQLite full RPM check also passed; its verified bundle and exact merge-tree
+identity are recorded in the SQLite supply review.
+
+The summary method changed its name and return type. Both complete baseline
+copies and both candidate copies have positive entry and raw-region counters.
+The comparator now admits public methods to the existing qualified-parent
+migration proofs. Without a unique unchanged statement seed, it requires a
+unique replacement in the same source/binding context, complete root-only copy
+inventories of equal size, no nested callable or macro in either body, and
+positive counters in every owner and region on both sides. Missing, cold,
+foreign or additional owners, ambiguous siblings and exhausted work remain
+refused. There is no deletion credit or callee-equivalence claim.
+
+Five new regression methods bring the comparator suite to 330 passing tests.
+The positive fixture fails the published checker. A missing-callback fault
+exposed an unsafe first draft; the final root-only restriction rejects it.
+All 153 adjacent producer, immutable-base, contract and SQLite tests pass too.
+The original 64,000,000-unit capacity is unchanged. Against the full unmodified
+`8cec97cc` sealed pair, the new proof binds both summary copies and leaves
+27,340,286 units at the proof. The global comparison then correctly refuses
+uncovered audit-warning code at `app.rs:501`; it has not passed globally.
+
+The existing real-IPC test harness now drives the TUI audit with complete and
+incomplete scope, each with zero and one finding. It checks that incomplete
+scope fails the action while retaining the finding count. Temporarily bypassing
+the warning fails this test; the restored production source passes. Product
+code is unchanged. Fresh ordinary-user profiles bind this run to binary SHA-256
+`92d2cf32d2471a338089f316e208d74a65546961f2fa3dfef0968d197d26c514`.
+All 33 mapped new-test rows and its owner entries are positive, and the warning
+branch executes twice. The `matches!` failure subregion stays cold; it is not
+claimed as executed. An initial root run reached the native fallback because
+root ignores socket overrides; it is excluded from the fault proof. Build and
+fault profiles are also excluded from the accepted local execution profile.
+
+The focused integration-test Clippy check passes with warnings denied, along
+with formatting and diff checks. This wave retains the 16 GiB target growth
+budget, two workers, existing debug/split-debug/incremental settings and explicit
+coverage instrumentation. After Clippy, Arch VHD allocation was 25,656,557,568
+bytes, guest use 24,296,640,512 bytes and C: free space 616,283,193,344 bytes.
+No debug companions were deleted or clocks changed. This is local behavior and
+coverage evidence; a fresh complete hosted comparison remains required. Later
+source correspondence, the shared work limit, release/VM/performance acceptance
+and CVE archive completeness remain open.

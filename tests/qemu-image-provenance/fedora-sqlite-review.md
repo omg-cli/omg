@@ -162,3 +162,19 @@ The library was used only through a private process environment; the custom RPM
 was not installed into the WSL system. This local WSL environment is not the
 pinned CI container. Its bundle is not substituted for trusted workflow supply,
 and it grants no ARM, KVM, guest lifecycle or product-release acceptance.
+
+### Pinned hosted build
+
+The [full RPM job at `8cec97cc`](https://github.com/omg-cli/omg/actions/runs/43754963552/job/132936970217)
+passed in the policy's pinned Fedora image. Its PR merge commit is
+`626d04ded85c04c4b7c8f8ccaafa902bdf3793b1`; its Git tree equals the PR head's
+`be4f4b1c0c3db85e3aef79637a5c4d69cd0bfcfc`.
+
+The [bundle artifact](https://github.com/omg-cli/omg/actions/runs/43754963552/artifacts/14178660473)
+has SHA-256 `56388f00550d18b800ee2a2e41a387c80d7e1fb8a64f5eb1009e5b66fcb65115`.
+After digest verification, the existing bundle verifier admitted it against
+that exact merge revision and current policy. Its 393,842 assertions, 46,391
+fuzz cases, 1,218-file inventory and required assertion counts all pass. The
+built library hash equals the independently built WSL library hash above.
+This closes the pinned source-build check; product guest execution, ARM and
+release acceptance remain separate requirements.
