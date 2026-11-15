@@ -144,3 +144,21 @@ assertion exactly once. All existing assertions, original file inventories,
 Tcl encoding behavior, RPM checks and limits remain. Older `walreset2` bundles
 are refused under the new package identity and patch digest. Native full RPM
 checking and fresh pinned-container CI remain required for this supplement.
+
+### Native Fedora WSL evidence
+
+On November 15, the complete source build at `c53b367f` passed the original
+`rpmbuild -ba` checks on Fedora 44 WSL: 393,842 assertions and 46,391 fuzz cases,
+zero errors. All 1,218 required test files retain the recorded inventory hash.
+FD exhaustion, every WAL assertion and `fts5integrity-12.2.1` executed with their
+required counts. The source signature, reviewed material hashes and resulting
+package bundle passed the existing verifier.
+
+The extracted built library has SHA-256
+`e07afe6ae51f49e85faf6f577eae81bb207d86dc89658c9b83f335e833353050`.
+A fresh Python process verified that exact mapped library, correct VCheck names
+for ASCII, Unicode and quoted identifiers, and successful integrity checks.
+The library was used only through a private process environment; the custom RPM
+was not installed into the WSL system. This local WSL environment is not the
+pinned CI container. Its bundle is not substituted for trusted workflow supply,
+and it grants no ARM, KVM, guest lifecycle or product-release acceptance.

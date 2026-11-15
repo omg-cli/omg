@@ -1953,3 +1953,48 @@ were skipped or relaxed. Fresh hosted CI/coverage, the remaining correspondence
 and work-bound obligations, release/VM/performance acceptance and CVE archive
 certification remain open. This continuation is solo, with no independent
 security or red-team review.
+
+### Windows continuation: SQLite EXPLAIN and fixture formatting
+
+The `4f45e7e7` head completed CI, CodeQL, security, secret scanning, mutation and
+Docker E2E successfully. Coverage production passed; comparison refused an
+additional compiled `Cmd<StatusMsg>::Debug::fmt` copy. The fixture's extra command
+diagnostic introduced it. `d069b9e9` restores the original refusal message while
+preserving the negative test and strict compiled-copy gate. Fresh native LLVM
+inventory confirms the extra formatter is absent from the unit binary. All 10
+status tests pass as before, with complete ordinary-user profiles and all 352
+mapped test rows positive. Arch all-target Clippy and formatting pass.
+
+One attempted rebuild reused a binary timestamped ahead of the current clock
+and was rejected as evidence. Only four owned 16-byte Cargo fingerprints were
+invalidated; no binary or debug companion was deleted. A fresh compile and
+execution bind the change to unit binary SHA-256
+`b3819133f2dff590407504ba1387a68c488501a3c372e6131acc3066d6a3dc35`.
+Full hosted multi-binary coverage acceptance remains required.
+
+Native Fedora 44 reproduced the earlier RPM failure's root cause independently:
+EXPLAIN VCheck emitted pointer bytes instead of a table name. `c1869784` handles
+`P4_TABLEREF` through the existing `P4_TABLE` name formatter and adds an assertion
+to the existing FTS5 test. `c53b367f` normalizes patch formatting. The private
+package identity is now `2.omgci.walreset3.fc44`; its patch digest changes and
+admission additionally requires `fts5integrity-12.2.1` exactly once. All 19 supply
+contract tests pass, including omitted/duplicate assertion and old-identity
+refusals. Existing file inventories, assertions, encoding checks, signatures,
+limits and the original full RPM check remain intact.
+
+The complete native Fedora WSL build at `c53b367f` passed 393,842 assertions and
+46,391 fuzz cases with zero errors. All 1,218 required files and every required
+FD/WAL/EXPLAIN assertion passed. The exact extracted library passed ASCII,
+Unicode and quoted table-name probes and integrity checks. The custom library
+was not installed globally. This is full local Fedora WSL evidence, not the
+pinned CI image, ARM/KVM, guest lifecycle or release acceptance. The package
+review records its library hash and environment limits.
+
+The Fedora wave had an explicit 6 GiB growth budget and 20 GiB C: reserve. It
+finished at VHD 1,812,987,904 bytes, guest use 1,267,789,824 bytes and backing free
+space 732,353,994,752 bytes. Authenticated build dependencies and an ordinary
+builder account were added to the previously minimal Fedora WSL environment.
+The Arch target retains its separately recorded 16 GiB growth allowance. No
+services were deliberately stopped or distros shut down. Fresh hosted checks,
+later coverage correspondence/work-budget, product release/VM/performance and
+CVE archive certification remain open.
