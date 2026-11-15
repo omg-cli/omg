@@ -2101,3 +2101,37 @@ bytes and C: free space 609,067,581,440 bytes. No debug companions were deleted
 or clocks changed. Fresh hosted coverage and portable checks, later source/work
 obligations, full release/VM/performance acceptance, independent security review
 and private CVE archive completeness remain open.
+
+### Windows continuation: reuse the complete method-scope inventory
+
+The coverage checker now indexes method-parent source locations once per
+comparison instead of decoding the full base owner list for each method scope.
+It keeps the same decoder, every compiled copy and callback, cross-file source
+locations, and conservative unknown-owner locations. Raw substring queries keep
+their existing scan; their cache keys are separate from method-scope keys.
+No counter, coverage threshold or original 64,000,000-unit capacity changed.
+
+The regression first observed eight decodes for four owners across two scope
+queries; the index reduces that to four. Cross-file copies, callback owners,
+LLVM inventory suffixes, distinct implementation identities, unattributed
+sources and exhaustion before decoding are covered. Unknown owners in another
+source still refuse the actual method migration. All 340 comparator tests pass
+in Arch WSL. Adjacent producer/base/SQLite suites pass 66/25/19 tests. The
+unchanged contract suite passes all 43 tests under Ubuntu's Python 3.12; its
+first Arch run produced a builtin-operation exception, and the isolated affected
+case then passed. These are 493 passing tests across the stated environments.
+
+A controlled lookup comparison uses all 30,549 owners in the sealed base raw
+report and five sampled method scopes from its 682 indexed scopes. Extracted
+old and candidate lookup functions return identical source-location sets. Work
+used falls from 15,636,926 to 3,136,099 units for those queries. This measures the
+lookup only and does not establish a complete comparison or global work pass.
+
+Other large local diagnostics produced interpreter faults and inconsistent
+builtin exceptions on repeated attempts. Those runs are excluded from evidence;
+no cause is attributed and no acceptance result is inferred from them. A Windows
+edit also briefly changed existing Unicode fixtures through the default text
+encoding; their exact original UTF-8 bytes were restored before final tests.
+No Rust source or native build settings changed in this slice. The active hosted
+runs at `34688b17` must finish before publishing another head; fresh complete
+immutable-base acceptance remains required for the index too.
