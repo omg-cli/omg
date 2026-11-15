@@ -636,6 +636,48 @@ fn native_audit_fix_dry_runs_preserve_unknown_scope_and_inert_advisory_text() {
 
 #[test]
 #[serial]
+fn tui_audit_refuses_incomplete_scope_and_keeps_reported_findings() {
+    use omg_lib::cli::tui::app::App;
+    use omg_lib::core::security::scan::SecurityAuditResult;
+    let identity = serde_json::json!({"name":"fixture","version":"1-1","architecture":null});
+    for (unknown, findings) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+        let audit: SecurityAuditResult = serde_json::from_value(serde_json::json!({
+            "coverage":{"status":"reported",
+                "assessed":if unknown {serde_json::json!([])} else {serde_json::json!([identity])},
+                "unassessed":if unknown {serde_json::json!([{"package":identity,"reason":"origin_unestablished"}])} else {serde_json::json!([])},
+                "sources":[{"kind":"osv","ecosystem":"Arch Linux:fixture"}]},
+            "total_vulnerabilities":findings,"high_severity":0,
+            "vulnerabilities":if findings == 0 {serde_json::json!([])} else {serde_json::json!([["fixture",[{
+                "id":"CVE-2026-1234","summary":"fixture advisory",
+                "applicability":if unknown {"possible"} else {"applicable"},"affected_installed":[identity]}]]])}
+        })).expect("valid audit wire result");
+        let mut daemon = MockDaemon::spawn(Box::new(move |request| {
+            assert!(matches!(request, Request::SecurityAudit { .. }));
+            Some(echo_frame(
+                request,
+                &ResponseResult::SecurityAudit(audit.clone()),
+            ))
+        }));
+        with_client_env(Some("0"), Some("0"), Some(&daemon.socket_path), || {
+            block(async {
+                let result = App::run_security_audit().await;
+                if unknown {
+                    let error =
+                        result.expect_err("unknown advisory scope must fail the TUI action");
+                    let message = error.to_string();
+                    assert!(message.contains("1 package(s) with unknown coverage"));
+                    assert!(message.contains(&format!("Reported findings: {findings}")));
+                } else {
+                    assert_eq!(result.expect("complete advisory scope"), findings);
+                }
+            });
+        });
+        assert_eq!(daemon.take_requests().len(), 1);
+    }
+}
+
+#[test]
+#[serial]
 fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
     use omg_lib::core::security::scan::{
         AdvisorySeverity, FindingApplicability, SecurityAuditResult,
