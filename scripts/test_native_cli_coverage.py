@@ -208,6 +208,45 @@ with socket.socket(socket.AF_UNIX) as server:
                     if wrong_peer:
                         self.assertFalse(trigger.exists(), 'Poweroff must not run against another monitor process')
 
+    def test_native_migration_state_requires_exact_packages_payloads_and_install_intents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            database = owner / 'db'
+            (database / 'local').mkdir(parents=True)
+            (owner / 'cache').mkdir()
+            packages = {}
+            for name in ('fixture-app', 'xorg-xrandr', 'hp-omnibook-3-audio'):
+                payload = (name + ': upgraded\n').encode()
+                packages[name] = dict(reason=0, payload_path='usr/share/fixture/' + name,
+                                      after_sha256=hashlib.sha256(payload).hexdigest())
+                if name != 'hp-omnibook-3-audio':
+                    PRODUCER.fixture_local_package(owner / 'root', database, name, '3-1',
+                                                   packages[name]['payload_path'], payload, 0)
+            (owner / 'data-receipt.json').write_text(json.dumps(dict(
+                initial_packages={'fixture-app': packages['fixture-app']},
+                migration_packages={name: packages[name] for name in ('xorg-xrandr', 'hp-omnibook-3-audio')})))
+            (owner / 'cache/unrelated.txt').write_text('must survive pruning\n')
+            (owner / 'outside-cache.txt').write_text('must survive symlink escape\n')
+            (owner / 'cache/escape.pkg.tar.gz').symlink_to(owner / 'outside-cache.txt')
+            for version in ('1-1', '2-1'):
+                for suffix in ('', '.sig'):
+                    (owner / f'cache/omg-coverage-app-{version}-any.pkg.tar.gz{suffix}').write_bytes(b'cached')
+            state = PRODUCER.verify_signed_fixture(owner, phase='migrated-unmatched')
+            self.assertEqual(set(state['packages']), {'fixture-app', 'xorg-xrandr'})
+            with self.assertRaisesRegex(ValueError, 'inventory differs'):
+                PRODUCER.verify_signed_fixture(owner, phase='migrated')
+            PRODUCER.fixture_local_package(owner / 'root', database, 'hp-omnibook-3-audio', '3-1',
+                                           packages['hp-omnibook-3-audio']['payload_path'],
+                                           b'hp-omnibook-3-audio: upgraded\n', 0)
+            with self.assertRaisesRegex(ValueError, 'Non-matching hardware'):
+                PRODUCER.verify_signed_fixture(owner, phase='migrated-unmatched')
+            state = PRODUCER.verify_signed_fixture(owner, phase='migrated')
+            self.assertEqual(set(state['packages']), set(packages))
+            description = database / 'local/hp-omnibook-3-audio-3-1/desc'
+            description.write_text(description.read_text().replace('%REASON%\n0', '%REASON%\n1'))
+            with self.assertRaisesRegex(ValueError, 'install intent'):
+                PRODUCER.verify_signed_fixture(owner, phase='migrated')
+
     def test_interrupted_update_requires_exact_partial_native_state(self):
         with tempfile.TemporaryDirectory() as directory:
             owner = Path(directory)
@@ -803,6 +842,9 @@ def evidence_fixture(root):
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status=PRODUCER.NATIVE_PHASES[case.native_phase])))
+        if stage.startswith('omarchy-native-migrations'):
+            (evidence / f'{stage}-migrations.txt').write_text(
+                'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n')
         if stage == 'omarchy-current-kernel':
             path = 'usr/lib/modules/fixture/modules.builtin'
             (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(
@@ -845,6 +887,8 @@ def evidence_fixture(root):
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
             'omarchy-success': '| System is up to date',
+            'omarchy-native-migrations': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
+            'omarchy-native-migrations-unmatched': '| System is up to date\nNative Omarchy migration-xrandr completed',
             'omarchy-current-kernel': '| System is up to date',
             'omarchy-runtime-unset': 'caller_runtime_hint=unset\n| System is up to date',
             'omarchy-interrupted': 'Omarchy update interrupted',
@@ -1099,7 +1143,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 20)
-            self.assertEqual(len(receipt['process_checks']), 60)
+            self.assertEqual(len(receipt['process_checks']), 62)
             self.assertEqual(len(receipt['fresh_admission']), 20)
             self.assertEqual(len(files), len(receipt['profiles']))
 
@@ -1238,6 +1282,33 @@ class ArtifactAdmission(unittest.TestCase):
 
 
 class FreshAdmissionFixture(unittest.TestCase):
+    def test_native_migration_case_requires_package_and_completion_evidence(self):
+        stage = 'omarchy-native-migrations'
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            receipt = evidence / f'{stage}-migrations.txt'
+            receipt.write_text('ordered_configuration=before,after recognized_native_migrations=2 completion_markers=3\n')
+            with self.assertRaisesRegex(ValueError, 'migration completion'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            receipt.write_text('ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n')
+            log = evidence / f'{stage}.log'
+            log.write_text(log.read_text().replace('Native Omarchy migration-xrandr completed', ''))
+            with self.assertRaisesRegex(ValueError, 'migration package operations'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
+    def test_native_migrations_are_a_required_signed_full_update_case(self):
+        case = PRODUCER.OMARCHY_CASES['omarchy-native-migrations']
+        self.assertEqual(case.exit_status, 0)
+        self.assertEqual(case.native_phase, 'migrated')
+        self.assertNotIn('omarchy-migrate', case.helpers)
+        self.assertIn('omarchy-hw-match\tOmniBook 3 Laptop', case.helpers)
+        self.assertIn('omarchy-state\tset\treboot-required', case.helpers)
+        script = PRODUCER.omarchy_guest_script()
+        self.assertIn('--native-migrations', script)
+        self.assertIn('1794518371.sh', script)
+        self.assertIn('1794675791.sh', script)
+
     def test_native_remediation_dry_run_is_a_mandatory_ipc_fixture(self):
         name = 'native_audit_fix_dry_runs_preserve_unknown_scope_and_inert_advisory_text'
         self.assertIn(name, PRODUCER.HARNESSES['ipc'].tests)

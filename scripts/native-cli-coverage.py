@@ -184,7 +184,7 @@ def fixture_local_package(root, database, name, version, payload_path, payload, 
     target.write_bytes(payload)
 
 
-def create_signed_fixture(owner, current_kernel=False):
+def create_signed_fixture(owner, current_kernel=False, native_migrations=False):
     if os.geteuid() != 0:
         raise RuntimeError('Guest root setup required')
     for kind in ('mnt', 'net'):
@@ -226,6 +226,9 @@ def create_signed_fixture(owner, current_kernel=False):
         ('archlinux-keyring', 'core', 0, ()), ('omarchy-keyring', 'omarchy', 0, ()),
         ('omg-coverage-app', 'core', 0, ('omg-coverage-dep>=1-1',)),
         ('omg-coverage-dep', 'core', 1, ()), ('omg-coverage-desktop', 'omarchy', 0, ())]
+    migration_packages = {}
+    if native_migrations:
+        packages.extend((name, 'core', 0, ()) for name in ('xorg-xrandr', 'hp-omnibook-3-audio'))
     running_modules = None
     if current_kernel:
         release = Path('/proc/sys/kernel/osrelease').read_text().strip()
@@ -242,13 +245,17 @@ def create_signed_fixture(owner, current_kernel=False):
             payload_path = running_modules['path']
         old_payload = before_public if keyring else (name + ': installed1\n').encode()
         new_payload = updated_public if keyring else (name + ': upgraded3\n').encode()
-        fixture_local_package(owner / 'root', owner / 'db', name, '1-1', payload_path, old_payload, reason, depends)
+        migration_only = native_migrations and name in ('xorg-xrandr', 'hp-omnibook-3-audio')
+        if not migration_only:
+            fixture_local_package(owner / 'root', owner / 'db', name, '1-1', payload_path, old_payload, reason, depends)
         archive = fixture_package(owner / 'repos' / repository, name, '3-1', payload_path, new_payload, depends)
         fixture_command(signing + ['--local-user', fingerprint, '--detach-sign', '--output', str(archive) + '.sig', str(archive)])
         repositories[repository].append((name, archive, payload_path, new_payload, depends))
-        initial[name] = {'version': '1-1', 'reason': reason, 'payload_path': payload_path,
-                         'before_sha256': hashlib.sha256(old_payload).hexdigest(),
-                         'after_sha256': hashlib.sha256(new_payload).hexdigest()}
+        inventory = migration_packages if migration_only else initial
+        inventory[name] = {'version': '3-1' if migration_only else '1-1', 'reason': reason,
+                           'payload_path': payload_path, 'after_sha256': hashlib.sha256(new_payload).hexdigest()}
+        if not migration_only:
+            inventory[name]['before_sha256'] = hashlib.sha256(old_payload).hexdigest()
     for name, reason in (('omg-coverage-dead-dep', 1),):
         fixture_local_package(owner / 'root', owner / 'db', name, '1-1', 'usr/share/omg-coverage/' + name + '.txt', b'retain unless actual orphan\n', reason)
     for repository, records in repositories.items():
@@ -279,7 +286,7 @@ def create_signed_fixture(owner, current_kernel=False):
     receipt = {'status': 'PREPARED_DATA_ONLY_NOT_RUNTIME_PROOF', 'owner': str(owner), 'created_unix': time.time(),
                'fixture_signer_fingerprint': fingerprint, 'signer_is_authored_throwaway_key': True,
                'host_or_publisher_secret_material_used': False, 'siglevel_weakened': False,
-               'initial_packages': initial, 'config_sha256': sha(owner / 'pacman.conf'),
+               'initial_packages': initial, 'migration_packages': migration_packages, 'config_sha256': sha(owner / 'pacman.conf'),
                'running_kernel_modules': running_modules,
                'initial_database_sha256': fixture_tree_hashes(owner / 'db/local'),
                'initial_payload_sha256': fixture_tree_hashes(owner / 'root'),
@@ -295,6 +302,8 @@ NATIVE_PHASES = {
     'initial': 'PASS_NATIVE_INITIAL_STATE',
     'cache-pruned': 'PASS_NATIVE_CACHE_PRUNED_STATE',
     'complete': 'PASS_SIGNED_NATIVE_STATE',
+    'migrated': 'PASS_SIGNED_NATIVE_MIGRATIONS_STATE',
+    'migrated-unmatched': 'PASS_SIGNED_NATIVE_MIGRATIONS_UNMATCHED_STATE',
 }
 
 
@@ -783,20 +792,31 @@ def validate_fresh_admission(value, cli_sha256):
 def verify_signed_fixture(owner, phase='complete'):
     require(phase in NATIVE_PHASES, 'Unknown native fixture phase')
     receipt = json.loads((owner / 'data-receipt.json').read_text())
-    version = '3-1' if phase == 'complete' else '1-1'
-    obsolete = '1-1' if phase == 'complete' else '3-1'
-    payload_hash = 'after_sha256' if phase == 'complete' else 'before_sha256'
-    expected_records = {name + '-' + version for name in receipt['initial_packages']}
-    if phase != 'complete':
+    completed = phase in ('complete', 'migrated', 'migrated-unmatched')
+    packages = dict(receipt['initial_packages'])
+    if phase in ('migrated', 'migrated-unmatched'):
+        require(set(receipt.get('migration_packages', {})) == {'xorg-xrandr', 'hp-omnibook-3-audio'},
+                'Native migration package fixtures are missing')
+        packages.update({name: value for name, value in receipt['migration_packages'].items()
+                         if phase == 'migrated' or name == 'xorg-xrandr'})
+        for name, value in receipt['migration_packages'].items():
+            if name not in packages:
+                require(not (owner / 'root' / value['payload_path']).exists(),
+                        'Non-matching hardware received an unrelated package payload')
+    version = '3-1' if completed else '1-1'
+    obsolete = '1-1' if completed else '3-1'
+    payload_hash = 'after_sha256' if completed else 'before_sha256'
+    expected_records = {name + '-' + version for name in packages}
+    if not completed:
         expected_records.add('omg-coverage-dead-dep-1-1')
     actual_records = {path.name for path in (owner / 'db/local').iterdir() if path.is_dir()}
     require(actual_records == expected_records, 'Native package inventory differs from expected phase')
-    if phase != 'complete':
+    if not completed:
         require(fixture_tree_hashes(owner / 'db/local') == receipt['initial_database_sha256'],
                 'Native package database differs from initial state')
         require(fixture_tree_hashes(owner / 'root') == receipt['initial_payload_sha256'],
                 'Native transaction payload differs from initial state')
-    for name, expected in receipt['initial_packages'].items():
+    for name, expected in packages.items():
         installed = owner / 'db/local' / (name + '-' + version)
         require(installed.is_dir() and not (owner / 'db/local' / (name + '-' + obsolete)).exists(),
                 'Native transaction has an unexpected version for ' + name)
@@ -816,7 +836,7 @@ def verify_signed_fixture(owner, phase='complete'):
             require((owner / f'cache/omg-coverage-app-{retained}-any.pkg.tar.gz{suffix}').is_file(),
                     'Native cache pruning removed a retained version')
     require(not (owner / 'db/db.lck').exists(), 'Native transaction leaked its database lock')
-    result = dict(status=NATIVE_PHASES[phase], packages=receipt['initial_packages'])
+    result = dict(status=NATIVE_PHASES[phase], packages=packages)
     kernel = receipt.get('running_kernel_modules')
     if kernel is not None:
         require(sha(Path('/') / kernel['path']) == kernel['sha256'], 'Real guest kernel inventory was changed')
@@ -964,6 +984,13 @@ class OmarchyCase(NamedTuple):
 
 OMARCHY_CASES = {
     'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-native-migrations': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
+        'omarchy-hw-aarch64-qualcomm', 'omarchy-hw-match\tOmniBook 3 Laptop',
+        'omarchy-state\tset\treboot-required', 'omarchy-notification-dismiss\tOmarchy Migrations',
+    ) + OMARCHY_SUFFIX[3:], native_phase='migrated'),
+    'omarchy-native-migrations-unmatched': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
+        'omarchy-hw-aarch64-qualcomm', 'omarchy-notification-dismiss\tOmarchy Migrations',
+    ) + OMARCHY_SUFFIX[3:], scene='migration-hardware-unmatched', native_phase='migrated-unmatched'),
     'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-runtime-unset': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
@@ -1086,6 +1113,7 @@ omarchy_security_require_source_root() {
 case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
 case "$name:${OMARCHY_FIXTURE_SCENE:-none}:${1:-}" in
+  omarchy-hw-aarch64-qualcomm:migration-hardware-unmatched:*) exit 1 ;;
   omarchy-update-requires-free-space:preflight-failure:*) exit 7 ;;
   omarchy-update-confirm:confirmation-failure:*) exit 2 ;;
   omarchy-update-dev:development-failure:*) exit 7 ;;
@@ -1308,7 +1336,8 @@ for name in omarchy-update-requires-free-space omarchy-update-confirm omarchy-up
   omarchy-snapshot omarchy-update-stay-awake omarchy-update-dev omarchy-update-keyring \
   omarchy-update-system-pkgs omarchy-migrate omarchy-restart-shell omarchy-update-orphan-pkgs \
   omarchy-update-analyze-logs omarchy-shell omarchy-update-restart omarchy-hook \
-  omarchy-update-mise omarchy-update-boot omarchy-system yay aura paru; do
+  omarchy-update-mise omarchy-update-boot omarchy-system omarchy-hw-aarch64-qualcomm \
+  omarchy-hw-match omarchy-state omarchy-notification-dismiss yay aura paru; do
   test ! -e "/usr/bin/$name" && test ! -L "/usr/bin/$name"
   install -m 755 "$fixture/stage" "/usr/bin/$name"
   created+=("/usr/bin/$name")
@@ -1333,6 +1362,7 @@ for stage in OMARCHY_STAGE_NAMES; do
   signed_owner="/opt/omg-coverage-$stage"
   signed_options=()
   if test "$stage" = omarchy-current-kernel; then signed_options=(--current-kernel); fi
+  if [[ $stage == omarchy-native-migrations* ]]; then signed_options=(--native-migrations); fi
   python3 /native-cli-coverage.py signed-fixture --owner "$signed_owner" "${signed_options[@]}"
   sed -i "s|file://$signed_owner/repos/|http://127.0.0.1:18080/${signed_owner##*/}/repos/|g" "$signed_owner/pacman.conf"
   cp "$signed_owner/pacman.conf" "$case_dir/pacman.conf"
@@ -1346,8 +1376,34 @@ for stage in OMARCHY_STAGE_NAMES; do
   printf '#!/bin/bash\nexit 88\n' > "$case_dir/checkout/bin/omarchy-migrate"
   chmod 755 "$case_dir/checkout/bin/omarchy-migrate"
   chown -R nobody:nobody "$case_dir"
-  rm -f "$fixture/runtime/migrations/1.sh"
+  find "$fixture/runtime/migrations" -maxdepth 1 -type f -name '*.sh' -delete
   case "$stage" in
+    omarchy-native-migrations|omarchy-native-migrations-unmatched)
+      cat > "$fixture/runtime/migrations/1794518371.sh" <<'OMG_NATIVE_MIGRATION_1794518371'
+echo "Install xrandr so Wine tray menus open at the pointer"
+
+# omarchy-tray-context-menu reads Xwayland's monitor layout with xrandr to
+# place a Wine app's own tray menu where it was right-clicked.
+omarchy-pkg-add xorg-xrandr
+OMG_NATIVE_MIGRATION_1794518371
+      cat > "$fixture/runtime/migrations/1794675791.sh" <<'OMG_NATIVE_MIGRATION_1794675791'
+echo "Give the HP OmniBook 3 working speakers and microphones"
+
+# See install/hardware/hp/fix-hp-omnibook-3-speakers.sh. The sound card comes
+# with linux-omarchy-dtbs' OmniBook 3 tree, so it comes up from the next boot.
+# Migrations run once per user, so a later user finds the package installed
+# and leaves the machine as it is.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match "OmniBook 3 Laptop" || omarchy-pkg-present hp-omnibook-3-audio; then
+  exit 0
+fi
+
+omarchy-pkg-add hp-omnibook-3-audio
+omarchy-state set reboot-required
+OMG_NATIVE_MIGRATION_1794675791
+      printf 'printf "before\\n" >> "$HOME/native-migration-order"\n' > "$fixture/runtime/migrations/0000000000.sh"
+      printf 'printf "after\\n" >> "$HOME/native-migration-order"\n' > "$fixture/runtime/migrations/9999999999.sh"
+      chmod 644 "$fixture/runtime/migrations/"*.sh
+      ;;
     omarchy-success)
       printf 'omarchy-pkg-aur-add forbidden-home-fixture\n' > "$case_dir/checkout/migrations/1.sh"
       ;;
@@ -1478,6 +1534,17 @@ OMG_AUTHORIZATION_RECEIPT
   fi
   python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" --phase "$native_phase" \
     > "/evidence/cli/$stage-native-state.json"
+  if [[ $stage == omarchy-native-migrations* ]]; then
+    printf 'before\nafter\n' > "$fixture/expected-migration-order"
+    cmp "$fixture/expected-migration-order" "$case_dir/native-migration-order"
+    for name in 0000000000.sh 1794518371.sh 1794675791.sh 9999999999.sh; do
+      test -f "$case_dir/migrations/$name" && test ! -L "$case_dir/migrations/$name"
+      test ! -s "$case_dir/migrations/$name"
+      test "$(stat -c '%u:%a:%h' "$case_dir/migrations/$name")" = "$(id -u nobody):600:1"
+    done
+    printf 'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n' \
+      > "/evidence/cli/$stage-migrations.txt"
+  fi
   if test "$stage" = omarchy-optional-failures; then
     for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-update-confirm; do
       test -L "/usr/bin/$name"
@@ -1945,9 +2012,20 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     'Omarchy has no complete genuine PTY transcript: ' + stage)
         require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
                 == NATIVE_PHASES[case.native_phase], 'Native package state differs: ' + stage)
-        if case.native_phase == 'complete':
+        if case.native_phase in ('complete', 'migrated', 'migrated-unmatched'):
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if stage.startswith('omarchy-native-migrations'):
+            require((evidence / f'{stage}-migrations.txt').read_text()
+                    == 'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n',
+                    'Native migration completion evidence differs')
+            operations = ('migration-xrandr', 'migration-omnibook-audio') if stage == 'omarchy-native-migrations' else ('migration-xrandr',)
+            require(all(f'Native Omarchy {operation} completed' in log
+                        for operation in operations),
+                    'Native migration package operations did not complete')
+            if stage.endswith('-unmatched'):
+                require('Native Omarchy migration-omnibook-audio completed' not in log,
+                        'Non-matching hardware invoked the audio package transaction')
         if case.failure_command:
             require(f'Omarchy stage {case.failure_command} did not complete: exit status: {case.failure_status}' in log,
                     'Lifecycle helper failure was not reported: ' + stage)
@@ -2163,6 +2241,7 @@ def main():
     signed = commands.add_parser('signed-fixture')
     signed.add_argument('--owner', required=True, type=Path)
     signed.add_argument('--current-kernel', action='store_true')
+    signed.add_argument('--native-migrations', action='store_true')
     fresh = commands.add_parser('fresh-admission-fixture')
     fresh.add_argument('--owner', required=True, type=Path)
     fresh.add_argument('--cli', required=True, type=Path)
@@ -2197,7 +2276,7 @@ def main():
             json.dump(value, stream, indent=2)
             stream.write('\n')
     elif args.operation == 'signed-fixture':
-        create_signed_fixture(args.owner, args.current_kernel)
+        create_signed_fixture(args.owner, args.current_kernel, args.native_migrations)
     elif args.operation == 'fresh-admission-fixture':
         print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles)))
     elif args.operation == 'verify-signed-fixture':

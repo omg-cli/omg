@@ -584,7 +584,9 @@ pub(crate) fn execute_omarchy_transaction(
 ) -> Result<()> {
     use super::arch::NativeOmarchyOperation;
     let kind = match operation {
-        NativeOmarchyOperation::RefreshKeyrings => TransactionKind::Install,
+        NativeOmarchyOperation::RefreshKeyrings
+        | NativeOmarchyOperation::InstallTrayMenuDependency
+        | NativeOmarchyOperation::InstallOmnibookAudio => TransactionKind::Install,
         NativeOmarchyOperation::UpgradeRepositories => TransactionKind::SystemUpgrade,
         NativeOmarchyOperation::RemoveOrphans => TransactionKind::Remove { recursive: true },
         NativeOmarchyOperation::PruneCache => anyhow::bail!("Cache pruning is not a transaction"),
@@ -690,7 +692,7 @@ fn execute_transaction_in(
                     break;
                 }
             }
-            let level = trusted_repository.context("Signing-key package is unavailable")?;
+            let level = trusted_repository.context("Omarchy package is unavailable")?;
             anyhow::ensure!(
                 level.contains(alpm::SigLevel::PACKAGE)
                     && !level.intersects(
@@ -698,7 +700,7 @@ fn execute_transaction_in(
                             | alpm::SigLevel::PACKAGE_UNKNOWN_OK
                             | alpm::SigLevel::PACKAGE_MARGINAL_OK
                     ),
-                "Native signing-key refresh requires mandatory trusted package signatures; trust bootstrap is unavailable"
+                "Native Omarchy package installation requires mandatory trusted package signatures; trust bootstrap is unavailable"
             );
         }
     }

@@ -16,6 +16,8 @@ pub enum NativeOmarchyOperation {
     RefreshKeyrings,
     UpgradeRepositories,
     RemoveOrphans,
+    InstallTrayMenuDependency,
+    InstallOmnibookAudio,
 }
 
 impl NativeOmarchyOperation {
@@ -26,6 +28,8 @@ impl NativeOmarchyOperation {
             "keyring-refresh" => Some(Self::RefreshKeyrings),
             "repository-upgrade" => Some(Self::UpgradeRepositories),
             "orphan-remove" => Some(Self::RemoveOrphans),
+            "migration-xrandr" => Some(Self::InstallTrayMenuDependency),
+            "migration-omnibook-audio" => Some(Self::InstallOmnibookAudio),
             _ => None,
         }
     }
@@ -37,6 +41,8 @@ impl NativeOmarchyOperation {
             Self::RefreshKeyrings => "keyring-refresh",
             Self::UpgradeRepositories => "repository-upgrade",
             Self::RemoveOrphans => "orphan-remove",
+            Self::InstallTrayMenuDependency => "migration-xrandr",
+            Self::InstallOmnibookAudio => "migration-omnibook-audio",
         }
     }
 }
@@ -153,6 +159,18 @@ pub fn execute_native_omarchy_operation(
         }
         NativeOmarchyOperation::UpgradeRepositories => Vec::new(),
         NativeOmarchyOperation::RemoveOrphans => super::list_orphans_direct()?,
+        NativeOmarchyOperation::InstallTrayMenuDependency => {
+            if super::is_installed_fast("xorg-xrandr")? {
+                return Ok(());
+            }
+            vec!["xorg-xrandr".to_owned()]
+        }
+        NativeOmarchyOperation::InstallOmnibookAudio => {
+            if super::is_installed_fast("hp-omnibook-3-audio")? {
+                return Ok(());
+            }
+            vec!["hp-omnibook-3-audio".to_owned()]
+        }
         NativeOmarchyOperation::PruneCache => unreachable!(),
     };
     if operation == NativeOmarchyOperation::RemoveOrphans && targets.is_empty() {
@@ -175,7 +193,9 @@ pub fn execute_native_omarchy_operation(
         let mut changes = Vec::new();
         for name in &targets {
             let previous = super::get_package_info(name)?;
-            let next = if operation == NativeOmarchyOperation::RefreshKeyrings {
+            let next = if operation == NativeOmarchyOperation::RemoveOrphans {
+                None
+            } else {
                 Some(super::alpm_direct::with_handle(|handle| {
                     for database in handle.syncdbs() {
                         if !database.usage()?.contains(alpm::Usage::INSTALL) {
@@ -187,11 +207,9 @@ pub fn execute_native_omarchy_operation(
                         }
                     }
                     anyhow::bail!(
-                        "Signing-key package {name} is unavailable from configured install repositories"
+                        "Omarchy package {name} is unavailable from configured install repositories"
                     )
                 })?)
-            } else {
-                None
             };
             changes.push(PackageChange {
                 name: name.clone(),

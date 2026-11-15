@@ -530,6 +530,23 @@ impl Commands {
         finish_cleanup(result, restored)
     }
 
+    async fn run_native_package(&mut self, operation: NativeOmarchyOperation) -> Result<()> {
+        use crate::package_managers::arch::NativeOmarchyInteraction;
+        let interaction = if self.yes {
+            NativeOmarchyInteraction::Unattended
+        } else {
+            NativeOmarchyInteraction::Attended
+        };
+        let command = crate::core::privilege::native_omarchy_command(operation, interaction)?;
+        let status = self.run_command(command, operation.argument()).await?;
+        crate::package_managers::arch::complete_native_omarchy_write(status.success()).await?;
+        anyhow::ensure!(
+            status.success(),
+            "Native Omarchy {operation:?} failed: {status}"
+        );
+        Ok(())
+    }
+
     async fn release_authorization(&mut self) {
         if let Some(task) = self.authorization.take() {
             task.abort();
@@ -557,21 +574,7 @@ impl StageExecutor for Commands {
     async fn execute(&mut self, stage: Stage) -> Result<Outcome> {
         match stage {
             Stage::NativePackage(operation) => {
-                use crate::package_managers::arch::NativeOmarchyInteraction;
-                let interaction = if self.yes {
-                    NativeOmarchyInteraction::Unattended
-                } else {
-                    NativeOmarchyInteraction::Attended
-                };
-                let command =
-                    crate::core::privilege::native_omarchy_command(operation, interaction)?;
-                let status = self.run_command(command, operation.argument()).await?;
-                crate::package_managers::arch::complete_native_omarchy_write(status.success())
-                    .await?;
-                anyhow::ensure!(
-                    status.success(),
-                    "Native Omarchy {operation:?} failed: {status}"
-                );
+                self.run_native_package(operation).await?;
                 return Ok(Outcome::Success);
             }
             Stage::RebootPrompt => {
@@ -600,6 +603,29 @@ impl StageExecutor for Commands {
             Stage::NativeAur => {
                 super::arch::update_omarchy_aur(self.yes).await?;
                 return Ok(Outcome::Success);
+            }
+            Stage::Migrations => {
+                let plan = pending_migrations(
+                    &self.runtime.root.join("migrations"),
+                    &self.runtime.migration_state,
+                )?;
+                if plan.iter().any(|migration| migration.native.is_some()) {
+                    let state = self.runtime.migration_state.clone();
+                    run_migration_plan(&plan, &state, self).await?;
+                    if let Ok(helper) = crate::core::privilege::root_controlled_program_path(
+                        "omarchy-notification-dismiss",
+                    ) {
+                        self.runtime
+                            .check_helper_layout("omarchy-notification-dismiss", &helper)?;
+                        if let Err(error) = self.run_program(&helper, &["Omarchy Migrations"]).await
+                        {
+                            tracing::warn!(
+                                "Cannot dismiss the Omarchy migration notification: {error:#}"
+                            );
+                        }
+                    }
+                    return Ok(Outcome::Success);
+                }
             }
             Stage::MigrationPreflight => {
                 OmarchyRuntime::validate_root_directory(&self.runtime.root)?;
@@ -664,12 +690,54 @@ impl StageExecutor for Commands {
     }
 }
 
-fn ensure_migrations_use_native_aur(migrations: &Path, state: &Path) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeMigration {
+    TrayMenuDependency,
+    OmnibookAudio,
+}
+
+#[derive(Debug)]
+struct PendingMigration {
+    path: PathBuf,
+    digest: [u8; 32],
+    native: Option<NativeMigration>,
+}
+
+fn read_migration(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("Cannot inspect Omarchy migration {}", path.display()))?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_MIGRATION_BYTES,
+        "Invalid or oversized Omarchy migration {}",
+        path.display()
+    );
+    let mut contents = String::new();
+    file.take(MAX_MIGRATION_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    anyhow::ensure!(
+        contents.len() as u64 <= MAX_MIGRATION_BYTES,
+        "Omarchy migration grew beyond its limit"
+    );
+    Ok(contents)
+}
+
+fn migration_digest(contents: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(contents.as_bytes()).into()
+}
+
+fn pending_migrations(migrations: &Path, state: &Path) -> Result<Vec<PendingMigration>> {
     let entries = match std::fs::read_dir(migrations) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error).context("Cannot inspect pending Omarchy migrations"),
     };
+    let mut pending = Vec::new();
     for (index, entry) in entries.enumerate() {
         anyhow::ensure!(
             index < MAX_MIGRATIONS,
@@ -683,13 +751,20 @@ fn ensure_migrations_use_native_aur(migrations: &Path, state: &Path) -> Result<(
         if state.join(name).is_file() {
             continue;
         }
-        let metadata = std::fs::metadata(&path)?;
-        anyhow::ensure!(
-            metadata.is_file() && metadata.len() <= MAX_MIGRATION_BYTES,
-            "Invalid or oversized Omarchy migration {}",
-            path.display()
-        );
-        let contents = std::fs::read_to_string(&path)?;
+        let contents = read_migration(&path)?;
+        let digest = migration_digest(&contents);
+        // Each equivalent replaces the entire published script, including its guards.
+        let native = match (name.to_str(), hex::encode(digest).as_str()) {
+            (
+                Some("1794518371.sh"),
+                "d3652d3d03b33d3d250f0681065dbaee2c17b3baee330be681248cc2139f74ea",
+            ) => Some(NativeMigration::TrayMenuDependency),
+            (
+                Some("1794675791.sh"),
+                "51547c19027f82b16bfddc3121fb1c14ff01425322afc0bce0ea207f069d4eac",
+            ) => Some(NativeMigration::OmnibookAudio),
+            _ => None,
+        };
         let known_external_aur = [
             "omarchy-pkg-aur-",
             "yay ",
@@ -704,14 +779,149 @@ fn ensure_migrations_use_native_aur(migrations: &Path, state: &Path) -> Result<(
             "omarchy-pkg-missing",
         ];
         anyhow::ensure!(
-            !known_external_aur
-                .iter()
-                .any(|command| contents.contains(command)),
+            native.is_some()
+                || !known_external_aur
+                    .iter()
+                    .any(|command| contents.contains(command)),
             "Native AUR integration refuses pending Omarchy migration {} because it references an external package helper. A native migration equivalent is required before continuing.",
             path.display()
         );
+        pending.push(PendingMigration {
+            path,
+            digest,
+            native,
+        });
+    }
+    pending.sort_by(|left, right| left.path.file_name().cmp(&right.path.file_name()));
+    Ok(pending)
+}
+
+fn ensure_migrations_use_native_aur(migrations: &Path, state: &Path) -> Result<()> {
+    pending_migrations(migrations, state).map(|_| ())
+}
+
+trait MigrationExecutor {
+    async fn execute_migration(&mut self, migration: &PendingMigration) -> Result<()>;
+}
+
+async fn run_migration_plan(
+    plan: &[PendingMigration],
+    state: &Path,
+    executor: &mut impl MigrationExecutor,
+) -> Result<()> {
+    for migration in plan {
+        let marker = state.join(
+            migration
+                .path
+                .file_name()
+                .context("Migration name is missing")?,
+        );
+        if marker.is_file() {
+            continue;
+        }
+        anyhow::ensure!(
+            migration_digest(&read_migration(&migration.path)?) == migration.digest,
+            "Omarchy migration changed after preflight: {}",
+            migration.path.display()
+        );
+        std::fs::create_dir_all(state)?;
+        executor.execute_migration(migration).await?;
+        anyhow::ensure!(
+            migration_digest(&read_migration(&migration.path)?) == migration.digest,
+            "Omarchy migration changed during execution: {}",
+            migration.path.display()
+        );
+        open_owned_file(&marker)?.sync_all()?;
+        File::open(state)?.sync_all()?;
     }
     Ok(())
+}
+
+impl MigrationExecutor for Commands {
+    async fn execute_migration(&mut self, migration: &PendingMigration) -> Result<()> {
+        OmarchyRuntime::validate_root_directory(
+            migration
+                .path
+                .parent()
+                .context("Migration directory is missing")?,
+        )?;
+        let metadata = std::fs::symlink_metadata(&migration.path)?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+            "Omarchy migration must be a root-controlled regular file"
+        );
+        println!(
+            "Running Omarchy migration {}",
+            migration
+                .path
+                .file_stem()
+                .context("Migration name")?
+                .display()
+        );
+        let Some(native) = migration.native else {
+            let shell = crate::core::privilege::root_controlled_program_path("bash")?;
+            let status = self
+                .run_program(
+                    &shell,
+                    &[
+                        "-euo",
+                        "pipefail",
+                        migration
+                            .path
+                            .to_str()
+                            .context("Migration path is not UTF-8")?,
+                    ],
+                )
+                .await?;
+            anyhow::ensure!(
+                status.success(),
+                "Omarchy migration {} failed: {status}",
+                migration.path.display()
+            );
+            return Ok(());
+        };
+        let operation = match native {
+            NativeMigration::TrayMenuDependency => {
+                NativeOmarchyOperation::InstallTrayMenuDependency
+            }
+            NativeMigration::OmnibookAudio => {
+                for (name, args) in [
+                    ("omarchy-hw-aarch64-qualcomm", &[][..]),
+                    ("omarchy-hw-match", &["OmniBook 3 Laptop"][..]),
+                ] {
+                    let helper = crate::core::privilege::root_controlled_program_path(name)?;
+                    self.runtime.check_helper_layout(name, &helper)?;
+                    let status = self.run_program(&helper, args).await?;
+                    if status.code() == Some(1)
+                        || name == "omarchy-hw-match" && status.code() == Some(2)
+                    {
+                        return Ok(());
+                    }
+                    anyhow::ensure!(
+                        status.success(),
+                        "Omarchy hardware detection {name} failed: {status}"
+                    );
+                }
+                if crate::package_managers::is_installed_fast("hp-omnibook-3-audio")? {
+                    return Ok(());
+                }
+                NativeOmarchyOperation::InstallOmnibookAudio
+            }
+        };
+        self.run_native_package(operation).await?;
+        if native == NativeMigration::OmnibookAudio {
+            let helper = crate::core::privilege::root_controlled_program_path("omarchy-state")?;
+            self.runtime.check_helper_layout("omarchy-state", &helper)?;
+            let status = self
+                .run_program(&helper, &["set", "reboot-required"])
+                .await?;
+            anyhow::ensure!(
+                status.success(),
+                "Cannot mark the Omarchy audio migration as requiring a reboot"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn native_reboot_reason() -> Result<Option<&'static str>> {
@@ -2701,6 +2911,206 @@ mod tests {
         .expect("owned fixture must succeed");
     }
 
+    fn native_package_migration_fixtures() -> [(&'static str, &'static str); 2] {
+        [
+            (
+                "1794518371.sh",
+                r#"echo "Install xrandr so Wine tray menus open at the pointer"
+
+# omarchy-tray-context-menu reads Xwayland's monitor layout with xrandr to
+# place a Wine app's own tray menu where it was right-clicked.
+omarchy-pkg-add xorg-xrandr
+"#,
+            ),
+            (
+                "1794675791.sh",
+                r#"echo "Give the HP OmniBook 3 working speakers and microphones"
+
+# See install/hardware/hp/fix-hp-omnibook-3-speakers.sh. The sound card comes
+# with linux-omarchy-dtbs' OmniBook 3 tree, so it comes up from the next boot.
+# Migrations run once per user, so a later user finds the package installed
+# and leaves the machine as it is.
+if ! omarchy-hw-aarch64-qualcomm || ! omarchy-hw-match "OmniBook 3 Laptop" || omarchy-pkg-present hp-omnibook-3-audio; then
+  exit 0
+fi
+
+omarchy-pkg-add hp-omnibook-3-audio
+omarchy-state set reboot-required
+"#,
+            ),
+        ]
+    }
+
+    #[test]
+    fn deployed_package_migrations_have_native_equivalents() {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations).expect("migration directory");
+        for (name, contents) in native_package_migration_fixtures() {
+            std::fs::write(migrations.join(name), contents).expect("deployed migration fixture");
+        }
+        ensure_migrations_use_native_aur(&migrations, &markers)
+            .expect("both exact deployed scripts must use native package equivalents");
+        assert!(!markers.exists(), "preflight must not claim completion");
+    }
+
+    #[test]
+    fn native_migration_equivalents_require_the_exact_name_and_contents() {
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations).expect("migration directory");
+        for (name, contents) in native_package_migration_fixtures() {
+            for (filename, text) in [
+                (name, format!("{contents}\n")),
+                ("other.sh", contents.to_owned()),
+                (name, format!("{contents}omarchy-pkg-add extra-package\n")),
+            ] {
+                let path = migrations.join(filename);
+                std::fs::write(&path, text).expect("changed migration");
+                ensure_migrations_use_native_aur(&migrations, &markers)
+                    .expect_err("a changed or renamed package script has no native equivalent");
+                std::fs::remove_file(path).expect("remove changed migration");
+            }
+        }
+        assert!(!markers.exists());
+    }
+
+    #[tokio::test]
+    async fn native_migration_plan_preserves_order_and_retries_only_unfinished_actions()
+    -> Result<()> {
+        struct Recorder {
+            calls: Vec<String>,
+            fail: bool,
+        }
+        impl MigrationExecutor for Recorder {
+            async fn execute_migration(&mut self, migration: &PendingMigration) -> Result<()> {
+                self.calls.push(
+                    migration
+                        .path
+                        .file_name()
+                        .expect("migration name")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                anyhow::ensure!(
+                    !self.fail || migration.native != Some(NativeMigration::OmnibookAudio),
+                    "fixture installation refused"
+                );
+                Ok(())
+            }
+        }
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations)?;
+        for (name, contents) in native_package_migration_fixtures().into_iter().rev() {
+            std::fs::write(migrations.join(name), contents)?;
+        }
+        for name in ["9999999999.sh", "0000000000.sh"] {
+            std::fs::write(migrations.join(name), "echo configuration\n")?;
+        }
+        let plan = pending_migrations(&migrations, &markers)?;
+        let mut recorder = Recorder {
+            calls: Vec::new(),
+            fail: true,
+        };
+        let error = run_migration_plan(&plan, &markers, &mut recorder)
+            .await
+            .expect_err("failed package action stays pending");
+        assert!(error.to_string().contains("fixture installation refused"));
+        assert_eq!(
+            recorder.calls,
+            ["0000000000.sh", "1794518371.sh", "1794675791.sh"]
+        );
+        assert!(markers.join("0000000000.sh").is_file());
+        assert!(markers.join("1794518371.sh").is_file());
+        assert!(!markers.join("1794675791.sh").exists());
+        assert!(!markers.join("9999999999.sh").exists());
+        recorder.calls.clear();
+        recorder.fail = false;
+        run_migration_plan(&plan, &markers, &mut recorder).await?;
+        assert_eq!(recorder.calls, ["1794675791.sh", "9999999999.sh"]);
+        assert!(pending_migrations(&migrations, &markers)?.is_empty());
+        recorder.calls.clear();
+        run_migration_plan(&plan, &markers, &mut recorder).await?;
+        assert!(
+            recorder.calls.is_empty(),
+            "completed migrations are not repeated"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_migration_state_directory_prevents_every_action() -> Result<()> {
+        struct Recorder {
+            calls: usize,
+        }
+        impl MigrationExecutor for Recorder {
+            async fn execute_migration(&mut self, _migration: &PendingMigration) -> Result<()> {
+                self.calls += 1;
+                Ok(())
+            }
+        }
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let state = owner.path().join("state-file");
+        std::fs::create_dir(&migrations)?;
+        std::fs::write(migrations.join("0001.sh"), "echo configuration\n")?;
+        std::fs::write(&state, "preserve state file\n")?;
+        let plan = pending_migrations(&migrations, &state)?;
+        let mut executor = Recorder { calls: 0 };
+        run_migration_plan(&plan, &state, &mut executor)
+            .await
+            .expect_err("state must be writable before package/configuration actions");
+        assert_eq!(
+            executor.calls, 0,
+            "invalid state must not permit a partial update"
+        );
+        assert_eq!(std::fs::read_to_string(state)?, "preserve state file\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_source_changes_never_create_a_completion_marker() -> Result<()> {
+        struct ChangingExecutor {
+            calls: usize,
+        }
+        impl MigrationExecutor for ChangingExecutor {
+            async fn execute_migration(&mut self, migration: &PendingMigration) -> Result<()> {
+                self.calls += 1;
+                std::fs::write(&migration.path, "echo changed during execution\n")?;
+                Ok(())
+            }
+        }
+        let owner = private_directory();
+        let migrations = owner.path().join("migrations");
+        let markers = owner.path().join("markers");
+        std::fs::create_dir(&migrations)?;
+        let path = migrations.join("0001.sh");
+        std::fs::write(&path, "echo initial\n")?;
+        let plan = pending_migrations(&migrations, &markers)?;
+        let mut executor = ChangingExecutor { calls: 0 };
+        std::fs::write(&path, "echo changed before execution\n")?;
+        let error = run_migration_plan(&plan, &markers, &mut executor)
+            .await
+            .expect_err("changed preflight source");
+        assert!(error.to_string().contains("changed after preflight"));
+        assert_eq!(executor.calls, 0);
+        let plan = pending_migrations(&migrations, &markers)?;
+        let error = run_migration_plan(&plan, &markers, &mut executor)
+            .await
+            .expect_err("changed running source");
+        assert!(error.to_string().contains("changed during execution"));
+        assert_eq!(executor.calls, 1);
+        assert!(
+            !markers.join("0001.sh").exists(),
+            "neither changed script is marked complete"
+        );
+        Ok(())
+    }
+
     #[test]
     fn known_external_aur_migrations_are_refused_until_marked_complete() {
         let owner = private_directory();
@@ -2815,9 +3225,9 @@ mod tests {
         assert_eq!(
             error
                 .downcast_ref::<std::io::Error>()
-                .expect("metadata error")
-                .kind(),
-            std::io::ErrorKind::NotFound
+                .expect("symlink refusal")
+                .raw_os_error(),
+            Some(nix::libc::ELOOP)
         );
         std::fs::remove_file(&script).expect("retire dangling link");
         std::fs::write(&script, [0xff, 0xfe]).expect("non-UTF8 shell contents");
