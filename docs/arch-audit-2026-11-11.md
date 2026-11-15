@@ -2135,3 +2135,40 @@ encoding; their exact original UTF-8 bytes were restored before final tests.
 No Rust source or native build settings changed in this slice. The active hosted
 runs at `34688b17` must finish before publishing another head; fresh complete
 immutable-base acceptance remains required for the index too.
+
+### Windows continuation: update repository origins before mutation
+
+The complete hosted comparison at `34688b17` cleared the warning ownership,
+guarded async helper and candidate-deferral repairs. Its coverage producer
+passed. Comparison then refused the unexecuted AUR origin at `service.rs:79`.
+The sealed comparison bundle has SHA-256
+`270aeea6066282fe8e4572f35ecac58c0e33c26f613c404c9ab52c2884186f2d`
+and binds the original `f2413f80` base to that exact head.
+
+A new public `PackageService::update` test uses the existing isolated mock
+backend and an injected source that records candidate subjects but returns a
+missing assessment inventory. Seven cases preserve lowercase/mixed-case AUR,
+empty Arch/Debian origins, exact declared Arch repository coordinates,
+case-distinct other repositories and ordinary distribution packages. Each
+update must refuse the missing assessment, preserve candidate name/version,
+and leave the installed version unchanged. No native transaction is invoked.
+
+Making the AUR comparison case sensitive and removing the missing-origin guard
+each fail the final test. The restored production bytes pass all seven cases.
+An earlier six-case table missed the empty Debian fallback; its ineffective
+mutation exposed that gap, and the final table includes it. The first build also
+caught a fixture trait error type and typed-version assertion mismatch; both
+were corrected before accepted execution. Production code is unchanged.
+Fresh isolated profiles cover all nine mapped origin-helper rows and all 91
+mapped new-test rows. Final unit binary SHA-256 is
+`818cc23cbe724cac8f83e028d0870436c647bd2a70532d8995847aef6d69682a`.
+This is local instrumented unit evidence, not a release or native transaction.
+
+Arch all-target Clippy passes with warnings denied and actual source checking;
+formatting and diff checks pass. The native wave was admitted with a 26 GiB
+target growth budget and 3 GiB forecast, preserving two workers, existing debug
+settings, coverage instrumentation and the 20 GiB backing-volume reserve.
+After Clippy, VHD file length was 35,882,270,720 bytes, guest use 33,046,446,080
+bytes and C: free space 605,352,214,528 bytes. No debug companions were retired.
+Fresh full hosted acceptance remains required for these changes and the method
+inventory index; later correspondence/work and release/VM/CVE obligations remain.
