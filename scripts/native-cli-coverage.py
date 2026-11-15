@@ -494,7 +494,7 @@ def fresh_admission_terminal(cli, arguments, environment, case, directory, state
             os.close(terminal)
 
 
-def run_fresh_admission_fixture(owner, cli, names=None):
+def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
     import pwd
     import signal
     import ssl
@@ -513,6 +513,11 @@ def run_fresh_admission_fixture(owner, cli, names=None):
     binary = cli.lstat()
     require(stat.S_ISREG(binary.st_mode) and binary.st_uid == 0 and not binary.st_mode & 0o022,
             'Root-controlled native CLI required')
+    if profiles is not None:
+        metadata = profiles.lstat()
+        require(profiles == Path('/profiles') and stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == 0 and stat.S_IMODE(metadata.st_mode) == 0o1777,
+                'Private guest coverage return directory required')
     selected = [case for case in FRESH_ADMISSION_CASES if names is None or case.name in names]
     require(selected and (names is None or set(names) == {case.name for case in selected}), 'Unknown fresh admission case')
     owner.mkdir(mode=0o700)
@@ -653,6 +658,8 @@ def run_fresh_admission_fixture(owner, cli, names=None):
             environment = dict(PATH='/usr/bin:/bin', LANG='C.UTF-8', HOME='/root', SUDO_USER='bench',
                 OMG_DISABLE_DAEMON='1', OMG_DISABLE_TELEMETRY='1', OMG_COLORS='never', RUST_LOG='warn',
                 SSL_CERT_FILE=str(ca), SSL_CERT_DIR=str(owner / 'empty-certs'))
+            if profiles is not None:
+                environment['LLVM_PROFILE_FILE'] = str(profiles / ('omg-extra-fresh-' + case.name + '-%p-%m.profraw'))
             row = dict(name=case.name, expected_commit=case.commits, status='FAIL')
             try:
                 if case.interaction == 'noninteractive':
@@ -692,7 +699,8 @@ def run_fresh_admission_fixture(owner, cli, names=None):
                 require(not (fixture / 'db/db.lck').exists(), 'Native admission left its transaction lock')
                 if case.interaction == 'timeout':
                     require(result['elapsed_seconds'] >= 59, 'Native acknowledgement timed out prematurely')
-                row.update(status='PASS', database_before=before, database_after=after)
+                row.update(status='PASS', database_before=before, database_after=after,
+                           payload_before=payload_before, payload_after=payload_after)
             except Exception as error:
                 row['failure'] = str(error)
             finally:
@@ -710,11 +718,66 @@ def run_fresh_admission_fixture(owner, cli, names=None):
     unchanged = fixture_tree_hashes(Path('/var/lib/pacman/local')) == real_database
     result = dict(status='PASS' if unchanged and all(row['status'] == 'PASS' for row in results) else 'FAIL',
         cli_sha256=sha(cli), selected=[case.name for case in selected], cases=results,
+        profile_stages=['fresh-' + case.name for case in selected] if profiles is not None else [],
         real_guest_database_unchanged=unchanged,
         complete_matrix=len(selected) == len(FRESH_ADMISSION_CASES), coverage_acceptance=False)
     (owner / 'receipt.json').write_text(json.dumps(result, indent=2) + '\n')
     require(result['status'] == 'PASS', 'Native fresh admission matrix failed; inspect per-case receipts')
     return result
+
+
+def validate_fresh_admission(value, cli_sha256):
+    require(type(value) is dict and set(value) == {'status', 'cli_sha256', 'selected', 'cases',
+            'profile_stages', 'real_guest_database_unchanged', 'complete_matrix', 'coverage_acceptance'},
+            'Unexpected native admission receipt schema')
+    names = [case.name for case in FRESH_ADMISSION_CASES]
+    require(value['status'] == 'PASS' and value['cli_sha256'] == cli_sha256
+            and value['selected'] == names and value['complete_matrix'] is True
+            and value['real_guest_database_unchanged'] is True and value['coverage_acceptance'] is False,
+            'Native admission source, complete matrix or package database proof differs')
+    require(value['profile_stages'] == ['fresh-' + name for name in names],
+            'Native admission profile inventory differs')
+    rows = value['cases']
+    require(type(rows) is list and len(rows) == len(names), 'Native admission cases are incomplete')
+    for case, row in zip(FRESH_ADMISSION_CASES, rows, strict=True):
+        require(type(row) is dict and row.get('name') == case.name and row.get('status') == 'PASS'
+                and row.get('expected_commit') is case.commits
+                and type(row.get('exit_code')) is int and row['exit_code'] == (0 if case.commits else 1)
+                and row.get('stopped_signal') is None and row.get('transaction_lock_remains') is False
+                and row.get('server_errors') == [], 'Native admission failed or left a stopped transaction: ' + case.name)
+        prompt = case.interaction not in ('none', 'noninteractive')
+        require(row.get('prompt_seen') is prompt, 'Native attended admission was not exercised: ' + case.name)
+        output = row.get('output')
+        require(type(output) is str and len(output.encode()) <= 1024 * 1024
+                and case.diagnostic in output and (not prompt or 'applicability is UNKNOWN' in output),
+                'Native admission diagnostic differs: ' + case.name)
+        fetched = case.interaction == 'accept' or case.name.startswith('repository-')
+        requests = [dict(path='/v1/arch/advisories', prompt_seen=prompt)] if fetched else []
+        require(row.get('requests') == requests, 'Native admission fetch crossed the acknowledgement boundary: ' + case.name)
+        for key in ('database_before', 'database_after', 'payload_before', 'payload_after'):
+            tree = row.get(key)
+            require(type(tree) is dict and tree and all(type(name) is str and type(digest) is str
+                    and re.fullmatch(r'[a-f0-9]{64}', digest) for name, digest in tree.items()),
+                    'Native admission state fingerprint is missing: ' + case.name)
+        if not case.commits:
+            require(row['database_before'] == row['database_after']
+                    and row['payload_before'] == row['payload_after'],
+                    'Refused native admission changed package state: ' + case.name)
+        else:
+            repository = case.name.startswith('repository-')
+            package = 'omg-coverage-app-3-1' if repository else 'omg-fresh-archive-1-1'
+            path = 'usr/share/omg-coverage/omg-coverage-app.txt' if repository else 'usr/share/omg-fresh-archive.txt'
+            payload = b'omg-coverage-app: upgraded3\n' if repository else b'approved inert archive\n'
+            require(package + '/desc' in row['database_after'] and row['database_before'] != row['database_after']
+                    and row['payload_after'].get(path) == hashlib.sha256(payload).hexdigest(),
+                    'Native admission did not commit the approved package bytes: ' + case.name)
+        if case.interaction == 'foreground-loss':
+            require(row.get('foreground_moved') is True, 'Native foreground-loss control was not exercised')
+        if case.interaction == 'timeout':
+            elapsed = row.get('elapsed_seconds')
+            require(type(elapsed) in (int, float) and 59 <= elapsed <= 75,
+                    'Native admission did not exercise the real timeout')
+    return rows
 
 
 def verify_signed_fixture(owner, phase='complete'):
@@ -954,8 +1017,9 @@ OMARCHY_CASES = {
 }
 
 ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
+FRESH_ADMISSION_STAGES = tuple('fresh-' + case.name for case in FRESH_ADMISSION_CASES)
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'cli-fresh-mock-refused', 'cli-elevation-denied', 'cli-authorization-denied',
-                  'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES)
+                  'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES, *FRESH_ADMISSION_STAGES)
 STAGES = tuple('registry-' + role for role in HARNESSES) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
 
@@ -1698,6 +1762,16 @@ ordinary env LLVM_PROFILE_FILE='/profiles/omg-extra-daemon-%p-%m.profraw' RUST_L
   ' > /evidence/cli/daemon.log 2>&1
 printf 'daemon\t0\n' >> /evidence/cli/process-checks.tsv
 OMARCHY_CASE_BODY
+python3 /native-cli-coverage.py fresh-admission-fixture --owner /opt/omg-coverage-fresh-ci \
+  --cli /omg-extra-bin/cli --profiles /profiles > /evidence/cli/fresh-admission.json
+python3 - <<'OMG_FRESH_STAGE_RECEIPTS'
+import json
+from pathlib import Path
+value = json.loads(Path('/evidence/cli/fresh-admission.json').read_text())
+with Path('/evidence/cli/process-checks.tsv').open('a') as stream:
+    for stage in value['profile_stages']:
+        stream.write(stage + '\t0\n')
+OMG_FRESH_STAGE_RECEIPTS
 OMG_EXTRA_NAMESPACE
 fingerprint_db > /evidence/cli/db-after.txt
 cmp /evidence/cli/db-before.txt /evidence/cli/db-after.txt
@@ -1968,10 +2042,16 @@ def validate_evidence(evidence, profiles, artifacts, commit):
     for path in evidence.rglob('*'):
         if path.is_file():
             require(not re.search(rb'LLVM Profile (Error|Warning)', path.read_bytes()), 'LLVM runtime diagnostic in evidence')
+    fresh_receipt = evidence / 'fresh-admission.json'
+    require(fresh_receipt.is_file(), 'Native admission receipt is missing')
+    fresh = validate_fresh_admission(json.loads(fresh_receipt.read_text()), artifacts['cli']['sha256'])
+    for stage in FRESH_ADMISSION_STAGES:
+        require({PROFILE.fullmatch(path.name)[3] for path in grouped[stage]} == cli_modules,
+                'Native admission profiles do not match the actual CLI: ' + stage)
     ET.ElementTree(suite).write(evidence / 'tests.xml', encoding='unicode', xml_declaration=True)
     selected = sorted(path for paths in grouped.values() for path in paths)
     (evidence / 'verification.json').write_text(json.dumps(dict(source_commit=commit, tests=tests,
-        process_checks=list(PROCESS_STAGES), artifacts=artifacts,
+        process_checks=list(PROCESS_STAGES), artifacts=artifacts, fresh_admission=fresh,
         profiles=[dict(name=p.name, bytes=p.stat().st_size, sha256=sha(p)) for p in selected]), indent=2) + '\n')
     return selected
 
@@ -2063,6 +2143,7 @@ def main():
     fresh = commands.add_parser('fresh-admission-fixture')
     fresh.add_argument('--owner', required=True, type=Path)
     fresh.add_argument('--cli', required=True, type=Path)
+    fresh.add_argument('--profiles', type=Path)
     fresh.add_argument('--case', action='append', choices=tuple(case.name for case in FRESH_ADMISSION_CASES))
     signed_check = commands.add_parser('verify-signed-fixture')
     signed_check.add_argument('--owner', required=True, type=Path)
@@ -2095,7 +2176,7 @@ def main():
     elif args.operation == 'signed-fixture':
         create_signed_fixture(args.owner, args.current_kernel)
     elif args.operation == 'fresh-admission-fixture':
-        print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case)))
+        print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles)))
     elif args.operation == 'verify-signed-fixture':
         print(json.dumps(verify_signed_fixture(args.owner, args.phase)))
     elif args.operation == 'verify-machine-identity-fixture':

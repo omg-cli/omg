@@ -690,6 +690,37 @@ with socket.socket(socket.AF_UNIX) as server:
         self.assertNotIn('systemd-detect-virt', script)
 
 
+def fresh_admission_receipt():
+    rows = []
+    for case in PRODUCER.FRESH_ADMISSION_CASES:
+        prompt = case.interaction not in ('none', 'noninteractive')
+        fetched = case.interaction == 'accept' or case.name.startswith('repository-')
+        before = {'installed-1-1/desc': 'd' * 64}
+        after = dict(before)
+        payload = {'usr/share/installed.txt': 'e' * 64}
+        changed = dict(payload)
+        if case.commits:
+            if case.name.startswith('repository-'):
+                after['omg-coverage-app-3-1/desc'] = 'f' * 64
+                changed['usr/share/omg-coverage/omg-coverage-app.txt'] = hashlib.sha256(
+                    b'omg-coverage-app: upgraded3\n').hexdigest()
+            else:
+                after['omg-fresh-archive-1-1/desc'] = 'f' * 64
+                changed['usr/share/omg-fresh-archive.txt'] = hashlib.sha256(b'approved inert archive\n').hexdigest()
+        rows.append(dict(name=case.name, expected_commit=case.commits, status='PASS',
+            exit_code=0 if case.commits else 1, stopped_signal=None, transaction_lock_remains=False,
+            prompt_seen=prompt, foreground_moved=case.interaction == 'foreground-loss',
+            elapsed_seconds=60 if case.interaction == 'timeout' else 1,
+            output=('Arch advisory applicability is UNKNOWN\n' if prompt else '') + case.diagnostic,
+            requests=[dict(path='/v1/arch/advisories', prompt_seen=prompt)] if fetched else [],
+            server_errors=[], database_before=before, database_after=after,
+            payload_before=payload, payload_after=changed))
+    return dict(status='PASS', cli_sha256='a' * 64, cases=rows,
+        selected=[row['name'] for row in rows], complete_matrix=True,
+        profile_stages=['fresh-' + row['name'] for row in rows],
+        real_guest_database_unchanged=True, coverage_acceptance=False)
+
+
 def evidence_fixture(root):
     evidence, profiles = root / 'evidence', root / 'profiles'
     evidence.mkdir()
@@ -697,6 +728,7 @@ def evidence_fixture(root):
     artifacts = {role: dict(path='/build/' + role, sha256='a' * 64, bytes=16)
                  for role in PRODUCER.ROLES}
     (evidence / 'all-stages-pass.txt').write_text('PASS\n')
+    (evidence / 'fresh-admission.json').write_text(json.dumps(fresh_admission_receipt()))
     rows = ['\t'.join(row) for row in PRODUCER.CASES]
     (evidence / 'expected-tests.tsv').write_text('\n'.join(rows) + '\n')
     (evidence / 'passed.tsv').write_text('\n'.join(row + '\tPASS' for row in rows) + '\n')
@@ -1062,7 +1094,8 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 18)
-            self.assertEqual(len(receipt['process_checks']), 39)
+            self.assertEqual(len(receipt['process_checks']), 59)
+            self.assertEqual(len(receipt['fresh_admission']), 20)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -1085,6 +1118,10 @@ class SupplementalEvidence(unittest.TestCase):
             'no-daemon-cleanup': lambda e, p: (e / 'daemon.log').write_text('[extra-daemon] startup_socket=ready uid=65534'),
             'duplicate-result': lambda e, p: (e / 'passed.tsv').write_text((e / 'passed.tsv').read_text() * 2),
             'missing-process': lambda e, p: (e / 'process-checks.tsv').write_text('cli-q\t0\n'),
+            'fresh-missing-receipt': lambda e, p: (e / 'fresh-admission.json').unlink(),
+            'fresh-incomplete-receipt': lambda e, p: (e / 'fresh-admission.json').write_text('{}'),
+            'fresh-wrong-cli-profile': lambda e, p: (p / 'omg-extra-fresh-archive-accept-123-100_0.profraw').rename(
+                p / 'omg-extra-fresh-archive-accept-123-200_0.profraw'),
             'wrong-artifact': lambda e, p: (e / 'artifacts.sha256').write_text('different'),
             'llvm-warning': lambda e, p: (e / 'cli-q.log').write_text('LLVM Profile Warning: write failed'),
             'omarchy-failed-status': lambda e, p: (e / 'omarchy-success-exit.txt').write_text('1\n'),
@@ -1192,6 +1229,46 @@ class ArtifactAdmission(unittest.TestCase):
 
 
 class FreshAdmissionFixture(unittest.TestCase):
+    def test_generated_guest_program_requires_all_native_admission_profiles(self):
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
+        self.assertIn('fresh-admission-fixture --owner /opt/omg-coverage-fresh-ci', script)
+        self.assertIn('--cli /omg-extra-bin/cli --profiles /profiles', script)
+        for case in PRODUCER.FRESH_ADMISSION_CASES:
+            self.assertIn('fresh-' + case.name, PRODUCER.PROCESS_STAGES)
+
+    def test_native_admission_evidence_requires_matching_cli_and_complete_behavior(self):
+        value = fresh_admission_receipt()
+        PRODUCER.validate_fresh_admission(value, 'a' * 64)
+        mutations = {
+            'missing-case': lambda r: r['cases'].pop(),
+            'reordered-case': lambda r: r['cases'].reverse(),
+            'partial': lambda r: r.update(complete_matrix=False),
+            'foreign-cli': lambda r: r.update(cli_sha256='b' * 64),
+            'database-changed': lambda r: r.update(real_guest_database_unchanged=False),
+            'missing-profile': lambda r: r['profile_stages'].pop(),
+            'stopped': lambda r: r['cases'][7].update(stopped_signal=21),
+            'held-lock': lambda r: r['cases'][7].update(transaction_lock_remains=True),
+            'panic': lambda r: r['cases'][1].update(exit_code=101),
+            'no-prompt': lambda r: r['cases'][0].update(prompt_seen=False),
+            'wrong-refusal': lambda r: r['cases'][1].update(output='unrelated error'),
+            'empty-database': lambda r: r['cases'][1].update(database_before={}, database_after={}),
+            'refusal-mutated-payload': lambda r: r['cases'][1]['payload_after'].update(escape='c' * 64),
+            'background-not-exercised': lambda r: r['cases'][7].update(foreground_moved=False),
+            'short-timeout': lambda r: r['cases'][9].update(elapsed_seconds=1),
+            'server-error': lambda r: r['cases'][0].update(server_errors=['failure']),
+            'early-fetch': lambda r: r['cases'][0]['requests'][0].update(prompt_seen=False),
+            'missing-fetch': lambda r: r['cases'][0].update(requests=[]),
+            'wrong-committed-bytes': lambda r: r['cases'][0]['payload_after'].update(
+                {'usr/share/omg-fresh-archive.txt': 'c' * 64}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                value = fresh_admission_receipt()
+                mutate(value)
+                with self.assertRaises(ValueError):
+                    PRODUCER.validate_fresh_admission(value, 'a' * 64)
+
     def test_matrix_covers_attended_refusal_and_precommit_authority_changes(self):
         cases = PRODUCER.FRESH_ADMISSION_CASES
         by_name = {case.name: case for case in cases}
