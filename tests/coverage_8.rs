@@ -495,6 +495,7 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
                         daemon.socket_path.to_str().expect("UTF-8 fixture path"),
                     ),
                     ("OMG_COLORS", colors),
+                    ("RUST_LOG", if colors == "always" { "warn" } else { "off" }),
                     (
                         "OMG_PACMAN_CONF",
                         missing_conf.to_str().expect("UTF-8 fixture path"),
@@ -522,6 +523,13 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
             if case == "false-clean" {
                 assert!(result.stderr.contains("mismatch"), "{result:?}");
             } else if case == "legacy-unreported" {
+                assert_eq!(
+                    result
+                        .stderr
+                        .contains("Daemon audit omitted coverage; using the native audit instead"),
+                    colors == "always",
+                    "explicit logging mode must control fallback diagnostics: {result:?}"
+                );
                 assert!(
                     !result.stderr.is_empty(),
                     "missing native evidence must explain the refusal"
