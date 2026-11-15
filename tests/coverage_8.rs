@@ -458,6 +458,7 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
             "partial",
             "false-clean",
             "legacy-unreported",
+            "daemon-unavailable",
         ] {
             let partial = case == "partial";
             let has_findings = matches!(case, "findings" | "fail-on-findings" | "false-clean");
@@ -481,6 +482,12 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
             }));
             let project = TestProject::new();
             let missing_conf = project.pacman_root.path().join("missing-pacman.conf");
+            let missing_socket = project.path().join("missing.sock");
+            let socket = if case == "daemon-unavailable" {
+                &missing_socket
+            } else {
+                &daemon.socket_path
+            };
             let mut args = vec!["audit", "scan"];
             if case == "fail-on-findings" {
                 args.push("--fail-on-findings");
@@ -492,7 +499,7 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
                     ("OMG_DISABLE_DAEMON", "0"),
                     (
                         "OMG_SOCKET_PATH",
-                        daemon.socket_path.to_str().expect("UTF-8 fixture path"),
+                        socket.to_str().expect("UTF-8 fixture path"),
                     ),
                     ("OMG_COLORS", colors),
                     ("RUST_LOG", if colors == "always" { "warn" } else { "off" }),
@@ -505,13 +512,17 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
             // Wake the private accept loop if the CLI failed before connecting.
             drop(std::os::unix::net::UnixStream::connect(&daemon.socket_path));
             let requests = daemon.take_requests();
-            assert_eq!(requests.len(), 1, "case={case}: {result:?}");
+            assert_eq!(
+                requests.len(),
+                usize::from(case != "daemon-unavailable"),
+                "case={case}: {result:?}"
+            );
             let text = console::strip_ansi_codes(&result.stdout);
             assert_eq!(
                 result.success,
                 !matches!(
                     case,
-                    "fail-on-findings" | "false-clean" | "legacy-unreported"
+                    "fail-on-findings" | "false-clean" | "legacy-unreported" | "daemon-unavailable"
                 ),
                 "case={case}: {result:?}"
             );
@@ -522,12 +533,12 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
             );
             if case == "false-clean" {
                 assert!(result.stderr.contains("mismatch"), "{result:?}");
-            } else if case == "legacy-unreported" {
+            } else if matches!(case, "legacy-unreported" | "daemon-unavailable") {
                 assert_eq!(
                     result
                         .stderr
                         .contains("Daemon audit omitted coverage; using the native audit instead"),
-                    colors == "always",
+                    case == "legacy-unreported" && colors == "always",
                     "explicit logging mode must control fallback diagnostics: {result:?}"
                 );
                 assert!(
