@@ -1809,7 +1809,8 @@ mod tests {
                     vulnerabilities: Vec::new(),
                 },
                 true,
-            )?;
+            )
+            .expect("zero findings must succeed for every advisory coverage scope");
         }
         let finding =
             |id: &str, score: Option<&str>, advisory_severity, applicability| Vulnerability {
