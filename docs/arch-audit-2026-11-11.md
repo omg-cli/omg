@@ -2203,3 +2203,51 @@ bytes, guest use 34,706,935,808 bytes and C: free space 602,907,217,920 bytes.
 Current debug companions remain preserved. A fresh full hosted comparison must
 still judge this test addition; later correspondence/work, release/VM/performance,
 independent security review and private CVE archive completeness remain open.
+
+### Windows continuation: install provenance and normal-success controls
+
+The hosted producer at `883532e7` passed. Its complete immutable-base comparison
+cleared the official install check and next refused `service.rs:179`, the AUR
+candidate assessment. Artifact 14184608427 has SHA-256
+`8d4b919a84e1f738f9d57f6f9704a177b05b55347a80cc2958d19e55b2cb4ceb`
+and binds original `f2413f80` to that head. All other workflows, including CI,
+completed successfully.
+
+The service tests now cover AUR assessment and explicit AUR denial using a fresh
+private metadata snapshot. They reuse the metadata publisher, process-isolation
+helper and existing UID 65534 receiver; no endpoint override or test API was
+added. Missing assessments and disabled AUR must stop before backend mutation or
+new build storage. Another test configures AUR provenance inside the existing
+mock's own test module and requires the generic service path to retain its AUR
+policy. Debian candidates retain their Verified source grade. The official
+fixture also checks successful installation after the ban is removed.
+
+Three provenance faults fail for the intended reasons: misclassifying the AUR
+snapshot as Unknown, dropping a generic backend's AUR origin, and downgrading a
+distribution candidate. The AUR fault was repeated after fixture setup checks
+were made explicit. The initial intact AUR test passed, but its private proof
+wrapper expected output that the isolation helper suppresses on success; actual
+root/root/65534 profile ownership and the existing child byte-identity check
+provide the witness instead. No isolation deadline was changed. Two cold setup
+error-return rows were replaced by explicit fatal setup checks, and Clippy's
+Duration-unit warning was fixed with `from_hours(1)`.
+
+All four final intact cases pass on binary SHA-256
+`8a63396dbaa876c4d4a2868e7e0da42f95453c127950ba7d510a29284b93c3cd`.
+Six fresh profiles share its module identity, including the UID 65534 receiver;
+no build or fault profiles are merged. All 200 mapped test-scope rows are
+positive, as are the 13 AUR admission rows and both generic origin rows that
+were cold in the planning report. Official admission and backend-install rows
+are positive too. These are instrumented unit/mock and local-metadata results,
+not actual AUR builds, native installs or permission-boundary acceptance.
+
+All-target Arch Clippy passes with warnings denied and actual source checking;
+formatting and diff checks pass. Both production prefixes are byte-for-byte
+unchanged. This wave was admitted with a 32 GiB target growth allowance and
+4 GiB forecast; subsequent fixture-only checks used fresh remaining-work
+forecasts within that allowance. Two workers, existing debug/split-debug,
+incremental and coverage settings, and the 20 GiB C: reserve were preserved.
+After final Clippy, VHD file length was 42,119,200,768 bytes, guest use
+38,366,736,384 bytes and C: free space 599,646,052,352 bytes. Current debug
+companions remain preserved. Fresh complete hosted coverage, later source/work
+obligations and the broader release/VM/performance/CVE acceptance remain open.
