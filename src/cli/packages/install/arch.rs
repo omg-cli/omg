@@ -893,13 +893,10 @@ mod tests {
                     Some("MIT"),
                 ))
                 .expect_err("mock backend cannot own fresh native admission");
-            assert!(
-                matches!(
-                    error.downcast_ref::<PolicyError>(),
-                    Some(PolicyError::PreparedAdmissionRequired)
-                ),
-                "{error:#}"
-            );
+            let error = error
+                .downcast::<PolicyError>()
+                .expect("native admission refusal must retain its policy error type");
+            assert!(matches!(error, PolicyError::PreparedAdmissionRequired));
             assert_eq!(
                 scanner.calls.load(std::sync::atomic::Ordering::SeqCst),
                 0,

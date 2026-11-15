@@ -273,27 +273,74 @@ class SourceAwareCoverageTests(unittest.TestCase):
 
     def test_trait_closure_paths_rebase_backreferences_and_preserve_crate_copies(self):
         parent = '_RNvXNtNtNtNtNtCs40j12eeWnis_7omg_lib3cli8packages7install4arch5testsNtB2_13FixtureSourceNtNtNtNtBc_4core8security13vulnerability19VulnerabilitySource12scan_package'
-        path = coverage.trait_method_path(parent)
+        path = coverage.nominal_method_path(parent)
         for prefix, self_ref, trait_ref, suffix, depth in (
                 ('_RNC', 'B4_', 'Be_', '0Be_', 1),
                 ('_RNCNC', 'B6_', 'Bg_', '00Bg_', 2)):
             raw = prefix + parent[2:].replace('B2_', self_ref).replace('Bc_', trait_ref) + suffix
-            child = coverage.trait_method_path(raw)
+            child = coverage.nominal_method_path(raw)
             self.assertIsNotNone(child)
             self.assertEqual(child.copy_identity, path.copy_identity)
             self.assertEqual(child.callbacks, ('',) * depth)
-            other = coverage.trait_method_path(raw.replace('s40j12eeWnis_', 's99_'))
+            other = coverage.nominal_method_path(raw.replace('s40j12eeWnis_', 's99_'))
             self.assertNotEqual(other.copy_identity, path.copy_identity)
-            self.assertIsNone(coverage.trait_method_parent(raw))
-            self.assertIsNone(coverage.trait_method_path(raw.replace(self_ref, 'B2_')))
+            self.assertIsNone(coverage.nominal_method_parent(raw))
+            self.assertIsNone(coverage.nominal_method_path(raw.replace(self_ref, 'B2_')))
 
-    def migrated_trait_compare(self, mutation=None, callback=False):
+    def test_default_trait_methods_preserve_nominal_and_instantiating_crate_identity(self):
+        symbols = [
+            ('_RNvYNtNtNtCsaJq9CMLDmry_7omg_lib16package_managers4mock18MockPackageManagerNtNtB6_6traits14PackageManager18security_inventoryB8_',
+             '_RNCNvYNtNtNtCsaJq9CMLDmry_7omg_lib16package_managers4mock18MockPackageManagerNtNtB8_6traits14PackageManager18security_inventory0Ba_'),
+            ('_RNvYNtNtNtCs4c7pFuLdASW_21daemon_security_tests6common5mocks18MockPackageManagerNtNtNtCsaJq9CMLDmry_7omg_lib16package_managers6traits14PackageManager18security_inventoryB8_',
+             '_RNCNvYNtNtNtCs4c7pFuLdASW_21daemon_security_tests6common5mocks18MockPackageManagerNtNtNtCsaJq9CMLDmry_7omg_lib16package_managers6traits14PackageManager18security_inventory0Ba_'),
+        ]
+        for parent, child in symbols:
+            with self.subTest(symbol=parent):
+                decoded = coverage.nominal_method_path(parent)
+                self.assertIsNotNone(decoded, 'valid compiler-emitted default trait method was refused')
+                nested = coverage.nominal_method_path(child)
+                self.assertIsNotNone(nested)
+                self.assertEqual(decoded.method, ('security_inventory', ''))
+                self.assertEqual(decoded.callbacks, ())
+                self.assertEqual(nested.callbacks, ('',))
+                self.assertEqual(nested.copy_identity, decoded.copy_identity)
+                self.assertNotEqual(coverage.nominal_method_path(child.replace('CsaJq9CMLDmry_', 'Cs99_')).copy_identity,
+                                    decoded.copy_identity)
+                self.assertIsNone(coverage.nominal_method_path(parent + '.llvm.1'))
+                self.assertIsNone(coverage.nominal_method_path(child.replace('Ba_', 'B2_')))
+        foreign = symbols[1][1]
+        self.assertIsNotNone(coverage.nominal_method_path(foreign))
+        self.assertNotEqual(coverage.nominal_method_path(foreign.replace('Cs4c7pFuLdASW_', 'Cs98_')).copy_identity,
+                            coverage.nominal_method_path(foreign).copy_identity)
+
+    def test_inherent_method_callbacks_preserve_impl_and_crate_scope(self):
+        parent = '_RNvMs0_NtNtNtCsbXaNnEHeRiG_7omg_lib4core8security4scanNtB5_19SecurityAuditResult15validate_counts'
+        child = '_RNCNvMs0_NtNtNtCsbXaNnEHeRiG_7omg_lib4core8security4scanNtB7_19SecurityAuditResult15validate_countss_0Bd_'
+        decoded = coverage.nominal_method_path(parent)
+        self.assertIsNotNone(decoded, 'valid compiler-emitted inherent method was refused')
+        nested = coverage.nominal_method_path(child)
+        self.assertIsNotNone(nested)
+        self.assertEqual(decoded.copy_identity, nested.copy_identity)
+        self.assertEqual(nested.callbacks, ('s_',))
+        self.assertNotEqual(coverage.nominal_method_path(child.replace('Ms0_', 'Ms1_')).copy_identity,
+                            decoded.copy_identity)
+
+    def migrated_trait_compare(self, mutation=None, callback=False, method_kind='X'):
         old = b"impl Source for FixtureSource {\n    fn scan_package<'a>(\n        &'a self,\n        name: &'a str,\n    ) -> Result<Value> {\n        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n        old_step();\n    }\n}\n"
+        if method_kind == 'M':
+            old = old.replace(b'impl Source for FixtureSource {', b'impl FixtureSource {')
+        elif method_kind == 'Y':
+            old = old.replace(b'impl Source for FixtureSource {', b'trait Source {')
         if callback:
             old = old.replace(b'        old_step();', b'        Box::pin(async move {\n            old_step();\n        })')
         new = old.replace(b'scan_package', b'assess_packages').replace(
             b"name: &'a str", b"packages: &'a [Package]").replace(b'Result<Value>', b'Result<Assessment>').replace(b'old_step()', b'new_step()')
         original = '_RNvXNtNtNtNtNtCs40j12eeWnis_7omg_lib3cli8packages7install4arch5testsNtB2_13FixtureSourceNtNtNtNtBc_4core8security13vulnerability19VulnerabilitySource12scan_package'
+        crate = 'Cs40j12eeWnis_7omg_lib'
+        if method_kind == 'M':
+            original = '_RNvM' + crate + 'Nt' + crate + '13FixtureSource12scan_package'
+        elif method_kind == 'Y':
+            original = '_RNvYNt' + crate + '13FixtureSourceNt' + crate + '6Source12scan_package' + crate
         current = original.replace('s40j12eeWnis_', 'sjVdvAHsNP8N_').replace('12scan_package', '15assess_packages')
         def owners(base, head):
             for document, source, symbol in ((base, old, original), (head, new, current)):
@@ -306,7 +353,13 @@ class SourceAwareCoverageTests(unittest.TestCase):
                           for line in ([6, 7, end] if callback else range(6, end + 1))]])]
                 if callback:
                     rebased = symbol[2:].replace('B2_', 'B4_').replace('Bc_', 'Be_')
-                    document['data'][0]['functions'].append(dict(name='_RNC' + rebased + '0Be_',
+                    child = '_RNC' + rebased + '0Be_'
+                    if method_kind == 'M':
+                        child = '_RNC' + symbol[2:] + '0'
+                    elif method_kind == 'Y':
+                        root = crate if symbol == original else crate.replace('s40j12eeWnis_', 'sjVdvAHsNP8N_')
+                        child = '_RNC' + symbol[2:-len(root)] + '0' + root
+                    document['data'][0]['functions'].append(dict(name=child,
                         count=1, filenames=['/src/example.rs'], regions=[
                             [7, lines[6].index('{') + 1, 9, 10, 1, 0, 0, 0],
                             [8, 13, 8, len(lines[7]) + 1, 1, 0, 0, 0]]))
@@ -328,6 +381,69 @@ class SourceAwareCoverageTests(unittest.TestCase):
                                                  'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
         proofs = receipt['retained_replacement_obligations']
         self.assertTrue(any(row.get('fully_covered_replacement_owners') for row in proofs))
+
+    def test_fully_covered_nominal_method_migrations_preserve_every_owner(self):
+        for kind in ('M', 'Y'):
+            with self.subTest(kind=kind):
+                receipt = self.migrated_trait_compare(callback=True, method_kind=kind)
+                self.assertTrue(any(row.get('fully_covered_replacement_owners')
+                                    for row in receipt['retained_replacement_obligations']))
+                self.assertEqual(receipt['deleted_mapped'], 0)
+                self.assertEqual(receipt['deleted_summary_found'], 0)
+
+    def test_nominal_method_migration_cannot_borrow_coverage_from_another_copy(self):
+        def mutate(base, head, mode):
+            child = head['data'][0]['functions'][1]
+            if mode == 'cold-entry':
+                child['count'] = 0
+            elif mode == 'cold-region':
+                child['regions'][1][4] = 0
+            else:
+                child['name'] = child['name'].replace('sjVdvAHsNP8N_', 's99_')
+        for kind in ('M', 'Y'):
+            for mode in ('cold-entry', 'cold-region', 'foreign-copy'):
+                with self.subTest(kind=kind, mode=mode), self.assertRaises(ValueError):
+                    self.migrated_trait_compare(callback=True, method_kind=kind,
+                        mutation=lambda base, head: mutate(base, head, mode))
+
+    def test_nominal_migration_keeps_multiple_compiled_copy_states_separate(self):
+        def copies(base, head, cold):
+            for document in (base, head):
+                duplicates = copy.deepcopy(document['data'][0]['functions'])
+                for owner in duplicates:
+                    owner['name'] = re.sub(r'Cs(?:40j12eeWnis|jVdvAHsNP8N)_', 'Cs88_', owner['name'])
+                if cold and document is head:
+                    duplicates[1]['count'] = 0
+                    for region in duplicates[1]['regions']:
+                        region[4] = 0
+                document['data'][0]['functions'].extend(duplicates)
+        for kind in ('M', 'Y'):
+            with self.subTest(kind=kind):
+                receipt = self.migrated_trait_compare(callback=True, method_kind=kind,
+                    mutation=lambda base, head: copies(base, head, False))
+                proof = next(row for row in receipt['retained_replacement_obligations']
+                             if row.get('fully_covered_replacement_owners'))
+                self.assertEqual([len(side) for side in proof['fully_covered_replacement_owners']], [4, 4])
+                with self.assertRaises(ValueError):
+                    self.migrated_trait_compare(callback=True, method_kind=kind,
+                        mutation=lambda base, head: copies(base, head, True))
+
+    def test_nominal_decoder_refuses_unsupported_or_ambiguous_paths(self):
+        original = '_RNvYNtNtNtCs4c7pFuLdASW_21daemon_security_tests6common5mocks18MockPackageManagerNtNtNtCsaJq9CMLDmry_7omg_lib16package_managers6traits14PackageManager18security_inventoryB8_'
+        for invalid in (original + '.llvm.1', original + 'junk', original[:-1],
+                        original.replace('B8_', 'Bz_'), original.replace('B8_', 'B1_'),
+                        original.replace('B8_', 'NtB8_6nested'),
+                        original.replace('_RNvY', '_RNvI'),
+                        original.replace('CsaJq9CMLDmry_7omg_lib', 'Cs99_21daemon_security_tests'),
+                        original.replace('Y', 'Y' + 'Nt' * 17, 1)):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(coverage.nominal_method_path(invalid))
+        first = coverage.nominal_method_path(original)
+        self.assertIsNotNone(first)
+        other = coverage.nominal_method_path(original[:-3] + 'C5other')
+        self.assertIsNotNone(other)
+        self.assertNotEqual(first.copy_identity, other.copy_identity)
+        self.assertEqual(first.parent_scope, other.parent_scope)
 
     def test_trait_async_proof_refuses_incomplete_cold_or_foreign_owner_trees(self):
         def mutate(base, head, mode):

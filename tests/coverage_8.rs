@@ -457,16 +457,17 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
             "empty",
             "partial",
             "false-clean",
+            "legacy-unreported",
         ] {
             let partial = case == "partial";
             let has_findings = matches!(case, "findings" | "fail-on-findings" | "false-clean");
             let audit: SecurityAuditResult = serde_json::from_value(serde_json::json!({
-                "coverage": { "status":"reported", "assessed":[], "sources":[],
+                "coverage": if case == "legacy-unreported" { serde_json::json!({"status":"unreported"}) } else { serde_json::json!({ "status":"reported", "assessed":[], "sources":[],
                     "unassessed": if partial { serde_json::json!([{
                         "package":{"name":"custom","version":"1-1","architecture":null},
                         "reason":omg_lib::core::security::vulnerability::UnknownCoverage::OriginUnestablished
                     }]) } else { serde_json::json!([]) }
-                },
+                }) },
                 "total_vulnerabilities": if has_findings && case != "false-clean" {3} else {0},
                 "high_severity": if has_findings && case != "false-clean" {2} else {0},
                 "vulnerabilities": if has_findings {findings.clone()} else {serde_json::json!([])}
@@ -479,6 +480,7 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
                 ))
             }));
             let project = TestProject::new();
+            let missing_conf = project.pacman_root.path().join("missing-pacman.conf");
             let mut args = vec!["audit", "scan"];
             if case == "fail-on-findings" {
                 args.push("--fail-on-findings");
@@ -493,6 +495,10 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
                         daemon.socket_path.to_str().expect("UTF-8 fixture path"),
                     ),
                     ("OMG_COLORS", colors),
+                    (
+                        "OMG_PACMAN_CONF",
+                        missing_conf.to_str().expect("UTF-8 fixture path"),
+                    ),
                 ],
             );
             // Wake the private accept loop if the CLI failed before connecting.
@@ -502,7 +508,10 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
             let text = console::strip_ansi_codes(&result.stdout);
             assert_eq!(
                 result.success,
-                !matches!(case, "fail-on-findings" | "false-clean"),
+                !matches!(
+                    case,
+                    "fail-on-findings" | "false-clean" | "legacy-unreported"
+                ),
                 "case={case}: {result:?}"
             );
             assert_eq!(
@@ -512,6 +521,15 @@ fn audit_scan_cli_reports_findings_and_refuses_false_clean_daemon_results() {
             );
             if case == "false-clean" {
                 assert!(result.stderr.contains("mismatch"), "{result:?}");
+            } else if case == "legacy-unreported" {
+                assert!(
+                    !result.stderr.is_empty(),
+                    "missing native evidence must explain the refusal"
+                );
+                assert!(
+                    !missing_conf.exists(),
+                    "read-only fallback must preserve the missing configuration"
+                );
             } else if has_findings {
                 assert!(text.contains("Found 3 vulnerabilities (2 high severity)"));
                 assert!(text.contains("[Score: 9.8]"));

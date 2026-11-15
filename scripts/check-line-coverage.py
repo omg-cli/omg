@@ -1571,7 +1571,7 @@ def _construct_inventory(source, work):
         parent = code.parents[i]; first = beginning(i, parent); end = code.pairs[i]
         _construct_charge(work, i - first)
         prefix = code.words[first:i]
-        kind = next((word for word in ('fn', 'struct', 'enum', 'impl', 'mod', 'if', 'for', 'while', 'loop', 'match')
+        kind = next((word for word in ('fn', 'struct', 'enum', 'impl', 'trait', 'mod', 'if', 'for', 'while', 'loop', 'match')
                      if word in prefix), 'expression')
         row = dict(first=first, opening=i, end=end, kind=kind, header=tuple(prefix),
                    digest=digest(first, end), body=digest(i, end), supported='#' not in prefix)
@@ -1604,39 +1604,42 @@ def _construct_inventory(source, work):
 
 
 @dataclass(frozen=True)
-class RustTraitMethodPath:
+class RustNominalMethodPath:
     impl_scope: str
     namespace: tuple
     self_type: tuple
-    trait: tuple
+    trait: tuple | None
     method: tuple[str, str]
-    crate: tuple[str, str]
     callbacks: tuple[str, ...]
+    kind: str
+    crate_graph: tuple[tuple[str, str], ...]
+    instantiating_crate: tuple[str, str]
 
     @property
     def parent_scope(self):
-        return self.impl_scope, self.namespace, self.self_type, self.trait
+        return self.kind, self.impl_scope, self.namespace, self.self_type, self.trait
 
     @property
     def copy_identity(self):
-        return self.parent_scope, self.method, self.crate
+        return self.parent_scope, self.method, self.crate_graph, self.instantiating_crate
 
 
 @lru_cache(maxsize=4096)
-def trait_method_path(symbol, *, inventory=False):
-    """Decode only non-instantiated ASCII v0 trait methods within one crate.
+def nominal_method_path(symbol, *, inventory=False):
+    """Decode bounded nominal v0 inherent, trait-impl and default-trait methods.
 
-    Replacement identity omits the defining crate's disambiguator; callback
-    ownership retains it. Backreferences require a complete earlier path.
+    Replacement identity omits crate disambiguators; callback ownership retains
+    every crate copy and the instantiating crate. Backreferences require a complete earlier path.
     Inventory mode includes suffixes conservatively, never for execution proof.
     """
     if type(symbol) is not str or len(symbol) > 4096:
         return None
-    prefix = re.match(r'_R((?:NC){0,8})NvX', symbol)
+    prefix = re.match(r'_R((?:NC){0,8})Nv([MXY])', symbol)
     if prefix is None:
         return None
     depth = len(prefix[1]) // 2
-    at = prefix.end(); paths = {}; work = 256; crate = None
+    kind = prefix[2]
+    at = prefix.end(); paths = {}; work = 256; crate = None; crates = {}
     def disambiguator():
         nonlocal at
         match = re.match(r's[0-9A-Za-z]{0,32}_', symbol[at:])
@@ -1668,8 +1671,11 @@ def trait_method_path(symbol, *, inventory=False):
             value, scope = identifier()
             if crate is None:
                 crate = value, scope
-            elif crate != (value, scope):
+            elif kind != 'Y' and crate != (value, scope):
                 raise ValueError('external crate identity is unsupported')
+            if value in crates and crates[value] != scope:
+                raise ValueError('ambiguous nominal crate copy')
+            crates[value] = scope
             result = ('crate', value)
         elif tag == 'N' and symbol[at:at + 1] == 't':
             at += 1
@@ -1692,8 +1698,13 @@ def trait_method_path(symbol, *, inventory=False):
         paths[first] = result
         return result
     try:
-        impl_scope = disambiguator()
-        namespace = path(); self_type = path(); trait = path()
+        if kind == 'Y':
+            impl_scope = ''; namespace = ()
+            self_type = path(); trait = path()
+        else:
+            impl_scope = disambiguator()
+            namespace = path(); self_type = path()
+            trait = path() if kind == 'X' else None
         method, item_scope = identifier()
         callbacks = []
         for _ in range(depth):
@@ -1701,22 +1712,30 @@ def trait_method_path(symbol, *, inventory=False):
             if symbol[at:at + 1] != '0':
                 return None
             at += 1
-        if depth and symbol[at:at + 1] == 'B' and path() != ('crate', crate[0]):
+        instance = None
+        if (depth and symbol[at:at + 1] == 'B'
+                or kind == 'Y' and symbol[at:at + 1] in ('B', 'C')):
+            root = path()
+            if root[0] != 'crate':
+                return None
+            instance = root[1], crates[root[1]]
+        if kind == 'Y' and len(crates) > 1 and instance is None and not inventory:
             return None
         if not inventory and at != len(symbol):
             return None
-        return RustTraitMethodPath(impl_scope, namespace, self_type, trait,
-                                   (method, item_scope), crate, tuple(callbacks))
+        return RustNominalMethodPath(impl_scope, namespace, self_type, trait,
+            (method, item_scope), tuple(callbacks), kind,
+            tuple(sorted(crates.items())), instance or crate)
     except ValueError:
         return None
 
 
-def trait_method_parent(symbol, declaration=None, *, inventory=False):
-    shape = trait_method_path(symbol, inventory=inventory)
+def nominal_method_parent(symbol, declaration=None, *, inventory=False):
+    shape = nominal_method_path(symbol, inventory=inventory)
     if (shape is None or not inventory and shape.callbacks
             or declaration is not None and shape.method[0] != declaration):
         return None
-    return ('trait:' + repr((*shape.parent_scope, shape.method[1])), 'trait:' + repr(shape.parent_scope))
+    return ('method:' + repr((*shape.parent_scope, shape.method[1])), 'method:' + repr(shape.parent_scope))
 
 
 def replacement_raw_parent(symbol, declaration=None):
@@ -1724,7 +1743,7 @@ def replacement_raw_parent(symbol, declaration=None):
         return None
     prefix = re.match(r'_RNv((?:Nt){0,16})C(?:s[0-9A-Za-z]{0,32}_)?', symbol)
     if prefix is None:
-        return trait_method_parent(symbol, declaration)
+        return nominal_method_parent(symbol, declaration)
     at = prefix.end(); parts = []
     for index in range(len(prefix[1]) // 2 + 2):
         first = at
@@ -1762,12 +1781,12 @@ def fully_covered_replacement(name, old, new, before, after, descriptors, groupe
         if any(count <= 0 for line, count in counts.items() if first <= line <= last):
             return None
         parent_names = {owner['name'] for owner in parents}
-        trait_shapes = {parent: trait_method_path(parent) for parent in parent_names}
+        method_shapes = {parent: nominal_method_path(parent) for parent in parent_names}
         plain_shapes = {parent: plain_rust_function_symbol(parent) for parent in parent_names}
-        if any((trait is None or trait.callbacks) and plain_shapes[parent] is None
-               for parent, trait in trait_shapes.items()):
+        if any((method is None or method.callbacks) and plain_shapes[parent] is None
+               for parent, method in method_shapes.items()):
             return None
-        parent_paths = {shape.copy_identity for shape in trait_shapes.values() if shape is not None}
+        parent_paths = {shape.copy_identity for shape in method_shapes.values() if shape is not None}
         async_bodies = {parent: [] for parent in parent_names}
         owners = []; regions = []
         for owner in compiled[0]:
@@ -1775,7 +1794,7 @@ def fully_covered_replacement(name, old, new, before, after, descriptors, groupe
             span = min(row[0] for row in owner['regions']), max(row[2] for row in owner['regions'])
             if span[1] < first or span[0] > last:
                 continue
-            shape = trait_method_path(owner['name'])
+            shape = nominal_method_path(owner['name'])
             child = (shape is not None and shape.callbacks and shape.copy_identity in parent_paths
                      or any(plain is not None and any(direct_rust_callback_symbol(
                          owner['name'], parent, plain.modules, depth) for depth in range(1, 9))
@@ -1858,7 +1877,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 continue
             scopes = _construct_ancestors(code, row['opening'], work)
             parents = [by_opening.get(opening) for opening in scopes if opening != row['opening']]
-            if any(parent is None or parent['kind'] not in ('mod', 'impl') for parent in parents):
+            if any(parent is None or parent['kind'] not in ('mod', 'impl', 'trait') for parent in parents):
                 continue
             scope_key = tuple(tuple(parent['header']) for parent in parents)
             key = id(code), tuple(scopes)
@@ -2126,8 +2145,8 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     for left_prefix, left in descriptors[0].items():
         for right_prefix, right in descriptors[1].items():
             _construct_charge(work, 1)
-            trait_migration = (left_prefix != right_prefix
-                and all(trait_method_parent(owner['name'], descriptor['declaration']) is not None
+            method_migration = (left_prefix != right_prefix
+                and all(nominal_method_parent(owner['name'], descriptor['declaration']) is not None
                         for descriptor in (left, right) for owner in descriptor['group'][2]))
             test_attributes = (['#', '[', 'test', ']'], ['#', '[', 'tokio', '::', 'test', ']', 'async'])
             complete_test_rewrite = (left_prefix != right_prefix
@@ -2137,7 +2156,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                      or left['signature'] != right['signature']))
             if (not complete_test_rewrite and (left['context'] != right['context']
                     or left['attributes'] != right['attributes']
-                    or left['signature'] != right['signature'] and not trait_migration)):
+                    or left['signature'] != right['signature'] and not method_migration)):
                 continue
             seeds = []; parent = None
             renamed = left_prefix != right_prefix
@@ -2186,7 +2205,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     and groups[1][0] <= row['head_line'] <= groups[1][1]]
         if not selected:
             continue
-        if complete_test_rewrite or parent is not None and parent[0].startswith('trait:') and left['signature'] != right['signature']:
+        if complete_test_rewrite or parent is not None and parent[0].startswith('method:') and left['signature'] != right['signature']:
             covered = fully_covered_replacement(name, old, new, before, after, (left, right),
                 grouped, selected, equal_rows, work)
             if covered is not None:
@@ -4159,9 +4178,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             _construct_charge(construct_work, len(bf))
             for owner in bf:
                 _construct_charge(construct_work, len(owner['name']) + 1)
-                trait_scope = parent[0].startswith('trait:')
-                decoded = trait_method_parent(owner['name'], inventory=True) if trait_scope else None
-                matches = (decoded is not None and decoded[1] == parent[1]) if trait_scope else parent[1] in owner['name']
+                method_scope = parent[0].startswith('method:')
+                decoded = nominal_method_parent(owner['name'], inventory=True) if method_scope else None
+                matches = (decoded is not None and decoded[1] == parent[1]) if method_scope else parent[1] in owner['name']
                 if matches or not owner['name'].startswith(('_R', '_ZN')):
                     _construct_charge(construct_work, len(owner['filenames']))
                     locations.update(base_files.get(path, '<unattributed source>') for path in owner['filenames'])
