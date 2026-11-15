@@ -7,7 +7,7 @@
   "source_url": "https://kojipkgs.fedoraproject.org/packages/sqlite/3.51.2/2.fc44/data/signed/6d9f90a6/src/sqlite-3.51.2-2.fc44.src.rpm",
   "source_sha256": "f625466bdc4fefb2ba4dbb8b8a5b675d06a122a6bccb6cd0dfe5c4d1f68bf858",
   "patch": "sqlite-3.51.2-wal-reset.patch",
-  "patch_sha256": "cf643573e0f84cd638f370e2022bf91248f355b73ca0fd0422b0eaa42b51ffe2",
+  "patch_sha256": "6c6980203419ffc0c401bfe85cd68a03c2a7a1642870f298e3563dff0406d137",
   "upstream_fix": "fe57e14b49f9189b56da8233ab3415ce5ff6b1ff",
   "keyring": "fedora.gpg",
   "keyring_sha256": "ee42b9c07cf45061e59446506442fed9a68270e2a65b775d41b2549501fc4dbc",

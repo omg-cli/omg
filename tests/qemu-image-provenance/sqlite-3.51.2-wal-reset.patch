@@ -251,7 +251,7 @@
 @@ -379,6 +379,16 @@
  db close
  sqlite3 db test.db -readonly 1
- 
+
 +do_test 12.2.1 {
 +  set vcheck {}
 +  db eval {EXPLAIN PRAGMA integrity_check} row {
