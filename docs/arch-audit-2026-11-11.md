@@ -2172,3 +2172,34 @@ After Clippy, VHD file length was 35,882,270,720 bytes, guest use 33,046,446,080
 bytes and C: free space 605,352,214,528 bytes. No debug companions were retired.
 Fresh full hosted acceptance remains required for these changes and the method
 inventory index; later correspondence/work and release/VM/CVE obligations remain.
+
+### Windows continuation: official install admission before mutation
+
+At `b2cb6647`, the hosted coverage producer passed and the complete comparison
+cleared repository-origin coverage. Its next refusal is the official install
+candidate at `service.rs:157`. Artifact 14183898887 has SHA-256
+`c872e7e5e7716976a8391b8699018ed8ea2cb3dc232eba34d53c7dc8cacdf244`
+and binds the original base to that exact head.
+
+A focused public install regression now uses the existing isolated Arch mock
+backend, an explicit policy banning the available official fixture, and disabled
+history. It requires the typed banned-package error and an empty installed set.
+Temporarily ignoring this path's admission error makes the test fail because
+install returns success; the restored product bytes pass. This verifies the
+service boundary with a mock backend and performs no native package operation.
+
+One fresh intact profile, separate from build and fault profiles, covers all 13
+mapped admission rows and all 25 mapped new-test rows. Its library-test binary
+SHA-256 is `4b89399e0d5db865af13ff7bdd80127c9825fbb07ee064faae7a50beab45257a`.
+Arch all-target Clippy passes with warnings denied and actual source checking;
+formatting, diff checks and the 340-test comparator suite pass. No comparator
+implementation or acceptance setting changed in this slice. Research on later
+eager-prefix correspondence remains parked, without granting acceptance.
+
+The native wave was admitted at a 28 GiB growth allowance with a 2 GiB forecast,
+two workers, the same debug/split-debug/incremental and coverage settings, and a
+20 GiB backing-volume reserve. After Clippy, VHD file length was 37,939,576,832
+bytes, guest use 34,706,935,808 bytes and C: free space 602,907,217,920 bytes.
+Current debug companions remain preserved. A fresh full hosted comparison must
+still judge this test addition; later correspondence/work, release/VM/performance,
+independent security review and private CVE archive completeness remain open.
