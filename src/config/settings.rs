@@ -471,7 +471,13 @@ impl Settings {
                 "[omg-unprivileged-fixture] test={test_name} parent_uid=0 executable_sha256={digest}"
             );
             let output = std::process::Command::new(&executable)
-                .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                .args([
+                    "--exact",
+                    test_name,
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
                 .current_dir(fixture.path())
                 .env("TMPDIR", "/var/tmp")
                 .env(

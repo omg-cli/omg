@@ -761,6 +761,11 @@ def evidence_fixture(root):
         (evidence / f'registry-{role}.txt').write_text(''.join(name + ': test\n' for name in names))
     for stage in PRODUCER.STAGES:
         (profiles / f'omg-extra-{stage}-123-100_0.profraw').write_bytes(bytes.fromhex('8172666f72706cff') + b'fixture')
+    (profiles / 'omg-extra-native-preflight-isolation-124-100_0.profraw').write_bytes(
+        bytes.fromhex('8172666f72706cff') + b'fixture')
+    (evidence / 'native-preflight-isolation.log').write_text(
+        '[native-preflight-isolation] uid=65534 test_mode=absent\n'
+        'test result: ok. 1 passed; 0 failed; 0 ignored;\n')
     for stage, role, name in PRODUCER.CASES:
         log = f'test {name} ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;\n'
         if role in ('cli-unit', 'lib-unit'):
@@ -1093,8 +1098,8 @@ class SupplementalEvidence(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
-            self.assertEqual(len(receipt['tests']), 18)
-            self.assertEqual(len(receipt['process_checks']), 59)
+            self.assertEqual(len(receipt['tests']), 19)
+            self.assertEqual(len(receipt['process_checks']), 60)
             self.assertEqual(len(receipt['fresh_admission']), 20)
             self.assertEqual(len(files), len(receipt['profiles']))
 
@@ -1120,6 +1125,10 @@ class SupplementalEvidence(unittest.TestCase):
             'missing-process': lambda e, p: (e / 'process-checks.tsv').write_text('cli-q\t0\n'),
             'fresh-missing-receipt': lambda e, p: (e / 'fresh-admission.json').unlink(),
             'fresh-incomplete-receipt': lambda e, p: (e / 'fresh-admission.json').write_text('{}'),
+            'native-preflight-not-executed': lambda e, p: (e / 'native-preflight-isolation.log').write_text(
+                '[native-preflight-isolation] uid=65534 test_mode=absent\n'
+                'test result: ok. 0 passed; 0 failed; 1 ignored;\n'),
+            'native-preflight-no-worker': lambda e, p: (p / 'omg-extra-native-preflight-isolation-124-100_0.profraw').unlink(),
             'fresh-wrong-cli-profile': lambda e, p: (p / 'omg-extra-fresh-archive-accept-123-100_0.profraw').rename(
                 p / 'omg-extra-fresh-archive-accept-123-200_0.profraw'),
             'wrong-artifact': lambda e, p: (e / 'artifacts.sha256').write_text('different'),
@@ -1229,6 +1238,14 @@ class ArtifactAdmission(unittest.TestCase):
 
 
 class FreshAdmissionFixture(unittest.TestCase):
+    def test_native_preflight_is_mandatory_even_when_ordinary_runs_ignore_it(self):
+        name = 'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy'
+        self.assertIn(name, PRODUCER.HARNESSES['lib-unit'].tests)
+        artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
+        script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
+        self.assertIn('"$name" --exact --include-ignored --nocapture', script)
+        self.assertIn('native-preflight-isolation', PRODUCER.PROCESS_STAGES)
+
     def test_generated_guest_program_requires_all_native_admission_profiles(self):
         artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
         script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')

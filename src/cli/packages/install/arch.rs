@@ -906,6 +906,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires native Arch; mandatory in the native coverage VM"]
     fn native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy() {
         use crate::core::security::policy::AdvisoryRequirement;
         use crate::core::security::{PolicyError, SecurityPolicy};
@@ -915,15 +916,17 @@ mod tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
         temp_env::with_vars(
             [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
             || {
-                if crate::core::env::distro::detect_distro()
-                    != crate::core::env::distro::Distro::Arch
-                {
-                    eprintln!("[omg-skip] fresh snapshot preflight requires native Arch");
-                    return;
-                }
+                assert_eq!(
+                    crate::core::env::distro::detect_distro(),
+                    crate::core::env::distro::Distro::Arch,
+                    "native prepared-admission fixture requires the actual Arch backend"
+                );
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()

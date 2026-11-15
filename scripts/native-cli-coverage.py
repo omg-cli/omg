@@ -925,7 +925,10 @@ HARNESSES = {
     )),
     'comprehensive': Harness('cli_comprehensive', ('behavior_inventory_runs_in_hermetic_state',)),
     'cli-unit': Harness('omg', ('fast_path_tests::private_install_plan_rejects_missing_or_invalid_descriptors',)),
-    'lib-unit': Harness('omg_lib', ('cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy',)),
+    'lib-unit': Harness('omg_lib', (
+        'cli::tui::ui::tests::security_tab_tracks_configured_policy_and_reports_invalid_policy',
+        'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy',
+    )),
     'coverage11': Harness('coverage_11', ('machine_id_is_stable_sixteen_lowercase_hex',)),
 }
 ROLES = ('cli', 'daemon', *HARNESSES)
@@ -1017,9 +1020,10 @@ OMARCHY_CASES = {
 }
 
 ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
+NATIVE_PREFLIGHT_TEST = 'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy'
 FRESH_ADMISSION_STAGES = tuple('fresh-' + case.name for case in FRESH_ADMISSION_CASES)
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'cli-fresh-mock-refused', 'cli-elevation-denied', 'cli-authorization-denied',
-                  'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES, *FRESH_ADMISSION_STAGES)
+                  'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES, *FRESH_ADMISSION_STAGES, 'native-preflight-isolation')
 STAGES = tuple('registry-' + role for role in HARNESSES) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
 
@@ -1641,7 +1645,7 @@ while IFS=$'\t' read -r stage role name; do
       OMG_DISABLE_TELEMETRY=1 LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
       "${fixture_env[@]}" \
       bash -c 'cd "$HOME"; test "$(id -u)" = 0; printf "[extra-root-test] uid=%s\n" "$(id -u)"; exec "$@"' \
-      bash /omg-extra-bin/"$role" "$name" --exact --nocapture --test-threads=1 < /dev/null > "$log" 2>&1
+      bash /omg-extra-bin/"$role" "$name" --exact --include-ignored --nocapture --test-threads=1 < /dev/null > "$log" 2>&1
   elif test "$role" = coverage11; then
     identity_owner=/var/tmp/omg-machine-identity
     test ! -e "$identity_owner"
@@ -1772,6 +1776,13 @@ with Path('/evidence/cli/process-checks.tsv').open('a') as stream:
     for stage in value['profile_stages']:
         stream.write(stage + '\t0\n')
 OMG_FRESH_STAGE_RECEIPTS
+stage=native-preflight-isolation
+ordinary env LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
+  timeout --signal=TERM --kill-after=3 45 bash -c \
+  'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${OMG_ISOLATED_FIXTURE_TEST+x}"; printf "[native-preflight-isolation] uid=%s test_mode=absent\n" "$(id -u)"; exec "$@"' \
+  bash /omg-extra-bin/lib-unit NATIVE_PREFLIGHT_TEST --exact --include-ignored --nocapture --test-threads=1 \
+  < /dev/null > /evidence/cli/native-preflight-isolation.log 2>&1
+printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
 OMG_EXTRA_NAMESPACE
 fingerprint_db > /evidence/cli/db-after.txt
 cmp /evidence/cli/db-before.txt /evidence/cli/db-after.txt
@@ -1783,6 +1794,7 @@ printf 'PASS\n' > /evidence/cli/all-stages-pass.txt
     script = script.replace('RECEIPT', quote(receipt)).replace('ARTIFACTS', quote(artifact_lines))
     script = script.replace('SELECTION', quote(selection)).replace('COMPILED_CLI', quote(compiled_cli))
     script = script.replace('OMARCHY_CASE_BODY', omarchy_guest_script())
+    script = script.replace('NATIVE_PREFLIGHT_TEST', shlex.quote(NATIVE_PREFLIGHT_TEST))
     # The timeout shell inherits this function, never a caller-supplied environment.
     script = script.replace('ordinary bash -c', 'export -f ordinary\nordinary bash -c', 1)
     return script
@@ -2048,6 +2060,16 @@ def validate_evidence(evidence, profiles, artifacts, commit):
     for stage in FRESH_ADMISSION_STAGES:
         require({PROFILE.fullmatch(path.name)[3] for path in grouped[stage]} == cli_modules,
                 'Native admission profiles do not match the actual CLI: ' + stage)
+    native_stage = next(stage for stage, role, name in CASES if role == 'lib-unit' and name == NATIVE_PREFLIGHT_TEST)
+    isolation = 'native-preflight-isolation'
+    isolation_log = (evidence / (isolation + '.log')).read_text()
+    require(f'[native-preflight-isolation] uid={uid} test_mode=absent' in isolation_log
+            and len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', isolation_log, re.M)) == 1,
+            'Native preflight isolation did not execute as the ordinary fixture user')
+    require(len(grouped[isolation]) == 2
+            and {PROFILE.fullmatch(path.name)[3] for path in grouped[isolation]}
+                == {PROFILE.fullmatch(path.name)[3] for path in grouped[native_stage]},
+            'Native preflight isolation lacks both matching unit processes')
     ET.ElementTree(suite).write(evidence / 'tests.xml', encoding='unicode', xml_declaration=True)
     selected = sorted(path for paths in grouped.values() for path in paths)
     (evidence / 'verification.json').write_text(json.dumps(dict(source_commit=commit, tests=tests,
