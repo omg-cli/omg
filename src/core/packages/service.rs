@@ -51,7 +51,8 @@ impl PackageService {
         let packages = [package];
         let prepared_arch_admission = cfg!(feature = "arch") && self.backend.name() == "pacman";
         let assessments = if policy.advisory_requirement == AdvisoryRequirement::Optional
-            || prepared_arch_admission
+            || (prepared_arch_admission
+                && policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot)
         {
             vec![PackageAssessment::unknown(
                 packages[0].clone(),
@@ -64,7 +65,12 @@ impl PackageService {
         };
         validate_assessment_inventory(&packages, &assessments)?;
         if prepared_arch_admission {
-            policy.check_sources_and_findings(&assessments)?;
+            policy.validate_advisory_scope()?;
+            let package = &packages[0];
+            let license = crate::core::security::policy::combined_license_expression(
+                package.licenses.iter().map(String::as_str),
+            );
+            policy.check_source(&package.name, &package.origin, license.as_deref())?;
         } else {
             policy.check_assessments(&assessments)?;
         }
@@ -870,12 +876,11 @@ mod tests {
                 let mut review = fresh.clone();
                 review.advisory_requirement =
                     crate::core::security::policy::AdvisoryRequirement::Review;
-                service
+                let error = service
                     .check_candidate(&review, package.clone())
                     .await
-                    .expect(
-                        "native owner must present advisory consent after dependency resolution",
-                    );
+                    .expect_err("explicit review must validate the preflight inventory before native consent");
+                assert!(error.to_string().contains("inventory differs"), "{error:#}");
                 fresh.banned_packages.push(package.name.clone());
                 let error = service
                     .check_candidate(&fresh, package.clone())

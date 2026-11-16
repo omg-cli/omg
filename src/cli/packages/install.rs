@@ -42,7 +42,8 @@ pub(crate) async fn enforce_install_policy(
         return Err(crate::core::security::PolicyError::PreparedAdmissionRequired.into());
     }
     let assessments = if policy.advisory_requirement == AdvisoryRequirement::Optional
-        || prepared_arch_admission
+        || (prepared_arch_admission
+            && policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot)
     {
         vec![PackageAssessment::unknown(
             packages[0].clone(),
@@ -55,9 +56,9 @@ pub(crate) async fn enforce_install_policy(
     };
     validate_assessment_inventory(&packages, &assessments)?;
     if prepared_arch_admission {
-        // The native owner reviews resolved versions and dependencies, including
-        // disclosed risk. Preflight must not veto that transaction's consent.
-        policy.check_sources_and_findings(&assessments)?;
+        // Source policy was checked above. Only the resolved native transaction
+        // can accept findings; explicit review still validates this inventory.
+        policy.validate_advisory_scope()?;
     } else {
         policy.check_assessments(&assessments)?;
     }

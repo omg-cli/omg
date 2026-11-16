@@ -980,6 +980,7 @@ mod tests {
 
     #[test]
     fn install_policy_rejects_known_vulnerabilities() {
+        use crate::core::security::vulnerability::{AssessmentUse, VulnerabilitySource as _};
         const NAME: &str =
             "cli::packages::install::arch::tests::install_policy_rejects_known_vulnerabilities";
         if crate::core::testing::run_isolated_test(NAME) {
@@ -999,7 +1000,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("private test runtime");
-            let error = runtime
+            runtime
                 .block_on(enforce_install_policy(
                     &policy,
                     &scanner,
@@ -1010,6 +1011,27 @@ mod tests {
                     },
                     Some("MIT"),
                 ))
+                .expect("valid findings must reach the resolved native consent gate");
+            assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let reported = runtime
+                .block_on(scanner.assess_packages(
+                    &[crate::package_managers::types::SecurityPackage {
+                        origin: crate::package_managers::types::SecurityOrigin::OtherRepository {
+                            repository: "fixture".into(),
+                        },
+                        name: "example".into(),
+                        version: "1.0-1".into(),
+                        advisory_source: None,
+                        architecture: None,
+                        description: String::new(),
+                        licenses: vec!["MIT".into()],
+                    }],
+                    AssessmentUse::Admission,
+                ))
+                .expect("complete reported finding");
+            let error = policy
+                .check_assessments(&reported)
+                .map_err(anyhow::Error::from)
                 .expect_err("vulnerable packages must be below the default Community grade");
 
             assert!(error.to_string().contains("below required minimum"));
@@ -1021,7 +1043,7 @@ mod tests {
                     minimum: crate::core::security::SecurityGrade::Community,
                 }) if name == "example"
             ));
-            assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 
             let clean_scanner = FixtureSource {
                 calls: std::sync::atomic::AtomicUsize::new(0),

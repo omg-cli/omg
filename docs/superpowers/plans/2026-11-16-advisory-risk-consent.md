@@ -40,6 +40,12 @@ Local evidence includes real controlling-PTY accept/refuse cases, a deliberate g
 
 Remaining work: a disposable actual-install accept/decline/change-before-commit drill, terminal cancellation/foreground fault coverage, runtime vendor applicability and activation gates, other native backends, and full immutable-base/public/native acceptance. Keep the original goal active until those requirements are verified.
 
+## Preflight boundary correction
+
+Hosted d6fce696 exposed three failures. Local reproduction confirms them: broad Arch deferral skipped explicit Review inventory validation, allowing a mock update to proceed and an AUR fixture to reach another metadata request. Restore the Review lookup and exact inventory check before handoff. Optional and final-only FreshSnapshot retain their preflight lookup behavior. Source/license checks remain mandatory; valid findings alone defer to native consent. Keep the two service no-mutation assertions unchanged. Update the CLI finding test to prove successful handoff and retain its exact typed Risk/Community policy rejection using the reported finding. Re-run both affected test modules, the review model, relevant policy controls, Clippy and hosted gates. Do not label the native install/commit drill complete until it runs.
+
+The correction passes all 81 tests in the four affected modules, plus the separate no-terminal regression and five real controlling-PTY cases. Arch all-target Clippy, formatting and diff checks pass. Hosted acceptance and the actual install/commit drill remain open.
+
 ### Task 1: Canonical risk review and advisory links
 
 **Files:** Add src/core/security/advisory_review.rs; wire its module in src/core/security/mod.rs. Reuse types from scan.rs, vulnerability.rs and package_managers/types.rs. Add focused tests in the new module.
