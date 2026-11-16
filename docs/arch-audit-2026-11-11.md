@@ -1859,3 +1859,45 @@ Git. Before resuming the same fenced session, confirm the old process is
 terminal, inspect the writer lease, reconcile server membership/counters
 with the checkpoint, and replay any acknowledged-but-unsaved batch. Never
 manually advance the cursor or claim exhaustive certification from progress.
+
+### Windows continuation: conservative coverage repair
+
+The existing Windows main checkout now contains the PR source. Its original
+30 changed/untracked files remain in recovery stash
+`983d38c836bd36dfa335568b93f20294284cf92c`; do not drop or apply it over the PR.
+The remote destination remains `codex/arch-hardening`, never remote main.
+
+`dc947294` replaces the empty-report fixture's cold `?` with an explicit success
+assertion. Fresh instrumented Arch WSL execution covers the replacement six
+times across the parent and both color-mode subprocesses. Its hosted CI,
+security, CodeQL, mutation and Docker E2E runs passed. Coverage production
+passed, but the immutable-base comparison refused the sanitizer extraction.
+
+`37e210cb` closes two fail-open fallback paths in the comparator. A previously
+closed compiled-owner inventory must retain its copies and closed layout.
+Both malformed fixtures were accepted by the prior checker and are now refused.
+The original 64,000,000-unit work capacity and all coverage requirements remain.
+
+`31949a13` restores the sanitizer's exact baseline callback while preserving
+the allocation-free streaming formatter. Both filters agree for all 1,112,064
+Unicode scalar values; removing U+200B from the streaming filter fails this
+test. All 16 style tests pass. Fresh LLVM export preserves the callback's
+baseline geometry and covers every callback region in the local unit binary.
+It also covers every region in the new parity test. This focused proof has one
+unit-binary copy; it does not replace the complete hosted multi-binary proof.
+The speculative extraction-proof extension was not published.
+
+Arch WSL validation passes 319 comparator, 66 native-producer, 25 immutable-base
+admission and 43 contract-coverage tests, plus formatting and diff checks.
+The transport suite initially stopped before Docker because local `jq` was
+absent; installing jq and its oniguruma dependency resolves that prerequisite.
+Builds retain two workers and existing debug/split-debug/incremental settings,
+with explicit coverage instrumentation. The target has a 12 GiB growth budget
+and a 20 GiB backing-volume reserve. Final VHD allocation was 15,968,763,904
+bytes, guest use 15,048,273,920 bytes and backing-volume free space over 687 GiB.
+
+Fresh hosted coverage acceptance is still required. Nested status-model source
+correspondence, later retained-source obligations and the original comparison
+work bound remain open. No release rebuild, installation, full VM/performance
+acceptance, independent security review or CVE archive certification is claimed
+for this continuation. The broader goal remains active.
