@@ -87,6 +87,10 @@ Advisory requirements are separate from source trust and the AUR build profile:
 
 When no policy file exists, OMG uses the built-in `optional` behavior. An existing policy file that omits the new field keeps evidence-required `review` behavior. Write `optional` explicitly to opt out of that requirement. Package bans, source restrictions and license rules still apply in every mode.
 
+Arch install and upgrade transactions attempt an advisory lookup even in `optional` mode. An unavailable feed produces an Unknown-coverage warning in that mode. A finding, including a possible match on an uncovered source, requires a separate attended security review: OMG shows the selected versions, advisory IDs and available URLs, then asks you to type `accept` followed by the displayed review ID. Blank input, refusal, disconnection and timeout cancel installation. `--yes` does not answer this security prompt. Accepting disclosed advisory risk permits that exact transaction; it does not change the findings, establish missing coverage, or override source, license, package-ban, signature or archive-integrity checks. Changed versions, policy, invoking identity or archive bytes invalidate the review before commit.
+
+This transaction consent currently applies to the native Arch backend. Runtime vendor advisory matching and equivalent transaction-bound consent on other native package backends are not implemented. No feed can establish that an undisclosed zero-day does not exist.
+
 For a fresh Arch admission, declare which configured repositories use Arch Linux Security Tracker coordinates. For example, if these repository names have that meaning in your configuration:
 
 ```toml

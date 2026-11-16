@@ -1,3 +1,5 @@
+#[cfg(any(feature = "arch", test))]
+pub(crate) mod advisory_review;
 #[cfg(unix)]
 pub mod artifact;
 pub mod audit;

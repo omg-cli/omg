@@ -2341,40 +2341,26 @@ struct UnknownArchiveAcknowledgement {
 }
 
 #[cfg(target_os = "linux")]
-fn confirm_unknown_archives(
-    packages: &[PreparedAdvisoryPackage],
+fn confirm_advisory_prompt(
+    details: &str,
     digest: &str,
     invoking_uid: u32,
     signals: &AdmissionSignals,
-) -> Result<UnknownArchiveAcknowledgement> {
+) -> Result<()> {
     use std::fmt::Write as _;
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
     anyhow::ensure!(
         crate::core::is_root(),
-        "FreshSnapshot archive acknowledgement requires the privileged transaction owner"
-    );
-    let unknown = packages
-        .iter()
-        .filter(|item| {
-            matches!(
-                item.package.origin,
-                super::types::SecurityOrigin::AurArchive
-                    | super::types::SecurityOrigin::LocalArchive
-            )
-        })
-        .collect::<Vec<_>>();
-    anyhow::ensure!(
-        unknown.len() <= 64,
-        "Split FreshSnapshot archive acknowledgements into batches of at most 64 archives"
+        "Security acknowledgement requires the privileged transaction owner"
     );
     let tty = std::fs::OpenOptions::new().read(true).write(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
-        .open("/dev/tty").context("FreshSnapshot unknown archives require an attended controlling terminal; --yes cannot acknowledge unknown coverage")?;
+        .open("/dev/tty").with_context(|| format!("{details}\nSecurity review requires an attended controlling terminal; --yes cannot accept advisory risk or unknown coverage"))?;
     anyhow::ensure!(
         nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
-        "FreshSnapshot acknowledgement must run in the terminal foreground"
+        "Security acknowledgement must run in the terminal foreground"
     );
     let mut session: nix::libc::pid_t = 0;
     // SAFETY: TIOCGSID writes one session identifier into this valid stack value.
@@ -2390,7 +2376,7 @@ fn confirm_unknown_archives(
     }
     anyhow::ensure!(
         nix::unistd::getsid(None)?.as_raw() == session,
-        "FreshSnapshot acknowledgement terminal belongs to another session"
+        "Security acknowledgement terminal belongs to another session"
     );
     let mut device: nix::libc::c_uint = 0;
     // SAFETY: TIOCGDEV writes one kernel device number into this valid stack value.
@@ -2410,35 +2396,23 @@ fn confirm_unknown_archives(
     } else if major == 4 && (1..=63).contains(&minor) {
         format!("/dev/tty{minor}")
     } else {
-        anyhow::bail!("Unsupported terminal identity for FreshSnapshot acknowledgement");
+        anyhow::bail!("Unsupported terminal identity for Security acknowledgement");
     };
     let metadata = std::fs::symlink_metadata(path)?;
     anyhow::ensure!(
         metadata.file_type().is_char_device()
             && metadata.rdev() == u64::from(device)
             && (metadata.uid() == invoking_uid || metadata.uid() == 0),
-        "FreshSnapshot acknowledgement terminal is not owned by root or the invoking user"
+        "Security acknowledgement terminal is not owned by root or the invoking user"
     );
-    let mut prompt = format!(
-        "\nArch advisory applicability is UNKNOWN for these exact archives. This acknowledgement does not establish coverage.\nInvoking UID: {invoking_uid}\nFull prepared batch SHA-256: {digest}\n"
-    );
-    for item in unknown {
-        prompt.push_str(&serde_json::to_string(&(
-            &item.package.name,
-            &item.package.version,
-            &item.package.architecture,
-            &item.package.origin,
-            &item.sha256,
-        ))?);
-        prompt.push('\n');
-    }
+    let mut prompt = details.to_owned();
     write!(
         prompt,
-        "Type accept {digest} within 60 seconds to continue: "
+        "\nType accept {digest} within 60 seconds to continue (default: cancel): "
     )?;
     anyhow::ensure!(
         prompt.len() <= 64 * 1024,
-        "FreshSnapshot acknowledgement display exceeds limit"
+        "Security acknowledgement display exceeds limit"
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     fn ready(
@@ -2452,20 +2426,20 @@ fn confirm_unknown_archives(
             signals.check()?;
             anyhow::ensure!(
                 nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
-                "FreshSnapshot terminal foreground changed during acknowledgement"
+                "Security terminal foreground changed during acknowledgement"
             );
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
-                .context("FreshSnapshot acknowledgement timed out")?;
+                .context("Security acknowledgement timed out")?;
             let timeout = Timespec::try_from(remaining.min(std::time::Duration::from_millis(100)))
                 .context("Invalid acknowledgement timeout")?;
             let mut items = [PollFd::new(tty, events)];
-            let result = poll(&mut items, Some(&timeout))
-                .context("FreshSnapshot acknowledgement interrupted")?;
+            let result =
+                poll(&mut items, Some(&timeout)).context("Security acknowledgement interrupted")?;
             signals.check()?;
             anyhow::ensure!(
                 nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
-                "FreshSnapshot terminal foreground changed during acknowledgement"
+                "Security terminal foreground changed during acknowledgement"
             );
             if result == 0 {
                 continue;
@@ -2474,11 +2448,11 @@ fn confirm_unknown_archives(
                 !items[0]
                     .revents()
                     .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
-                "FreshSnapshot acknowledgement terminal disconnected"
+                "Security acknowledgement terminal disconnected"
             );
             anyhow::ensure!(
                 items[0].revents().contains(events),
-                "FreshSnapshot acknowledgement terminal is not ready"
+                "Security acknowledgement terminal is not ready"
             );
             return Ok(());
         }
@@ -2500,7 +2474,7 @@ fn confirm_unknown_archives(
         previous.thread_set_mask()?;
         anyhow::ensure!(
             nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
-            "FreshSnapshot terminal foreground changed during acknowledgement"
+            "Security terminal foreground changed during acknowledgement"
         );
         Ok(result)
     }
@@ -2508,7 +2482,7 @@ fn confirm_unknown_archives(
     while !remaining.is_empty() {
         ready(&tty, rustix::event::PollFlags::OUT, deadline, signals)?;
         match foreground_io(&tty, |mut tty| tty.write(remaining))? {
-            Ok(0) => anyhow::bail!("FreshSnapshot acknowledgement terminal closed"),
+            Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
             Ok(count) => remaining = &remaining[count..],
             Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {}
             Err(error) => return Err(error.into()),
@@ -2519,7 +2493,7 @@ fn confirm_unknown_archives(
         ready(&tty, rustix::event::PollFlags::IN, deadline, signals)?;
         let mut buffer = [0_u8; 128];
         let count = match foreground_io(&tty, |mut tty| tty.read(&mut buffer))? {
-            Ok(0) => anyhow::bail!("FreshSnapshot acknowledgement terminal closed"),
+            Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
             Ok(count) => count,
             Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {
                 continue;
@@ -2529,7 +2503,7 @@ fn confirm_unknown_archives(
         answer.extend_from_slice(&buffer[..count]);
         anyhow::ensure!(
             answer.len() <= 96,
-            "FreshSnapshot acknowledgement input exceeds limit"
+            "Security acknowledgement input exceeds limit"
         );
         if answer.contains(&b'\n') {
             break;
@@ -2537,28 +2511,69 @@ fn confirm_unknown_archives(
     }
     anyhow::ensure!(
         nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
-        "FreshSnapshot terminal foreground changed during acknowledgement"
+        "Security terminal foreground changed during acknowledgement"
     );
     anyhow::ensure!(
         answer == format!("accept {digest}\n").as_bytes()
             || answer == format!("accept {digest}\r\n").as_bytes(),
-        "FreshSnapshot unknown-coverage acknowledgement declined"
+        "Security acknowledgement declined"
     );
     signals.check()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn confirm_advisory_prompt(
+    _details: &str,
+    _digest: &str,
+    _invoking_uid: u32,
+    _signals: &AdmissionSignals,
+) -> Result<()> {
+    anyhow::bail!("Security acknowledgement requires Linux terminal ownership checks")
+}
+
+fn confirm_unknown_archives(
+    packages: &[PreparedAdvisoryPackage],
+    digest: &str,
+    invoking_uid: u32,
+    signals: &AdmissionSignals,
+) -> Result<UnknownArchiveAcknowledgement> {
+    use std::fmt::Write as _;
+    let unknown = packages
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.package.origin,
+                super::types::SecurityOrigin::AurArchive
+                    | super::types::SecurityOrigin::LocalArchive
+            )
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        unknown.len() <= 64,
+        "Split FreshSnapshot archive acknowledgements into batches of at most 64 archives"
+    );
+    let mut prompt = format!(
+        "\nArch advisory applicability is UNKNOWN for these exact archives. This acknowledgement does not establish coverage.\nInvoking UID: {invoking_uid}\nFull prepared batch SHA-256: {digest}\n"
+    );
+    for item in unknown {
+        writeln!(
+            prompt,
+            "{}",
+            serde_json::to_string(&(
+                &item.package.name,
+                &item.package.version,
+                &item.package.architecture,
+                &item.package.origin,
+                &item.sha256,
+            ))?
+        )?;
+    }
+    confirm_advisory_prompt(&prompt, digest, invoking_uid, signals)?;
     Ok(UnknownArchiveAcknowledgement {
         batch_digest: digest.to_owned(),
         invoking_uid,
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn confirm_unknown_archives(
-    _packages: &[PreparedAdvisoryPackage],
-    _digest: &str,
-    _invoking_uid: u32,
-    _signals: &AdmissionSignals,
-) -> Result<UnknownArchiveAcknowledgement> {
-    anyhow::bail!("FreshSnapshot archive acknowledgement requires Linux terminal ownership checks")
 }
 
 struct PreparedAdvisoryAdmission {
@@ -2567,6 +2582,7 @@ struct PreparedAdvisoryAdmission {
     profile: Vec<u8>,
     invoking_uid: u32,
     acknowledgement: Option<UnknownArchiveAcknowledgement>,
+    risk_acceptance: Option<crate::core::security::advisory_review::AdvisoryRiskAcceptance>,
     operation: Option<crate::core::security::vulnerability::ArchOperationAssessment>,
 }
 
@@ -2644,9 +2660,8 @@ impl PreparedAdvisoryAdmission {
         } else {
             None
         };
-        let operation = if packages.is_empty()
-            || policy.advisory_requirement == AdvisoryRequirement::Optional
-        {
+        let mut risk_acceptance = None;
+        let operation = if packages.is_empty() {
             None
         } else {
             let subjects = packages
@@ -2668,31 +2683,67 @@ impl PreparedAdvisoryAdmission {
                     .map_err(Into::into)
             })
             .join()
-            .map_err(|_| anyhow::anyhow!("Prepared Arch advisory worker failed"))??;
-            anyhow::ensure!(
-                operation.assessments().len() == packages.len()
-                    && operation
-                        .assessments()
-                        .iter()
-                        .zip(&packages)
-                        .all(|(assessment, item)| assessment.package == item.package),
-                "Prepared Arch assessment identity mismatch"
-            );
-            policy.check_sources_and_findings(operation.assessments())?;
-            if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot {
-                for assessment in operation.assessments() {
-                    anyhow::ensure!(
-                        assessment.coverage.is_assessed()
-                            || matches!(
-                                assessment.package.origin,
-                                super::types::SecurityOrigin::AurArchive
-                                    | super::types::SecurityOrigin::LocalArchive
-                            ) && acknowledgement.is_some(),
-                        "FreshSnapshot requires assessed coordinates or an exact private archive acknowledgement"
+            .map_err(|_| anyhow::anyhow!("Prepared Arch advisory worker failed"))?;
+            let operation = match operation {
+                Ok(operation) => Some(operation),
+                Err(error) if policy.advisory_requirement == AdvisoryRequirement::Optional => {
+                    eprintln!(
+                        "Warning: advisory coverage is UNKNOWN; no clean result was established: {}",
+                        crate::cli::style::sanitize_terminal_text(&error.to_string())
                     );
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(operation) = &operation {
+                anyhow::ensure!(
+                    operation.assessments().len() == packages.len()
+                        && operation
+                            .assessments()
+                            .iter()
+                            .zip(&packages)
+                            .all(|(assessment, item)| assessment.package == item.package),
+                    "Prepared Arch assessment identity mismatch"
+                );
+                if let Some(review) =
+                    crate::core::security::advisory_review::AdvisoryRiskReview::new(
+                        operation.assessments(),
+                        &advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?,
+                    )?
+                {
+                    if signals.is_none() {
+                        AdmissionSignals::begin_in(signals).with_context(|| {
+                            format!(
+                                "{}\nAdvisory risk review requires an attended native OMG CLI",
+                                review.details(),
+                            )
+                        })?;
+                    }
+                    confirm_advisory_prompt(
+                        review.details(),
+                        review.id(),
+                        invoking_uid,
+                        signals
+                            .as_ref()
+                            .context("Advisory risk signal owner is missing")?,
+                    )?;
+                    risk_acceptance = Some(review.accept(&format!("accept {}", review.id()))?);
+                }
+                if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot {
+                    for assessment in operation.assessments() {
+                        anyhow::ensure!(
+                            assessment.coverage.is_assessed()
+                                || matches!(
+                                    assessment.package.origin,
+                                    super::types::SecurityOrigin::AurArchive
+                                        | super::types::SecurityOrigin::LocalArchive
+                                ) && acknowledgement.is_some(),
+                            "FreshSnapshot requires assessed coordinates or an exact private archive acknowledgement"
+                        );
+                    }
                 }
             }
-            Some(operation)
+            operation
         };
         if let Some(signals) = signals.as_ref() {
             signals.check()?;
@@ -2703,6 +2754,7 @@ impl PreparedAdvisoryAdmission {
             profile,
             invoking_uid,
             acknowledgement,
+            risk_acceptance,
             operation,
         })
     }
@@ -2740,6 +2792,17 @@ impl PreparedAdvisoryAdmission {
         }
         if let Some(operation) = &self.operation {
             operation.validate_now()?;
+            if let Some(review) = crate::core::security::advisory_review::AdvisoryRiskReview::new(
+                operation.assessments(),
+                &advisory_batch_digest(&current, &policy, &profile, invoking_uid)?,
+            )? {
+                anyhow::ensure!(
+                    self.risk_acceptance
+                        .as_ref()
+                        .is_some_and(|accepted| accepted.matches(&review)),
+                    "Advisory risk acceptance no longer matches this transaction; review again"
+                );
+            }
         }
         if let Some(signals) = signals.as_mut() {
             signals.check()?;
@@ -2959,6 +3022,46 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn advisory_risk_terminal_requires_exact_attended_acceptance() -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::advisory_risk_terminal_requires_exact_attended_acceptance";
+        if std::env::var("OMG_ISOLATED_FIXTURE_TEST").as_deref() != Ok(NAME) {
+            let output = std::process::Command::new("setsid")
+                .arg(std::env::current_exe()?)
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("OMG_ISOLATED_FIXTURE_TEST", NAME)
+                .env_remove("OMG_ADVISORY_TERMINAL_FIXTURE")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "isolated no-terminal review failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return Ok(());
+        }
+        let mode = std::env::var("OMG_ADVISORY_TERMINAL_FIXTURE").unwrap_or_default();
+        if mode.is_empty() {
+            assert!(std::fs::File::open("/dev/tty").is_err());
+        }
+        let mut signals = super::AdmissionSignals::begin()?;
+        let result = super::confirm_advisory_prompt(
+            "SECURITY WARNING: fixture 1.0-1 CVE-2026-12345 https://www.cve.org/CVERecord?id=CVE-2026-12345",
+            &"ab".repeat(32),
+            crate::core::privilege::invoking_uid()?,
+            &signals,
+        );
+        if mode == "accept" {
+            result?;
+        } else {
+            let error = result
+                .expect_err("missing terminal, generic yes, blank and wrong review must refuse");
+            assert!(!error.to_string().is_empty());
+        }
+        signals.finish()?;
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn fresh_admission_signal_ownership_is_scoped_and_refuses_handler_conflicts()

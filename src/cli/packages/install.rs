@@ -35,9 +35,9 @@ pub(crate) async fn enforce_install_policy(
         description: String::new(),
         licenses: license.into_iter().map(str::to_owned).collect(),
     }];
-    let prepared_arch_admission = policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot;
-    if prepared_arch_admission
-        && crate::package_managers::resolve_backend()? != crate::package_managers::Backend::Arch
+    let prepared_arch_admission = cfg!(feature = "arch")
+        && crate::package_managers::resolve_backend()? == crate::package_managers::Backend::Arch;
+    if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot && !prepared_arch_admission
     {
         return Err(crate::core::security::PolicyError::PreparedAdmissionRequired.into());
     }
@@ -55,8 +55,8 @@ pub(crate) async fn enforce_install_policy(
     };
     validate_assessment_inventory(&packages, &assessments)?;
     if prepared_arch_admission {
-        // Only the final prepared transaction can bind fresh evidence and
-        // acknowledge an exact uncovered artifact through the root terminal.
+        // The native owner reviews resolved versions and dependencies, including
+        // disclosed risk. Preflight must not veto that transaction's consent.
         policy.check_sources_and_findings(&assessments)?;
     } else {
         policy.check_assessments(&assessments)?;

@@ -242,15 +242,13 @@ impl SecurityPolicy {
             path: path.display().to_string(),
             source,
         })?;
-        let value: toml::Value = toml::from_str(&content).map_err(|source| PolicyError::Parse {
+        let parse_error = |source| PolicyError::Parse {
             path: path.display().to_string(),
             source,
-        })?;
+        };
+        let value: toml::Value = toml::from_str(&content).map_err(parse_error)?;
         let legacy = value.get("advisory_requirement").is_none();
-        let mut policy: Self = value.try_into().map_err(|source| PolicyError::Parse {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let mut policy: Self = value.try_into().map_err(parse_error)?;
         if legacy {
             policy.advisory_requirement = AdvisoryRequirement::Review;
         }

@@ -49,10 +49,7 @@ impl PackageService {
             AssessmentUse, PackageAssessment, UnknownCoverage, validate_assessment_inventory,
         };
         let packages = [package];
-        let prepared_arch_admission = policy.advisory_requirement
-            == AdvisoryRequirement::FreshSnapshot
-            && cfg!(feature = "arch")
-            && self.backend.name() == "pacman";
+        let prepared_arch_admission = cfg!(feature = "arch") && self.backend.name() == "pacman";
         let assessments = if policy.advisory_requirement == AdvisoryRequirement::Optional
             || prepared_arch_admission
         {
@@ -870,6 +867,15 @@ mod tests {
             let result = service.check_candidate(&fresh, package.clone()).await;
             if cfg!(feature = "arch") && distro == "arch" {
                 result.expect("native Arch admission is checked on the prepared transaction");
+                let mut review = fresh.clone();
+                review.advisory_requirement =
+                    crate::core::security::policy::AdvisoryRequirement::Review;
+                service
+                    .check_candidate(&review, package.clone())
+                    .await
+                    .expect(
+                        "native owner must present advisory consent after dependency resolution",
+                    );
                 fresh.banned_packages.push(package.name.clone());
                 let error = service
                     .check_candidate(&fresh, package.clone())
