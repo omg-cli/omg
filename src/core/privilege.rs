@@ -1180,6 +1180,173 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "arch", target_os = "linux"))]
+    fn command_constructors_preserve_policy_and_refuse_invalid_handoffs() {
+        use crate::core::security::policy::{
+            POLICY_MARKER, PolicyError, SecurityGrade, SecurityPolicy,
+        };
+        use crate::package_managers::arch::{NativeOmarchyInteraction, NativeOmarchyOperation};
+
+        const TEST: &str = "core::privilege::tests::command_constructors_preserve_policy_and_refuse_invalid_handoffs";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return;
+        }
+        assert!(!is_root(), "policy receiver must be unprivileged");
+        let directory = tempfile::tempdir_in("/var/tmp").expect("private policy fixture");
+        let config = directory.path().join("config");
+        let home = directory.path().join("home");
+        std::fs::create_dir(&config).expect("private config directory");
+        std::fs::create_dir(&home).expect("private home directory");
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ("HOME", Some(home.as_os_str())),
+                ("OMG_TEST_MODE", None),
+                ("OMG_TEST_DISTRO", None),
+                ("CARGO_PRIMARY_PACKAGE", Some(std::ffi::OsStr::new("1"))),
+                ("SUDO_USER", None),
+                ("SUDO_HOME", None),
+                ("DOAS_USER", None),
+            ],
+            || {
+                assert_eq!(crate::core::paths::config_dir(), config);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("policy command test runtime");
+                let policy = SecurityPolicy {
+                    minimum_grade: SecurityGrade::Verified,
+                    allow_aur: false,
+                    require_pgp: true,
+                    allowed_licenses: vec!["MIT".into()],
+                    banned_packages: vec!["blocked-fixture-package".into()],
+                    ..SecurityPolicy::default()
+                };
+                let file = config.join("policy.toml");
+                for explicit in [false, true] {
+                    if explicit {
+                        std::fs::write(
+                            &file,
+                            toml::to_string(&policy).expect("serialize explicit policy"),
+                        )
+                        .expect("write explicit policy");
+                    }
+                    let command = native_omarchy_command(
+                        NativeOmarchyOperation::UpgradeRepositories,
+                        NativeOmarchyInteraction::Unattended,
+                    )
+                    .expect("construct native command");
+                    let args: Vec<_> = command
+                        .as_std()
+                        .get_args()
+                        .map(|arg| arg.to_str().expect("UTF-8 fixture argument").to_owned())
+                        .collect();
+                    assert_eq!(
+                        &args[..7],
+                        [
+                            "-n",
+                            "--",
+                            "/usr/bin/systemd-run",
+                            "--scope",
+                            "--quiet",
+                            "--collect",
+                            "--"
+                        ]
+                    );
+                    assert_eq!(
+                        args[7],
+                        elevation_executable()
+                            .expect("current elevation executable")
+                            .to_str()
+                            .expect("UTF-8 fixture executable")
+                    );
+                    assert_eq!(args[8], ELEVATED_MARKER);
+                    let payload = &args[9..];
+                    if explicit {
+                        assert_eq!(payload.len(), 5, "explicit policy must precede operation");
+                        let encoded = payload[0]
+                            .strip_prefix(POLICY_MARKER)
+                            .expect("policy precedes private operation");
+                        let decoded: SecurityPolicy = serde_json::from_slice(
+                            &hex::decode(encoded).expect("hex policy handoff"),
+                        )
+                        .expect("decode policy handoff");
+                        assert_eq!(decoded, policy);
+                    }
+                    let offset = usize::from(explicit);
+                    assert_eq!(
+                        &payload[offset..],
+                        ["omarchy-native", "--", "repository-upgrade", "unattended"]
+                    );
+                    let refusal = runtime
+                        .block_on(sudo_payload_status(&["fullupdate", "--"]))
+                        .expect_err("development mode must refuse elevation")
+                        .to_string();
+                    assert!(
+                        refusal
+                            .starts_with("Privilege elevation not supported in development mode.")
+                    );
+                    let mut proposed = vec!["fullupdate".to_owned(), "--".to_owned()];
+                    if explicit {
+                        proposed.insert(0, payload[0].clone());
+                    }
+                    assert!(
+                        refusal.ends_with(&format!("{proposed:?}")),
+                        "development refusal must preserve policy and operation"
+                    );
+                }
+                std::fs::write(&file, "require_pgp = 'not-a-boolean'")
+                    .expect("write malformed policy");
+                for error in [
+                    native_omarchy_command(
+                        NativeOmarchyOperation::UpgradeRepositories,
+                        NativeOmarchyInteraction::Unattended,
+                    )
+                    .expect_err("malformed policy must refuse command construction"),
+                    runtime
+                        .block_on(sudo_payload_status(&["fullupdate", "--"]))
+                        .expect_err("malformed policy must refuse ordinary elevation"),
+                ] {
+                    let parse_error = error
+                        .downcast_ref::<PolicyError>()
+                        .expect("malformed handoff must preserve the parse error");
+                    assert!(
+                        matches!(parse_error, PolicyError::Parse { .. }),
+                        "malformed handoff must preserve the parse error"
+                    );
+                }
+                let oversized = SecurityPolicy {
+                    banned_packages: vec!["x".repeat(32769)],
+                    ..policy
+                };
+                std::fs::write(
+                    &file,
+                    toml::to_string(&oversized).expect("serialize oversized policy"),
+                )
+                .expect("write oversized policy");
+                for error in [
+                    native_omarchy_command(
+                        NativeOmarchyOperation::UpgradeRepositories,
+                        NativeOmarchyInteraction::Unattended,
+                    )
+                    .expect_err("oversized policy must refuse command construction"),
+                    runtime
+                        .block_on(sudo_payload_status(&["fullupdate", "--"]))
+                        .expect_err("oversized policy must refuse ordinary elevation"),
+                ] {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Security policy exceeds elevation handoff limit")
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
     fn payload_command_transmits_elevation_via_argv_marker() {
         // Regression: OMG_ELEVATED=1 in the child environment is stripped by
         // sudo's env_reset, which killed every fast-elevated path. The marker
