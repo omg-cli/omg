@@ -3,6 +3,7 @@
 use super::scan::{AdvisoryProvenance, FindingApplicability};
 use super::vulnerability::PackageAssessment;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 pub(crate) struct AdvisoryRiskReview {
     id: String,
@@ -70,14 +71,14 @@ impl AdvisoryRiskReview {
                 &assessment.package.version,
                 &assessment.package.architecture,
             ))?;
-            details.push_str(&format!("Package: {package}\n"));
+            let _ = writeln!(details, "Package: {package}");
             if let Some(reason) = assessment.coverage.unknown_reason() {
-                details.push_str(&format!("Coverage: unknown ({reason:?})\n"));
+                let _ = writeln!(details, "Coverage: unknown ({reason:?})");
             } else {
                 details.push_str("Coverage: assessed\n");
             }
             let source = serde_json::to_string(&assessment.coverage.provenance())?;
-            details.push_str(&format!("Source: {source}\n"));
+            let _ = writeln!(details, "Source: {source}");
             for finding in &assessment.findings {
                 let confidence = match finding.applicability {
                     FindingApplicability::Applicable => "affected version",
@@ -85,19 +86,20 @@ impl AdvisoryRiskReview {
                 };
                 let id = serde_json::to_string(&finding.id)?;
                 let summary = serde_json::to_string(&finding.summary)?;
-                details.push_str(&format!("  {id} ({confidence})\n  {summary}\n"));
+                let _ = writeln!(details, "  {id} ({confidence})\n  {summary}");
                 if let Some(url) = advisory_link(&finding.id) {
-                    details.push_str(&format!("  {url}\n"));
+                    let _ = writeln!(details, "  {url}");
                 }
                 if let Some(native) = &finding.native_advisory {
                     let source = serde_json::to_string(&native.source)?;
                     let description = serde_json::to_string(&native.description)?;
-                    details.push_str(&format!(
-                        "  Source: {source}\n  Provider details: {description}\n"
-                    ));
+                    let _ = writeln!(
+                        details,
+                        "  Source: {source}\n  Provider details: {description}"
+                    );
                     for reference in &native.references {
                         if let Some(url) = safe_reference(&reference.url) {
-                            details.push_str(&format!("  {url}\n"));
+                            let _ = writeln!(details, "  {url}");
                         }
                     }
                 }
