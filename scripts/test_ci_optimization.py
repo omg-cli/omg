@@ -118,6 +118,12 @@ class OptimizationContracts(unittest.TestCase):
             producer = scripts / 'native-cli-coverage.py'
             producer.write_bytes(b'print("fixture producer")\n')
             producer.chmod(0o666)
+            advisory_sources = []
+            for name in ('test-arch-advisory-consent.py', 'qemu-arch-advisory-oracle.py'):
+                source = scripts / name
+                source.write_bytes((ROOT / 'scripts' / name).read_bytes())
+                source.chmod(0o666)
+                advisory_sources.append(source)
             artifacts = {}
             from test_native_cli_coverage import PRODUCER
             for role in PRODUCER.ROLES:
@@ -129,7 +135,8 @@ class OptimizationContracts(unittest.TestCase):
             manifest.write_text(json.dumps({'artifacts': artifacts}))
             manifest.chmod(0o666)
             originals = {path: (stat.S_IMODE(path.stat().st_mode), path.read_bytes())
-                         for path in (producer, manifest, *(Path(a['path']) for a in artifacts.values()))}
+                         for path in (producer, manifest, *advisory_sources,
+                                      *(Path(a['path']) for a in artifacts.values()))}
             fixture = root / 'fixture'
             fixture.write_bytes(b'native fixture')
             fixture.chmod(0o755)
@@ -151,7 +158,14 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
             arguments = capture.read_bytes().split(b'\0')[:-1]
             copied = {target.decode(): (root / source.decode()).resolve()
                       for source, target in zip(arguments[::2], arguments[1::2])}
-            self.assertEqual(copied, {'fixture-container:/fixture': fixture})
+            self.assertEqual(copied, {
+                'fixture-container:/fixture': fixture,
+                'fixture-container:/advisory-fixture': runner / 'advisory-fixture',
+            })
+            for original in advisory_sources:
+                staged = runner / 'advisory-fixture' / original.name
+                self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o644)
+                self.assertEqual(staged.read_bytes(), original.read_bytes())
             for original, name in ((producer, 'native-cli-coverage.py'),
                                    (manifest, 'native-cli-manifest.json')):
                 staged = runner / 'native-cli-inputs' / name
@@ -203,8 +217,9 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
             binary.write_text('fixture')
             binary.chmod(0o755)
             (root / 'scripts').mkdir()
-            (root / 'scripts/native-cli-coverage.py').write_bytes(
-                (ROOT / 'scripts/native-cli-coverage.py').read_bytes())
+            for name in ('native-cli-coverage.py', 'test-arch-advisory-consent.py',
+                         'qemu-arch-advisory-oracle.py'):
+                (root / 'scripts' / name).write_bytes((ROOT / 'scripts' / name).read_bytes())
             from test_native_cli_coverage import PRODUCER
             artifacts = ['debug/omg', 'debug/omgd'] + [
                 f'debug/deps/{harness.binary}-1111111111111111'
@@ -359,7 +374,8 @@ git() { printf '%040d\\n' 1; }
         self.assertIn('cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build', selected)
         self.assertIn('"$test_name" == cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build', script)
         self.assertEqual(len(selected), len(set(selected)))
-        self.assertEqual(len(selected), 25)
+        self.assertIn('package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction', selected)
+        self.assertEqual(len(selected), 26)
         for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
             name = 'package_managers::arch_install::native_tests::' + test
             self.assertIn(name, selected)
