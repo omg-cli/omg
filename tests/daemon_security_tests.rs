@@ -106,7 +106,7 @@ async fn audit_append_failure_marks_the_explicit_daemon_collection_incomplete() 
         original,
         "existing audit history must survive the append failure"
     );
-    let report = AuditLogger::new_in(&history)?.verify_integrity()?;
+    let report = AuditLogger::new_in(history)?.verify_integrity()?;
     assert!(report.is_valid());
     assert_eq!(report.total_entries, 1);
     assert!(

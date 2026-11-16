@@ -3403,8 +3403,8 @@ mod tests {
         fs::rename(&desc, &saved)?;
         fs::create_dir(&desc)?;
 
-        let audit_path = std::path::Path::new("/var/lib/omg/audit/audit.jsonl");
-        let audit_before = crate::core::security::AuditLogger::new_in(audit_path)
+        let audit_path = std::path::PathBuf::from("/var/lib/omg/audit/audit.jsonl");
+        let audit_before = crate::core::security::AuditLogger::new_in(&audit_path)
             .expect("initialize disposable fixture audit state")
             .get_recent(usize::MAX)
             .expect("read a valid disposable fixture audit baseline")

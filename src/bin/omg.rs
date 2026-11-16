@@ -2309,8 +2309,6 @@ mod tests {
                 corrupt,
                 "{outcome}: recovery must preserve history loss"
             );
-            let logger = omg_lib::core::security::audit::AuditLogger::new_in(&log)?;
-            assert!(logger.verify_integrity()?.chain_valid, "{outcome}");
             if corrupt {
                 let error = omg_lib::core::security::audit::ensure_complete_collection(&marker)
                     .expect_err("recovered history remains incomplete");
@@ -2335,6 +2333,8 @@ mod tests {
                     b"{truncated historical event\n"
                 );
             }
+            let logger = omg_lib::core::security::audit::AuditLogger::new_in(log)?;
+            assert!(logger.verify_integrity()?.chain_valid, "{outcome}");
         }
         Ok(())
     }
