@@ -2013,21 +2013,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_vuln_source_fails_closed() -> anyhow::Result<()> {
+    async fn unavailable_vuln_source_fails_closed() {
         let policy = SecurityPolicy {
             advisory_requirement: AdvisoryRequirement::Review,
             ..SecurityPolicy::default()
         };
-        let service = update_service(policy, std::sync::Arc::new(FailingVulns))?;
+        let service = update_service(policy, std::sync::Arc::new(FailingVulns))
+            .expect("build unavailable-source fixture");
         let error = service
             .update()
             .await
             .expect_err("missing evidence must not look like a clean package");
+        let error = error
+            .downcast::<VulnerabilityError>()
+            .expect("service must preserve the vulnerability error type");
         assert!(
-            matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "osv unavailable"),
+            matches!(
+                error,
+                VulnerabilityError::Unavailable { ref reason } if reason == "osv unavailable"
+            ),
             "scanner error must be preserved, got: {error}"
         );
-        Ok(())
     }
 
     #[test]
