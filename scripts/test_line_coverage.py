@@ -734,6 +734,155 @@ class SourceAwareCoverageTests(unittest.TestCase):
         return self.compare(before=before, after=after, mutate=owners,
             sources=({'example.rs': old}, {'example.rs': new}))
 
+    def eager_prefix_compare(self, mutation=None, fixture_name='coverage-eager-prefix.json'):
+        fixture = json.loads((SCRIPT.parent / 'fixtures' / fixture_name).read_text(encoding='utf-8'))
+        if mutation:
+            mutation(fixture['base'], fixture['head'])
+        def owners(base, head):
+            base['data'][0]['functions'] = fixture['base']['owners']
+            head['data'][0]['functions'] = fixture['head']['owners']
+        return self.compare(before=fixture['base']['counts'], after=fixture['head']['counts'],
+            mutate=owners, sources=tuple({'example.rs': ('\n'.join(fixture[side]['source'])+'\n').encode()}
+                                        for side in ('base', 'head')))
+
+    def test_identical_eager_prefix_survives_a_later_call_result_check(self):
+        receipt = self.eager_prefix_compare()
+        self.assertEqual(receipt['deleted_mapped'], 0)
+        witnesses = [row for row in receipt['retained_replacement_obligations'] if 'eager_call_prefix' in row]
+        self.assertEqual(len(witnesses), 1)
+        self.assertTrue(all(line <= 9 for line, target in witnesses[0]['pairs']))
+
+    def test_native_eager_chain_prefix_survives_a_changed_return_type_and_continuation(self):
+        receipt = self.eager_prefix_compare(fixture_name='coverage-eager-chain-prefix.json')
+        witnesses = [row for row in receipt['retained_replacement_obligations'] if 'eager_call_prefix' in row]
+        self.assertEqual(len(witnesses), 1)
+        self.assertEqual(receipt['deleted_mapped'], 0)
+
+    def test_native_eager_chain_refuses_changed_conditions_or_mixed_regions(self):
+        for mode in ('condition', 'cold_subregion'):
+            def mutate(base, head):
+                if mode == 'condition':
+                    head['source'][7] = head['source'][7].replace('if parent_records', 'if changed_flag')
+                else:
+                    for side, line in ((base, 27), (head, 26)):
+                        for owner in side['owners']:
+                            if owner['regions'][0][0] == 1:
+                                state = int(owner['count'] > 0) if side is base else 0
+                                owner['regions'].append([line, 13, line, 20, state, 0, 0, 0])
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.eager_prefix_compare(mutate, fixture_name='coverage-eager-chain-prefix.json')
+
+    def test_changed_parameters_or_missing_copies_cannot_receive_an_eager_chain_prefix_witness(self):
+        for mode in ('parameter', 'missing_copy'):
+            def mutate(base, head):
+                if mode == 'parameter':
+                    head['source'][1] = head['source'][1].replace('sudo_program:', 'different_program:')
+                else:
+                    index = next(index for index, owner in enumerate(head['owners']) if owner['regions'][0][0] == 1)
+                    del head['owners'][index]
+            with self.subTest(mode=mode):
+                receipt = self.eager_prefix_compare(mutate, fixture_name='coverage-eager-chain-prefix.json')
+                self.assertFalse(any('eager_call_prefix' in row
+                    for row in receipt.get('retained_replacement_obligations', [])))
+
+    def test_eager_prefix_refuses_cold_or_changed_raw_parent_regions(self):
+        for mode in ('cold', 'geometry', 'missing'):
+            def mutate(base, head):
+                parent = head['owners'][1]
+                if mode == 'cold':
+                    parent['regions'][6][4] = 0
+                elif mode == 'geometry':
+                    parent['regions'][6][1] += 1
+                else:
+                    del parent['regions'][6]
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.eager_prefix_compare(mutate)
+
+    def test_eager_prefix_witness_refuses_preceding_deferred_control_or_macro_work(self):
+        calls = []
+        original = coverage.eager_call_prefix_obligations
+        def inspect(*args):
+            calls.append(args)
+            return original(*args)
+        with patch.object(coverage, 'eager_call_prefix_obligations', side_effect=inspect):
+            self.eager_prefix_compare()
+        self.assertEqual(len(calls), 1)
+        name, sources, counts, descriptors, inventories, grouped, work = calls[0]
+        for expression in ('hidden(|| make_path())', 'resolve!()',
+                           'match enabled { true => make_path(), false => fallback() }'):
+            changed = [list(source) for source in sources]
+            for source in changed:
+                source[4] = '        let exe = ' + expression + ';'
+            budget = [64_000_000]
+            inventory = [coverage._construct_inventory(source, budget) for source in changed]
+            descriptor = [dict(previous, row=next(row for row in current[1] if row['kind'] == 'fn'))
+                          for previous, current in zip(descriptors, inventory)]
+            with self.subTest(expression=expression):
+                self.assertIsNone(original(name, changed, counts, descriptor, inventory, grouped, budget))
+
+    def test_eager_prefix_keeps_one_joint_matching_across_complete_copies(self):
+        def copies(base, head, split=False):
+            for side in (base, head):
+                extra = json.loads(json.dumps(side['owners']))
+                for owner in extra:
+                    owner['name'] = re.sub(r'Cs[^_]+_', 'Cs2_', owner['name'])
+                    owner['count'] = 0
+                    for region in owner['regions']:
+                        region[4] = 0
+                side['owners'].extend(extra)
+            if split:
+                head['owners'][1]['regions'][6][4] = 0
+                head['owners'][3]['regions'][6][4] = 1
+        receipt = self.eager_prefix_compare(copies)
+        proof = next(row for row in receipt['retained_replacement_obligations'] if 'eager_call_prefix' in row)
+        self.assertEqual(len(proof['base_instance_states']), 2)
+        self.assertEqual(len(proof['instance_matching']), 2)
+        with self.assertRaisesRegex(ValueError, 'Eager call prefix lost compiled-copy coverage'):
+            self.eager_prefix_compare(lambda base, head: copies(base, head, split=True))
+
+    def test_eager_prefix_refuses_foreign_overlapping_owners_and_changed_bindings(self):
+        for mode in ('foreign', 'binding', 'callee'):
+            def mutate(base, head):
+                if mode == 'foreign':
+                    head['owners'].append(dict(name='_RNvCs2_7example7foreign', count=1,
+                        filenames=['/src/example.rs'], regions=[[7, 13, 7, 41, 1, 0, 0, 0]]))
+                elif mode == 'binding':
+                    for side, provider in ((base, 'first'), (head, 'second')):
+                        side['source'].insert(0, f'use {provider}::payload_command;')
+                        side['counts'] = [[line+1, count] for line, count in side['counts']]
+                        for owner in side['owners']:
+                            for region in owner['regions']:
+                                region[0] += 1; region[2] += 1
+                else:
+                    head['source'][5] = head['source'][5].replace('payload_command', 'changed_command')
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.eager_prefix_compare(mutate)
+
+    def test_eager_prefix_cannot_paint_a_cold_subregion_under_a_hot_parent(self):
+        def mutate(base, head):
+            for side in (base, head):
+                side['owners'][1]['regions'].append([6, 1, 9, 34, 1, 0, 0, 0])
+            head['owners'][1]['regions'][6][4] = 0
+        with self.assertRaisesRegex(ValueError, 'Eager call prefix lost compiled-copy coverage'):
+            self.eager_prefix_compare(mutate)
+
+    def test_eager_prefix_obeys_the_shared_work_bound(self):
+        calls = []
+        original = coverage.eager_call_prefix_obligations
+        def inspect(*args):
+            calls.append(args)
+            return original(*args)
+        with patch.object(coverage, 'eager_call_prefix_obligations', side_effect=inspect):
+            self.eager_prefix_compare()
+        self.assertEqual(len(calls), 1)
+        budget = [64_000_000]
+        result = original(*calls[0][:-1], budget)
+        self.assertIsNotNone(result)
+        used = 64_000_000 - budget[0]
+        self.assertGreater(used, 0)
+        with self.assertRaisesRegex(ValueError, 'work'):
+            original(*calls[0][:-1], [used - 1])
+
     def test_extracted_callback_requires_complete_source_ownership_proof(self):
         with self.assertRaisesRegex(ValueError, 'complete callback/phase evidence required'):
             self.extracted_callback_predicate_compare()

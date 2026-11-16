@@ -2131,6 +2131,125 @@ def fully_covered_replacement(name, old, new, before, after, descriptors, groupe
         summary_credit=[0, 0], mapped_credit=[0, 0])
 
 
+def eager_call_prefix_obligations(name, sources, counts, descriptors, inventories, grouped, work):
+    """Prove only initial direct-call evaluation before a changed continuation."""
+    codes = [inventory[0] for inventory in inventories]
+    functions = [descriptor['row'] for descriptor in descriptors]
+    if any('async' in function['header'] for function in functions):
+        return None
+    bodies = []
+    for code, function in zip(codes, functions):
+        _construct_charge(work, function['end'] - function['opening'])
+        bodies.append(code.words[function['opening'] + 1:function['end']])
+    common = 0
+    while common < min(map(len, bodies)) and bodies[0][common] == bodies[1][common]:
+        _construct_charge(work, len(bodies[0][common]) + 1)
+        common += 1
+    forbidden = {'|', '||', '&&', 'async', 'await', '!', '?', '#',
+                 'match', 'loop', 'while', 'for', 'return', 'break',
+                 'continue', 'yield', 'fn', 'use', 'const', 'static', 'type', 'mod',
+                 'struct', 'enum', 'impl', 'trait', 'extern', 'macro_rules'}
+    if (not common or common == min(map(len, bodies)) or bodies[0][common - 1] != ')'
+            or {bodies[0][common], bodies[1][common]} != {';', '.'}
+            or forbidden.intersection(bodies[0][:common])):
+        return None
+    ends = [function['opening'] + common for function in functions]
+    for code, function, end in zip(codes, functions, ends):
+        opening = code.pairs[end]
+        if code.parents[opening] != function['opening']:
+            return None
+        if code.words[end + 1] == '.' and (re.fullmatch(r'[A-Za-z_]\w*', code.words[end + 2]) is None
+                or code.words[end + 3] != '('):
+            return None
+    bounds = [(code.position(code.starts[function['opening'] + 1])[0],
+               code.position(code.ends[end])[0]) for code, function, end in zip(codes, functions, ends)]
+    positions = [[code.position(code.starts[function['opening'] + 1 + offset])[0]
+                  for offset in range(common)] for code, function in zip(codes, functions)]
+    line_targets = {}; target_lines = {}
+    _construct_charge(work, common * 3)
+    for line, target in zip(*positions):
+        line_targets.setdefault(line, set()).add(target)
+        target_lines.setdefault(target, set()).add(line)
+    mapped = []
+    for line, targets in line_targets.items():
+        if len(targets) != 1:
+            continue
+        target, = targets
+        if target_lines[target] != {line}:
+            continue
+        _construct_charge(work, len(sources[0][line - 1]) + len(sources[1][target - 1]))
+        if sources[0][line - 1] != sources[1][target - 1]:
+            continue
+        if line in counts[0] or target in counts[1]:
+            if line not in counts[0] or target not in counts[1]:
+                return None
+            mapped.append((line, target))
+    if not mapped:
+        return None
+    geometries = []; vectors = []
+    for side, (source, descriptor, compiled) in enumerate(zip(sources, descriptors, grouped)):
+        members = descriptor['group'][2]; shapes = []; states = []; observed = set()
+        member_ids = {id(owner) for owner in members}
+        for owner in compiled[0]:
+            _construct_charge(work, len(mapped) * (len(owner['regions']) + 1))
+            if id(owner) not in member_ids and any(
+                    tuple(region[:2]) < (pair[side], len(source[pair[side] - 1].encode()) + 1)
+                    and (pair[side], 1) < tuple(region[2:4])
+                    for pair in mapped for region in owner['regions']):
+                return None
+        for owner in members:
+            pieces = []
+            for ordinal, pair in enumerate(mapped):
+                line = pair[side]; text = source[line - 1]
+                low, high = (line, 1), (line, len(text.encode()) + 1)
+                _construct_charge(work, len(owner['regions']))
+                clipped = []
+                for region in owner['regions']:
+                    start, end = max(tuple(region[:2]), low), min(tuple(region[2:4]), high)
+                    if start < end:
+                        clipped.append(((ordinal, start[1], end[1], *region[5:]), int(region[4] > 0)))
+                        if region[4] > 0:
+                            observed.add(ordinal)
+                if not clipped:
+                    return None
+                pieces.extend(clipped)
+            _construct_charge(work, len(pieces) * (len(pieces).bit_length() + 3))
+            pieces.sort()
+            shapes.append(tuple(shape for shape, state in pieces))
+            states.append(tuple(state for shape, state in pieces))
+        _construct_charge(work, len(mapped))
+        if any(bool(counts[side][pair[side]]) != (ordinal in observed)
+               for ordinal, pair in enumerate(mapped)):
+            return None
+        geometries.append(shapes); vectors.append(states)
+    if len(vectors[0]) != len(vectors[1]) or not vectors[0]:
+        return None
+    raw_regions = None
+    if any(shape != geometries[0][0] for side in geometries for shape in side):
+        normalized = homogeneous_clipped_regions(geometries, vectors, work)
+        if normalized is None:
+            return None
+        raw_regions = dict(geometry=geometries, instance_states=vectors)
+        geometries, vectors = normalized
+        if any(shape != geometries[0][0] for side in geometries for shape in side):
+            return None
+    _construct_charge(work, (len(vectors[0]) * len(vectors[1]) + 1) * len(vectors[0][0]))
+    matching = compiled_hit_state_matching(*vectors)
+    if matching is None:
+        raise ValueError('Eager call prefix lost compiled-copy coverage')
+    _construct_charge(work, len(repr(descriptors[0]['context'])) + len(repr(descriptors[0]['signature'])))
+    receipt = dict(file=name, pairs=mapped,
+        eager_call_prefix=dict(base_range=list(bounds[0]), head_range=list(bounds[1]),
+            source_sha256=hashlib.sha256(repr(bodies[0][:common]).encode()).hexdigest(),
+            context_sha256=hashlib.sha256(repr(descriptors[0]['context']).encode()).hexdigest(),
+            declaration_sha256=hashlib.sha256(repr(descriptors[0]['signature']).encode()).hexdigest()),
+        geometry=geometries[0][0], base_instance_states=vectors[0], head_instance_states=vectors[1],
+        instance_matching=matching, claim='Complete-copy initial direct-call evaluation only')
+    if raw_regions is not None:
+        receipt['homogeneous_clipped_regions'] = raw_regions
+    return dict(mapped), receipt
+
+
 def retained_replacement_obligations(name, old, new, before, after, inventories, grouped,
                                      replacements, work, head_counts=None, parent_files=None):
     if not replacements or any(value is None for value in tuple(inventories) + tuple(grouped)):
@@ -2198,6 +2317,9 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 selected_bindings.sort(key=lambda entry: entry[0])
                 context_cache[key] = tuple(value for index, value in selected_bindings)
             header[fn + 1] = '<declaration>'
+            parameter_opening = row['first'] + fn + 2
+            parameter_signature = (tuple(header[:code.pairs[parameter_opening] - row['first'] + 1])
+                if code.words[parameter_opening] == '(' else None)
             first = bisect.bisect_right(statement_starts, row['opening'])
             last = bisect.bisect_left(statement_starts, row['end'])
             _construct_charge(work, last - first)
@@ -2209,6 +2331,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 by_digest.setdefault(statement['digest'], []).append(statement)
             functions[prefix] = dict(group=group, row=row, declaration=declaration,
                 signature=tuple(header), attributes=attributes, context=(scope_key, context_cache[key]),
+                parameter_signature=parameter_signature,
                 statements=by_digest, constructs=by_opening)
         descriptors.append(functions)
     statement_contexts = {}; capsule_indexes = {}
@@ -2440,9 +2563,12 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 and left['context'][0] == right['context'][0]
                 and (left['context'] != right['context'] or left['attributes'] != right['attributes']
                      or left['signature'] != right['signature']))
+            prefix_only = (left_prefix == right_prefix and left['signature'] != right['signature']
+                and left['parameter_signature'] is not None
+                and left['parameter_signature'] == right['parameter_signature'])
             if (not complete_test_rewrite and (left['context'] != right['context']
                     or left['attributes'] != right['attributes']
-                    or left['signature'] != right['signature'] and not method_migration)):
+                    or left['signature'] != right['signature'] and not method_migration and not prefix_only)):
                 continue
             seeds = []; parent = None
             renamed = left_prefix != right_prefix
@@ -2482,7 +2608,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                             inventory[0].words[descriptor['row']['opening'] + 1:descriptor['row']['end']])
                             for descriptor, inventory in zip((left, right), inventories)):
                         continue
-            candidates.append((left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite))
+            candidates.append((left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite, prefix_only))
     left_counts = Counter(row[0] for row in candidates); right_counts = Counter(row[1] for row in candidates)
     pairs = {}; receipts = []; proved_functions = set(); excerpts = []
     _construct_charge(work, 3 * (len(old) + len(new)))
@@ -2490,7 +2616,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                   for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
                   if tag == 'equal' for line in range(a, b)]
     equal_positions = [row[0] for row in equal_rows]
-    for left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite in candidates:
+    for left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite, prefix_only in candidates:
         if left_counts[left_prefix] != 1 or right_counts[right_prefix] != 1:
             continue
         groups = left['group'], right['group']
@@ -2501,6 +2627,18 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     if groups[0][0] <= row['base_line'] <= groups[0][1]
                     and groups[1][0] <= row['head_line'] <= groups[1][1]]
         if not selected:
+            continue
+        if left_prefix == right_prefix:
+            eager = eager_call_prefix_obligations(name, (old, new), (before, after),
+                (left, right), inventories, grouped, work)
+            if eager is not None:
+                eager_pairs, eager_receipt = eager
+                if any(line in pairs and pairs[line] != target for line, target in eager_pairs.items()):
+                    raise ValueError('Ambiguous eager prefix correspondence')
+                pairs.update(eager_pairs); receipts.append(eager_receipt)
+                excerpts.extend(('\n'.join(source[group[0] - 1:group[1]]) + '\n').encode()
+                                for source, group in zip((old, new), groups))
+        if prefix_only:
             continue
         if (complete_test_rewrite or parent is not None and parent[0].startswith('method:')
                 and (left['signature'] != right['signature'] or not seeds)):
