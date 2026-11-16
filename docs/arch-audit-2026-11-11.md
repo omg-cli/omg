@@ -1901,3 +1901,55 @@ correspondence, later retained-source obligations and the original comparison
 work bound remain open. No release rebuild, installation, full VM/performance
 acceptance, independent security review or CVE archive certification is claimed
 for this continuation. The broader goal remains active.
+
+### Windows continuation: nominal async ownership
+
+Hosted head `eba415af` passed its instrumented producer. Its sealed comparison
+cleared the sanitizer and refused status-model line 137 -> 158. The two raw
+owners are the outer async timeout call and the inner async poll entry.
+`a30d2f19` binds the complete lexical phase tree to each nominal method copy,
+including entry/completion observations, raw parent/child identities and every
+region claimed by retained fragments. One joint matching covers all retained
+fragments. Missing polls, siblings, copies, foreign owners, changed contexts or
+geometry and scattered hits remain refused. Repeated-text candidates are
+distinguished by ownership and geometry, never by their hit counts. This proof
+refuses unsupported forms.
+
+The published checker fails the new trait/inherent-method fixture. The candidate
+passes 325 comparator regressions, including 22 malformed phase cases, joint
+matching, changed-call context and exhausted shared-work checks. On the
+unmodified [sealed report pair](https://github.com/omg-cli/omg/actions/runs/43744548312/artifacts/14174626090),
+the status ownership proof matches copies [0,1] and leaves 32,470,845 of the
+original 64,000,000 work units. The overall comparison still refuses new cold
+test code at line 388; this is correspondence proof, not coverage acceptance.
+
+`f4ef743a` preserves those fixture refusals in two private test helpers and tests
+invalid commands/messages explicitly. The real socket test waits for the
+server's observed WouldBlock state before connecting. Unexpected accept errors
+still fail, and the three-second bounds remain. All 10 status tests and 16 style
+tests pass. Fresh isolated profiles include the root and two UID-65534 processes;
+all 352 mapped status-test rows are positive. The first collection had a child
+profile permission error and is not used. The accepted local unit binary SHA-256
+is `3e76a67eab348126df918fd0f970034374369ef91c8d54f0f33d78f3469ae0fc`.
+It was built from the working sources committed in this slice; its build-start
+Git revision remains `eba415af`. It is not a release or complete multi-binary proof.
+
+`de9707d3` fixes the prior head's Clippy failures: the streaming helper now has
+its caller's feature gate, and the Unicode limit has digit separators. Fresh
+Arch all-target and no-default-feature library Clippy pass with warnings denied.
+All 459 adjacent Python regressions, formatting and diff checks pass.
+
+All-target Clippy metadata required additional target headroom. The recorded
+growth allowance is now 16 GiB from the original baseline, with two workers,
+unchanged debug/split-debug/incremental settings, the 100 GiB distro cap and
+20 GiB C: reserve. After the feature checks, VHD allocation was 21,295,529,984
+bytes, guest use 20,169,420,800 bytes and backing free space 732,472,844,288 bytes.
+No coverage, release or comparison-work setting changed.
+
+The prior CI also has an independent Fedora SQLite full-RPM %check failure:
+Tcl could not write a VCheck diagnostic containing invalid Unicode. Its failure
+artifact and raw build log are preserved. No upstream tests or encoding checks
+were skipped or relaxed. Fresh hosted CI/coverage, the remaining correspondence
+and work-bound obligations, release/VM/performance acceptance and CVE archive
+certification remain open. This continuation is solo, with no independent
+security or red-team review.
