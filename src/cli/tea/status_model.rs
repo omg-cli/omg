@@ -240,6 +240,29 @@ impl Model for StatusModel {
 mod tests {
     use super::*;
 
+    fn run_status_load(command: Cmd<StatusMsg>) -> anyhow::Result<StatusMsg> {
+        match command {
+            Cmd::Exec(load) => Ok(load()),
+            other => anyhow::bail!("load must return an executable command: {other:?}"),
+        }
+    }
+
+    fn loaded_status(message: &StatusMsg) -> anyhow::Result<&StatusData> {
+        match message {
+            StatusMsg::Loaded(data) => Ok(data),
+            other => anyhow::bail!("status request did not load: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_fixture_rejects_non_executable_commands_and_unloaded_messages() {
+        let error = run_status_load(Cmd::none()).expect_err("a missing load command must fail");
+        assert!(error.to_string().contains("executable command"));
+        let message = StatusMsg::Error("fixture refusal".into());
+        let error = loaded_status(&message).expect_err("an unloaded status message must fail");
+        assert!(error.to_string().contains("fixture refusal"));
+    }
+
     #[test]
     fn status_without_scan_never_claims_security_health() {
         for fast_mode in [false, true] {
@@ -373,19 +396,21 @@ mod tests {
             let socket = owner.path().join("status.sock");
             let listener = UnixListener::bind(&socket)?;
             listener.set_nonblocking(true)?;
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let server = std::thread::spawn(move || -> anyhow::Result<()> {
                 let started = Instant::now();
                 let mut stream = loop {
                     match listener.accept() {
                         Ok((stream, _)) => break stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        Err(error) => {
+                            anyhow::ensure!(error.kind() == std::io::ErrorKind::WouldBlock, error);
                             anyhow::ensure!(
                                 started.elapsed() < Duration::from_secs(3),
                                 "status client did not connect"
                             );
+                            ready_tx.send(())?;
                             std::thread::sleep(Duration::from_millis(1));
                         }
-                        Err(error) => return Err(error.into()),
                     }
                 };
                 stream.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -413,7 +438,8 @@ mod tests {
                         id: request.id(),
                         result: ResponseResult::Status(status),
                     })?,
-                )?;
+                )
+                .expect("status fixture response must be written");
                 Ok(())
             });
             let observed = temp_env::with_vars(
@@ -423,14 +449,10 @@ mod tests {
                     ("OMG_SOCKET_PATH", socket.to_str()),
                 ],
                 || -> anyhow::Result<()> {
+                    ready_rx.recv_timeout(Duration::from_secs(3))?;
                     let mut model = StatusModel::new().with_fast_mode(true);
-                    let Cmd::Exec(load) = model.update(StatusMsg::Load) else {
-                        anyhow::bail!("load must return an executable command");
-                    };
-                    let message = load();
-                    let StatusMsg::Loaded(data) = &message else {
-                        anyhow::bail!("status request did not load: {message:?}");
-                    };
+                    let message = run_status_load(model.update(StatusMsg::Load))?;
+                    let data = loaded_status(&message)?;
                     anyhow::ensure!(
                         (
                             data.total_packages,
