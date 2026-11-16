@@ -2395,3 +2395,67 @@ Clippy, VHD file length was 51,961,135,104 bytes, guest use 40,534,855,680 bytes
 guest available space 9,285,578,752 bytes and C: free space 590,485,102,592 bytes.
 Fresh full hosted comparison, later source/work obligations, release/VM/
 performance, independent review and private CVE completeness remain open.
+
+### Windows continuation: current CLI and constructor copy cohort
+
+The `7b6d8f4b` coverage producer passed in job 133363285664. Its full comparison
+in job 133376947959 progressed past the sudo spawn-error rows, then refused
+`src/core/security/audit.rs`: an unchanged constructor had an incomplete
+compiled-copy correspondence. Artifact 14237090102 binds original `f2413f80`
+to this head; ZIP SHA-256 is
+`7d3b3e4cf0288744eac1b4cbdb0d632b68f03886762fc3143b796cdfed9e45aa`.
+The canonical inventories contain five base copies and eight head copies of
+`AuditLogger::new_in`, each with the same fifteen-region geometry. Three new
+fixtures introduced a borrowed `Path` instantiation and two caller-crate
+borrowed `PathBuf` instantiations.
+
+Those fixtures now reuse existing `PathBuf` forms. The disposable reason-write
+fixture retains an owned path and borrows it for construction. The daemon
+fixture transfers its history path after its final direct read. The CLI exit
+fixture transfers its path after quarantine inspection, then checks the same
+integrity assertion. No assertion, native-fixture guard or production API was
+removed. The constructor and checker are byte-for-byte unchanged. Production
+prefixes before the test modules are unchanged too.
+
+Seven ordinary native checks pass: two unit constructor controls, CLI exit
+flushing, daemon append-failure handling, optional-daemon integrity refusal,
+chain integrity and borrowed-path parent-directory creation. The ignored
+reason-persistence fixture remains reserved for a disposable native guest;
+it was not run against the WSL host. All-target Arch Clippy, formatting and
+diff checks pass. Six exact-object exports, including the ordinary CLI, use
+only their matching module profiles and produce no LLVM warnings. Their union
+has the original five constructor copies, each exercised somewhere in the
+local cohort. This establishes the local inventory, not complete coverage of
+all constructor regions or full hosted acceptance. An initial combined export
+reported three function/profile mismatches and was excluded; its counters did
+not enter the final object-separated evidence.
+
+The preceding fresh instrumented development CLI, SHA-256
+`fc97c41e7c863d8f4764d0d38d68bd4d331ea2a8e0680248d197dcc64818a432`,
+passed version, JSON glibc info, official search and fast JSON status against
+the real Arch WSL database under UID 65534, with isolated user state and daemon
+bypass. Metadata, licenses and dependencies match pacman; all ten search
+results are official. Status agrees on 193 installed packages, 11 explicit
+packages and zero orphans. The database fingerprint stayed unchanged after
+every command. The first build crashed in rustc/LLVM while compiling
+sequoia-openpgp; one unchanged-command retry passed without compiler or profile
+changes. The cause is unproven and both logs remain. Before subsequent builds,
+all 2,021 CLI and 1,872 unit debug references were verified and hashed. These
+are development-CLI checks, not optimized performance or release/VM acceptance.
+
+At `7b6d8f4b`, CodeQL, Docker, mutation, security and secret scanning passed.
+CI run 43885699288 failed its aggregate because the macOS standalone job was
+cancelled without receiving a runner. The other executed lanes, including
+Arch and QEMU, passed. This remains a failed CI run. A current optimized pair
+and the original-base pair were downloaded with verified artifact hashes for
+a future controlled performance comparison; that comparison has not run.
+The current pair's merge-commit tree equals the PR head tree.
+
+The fixture wave used the existing 44 GiB growth budget, with a 3 GiB build
+forecast and fresh 1.5 GiB lint forecast. Two workers and existing coverage,
+debug, split-debug and incremental settings remained unchanged. After the
+final control and exports, guest use was 46,347,563,008 bytes, guest available
+space 3,472,871,424 bytes, VHD file length 51,961,135,104 bytes and C: free space
+580,726,091,776 bytes. No debug files were retired. Another Rust wave needs a
+fresh forecast and sufficient guest reserve. Full hosted comparison, native
+release/VM/performance, independent review and CVE completeness remain open.
