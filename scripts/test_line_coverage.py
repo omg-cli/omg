@@ -525,6 +525,59 @@ class SourceAwareCoverageTests(unittest.TestCase):
         return self.compare(before=counts, after=counts, mutate=owners,
             sources=({'example.rs': old}, {'example.rs': new}))
 
+    def extracted_callback_predicate_compare(self, mutation=None):
+        old = b'fn checked(text: &str) -> String {\n    text.chars()\n        .filter(|character| {\n            !character.is_control()\n        })\n        .collect()\n}\n'
+        new = (b'fn checked(text: &str) -> String {\n    text.chars()\n        .filter(|character| allowed(*character))\n        .collect()\n}\n'
+               b'fn allowed(character: char) -> bool {\n    !character.is_control()\n}\n')
+        def owners(base, head):
+            for document, source in ((base, old), (head, new)):
+                lines = source.decode().splitlines()
+                end = 7 if document is base else 5
+                members = []
+                for number in range(2):
+                    parent = f'_RNvCs{number + 1}_7example7checked'
+                    members.append(dict(name=parent, count=1, filenames=['/src/example.rs'], regions=[
+                        [1, 1, 1, lines[0].index('{') + 1, 1, 0, 0, 0],
+                        [2, 5, 2, len(lines[1]) + 1, 1, 0, 0, 0],
+                        [3, 10, 3, 16, 1, 0, 0, 0],
+                        [end-1, 9, end-1, len(lines[end-2]) + 1, 1, 0, 0, 0],
+                        [end, 1, end, 2, 1, 0, 0, 0]]))
+                    child_regions = ([[3, 29, 3, 30, 1, 0, 0, 0],
+                                      [4, 13, 4, len(lines[3]) + 1, 1, 0, 0, 0],
+                                      [5, 9, 5, 10, 1, 0, 0, 0]]
+                                     if document is base else [[3, 29, 3, 36, 1, 0, 0, 0],
+                                                               [3, 37, 3, 47, 1, 0, 0, 0]])
+                    members.append(dict(name='_RNC' + parent[2:] + '0B3_', count=1,
+                        filenames=['/src/example.rs'], regions=child_regions))
+                    if document is head:
+                        members.append(dict(name=f'_RNvCs{number + 1}_7example7allowed', count=1,
+                            filenames=['/src/example.rs'], regions=[
+                                [6, 1, 6, lines[5].index('{') + 1, 1, 0, 0, 0],
+                                [7, 5, 7, len(lines[6]) + 1, 1, 0, 0, 0],
+                                [8, 1, 8, 2, 1, 0, 0, 0]]))
+                document['data'][0]['functions'] = members
+            if mutation:
+                mutation(base['data'][0]['functions'], head['data'][0]['functions'])
+        before, after = ([(line, 2) for line in range(1, 8)],
+                         [(line, 2) for line in range(1, 9)])
+        return self.compare(before=before, after=after, mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_extracted_callback_requires_complete_source_ownership_proof(self):
+        with self.assertRaisesRegex(ValueError, 'complete callback/phase evidence required'):
+            self.extracted_callback_predicate_compare()
+
+    def test_closed_compiled_owner_inventory_cannot_fall_back_after_losing_a_copy_or_layout(self):
+        for mode in ('missing_copy', 'changed_geometry'):
+            def mutate(base, head):
+                if mode == 'missing_copy':
+                    del head[3:]
+                else:
+                    head[3]['regions'][1][1] += 1
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                    ValueError, 'complete compiled-copy inventory|closed compiled-owner layout'):
+                self.extracted_callback_predicate_compare(mutate)
+
     def test_changed_callback_body_keeps_precise_parent_and_child_obligations(self):
         result = self.changed_callback_compare()
         self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',

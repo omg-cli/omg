@@ -4296,6 +4296,21 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         grouped = [_compiled_function_groups(name, owners, files, source, construct_work, source_structure) for owners, files, source in (
             (owners_by_file.get(name, []), base_files, old), (head_owners_by_file.get(name, []), head_files, new))]
         base_groups, head_groups = (value[1] if value is not None else {} for value in grouped)
+        _construct_charge(construct_work, sum(len(group[2]) + 1
+            for groups in (base_groups, head_groups) for group in groups.values()))
+        closed = [{frozenset(id(owner) for owner in group[2]) for group in groups.values()}
+                  for groups in (base_groups, head_groups)]
+        for declaration in base_declarations.keys() & head_declarations.keys():
+            previous, current = base_declarations[declaration], head_declarations[declaration]
+            _construct_charge(construct_work, len(previous) + len(current) + 1)
+            if frozenset(map(id, previous)) not in closed[0]:
+                continue
+            if len(previous) != len(current):
+                raise ValueError(f'Ambiguous unchanged source correspondence: {name}; '
+                                 'Retained covered line requires a complete compiled-copy inventory')
+            if frozenset(map(id, current)) not in closed[1]:
+                raise ValueError(f'Ambiguous unchanged source correspondence: {name}; '
+                                 'Retained covered line requires a closed compiled-owner layout')
         for prefix, group in base_groups.items():
             target = head_groups.get(prefix)
             if target is not None and len(group[2]) == len(target[2]):
