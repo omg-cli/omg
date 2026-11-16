@@ -2459,3 +2459,73 @@ space 3,472,871,424 bytes, VHD file length 51,961,135,104 bytes and C: free spac
 580,726,091,776 bytes. No debug files were retired. Another Rust wave needs a
 fresh forecast and sufficient guest reserve. Full hosted comparison, native
 release/VM/performance, independent review and CVE completeness remain open.
+
+### Windows continuation: typed policy assertion and release latency
+
+At `80cebb8c`, CI, CodeQL, Docker, mutation, security and secret scanning passed.
+The coverage producer passed in job 133394925372. The complete comparison in
+job 133405496545 cleared the audit-constructor copy refusal and next refused
+`policy.rs:1622 -> 2028`: the retained assertion's closing row had no head
+mapping. Verified artifact 14238998816 binds original `f2413f80` to this head;
+its ZIP SHA-256 is
+`bcf72a76bf913e40a1dd2061e489f002ff64c6b068497ce6481d928fac690be5`.
+
+The unavailable-source mock test now recovers the public owned vulnerability
+error before asserting its variant and original reason. Its original unit
+return shape and exact multi-line assertion are restored; fixture setup
+failure remains fatal with an explicit diagnostic. No production policy code
+or error handling changed. A wrong provider error variant and a changed reason
+each fail the assertion in separately compiled controls. The restored test and
+two neighboring policy controls pass, including the isolated ordinary-user
+explicit-policy requirement. Final unit SHA-256 is
+`a3c73a91819d1ad8ddb15380d48a614bdf490ac219966311b7fff5a4fa5b19b3`.
+Only its one fresh intact profile enters the owned export. All 22 mapped test
+rows are positive, including the retained row, now 2035. Fault, build and
+neighboring profiles are excluded. All-target Arch Clippy, formatting and diff
+checks pass. The checker and original 64,000,000-unit capacity are unchanged.
+Fresh full hosted comparison remains necessary.
+
+The exact-head optimized CLI also ran against original-main `f2413f80` on the
+same unchanged Arch WSL catalogs. Both CI artifacts have matching pinned image,
+Rust/LLVM, feature, CPU and release settings without instrumentation. The
+candidate merge tree equals the PR head tree. Both candidate executable hashes
+also equal the preceding fixture-only head's executable hashes. After one warm
+up per side and command, eight measured pairs alternate execution order. All
+56 commands, including identity checks and warm-ups, succeeded without stderr.
+Returned JSON is identical except the explicitly excluded status timing field;
+database bytes, permissions, ownership and symlink targets remain unchanged
+after every command. No daemon or installed binary was changed.
+
+| Command | Base median ms | Candidate median ms | Added ms | 50 ms target |
+| --- | ---: | ---: | ---: | --- |
+| `info firefox` | 148.765 | 234.453 | 85.689 | Unmet |
+| Official-only `search glibc` | 155.256 | 155.982 | 0.726 | Met |
+| Fast JSON status | 31.593 | 46.074 | 14.481 | Met |
+
+These are scoped same-host observations, not population percentiles or proof
+for the earlier native Linux hardware. Package-info latency remains a measured
+regression requiring work. The generated guest executable copies and isolated
+user state were retired after the verified comparison; both verified archive
+subjects, their hashes and per-command observations remain on C:.
+
+A frozen `7b6d8f4b` comparison diagnostic reached 148 of 174 common files with
+the original shared work budget: 127 had no first local refusal and 21 had a
+first-refusal record, ending at work exhaustion. The other 26 files were not
+examined. This is a partial diagnostic, not acceptance or a final defect list.
+An initial attempt lacking rustfmt in PATH was excluded; the reported run uses
+the installed pinned formatter. Further source/copy/work obligations remain.
+
+Before native compilation, receipt-bound retirement removed 5,494 compiler-only
+raw profiles from two passing Clippy phases, releasing 2,354,470,912 guest
+allocation bytes. Six current executables, 2,822 referenced debug companions
+and 18 runtime profiles were verified unchanged before and after retirement.
+Compressed per-file hash manifests and receipts remain. After trim, host VHD
+allocation fell from 48,847,257,600 to 46,550,876,160 bytes; file length remained
+51,961,135,104. Offline compaction was unavailable without elevation/Optimize-VHD;
+no shutdown, deliberate service stop, debug or owner-data deletion occurred.
+The subsequent wave kept the 44 GiB growth allowance, 3 GiB build and 1.5 GiB
+lint forecasts, two workers, original profiles and 20 GiB host reserve. Its new
+unit binary's 1,872 debug references are verified in place. Final guest use is
+45,764,276,224 bytes, guest available space 4,056,158,208 bytes and C: free space
+580,975,382,528 bytes. Another native wave needs fresh admission. Full coverage,
+release/VM/performance, independent review and CVE completeness remain open.
