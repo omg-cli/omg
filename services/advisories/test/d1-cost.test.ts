@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, URL as NodeURL } from "node:url";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { unstable_splitSqlQuery } from "wrangler";
 import { handle } from "../src/service";
@@ -31,9 +32,9 @@ async function measureImport(count: number) {
     }));
     try {
         const db = await runtime.getD1Database("DB");
-        const initial = await readFile(new URL("../migrations/0001_advisories.sql", import.meta.url).pathname, "utf8");
+        const initial = await readFile(new NodeURL("../migrations/0001_advisories.sql", import.meta.url), "utf8");
         await db.batch(unstable_splitSqlQuery(initial).map((statement) => db.prepare(statement)));
-        const counter = await readFile(new URL("../migrations/0002_baseline_member_counter.sql", import.meta.url).pathname, "utf8");
+        const counter = await readFile(new NodeURL("../migrations/0002_baseline_member_counter.sql", import.meta.url), "utf8");
         await db.batch(unstable_splitSqlQuery(counter).map((statement) => db.prepare(statement)));
         let rowsRead = 0;
         const measured = {
@@ -144,7 +145,7 @@ function largeCveFixture(id = "CVE-2026-1234", bytes = 2_402_038): string {
 
 test("real workerd route roundtrips a structured 2.4 MB CVE through private R2 and small D1 rows", async () => {
     const {sha256, string, parseCve} = await import("../src/domain");
-    const build = await Bun.build({entrypoints: [new URL("../src/index.ts", import.meta.url).pathname], target: "browser"});
+    const build = await Bun.build({entrypoints: [fileURLToPath(new NodeURL("../src/index.ts", import.meta.url))], target: "browser"});
     expect(build.success).toBe(true);
     const output = build.outputs[0];
     if (!output) throw new Error("missing bundled real Worker entrypoint");
@@ -155,7 +156,7 @@ test("real workerd route roundtrips a structured 2.4 MB CVE through private R2 a
     try {
         const db = await runtime.getD1Database("DB");
         for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql"]) {
-            const source = await readFile(new URL(`../migrations/${name}`, import.meta.url).pathname, "utf8");
+            const source = await readFile(new NodeURL(`../migrations/${name}`, import.meta.url), "utf8");
             await db.batch(unstable_splitSqlQuery(source).map((statement) => db.prepare(statement)));
         }
         const worker = await runtime.getWorker();

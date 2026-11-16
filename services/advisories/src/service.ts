@@ -10,6 +10,8 @@ import {
 } from "./domain";
 import { ingestCveGroups, parseBatch } from "./ingestion";
 import { Store, type Checkpoint, type RecordRow } from "./storage";
+import { recentCves } from "./recent";
+import { publicResponse } from "./cache";
 async function authorized(
     request: Request,
     token: string | undefined,
@@ -77,6 +79,14 @@ export async function handle(
     store: Store,
     token?: string,
     now = new Date().toISOString(),
+): Promise<Response> {
+    return publicResponse(request, await route(request, store, token, now), now);
+}
+async function route(
+    request: Request,
+    store: Store,
+    token: string | undefined,
+    now: string,
 ): Promise<Response> {
     const url = new URL(request.url);
     try {
@@ -353,6 +363,17 @@ export async function handle(
                 payload_json: await raw.text(),
             });
         }
+        if (url.pathname === "/v1/cves/recent") {
+            const page = await recentCves(url, store.sql, now);
+            const checkpoint = await store.checkpoint("cve");
+            return Response.json({
+                schema_version: 1, ...page,
+                checked_at: checkpoint?.checked_at ?? null,
+                complete: !!checkpoint?.complete && !!checkpoint.bootstrap_complete &&
+                    !checkpoint.error && fresh(checkpoint, now),
+                package_applicability: "unknown",
+            });
+        }
         const match = /^\/v1\/cves\/(CVE-\d{4}-\d{4,19})$/.exec(url.pathname);
         if (match?.[1]) {
             const id = cveId(match[1]);
@@ -368,6 +389,7 @@ export async function handle(
             const raw = await store.raw.get(record.object_key);
             if (!raw) throw new Error("CVE object missing");
             const kev = await store.checkpoint("kev");
+            const cve = await store.checkpoint("cve");
             const annotation = await store.sql.first<{ payload_json: string }>(
                 "SELECT payload_json FROM kev_annotation WHERE cve_id=?",
                 [id],
@@ -376,6 +398,9 @@ export async function handle(
                 schema_version: 1,
                 payload_json: await raw.text(),
                 provenance: record,
+                cve_checked_at: cve?.checked_at ?? null,
+                cve_complete: !!cve?.complete && !!cve.bootstrap_complete &&
+                    !cve.error && fresh(cve, now),
                 kev: annotation ? JSON.parse(annotation.payload_json) : null,
                 kev_checked_at: kev?.checked_at,
                 kev_complete: kev

@@ -1,9 +1,10 @@
 import { test, expect } from "bun:test";
 import { crc32, deflateRawSync } from "node:zlib";
+import { fileURLToPath, URL as NodeURL } from "node:url";
 import { parseBatch } from "../src/ingestion";
 import { scanArchive, fileHash, type ArchiveState } from "../scripts/archive";
 const encodeBatch = (records: string[]) => JSON.stringify({source: "cve", records});
-const path = new URL("./fixtures/tiny.zip", import.meta.url).pathname;
+const path = fileURLToPath(new NodeURL("./fixtures/tiny.zip", import.meta.url));
 test("tiny ZIP scans lazily, stops at record budget and resumes without extracting files", async () => {
     const digest = await fileHash(path);
     const state: ArchiveState = {
@@ -60,7 +61,7 @@ test("archive hash and year mismatch fail before accepting records", async () =>
             save: async () => {},
         }),
     ).rejects.toThrow("digest mismatch");
-    const bad = new URL("./fixtures/wrong-year.zip", import.meta.url).pathname;
+    const bad = fileURLToPath(new NodeURL("./fixtures/wrong-year.zip", import.meta.url));
     const digest = await fileHash(bad);
     await expect(
         scanArchive({
@@ -109,7 +110,7 @@ test("archive mutation after verification cannot change the bytes being parsed",
     const directory = await mkdtemp(join(tmpdir(),"advisory-archive-test-"));
     const mutable = join(directory,"archive.zip");
     try {
-        await copyFile(new URL("./fixtures/nine.zip",import.meta.url).pathname,mutable);
+        await copyFile(fileURLToPath(new NodeURL("./fixtures/nine.zip",import.meta.url)),mutable);
         const digest = await fileHash(mutable);
         const state: ArchiveState = {digest,next_entry:0,accepted:0,exhausted:false,finished_at:null};
         const records:string[] = [];

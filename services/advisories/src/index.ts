@@ -1,13 +1,13 @@
 import { handle } from "./service";
 import { refresh } from "./ingestion";
 import { Store, d1Sql } from "./storage";
+import { cachedRead } from "./cache";
 type Environment = Env & { INGEST_TOKEN?: string };
 export default {
     fetch(request, env) {
-        return handle(
-            request,
-            new Store(d1Sql(env.DB), env.RAW),
-            env.INGEST_TOKEN,
+        return cachedRead(
+            request, caches.default,
+            (input) => handle(input, new Store(d1Sql(env.DB), env.RAW), env.INGEST_TOKEN),
         );
     },
     scheduled(_event, env, context) {
