@@ -65,54 +65,39 @@ impl AdvisoryRiskReview {
             if assessment.findings.is_empty() {
                 continue;
             }
-            use std::fmt::Write as _;
-            writeln!(
-                details,
-                "Package: {}",
-                serde_json::to_string(&(
-                    &assessment.package.name,
-                    &assessment.package.version,
-                    &assessment.package.architecture,
-                ))?
-            )?;
+            let package = serde_json::to_string(&(
+                &assessment.package.name,
+                &assessment.package.version,
+                &assessment.package.architecture,
+            ))?;
+            details.push_str(&format!("Package: {package}\n"));
             if let Some(reason) = assessment.coverage.unknown_reason() {
-                writeln!(details, "Coverage: unknown ({reason:?})")?;
+                details.push_str(&format!("Coverage: unknown ({reason:?})\n"));
             } else {
-                writeln!(details, "Coverage: assessed")?;
+                details.push_str("Coverage: assessed\n");
             }
-            writeln!(
-                details,
-                "Source: {}",
-                serde_json::to_string(&assessment.coverage.provenance())?
-            )?;
+            let source = serde_json::to_string(&assessment.coverage.provenance())?;
+            details.push_str(&format!("Source: {source}\n"));
             for finding in &assessment.findings {
                 let confidence = match finding.applicability {
                     FindingApplicability::Applicable => "affected version",
                     FindingApplicability::Possible => "possible match; applicability unconfirmed",
                 };
-                writeln!(
-                    details,
-                    "  {} ({confidence})",
-                    serde_json::to_string(&finding.id)?
-                )?;
-                writeln!(details, "  {}", serde_json::to_string(&finding.summary)?)?;
+                let id = serde_json::to_string(&finding.id)?;
+                let summary = serde_json::to_string(&finding.summary)?;
+                details.push_str(&format!("  {id} ({confidence})\n  {summary}\n"));
                 if let Some(url) = advisory_link(&finding.id) {
-                    writeln!(details, "  {url}")?;
+                    details.push_str(&format!("  {url}\n"));
                 }
                 if let Some(native) = &finding.native_advisory {
-                    writeln!(
-                        details,
-                        "  Source: {}",
-                        serde_json::to_string(&native.source)?
-                    )?;
-                    writeln!(
-                        details,
-                        "  Provider details: {}",
-                        serde_json::to_string(&native.description)?
-                    )?;
+                    let source = serde_json::to_string(&native.source)?;
+                    let description = serde_json::to_string(&native.description)?;
+                    details.push_str(&format!(
+                        "  Source: {source}\n  Provider details: {description}\n"
+                    ));
                     for reference in &native.references {
                         if let Some(url) = safe_reference(&reference.url) {
-                            writeln!(details, "  {url}")?;
+                            details.push_str(&format!("  {url}\n"));
                         }
                     }
                 }
@@ -349,6 +334,67 @@ mod tests {
         ] {
             assert!(safe_reference(url).is_none(), "{url:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_advisory_ids_do_not_produce_official_looking_links() {
+        for id in [
+            "",
+            "CVE-2026",
+            "CVE-26-1234",
+            "CVE-202x-1234",
+            "CVE-2026-123x",
+            "CVE-2026-1",
+            "CVE-2026-1234\nforged",
+            "AVG-",
+            "AVG-not-a-number",
+        ] {
+            assert_eq!(advisory_link(id), None, "{id:?}");
+        }
+        assert_eq!(advisory_link(&"x".repeat(161)), None);
+    }
+
+    #[test]
+    fn native_provider_review_preserves_the_warning_and_omits_unsafe_references()
+    -> anyhow::Result<()> {
+        use crate::core::security::scan::{AdvisoryReference, NativeAdvisory};
+        let mut assessment = package("app");
+        let mut item = finding("CVE-2026-12345", FindingApplicability::Applicable);
+        item.native_advisory = Some(NativeAdvisory {
+            source: "Vendor".into(),
+            advisory_nevra: "app-1.0-1".into(),
+            published_severity: "Important".into(),
+            description: "Provider details".into(),
+            references: vec![
+                AdvisoryReference {
+                    id: "safe".into(),
+                    kind: "vendor".into(),
+                    url: "https://vendor.test/advisory/123".into(),
+                },
+                AdvisoryReference {
+                    id: "unsafe".into(),
+                    kind: "vendor".into(),
+                    url: "http://untrusted.test/reference".into(),
+                },
+            ],
+        });
+        assessment.findings = vec![item];
+        let review = AdvisoryRiskReview::new(&[assessment], "transaction")?.unwrap();
+        assert_eq!(
+            review.details(),
+            concat!(
+                "\nSECURITY WARNING: the selected transaction has disclosed advisory findings.\n",
+                "Accepting the risk does not mark these versions safe or establish missing coverage.\n",
+                "Package: [\"app\",\"1.0-1\",null]\n",
+                "Coverage: unknown (EvidenceUnavailable)\nSource: null\n",
+                "  \"CVE-2026-12345\" (affected version)\n",
+                "  \"A disclosed vulnerability\"\n",
+                "  https://www.cve.org/CVERecord?id=CVE-2026-12345\n",
+                "  Source: \"Vendor\"\n  Provider details: \"Provider details\"\n",
+                "  https://vendor.test/advisory/123"
+            )
+        );
         Ok(())
     }
 
