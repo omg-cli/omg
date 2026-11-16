@@ -2339,3 +2339,59 @@ and C: free space 588,825,415,680 bytes. Active debug companions remain in place
 A further native wave requires fresh guest/VHD/host measurements and a growth
 forecast. Full hosted coverage, later source/work obligations, release/VM/
 performance, independent review and private CVE completeness remain open.
+
+### Windows continuation: payload spawn failures and lint-profile retirement
+
+At `d2230e2f`, CI, CodeQL, Docker, mutation, security and secret scanning passed.
+Coverage run 43784109080 produced successfully in job 133027813822, then its
+immutable-base comparison failed in job 133033945219 at
+`src/core/privilege.rs:951`. Verified artifact 14190192894 binds original
+`f2413f80` to that head; its ZIP SHA-256 is
+`3b3c13e63eca1869eabf266ff27e8aaf99f7d60ce90b353516103aeeab0d5f33`.
+The sealed head report has positive counts at prior policy rows 789 and 822,
+and all 131 mapped policy-test rows are positive. This is progress through the
+complete comparison, not coverage acceptance.
+
+A normal, process-isolated test now exercises both sudo payload spawn-error
+branches under UID 65534. Its private fake validation program removes only
+itself before returning either an interactive-validation failure or an
+authenticated-validation success. The subsequent kernel spawn fails with
+ENOENT. Both paths must retain the contextual error, original OS error and
+doctor hint, and must return an error promptly. The invocation log contains
+only validation. No real sudo, authentication, systemd-run or package operation
+runs; the log does not establish the number of failed exec attempts.
+
+Two separately compiled faults turn each spawn error into a successful status.
+Both fail the new test at its error expectation; restored code passes. Five
+neighboring argv, development-refusal and policy controls pass on the same
+intact binary, SHA-256
+`79b6deb1db1c3e62d2bfb39700d91741562c0e9521074801b10f62d5c2b4ed56`.
+Only its three fresh intact profiles, owned by root/root/65534 with one module
+identity, enter the owned coverage export. All 49 mapped new-test rows and all
+six mapped rows in each targeted spawn/error path are positive, including 951.
+Build, fault and neighboring-test profiles are excluded. Arch all-target
+Clippy passes with warnings denied and actual source checking; formatting and
+diff checks pass. Production bytes before the test module and the comparator
+are unchanged. The original work capacity and acceptance settings are intact.
+
+Before the native wave, a receipt-bound retirement removed 19,707 obsolete
+compiler/proc-macro raw profiles from seven passing Clippy phases, releasing
+8,454,737,920 guest allocation bytes. Compressed per-file hash manifests and
+compact proof receipts remain private. No debug, runtime/fault profile, QEMU,
+source, database or authored asset was retired. The retirement checks preserved
+18,046 debug-companion paths and verified all 1,872 debug references from the
+then-current unit binary. Five same-binary smoke tests passed afterward.
+Subsequent native builds legitimately replaced that binary and some generated
+debug files; the retirement receipt records the earlier verified state.
+
+Guest trim returned 7,200,112,640 bytes of sparse host allocation: allocated
+bytes fell from 49,378,099,200 to 42,177,986,560 while VHD file length remained
+51,961,135,104. Offline compaction was unavailable in this non-elevated Windows
+session without Optimize-VHD; no global WSL shutdown or deliberate service stop
+was used. The new native wave was admitted with a 44 GiB target growth allowance
+and 3 GiB forecast. Two workers, existing debug/split-debug, incremental and
+coverage settings, and the 20 GiB C: reserve remained unchanged. After final
+Clippy, VHD file length was 51,961,135,104 bytes, guest use 40,534,855,680 bytes,
+guest available space 9,285,578,752 bytes and C: free space 590,485,102,592 bytes.
+Fresh full hosted comparison, later source/work obligations, release/VM/
+performance, independent review and private CVE completeness remain open.
