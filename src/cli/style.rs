@@ -247,10 +247,26 @@ pub fn command(cmd: &str) -> String {
 #[must_use]
 pub fn sanitize_terminal_text(text: &str) -> String {
     text.chars()
-        .filter(|character| terminal_character_allowed(*character))
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    character,
+                    // Bidi embedding/override/isolate (Trojan Source class)
+                    '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                        // Zero-width + invisible formatting (LRM/RLM/ZWJ/WJ)
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{2060}'..='\u{2064}'
+                        // Unicode line/paragraph separator (breaks single-line layout)
+                        | '\u{2028}' | '\u{2029}'
+                        // Zero-width no-break space / BOM in the middle of text
+                        | '\u{feff}'
+                )
+        })
         .collect()
 }
 
+// Preserve the owned callback's coverage ownership; exhaustive scalar parity prevents drift.
 fn terminal_character_allowed(character: char) -> bool {
     !character.is_control()
         && !matches!(
@@ -484,6 +500,20 @@ mod tests {
                 assert_eq!(rendered.matches("OK").count(), 1, "{rendered:?}");
             },
         );
+    }
+
+    #[test]
+    fn streaming_terminal_text_matches_owned_sanitization_for_every_unicode_scalar() {
+        for character in (0..=0x10ffff).filter_map(char::from_u32) {
+            let codepoint = u32::from(character);
+            let mut bytes = [0; 4];
+            let input = character.encode_utf8(&mut bytes);
+            assert_eq!(
+                display_terminal_text(input).to_string(),
+                sanitize_terminal_text(input),
+                "terminal filters differ for U+{codepoint:04X}"
+            );
+        }
     }
 
     #[test]
