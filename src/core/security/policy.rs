@@ -2390,9 +2390,8 @@ mod tests {
     }
 
     #[test]
-    fn policy_entry_points_preserve_explicit_policy() -> anyhow::Result<()> {
-        const NAME: &str =
-            "core::security::policy::tests::policy_entry_points_preserve_explicit_policy";
+    fn mutation_prepared_entry_points_preserve_explicit_policy() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::policy::tests::mutation_prepared_entry_points_preserve_explicit_policy";
         if crate::core::testing::run_isolated_test(NAME) {
             return Ok(());
         }
