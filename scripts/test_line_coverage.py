@@ -578,6 +578,158 @@ class SourceAwareCoverageTests(unittest.TestCase):
                     ValueError, 'complete compiled-copy inventory|closed compiled-owner layout'):
                 self.extracted_callback_predicate_compare(mutate)
 
+    def nominal_async_callback_compare(self, mutation=None, context_change=False, inherent=False):
+        old = (b'impl Model for StatusModel {\n'
+               b'    fn update(&mut self) -> Cmd {\n'
+               b'        Cmd::exec(move || {\n'
+               b'            bridge(async move {\n'
+               b'                timeout(500, async {\n'
+               b'                    old_step();\n'
+               b'                    verify(first && second, third && fourth);\n'
+               b'                }).await\n'
+               b'            });\n'
+               b'            bridge(async move {\n'
+               b'                fallback();\n'
+               b'            })\n'
+               b'        })\n'
+               b'    }\n'
+               b'}\n')
+        if inherent:
+            old = old.replace(b'impl Model for StatusModel', b'impl StatusModel')
+        new = old.replace(b'old_step', b'new_step')
+        if context_change:
+            new = new.replace(b'timeout', b'reroute')
+        def owners(base, head):
+            for document, source in ((base, old), (head, new)):
+                lines = source.decode().splitlines(); members = []
+                def region(line, token, count):
+                    column = lines[line-1].index(token) + 1
+                    return [line, column, line, column+len(token), count, 0, 0, 0]
+                for number in (1, 2):
+                    scope = f'NtCs{number}_7example5scope'
+                    parent = (f'_RNvM{scope}Nt{scope}11StatusModel6update' if inherent
+                              else f'_RNvX{scope}Nt{scope}11StatusModelNt{scope}5Model6update')
+                    count = int(number == 1)
+                    declarations = [
+                        (parent, 1, [[2, 5, 2, lines[1].index('{')+1, 1, 0, 0, 0],
+                                     region(3, 'Cmd::exec', 1), region(14, '}', 1)]),
+                        ('_RNC'+parent[2:]+'0', count,
+                         [region(3, '{', count), region(4, 'bridge', count),
+                          region(10, 'bridge', count), region(13, '}', count)]),
+                        ('_RNCNC'+parent[2:]+'00', count,
+                         [region(4, '{', count), region(5, 'reroute' if document is head and context_change else 'timeout', count),
+                          region(8, '.await', count), region(9, '}', count)]),
+                        ('_RNCNCNC'+parent[2:]+'000', count,
+                         [region(5, '{', count), region(6, 'old_step()' if document is base else 'new_step()', count),
+                          region(7, 'verify', count), region(7, 'second', count),
+                          region(7, 'fourth', count), region(8, '}', count)]),
+                        ('_RNCNC'+parent[2:]+'0s_0', count,
+                         [region(10, '{', count), region(11, 'fallback()', count), region(12, '}', count)])]
+                    members.extend(dict(name=name, count=hits, filenames=['/src/example.rs'], regions=regions)
+                                   for name, hits, regions in declarations)
+                document['data'][0]['functions'] = members
+            if mutation:
+                mutation(base['data'][0]['functions'], head['data'][0]['functions'])
+        counts = [(line, 2 if line in (2, 3, 14) else 1) for line in range(2, 15)]
+        return self.compare(before=counts, after=counts, mutate=owners,
+            sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_nominal_nested_async_fragment_keeps_constructor_and_poll_owners(self):
+        for inherent in (False, True):
+            with self.subTest(inherent=inherent):
+                result = self.nominal_async_callback_compare(inherent=inherent)
+                self.assertTrue(any(proof.get('nominal_phase_fragments')
+                                    for proof in result['positive_source_fragments']))
+                self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
+                                                         'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
+
+    def test_nominal_async_phase_refuses_missing_cold_or_foreign_evidence(self):
+        def mutate(base, head, mode):
+            if mode in ('constructor-only', 'poll-only'):
+                owner = head[3 if mode == 'constructor-only' else 2]
+                owner['count'] = 0
+                for region in owner['regions']: region[4] = 0
+            elif mode == 'missing-poll': head.pop(3)
+            elif mode == 'missing-sibling': head.pop(4)
+            elif mode == 'foreign-copy': head[3]['name'] = head[3]['name'].replace('Cs1_', 'Cs9_')
+            elif mode == 'wrong-parent': head[3]['name'] = head[3]['name'][:-3] + '0s_00'
+            elif mode == 'duplicate-owner': head.append(copy.deepcopy(head[3]))
+            elif mode == 'foreign-file': head[3]['filenames'] = ['/another/example.rs']
+            elif mode == 'changed-geometry':
+                for index in (2, 7): head[index]['regions'][1][3] -= 1
+            elif mode == 'cold-subregion': head[3]['regions'][2][4] = 0
+            elif mode == 'disagreed-entry': head[3]['count'] = 0
+            elif mode == 'cold-completion': head[3]['regions'][-1][4] = 0
+            elif mode == 'missing-entry': head[3]['regions'].pop(0)
+            elif mode == 'missing-fragment':
+                for index in (3, 8):
+                    head[index]['regions'] = [region for region in head[index]['regions'] if region[0] != 7]
+            elif mode in ('cold-root', 'cold-sync', 'cold-sibling'):
+                owner = head[{'cold-root': 0, 'cold-sync': 1, 'cold-sibling': 4}[mode]]
+                owner['count'] = 0
+                for region in owner['regions']: region[4] = 0
+            elif mode == 'missing-sync': head.pop(1)
+            elif mode == 'wide-region': head[3]['regions'][1][2] = 13
+            elif mode == 'foreign-overlap':
+                head.append(dict(name='foreign', count=1, filenames=['/src/example.rs'],
+                                 regions=[copy.deepcopy(head[2]['regions'][1])]))
+            elif mode == 'different-type':
+                for owner in head: owner['name'] = owner['name'].replace('11StatusModel', '12AnotherModel')
+            elif mode == 'swapped-siblings':
+                for index in (2, 7):
+                    head[index]['name'], head[index+2]['name'] = head[index+2]['name'], head[index]['name']
+        for mode in ('constructor-only', 'poll-only', 'missing-poll', 'missing-sibling', 'foreign-copy',
+                     'wrong-parent', 'duplicate-owner', 'foreign-file', 'changed-geometry', 'cold-subregion',
+                     'disagreed-entry', 'cold-completion', 'missing-entry', 'wide-region', 'foreign-overlap',
+                     'different-type', 'swapped-siblings', 'missing-fragment',
+                     'cold-root', 'cold-sync', 'cold-sibling', 'missing-sync'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.nominal_async_callback_compare(lambda base, head: mutate(base, head, mode))
+
+    def test_nominal_async_phase_preserves_one_matching_across_all_regions(self):
+        def populate(base, head):
+            for members in (base, head):
+                for owner in members:
+                    owner['count'] = 1
+                    for region in owner['regions']: region[4] = 1
+                members[3]['regions'][3][4] = 0
+                members[8]['regions'][4][4] = 0
+        self.nominal_async_callback_compare(populate)
+        def redistribute(base, head):
+            populate(base, head)
+            head[3]['regions'][3][4] = 1
+            head[8]['regions'][3][4] = 0
+        with self.assertRaises(ValueError):
+            self.nominal_async_callback_compare(redistribute)
+
+    def test_nominal_async_phase_accepts_newly_executed_complete_copy(self):
+        def execute(base, head):
+            for owner in head[5:]:
+                owner['count'] = 1
+                for region in owner['regions']: region[4] = 1
+        self.nominal_async_callback_compare(execute)
+
+    def test_nominal_async_phase_cannot_borrow_identical_text_from_a_changed_call_context(self):
+        with self.assertRaises(ValueError):
+            self.nominal_async_callback_compare(context_change=True)
+
+    def test_nominal_async_phase_obeys_shared_work_exhaustion_with_and_without_prepared_inventory(self):
+        original = coverage.nominal_phase_fragment
+        captured = []
+        def record(*args):
+            captured.append(args)
+            return original(*args)
+        with patch.object(coverage, 'nominal_phase_fragment', side_effect=record):
+            self.nominal_async_callback_compare()
+        self.assertTrue(captured)
+        for cache in ({}, captured[-1][-1]):
+            args = list(captured[-1])
+            args[-2] = [0]
+            args[-1] = cache
+            with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                original(*args)
+        self.nominal_async_callback_compare()
+
     def test_changed_callback_body_keeps_precise_parent_and_child_obligations(self):
         result = self.changed_callback_compare()
         self.assertEqual([result[key] for key in ('deleted_summary_found', 'deleted_summary_hit',

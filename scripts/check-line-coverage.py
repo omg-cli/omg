@@ -1323,6 +1323,186 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     return CallbackFragmentEvidence(tuple(states), tuple(line_states), signature, witness)
 
 
+def nominal_phase_fragment(source, group, owners, name_counts, first, last, inventory, work, cache):
+    """Bind a nongeneric impl method's complete lexical phase tree to compiled copies."""
+    if inventory is None:
+        return None
+    _construct_charge(work, len(group[2])+1)
+    if any(not owner['name'].startswith(('_RNvM', '_RNvX')) for owner in group[2]):
+        return None
+    code, rows = inventory[:2]
+    key = id(code), group[:2], tuple(id(owner) for owner in group[2])
+    if key not in cache:
+        cache[key] = None
+        _construct_charge(work, len(rows) + len(owners))
+        functions = [row for row in rows if row['kind'] == 'fn' and 'fn' in row['header']
+            and code.position(code.starts[row['first'] + row['header'].index('fn')])[0] == group[0]
+            and code.position(code.ends[row['end']])[0] == group[1]]
+        if len(functions) != 1:
+            return None
+        function = functions[0]; header = function['header']; fn = header.index('fn')
+        if header[:fn] not in ((), ('pub',)):
+            return None
+        by_opening = {row['opening']: row for row in rows if row['opening'] is not None}
+        enclosing = [by_opening.get(index) for index in _construct_ancestors(code, function['opening'], work)]
+        if (not enclosing or enclosing[0] is None or enclosing[0]['kind'] != 'impl'
+                or any(row is None or row['kind'] not in ('impl', 'mod') for row in enclosing)):
+            return None
+        implementation = enclosing[0]['header']
+        if len(implementation) not in (2, 4) or implementation[0] != 'impl':
+            return None
+        if len(implementation) == 4 and implementation[2] != 'for':
+            return None
+        phases = []
+        for row in rows:
+            opening = row['opening']
+            if opening is None or not function['opening'] < opening < row['end'] < function['end']:
+                continue
+            # shortcut: argument-position zero-arg closures and async blocks only; add other forms with phase fixtures.
+            if code.words[opening-1] not in ('||', 'async', 'move'):
+                continue
+            parent = code.parents[opening]
+            if parent is None or code.words[parent] != '(':
+                continue
+            argument = opening - 1
+            while argument > parent:
+                _construct_charge(work, 1)
+                if code.parents[argument] == parent and code.words[argument] == ',':
+                    break
+                argument -= 1
+            _construct_charge(work, opening - argument)
+            if tuple(code.words[argument+1:opening]) not in (
+                    ('||',), ('move', '||'), ('async',), ('async', 'move')):
+                continue
+            phases.append(row)
+        _construct_charge(work, len(phases) * (len(phases).bit_length() + 1))
+        phases.sort(key=lambda row: row['opening'])
+        if not phases:
+            return None
+        phase_indices = {row['opening']: index for index, row in enumerate(phases)}
+        contexts = []; ancestors = []
+        for row in phases:
+            chain = _construct_ancestors(code, row['opening'], work)
+            if function['opening'] not in chain:
+                return None
+            chain = chain[:chain.index(function['opening'])+1]
+            ancestors.append(next((phase_indices[index] for index in chain if index in phase_indices), None))
+            context = []; child = row['opening']
+            for parent in chain:
+                start = parent + 1
+                if code.words[parent] == '{':
+                    cursor = child - 1
+                    while cursor > parent:
+                        _construct_charge(work, 1)
+                        if (code.parents[cursor] == parent and code.words[cursor] == ';'
+                                or code.words[cursor] == '}' and code.parents[code.pairs[cursor]] == parent):
+                            start = cursor + 1; break
+                        cursor -= 1
+                _construct_charge(work, child - start + 1)
+                context.append((code.words[parent], tuple(code.words[start:child])))
+                child = parent
+            contexts.append(tuple(context))
+        start = (group[0], len(source[group[0]-1]) - len(source[group[0]-1].lstrip()) + 1)
+        header_ends = (code.position(code.starts[function['opening']]),
+                       code.position(code.ends[function['opening']-1]))
+        bounds = [(code.position(code.starts[row['opening']]), code.position(code.ends[row['end']]))
+                  for row in phases]
+        identity_work = sum(len(owner['name'])+1 for owner in owners)
+        _construct_charge(work, len(phases) + identity_work)
+        decoded = {id(owner): nominal_method_path(owner['name']) for owner in owners}
+        copies = []; identities = []; bound = set()
+        for root in group[2]:
+            shape = decoded.get(id(root))
+            if (shape is None or shape.callbacks or shape.method[0] != header[fn+1]
+                    or shape.kind not in ('M', 'X') or shape.self_type[0] != 'type'
+                    or shape.self_type[-1][0] != implementation[-1]
+                    or (shape.kind == 'X') != (len(implementation) == 4)
+                    or shape.kind == 'X' and (shape.trait[0] != 'type' or shape.trait[-1][0] != implementation[1])):
+                return None
+            identities.append((shape.parent_scope, shape.method))
+            _construct_charge(work, identity_work)
+            members = [owner for owner in owners if decoded[id(owner)] is not None
+                       and decoded[id(owner)].copy_identity == shape.copy_identity]
+            _construct_charge(work, len(members) + len(phases))
+            if len(members) != len(phases) + 1:
+                return None
+            by_start = {}
+            for owner in members:
+                _construct_charge(work, len(owner['regions'])+1)
+                by_start.setdefault(min(tuple(region[:2]) for region in owner['regions']), []).append(owner)
+            ordered = [root]
+            for low, high in bounds:
+                choices = by_start.get(low, ())
+                if len(choices) != 1 or choices[0] is root:
+                    return None
+                ordered.append(choices[0])
+            if len({id(owner) for owner in ordered}) != len(ordered):
+                return None
+            for index, owner in enumerate(ordered):
+                _construct_charge(work, 2 * len(owner['regions']) + 1)
+                count = owner.get('count')
+                if (type(count) is not int or not 0 <= count < COUNTER_LIMIT or name_counts[owner['name']] != 1
+                        or owner['filenames'] != root['filenames'] or len(owner['filenames']) != 1
+                        or any(region[5:] != [0, 0, 0] for region in owner['regions'])):
+                    return None
+                if index == 0:
+                    entries = [region for region in owner['regions']
+                               if tuple(region[:2]) == start and tuple(region[2:4]) in header_ends]
+                    closing = code.position(code.starts[function['end']]), code.position(code.ends[function['end']])
+                else:
+                    low, high = bounds[index-1]
+                    entries = [region for region in owner['regions']
+                               if tuple(region[:4]) == (*low, low[0], low[1]+1)]
+                    closing = (high[0], high[1]-1), high
+                    parent = ordered[0 if ancestors[index-1] is None else ancestors[index-1]+1]
+                    if (decoded[id(owner)].callbacks[:-1] != decoded[id(parent)].callbacks
+                            or len(decoded[id(owner)].callbacks) != len(decoded[id(parent)].callbacks)+1
+                            or any(not low <= tuple(region[:2]) < tuple(region[2:4]) <= high
+                                   for region in owner['regions'])):
+                        return None
+                completions = [region for region in owner['regions']
+                               if tuple(region[:4]) == (*closing[0], *closing[1])]
+                if (len(entries) != 1 or entries[0][4] != count or len(completions) != 1
+                        or completions[0][4] != count):
+                    return None
+            bound.update(map(id, ordered)); copies.append(ordered)
+        if len(set(identities)) != 1:
+            return None
+        low = code.position(code.starts[function['first']]); high = code.position(code.ends[function['end']])
+        _construct_charge(work, sum(len(owner['regions']) for owner in owners))
+        if any(id(owner) not in bound and any(tuple(region[:2]) < high and tuple(region[2:4]) > low
+               for region in owner['regions']) for owner in owners):
+            return None
+        topology = [tuple(decoded[id(owner)].callbacks for owner in ordered) for ordered in copies]
+        if len(set(topology)) != 1:
+            return None
+        cache[key] = copies, (identities[0], tuple(header), implementation, tuple(contexts), topology[0]), bounds
+    prepared = cache[key]
+    if prepared is None:
+        return None
+    copies, context, bounds = prepared
+    states = []; line_states = []; geometries = []
+    for members in copies:
+        pieces = [fragment_region_states(owner, first, last, source, work) for owner in members]
+        prefix = fragment_region_states(members[0], group[0], bounds[0][0][0], source, work)
+        geometry = tuple(piece[0] for piece in pieces), prefix[0]
+        geometries.append(geometry)
+        states.append(tuple(int(owner['count'] > 0) for owner in members)
+                      + prefix[1] + tuple(value for piece in pieces for value in piece[1]))
+        _construct_charge(work, (last-first+1) * sum(len(owner['regions']) for owner in members))
+        line_states.append(tuple(int(any(region[4] > 0 and owner_covers_lines([region], line, line)
+            for owner in members for region in owner['regions'])) for line in range(first, last+1)))
+    if len(set(geometries)) != 1:
+        return None
+    signature = 'nominal-phase-tree-fragment', context, geometries[0]
+    return CallbackFragmentEvidence(tuple(states), tuple(line_states), signature,
+        dict(kind='nominal-phase-tree-fragment', source_phase_ranges=bounds,
+             owners=[[owner['name'] for owner in members] for members in copies],
+             context_sha256=hashlib.sha256(repr(context).encode()).hexdigest(),
+             geometry=geometries[0],
+             limitation='Same lexical phase tree and compiled-copy execution; no callee-semantic equivalence'))
+
+
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
                               fragments, work=None, construct_inventories=None, compiled_groups=None,
                               callback_functions=()):
@@ -1364,6 +1544,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
     for prefix, (group, _) in forwarders.items():
         groups[1][prefix] = group
     claimed = {}; pairs = {}; excerpts = {}; callback_sources = {}; callback_inventories = {}; callback_work = 20_000_000
+    nominal_phase_cache = {}
     for a, b, c, d, pending in fragments:
         current_fragment = (a, b, c, d, pending)
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
@@ -1412,11 +1593,44 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             endpoint_kind = async_groups[0][prefix].closing_kinds.get(a + 1)
             if endpoint_kind is None or endpoint_kind != async_groups[1][prefix].closing_kinds.get(c + 1):
                 refuse()
+        nominal_fragments = {}; nominal_signature = None
+        _construct_charge(work, len(bg[2][0]['name']) + 1)
+        if prefix in callback_functions and nominal_method_path(bg[2][0]['name']) is not None:
+            if 0 not in callback_inventories:
+                callback_inventories[0] = (_construct_inventory(old, work)
+                    if construct_inventories is None else construct_inventories[0])
+            nominal = nominal_phase_fragment(old, bg, inventories[0], inventory_names[0],
+                a+1, b, callback_inventories[0], work, nominal_phase_cache)
+            if nominal is not None:
+                nominal_fragments[0, a] = nominal
+                nominal_signature = nominal.signature
         occurrences = []; callback_signature = None; callback_mode = None; precise_signature = None; scoped_callback = False
         for side, source, counts, group, proposed in ((0, old, before, bg, a), (1, new, after, hg, c)):
             start, end, members = group
             starts = [offset for offset in range(start - 1, end - (b - a) + 1)
                       if source[offset:offset + b - a] == old[a:b]]
+            if nominal_signature is not None:
+                if side not in callback_inventories:
+                    callback_inventories[side] = (_construct_inventory(source, work)
+                        if construct_inventories is None else construct_inventories[side])
+                scoped_starts = []
+                for offset in starts:
+                    key = side, offset
+                    if key not in nominal_fragments:
+                        nominal_fragments[key] = nominal_phase_fragment(source, group, inventories[side],
+                            inventory_names[side], offset+1, offset+b-a,
+                            callback_inventories[side], work, nominal_phase_cache)
+                    evidence = nominal_fragments[key]
+                    if evidence is None:
+                        refuse()
+                    matched = evidence.signature == nominal_signature
+                    entry.setdefault('nominal_phase_candidates', []).append(dict(
+                        side=side, source_range=[offset+1, offset+b-a],
+                        matches_base_context=matched, geometry=evidence.witness['geometry'],
+                        context_sha256=evidence.witness['context_sha256']))
+                    if matched:
+                        scoped_starts.append(offset)
+                starts = scoped_starts
             if endpoint_kind is not None:
                 kinds = async_groups[side][prefix].closing_kinds
                 if any(offset + 1 not in kinds for offset in starts):
@@ -1467,11 +1681,20 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                                 if construct_inventories is None else construct_inventories[side])
                         callback = zero_arg_callback_fragment(source, group, inventories[side],
                             inventory_names[side], offset + 1, offset + b - a, callback_inventories[side], work)
+                        if callback is None:
+                            callback = nominal_fragments.get((side, offset))
+                            if callback is None:
+                                callback = nominal_phase_fragment(source, group, inventories[side],
+                                    inventory_names[side], offset + 1, offset + b - a,
+                                    callback_inventories[side], work, nominal_phase_cache)
                         if callback is None or callback_signature is not None and callback_signature != callback.signature:
                             refuse()
                         children = callback.states; callback_lines = callback.line_states
                         callback_signature = callback.signature; scoped_callback = True
                         entry.setdefault('callback_owners', []).append(dict(side=side, candidate=offset + 1, **callback.witness))
+                        if callback.witness['kind'] == 'nominal-phase-tree-fragment':
+                            entry.setdefault('nominal_phase_fragments', []).append(dict(
+                                side=side, candidate=offset+1, **callback.witness))
                 elif not parents_cover:
                     refuse()
                 parent_lines = tuple(tuple(int(any(region[4] > 0 and owner_covers_lines([region], line, line)
