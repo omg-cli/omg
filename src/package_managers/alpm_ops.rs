@@ -3481,6 +3481,212 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the isolated native advisory consent driver"]
+    fn native_advisory_consent_installs_only_the_accepted_transaction() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::io::Write as _;
+        anyhow::ensure!(
+            crate::core::is_root()
+                && std::env::var("OMG_ARCH_INSTALL_FIXTURE").as_deref() == Ok("isolated-container"),
+            "native consent requires the explicitly provisioned root fixture"
+        );
+        for namespace in ["mnt", "net"] {
+            anyhow::ensure!(
+                std::fs::read_link(format!("/proc/self/ns/{namespace}"))?
+                    != std::fs::read_link(format!("/proc/1/ns/{namespace}"))?,
+                "native consent requires private mount and network namespaces"
+            );
+        }
+        let case = std::env::var("OMG_ADVISORY_INSTALL_CASE")?;
+        anyhow::ensure!(
+            [
+                "accept",
+                "generic-yes",
+                "blank",
+                "wrong-review",
+                "eof",
+                "no-tty",
+                "archive-change",
+                "policy-change"
+            ]
+            .contains(&case.as_str()),
+            "unknown consent fixture case"
+        );
+        let policy = crate::core::security::SecurityPolicy::load_current()?;
+        anyhow::ensure!(
+            policy == crate::core::security::SecurityPolicy::default()
+                && crate::core::paths::config_dir() == std::path::Path::new("/root/.config/omg"),
+            "native consent fixture requires its empty private root configuration"
+        );
+        let fixture = RepositoryFixture::new()?;
+        let archive_path = fixture.directory.path().join("glibc-1-1-any.pkg.tar.gz");
+        let payload = b"isolated advisory consent fixture\n";
+        let package_info = format!(
+            "pkgname = glibc\npkgver = 1-1\npkgdesc = isolated consent fixture\nbuilddate = 1\npackager = OMG fixture\nsize = {}\narch = any\nlicense = MIT\n",
+            payload.len()
+        );
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive_path)?,
+            flate2::Compression::fast(),
+        ));
+        for (path, bytes) in [
+            (".PKGINFO", package_info.as_bytes()),
+            ("usr/share/omg-consent-fixture", payload.as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, bytes)?;
+        }
+        archive.into_inner()?.finish()?;
+        let targets = vec![
+            archive_path
+                .to_str()
+                .context("fixture archive path")?
+                .to_owned(),
+        ];
+        let installed_file = fixture
+            .directory
+            .path()
+            .join("root/usr/share/omg-consent-fixture");
+        let mut alpm = fixture.open();
+        alpm.set_hookdirs(std::iter::empty::<&str>())?;
+        alpm.set_logfile(
+            fixture
+                .directory
+                .path()
+                .join("pacman.log")
+                .to_str()
+                .context("fixture log path")?,
+        )?;
+        alpm.set_check_space(false);
+        alpm.trans_init(alpm::TransFlag::empty())?;
+        let mut transaction =
+            super::AlpmTransaction(&mut alpm, super::PreparedArchiveInspections::new(), None);
+        let package = transaction
+            .0
+            .pkg_load(targets[0].as_str(), true, alpm::SigLevel::NONE)?;
+        transaction
+            .0
+            .trans_add_pkg(package)
+            .map_err(|error| anyhow::anyhow!("fixture package add: {error}"))?;
+        transaction
+            .0
+            .trans_prepare()
+            .map_err(|error| anyhow::anyhow!("fixture preparation: {error}"))?;
+        let prepared = super::PreparedAdvisoryAdmission::new(
+            transaction.0,
+            super::TransactionKind::Install,
+            &targets,
+            &policy,
+            &transaction.1,
+            &mut transaction.2,
+        );
+        let refused = matches!(
+            case.as_str(),
+            "generic-yes" | "blank" | "wrong-review" | "eof" | "no-tty"
+        );
+        let rejection = if refused {
+            let Err(error) = prepared else {
+                anyhow::bail!("risk installed without an explicit attended acceptance");
+            };
+            let text = format!("{error:#}");
+            assert!(
+                text.contains(if case == "no-tty" {
+                    "attended controlling terminal"
+                } else {
+                    "Security acknowledgement"
+                }),
+                "{text}"
+            );
+            Some(text)
+        } else {
+            let admission = prepared?;
+            assert!(
+                admission.risk_acceptance.is_some(),
+                "the actual finding needs a bound acceptance"
+            );
+            let operation = admission
+                .operation
+                .as_ref()
+                .context("missing actual advisory request")?;
+            assert_eq!(operation.assessments().len(), 1);
+            assert_eq!(operation.assessments()[0].findings.len(), 1);
+            assert_eq!(
+                operation.assessments()[0].findings[0].applicability,
+                crate::core::security::scan::FindingApplicability::Possible
+            );
+            if case == "archive-change" {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&archive_path)?
+                    .write_all(b"changed after review")?;
+            } else if case == "policy-change" {
+                let path = crate::core::paths::config_dir();
+                std::fs::create_dir_all(&path)?;
+                std::fs::write(
+                    path.join("policy.toml"),
+                    "advisory_requirement = 'optional'\nbanned_packages = ['glibc']\n",
+                )?;
+            }
+            let validated = admission.validate(
+                transaction.0,
+                super::TransactionKind::Install,
+                &targets,
+                &mut transaction.2,
+            );
+            if case == "accept" {
+                validated?;
+                transaction
+                    .0
+                    .trans_commit()
+                    .map_err(|error| anyhow::anyhow!("fixture commit: {error}"))?;
+                None
+            } else {
+                let error = validated.expect_err("changed state must invalidate the acceptance");
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains(if case == "archive-change" {
+                        "archive changed after advisory admission"
+                    } else {
+                        "changed before commit"
+                    }),
+                    "{text}"
+                );
+                Some(text)
+            }
+        };
+        drop(transaction);
+        drop(alpm);
+        let verified = fixture.open();
+        let installed_version = verified
+            .localdb()
+            .pkg("glibc")
+            .ok()
+            .map(|package| package.version().as_str().to_owned());
+        let installed = installed_version.is_some();
+        assert_eq!(installed, case == "accept");
+        assert_eq!(
+            installed_version.as_deref(),
+            if installed { Some("1-1") } else { None }
+        );
+        assert_eq!(installed_file.exists(), installed);
+        if installed {
+            assert_eq!(std::fs::read(&installed_file)?, payload);
+        }
+        println!(
+            "OMG_NATIVE_ADVISORY_CONSENT_RESULT={}",
+            serde_json::to_string(&serde_json::json!({
+                "case": case, "installed": installed, "rejection": rejection,
+            "package": "glibc", "version": "1-1", "installed_version": installed_version,
+            "private_root": fixture.directory.path(),
+            }))?
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires an explicitly provisioned isolated Arch container or QEMU guest"]
     fn native_reason_write_failure_preserves_durable_reason() -> anyhow::Result<()> {
         use anyhow::Context as _;

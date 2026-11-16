@@ -1113,6 +1113,34 @@ done
 fixture=/opt/omg-omarchy-coverage
 test ! -e "$fixture" && test ! -L "$fixture"
 install -d -m 755 "$fixture"
+# Model an unavailable provider locally; offline DNS must not consume each request deadline.
+python3 - "$fixture" <<'OMG_OMARCHY_OFFLINE_ADVISORY'
+import re
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+host = 'omg-advisories.latham.workers.dev'
+hosts = Path('/etc/hosts').read_text()
+assert all(host not in line.split('#', 1)[0].split()[1:] for line in hosts.splitlines())
+(root / 'advisory-hosts').write_text(hosts.rstrip() + '\n127.0.0.1 ' + host + '\n')
+nss = Path('/etc/nsswitch.conf').read_text()
+assert len(re.findall(r'^hosts:.*$', nss, flags=re.M)) == 1
+(root / 'advisory-nss').write_text(re.sub(r'^hosts:.*$', 'hosts: files', nss, flags=re.M))
+OMG_OMARCHY_OFFLINE_ADVISORY
+mount --bind "$fixture/advisory-hosts" /etc/hosts
+mount --bind "$fixture/advisory-nss" /etc/nsswitch.conf
+ip link set lo up
+python3 - <<'OMG_OMARCHY_OFFLINE_PROBE'
+import socket
+host = 'omg-advisories.latham.workers.dev'
+assert {row[4][0] for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)} == {'127.0.0.1'}
+try:
+    socket.create_connection((host, 443), timeout=1).close()
+except ConnectionRefusedError:
+    print('[native-coverage] Omarchy advisory provider is explicitly unavailable on private loopback')
+else:
+    raise AssertionError('unexpected advisory listener in private Omarchy network')
+OMG_OMARCHY_OFFLINE_PROBE
 printf 'ID=omarchy\nID_LIKE=arch\n' > "$fixture/release"
 mount --bind "$fixture/release" /etc/os-release
 mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp

@@ -38,7 +38,9 @@ Native Arch admission attempts the snapshot lookup even in built-in `optional` m
 
 Local evidence includes real controlling-PTY accept/refuse cases, a deliberate generic-answer bypass caught by the rejection test, and a large-upgrade regression that first failed the display bound. Related policy parsing/source/dependency tests and Arch all-target Clippy are also required. These checks do not establish full install-to-commit acceptance or support on other backends.
 
-Remaining work: a disposable actual-install accept/decline/change-before-commit drill, terminal cancellation/foreground fault coverage, runtime vendor applicability and activation gates, other native backends, and full immutable-base/public/native acceptance. Keep the original goal active until those requirements are verified.
+The disposable native-owner drill now passes eight cases with a synthetic HTTPS advisory source and actual libalpm writes in a private package root: acceptance installs the exact fixture; generic yes, blank, wrong ID, EOF, no TTY, changed archive and changed policy leave the file and local database uninstalled. This is native-owner proof, not complete CLI/sudo/history/progress or Windows/npm proof. The coverage runner collects the fixture's actual profiles through its normal expected/passed test accounting.
+
+Remaining work: full CLI/sudo/history/progress verification, terminal cancellation/foreground fault coverage, runtime vendor applicability and activation gates, other native backends, and full immutable-base/public/native acceptance. Keep the original goal active until those requirements are verified.
 
 ## Preflight boundary correction
 
@@ -79,6 +81,12 @@ The correction passes all 81 tests in the four affected modules, plus the separa
 - [ ] Keep accepted findings Risk in audit/SBOM/export data. Test that risk consent cannot authorize unrelated policy violations or forged finding counts.
 
 ### Task 4: Complete caller coverage and real verification
+
+User acceptance requirement: once npm admission is operational, install a verified Windows OMG build on the user's machine and exercise an npm package installation through OMG-managed execution. Use a known-vulnerable package version with a real advisory URL; prove default refusal before package installation or lifecycle execution, and retain the explicit transaction-bound override. Do not present the Arch fixture as Windows/npm proof. Preserve the user's existing Node/npm installation and environment. Record the installed OMG path/version, the exact test command and observed result. The user has authorized this local installation once the gate is operational; no repeat permission question is needed.
+
+The native install drill will add an explicitly provisioned ignored fixture to `alpm_ops.rs` and a Bubblewrap/PTY driver in `scripts/test-arch-advisory-consent.py`. Reuse the existing oracle's synthetic feed, hosts and NSS helpers; keep its QEMU-only main unchanged. Use the fixed production HTTPS endpoint with a fixture CA/DNS only inside private mount/network namespaces. Install a harmless local archive into the existing disposable ALPM root/database fixture. Cover acceptance, generic yes, blank, wrong review, EOF, no TTY, changed archive and changed policy. Assert actual installed file/localdb state, request count, review classification and exact failure reasons. Wire the driver into the native coverage fixture runner after it passes locally; its test identity and profiles must enter the existing expected/passed evidence rather than bypassing that accounting.
+
+The prior 95889dae coverage producer passed its ordinary tests but timed out in the supplemental QEMU harness before comparison. Its exported Omarchy transcripts contain repeated unavailable-provider warnings. Keep that fixture's provider explicitly unavailable on private loopback, with local hosts-only resolution and a refused-port probe, so offline DNS cannot consume request deadlines repeatedly. Preserve Unknown coverage and every existing deadline. A separate HTTPS fixture exercises actual advisory findings. The exact generated offline setup passes in private namespaces without changing host hosts/NSS files; full hosted producer acceptance remains required.
 
 **Files:** Existing CLI/daemon/TUI mutation paths, cli/runtimes.rs, direct runtime-manager callers, help/docs and relevant behavioral tests. Use the code inventory to pin exact files before implementation.
 

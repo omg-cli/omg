@@ -196,7 +196,7 @@ jobs:
 
           docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
-          RUN pacman -Syu --noconfirm --needed apparmor bubblewrap fakeroot python sudo debugedit git make jq diffutils && pacman -Scc --noconfirm
+          RUN pacman -Syu --noconfirm --needed apparmor bubblewrap fakeroot python openssl iproute2 sudo debugedit git make jq diffutils && pacman -Scc --noconfirm
           DOCKERFILE
           python3 scripts/native-cli-coverage.py prepare --target "$profile_dir" \
             --source-commit "$(git rev-parse HEAD)" --output "$evidence_dir/cli-manifest.json"
@@ -302,6 +302,16 @@ jobs:
                 local case_id=${test_name//::/_}
                 local log="$fixture_evidence/$case_id.log"
                 local runner=()
+                if [ "$test_name" = package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction ]; then
+                  grep -Fx "$test_name: test" "$fixture_evidence/registry.txt"
+                  timeout --kill-after=2s 35s python3 /advisory-fixture/test-arch-advisory-consent.py \
+                    --unit "$fixture_binary" --output "$fixture_evidence/advisory-consent" \
+                    --profiles "$fixture_profiles" 2>&1 | tee "$log"
+                  local profiles=("$fixture_profiles/omg-fixture-$case_id-"*.profraw)
+                  for profile in "${profiles[@]}"; do test -s "$profile"; done
+                  printf "%s\t%s\n" "$test_name" "${#profiles[@]}" >> "$fixture_evidence/passed.tsv"
+                  return
+                fi
                 if [[ "$test_name" == package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents ||
                       "$test_name" == package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff ||
                       "$test_name" == package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff ||
@@ -353,6 +363,7 @@ jobs:
                 package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff
                 package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff
                 package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason
+                package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction
                 package_managers::aur::utils::tests::native_lifecycle_original_user_ownership
                 cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build
                 core::usage::tests::elevated_state_roundtrip_preserves_caller_files
@@ -374,6 +385,10 @@ jobs:
               done
             ')
           docker cp "$binary" "$container:/fixture"
+          advisory_fixture="$RUNNER_TEMP/advisory-fixture"
+          mkdir "$advisory_fixture"
+          install -m 644 scripts/test-arch-advisory-consent.py scripts/qemu-arch-advisory-oracle.py "$advisory_fixture/"
+          docker cp "$advisory_fixture" "$container:/advisory-fixture"
           staging="$RUNNER_TEMP/native-cli-inputs"
           mkdir -m 755 "$staging" "$staging/bin"
           install -m 644 scripts/native-cli-coverage.py "$staging/native-cli-coverage.py"

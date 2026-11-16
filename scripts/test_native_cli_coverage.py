@@ -496,7 +496,7 @@ with socket.socket(socket.AF_UNIX) as server:
         image = image.split('DOCKERFILE', 1)[0]
         install = next(line.strip() for line in image.splitlines() if line.strip().startswith('RUN pacman '))
         packages = set(shlex.split(install.split('&&', 1)[0]))
-        required = {'git', 'make', 'jq', 'diffutils'}
+        required = {'git', 'make', 'jq', 'diffutils', 'openssl', 'iproute2'}
         self.assertFalse(required - packages,
                          'Native supplemental fixtures lack runtime packages: ' + ', '.join(sorted(required - packages)))
 
@@ -526,6 +526,57 @@ with socket.socket(socket.AF_UNIX) as server:
         self.assertIn('--cap-add NET_ADMIN', create,
                       'Private network namespace cannot raise loopback without NET_ADMIN')
         self.assertIn('--network none', create)
+
+    @unittest.skipIf(os.name == 'nt', 'Native provider fixture reads POSIX host databases')
+    def test_omarchy_offline_provider_files_preserve_hosts_and_confine_dns(self):
+        script = PRODUCER.omarchy_guest_script()
+        block = script.split("<<'OMG_OMARCHY_OFFLINE_ADVISORY'\n", 1)[1].split('\nOMG_OMARCHY_OFFLINE_ADVISORY', 1)[0]
+        original_hosts = Path('/etc/hosts').read_bytes()
+        original_nss = Path('/etc/nsswitch.conf').read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, '-', directory], input=block, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            root = Path(directory)
+            self.assertEqual((root / 'advisory-hosts').read_text().splitlines()[-1],
+                             '127.0.0.1 omg-advisories.latham.workers.dev')
+            self.assertTrue((root / 'advisory-hosts').read_bytes().startswith(original_hosts.rstrip()))
+            nss_lines = (root / 'advisory-nss').read_text().splitlines()
+            self.assertEqual([line for line in nss_lines if line.startswith('hosts:')], ['hosts: files'])
+        self.assertEqual(Path('/etc/hosts').read_bytes(), original_hosts)
+        self.assertEqual(Path('/etc/nsswitch.conf').read_bytes(), original_nss)
+
+    @unittest.skipIf(os.name == 'nt', 'Native fixture runner requires POSIX Bash')
+    def test_advisory_consent_runner_counts_profiles_and_refuses_missing_evidence(self):
+        workflow = (ROOT / '.github/workflows/coverage.yml').read_text()
+        native = workflow.split('      - name: Cover sandbox descendant cancellation\n', 1)[1]
+        function = 'run_case() {' + native.split('run_case() {', 1)[1].split('\n              cases=(', 1)[0]
+        name = 'package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction'
+        case_id = name.replace('::', '_')
+        for produce_profiles in [True, False]:
+            with self.subTest(produce_profiles=produce_profiles), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'bin').mkdir()
+                (root / 'evidence').mkdir()
+                (root / 'profiles').mkdir()
+                (root / 'evidence/registry.txt').write_text(name + ': test\n')
+                fake = root / 'bin/python3'
+                fake.write_text('#!/bin/bash\nset -euo pipefail\n'
+                                'test "$1" = /advisory-fixture/test-arch-advisory-consent.py\n'
+                                'test "$2" = --unit\n'
+                                + ('printf profile > "$PROFILE_OUTPUT"\n' if produce_profiles else '')
+                                + 'printf \'{"passed":8}\\n\'\n')
+                fake.chmod(0o755)
+                script = 'set -euo pipefail\n' + function + '\nrun_case ' + shlex.quote(name)
+                result = subprocess.run([BASH, '-c', script], capture_output=True, text=True,
+                                        env=os.environ | {'PATH': str(root / 'bin') + os.pathsep + os.environ['PATH'],
+                                            'fixture_evidence': str(root / 'evidence'), 'fixture_profiles': str(root / 'profiles'),
+                                            'fixture_binary': '/fixture', 'PROFILE_OUTPUT': str(root / 'profiles' / ('omg-fixture-' + case_id + '-accept-1-1.profraw'))})
+                self.assertEqual(result.returncode == 0, produce_profiles, result.stdout + result.stderr)
+                passed = root / 'evidence/passed.tsv'
+                if produce_profiles:
+                    self.assertEqual(passed.read_text(), name + '\t1\n')
+                else:
+                    self.assertFalse(passed.exists(), 'Missing profiles must not be reported as a passed native fixture')
 
     def test_supplemental_cli_execution_precedes_the_state_mount(self):
         workflow = (ROOT / '.github/workflows/coverage.yml').read_text()
