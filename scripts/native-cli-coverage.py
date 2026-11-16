@@ -12,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
+import signal
 import socket
 import stat
 import struct
@@ -1419,6 +1420,8 @@ for ((attempt=0; attempt<50; attempt++)); do
   sleep 0.1
 done
 for stage in OMARCHY_STAGE_NAMES; do
+  stage_started=$SECONDS
+  printf '[native-coverage] starting %s at %ss\n' "$stage" "$SECONDS"
   case_dir="$case_root/$stage"
   install -d -m 700 -o nobody -g nobody "$case_dir" "$case_dir/config" "$case_dir/run" \
     "$case_dir/db" "$case_dir/db/local" "$case_dir/db/sync" "$case_dir/migrations" \
@@ -1713,6 +1716,7 @@ OMG_AUTHORIZATION_RECEIPT
     printf 'released private lock; owned transcript mode=600\n' > "/evidence/cli/$stage-coordination.txt"
   fi
   printf '%s\t0\n' "$stage" >> /evidence/cli/process-checks.tsv
+  printf '[native-coverage] completed %s in %ss\n' "$stage" "$((SECONDS-stage_started))"
 done
 printf 'ID=arch\n' > "$fixture/release"
 case_dir="$case_root/omarchy-success"
@@ -2365,6 +2369,24 @@ def validate_artifact_copies(directory, artifacts):
                 'Copied artifact identity differs: ' + role)
 
 
+def run_guest_script(script, timeout=660):
+    command = ['bash', '-euo', 'pipefail', '-c', script]
+    with subprocess.Popen(command, start_new_session=True) as process:
+        try:
+            status = process.wait(timeout=timeout)
+        except BaseException:
+            if process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError as error:
+                    if process.poll() is None:
+                        raise RuntimeError('The owned producer process group is missing') from error
+                process.wait(timeout=3)
+            raise
+        if status:
+            raise subprocess.CalledProcessError(status, command)
+
+
 def run_guest(manifest):
     require(os.geteuid() == 0, 'Supplemental execution requires a disposable root guest')
     directory = Path('/omg-extra-bin')
@@ -2376,7 +2398,7 @@ def run_guest(manifest):
                 'Supplemental input is writable or not root-owned: ' + str(path))
     validate_artifact_copies(directory, manifest['artifacts'])
     script = guest_script(manifest['artifacts'], manifest['artifacts']['cli']['path'])
-    subprocess.run(['bash', '-euo', 'pipefail', '-c', script], check=True, timeout=660)
+    run_guest_script(script)
     for role, artifact in manifest['artifacts'].items():
         require(sha(directory / role) == artifact['sha256'], 'Artifact changed during execution: ' + role)
     validate_evidence(Path('/evidence/cli'), Path('/profiles'), manifest['artifacts'], manifest['source_commit'])

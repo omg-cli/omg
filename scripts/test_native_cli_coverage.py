@@ -6,12 +6,15 @@ import io
 import json
 import os
 import re
+import select
+import signal
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -90,6 +93,51 @@ class MachineIdentityFixture(unittest.TestCase):
 
 
 class HostedProducer(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'linux', 'The producer executes in a Linux guest')
+    def test_guest_script_preserves_the_command_exit_status(self):
+        PRODUCER.run_guest_script('exit 0', timeout=1)
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            PRODUCER.run_guest_script('exit 17', timeout=1)
+        self.assertEqual(failure.exception.returncode, 17)
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Requires Linux process descriptors')
+    def test_guest_timeout_kills_owned_descendants_without_killing_unrelated_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'descendant.pid'
+            unrelated = subprocess.Popen(['sleep', '60'], start_new_session=True)
+            popen = subprocess.Popen
+            descendant = None
+
+            def capture(*args, **kwargs):
+                nonlocal descendant
+                process = popen(*args, **kwargs)
+                deadline = time.monotonic() + 2
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not marker.exists():
+                    process.kill()
+                    process.wait()
+                    self.fail('the owned descendant did not start')
+                descendant = os.pidfd_open(int(marker.read_text()))
+                return process
+
+            try:
+                with patch.object(PRODUCER.subprocess, 'Popen', side_effect=capture):
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        PRODUCER.run_guest_script(
+                            'sleep 60 & printf "%s" "$!" > ' + shlex.quote(str(marker)) + '; wait',
+                            timeout=0.1)
+                self.assertTrue(select.select([descendant], [], [], 2)[0],
+                                'the timed-out producer left a live descendant holding its output')
+                self.assertIsNone(unrelated.poll(), 'unrelated process must survive producer cleanup')
+            finally:
+                if descendant is not None:
+                    if not select.select([descendant], [], [], 0)[0]:
+                        signal.pidfd_send_signal(descendant, signal.SIGKILL)
+                    os.close(descendant)
+                unrelated.terminate()
+                unrelated.wait(timeout=3)
+
     def test_generated_fresh_stage_receipt_block_executes_without_template_corruption(self):
         artifacts = {role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}
         script = PRODUCER.guest_script(artifacts, '/workspace/target/debug/omg')
