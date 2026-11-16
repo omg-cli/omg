@@ -2443,8 +2443,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn assessment_grade_preserves_repository_identity() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn mutation_prepared_grade_preserves_official_identity() -> anyhow::Result<()> {
         use crate::package_managers::types::SecurityOrigin;
         let policy = SecurityPolicy {
             minimum_grade: SecurityGrade::Verified,
@@ -2469,18 +2469,17 @@ mod tests {
                 ..
             }
         ));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
         let service = update_service(
             SecurityPolicy {
                 advisory_requirement: AdvisoryRequirement::Review,
                 ..policy
             },
             std::sync::Arc::new(FailingVulns),
-        )?;
-        let error = runtime
-            .block_on(service.update())
+        )
+        .expect("construct the fake package-service fixture");
+        let error = service
+            .update()
+            .await
             .expect_err("review must preserve unavailable evidence");
         assert!(
             matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "osv unavailable")
@@ -2490,8 +2489,8 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn service_update_requires_advisory_evidence_for_explicit_policy() -> anyhow::Result<()> {
-        const NAME: &str = "core::security::policy::tests::service_update_requires_advisory_evidence_for_explicit_policy";
+    fn prepared_transaction_requires_advisory_evidence_for_explicit_policy() -> anyhow::Result<()> {
+        const NAME: &str = "core::security::policy::tests::prepared_transaction_requires_advisory_evidence_for_explicit_policy";
         if crate::core::testing::run_isolated_test(NAME) {
             return Ok(());
         }
@@ -2514,7 +2513,8 @@ mod tests {
                 let offline = update_service(
                     SecurityPolicy::load_default()?,
                     std::sync::Arc::new(FailingVulns),
-                )?;
+                )
+                .expect("construct the fake offline package-service fixture");
                 runtime.block_on(offline.update())?;
                 let path = directory.path().join("policy.toml");
                 let mut legacy = toml::Value::try_from(SecurityPolicy::default())?;
@@ -2526,7 +2526,8 @@ mod tests {
                 fs::write(&path, &bytes)?;
                 let loaded = SecurityPolicy::load_default()?;
                 assert_eq!(loaded.advisory_requirement, AdvisoryRequirement::Review);
-                let service = update_service(loaded, std::sync::Arc::new(FailingVulns))?;
+                let service = update_service(loaded, std::sync::Arc::new(FailingVulns))
+                    .expect("construct the fake policy-enforcing package-service fixture");
                 let error = runtime.block_on(service.update()).expect_err("explicit policy requires available advisory evidence even when all legacy fields have their default values");
                 assert!(
                     matches!(error.downcast_ref::<VulnerabilityError>(), Some(VulnerabilityError::Unavailable { reason }) if reason == "osv unavailable")
