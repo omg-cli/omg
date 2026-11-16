@@ -2251,3 +2251,44 @@ After final Clippy, VHD file length was 42,119,200,768 bytes, guest use
 38,366,736,384 bytes and C: free space 599,646,052,352 bytes. Current debug
 companions remain preserved. Fresh complete hosted coverage, later source/work
 obligations and the broader release/VM/performance/CVE acceptance remain open.
+
+### Windows continuation: retained eager-call execution
+
+At `72df7911`, CI, CodeQL, Docker, mutation, security and secret scanning passed.
+The coverage producer passed, while the complete immutable-base comparison
+refused retained execution without complete callback/phase evidence. Artifact
+14186264389 binds `f2413f80` to that exact head; its ZIP SHA-256 is
+`aff60dbc37e2dd32d8d7bec2f8637cf2d7951d69beb373e5a26d46881c8b892b`.
+
+Two native-derived fixtures reproduce the refusal: adding a result check after
+a constructor call, and retaining the initial command-building chain while its
+function's return type and later continuation change. Disabling the new prefix
+proof makes both regressions refuse again. The proof requires the same input
+declaration and lexical bindings, an identical initial body token sequence
+ending at a complete direct call, and a unique token-ordinal line mapping.
+Earlier callbacks, async work, macros and unsupported control constructs refuse
+this witness. Every participating parent copy keeps a joint raw-region state
+matching. Existing homogeneous clipping handles duplicate compiler regions
+only when their states agree; cold subregions cannot borrow a hot ancestor.
+The witness neither retires an owner nor grants deletion credit. Changed return
+types qualify only for this prefix proof, not the existing whole-function path.
+
+All 350 comparator tests, 25 immutable-base tests and 66 producer tests pass in
+Arch WSL. Negative cases cover changed inputs and conditions, foreign owners,
+missing/changed regions, split copy ownership, mixed subregions and work
+exhaustion. The existing extracted-callback refusal remains intact. Formatting
+and diff checks pass; no Rust product source or acceptance setting changed.
+
+Windows Python 3.13 completes the full original artifact comparison with this
+checker. Four witnesses account for 30 retained rows, including both compiled
+parents of the production command chain. It then refuses the next genuinely
+cold row, `src/core/privilege.rs:789`, with 24,277,012 of the original 64,000,000
+work units remaining. This is progress through the full pair, not acceptance.
+Failed local interpreter runs are excluded. A bounded read-only share of the
+existing Arch formatter for an alternate-runtime attempt was retired; no
+toolchain binaries were duplicated and no global WSL shutdown was used.
+
+This slice runs Python checks and performs no native Rust build or transaction.
+The current Arch target and its debug companions remain preserved. Fresh hosted
+comparison, the policy-handoff cold row, later source/work obligations, and
+release/VM/performance, independent review and CVE completeness remain open.
