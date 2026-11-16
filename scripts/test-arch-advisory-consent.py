@@ -20,7 +20,8 @@ import threading
 import time
 
 NAME = "package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction"
-CASES = ("accept", "generic-yes", "blank", "wrong-review", "eof", "no-tty", "archive-change", "policy-change")
+# The policy mutation is last because cases share this disposable home.
+CASES = ("accept", "generic-yes", "blank", "wrong-review", "eof", "no-tty", "archive-change", "interrupt", "terminate", "hangup", "policy-change")
 MARKER = "OMG_NATIVE_ADVISORY_CONSENT_RESULT="
 
 
@@ -81,8 +82,11 @@ def terminal_case(unit, case, environment):
                 if prompt and not sent:
                     assert b"possible match" in transcript and b"1-1" in transcript
                     assert b"https://security.archlinux.org/CVE-OMG-QEMU-616" in transcript
-                    answer = {"generic-yes": b"yes\n", "blank": b"\n", "wrong-review": b"accept another-review\n", "eof": b"\x04"}.get(case, b"accept " + prompt[1] + b"\n")
-                    os.write(descriptor, answer)
+                    if case in ("terminate", "hangup"):
+                        os.kill(pid, {"terminate": signal.SIGTERM, "hangup": signal.SIGHUP}[case])
+                    else:
+                        answer = {"generic-yes": b"yes\n", "blank": b"\n", "wrong-review": b"accept another-review\n", "eof": b"\x04", "interrupt": b"\x03"}.get(case, b"accept " + prompt[1] + b"\n")
+                        os.write(descriptor, answer)
                     sent = True
         while time.monotonic() < deadline:
             child, completed = os.waitpid(pid, os.WNOHANG)

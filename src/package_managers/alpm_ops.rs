@@ -3507,7 +3507,10 @@ mod tests {
                 "eof",
                 "no-tty",
                 "archive-change",
-                "policy-change"
+                "policy-change",
+                "interrupt",
+                "terminate",
+                "hangup"
             ]
             .contains(&case.as_str()),
             "unknown consent fixture case"
@@ -3585,7 +3588,14 @@ mod tests {
         );
         let refused = matches!(
             case.as_str(),
-            "generic-yes" | "blank" | "wrong-review" | "eof" | "no-tty"
+            "generic-yes"
+                | "blank"
+                | "wrong-review"
+                | "eof"
+                | "no-tty"
+                | "interrupt"
+                | "terminate"
+                | "hangup"
         );
         let rejection = if refused {
             let Err(error) = prepared else {
@@ -3593,10 +3603,10 @@ mod tests {
             };
             let text = format!("{error:#}");
             assert!(
-                text.contains(if case == "no-tty" {
-                    "attended controlling terminal"
-                } else {
-                    "Security acknowledgement"
+                text.contains(match case.as_str() {
+                    "no-tty" => "attended controlling terminal",
+                    "interrupt" | "terminate" | "hangup" => "interrupted",
+                    _ => "Security acknowledgement",
                 }),
                 "{text}"
             );
