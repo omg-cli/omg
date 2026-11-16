@@ -2292,3 +2292,50 @@ This slice runs Python checks and performs no native Rust build or transaction.
 The current Arch target and its debug companions remain preserved. Fresh hosted
 comparison, the policy-handoff cold row, later source/work obligations, and
 release/VM/performance, independent review and CVE completeness remain open.
+
+### Windows continuation: policy retention in both elevation senders
+
+At `f3bac520`, CI, CodeQL, Docker, mutation, security and secret scanning passed.
+The coverage producer passed and its full immutable-base comparison cleared the
+retained-call refusal. It next refused `src/core/privilege.rs:789`, the native
+Omarchy policy insertion. Verified artifact 14187789093 binds original
+`f2413f80` to that exact head; its ZIP SHA-256 is
+`10c6d201e281b889736a8752b7c016d702aa7fbdd3bac0f4134c6fe838a560e2`.
+
+A normal Arch/Linux test now exercises both `native_omarchy_command` and the
+ordinary elevation wrapper in a private, process-isolated configuration
+under UID 65534. An absent policy preserves the original arguments. An explicit
+restrictive policy must precede the operation and retain every field. Both
+senders must preserve malformed-policy parse errors and refuse oversized
+handoffs. The native path checks the actual command argv and system-scope
+layout; the ordinary path checks proposed argv in its existing development-mode
+refusal, before sudo is invoked. Neither command executes sudo, systemd-run or a
+package operation. This does not establish authenticated privilege-boundary or
+native transaction acceptance.
+
+Omitting either sender's policy marker and ignoring either sender's policy
+error each fail the final test for the intended reason. The restored code
+passes. An intermediate multiline `matches!` header had one cold mapped row;
+separating the typed downcast from the variant assertion retained both checks.
+All four faults and the intact test were repeated after that change. An export
+helper's stale ordinary-path line number was also corrected using source
+locations; that failed export contributes no coverage proof.
+
+Final unit binary SHA-256 is
+`e095fb12f39182d8c0daeeaeb6ccace7587af0bc89ee7f93da886704bab0a03a`.
+Only its three fresh intact profiles, owned by root/root/65534 with one module
+identity, enter the local export. All 131 mapped new-test rows, all 17 native
+command rows and the three targeted ordinary-handoff rows are positive. Build,
+fault and adjacent-test profiles are excluded. Four neighboring argv/policy
+controls pass on the same binary. Arch all-target Clippy passes with warnings
+denied and actual source checking; formatting and diff checks pass. Production
+bytes before the test module are unchanged. The comparator was not changed.
+
+Storage allowances were admitted before each wave, ending at 42 GiB growth
+with a 3.25 GiB remaining-wave forecast. Two workers and existing debug,
+split-debug, incremental and coverage settings remained unchanged. After final
+Clippy, VHD file length was 51,592,036,352 bytes, guest use 46,441,259,008 bytes
+and C: free space 588,825,415,680 bytes. Active debug companions remain in place.
+A further native wave requires fresh guest/VHD/host measurements and a growth
+forecast. Full hosted coverage, later source/work obligations, release/VM/
+performance, independent review and private CVE completeness remain open.
