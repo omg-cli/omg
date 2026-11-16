@@ -1786,6 +1786,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn payload_spawn_failure_keeps_context_without_retry() {
+        const TEST: &str =
+            "core::privilege::tests::payload_spawn_failure_keeps_context_without_retry";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return;
+        }
+        assert!(!is_root(), "spawn fixture must be unprivileged");
+        set_yes_flag(false);
+        let _reset = YesFlagReset;
+        for (validation_exit, context) in [
+            (1, "Failed to run with sudo privileges:"),
+            (0, "Failed to elevate privileges:"),
+        ] {
+            let (_directory, sudo, log) =
+                temp_env::with_var("TMPDIR", Some("/var/tmp"), || fake_sudo(validation_exit, 0));
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nrm -- \"$0\"\nexit {validation_exit}\n",
+                log.display()
+            );
+            std::fs::write(&sudo, script).expect("write disappearing sudo fixture");
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sudo_payload_status_in(
+                    &sudo,
+                    std::path::PathBuf::from("/usr/bin/omg"),
+                    false,
+                    &["fullupdate"],
+                ),
+            )
+            .await
+            .expect("failed spawn must not wait for authentication")
+            .expect_err("disappeared payload program must not become success");
+            let message = error.to_string();
+            assert!(
+                message.starts_with(context),
+                "missing spawn context: {message}"
+            );
+            assert!(message.contains("omg doctor --turbo"));
+            assert!(
+                message.contains(&std::io::Error::from_raw_os_error(nix::libc::ENOENT).to_string()),
+                "original spawn error must survive: {message}"
+            );
+            assert!(!sudo.exists(), "validation must remove its own fixture");
+            assert_eq!(
+                std::fs::read_to_string(log).expect("read invocation log"),
+                "-n -v\n",
+                "failed spawn must not retry authentication or execute a payload"
+            );
+        }
+    }
+
     #[test]
     fn test_elevate_for_operation_whitelist() {
         let empty_args = Vec::new();
