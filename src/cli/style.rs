@@ -267,6 +267,7 @@ pub fn sanitize_terminal_text(text: &str) -> String {
 }
 
 // Preserve the owned callback's coverage ownership; exhaustive scalar parity prevents drift.
+#[cfg(any(feature = "arch", test))]
 fn terminal_character_allowed(character: char) -> bool {
     !character.is_control()
         && !matches!(
@@ -504,7 +505,7 @@ mod tests {
 
     #[test]
     fn streaming_terminal_text_matches_owned_sanitization_for_every_unicode_scalar() {
-        for character in (0..=0x10ffff).filter_map(char::from_u32) {
+        for character in (0..=0x0010_ffff).filter_map(char::from_u32) {
             let codepoint = u32::from(character);
             let mut bytes = [0; 4];
             let input = character.encode_utf8(&mut bytes);
