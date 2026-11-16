@@ -436,7 +436,7 @@ def fresh_admission_terminal(cli, arguments, environment, case, directory, state
                     data = b''
                 transcript.extend(data)
                 require(len(transcript) <= 1024 * 1024, 'Fresh admission transcript exceeds budget')
-            if not answered and b'seconds to continue: ' in transcript:
+            if not answered and b'seconds to continue (default: cancel): ' in transcript:
                 found = re.search(rb'Full prepared batch SHA-256: ([a-f0-9]{64})', transcript)
                 require(found is not None, 'Native acknowledgement must publish its exact batch digest')
                 state['prompt_seen'] = True

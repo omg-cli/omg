@@ -93,6 +93,25 @@ class MachineIdentityFixture(unittest.TestCase):
 
 
 class HostedProducer(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == 'linux', 'Requires an owned Linux controlling terminal')
+    def test_fresh_terminal_answers_the_current_native_consent_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli = root / 'fixture-cli'
+            digest = 'c' * 64
+            cli.write_text('#!' + sys.executable + '\nimport signal,sys\n'
+                           'signal.alarm(2)\n'
+                           f'print("Full prepared batch SHA-256: {digest}")\n'
+                           f'print("Type accept {digest} within 60 seconds to continue (default: cancel): ", end="", flush=True)\n'
+                           f'sys.exit(0 if sys.stdin.readline() == "accept {digest}\\n" else 1)\n')
+            cli.chmod(0o755)
+            case = next(case for case in PRODUCER.FRESH_ADMISSION_CASES if case.name == 'archive-accept')
+            state = {}
+            result = PRODUCER.fresh_admission_terminal(cli, [], dict(os.environ), case, root,
+                                                       state, os.getuid(), os.getgid())
+            self.assertTrue(result['prompt_seen'], 'the current production prompt must be answered')
+            self.assertEqual(result['exit_code'], 0, result['output'])
+
     @unittest.skipUnless(sys.platform == 'linux', 'The producer executes in a Linux guest')
     def test_guest_script_preserves_the_command_exit_status(self):
         PRODUCER.run_guest_script('exit 0', timeout=1)
