@@ -1,6 +1,6 @@
 //! Resolved package admission shares one source, policy and terminal decision boundary.
 
-use super::advisory_review::AdvisoryRiskReview;
+use super::advisory_review::{AdvisoryRiskIdentity, AdvisoryRiskReview};
 use super::policy::SecurityPolicy;
 use super::vulnerability::{
     AssessmentUse, PackageAssessment, PackageCoverage, UnknownCoverage, VulnerabilitySource,
@@ -23,6 +23,7 @@ pub(crate) struct PackageReview {
     euid: u32,
     assessments: Vec<PackageAssessment>,
     review_id: Option<String>,
+    legacy_identity: Option<AdvisoryRiskIdentity>,
 }
 
 struct CancelPrompt(Arc<AtomicBool>);
@@ -169,6 +170,10 @@ pub(crate) async fn review_async(
         euid,
         assessments,
         review_id: risk.as_ref().map(|review| review.id().to_owned()),
+        legacy_identity: risk
+            .as_ref()
+            .and_then(AdvisoryRiskReview::legacy_identity)
+            .cloned(),
     };
     review.verify_async(source).await?;
     Ok(review)
@@ -202,6 +207,12 @@ impl PackageReview {
     }
     pub(crate) fn accepted(&self) -> bool {
         self.review_id.is_some()
+    }
+
+    pub(crate) fn legacy_id_for_context(&self, context: &str) -> Option<String> {
+        self.legacy_identity
+            .as_ref()
+            .map(|identity| identity.id_for_context(context))
     }
 
     pub(crate) async fn verify_async(&self, source: &dyn VulnerabilitySource) -> Result<()> {
@@ -627,6 +638,15 @@ print('controlling-PTY case passed:', kind)
             return Ok(());
         }
         let mut reviewed = reviewed?;
+        let destination_context = "actual final destination archive and dependency lock";
+        assert_eq!(
+            reviewed.legacy_id_for_context(destination_context),
+            AdvisoryRiskReview::new(reviewed.assessments(), destination_context)
+                .expect("existing canonical receipt identity")
+                .as_ref()
+                .map(|review| review.id().to_owned()),
+            "retained shared admission must preserve legacy identity without another source query"
+        );
         if case == "known-accept" {
             assert!(reviewed.accepted() && reviewed.id().is_some());
             assert_eq!(reviewed.assessments()[0].findings[0].id, "CVE-2021-23337");

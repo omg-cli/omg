@@ -287,24 +287,43 @@ impl ReviewedNpm<'_> {
                 }
             }
         }
-        self.runtime.verify()?;
-        self.node_admission.verify(&self.runtime.version_dir)?;
-        anyhow::ensure!(
-            active_security_overrides("npm", &self.package) == self.overrides
-                && crate::core::security::npm::NpmLock::parse(
-                    &read_npm_metadata(&prefix.join("package-lock.json"), 16 * 1024 * 1024)?,
-                    &self.spec
-                )?
-                .sha256
-                    == self.lock.sha256,
-            "NPM dependencies or security options changed after advisory review; activation cancelled"
-        );
-        self.lock.verify_installed(prefix, &self.spec)
+        verify_installation(
+            prefix,
+            &self.runtime,
+            &self.node_admission,
+            &self.spec,
+            &self.lock,
+            (&self.package, &self.overrides),
+        )
     }
 
     pub(crate) fn node_path(&self) -> &Path {
         &self.runtime.node
     }
+}
+
+fn verify_installation(
+    prefix: &Path,
+    runtime: &ManagedNpm,
+    node_admission: &crate::runtimes::security::RuntimeAdmission,
+    spec: &crate::core::security::npm::NpmSpec,
+    lock: &crate::core::security::npm::NpmLock,
+    request: (&str, &[&str]),
+) -> Result<()> {
+    let (package, overrides) = request;
+    runtime.verify()?;
+    node_admission.verify(&runtime.version_dir)?;
+    anyhow::ensure!(
+        active_security_overrides("npm", package) == overrides
+            && crate::core::security::npm::NpmLock::parse(
+                &read_npm_metadata(&prefix.join("package-lock.json"), 16 * 1024 * 1024)?,
+                spec
+            )?
+            .sha256
+                == lock.sha256,
+        "NPM dependencies or security options changed after advisory review; activation cancelled"
+    );
+    lock.verify_installed(prefix, spec)
 }
 
 fn npm_inventory(
@@ -380,21 +399,17 @@ fn write_receipt(
     scripts_ran: bool,
     signatures_verified: bool,
 ) -> Result<()> {
-    use crate::core::security::advisory_review::AdvisoryRiskReview;
     use sha2::{Digest as _, Sha256};
     let (prefix, destination) = paths;
     let runtime_content_sha256 =
         hex::encode(Sha256::digest(serde_json::to_vec(&runtime.identity)?));
-    let legacy_risk = AdvisoryRiskReview::new(
-        review.assessments(),
-        &transaction_context(
-            package,
-            destination,
-            runtime,
-            lock,
-            &active_security_overrides("npm", package),
-        )?,
-    )?;
+    let legacy_id = review.legacy_id_for_context(&transaction_context(
+        package,
+        destination,
+        runtime,
+        lock,
+        &active_security_overrides("npm", package),
+    )?);
     let assessed = review
         .assessments()
         .iter()
@@ -403,7 +418,7 @@ fn write_receipt(
         "schema_version":2,"package":package,"lock_sha256":lock.sha256,"node_version":runtime.version,
         "node_path":runtime.node,"runtime_content_sha256":runtime_content_sha256,
         "node_root":runtime.version_dir,"reviewed_at":jiff::Timestamp::now().to_string(),
-        "review_id":legacy_risk.as_ref().map(AdvisoryRiskReview::id),
+        "review_id":legacy_id,
         "risk_accepted":review.accepted(),"coverage":if assessed { "assessed" } else { "unknown" },
         "security_overrides":active_security_overrides("npm", package),
         "lifecycle_scripts_ran":scripts_ran,"npm_signatures_verified":signatures_verified,
@@ -412,7 +427,7 @@ fn write_receipt(
     if !assessed {
         receipt["coverage_review_id"] = serde_json::to_value(review.id())?;
         receipt["unknown_coverage"] =
-            serde_json::to_value(
+            serde_json::Value::Array(
                 review
                     .assessments()
                     .iter()
@@ -423,7 +438,7 @@ fn write_receipt(
             }))
                     })
                     .collect::<Vec<_>>(),
-            )?;
+            );
     }
     crate::core::safe_ops::atomic_write_file_sync(
         prefix.join(".omg-npm-advisory-review.json"),
@@ -462,23 +477,21 @@ pub(crate) fn review_installed_npm<'a>(
     )?;
     let overrides = active_security_overrides("npm", package);
     let review = review_lock(package, prefix, &runtime, &lock, &overrides, advisories)?;
-    let binding = ReviewedNpm {
-        runtime,
-        node_admission,
-        spec,
-        lock,
-        package: package.to_owned(),
-        overrides,
-        advisory: NpmAdmission::Fresh {
-            review,
-            source: advisories,
-        },
+    let unchanged = || -> Result<()> {
+        review.verify(advisories)?;
+        verify_installation(
+            prefix,
+            &runtime,
+            &node_admission,
+            &spec,
+            &lock,
+            (package, &overrides),
+        )
     };
-    binding.verify(prefix)?;
+    unchanged()?;
     let require_signatures = !package_is_allowed(ALLOW_UNVERIFIED_ENV, &format!("npm:{package}"));
     if require_signatures {
-        let status = binding
-            .runtime
+        let status = runtime
             .command(prefix, package)?
             .args(["audit", "signatures", "--prefix"])
             .arg(prefix)
@@ -490,22 +503,28 @@ pub(crate) fn review_installed_npm<'a>(
             "NPM signature/provenance verification failed for '{package}'; refusing to activate it"
         );
     }
-    binding.verify(prefix)?;
+    unchanged()?;
     write_receipt(
         (prefix, prefix),
         package,
-        &binding.runtime,
-        &binding.lock,
-        match &binding.advisory {
-            NpmAdmission::Fresh { review, .. } => review,
-            NpmAdmission::Cached { .. } => {
-                anyhow::bail!("Cannot publish a new receipt from cached npm authority")
-            }
-        },
+        &runtime,
+        &lock,
+        &review,
         previous["lifecycle_scripts_ran"].as_bool().unwrap_or(false),
         require_signatures,
     )?;
-    Ok(binding)
+    Ok(ReviewedNpm {
+        runtime,
+        node_admission,
+        spec,
+        lock,
+        package: package.to_owned(),
+        overrides,
+        advisory: NpmAdmission::Fresh {
+            review,
+            source: advisories,
+        },
+    })
 }
 
 fn verify_receipt_freshness(receipt: &serde_json::Value) -> Result<()> {
@@ -1182,6 +1201,42 @@ esac
         fs::create_dir(fixture.prefix.join("package.json")).expect("manifest write fault");
         assert!(fixture.install().is_err());
         assert!(!fixture.owner.path().join("phases").exists());
+    }
+
+    #[test]
+    fn receipt_refuses_non_utf8_destination_without_replacing_existing_authority() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let fixture = Fixture::new();
+        let admission = fixture.install().expect("controlled signed installation");
+        let receipt_path = fixture.prefix.join(".omg-npm-advisory-review.json");
+        let previous = fs::read(&receipt_path).expect("existing exact receipt authority");
+        let invalid_destination = fixture.owner.path().join(std::ffi::OsString::from_vec(
+            b"invalid-destination-\xff".to_vec(),
+        ));
+        let review = review_lock(
+            PACKAGE,
+            &fixture.prefix,
+            &admission.runtime,
+            &admission.lock,
+            &admission.overrides,
+            &CleanSource,
+        )
+        .expect("validated shared receipt capability");
+        let error = write_receipt(
+            (&fixture.prefix, &invalid_destination),
+            PACKAGE,
+            &admission.runtime,
+            &admission.lock,
+            &review,
+            false,
+            true,
+        )
+        .expect_err("unrepresentable destination cannot acquire a receipt identity");
+        assert!(format!("{error:#}").contains("UTF-8"));
+        assert_eq!(
+            fs::read(receipt_path).expect("previous authority survives refused replacement"),
+            previous
+        );
     }
 
     #[test]

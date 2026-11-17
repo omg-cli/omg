@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run fixed-public runtime installers only inside disposable native namespaces."""
 import argparse
+import gzip
 import hashlib
 import http.server
 from itertools import chain
@@ -20,6 +21,7 @@ import threading
 import time
 from typing import NamedTuple
 import urllib.request
+import zlib
 
 
 class Route(NamedTuple):
@@ -148,6 +150,36 @@ def write_route(route, stream):
         stream.write(route.body)
 
 
+def content_encoding(name, value):
+    require(value in (None, "identity", "gzip") and (value != "gzip" or name == "all-keys.asc"),
+            "Unsupported official Swift content encoding")
+    return value
+
+
+def validate_representation(path, name, encoding, maximum):
+    if content_encoding(name, encoding) == "gzip":
+        try:
+            with gzip.open(path, "rb") as source:
+                decoded = source.read(maximum + 1)
+        except (OSError, EOFError, zlib.error) as error:
+            raise ValueError("Invalid official Swift gzip representation") from error
+        require(0 < len(decoded) <= maximum, "Decoded Swift representation exceeds its bound")
+
+
+def response_headers(route, sources):
+    headers = [("Content-Length", str(route_metadata(route)["body_bytes"]))]
+    if isinstance(route, FileRoute):
+        source = sources.get(route.file.name)
+        require(type(source) is dict and source.get("url") == SWIFT_SOURCES[route.file.name][0]
+                and source.get("bytes") == route.bytes and source.get("sha256") == route.sha256,
+                "Swift response representation differs from its authenticated input")
+        encoding = content_encoding(route.file.name, source.get("content_encoding"))
+        require("content_encoding" in source, "Swift input lacks its official representation encoding")
+        if encoding is not None:
+            headers.append(("Content-Encoding", encoding))
+    return headers
+
+
 def free_bytes(path):
     volume = os.statvfs(path)
     return volume.f_bavail * volume.f_frsize
@@ -174,6 +206,7 @@ def download_swift_input(opener, name, output, deadline):
     count, digest = 0, hashlib.sha256()
     with opener.open(request, timeout=30) as response:
         require(response.status == 200 and response.geturl() == url, "Official Swift input returned an unexpected URL or status")
+        encoding = content_encoding(name, response.headers.get("content-encoding"))
         length = response.headers.get("content-length")
         if length is not None:
             require(re.fullmatch(r"[0-9]+", length) and 0 < int(length) <= maximum, "Official Swift input declared an invalid size")
@@ -188,9 +221,10 @@ def download_swift_input(opener, name, output, deadline):
                 stream.write(chunk)
     require(count > 0 and (expected is None or count == expected), "Official Swift input was truncated or has the wrong release size")
     require(length is None or count == int(length), "Official Swift input differs from its declared length")
+    validate_representation(temporary, name, encoding, maximum)
     temporary.rename(output / name)
     (output / name).chmod(0o444)
-    return {"url": url, "bytes": count, "sha256": digest.hexdigest()}
+    return {"url": url, "bytes": count, "sha256": digest.hexdigest(), "content_encoding": encoding}
 
 
 def prepare_swift(output):
@@ -240,7 +274,11 @@ def swift_inputs(source_commit):
         authenticated_file(SWIFT_INPUTS / name, value["bytes"], value["sha256"])
         url, _maximum, expected = SWIFT_SOURCES[name]
         require(expected is None or value["bytes"] == expected, "Swift input is not the pinned release")
-        require(owner["sources"][name] == {"url": url, **value}, "Swift source receipt does not match its fixed official URL")
+        source = owner["sources"][name]
+        require(type(source) is dict and "content_encoding" in source, "Swift source representation is missing")
+        encoding = content_encoding(name, source["content_encoding"])
+        require(source == {"url": url, **value, "content_encoding": encoding}, "Swift source receipt does not match its fixed official URL")
+        validate_representation(SWIFT_INPUTS / name, name, encoding, _maximum)
     return manifest
 
 
@@ -369,11 +407,13 @@ def inside(args):
     require(owner["purpose"] == "runtime-public-install" and sha(args.unit) == owner["unit_sha256"], "Public fixture owner or binary differs")
     require(owner.get("phase") == ("swift" if args.swift_only else "small"), "Public fixture phase differs")
     check_resources = None
+    swift_sources = {}
     if args.swift_only:
         require(os.uname().machine == "x86_64" and Path("/etc/os-release").read_text() == SWIFT_OS_RELEASE,
                 "Genuine Swift fixture requires its private Ubuntu 24.04 x86_64 identity")
         require(os.statvfs(SWIFT_INPUTS).f_flag & os.ST_RDONLY, "Genuine Swift inputs must be mounted readonly")
         manifest = swift_inputs(owner["source_commit"])
+        swift_sources = json.loads((SWIFT_INPUTS / "owner.json").read_bytes(), object_pairs_hook=unique_object)["sources"]
         require(sha(SWIFT_INPUTS / "manifest.json") == owner["swift_inputs_manifest_sha256"], "Genuine Swift inputs changed across namespace setup")
         check_resources = swift_disk_monitor(args.output, owner["swift_parent_copy_bytes"])
         check_resources()
@@ -442,7 +482,8 @@ def inside(args):
             try:
                 route = state["session"].request(self.headers.get("Host"), self.path)
                 self.send_response(route.status)
-                self.send_header("Content-Length", str(route_metadata(route)["body_bytes"]))
+                for name, value in response_headers(route, swift_sources):
+                    self.send_header(name, value)
                 self.send_header("Connection", "close")
                 self.end_headers()
                 write_route(route, self.wfile)
@@ -493,6 +534,7 @@ def inside(args):
         receipt.update(scope="Genuine Swift vendor-signed archive authentication and extraction followed by owned staging-tamper refusal; no SDK execution or smoke success",
                        swift_input_manifest_sha256=owner["swift_inputs_manifest_sha256"], swift_disk_budget_bytes=SWIFT_BUDGET,
                        swift_parent_copy_bytes=owner["swift_parent_copy_bytes"], swift_inputs=manifest)
+        receipt["swift_source_representations"] = swift_sources
     (args.output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps({"passed": len(cases), "receipt": str(args.output / "receipt.json")}))
 

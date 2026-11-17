@@ -372,7 +372,15 @@ impl SwiftManager {
             .tempdir_in(parent)?;
         let candidate = candidate_dir.path().join("keyring.asc");
         let refreshed = async {
-            download_file(self.client, SWIFT_KEYS_URL, &candidate).await?;
+            let response = crate::core::http::fetch_public_download_fresh(
+                SWIFT_KEYS_URL,
+                super::common::GITHUB_USER_AGENT,
+                Some(std::time::Duration::from_secs(30)),
+            )
+            .await?
+            .error_for_status()?;
+            let keys = crate::core::http::bounded_metadata_body(response).await?;
+            fs::write(&candidate, keys)?;
             publish_keyring(&candidate, &self.keyring_path)
         }
         .await;
@@ -654,6 +662,23 @@ mod tests {
         fs::write(plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
         let fixture =
             PublicationFixture::new_in("swift", "usr/bin/swift", Path::new("/swift-runtime-work"));
+        let owner: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("owner.json")).expect("genuine input representation receipt"),
+        )
+        .unwrap();
+        let wire_keys = fs::read(directory.join("all-keys.asc")).unwrap();
+        let keys = if owner["sources"]["all-keys.asc"]["content_encoding"] == "gzip" {
+            use std::io::Read as _;
+            let mut decoded = Vec::new();
+            flate2::read::GzDecoder::new(&wire_keys[..])
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut decoded)
+                .unwrap();
+            assert!(decoded.len() <= 1024 * 1024);
+            decoded
+        } else {
+            wire_keys
+        };
         let manager = SwiftManager {
             security: mutation_security(&fixture.versions),
             versions_dir: fixture.versions.clone(),
@@ -669,6 +694,11 @@ mod tests {
             "{error:#}"
         );
         assert!(!fixture.versions.join(version).exists());
+        assert_eq!(
+            fs::read(fixture.owner.path().join("keys/all-keys.asc")).unwrap(),
+            keys,
+            "published signing metadata must match the decoded genuine HTTP representation"
+        );
         fixture.assert_previous();
     }
 

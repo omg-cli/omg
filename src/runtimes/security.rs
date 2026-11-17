@@ -1995,6 +1995,87 @@ mod tests {
     }
 
     #[test]
+    fn attended_provider_unknown_keeps_exact_acceptance_without_local_integrity_gaps() {
+        const NAME: &str = "runtimes::security::tests::attended_provider_unknown_keeps_exact_acceptance_without_local_integrity_gaps";
+        if std::env::var_os("OMG_RUNTIME_PROVIDER_UNKNOWN_FIXTURE").is_none() {
+            const DRIVER: &str = r"
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('runtime_review_terminal', sys.argv[2])
+terminal = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(terminal)
+terminal.NAME = sys.argv[3]
+code, transcript = terminal.terminal_case(Path(sys.argv[1]), 'accept', dict(os.environ), expected=(b'Coverage: unknown', b'node', b'Controlled vendor feed coverage unavailable'))
+assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(errors='replace')
+";
+            let output = std::process::Command::new(
+                crate::core::privilege::root_controlled_program_path("python3")
+                    .expect("existing terminal fixture Python"),
+            )
+            .arg("-c")
+            .arg(DRIVER)
+            .arg(std::env::current_exe().expect("current runtime fixture executable"))
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/test-arch-advisory-consent.py"),
+            )
+            .arg(NAME)
+            .env("OMG_RUNTIME_PROVIDER_UNKNOWN_FIXTURE", "1")
+            .output()
+            .expect("run real controlling-PTY runtime review");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            return;
+        }
+        struct UnknownSource(AtomicUsize);
+        impl RuntimeEvidenceSource for UnknownSource {
+            fn read(&self, query: &RuntimeQuery) -> Result<Vec<u8>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let mut report: Envelope = serde_json::from_slice(
+                    &fixture_runtime_report(query).expect("controlled exact runtime report"),
+                )
+                .expect("controlled runtime report schema");
+                report.coverage = Coverage::Unknown;
+                report.gaps = vec!["Controlled vendor feed coverage unavailable".into()];
+                Ok(serde_json::to_vec(&report).expect("controlled provider Unknown report"))
+            }
+        }
+        let (_owner, root) = node_fixture().expect("exact publisher-owned Node fixture");
+        let identity = read_identity(&root).expect("read controlled publisher identity");
+        let (_, gap) = resolve_identity("node", "24.22.3", &root, identity.as_ref())
+            .expect("resolve exact supported Node identity");
+        assert!(
+            gap.is_none(),
+            "fixture must not introduce a local identity gap"
+        );
+        let source = Arc::new(UnknownSource(AtomicUsize::new(0)));
+        let security = RuntimeSecurity::with_source(source.clone());
+        let admission = security
+            .installed("node", &root, ReviewMode::FreshAttended)
+            .expect("explicitly accepted unchanged provider Unknown evidence");
+        assert_eq!(source.0.load(Ordering::SeqCst), 2);
+        assert_eq!(admission.record.report.coverage, Coverage::Unknown);
+        assert!(admission.record.local_gaps.is_empty());
+        assert!(admission.record.accepted_review.is_some());
+        admission
+            .verify(&root)
+            .expect("verify exact accepted authority");
+        let cached = security
+            .installed("node", &root, ReviewMode::CachedOnly)
+            .expect("reuse exact accepted Unknown authority without another prompt");
+        assert_eq!(source.0.load(Ordering::SeqCst), 2);
+        assert_eq!(cached.record.report.coverage, Coverage::Unknown);
+        assert!(cached.record.local_gaps.is_empty());
+        assert_eq!(
+            cached.record.accepted_review,
+            admission.record.accepted_review
+        );
+        cached
+            .verify(&root)
+            .expect("verify unchanged cached Unknown authority");
+    }
+
+    #[test]
     fn accepted_local_integrity_gap_survives_provider_refresh_until_verified_replacement()
     -> Result<()> {
         let (owner, root) = node_fixture()?;

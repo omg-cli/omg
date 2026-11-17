@@ -1,5 +1,6 @@
 """Controls for the native public-runtime fixture driver, not installer acceptance."""
 import importlib.util
+import gzip
 import hashlib
 import io
 import json
@@ -59,7 +60,7 @@ class PublicRuntimeDriver(unittest.TestCase):
             manifest.chmod(0o444)
             owner = {"purpose": "genuine-swift-public-inputs", "source_commit": commit, "complete": True,
                      "manifest_sha256": DRIVER.sha(manifest),
-                     "sources": {name: {"url": sources[name][0], **identity} for name, identity in files.items()}}
+                     "sources": {name: {"url": sources[name][0], **identity, "content_encoding": None} for name, identity in files.items()}}
             path = root / "owner.json"
             try:
                 with patch.object(DRIVER, "SWIFT_INPUTS", root), patch.object(DRIVER, "SWIFT_SOURCES", sources):
@@ -133,11 +134,13 @@ class PublicRuntimeDriver(unittest.TestCase):
         url = "https://www.swift.org/keys/all-keys.asc"
 
         class Reply:
-            def __init__(self, body=b"keys", status=200, selected=url, length="4"):
+            def __init__(self, body=b"keys", status=200, selected=url, length="4", encoding=None):
                 self.body = io.BytesIO(body)
                 self.status = status
                 self.selected = selected
                 self.headers = {} if length is None else {"content-length": length}
+                if encoding is not None:
+                    self.headers["content-encoding"] = encoding
 
             def geturl(self): return self.selected
             def read(self, count): return self.body.read(count)
@@ -157,7 +160,7 @@ class PublicRuntimeDriver(unittest.TestCase):
                 opener = Opener(Reply())
                 with patch.object(DRIVER, "free_bytes", return_value=30 * 1024 ** 3):
                     result = DRIVER.download_swift_input(opener, "all-keys.asc", path, time.monotonic() + 5)
-                self.assertEqual(result, dict(url=url, bytes=4, sha256=hashlib.sha256(b"keys").hexdigest()))
+                self.assertEqual(result, dict(url=url, bytes=4, sha256=hashlib.sha256(b"keys").hexdigest(), content_encoding=None))
                 self.assertEqual((path / "all-keys.asc").read_bytes(), b"keys")
                 self.assertEqual(opener.request.full_url, url)
                 self.assertEqual(opener.request.get_header("Accept-encoding"), "identity")
@@ -170,6 +173,28 @@ class PublicRuntimeDriver(unittest.TestCase):
                     self.assertFalse((path / "all-keys.asc").exists(), "Rejected inputs cannot become authenticated files")
             with self.assertRaisesRegex(ValueError, "must not redirect"):
                 DRIVER.NoRedirect().redirect_request(None, None, 302, "redirect", {}, "https://attacker.invalid/")
+
+        clear = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\ncontrolled key metadata\n"
+        wire = gzip.compress(clear, mtime=0)
+        with patch.dict(DRIVER.SWIFT_SOURCES, {"all-keys.asc": (url, 1024, None)}):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                with patch.object(DRIVER, "free_bytes", return_value=30 * 1024 ** 3):
+                    result = DRIVER.download_swift_input(Opener(Reply(wire, length=str(len(wire)), encoding="gzip")), "all-keys.asc", path, time.monotonic() + 5)
+                self.assertEqual((path / "all-keys.asc").read_bytes(), wire)
+                self.assertEqual(result, dict(url=url, bytes=len(wire), sha256=hashlib.sha256(wire).hexdigest(), content_encoding="gzip"))
+                selected = DRIVER.FileRoute("www.swift.org", "/keys/all-keys.asc", 200, path / "all-keys.asc", len(wire), result["sha256"])
+                self.assertEqual(dict(DRIVER.response_headers(selected, {"all-keys.asc": result})),
+                                 {"Content-Length": str(len(wire)), "Content-Encoding": "gzip"})
+                self.assertEqual(gzip.decompress(wire), clear)
+            for compressed, encoding in [(wire, "br"), (wire, "gzip, identity"), (wire, "gzip\r\nInjected: bad"),
+                                         (wire[:-4], "gzip"), (b"not-gzip", "gzip"),
+                                         (gzip.compress(b"x" * 1025), "gzip")]:
+                with self.subTest(encoding=encoding, wire=len(compressed)), tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory)
+                    with patch.object(DRIVER, "free_bytes", return_value=30 * 1024 ** 3), self.assertRaises(ValueError):
+                        DRIVER.download_swift_input(Opener(Reply(compressed, length=str(len(compressed)), encoding=encoding)), "all-keys.asc", path, time.monotonic() + 5)
+                    self.assertFalse((path / "all-keys.asc").exists())
 
     def test_manifest_retains_exact_order_query_bytes_and_duplicate_routes(self):
         rows = [route(), route("api.github.com", "/releases?page=1"), route()]

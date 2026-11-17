@@ -274,11 +274,11 @@ pub fn get_pkg_info_from_db(alpm: &alpm::Alpm, name: &str) -> Result<Option<Pack
         let verified = verifier.register_syncdb(db.name(), db.siglevel())?;
         validate_sync_signature(&verifier, verified)?;
         let path = sync_dir.join(format!("{}.db", db.name()));
-        let mut packages =
-            super::pacman_db::parse_sync_db(&path, db.name()).with_context(|| {
+        let package = super::pacman_db::parse_sync_db_package(&path, db.name(), name)
+            .with_context(|| {
                 format!("Repository '{}' failed Rust metadata validation", db.name())
             })?;
-        if let Some(pkg) = packages.remove(name) {
+        if let Some(pkg) = package {
             let installed = super::pacman_db::read_local_package_at(
                 &std::path::Path::new(alpm.dbpath()).join("local"),
                 &pkg.name,

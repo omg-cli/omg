@@ -264,6 +264,46 @@ impl Default for LocalDbPackage {
 /// Parse a sync database file (core.db, extra.db, multilib.db)
 /// Returns a `HashMap` of package name -> `SyncDbPackage`
 pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, SyncDbPackage>> {
+    let mut packages = HashMap::new();
+    parse_sync_db_into(path, repo_name, &mut |entry, package| {
+        anyhow::ensure!(
+            packages.insert(package.name.clone(), package).is_none(),
+            "Duplicate package identity in {} from repository {repo_name}",
+            entry.display()
+        );
+        Ok(())
+    })?;
+    Ok(packages)
+}
+
+/// Validate the entire catalog while retaining only one requested package.
+/// Unrelated metadata, duplicate names and the compressed footer still matter.
+pub(crate) fn parse_sync_db_package(
+    path: &Path,
+    repo_name: &str,
+    name: &str,
+) -> Result<Option<SyncDbPackage>> {
+    let mut names = std::collections::HashSet::new();
+    let mut selected = None;
+    parse_sync_db_into(path, repo_name, &mut |entry, package| {
+        anyhow::ensure!(
+            names.insert(package.name.clone()),
+            "Duplicate package identity in {} from repository {repo_name}",
+            entry.display()
+        );
+        if package.name == name {
+            selected = Some(package);
+        }
+        Ok(())
+    })?;
+    Ok(selected)
+}
+
+fn parse_sync_db_into(
+    path: &Path,
+    repo_name: &str,
+    collect: &mut impl FnMut(&Path, SyncDbPackage) -> Result<()>,
+) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NONBLOCK)
@@ -315,7 +355,6 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
     };
 
     let mut archive = tar::Archive::new(reader);
-    let mut packages = HashMap::new();
     let mut entry_count = 0usize;
     let mut descriptions = Vec::new();
     let mut buffered_bytes = 0usize;
@@ -358,13 +397,13 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
             buffered_bytes += raw.len() + entry_path.as_os_str().len();
             descriptions.push((entry_path, raw));
             if descriptions.len() == 512 || buffered_bytes >= 1024 * 1024 {
-                merge_sync_descriptions(&mut packages, &mut descriptions, repo_name)?;
+                parse_sync_descriptions(&mut descriptions, repo_name, collect)?;
                 buffered_bytes = 0;
             }
         }
     }
 
-    merge_sync_descriptions(&mut packages, &mut descriptions, repo_name)?;
+    parse_sync_descriptions(&mut descriptions, repo_name, collect)?;
 
     std::io::copy(&mut archive.into_inner(), &mut std::io::sink()).with_context(|| {
         format!(
@@ -372,7 +411,7 @@ pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, Syn
             path.display()
         )
     })?;
-    Ok(packages)
+    Ok(())
 }
 
 fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<SyncDbPackage> {
@@ -423,10 +462,10 @@ fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<S
     Ok(pkg)
 }
 
-fn merge_sync_descriptions(
-    packages: &mut HashMap<String, SyncDbPackage>,
+fn parse_sync_descriptions(
     descriptions: &mut Vec<(PathBuf, Vec<u8>)>,
     repo_name: &str,
+    collect: &mut impl FnMut(&Path, SyncDbPackage) -> Result<()>,
 ) -> Result<()> {
     static POOL: std::sync::LazyLock<Option<rayon::ThreadPool>> = std::sync::LazyLock::new(|| {
         let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
@@ -461,12 +500,7 @@ fn merge_sync_descriptions(
         None => entries.into_iter().map(parse).collect(),
     };
     for (path, package) in parsed {
-        let package = package?;
-        anyhow::ensure!(
-            packages.insert(package.name.clone(), package).is_none(),
-            "Duplicate package identity in {} from repository {repo_name}",
-            path.display()
-        );
+        collect(&path, package?)?;
     }
     Ok(())
 }
@@ -3017,6 +3051,130 @@ mod tests {
             format!("{error:#}").contains("Inconsistent package identity"),
             "long path buffering consumed the damaged later header first: {error:#}"
         );
+    }
+
+    #[test]
+    fn exact_sync_lookup_matches_full_metadata_and_reports_absence() {
+        let directory = tempfile::tempdir().expect("private exact lookup catalog");
+        let path = directory.path().join("core.db");
+        write_sync_identity_fixture(
+            &path,
+            &[
+                ("other-1-1/desc", "%NAME%\nother\n\n%VERSION%\n1-1\n\n"),
+                (
+                    "selected-2:3.4-5/desc",
+                    "%NAME%\nselected\n\n%VERSION%\n2:3.4-5\n\n%DESC%\nSelected complete metadata\n\n%ISIZE%\n4096\n\n%CSIZE%\n1024\n\n%DEPENDS%\nother>=1\n\n%LICENSE%\nMIT\n\n%URL%\nhttps://example.invalid/selected\n\n",
+                ),
+            ],
+        );
+        let mut all = parse_sync_db(&path, "core").expect("full validated catalog");
+        let selected = parse_sync_db_package(&path, "core", "selected")
+            .expect("exact validated lookup")
+            .expect("selected package");
+        assert_eq!(selected.name, "selected");
+        assert_eq!(selected.version.to_string(), "2:3.4-5");
+        assert_eq!(selected.depends, ["other>=1"]);
+        assert_eq!(
+            serde_json::to_value(selected).unwrap(),
+            serde_json::to_value(all.remove("selected").unwrap()).unwrap()
+        );
+        assert!(
+            parse_sync_db_package(&path, "core", "absent")
+                .expect("absence only after the complete valid stream")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_sync_lookup_rejects_unrelated_late_metadata_and_duplicates() {
+        let directory = tempfile::tempdir().expect("private late-corruption catalog");
+        let path = directory.path().join("core.db");
+        let mut records = vec![(
+            "selected-1-1/desc".to_owned(),
+            "%NAME%\nselected\n\n%VERSION%\n1-1\n\n".to_owned(),
+        )];
+        records.extend((0..512).map(|index| {
+            (
+                format!("other-{index}-1-1/desc"),
+                format!("%NAME%\nother-{index}\n\n%VERSION%\n1-1\n\n"),
+            )
+        }));
+        for (entry, desc, diagnostic) in [
+            (
+                "broken-1-1/desc",
+                "%NAME%\nbroken\n\n",
+                "Missing package version",
+            ),
+            (
+                "nested/broken-1-1/desc",
+                "%NAME%\nbroken\n\n%VERSION%\n1-1\n\n",
+                "Nested sync package directory identity",
+            ),
+            (
+                "broken-2-1/desc",
+                "%NAME%\nbroken\n\n%VERSION%\n1-1\n\n",
+                "Inconsistent package identity",
+            ),
+            (
+                "other-0-2-1/desc",
+                "%NAME%\nother-0\n\n%VERSION%\n2-1\n\n",
+                "Duplicate package identity",
+            ),
+        ] {
+            let mut corrupt = records.clone();
+            corrupt.push((entry.to_owned(), desc.to_owned()));
+            write_sync_identity_fixture(
+                &path,
+                &corrupt
+                    .iter()
+                    .map(|(p, d)| (p.as_str(), d.as_str()))
+                    .collect::<Vec<_>>(),
+            );
+            let error = parse_sync_db_package(&path, "core", "selected")
+                .expect_err("a found target cannot conceal later invalid unrelated metadata");
+            assert!(
+                format!("{error:#}").contains(diagnostic),
+                "{entry}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_sync_lookup_checks_late_utf8_and_compression_footer() {
+        let directory = tempfile::tempdir().expect("private complete-stream lookup");
+        let path = directory.path().join("core.db");
+        let target = "%NAME%\nselected\n\n%VERSION%\n1-1\n\n";
+        write_sync_identity_fixture(&path, &[("selected-1-1/desc", target)]);
+        let mut compressed = fs::read(&path).expect("valid small gzip catalog");
+        let crc = compressed.len() - 8;
+        compressed[crc] ^= 1;
+        fs::write(&path, compressed).expect("corrupt only the gzip footer");
+        parse_sync_db_package(&path, "core", "selected")
+            .expect_err("TAR termination after target must not conceal corrupt gzip CRC");
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        for (entry, bytes) in [
+            ("selected-1-1/desc", target.as_bytes()),
+            (
+                "broken-1-1/desc",
+                b"%NAME%\nbroken\n\n%VERSION%\n1-1\n\n%DESC%\n\xff\n".as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, entry, bytes)
+                .expect("small bounded archive member");
+        }
+        fs::write(&path, archive.into_inner().unwrap().finish().unwrap())
+            .expect("late invalid UTF-8 catalog");
+        let error = parse_sync_db_package(&path, "core", "selected")
+            .expect_err("selected package cannot hide unrelated UTF-8 failure");
+        assert!(error.downcast_ref::<std::string::FromUtf8Error>().is_some());
     }
 
     #[test]

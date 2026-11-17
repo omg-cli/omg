@@ -8,6 +8,21 @@ use std::fmt::Write as _;
 pub(crate) struct AdvisoryRiskReview {
     id: String,
     details: String,
+    legacy_identity: Option<AdvisoryRiskIdentity>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AdvisoryRiskIdentity {
+    records: Vec<String>,
+}
+
+impl AdvisoryRiskIdentity {
+    pub(crate) fn id_for_context(&self, transaction_context: &str) -> String {
+        hex::encode(Sha256::digest(
+            serde_json::json!(("omg-advisory-risk-v1", transaction_context, &self.records,))
+                .to_string(),
+        ))
+    }
 }
 
 pub(crate) struct AdvisoryRiskAcceptance {
@@ -85,7 +100,11 @@ impl AdvisoryRiskReview {
             details.len() <= 60 * 1024,
             "Advisory review exceeds terminal display limit; split the transaction"
         );
-        Ok(Some(Self { id, details }))
+        Ok(Some(Self {
+            id,
+            details,
+            legacy_identity: risk.and_then(|review| review.legacy_identity),
+        }))
     }
 
     pub(crate) fn new(
@@ -138,7 +157,7 @@ impl AdvisoryRiskReview {
         let id = hex::encode(Sha256::digest(serde_json::to_vec(&(
             "omg-advisory-risk-v1",
             transaction_context,
-            records,
+            &records,
         ))?));
         let mut details = String::from(
             "\nSECURITY WARNING: the selected transaction has disclosed advisory findings.\nAccepting the risk does not mark these versions safe or establish missing coverage.\n",
@@ -254,7 +273,11 @@ impl AdvisoryRiskReview {
             details.len() <= 60 * 1024,
             "Advisory review exceeds terminal display limit; split the transaction"
         );
-        Ok(Some(Self { id, details }))
+        Ok(Some(Self {
+            id,
+            details,
+            legacy_identity: Some(AdvisoryRiskIdentity { records }),
+        }))
     }
 
     pub(crate) fn id(&self) -> &str {
@@ -262,6 +285,10 @@ impl AdvisoryRiskReview {
     }
     pub(crate) fn details(&self) -> &str {
         &self.details
+    }
+
+    pub(crate) fn legacy_identity(&self) -> Option<&AdvisoryRiskIdentity> {
+        self.legacy_identity.as_ref()
     }
 
     pub(crate) fn accept(&self, answer: &str) -> anyhow::Result<AdvisoryRiskAcceptance> {
@@ -362,6 +389,73 @@ mod tests {
             native_advisory: None,
             affected_installed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn retained_legacy_identity_matches_existing_canonical_ids_across_contexts() {
+        use super::super::vulnerability::PackageCoverage;
+        let mut assessment = package("quoted-\"package\"-λ");
+        assessment.findings = vec![
+            finding("CVE-2026-10002", FindingApplicability::Applicable),
+            finding("CVE-2026-10001", FindingApplicability::Possible),
+        ];
+        assessment.findings[0].summary = "Escaped \"publisher\" detail\nUnicode λ".into();
+        for coverage in [
+            assessment.coverage.clone(),
+            PackageCoverage::Assessed {
+                provenance: AdvisoryProvenance::Osv {
+                    ecosystem: "npm".into(),
+                },
+            },
+        ] {
+            assessment.coverage = coverage;
+            let original = AdvisoryRiskReview::new(&[assessment.clone()], "original context")
+                .expect("existing canonical finding review")
+                .expect("disclosed finding identity");
+            let wrapped =
+                AdvisoryRiskReview::new_with_unknown(&[assessment.clone()], "original context")
+                    .expect("validated review with preserved coverage")
+                    .expect("finding or Unknown decision");
+            let identity = wrapped
+                .legacy_identity()
+                .expect("finding identity survives the Unknown wrapper")
+                .clone();
+            assert_eq!(identity.id_for_context("original context"), original.id());
+            let destination =
+                AdvisoryRiskReview::new(&[assessment.clone()], "actual destination context")
+                    .expect("existing destination-bound canonical review")
+                    .expect("destination finding identity");
+            assert_eq!(
+                identity.id_for_context("actual destination context"),
+                destination.id()
+            );
+            assert_ne!(destination.id(), original.id());
+            let mut changed = assessment.clone();
+            changed.findings[0].summary.push_str(" Changed evidence.");
+            let changed = AdvisoryRiskReview::new(&[changed], "actual destination context")
+                .expect("changed finding review")
+                .expect("changed finding identity");
+            assert_ne!(
+                identity.id_for_context("actual destination context"),
+                changed.id()
+            );
+        }
+        let unknown = package("coverage-only");
+        let review = AdvisoryRiskReview::new_with_unknown(&[unknown.clone()], "coverage context")
+            .expect("Unknown-only explicit decision")
+            .expect("Unknown must remain a decision");
+        assert!(review.legacy_identity().is_none());
+        let mut clean = unknown;
+        clean.coverage = PackageCoverage::Assessed {
+            provenance: AdvisoryProvenance::Osv {
+                ecosystem: "npm".into(),
+            },
+        };
+        assert!(
+            AdvisoryRiskReview::new_with_unknown(&[clean], "clean context")
+                .expect("complete clean evidence")
+                .is_none()
+        );
     }
 
     #[test]
