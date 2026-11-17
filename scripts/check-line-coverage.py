@@ -1564,7 +1564,8 @@ def index_compiled_owner_sources(owners, files, work, source_names=None):
     """Index the exact canonical-or-literal-suffix predicate once per owner set."""
     _construct_charge(work, len(owners))
     if source_names is not None:
-        _construct_charge(work, len(source_names) + sum(len(name) for name in source_names))
+        _construct_charge(work, len(source_names))
+        _construct_charge(work, sum(len(name) for name in source_names))
         source_names = frozenset(source_names)
     aliases = {}; inventories = {}; names = Counter()
     for owner in owners:
@@ -1588,6 +1589,7 @@ def index_compiled_owner_sources(owners, files, work, source_names=None):
         _construct_charge(work, len(targets))
         for target in targets:
             inventories.setdefault(target, []).append(owner)
+    _construct_charge(work, len(inventories))
     _construct_charge(work, sum(len(rows) for rows in inventories.values()))
     return CompiledOwnerSourceIndex(owners, files, len(owners), len(files),
         {name: tuple(rows) for name, rows in inventories.items()}, names, source_names)

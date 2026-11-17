@@ -431,16 +431,25 @@ pub struct StatusResult {
 }
 
 impl StatusResult {
+    /// Findings counted by a scan, including scans with advisory coverage gaps.
+    #[must_use]
+    pub const fn scanned_vulnerability_count(&self) -> Option<usize> {
+        if self.vulnerabilities_scanned {
+            Some(self.security_vulnerabilities)
+        } else {
+            None
+        }
+    }
+
     /// Findings and uncovered packages from an explicitly reported scan scope.
     #[must_use]
     pub const fn scanned_vulnerability_summary(&self) -> Option<(usize, usize)> {
-        if self.vulnerabilities_scanned {
-            match self.security_unknown_packages {
-                Some(unknown) => Some((self.security_vulnerabilities, unknown)),
-                None => None,
-            }
-        } else {
-            None
+        match (
+            self.scanned_vulnerability_count(),
+            self.security_unknown_packages,
+        ) {
+            (Some(findings), Some(unknown)) => Some((findings, unknown)),
+            _ => None,
         }
     }
 
@@ -740,12 +749,14 @@ mod tests {
         }))
         .expect("legacy status remains decodable");
         assert_eq!(status.scanned_vulnerability_summary(), None);
+        assert_eq!(status.scanned_vulnerability_count(), Some(0));
         status.security_unknown_packages = Some(2);
         assert_eq!(status.scanned_vulnerability_summary(), Some((0, 2)));
         status.security_unknown_packages = Some(0);
         assert_eq!(status.scanned_vulnerability_summary(), Some((0, 0)));
         status.invalidate_security_scope();
         assert_eq!(status.scanned_vulnerability_summary(), None);
+        assert_eq!(status.scanned_vulnerability_count(), None);
         assert_eq!(status.security_unknown_packages, None);
         assert_eq!(
             status.security_vulnerabilities, 0,

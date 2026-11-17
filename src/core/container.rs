@@ -11,6 +11,240 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+const GENERATED_RECIPE_MARKER: &str = "# OMG Development Environment";
+
+struct ReviewedGeneratedBuild {
+    _directory: tempfile::TempDir,
+    original: std::path::PathBuf,
+    recipe: String,
+    recipe_path: std::path::PathBuf,
+    ignore_path: std::path::PathBuf,
+    ignore: String,
+    ignore_sources: Vec<(std::path::PathBuf, Option<String>)>,
+    context: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+    program: std::path::PathBuf,
+    program_sha256: String,
+    environment: std::collections::BTreeMap<String, String>,
+    review: crate::core::security::package_review::PackageReview,
+    source: crate::core::security::vulnerability::VulnerabilityScanner,
+}
+
+fn generated_recipe(path: &Path) -> Result<Option<String>> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(path) else {
+        return Ok(None);
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    let mut prefix = Vec::new();
+    file.take(1024 * 1024).read_to_end(&mut prefix)?;
+    if !prefix
+        .split(|byte| *byte == b'\n')
+        .any(|line| line.strip_suffix(b"\r").unwrap_or(line) == GENERATED_RECIPE_MARKER.as_bytes())
+    {
+        return Ok(None);
+    }
+    let recipe = crate::config::mise_env::read_bounded_regular_file(path)?
+        .context("OMG-generated recipe disappeared before review")?;
+    anyhow::ensure!(
+        recipe.lines().any(|line| line == GENERATED_RECIPE_MARKER),
+        "OMG-generated recipe changed before review"
+    );
+    Ok(Some(recipe))
+}
+
+impl ReviewedGeneratedBuild {
+    fn prepare(
+        runtime: ContainerRuntime,
+        dockerfile: &Path,
+        tag: &str,
+        context: &Path,
+        no_cache: bool,
+        build_args: &[String],
+        target: Option<&str>,
+    ) -> Result<Option<Self>> {
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        use sha2::{Digest as _, Sha256};
+        let Some(recipe) = generated_recipe(dockerfile)? else {
+            return Ok(None);
+        };
+        crate::core::security::policy::require_native_plan_support("OMG-generated container")?;
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        let original = dockerfile.canonicalize()?;
+        let context = context.canonicalize()?;
+        anyhow::ensure!(
+            context.is_dir() && original.starts_with(&context),
+            "OMG-generated recipes require a local build context containing the recipe"
+        );
+        anyhow::ensure!(
+            runtime != ContainerRuntime::Podman
+                || original.extension().is_none_or(|ext| ext != "in"),
+            "Reviewed OMG recipes cannot use Podman .in preprocessing; use a plain generated Dockerfile"
+        );
+        let filename = original
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("OMG-generated recipe filename must be UTF-8")?;
+        let specific = |suffix: &str| original.with_file_name(format!("{filename}.{suffix}"));
+        let priorities = match runtime {
+            ContainerRuntime::Docker => {
+                vec![specific("dockerignore"), context.join(".dockerignore")]
+            }
+            ContainerRuntime::Podman => vec![
+                context.join(".containerignore"),
+                context.join(".dockerignore"),
+                specific("dockerignore"),
+                specific("containerignore"),
+            ],
+        };
+        let mut ignore_sources = Vec::new();
+        let mut ignore = String::new();
+        for path in priorities {
+            let value = crate::config::mise_env::read_bounded_regular_file(&path)?;
+            let found = value.is_some();
+            if let Some(content) = &value {
+                ignore.clone_from(content);
+            }
+            ignore_sources.push((path, value));
+            if found {
+                break;
+            }
+        }
+        let directory = tempfile::Builder::new()
+            .prefix("omg-container-review-")
+            .tempdir()?;
+        anyhow::ensure!(
+            !directory.path().canonicalize()?.starts_with(&context),
+            "Reviewed container snapshots require a temporary directory outside the build context"
+        );
+        let recipe_path = directory.path().join(filename);
+        let ignore_path = directory.path().join(format!("{filename}.dockerignore"));
+        std::fs::write(&recipe_path, &recipe)?;
+        std::fs::write(&ignore_path, &ignore)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for path in [&recipe_path, &ignore_path] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400))?;
+            }
+        }
+        let program = which::which(runtime.command())?.canonicalize()?;
+        let program_sha256 = crate::runtimes::security::file_digest(&program, 512 * 1024 * 1024)?.0;
+        let mut environment = std::env::vars_os()
+            .map(|(key, value)| {
+                Ok((
+                    key.into_string().map_err(|_| {
+                        anyhow::anyhow!("Generated build environment key is not UTF-8")
+                    })?,
+                    value.into_string().map_err(|_| {
+                        anyhow::anyhow!("Generated build environment value is not UTF-8")
+                    })?,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        if runtime == ContainerRuntime::Docker {
+            environment.insert("DOCKER_BUILDKIT".into(), "1".into());
+        }
+        let environment_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&environment)?));
+        let recipe_sha256 = hex::encode(Sha256::digest(recipe.as_bytes()));
+        let images = recipe
+            .lines()
+            .filter(|line| line.trim_start().starts_with("FROM "))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !images.is_empty(),
+            "OMG-generated recipe has no base image declaration"
+        );
+        let image_labels = images
+            .iter()
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .filter(|image| crate::core::security::validate_image_ref(image).is_ok())
+                    .unwrap_or("unresolved image reference")
+            })
+            .collect::<Vec<_>>();
+        let transaction = serde_json::to_string(&serde_json::json!({
+            "kind":"omg-generated-container-v1", "recipe":original,"recipe_sha256":recipe_sha256,
+            "context":context,"cwd":cwd,"runtime":runtime,"program":program,"program_sha256":program_sha256,
+            "images":images,"tag":tag,"target":target,"no_cache":no_cache,"build_args":build_args,
+            "environment_sha256":environment_sha256,"ignore_sources":ignore_sources,
+        }))?;
+        let gaps = vec![
+            format!("OMG-generated recipe: {}. Declared base image(s): {}. Output tag: {tag}. Stage: {}. Cache disabled: {no_cache}.", original.display(), image_labels.join("; "), target.unwrap_or("default")),
+            "Base-image layers, distribution package resolution, installed runtime versions and transitive dependencies have no resolved CVE assessment for this build. Known package restrictions cannot be evaluated against an unresolved package inventory.".into(),
+            "Installer checksums authenticate downloaded bytes; they do not establish CVE coverage or protection against undisclosed zero-days. Mutable image tags, remote repository results and copied project files remain unassessed. Accepting this recipe keeps coverage UNKNOWN.".into(),
+        ];
+        let package = SecurityPackage {
+            name: "omg-generated-container".into(),
+            version: "unresolved".into(),
+            origin: SecurityOrigin::Unknown,
+            architecture: None,
+            advisory_source: None,
+            description: String::new(),
+            licenses: Vec::new(),
+        };
+        let source = crate::core::security::vulnerability::VulnerabilityScanner::new();
+        let review = crate::core::security::package_review::review(
+            &[package],
+            &transaction,
+            &gaps,
+            &source,
+        )?;
+        Ok(Some(Self {
+            _directory: directory,
+            original,
+            recipe,
+            recipe_path,
+            ignore_path,
+            ignore,
+            ignore_sources,
+            context,
+            cwd,
+            program,
+            program_sha256,
+            environment,
+            review,
+            source,
+        }))
+    }
+
+    fn verify(&self) -> Result<()> {
+        self.review.verify(&self.source)?;
+        anyhow::ensure!(
+            generated_recipe(&self.original)?.as_deref() == Some(self.recipe.as_str())
+                && self.context.canonicalize()? == self.context
+                && self.cwd.canonicalize()? == self.cwd
+                && crate::config::mise_env::read_bounded_regular_file(&self.recipe_path)?
+                    .as_deref()
+                    == Some(self.recipe.as_str())
+                && crate::config::mise_env::read_bounded_regular_file(&self.ignore_path)?
+                    .as_deref()
+                    == Some(self.ignore.as_str())
+                && crate::runtimes::security::file_digest(&self.program, 512 * 1024 * 1024)?.0
+                    == self.program_sha256,
+            "Generated container recipe, builder or review snapshot changed; review the build again"
+        );
+        for (path, expected) in &self.ignore_sources {
+            anyhow::ensure!(
+                crate::config::mise_env::read_bounded_regular_file(path)? == *expected,
+                "Container ignore rules changed after review; review the build again"
+            );
+        }
+        crate::core::security::policy::require_native_plan_support("OMG-generated container")?;
+        Ok(())
+    }
+}
+
 /// Supported container runtimes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContainerRuntime {
@@ -249,9 +483,25 @@ impl ContainerManager {
             anyhow::bail!("Invalid build context {context_str:?}: '..' is not allowed");
         }
 
-        let mut cmd = Command::new(self.runtime.command());
+        let reviewed = ReviewedGeneratedBuild::prepare(
+            self.runtime,
+            dockerfile,
+            tag,
+            context,
+            no_cache,
+            build_args,
+            target,
+        )?;
+        let mut cmd = reviewed.as_ref().map_or_else(
+            || Command::new(self.runtime.command()),
+            |reviewed| Command::new(&reviewed.program),
+        );
         cmd.arg("build");
-        cmd.args(["-f", &dockerfile.display().to_string()]);
+        cmd.arg("-f").arg(
+            reviewed
+                .as_ref()
+                .map_or(dockerfile, |reviewed| &reviewed.recipe_path),
+        );
         cmd.args(["-t", tag]);
 
         if no_cache {
@@ -266,8 +516,22 @@ impl ContainerManager {
             cmd.args(["--target", t]);
         }
 
+        if let Some(reviewed) = &reviewed {
+            cmd.env_clear()
+                .envs(&reviewed.environment)
+                .current_dir(&reviewed.cwd);
+            if self.runtime == ContainerRuntime::Podman {
+                cmd.arg("--ignorefile").arg(&reviewed.ignore_path);
+            }
+            reviewed.verify()?;
+        }
+
         cmd.arg("--");
-        cmd.arg(context.display().to_string());
+        cmd.arg(
+            reviewed
+                .as_ref()
+                .map_or(context, |reviewed| reviewed.context.as_path()),
+        );
 
         let status = cmd.status().context("Failed to build container")?;
         if !status.success() {
@@ -388,7 +652,8 @@ impl ContainerManager {
         use std::fmt::Write as _;
 
         let mut dockerfile = format!("FROM {base_image}\n\n");
-        dockerfile.push_str("# OMG Development Environment\n");
+        dockerfile.push_str(GENERATED_RECIPE_MARKER);
+        dockerfile.push('\n');
         dockerfile.push_str("LABEL maintainer=\"OMG Team\"\n\n");
         let mut unpinned_urls = Vec::new();
         let mut runtime_errors = Vec::new();
@@ -1100,6 +1365,309 @@ pub fn dev_container_config(project_dir: &Path) -> ContainerConfig {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_recipe_requires_unknown_review_even_with_generic_yes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const NAME: &str = "core::container::tests::generated_recipe_requires_unknown_review_even_with_generic_yes";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        nix::unistd::setsid().expect("detach unattended generated-build fixture");
+        let owner = tempfile::tempdir().expect("private generated-build fixture");
+        let project = owner.path().join("project");
+        let bin = owner.path().join("bin");
+        let config = owner.path().join("config");
+        for path in [&project, &bin, &config] {
+            fs::create_dir(path).expect("owned generated-build fixture directory");
+        }
+        let marker = owner.path().join("builder-started");
+        let executable = bin.join("docker");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf build > '{}'\n",
+                owner.path().join("argv").display(),
+                marker.display()
+            ),
+        )
+        .expect("controlled container builder");
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755))
+            .expect("controlled builder executable");
+        let manager = ContainerManager::with_runtime(ContainerRuntime::Docker);
+        let generated = manager.generate_dockerfile("ubuntu:24.04", &[], &InstallerDigests::new());
+        fs::write(project.join("Dockerfile.omg"), generated.content).expect("generated recipe");
+        let previous = std::env::current_dir().expect("original fixture working directory");
+        std::env::set_current_dir(&project).expect("private build context");
+        temp_env::with_vars(
+            [
+                ("PATH", Some(bin.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+            ],
+            || {
+                assert_eq!(crate::core::paths::config_dir(), config);
+                crate::core::privilege::set_yes_flag(true);
+                let error = manager
+                    .build_with_options(
+                        Path::new("Dockerfile.omg"),
+                        "fixture:review",
+                        &project,
+                        false,
+                        &[],
+                        None,
+                    )
+                    .expect_err("generic yes cannot authorize unknown generated installs");
+                assert!(format!("{error:#}").contains("attended controlling terminal"));
+                assert!(
+                    !marker.exists(),
+                    "builder ran before explicit Unknown acceptance"
+                );
+                for policy in [
+                    "banned_packages = ['glibc']\n",
+                    "require_pgp = true\n",
+                    "allowed_licenses = ['MIT']\n",
+                    "advisory_requirement = 'fresh_snapshot'\narch_advisory_repositories = ['core']\n",
+                    "advisory_requirement = 'optional'\n",
+                ] {
+                    fs::write(config.join("policy.toml"), policy)
+                        .expect("explicit container policy");
+                    let error = manager
+                        .build_with_options(
+                            Path::new("Dockerfile.omg"),
+                            "fixture:review",
+                            &project,
+                            false,
+                            &[],
+                            None,
+                        )
+                        .expect_err(
+                            "unresolved container packages cannot enforce an explicit policy",
+                        );
+                    assert!(format!("{error:#}").contains("cannot enforce an explicit OMG policy"));
+                    assert!(
+                        !marker.exists(),
+                        "restricted generated build invoked its builder"
+                    );
+                }
+                fs::write(project.join("Dockerfile"), "FROM scratch\n")
+                    .expect("user-supplied recipe");
+                manager.build_with_options(Path::new("Dockerfile"), "fixture:custom", &project, false, &[], None)
+                    .expect("custom Dockerfile retains its existing explicit-policy and builder contract");
+                assert!(marker.exists());
+                assert_eq!(
+                    fs::read_to_string(owner.path().join("argv")).expect("custom builder argv"),
+                    format!(
+                        "build\n-f\nDockerfile\n-t\nfixture:custom\n--\n{}\n",
+                        project.display()
+                    )
+                );
+            },
+        );
+        std::env::set_current_dir(previous).expect("restore fixture working directory");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn generated_recipe_terminal_binds_recipe_ignore_builder_and_policy() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const NAME: &str = "core::container::tests::generated_recipe_terminal_binds_recipe_ignore_builder_and_policy";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        let Ok(case) = std::env::var("OMG_CONTAINER_BUILD_CASE") else {
+            const DRIVER: &str = r#"
+import importlib.util, os, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('container_review_terminal', sys.argv[2])
+terminal = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(terminal)
+terminal.NAME = sys.argv[3]
+for case in ('accept-docker', 'accept-podman', 'accept-empty', 'yes', 'recipe-change', 'ignore-change', 'builder-change', 'policy-change'):
+    with tempfile.TemporaryDirectory(prefix='omg-container-case-') as folder:
+        root = Path(folder)
+        environment = dict(os.environ, OMG_CONTAINER_BUILD_CASE=case, OMG_CONTAINER_BUILD_ROOT=folder)
+        def mutate():
+            if case == 'recipe-change':
+                with (root / 'project' / 'renamed.Dockerfile').open('a') as output:
+                    output.write('\nRUN echo changed\n')
+            elif case == 'ignore-change':
+                (root / 'project' / 'renamed.Dockerfile.dockerignore').write_text('!secrets.key\n')
+            elif case == 'builder-change':
+                (root / 'bin' / 'docker').write_text('#!/bin/sh\nexit 19\n')
+            elif case == 'policy-change':
+                (root / 'config' / 'policy.toml').write_text("banned_packages = ['omg-generated-container']\n")
+        code, transcript = terminal.terminal_case(Path(sys.argv[1]), 'generic-yes' if case == 'yes' else 'accept', environment,
+            expected=(b'Coverage: unknown', b'omg-generated-container', b'Mutable image tags', b'coverage UNKNOWN'), before_answer=mutate)
+        assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(errors='replace')
+"#;
+            let output = Command::new(
+                crate::core::privilege::root_controlled_program_path("python3")
+                    .expect("existing terminal fixture Python"),
+            )
+            .args(["-c", DRIVER])
+            .arg(std::env::current_exe().expect("current container test executable"))
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/test-arch-advisory-consent.py"),
+            )
+            .arg(NAME)
+            .output()
+            .expect("bounded real controlling-PTY container review cases");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            return;
+        };
+        let root = std::path::PathBuf::from(
+            std::env::var_os("OMG_CONTAINER_BUILD_ROOT").expect("owned container fixture root"),
+        );
+        let project = root.join("project");
+        let bin = root.join("bin");
+        let config = root.join("config");
+        for path in [&project, &bin, &config] {
+            fs::create_dir(path).expect("owned build fixture directory");
+        }
+        let runtime = if case == "accept-podman" {
+            ContainerRuntime::Podman
+        } else {
+            ContainerRuntime::Docker
+        };
+        let executable = bin.join(runtime.command());
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+set -eu
+root=$OMG_CONTAINER_BUILD_ROOT
+printf '%s\n' "$@" > "$root/argv"
+recipe=''
+ignore=''
+while [ "$#" -gt 0 ]; do
+ case "$1" in
+  -f) recipe=$2; shift ;;
+  --ignorefile) ignore=$2; shift ;;
+ esac
+ shift
+done
+[ -n "$ignore" ] || ignore="$recipe.dockerignore"
+printf '%s' "$recipe" > "$root/recipe-path"
+cat "$recipe" > "$root/seen-recipe"
+cat "$ignore" > "$root/seen-ignore"
+printf '%s' "${DOCKER_BUILDKIT-unset}" > "$root/buildkit"
+printf build > "$root/builder-started"
+"#,
+        )
+        .expect("controlled builder reads actual pinned recipe and ignore");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("controlled builder executable");
+        let manager = ContainerManager::with_runtime(runtime);
+        let recipe = manager
+            .generate_dockerfile("ubuntu:24.04", &[], &InstallerDigests::new())
+            .content;
+        fs::write(project.join("renamed.Dockerfile"), &recipe).expect("renamed OMG recipe");
+        if case != "accept-empty" {
+            for (name, content) in [
+                (".dockerignore", "root-rules\n"),
+                (".containerignore", "podman-rules\n"),
+                ("renamed.Dockerfile.dockerignore", "specific-rules\n"),
+            ] {
+                fs::write(project.join(name), content).expect("original ignore precedence fixture");
+            }
+        }
+        let before = fs::read_dir(&project)
+            .expect("original build context")
+            .map(|entry| entry.expect("context entry").file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let previous = std::env::current_dir().expect("original working directory");
+        std::env::set_current_dir(&project).expect("private build context");
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        temp_env::with_vars(
+            [
+                ("PATH", Some(std::ffi::OsStr::new(&path))),
+                ("OMG_CONFIG_DIR", Some(config.as_os_str())),
+                ("DOCKER_BUILDKIT", None),
+            ],
+            || {
+                let result = manager.build_with_options(
+                    Path::new("renamed.Dockerfile"),
+                    "fixture:review",
+                    &project,
+                    true,
+                    &["PINNED=value".into()],
+                    Some("builder"),
+                );
+                if case.starts_with("accept-") {
+                    result.expect("exact accepted Unknown build");
+                    assert_eq!(
+                        fs::read_to_string(root.join("seen-recipe"))
+                            .expect("builder received reviewed recipe"),
+                        recipe
+                    );
+                    let ignore = if case == "accept-empty" {
+                        ""
+                    } else if runtime == ContainerRuntime::Podman {
+                        "podman-rules\n"
+                    } else {
+                        "specific-rules\n"
+                    };
+                    assert_eq!(
+                        fs::read_to_string(root.join("seen-ignore"))
+                            .expect("builder received correct original ignore"),
+                        ignore
+                    );
+                    let snapshot = std::path::PathBuf::from(
+                        fs::read_to_string(root.join("recipe-path"))
+                            .expect("actual private recipe path"),
+                    );
+                    assert!(!snapshot.starts_with(&project));
+                    assert!(
+                        !snapshot.exists(),
+                        "review namespace must retire after child exits"
+                    );
+                    assert_eq!(
+                        fs::read_to_string(root.join("buildkit")).expect("actual builder mode"),
+                        if runtime == ContainerRuntime::Docker {
+                            "1"
+                        } else {
+                            "unset"
+                        }
+                    );
+                    let argv =
+                        fs::read_to_string(root.join("argv")).expect("actual builder arguments");
+                    for expected in [
+                        "fixture:review",
+                        "--no-cache",
+                        "PINNED=value",
+                        "--target\nbuilder",
+                    ] {
+                        assert!(argv.contains(expected));
+                    }
+                } else {
+                    let error = result.expect_err("unaccepted or changed build must be refused");
+                    let message = format!("{error:#}");
+                    assert!(
+                        message.contains(if case == "yes" {
+                            "Security acknowledgement declined"
+                        } else {
+                            "changed"
+                        }),
+                        "{message}"
+                    );
+                    assert!(!root.join("builder-started").exists());
+                }
+            },
+        );
+        assert_eq!(
+            before,
+            fs::read_dir(&project)
+                .expect("context after review")
+                .map(|entry| entry.expect("context entry").file_name())
+                .collect()
+        );
+        std::env::set_current_dir(previous).expect("restore working directory");
+    }
 
     #[test]
     fn dev_container_config_sanitizes_project_directory_name() {

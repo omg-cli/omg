@@ -1611,6 +1611,8 @@ omg team activity --days 30
 
 Docker/Podman integration.
 
+For OMG-generated recipes, `omg container build` requires attended acceptance of Unknown advisory coverage. The review binds the recipe, declared base images, build options and effective ignore rules. An explicit OMG package policy requires a resolved transaction, so a generated build with that policy stops before launching the builder.
+
 ```bash
 omg container <SUBCOMMAND>
 ```

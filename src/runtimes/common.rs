@@ -5176,6 +5176,54 @@ mod tests {
     }
 
     #[test]
+    fn file_gzip_budget_refuses_excess_and_preserves_exact_limit() -> anyhow::Result<()> {
+        let owner = TempDir::new()?;
+        let archive = owner.path().join("bounded.gz");
+        fs::write(&archive, gzip_bomb(4096))?;
+        for budget in [4095, 4096] {
+            let decoder = flate2::read::GzDecoder::new(File::open(&archive)?);
+            let mut reader = BudgetedReader::new(decoder, budget);
+            let mut output = Vec::new();
+            let result = reader.read_to_end(&mut output);
+            if budget == 4096 {
+                assert_eq!(result?, 4096);
+                assert_eq!(output, vec![0; 4096]);
+            } else {
+                let error = result.expect_err("File-backed gzip must reject the first excess byte");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("configured limit of 4095 bytes"));
+                assert!(output.len() <= usize::try_from(budget)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn file_zstd_budget_refuses_excess_and_preserves_exact_limit() -> anyhow::Result<()> {
+        let owner = TempDir::new()?;
+        let archive = owner.path().join("bounded.zst");
+        let payload = vec![b'z'; 4096];
+        fs::write(&archive, zstd::stream::encode_all(payload.as_slice(), 1)?)?;
+        for budget in [4095, 4096] {
+            let decoder = ruzstd::decoding::StreamingDecoder::new(File::open(&archive)?)
+                .expect("owned tiny Zstd fixture must decode");
+            let mut reader = BudgetedReader::new(decoder, budget);
+            let mut output = Vec::new();
+            let result = reader.read_to_end(&mut output);
+            if budget == 4096 {
+                assert_eq!(result?, 4096);
+                assert_eq!(output, payload);
+            } else {
+                let error = result.expect_err("File-backed Zstd must reject the first excess byte");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("configured limit of 4095 bytes"));
+                assert!(output.len() <= usize::try_from(budget)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn budgeted_writer_stops_before_exceeding_cumulative_budget() {
         {
             let mut remaining = 16;
