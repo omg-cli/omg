@@ -268,6 +268,12 @@ jobs:
           cargo clippy --all-targets --no-default-features \
             --features debian-pure --locked -- -D warnings
 
+      - name: Verify Node authentication fails closed without PGP
+        run: |
+          cargo test --lib --no-default-features --features license --locked \
+            runtimes::node::tests::node_install_without_pgp_refuses_before_contacting_the_publisher \
+            -- --exact --nocapture
+
       - name: Check fuzz targets
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
