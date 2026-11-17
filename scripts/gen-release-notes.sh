@@ -6,7 +6,7 @@
 # pushes and manual publishes). The verification section MUST stay in sync
 # with how artifacts are actually published and attested:
 #   - archives + .sha256 sidecars → GitHub Releases
-#   - SLSA build provenance attestations → GitHub artifacts API
+#   - SLSA build provenance attestations → GitHub artifacts API + release bundle
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -126,6 +126,10 @@ CLI:
 \`\`\`bash
 gh attestation verify omg-v${version}-x86_64-linux-arch.tar.gz -R ${signer_repo} --source-ref refs/tags/v${version} --signer-workflow ${signer_repo}/.github/workflows/release.yml
 \`\`\`
+
+The release also includes \`omg-release.sigstore.json\`, the signed provenance
+bundle for the archives and SBOM. To verify a downloaded archive using that
+bundle, add \`--bundle omg-release.sigstore.json\` to the command above.
 
 \`install.sh\` requires GitHub CLI and successful provenance verification.
 \`omg self-update\` also fails closed unless provenance verifies; its explicit
