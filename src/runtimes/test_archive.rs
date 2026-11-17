@@ -153,15 +153,24 @@ impl PublicationFixture {
         .expect("prior admission survives failed publication")
         .verify(&previous)
         .expect("prior content remains bound");
-        assert!(
-            !std::fs::read_dir(&self.versions)
-                .expect("fixture versions")
-                .any(|entry| {
-                    let entry = entry.expect("owned fixture entry");
-                    entry.file_name().to_string_lossy().starts_with(".install-")
-                }),
-            "temporary publication trees must be retired by their owner"
-        );
+        for entry in std::fs::read_dir(&self.versions).expect("fixture versions") {
+            let entry = entry.expect("owned fixture entry");
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(suffix) = name.strip_prefix(".install-") else {
+                continue;
+            };
+            assert!(
+                suffix.strip_suffix(".lock").is_some_and(|version| {
+                    crate::core::security::validate_runtime_version(version).is_ok()
+                }) && entry
+                    .file_type()
+                    .expect("owned fixture entry type")
+                    .is_file(),
+                "unexpected temporary publication path: {}",
+                entry.path().display()
+            );
+        }
     }
 
     pub(super) fn corrupt_identity(&self, version: &str) {
@@ -208,6 +217,27 @@ pub(super) fn mutation_security(versions: &std::path::Path) -> super::security::
     super::security::RuntimeSecurity::with_source(std::sync::Arc::new(Mutation(
         versions.to_path_buf(),
     )))
+}
+
+#[test]
+fn publication_fixture_allows_install_lease_but_rejects_staging_leftovers() -> Result<()> {
+    let fixture = PublicationFixture::new("swift", "usr/bin/swift");
+    let lease = super::common::try_lock_runtime_install(&fixture.versions, "6.0.3")?;
+    drop(lease);
+    let lock = fixture.versions.join(".install-6.0.3.lock");
+    assert!(lock.is_file(), "released leases keep a stable lock path");
+    fixture.assert_previous();
+
+    let stage = super::common::begin_staged_install(&fixture.versions)?;
+    assert!(std::panic::catch_unwind(|| fixture.assert_previous()).is_err());
+    stage.close()?;
+
+    let linked_lock = fixture.versions.join(".install-6.0.4.lock");
+    std::os::unix::fs::symlink(&lock, &linked_lock)?;
+    assert!(std::panic::catch_unwind(|| fixture.assert_previous()).is_err());
+    std::fs::remove_file(linked_lock)?;
+    fixture.assert_previous();
+    Ok(())
 }
 
 #[test]

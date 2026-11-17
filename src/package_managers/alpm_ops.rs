@@ -245,8 +245,8 @@ pub fn get_sync_pkg_info(name: &str) -> Result<Option<PackageInfo>> {
     }
 
     let epoch = super::pacman_db::SyncDbEpoch::observe()?;
-    let package =
-        crate::package_managers::alpm_direct::with_handle(|alpm| get_pkg_info_from_db(alpm, name))?;
+    let alpm = crate::package_managers::alpm_direct::create_alpm_handle()?;
+    let package = get_pkg_info_from_db(&alpm, name)?;
     anyhow::ensure!(
         epoch == super::pacman_db::SyncDbEpoch::observe()?,
         "Package databases or configuration changed while querying; retry the operation"

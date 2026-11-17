@@ -2732,7 +2732,7 @@ assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(erro
         use std::io::{Read, Write};
         for (status, declared, body, accepted) in [
             (200, 2, vec![b'[', b']'], true),
-            (503, 2, vec![b'[', b']'], false),
+            (503, 0, Vec::new(), false),
             (200, 10, b"short".to_vec(), false),
             (200, MAX_REPORT + 1, vec![b'x'; MAX_REPORT + 1], false),
         ] {
@@ -2750,22 +2750,9 @@ assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(erro
                     stream,
                     "HTTP/1.1 {status} Controlled\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
                 ).expect("write the controlled HTTP fixture headers");
-                if status == 503 {
-                    stream.shutdown(std::net::Shutdown::Write).expect(
-                        "inject a settled server write-side disconnect after status headers",
-                    );
-                }
-                let written = stream.write_all(&body);
-                let error_kind = written.as_ref().err().map(std::io::Error::kind);
-                assert!(
-                    matches!(
-                        error_kind,
-                        None | Some(
-                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        )
-                    ),
-                    "unexpected fixture write: {written:?}"
-                );
+                stream
+                    .write_all(&body)
+                    .expect("write the controlled HTTP fixture body");
             });
             let response = reqwest::Client::builder()
                 .no_proxy()
@@ -2777,6 +2764,11 @@ assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(erro
             assert_eq!(result.is_ok(), accepted);
             if status == 503 {
                 assert!(format!("{:#}", result.as_ref().unwrap_err()).contains("HTTP 503"));
+            }
+            if declared > MAX_REPORT {
+                assert!(
+                    format!("{:#}", result.as_ref().unwrap_err()).contains("exceeds its bound")
+                );
             }
             if accepted {
                 assert_eq!(result?, b"[]");

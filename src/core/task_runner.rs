@@ -2016,8 +2016,12 @@ mod tests {
         fs::create_dir(&config).unwrap();
         fs::copy(python, bin.join("python3")).unwrap();
         let venv = owner.path().join(".venv");
+        // Framework launchers may report an external sys._base_executable
+        // after being copied. Bind stock venv construction to this owned base.
+        const CREATE_VENV: &str = "import sys,venv\nsys._base_executable=sys.argv[1]\nvenv.EnvBuilder(with_pip=False,symlinks=True).create(sys.argv[2])\n";
         let status = Command::new(bin.join("python3"))
-            .args(["-m", "venv", "--without-pip", "--symlinks"])
+            .args(["-c", CREATE_VENV])
+            .arg(bin.join("python3"))
             .arg(&venv)
             .status()
             .unwrap();
@@ -2025,6 +2029,33 @@ mod tests {
             status.success(),
             "system Python must create the owned no-download virtualenv"
         );
+        let venv_config = venv.join("pyvenv.cfg");
+        let original_config = fs::read_to_string(&venv_config).unwrap();
+        let actual_base = validate_venv_python(&venv, Some(&bin)).unwrap_or_else(|error| {
+            panic!(
+                "owned venv base mismatch: expected={} config={original_config:?}: {error:#}",
+                bin.display()
+            )
+        });
+        assert_eq!(actual_base, bin.canonicalize().unwrap());
+        let external_base = owner.path().join("external-base");
+        fs::create_dir(&external_base).unwrap();
+        let wrong_config = original_config
+            .lines()
+            .map(|line| {
+                if line.starts_with("home =") {
+                    format!("home = {}", external_base.display())
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&venv_config, wrong_config).unwrap();
+        let error = validate_venv_python(&venv, Some(&bin))
+            .expect_err("external framework base cannot stand in for the selected owned base");
+        assert!(format!("{error:#}").contains("differs from the selected reviewed Python"));
+        fs::write(&venv_config, &original_config).unwrap();
         let packages = venv.join(format!("lib/python{}/site-packages", versions[1]));
         fs::create_dir_all(&packages).unwrap();
         fs::write(
@@ -2066,7 +2097,9 @@ mod tests {
                     owner.path(),
                     owner.path(),
                 )
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    panic!("real venv task failed: expected_base={} config={original_config:?}: {error:#}", bin.display())
+                });
                 assert_eq!(
                     fs::read_to_string(&observed).unwrap(),
                     format!("{}|local-package", venv.display())

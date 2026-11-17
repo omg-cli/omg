@@ -36,7 +36,7 @@ fn cached_alpm_is_reusable(
     software_loaded == software_now && disk_now == disk_loaded
 }
 
-fn create_alpm_handle() -> Result<Alpm> {
+pub(crate) fn create_alpm_handle() -> Result<Alpm> {
     use crate::package_managers::alpm_ops::open_default_alpm;
     let mut alpm = open_default_alpm().context("Failed to initialize ALPM handle")?;
     let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
@@ -187,7 +187,8 @@ pub fn get_package_info(name: &str) -> Result<Option<PackageInfo>> {
     }
 
     let epoch = pacman_db::SyncDbEpoch::observe()?;
-    let package = with_handle(|handle| super::alpm_ops::get_pkg_info_from_db(handle, name))?;
+    let handle = create_alpm_handle()?;
+    let package = super::alpm_ops::get_pkg_info_from_db(&handle, name)?;
     anyhow::ensure!(
         epoch == pacman_db::SyncDbEpoch::observe()?,
         "Package databases or configuration changed while querying; retry the operation"
@@ -940,6 +941,202 @@ mod tests {
                 assert_eq!(search[0].version.to_string(), "6.1.0-1");
                 assert!(search_sync("hidden-only").unwrap().is_empty());
                 assert_eq!(list_all_package_names().unwrap(), ["linux", "pacman"]);
+            },
+        );
+    }
+
+    #[test]
+    fn exact_info_uses_current_configured_repository_priority_and_search_usage() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(exact_info_uses_current_configured_repository_priority_and_search_usage)
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().expect("private database");
+                with_handle(|handle| {
+                    assert_eq!(handle.syncdbs().len(), 1);
+                    Ok(())
+                })
+                .expect("prime a configured native handle before changing its source");
+                write_sync_fixture(
+                    &database,
+                    "preferred",
+                    &[("linux", "9.0-1", ""), ("preferred-only", "1.0-1", "")],
+                )
+                .expect("preferred repository fixture");
+                let config = paths::pacman_conf_path();
+                for (repositories, expected_repo, expected_version, preferred_visible) in [
+                    (
+                        "[preferred]\nUsage = Upgrade\n[core]\nUsage = Search\n",
+                        "core",
+                        "6.1.0-1",
+                        false,
+                    ),
+                    (
+                        "[preferred]\nUsage = Search\n[core]\nUsage = Search\n",
+                        "preferred",
+                        "9.0-1",
+                        true,
+                    ),
+                    (
+                        "[core]\nUsage = Search\n[preferred]\nUsage = Search\n",
+                        "core",
+                        "6.1.0-1",
+                        true,
+                    ),
+                ] {
+                    std::fs::write(
+                        &config,
+                        format!("[options]\nSigLevel = Never\n{repositories}"),
+                    )
+                    .expect("replace current repository order and usage");
+                    for query in [get_package_info, super::super::alpm_ops::get_sync_pkg_info] {
+                        let info = query("linux")
+                            .expect("query current configured repository scope")
+                            .expect("selected searchable package");
+                        assert_eq!(info.repo, expected_repo);
+                        assert_eq!(info.version.to_string(), expected_version);
+                        assert_eq!(
+                            query("preferred-only")
+                                .expect("current Search usage controls visibility")
+                                .is_some(),
+                            preferred_visible
+                        );
+                    }
+                }
+                std::fs::write(
+                    &config,
+                    "[options]\nSigLevel = NotASignaturePolicy\n[core]\n",
+                )
+                .expect("invalid current policy fixture");
+                for query in [get_package_info, super::super::alpm_ops::get_sync_pkg_info] {
+                    let error =
+                        query("linux").expect_err("a former handle cannot mask invalid policy");
+                    assert!(format!("{error:#}").contains("Invalid pacman SigLevel"));
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn exact_info_revalidates_current_database_signature_policy_after_priming() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(exact_info_revalidates_current_database_signature_policy_after_priming)
+            ),
+            || {
+                let database = paths::pacman_db_dir_result().expect("private database");
+                let keyring = paths::pacman_root_result()
+                    .expect("private pacman root")
+                    .join("etc/pacman.d/gnupg");
+                std::fs::create_dir_all(keyring).expect("private empty keyring");
+                let config = paths::pacman_conf_path();
+                std::fs::write(&config, "[options]\nSigLevel = Optional\n[core]\n")
+                    .expect("optional database signature policy");
+                for query in [get_package_info, super::super::alpm_ops::get_sync_pkg_info] {
+                    assert!(
+                        query("linux")
+                            .expect("missing optional signature")
+                            .is_some()
+                    );
+                }
+                let signature = database.join("sync/core.db.sig");
+                std::fs::write(&signature, b"invalid current signature")
+                    .expect("replace signature after successful query");
+                for query in [get_package_info, super::super::alpm_ops::get_sync_pkg_info] {
+                    let error = query("linux")
+                        .expect_err("present invalid signature must not reuse prior validation");
+                    assert!(error.downcast_ref::<alpm::Error>().is_some(), "{error:#}");
+                }
+                std::fs::remove_file(signature).expect("remove invalid signature");
+                std::fs::write(&config, "[options]\nSigLevel = Required\n[core]\n")
+                    .expect("require current repository signatures");
+                for query in [get_package_info, super::super::alpm_ops::get_sync_pkg_info] {
+                    let error = query("linux").expect_err(
+                        "new required signature policy cannot reuse an optional handle",
+                    );
+                    assert!(error.downcast_ref::<alpm::Error>().is_some(), "{error:#}");
+                }
+                std::fs::write(
+                    config,
+                    "[options]\nSigLevel = Required\n[core]\nSigLevel = DatabaseNever\n",
+                )
+                .expect("explicit repository database policy override");
+                for query in [get_package_info, super::super::alpm_ops::get_sync_pkg_info] {
+                    assert!(
+                        query("linux")
+                            .expect("current repository override")
+                            .is_some()
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn exact_sync_info_reads_current_local_records_independently_of_native_cache() {
+        with_private_alpm(
+            concat!(
+                "package_managers::alpm_direct::tests::",
+                stringify!(
+                    exact_sync_info_reads_current_local_records_independently_of_native_cache
+                )
+            ),
+            || {
+                let local = paths::pacman_db_dir_result()
+                    .expect("private database")
+                    .join("local");
+                with_handle(|handle| {
+                    assert!(handle.localdb().pkg("linux").is_err());
+                    Ok(())
+                })
+                .expect("prime native local absence before source changes");
+                let query_sync = super::super::alpm_ops::get_sync_pkg_info;
+                assert!(
+                    !query_sync("linux")
+                        .expect("initial query")
+                        .unwrap()
+                        .installed
+                );
+                let installed = local.join("linux-5.0-1");
+                std::fs::create_dir(&installed).expect("new local package directory");
+                std::fs::write(
+                    installed.join("desc"),
+                    "%NAME%\nlinux\n\n%VERSION%\n5.0-1\n\n%DESC%\ninstalled kernel\n\n%ARCH%\nx86_64\n\n",
+                )
+                .expect("newly installed local package record");
+                let sync = query_sync("linux")
+                    .expect("observe new local source")
+                    .unwrap();
+                assert!(sync.installed);
+                assert_eq!(sync.repo, "core");
+                assert_eq!(sync.version.to_string(), "6.1.0-1");
+                let direct = get_package_info("linux")
+                    .expect("current local metadata")
+                    .unwrap();
+                assert_eq!(direct.repo, "local");
+                assert_eq!(direct.version.to_string(), "5.0-1");
+                std::fs::write(
+                    installed.join("desc"),
+                    b"%NAME%\nlinux\n\n%VERSION%\n5.0-1\n\n%DESC%\ninvalid-\xff\n",
+                )
+                .expect("malformed selected local source");
+                for query in [get_package_info, query_sync] {
+                    let error =
+                        query("linux").expect_err("invalid selected local metadata must fail");
+                    assert!(format!("{error:#}").contains("UTF-8"));
+                }
+                std::fs::remove_file(installed.join("desc")).expect("remove local metadata");
+                std::fs::remove_dir(installed).expect("remove selected local package");
+                for query in [get_package_info, query_sync] {
+                    let info = query("linux")
+                        .expect("observe current local removal")
+                        .unwrap();
+                    assert!(!info.installed);
+                    assert_eq!(info.repo, "core");
+                }
             },
         );
     }

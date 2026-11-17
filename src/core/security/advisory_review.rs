@@ -441,9 +441,12 @@ mod tests {
             );
         }
         let unknown = package("coverage-only");
-        let review = AdvisoryRiskReview::new_with_unknown(&[unknown.clone()], "coverage context")
-            .expect("Unknown-only explicit decision")
-            .expect("Unknown must remain a decision");
+        let review = AdvisoryRiskReview::new_with_unknown(
+            std::slice::from_ref(&unknown),
+            "coverage context",
+        )
+        .expect("Unknown-only explicit decision")
+        .expect("Unknown must remain a decision");
         assert!(review.legacy_identity().is_none());
         let mut clean = unknown;
         clean.coverage = PackageCoverage::Assessed {
