@@ -726,6 +726,7 @@ pub(crate) async fn fetch_metadata_text(client: &Client, url: &str) -> anyhow::R
 
 const DEFAULT_METADATA_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+#[cfg(any(feature = "pgp", test))]
 pub(crate) async fn fetch_metadata_text_limited(
     client: &Client,
     url: &str,

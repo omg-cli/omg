@@ -1597,6 +1597,28 @@ jobs:
       - name: Install Fish unit test dependency
         run: brew list fish &>/dev/null || brew install fish
 
+      - name: Provision relocatable Python virtualenv fixture
+        run: |
+          set -euo pipefail
+          umask 077
+          fixture_dir=$(mktemp -d "$RUNNER_TEMP/omg-python-venv.XXXXXX")
+          archive="$fixture_dir/cpython-3.13.7-arm64.tar.gz"
+          # Exact official release asset 294829551; publisher SHA256SUMS agrees
+          # with GitHub's authenticated asset digest. Rust rechecks before extraction.
+          curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --fail --location --retry 3 --connect-timeout 20 --max-time 180 \
+            --max-filesize 16617745 --user-agent 'OMG-CI-Python-fixture/0.1.225' \
+            --output "$archive" \
+            'https://github.com/astral-sh/python-build-standalone/releases/download/20250918/cpython-3.13.7%2B20250918-aarch64-apple-darwin-install_only.tar.gz'
+          python3 - "$archive" <<'PY'
+          import hashlib, pathlib, sys
+          archive = pathlib.Path(sys.argv[1])
+          assert archive.is_absolute() and archive.is_file() and not archive.is_symlink()
+          assert archive.stat().st_size == 16617745
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == '7f5ec658219bdb1d1142c6abab89680322166c78350a017fb0af3c869dceee41'
+          PY
+          printf 'OMG_MACOS_PYTHON_FIXTURE_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
+
       - name: Run unit tests
         run: python3 scripts/run-native-contracts.py --features macos,pgp,license
 

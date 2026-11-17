@@ -2003,48 +2003,89 @@ mod tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
-        let python = crate::core::privilege::root_controlled_program_path("python3").unwrap();
-        // The test needs the interpreter itself. Darwin's developer-tool and
-        // framework launchers can replace argv[0] before Python sees it.
-        const PYTHON_IDENTITY: &str = r"
+        let owner = tempfile::tempdir().unwrap();
+        let data = owner.path().join("data");
+        let config = owner.path().join("config");
+        fs::create_dir(&config).unwrap();
+        #[cfg(target_os = "macos")]
+        let (version, major_minor, runtime) = {
+            // Apple framework images depend on their original relative library
+            // layout. Extract the complete pinned relocatable distribution.
+            const SIZE: u64 = 16_617_745;
+            const SHA256: &str = "7f5ec658219bdb1d1142c6abab89680322166c78350a017fb0af3c869dceee41";
+            let archive = PathBuf::from(
+                std::env::var_os("OMG_MACOS_PYTHON_FIXTURE_ARCHIVE")
+                    .expect("provision the pinned macOS CPython archive before this test"),
+            );
+            assert!(archive.is_absolute(), "fixture archive must be absolute");
+            let (digest, size) = crate::runtimes::security::file_digest(&archive, SIZE)
+                .expect("fixture archive must be a bounded regular file");
+            assert_eq!((digest.as_str(), size), (SHA256, SIZE));
+            let runtime = data.join("versions/python/3.13.7");
+            crate::runtimes::common::extract_component_tar_gz(
+                &archive,
+                &runtime,
+                256 * 1024 * 1024,
+                &|path| crate::core::archive::stripped_archive_path(path, 1),
+            )
+            .expect("extract the complete authenticated relocatable CPython fixture");
+            crate::runtimes::common::require_internal_runtime_binary(
+                &runtime,
+                std::path::Path::new("bin/python3"),
+            )
+            .expect("relocatable fixture must contain its Python executable");
+            let output = Command::new(runtime.join("bin/python3"))
+                .env_remove("PYTHONEXECUTABLE")
+                .env_remove("__PYVENV_LAUNCHER__")
+                .args([
+                    "-I",
+                    "-c",
+                    "import sys; print('.'.join(map(str, sys.version_info[:3])))",
+                ])
+                .output()
+                .expect("execute the owned relocatable interpreter");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "3.13.7");
+            ("3.13.7".to_owned(), "3.13".to_owned(), runtime)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (version, major_minor, runtime) = {
+            let python = crate::core::privilege::root_controlled_program_path("python3").unwrap();
+            const PYTHON_IDENTITY: &str = r"
 import json, os, sys
 image = sys.executable
-if sys.platform == 'darwin':
-    import ctypes
-    path = ctypes.create_string_buffer(4096)
-    size = ctypes.c_uint32(len(path))
-    assert ctypes.CDLL(None)._NSGetExecutablePath(path, ctypes.byref(size)) == 0
-    image = os.fsdecode(path.value)
 assert os.path.isabs(image)
 print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
                   '.'.join(map(str, sys.version_info[:2])),
                   os.path.realpath(image))))
 ";
-        let output = Command::new(&python)
-            .env_remove("PYTHONEXECUTABLE")
-            .env_remove("__PYVENV_LAUNCHER__")
-            .args(["-I", "-c", PYTHON_IDENTITY])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let (version, major_minor, image): (String, String, PathBuf) =
-            serde_json::from_slice(&output.stdout).unwrap();
-        assert!(image.is_absolute() && fs::symlink_metadata(&image).unwrap().is_file());
-        let owner = tempfile::tempdir().unwrap();
-        let data = owner.path().join("data");
-        let config = owner.path().join("config");
-        let runtime = data.join("versions/python").join(&version);
+            let output = Command::new(&python)
+                .env_remove("PYTHONEXECUTABLE")
+                .env_remove("__PYVENV_LAUNCHER__")
+                .args(["-I", "-c", PYTHON_IDENTITY])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let (version, major_minor, image): (String, String, PathBuf) =
+                serde_json::from_slice(&output.stdout).unwrap();
+            assert!(image.is_absolute() && fs::symlink_metadata(&image).unwrap().is_file());
+            let runtime = data.join("versions/python").join(&version);
+            let bin = runtime.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::copy(&image, bin.join("python3")).unwrap();
+            (version, major_minor, runtime)
+        };
         let bin = runtime.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir(&config).unwrap();
-        fs::copy(&image, bin.join("python3")).unwrap();
         let venv = owner.path().join(".venv");
-        // Framework launchers may report an external sys._base_executable
-        // after being copied. Bind stock venv construction to this owned base.
+        // Bind stock venv construction to the owned interpreter path.
         const CREATE_VENV: &str = "import sys,venv\nsys._base_executable=sys.argv[1]\nvenv.EnvBuilder(with_pip=False,symlinks=True).create(sys.argv[2])\n";
         let status = Command::new(bin.join("python3"))
             .env_remove("PYTHONEXECUTABLE")
@@ -2056,7 +2097,7 @@ print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
             .unwrap();
         assert!(
             status.success(),
-            "system Python must create the owned no-download virtualenv"
+            "owned Python must create the no-download virtualenv"
         );
         let venv_config = venv.join("pyvenv.cfg");
         let original_config = fs::read_to_string(&venv_config).unwrap();

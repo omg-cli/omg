@@ -3154,13 +3154,17 @@ mod tests {
             .rsplit(':')
             .next()
             .expect("version has a final component");
-        let checksum = if md5 {
-            "%MD5SUM%\n0123456789abcdef0123456789abcdef\n\n"
+        let v1_fields = if md5 {
+            // V1 requires PGPSIG. This is the pinned upstream schema's example packet.
+            concat!(
+                "%MD5SUM%\n0123456789abcdef0123456789abcdef\n\n%PGPSIG%\n",
+                "iHUEABYKAB0WIQRizHP4hOUpV7L92IObeih9mi7GCAUCaBZuVAAKCRCbeih9mi7GCIlMAP9ws/jU4f580ZRQlTQKvUiLbAZOdcB7mQQj83hD1Nc/GwD/WIHhO1/OQkpMERejUrLo3AgVmY3b4/uGhx9XufWEbgE=\n\n",
+            )
         } else {
             ""
         };
         format!(
-            "%FILENAME%\n{name}-{file_version}-x86_64.pkg.tar.zst\n\n%NAME%\n{name}\n\n%BASE%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nComplete typed metadata\n\n%GROUPS%\nfixture-group\n\n%CSIZE%\n1024\n\n%ISIZE%\n4096\n\n%SHA256SUM%\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\n{checksum}%URL%\nhttps://example.invalid/widget\n\n%LICENSE%\nMIT\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n1700000000\n\n%PACKAGER%\nOMG Fixture <fixture@example.invalid>\n\n%DEPENDS%\nglibc>=2.40\n\n%MAKEDEPENDS%\ncmake>=3\n\n%CHECKDEPENDS%\npytest\n\n%OPTDEPENDS%\noptional: runtime support\n\n%PROVIDES%\nvirtual-widget=1\n\n%CONFLICTS%\nincompatible-widget<2\n\n%REPLACES%\nolder-widget\n\n"
+            "%FILENAME%\n{name}-{file_version}-x86_64.pkg.tar.zst\n\n%NAME%\n{name}\n\n%BASE%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nComplete typed metadata\n\n%GROUPS%\nfixture-group\n\n%CSIZE%\n1024\n\n%ISIZE%\n4096\n\n%SHA256SUM%\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\n{v1_fields}%URL%\nhttps://example.invalid/widget\n\n%LICENSE%\nMIT\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n1700000000\n\n%PACKAGER%\nOMG Fixture <fixture@example.invalid>\n\n%DEPENDS%\nglibc>=2.40\n\n%MAKEDEPENDS%\ncmake>=3\n\n%CHECKDEPENDS%\npytest\n\n%OPTDEPENDS%\noptional: runtime support\n\n%PROVIDES%\nvirtual-widget=1\n\n%CONFLICTS%\nincompatible-widget<2\n\n%REPLACES%\nolder-widget\n\n"
         )
     }
 

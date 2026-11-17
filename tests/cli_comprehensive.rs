@@ -2896,6 +2896,23 @@ fn behavior_inventory_runs_in_hermetic_state() {
         if expected_exit != 0 && result.stderr.trim().is_empty() {
             issues.push("failure did not explain itself on stderr".to_string());
         }
+        if case.id == "new" {
+            let scaffold = project.path().join("smoke-app");
+            let cargo = std::fs::read_to_string(scaffold.join("Cargo.toml"))
+                .ok()
+                .and_then(|manifest| toml::from_str::<toml::Value>(&manifest).ok());
+            if !cargo.is_some_and(|manifest| {
+                manifest
+                    .get("package")
+                    .and_then(|package| package.get("name"))
+                    .and_then(toml::Value::as_str)
+                    == Some("smoke-app")
+            }) || !scaffold.join("src/main.rs").is_file()
+                || !scaffold.join(".git").is_dir()
+            {
+                issues.push("new did not write the Rust starter and Git repository".to_string());
+            }
+        }
         let audit_success = match case.id.as_str() {
             "audit" | "audit-scan" | "audit-scan-fail-on-findings-offline" => {
                 Some("No vulnerabilities found in assessed packages.")
