@@ -189,7 +189,14 @@ def inside(args):
             assert len(marker) == 1, "missing or duplicate native state result"
             record = json.loads(marker[0])
             assert record["case"] == case and record["installed"] == (case == "accept")
-            assert len(events) == start + 1 and events[-1]["status"] == (503 if args.coverage == "unavailable" else 200), "the default native owner must query the actual HTTPS fixture once"
+            audit = {"finding": "reported-findings", "unavailable": "refused-unavailable"}.get(args.coverage) if case == "accept" else None
+            assert record["native_audit"] == audit, "nonempty native audit must preserve findings or refuse unavailable evidence"
+            expected_requests = 1 + int(audit is not None)
+            requests = events[start:]
+            assert len(requests) == expected_requests, "each install/audit owner must freshly query the fixed HTTPS fixture once"
+            assert all(event["host"] == source.ARCH_HOST and event["path"] == source.ARCH_PATH
+                       and event["status"] == (503 if args.coverage == "unavailable" else 200)
+                       for event in requests), "native install/audit must use the same authenticated fixed source"
             records.append(record | {"exit_code": code, "requests": events[start:]})
             (args.output / "receipt.json").write_text(json.dumps(dict(scope="local native owner plus real private-root ALPM install; not full CLI/QEMU/release acceptance", coverage=args.coverage, unit_sha256=sha(args.unit), namespaces=namespaces, cases=records), indent=2) + "\n")
     finally:

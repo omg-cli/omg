@@ -762,8 +762,104 @@ pub async fn is_installed(package: &str) -> AnyhowResult<bool> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub(crate) fn native_audit_verifies_existing_advisory_fixture(
+        root: &std::path::Path,
+        database: &std::path::Path,
+        unavailable: bool,
+    ) -> &'static str {
+        use crate::core::security::scan::{AuditCoverage, FindingApplicability};
+        use crate::core::security::vulnerability::{UnknownCoverage, VulnerabilityError};
+        assert!(
+            crate::core::is_root()
+                && std::env::var("OMG_ARCH_INSTALL_FIXTURE").as_deref() == Ok("isolated-container"),
+            "native audit requires the existing isolated HTTPS consent fixture"
+        );
+        let descriptor = database.join("local/glibc-1-1/desc");
+        let original = std::fs::read(&descriptor).expect("real installed fixture metadata");
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+                crate::package_managers::alpm_direct::clear_alpm_cache();
+            }
+        }
+        let _restore = Restore;
+        crate::core::paths::set_test_overrides(Some(root.to_owned()), Some(database.to_owned()));
+        crate::package_managers::alpm_direct::clear_alpm_cache();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("native audit fixture runtime");
+        let status = runtime.block_on(async {
+            let manager = ArchPackageManager::new();
+            let before = manager
+                .security_inventory()
+                .await
+                .expect("nonempty real installed inventory");
+            assert_eq!(before.len(), 1);
+            assert_eq!(before[0].name, "glibc");
+            assert_eq!(before[0].version, "1-1");
+            let result = manager.security_audit().expect("native audit owner").await;
+            let status = if unavailable {
+                let error = result.expect_err("unavailable evidence cannot become an empty audit");
+                assert!(
+                    format!("{error:#}").contains("Failed to query native security advisories")
+                );
+                assert!(matches!(
+                    error.downcast_ref::<VulnerabilityError>(),
+                    Some(VulnerabilityError::Unavailable { reason })
+                        if reason == "Arch snapshot returned an unexpected URL or status"
+                ));
+                "refused-unavailable"
+            } else {
+                let result = result.expect("fixed source snapshot must preserve actual findings");
+                result.validate().expect("coherent native audit report");
+                assert_eq!(result.total_vulnerabilities, 1);
+                assert_eq!(result.high_severity, 1);
+                assert_eq!(result.vulnerabilities.len(), 1);
+                assert_eq!(result.vulnerabilities[0].0, "glibc");
+                let findings = &result.vulnerabilities[0].1;
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].id, "AVG-OMG-QEMU-616");
+                assert_eq!(findings[0].applicability, FindingApplicability::Possible);
+                assert!(findings[0].score.is_none());
+                let native = findings[0]
+                    .native_advisory
+                    .as_ref()
+                    .expect("native finding retains publisher details");
+                assert_eq!(native.published_severity, "Critical");
+                assert!(native.references.iter().any(|reference| {
+                    reference.id == "CVE-OMG-QEMU-616"
+                        && reference.url == "https://security.archlinux.org/CVE-OMG-QEMU-616"
+                }));
+                assert!(matches!(
+                    result.coverage,
+                    AuditCoverage::Reported { assessed, unassessed, sources }
+                        if assessed.is_empty()
+                            && unassessed.len() == 1
+                            && unassessed[0].package.name == "glibc"
+                            && unassessed[0].reason == UnknownCoverage::OriginUnestablished
+                            && sources.len() == 1
+                ));
+                "reported-findings"
+            };
+            let after = manager
+                .security_inventory()
+                .await
+                .expect("inventory after read-only native audit");
+            assert_eq!(before, after, "audit must not mutate installed inventory");
+            status
+        });
+        assert_eq!(
+            std::fs::read(descriptor).expect("installed metadata after native audit"),
+            original,
+            "native audit must not change durable package metadata"
+        );
+        status
+    }
 
     #[cfg(debug_assertions)]
     #[test]

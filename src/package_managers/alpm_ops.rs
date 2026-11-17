@@ -3626,10 +3626,22 @@ mod tests {
         if installed {
             assert_eq!(std::fs::read(&installed_file)?, payload);
         }
+        let native_audit = if case == "accept" && coverage != "unmapped" {
+            let status = super::super::arch::tests::native_audit_verifies_existing_advisory_fixture(
+                &fixture.directory.path().join("root"),
+                &fixture.database(),
+                coverage == "unavailable",
+            );
+            assert_eq!(std::fs::read(&installed_file)?, payload);
+            Some(status)
+        } else {
+            None
+        };
         println!(
             "OMG_NATIVE_ADVISORY_CONSENT_RESULT={}",
             serde_json::to_string(&serde_json::json!({
                 "case": case, "installed": installed, "rejection": rejection,
+            "native_audit": native_audit,
             "package": "glibc", "version": "1-1", "installed_version": installed_version,
             "private_root": fixture.directory.path(),
             }))?
