@@ -923,13 +923,10 @@ pub(crate) mod tests {
                 verifier.verify_cleartext_memory(&encoded, 1024),
                 Err(PgpError::CleartextFormat)
             ));
-            assert!(
-                matches!(
-                    verifier.verify_cleartext_message(&encoded, 1024),
-                    Err(PgpError::CleartextFormat)
-                ),
-                "even a cryptographically valid message must retain the inner cleartext format boundary"
-            );
+            let error = verifier
+                .verify_cleartext_message(&encoded, 1024)
+                .expect_err("a valid signature cannot replace the inner cleartext format boundary");
+            assert!(matches!(error, PgpError::CleartextFormat));
         }
     }
 

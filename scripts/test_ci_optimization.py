@@ -120,7 +120,7 @@ class OptimizationContracts(unittest.TestCase):
             producer.chmod(0o666)
             advisory_sources = []
             for name in ('test-arch-advisory-consent.py', 'qemu-arch-advisory-oracle.py',
-                         'attend-unknown-fixture.py'):
+                         'attend-unknown-fixture.py', 'test-runtime-public-install.py'):
                 source = scripts / name
                 source.write_bytes((ROOT / 'scripts' / name).read_bytes())
                 source.chmod(0o666)
@@ -162,6 +162,7 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
             self.assertEqual(copied, {
                 'fixture-container:/fixture': fixture,
                 'fixture-container:/advisory-fixture': runner / 'advisory-fixture',
+                'fixture-container:/swift-authenticated-inputs': runner / 'swift-public-inputs',
             })
             for original in advisory_sources:
                 staged = runner / 'advisory-fixture' / original.name
@@ -220,7 +221,8 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
             binary.chmod(0o755)
             (root / 'scripts').mkdir()
             for name in ('native-cli-coverage.py', 'test-arch-advisory-consent.py',
-                         'qemu-arch-advisory-oracle.py', 'attend-unknown-fixture.py'):
+                         'qemu-arch-advisory-oracle.py', 'attend-unknown-fixture.py',
+                         'test-runtime-public-install.py'):
                 (root / 'scripts' / name).write_bytes((ROOT / 'scripts' / name).read_bytes())
             from test_native_cli_coverage import PRODUCER
             artifacts = ['debug/omg', 'debug/omgd'] + [
@@ -377,7 +379,10 @@ git() { printf '%040d\\n' 1; }
         self.assertIn('"$test_name" == cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build', script)
         self.assertEqual(len(selected), len(set(selected)))
         self.assertIn('package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction', selected)
-        self.assertEqual(len(selected), 26)
+        capability_test = 'cli::doctor::tests::native_capability_probe_recognizes_an_empty_capability_attribute'
+        self.assertIn(capability_test, selected)
+        self.assertIn('"$test_name" == ' + capability_test, script)
+        self.assertEqual(len(selected), 27)
         for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
             name = 'package_managers::arch_install::native_tests::' + test
             self.assertIn(name, selected)

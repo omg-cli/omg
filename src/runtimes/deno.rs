@@ -370,6 +370,85 @@ fn available_version_names(versions: &[DenoVersion]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::PublicationFixture;
+        use sha2::{Digest as _, Sha256};
+        use std::io::Write as _;
+
+        let version = "2.3.4";
+        let filename = format!(
+            "deno-{}.zip",
+            deno_target().expect("supported native Deno host")
+        );
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        zip.start_file("deno", options)
+            .expect("flat native Deno archive");
+        zip.write_all(b"fixture launcher")
+            .expect("owned Deno launcher");
+        zip.start_file("support.data", options)
+            .expect("owned Deno supporting entry");
+        zip.write_all(b"complete Deno implementation")
+            .expect("owned Deno supporting payload");
+        let archive = zip.finish().expect("complete native Deno ZIP").into_inner();
+        let archive_path = format!("/denoland/deno/releases/download/v{version}/{filename}");
+        let sidecar_path = format!("{archive_path}.sha256sum");
+        let sidecar = format!("{}  {filename}\n", hex::encode(Sha256::digest(&archive)));
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "tag_name": format!("v{version}"), "prerelease": false,
+            "assets": [
+                {"name": filename, "browser_download_url": format!("https://github.com{archive_path}"), "digest": null},
+                {"name": format!("{filename}.sha256sum"), "browser_download_url": format!("https://github.com{sidecar_path}"), "digest": null}
+            ]
+        })).expect("Deno metadata requiring the actual fixed-client sidecar path");
+        let metadata_path = format!("/repos/denoland/deno/releases/tags/v{version}");
+        super::super::test_https::fixed_public_routes(&[
+            ("api.github.com", &metadata_path, &metadata),
+            ("github.com", &sidecar_path, sidecar.as_bytes()),
+            ("github.com", &archive_path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("deno", "bin/deno");
+        let manager = DenoManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("public verified Deno installation");
+        let installed = fixture.versions.join(version);
+        assert!(super::super::common::is_valid_version_dir(&installed));
+        assert_eq!(
+            fs::read(installed.join("bin/deno")).expect("complete Deno launcher"),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("bin/support.data")).expect("complete Deno support tree"),
+            b"complete Deno implementation"
+        );
+        assert_eq!(
+            fs::canonicalize(fixture.versions.join("current")).unwrap(),
+            fs::canonicalize(&installed).unwrap()
+        );
+        super::super::security::admit_installed(
+            "deno",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("exact public Deno admission")
+        .verify(&installed)
+        .expect("published Deno tree remains bound");
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/deno")).unwrap(),
+            b"previous reviewed runtime"
+        );
+    }
+
     #[tokio::test]
     async fn checksum_sidecar_rejects_plain_http_before_request() {
         let error = fetch_checksum_sidecar(

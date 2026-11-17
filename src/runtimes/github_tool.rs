@@ -856,6 +856,79 @@ fn pathdiff_relative(target: &Path, base: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "1.2.3";
+        let filename = format!("fixture-tool-linux-{}.tar.gz", std::env::consts::ARCH);
+        let archive = tar_gz_entries(
+            "owned-tool",
+            &[
+                ("bin/fixture-tool", b"#!/bin/sh\nexit 0\n"),
+                ("lib/owned.data", b"complete tool implementation"),
+            ],
+        )
+        .expect("complete owned generic tool archive");
+        let archive_path =
+            format!("/omg-fixtures/registry/releases/download/v{version}/{filename}");
+        let metadata = serde_json::to_vec(&serde_json::json!([{
+            "tag_name": format!("v{version}"), "prerelease": false,
+            "assets": [{"name": filename, "browser_download_url": format!("https://github.com{archive_path}"),
+                "digest": format!("sha256:{}", hex::encode(Sha256::digest(&archive)))}]
+        }])).expect("controlled generic publisher metadata");
+        super::super::test_https::fixed_public_routes(&[
+            (
+                "api.github.com",
+                "/repos/omg-fixtures/registry/releases?per_page=30&page=1",
+                &metadata,
+            ),
+            ("github.com", &archive_path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("node", "bin/fixture-tool");
+        let manager = GenericToolManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            spec: &INSTALL_FIXTURE,
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("full public generic tool installation");
+        let installed = fixture.versions.join(version);
+        assert!(super::super::common::is_valid_version_dir(&installed));
+        assert_eq!(
+            fs::read(installed.join("bin/fixture-tool")).expect("complete generic launcher"),
+            b"#!/bin/sh\nexit 0\n"
+        );
+        assert_eq!(
+            fs::read(installed.join("owned-tool/lib/owned.data"))
+                .expect("complete generic support tree"),
+            b"complete tool implementation"
+        );
+        assert_eq!(
+            fs::canonicalize(fixture.versions.join("current")).unwrap(),
+            fs::canonicalize(&installed).unwrap()
+        );
+        super::super::security::admit_installed(
+            "node",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("exact generic publication admission")
+        .verify(&installed)
+        .expect("published generic tree remains bound");
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/fixture-tool")).unwrap(),
+            b"previous reviewed runtime"
+        );
+    }
+
     // An explicit mapped fixture product exercises this generic owner without inventing
     // advisory coverage for the unsupported public registry products.
     static INSTALL_FIXTURE: RegistryTool = RegistryTool {

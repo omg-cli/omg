@@ -10,6 +10,8 @@ mode=$1; binary=$2; guest_user=$3
 for tool in pacman pacman-conf repo-add bsdtar zstd python3 curl sudo; do
   command -v "$tool" >/dev/null || { printf 'missing fixture tool: %s\nOMG_QEMU_FIXTURE_SETUP_FAILED\n' "$tool" >&2; exit 120; }
 done
+consent="$(dirname "${BASH_SOURCE[0]}")/qemu-runtime-advisory-oracle.py"
+[[ -f "$consent" && ! -L "$consent" ]] || { echo 'missing real security-consent fixture' >&2; exit 120; }
 
 package=omg-qemu-update-oracle
 repo_id=omg-qa-update
@@ -151,7 +153,7 @@ curl --noproxy '*' -fsS "http://127.0.0.1:$port/$repo_id.db" -o "$base/served-ne
 [[ ! -s "$base/server.log" ]] || { cat "$base/server.log" >&2; }
 printf 'OMG_QEMU_UPDATE_FIXTURE:before:%s:1\n' "$mode"
 phase=product
-sudo -H -u "$guest_user" -- "$binary" update "--$mode" --yes
+sudo -H -u "$guest_user" -- python3 "$consent" --native --accept-only --require-review --timeout 600 -- "$binary" update "--$mode" --yes
 phase=verification
 [[ $(pacman -Q "$package") == "$package 2-1" ]] ||
   { echo 'OMG did not upgrade the native ALPM fixture to version 2' >&2; exit 1; }

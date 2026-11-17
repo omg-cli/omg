@@ -2669,6 +2669,11 @@ mod tests {
                     stream,
                     "HTTP/1.1 {status} Controlled\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
                 ).expect("write the controlled HTTP fixture headers");
+                if status == 503 {
+                    stream.shutdown(std::net::Shutdown::Write).expect(
+                        "inject a settled server write-side disconnect after status headers",
+                    );
+                }
                 let written = stream.write_all(&body);
                 let error_kind = written.as_ref().err().map(std::io::Error::kind);
                 assert!(
@@ -2689,6 +2694,9 @@ mod tests {
                 .await?;
             let result = runtime_response_bytes(response).await;
             assert_eq!(result.is_ok(), accepted);
+            if status == 503 {
+                assert!(format!("{:#}", result.as_ref().unwrap_err()).contains("HTTP 503"));
+            }
             if accepted {
                 assert_eq!(result?, b"[]");
             }

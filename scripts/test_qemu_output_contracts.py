@@ -19,6 +19,39 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipIf(os.name == 'nt', 'native preview assertions require POSIX bash')
 class NativeRemovalContracts(unittest.TestCase):
+    def test_fedora_history_requires_the_exact_reviewed_stored_transaction(self):
+        source = (ROOT / 'scripts/qemu-fedora-update-fixture.sh').read_text(encoding='utf-8')
+        body = re.search(r"jq -e --arg package \"\$package\" '(.*?)' \"\$base/history.json\"",
+                         source, re.S)
+        self.assertIsNotNone(body, 'The actual native history predicate must remain executable')
+        record = [{'status': 'Ok', 'packages': [
+            {'action': 'Upgrade', 'repository': '@stored_transaction(omg-qa-update)',
+             'nevra': 'omg-qemu-update-oracle-0:2-1.noarch'},
+            {'action': 'Replaced', 'repository': '@System',
+             'nevra': 'omg-qemu-update-oracle-0:1-1.noarch'},
+        ]}]
+        cases = [('actual stored replay', record, True)]
+        for field, value in [('repository', '@stored_transaction(other-repo)'),
+                             ('repository', 'omg-qa-update'),
+                             ('repository', '@stored_transaction(omg-qa-update)-other'),
+                             ('action', 'Install'),
+                             ('nevra', 'omg-qemu-update-oracle-0:3-1.noarch'),
+                             ('nevra', 'other-package-0:2-1.noarch'),
+                             ('nevra', 'omg-qemu-update-oracle-0:2-1.x86_64')]:
+            changed = json.loads(json.dumps(record))
+            changed[0]['packages'][0][field] = value
+            cases.append((field + '=' + value, changed, False))
+        failed = json.loads(json.dumps(record))
+        failed[0]['status'] = 'Error'
+        cases.extend([('failed transaction', failed, False),
+                      ('multiple transactions', record + record, False),
+                      ('empty transaction', [{'status': 'Ok', 'packages': []}], False)])
+        for label, data, expected in cases:
+            with self.subTest(label=label):
+                result = subprocess.run(['jq', '-e', '--arg', 'package', 'omg-qemu-update-oracle', body[1]],
+                                        input=json.dumps(data), text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode == 0, expected, result.stderr + result.stdout)
+
     def test_benchmark_search_smoke_accepts_only_exact_guest_package_identity(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         begin = source.index('"$bin" search tree > evidence/search.txt\n')
@@ -1138,6 +1171,39 @@ printf '  ✓ Created Dockerfile.omg\\n│ Base image: debian:bookworm │\\n'
                 result, evidence, logs = self.run_inventory(altered, [row])
                 self.assertEqual(evidence[0]['result'], expected, logs)
                 self.assertEqual(result.returncode, int(expected == 'FAIL'), result.stderr)
+
+    @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
+    def test_arch_package_mutation_receives_exact_attended_unknown_consent(self):
+        row = ('arch-unknown-install\t["install","--yes","fixture"]\tpackage-mutation\t0\tpass\t-\t'
+               'container\tarch:pass\t-\tcontainer-prune')
+        review = '''import hashlib,json,os
+details = ('SECURITY WARNING: advisory coverage for the selected transaction is unknown.\\n'
+           + 'Package: ' + json.dumps(['fixture','1-1',None],separators=(',',':')) + '\\n'
+           + 'Coverage: unknown (EvidenceUnavailable)\\n'
+           + 'Arch advisory source: https://security.archlinux.org/issues/all.json\\n')
+digest = hashlib.sha256(details.encode()).hexdigest()
+with open('/dev/tty','r+b',buffering=0) as terminal:
+    assert os.tcgetpgrp(terminal.fileno())==os.getpgrp()
+    terminal.write((details+'\\nType accept '+digest+' within 60 seconds to continue (default: cancel): ').encode())
+    assert terminal.readline()==('accept '+digest+'\\n').encode()
+print('explicit Unknown review accepted')
+'''
+        product = ('[[ "$1:$2:$3" == install:--yes:fixture ]] || exit 9\n'
+                   + shlex.quote(sys.executable) + " - <<'ARCH_UNKNOWN_REVIEW'\n"
+                   + review + 'ARCH_UNKNOWN_REVIEW\n')
+        result, evidence, logs = self.run_inventory(
+            product, [row], distro='arch', tiers='container', allow_mutations=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + str(logs))
+        self.assertEqual([item['result'] for item in evidence], ['PASS'], logs)
+        log = logs['arch-unknown-install.log']
+        self.assertIn('explicit Unknown review accepted', log)
+        receipt = re.search(r'OMG_QEMU_NATIVE_CONSENT=(\{[^\n]*\})', log)
+        self.assertIsNotNone(receipt, log)
+        value = json.loads(receipt[1])
+        self.assertEqual(value['runtime'], 'native')
+        self.assertEqual(value['accepted_exit_code'], 0)
+        self.assertEqual(len(value['accepted_reviews']), 1)
+        self.assertRegex(value['accepted_review'], r'^[0-9a-f]{64}$')
 
     @unittest.skipIf(os.name == 'nt', 'Full runner needs POSIX shell descriptors')
     def test_arch_update_rows_require_bounded_native_fixture_receipt(self):

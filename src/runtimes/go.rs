@@ -227,6 +227,75 @@ fn go_platform() -> Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "1.27.0";
+        let filename = format!(
+            "go{version}.{}.tar.gz",
+            go_platform().expect("supported native Go host")
+        );
+        let archive = tar_gz_entries(
+            "go",
+            &[
+                ("bin/go", b"fixture launcher"),
+                ("lib/support.data", b"complete Go implementation"),
+            ],
+        )
+        .expect("complete owned Go distribution");
+        let metadata = serde_json::to_vec(&serde_json::json!([{
+            "version": format!("go{version}"), "stable": true,
+            "files": [{"filename": filename, "sha256": hex::encode(Sha256::digest(&archive))}]
+        }]))
+        .expect("controlled official Go checksum inventory");
+        let archive_path = format!("/dl/{filename}");
+        super::super::test_https::fixed_public_routes(&[
+            ("go.dev", "/dl/?mode=json&include=all", &metadata),
+            ("go.dev", &archive_path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("go", "bin/go");
+        let manager = GoManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("public verified Go installation");
+        let installed = fixture.versions.join(version);
+        assert!(super::super::common::is_valid_version_dir(&installed));
+        assert_eq!(
+            fs::read(installed.join("bin/go")).expect("complete Go launcher"),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/support.data")).expect("complete Go support tree"),
+            b"complete Go implementation"
+        );
+        assert_eq!(
+            fs::canonicalize(fixture.versions.join("current")).unwrap(),
+            fs::canonicalize(&installed).unwrap()
+        );
+        super::super::security::admit_installed(
+            "go",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("exact public Go admission")
+        .verify(&installed)
+        .expect("published Go tree remains bound");
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/go")).unwrap(),
+            b"previous reviewed runtime"
+        );
+    }
+
     #[tokio::test]
     async fn incomplete_go_archive_is_not_published_and_can_be_retried() -> Result<()> {
         check_archive_publication(super::super::test_archive::Launcher::Missing).await

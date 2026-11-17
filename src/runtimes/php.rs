@@ -611,6 +611,80 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_xz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "8.5";
+        let launcher = b"#!/bin/sh\nprintf 'PHP 8.5.1 (cli)\\n'\n";
+        let archive = tar_xz_entries(
+            "usr",
+            &[
+                ("bin/php8.5", launcher),
+                (
+                    "include/php/main/php_version.h",
+                    b"#define PHP_VERSION \"8.5.1\"\n",
+                ),
+                ("lib/owned.data", b"complete PHP implementation"),
+            ],
+        )
+        .unwrap();
+        let filename = asset_name(version, &php_distro().unwrap(), host_arch_suffix().unwrap());
+        let path = format!("/shivammathur/php-builder/releases/download/{version}/{filename}");
+        let metadata = serde_json::to_vec(&serde_json::json!([{
+            "tag_name":version,"prerelease":false,
+            "assets":[{"name":filename,"browser_download_url":format!("https://github.com{path}"),"digest":format!("sha256:{}",hex::encode(Sha256::digest(&archive)))}]
+        }])).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            (
+                "api.github.com",
+                "/repos/shivammathur/php-builder/releases?per_page=50&page=1",
+                &metadata,
+            ),
+            (
+                "api.github.com",
+                "/repos/shivammathur/php-builder/releases?per_page=50&page=1",
+                &metadata,
+            ),
+            ("github.com", &path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("php", "bin/php");
+        let manager = PhpManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/php")).unwrap(),
+            launcher
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete PHP implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/php")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "php",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
 
     fn asset(name: &str, digest: Option<&str>) -> GithubAsset {

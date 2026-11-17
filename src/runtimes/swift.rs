@@ -605,6 +605,67 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", feature = "pgp"))]
+    #[tokio::test]
+    #[ignore = "requires budgeted genuine Swift vendor inputs and isolated native namespaces"]
+    async fn genuine_public_install_refuses_changed_signed_content() {
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        let version = "6.0.3";
+        assert_eq!(ubuntu_release().unwrap(), "24.04");
+        let metadata = serde_json::to_vec(&serde_json::json!([{
+            "tag_name":"swift-6.0.3-RELEASE", "prerelease":false, "assets":[]
+        }]))
+        .unwrap();
+        super::super::test_https::fixed_public_routes(&[(
+            "api.github.com",
+            "/repos/swiftlang/swift/releases?per_page=100&page=1",
+            &metadata,
+        )]);
+        let directory = Path::new("/swift-authenticated-inputs");
+        let inputs: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("manifest.json"))
+                .expect("owned genuine vendor input manifest"),
+        )
+        .expect("decode genuine Swift input identities");
+        let plan_path = Path::new("/tmp/omg-runtime-public-fixture/routes.json");
+        let mut plan: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(plan_path).unwrap()).unwrap();
+        let archive_url = tarball_url(version, "24.04", host_arch_suffix().unwrap());
+        for (filename, url) in [
+            ("all-keys.asc", SWIFT_KEYS_URL.to_owned()),
+            ("swift.tar.gz", archive_url.clone()),
+            ("swift.tar.gz.sig", format!("{archive_url}.sig")),
+        ] {
+            let url = reqwest::Url::parse(&url).unwrap();
+            let identity = &inputs["files"][filename];
+            plan.push(serde_json::json!({
+                "host":url.host_str().unwrap(), "path":url.path(), "status":200,
+                "file":directory.join(filename),
+                "bytes":identity["bytes"].as_u64().expect("genuine bounded vendor byte count"),
+                "sha256":identity["sha256"].as_str().expect("genuine vendor input digest"),
+            }));
+        }
+        fs::write(plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let fixture =
+            PublicationFixture::new_in("swift", "usr/bin/swift", Path::new("/swift-runtime-work"));
+        let manager = SwiftManager {
+            security: mutation_security(&fixture.versions),
+            versions_dir: fixture.versions.clone(),
+            keyring_path: fixture.owner.path().join("keys/all-keys.asc"),
+            client: download_client(),
+        };
+        let error = manager
+            .install(version)
+            .await
+            .expect_err("changed genuine signed content must refuse before SDK execution");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join(version).exists());
+        fixture.assert_previous();
+    }
+
     use super::*;
 
     async fn wait_for_prefix(directory: &Path, prefix: &[u8]) -> Result<()> {

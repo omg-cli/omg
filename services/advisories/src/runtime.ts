@@ -200,8 +200,8 @@ class Sources {
         if (!this.force && age >= 0 && age < (cached?.error ? MINUTE : SOURCE_TTL)) return use(previous);
         const lease = `runtime:${await sha256(cacheKey)}`, owner = crypto.randomUUID();
         if (!await this.store.lease(lease, owner, this.now)) {
+            if (previous?.receipt.complete) return use(previous);
             this.assessment.gap(`${name} refresh is already in progress`);
-            if (previous) previous.receipt.complete = false;
             return use(previous);
         }
         try {

@@ -130,6 +130,78 @@ test("assessed runtime HTTP freshness is bounded and no-cache reaches upstream",
         await handle(request("node", "20.10.0", "nodejs", { "cache-control": "no-cache" }), store, undefined, now, fetcher); expect(calls).toBe(2);
     } finally { db.close(); }
 });
+
+test("concurrent forced runtime revalidation retains a genuinely fresh verified snapshot", async () => {
+    const { store, db, setClock } = setup();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    try {
+        const first = await report(store, "node", "20.10.0", "nodejs", async () => Response.json(nodePayload));
+        const later = "2026-11-17T02:01:00.000Z";
+        setClock(later);
+        const owner = report(store, "node", "20.10.0", "nodejs", async () => {
+            entered.resolve();
+            await release.promise;
+            return Response.json(nodePayload);
+        }, later, true);
+        try {
+            await entered.promise;
+            let contenderFetches = 0;
+            const concurrent = await report(store, "node", "20.10.0", "nodejs", async () => {
+                contenderFetches++;
+                return new Response(null, { status: 503 });
+            }, later, true);
+            expect(concurrent.coverage).toBe("assessed");
+            expect(concurrent.findings).toEqual(first.findings);
+            expect(concurrent.gaps).toEqual([]);
+            expect(concurrent.sources).toEqual(first.sources);
+            expect(concurrent.checked_at).toBe(now);
+            expect(contenderFetches).toBe(0);
+            expect(db.query<{ successful_at: string; error: string | null }, []>("SELECT successful_at,error FROM runtime_source").get())
+                .toEqual({ successful_at: now, error: null });
+        } finally { release.resolve(); await owner; }
+    } finally { release.resolve(); db.close(); }
+});
+
+test("busy runtime refresh never certifies stale failed missing or corrupt prior evidence", async () => {
+    for (const state of ["stale", "failed", "missing", "corrupt"] as const) {
+        const { store, db, objects, setClock } = setup();
+        try {
+            if (state !== "missing") {
+                await report(store, "node", "20.10.0", "nodejs", async () => Response.json(nodePayload));
+            }
+            const at = state === "stale" ? "2026-11-17T02:31:00.000Z" : "2026-11-17T02:01:00.000Z";
+            setClock(at);
+            if (state === "failed") {
+                await report(store, "node", "20.10.0", "nodejs", async () => new Response(null, { status: 503 }), at, true);
+            }
+            if (state === "corrupt") {
+                const key = db.query<{ object_key: string }, []>("SELECT object_key FROM runtime_source").get()?.object_key;
+                if (!key) throw new Error("missing controlled source object");
+                objects.set(key, "{}");
+            }
+            const lease = `runtime:${await sha256("v1:node:core")}`;
+            expect(await store.lease(lease, "controlled-refresh-owner", at)).toBe(true);
+            let fetched = false;
+            const response = await handle(request("node", "20.10.0", "nodejs", { "cache-control": "no-cache" }), store, undefined, at, async () => {
+                fetched = true;
+                return Response.json(nodePayload);
+            });
+            const body = object(await response.json());
+            expect(body.coverage).toBe(state === "stale" || state === "failed" ? "partial" : "unknown");
+            expect(body.gaps).not.toEqual([]);
+            expect(response.headers.get("cache-control")).toBe("no-store");
+            expect(fetched).toBe(false);
+            if (state === "stale" || state === "failed") {
+                expect(body.findings).toMatchObject([{ id: "CVE-2026-12345" }]);
+                expect(body.sources).toMatchObject([{ checked_at: now, complete: false }]);
+            } else {
+                expect(body.sources).toEqual([]);
+            }
+            await store.release(lease, "controlled-refresh-owner");
+        } finally { db.close(); }
+    }
+});
 test("Go uses both exact OSV standard-library and toolchain coordinates with full pagination", async () => {
     const { store, db } = setup(); const queries: Record<string, unknown>[] = [];
     try {

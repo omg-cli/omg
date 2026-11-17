@@ -241,6 +241,25 @@ jobs:
           assert re.search(rb'^test result: ok\. 1 passed; 0 failed; 0 ignored;', log, re.M)
           assert re.findall(rb'^test (tests::\S+) \.\.\. ok$', log, re.M) == [name.encode()]
           assert not re.search(rb'\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)', log)
+          cli = target / 'debug/omg'
+          assert cli.is_file() and not cli.is_symlink() and os.access(cli, os.X_OK)
+          controls = []
+          for arguments, message in [
+              (['dnf-native'], b'Native DNF admission requires authenticated root re-execution'),
+              (['__omg_elevated', 'dnf-native'], b'Native DNF admission requires its fixed argument separator'),
+              (['__omg_elevated', 'dnf-native', '--', 'install', 'fixture'],
+                  b'This build does not include native DNF admission'),
+          ]:
+              result = subprocess.run([str(cli), *arguments], env=environment,
+                  capture_output=True, timeout=30, check=False)
+              output = result.stdout + result.stderr
+              assert len(output) <= 128 * 1024
+              assert result.returncode == 1 and message in output, output.decode(errors='replace')
+              assert not re.search(rb'\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)', output)
+              filename = f'cli-refusal-{len(controls) + 1}.log'
+              (evidence / filename).write_bytes(output)
+              controls.append({'arguments': arguments, 'exit_code': result.returncode,
+                  'refusal': message.decode(), 'log': filename})
           profiles = sorted(target.glob('omg-fixture-native_protocol-*.profraw'))
           assert profiles and all(path.is_file() and path.stat().st_size > 0 for path in profiles)
           def digest(path):
@@ -248,6 +267,7 @@ jobs:
                   return hashlib.file_digest(stream, 'sha256').hexdigest()
           receipt = {'test': name, 'result': 'PASS', 'attempts': 1, 'effective_uid': os.geteuid(),
               'binary': str(binary), 'binary_sha256': digest(binary),
+              'cli': str(cli), 'cli_sha256': digest(cli), 'cli_refusals': controls,
               'profiles': [{'path': str(path), 'bytes': path.stat().st_size, 'sha256': digest(path)}
                   for path in profiles]}
           (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
@@ -261,6 +281,12 @@ jobs:
           path: native-protocol-coverage
           if-no-files-found: error
           retention-days: 14
+
+      - name: Stage genuine Swift publisher inputs
+        timeout-minutes: 5
+        run: |
+          python3 scripts/test-runtime-public-install.py --prepare-swift \
+            --output "$RUNNER_TEMP/swift-public-inputs"
 
       - name: Cover sandbox descendant cancellation
         id: native_fixture_tests
@@ -350,6 +376,7 @@ jobs:
           # Namespace permissions apply only to this credential-free fixture.
           container=$(docker create --cap-add SYS_ADMIN --cap-add NET_ADMIN --security-opt "apparmor=$fixture_apparmor" \
             --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json \
+            --env GITHUB_SHA \
             --network none --add-host aur.archlinux.org:127.0.0.1 --pids-limit 128 --memory 1g --cpus 2 \
             omg-coverage-sandbox /bin/bash -euo pipefail -c '
               mkdir -m 1777 /profiles
@@ -408,6 +435,7 @@ jobs:
                       "$test_name" == package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff ||
                       "$test_name" == package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff ||
                       "$test_name" == package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason ||
+                      "$test_name" == cli::doctor::tests::native_capability_probe_recognizes_an_empty_capability_attribute ||
                       "$test_name" == package_managers::aur::utils::tests::native_lifecycle_original_user_ownership ||
                       "$test_name" == cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build ]]; then
                   runner=(env OMG_ARCH_INSTALL_FIXTURE=isolated-container)
@@ -459,6 +487,7 @@ jobs:
                 package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff
                 package_managers::arch_install::native_tests::descriptor_sealing_denial_refuses_installation_handoff
                 package_managers::alpm_ops::tests::native_reason_write_failure_preserves_durable_reason
+                cli::doctor::tests::native_capability_probe_recognizes_an_empty_capability_attribute
                 package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction
                 package_managers::aur::utils::tests::native_lifecycle_original_user_ownership
                 cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build
@@ -479,13 +508,16 @@ jobs:
                   run_case "$test_name"
                 fi
               done
+              python3 /advisory-fixture/test-runtime-public-install.py --unit "$fixture_binary" \
+                --output "$fixture_evidence/runtime-public" --profiles "$fixture_profiles" --include-swift
             ')
           docker cp "$binary" "$container:/fixture"
           advisory_fixture="$RUNNER_TEMP/advisory-fixture"
           mkdir "$advisory_fixture"
           install -m 644 scripts/test-arch-advisory-consent.py scripts/qemu-arch-advisory-oracle.py \
-            scripts/attend-unknown-fixture.py "$advisory_fixture/"
+            scripts/attend-unknown-fixture.py scripts/test-runtime-public-install.py "$advisory_fixture/"
           docker cp "$advisory_fixture" "$container:/advisory-fixture"
+          docker cp "$RUNNER_TEMP/swift-public-inputs" "$container:/swift-authenticated-inputs"
           staging="$RUNNER_TEMP/native-cli-inputs"
           mkdir -m 755 "$staging" "$staging/bin"
           install -m 644 scripts/native-cli-coverage.py "$staging/native-cli-coverage.py"

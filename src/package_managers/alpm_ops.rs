@@ -2351,7 +2351,11 @@ fn confirm_advisory_prompt(
         crate::core::is_root(),
         "Security acknowledgement requires the privileged transaction owner"
     );
-    crate::core::privilege::confirm_security_review(details, digest, invoking_uid, &|| {
+    let details = format!(
+        "{details}\nArch advisory source: {}\n",
+        crate::core::security::vulnerability::ARCH_UPSTREAM_URL
+    );
+    crate::core::privilege::confirm_security_review(&details, digest, invoking_uid, &|| {
         signals.check()
     })
 }

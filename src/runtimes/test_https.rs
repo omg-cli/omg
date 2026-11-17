@@ -6,6 +6,44 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, rustls};
 
+#[cfg(target_os = "linux")]
+pub(super) fn fixed_public_routes(routes: &[(&str, &str, &[u8])]) {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    use std::path::Path;
+    assert!(crate::core::is_root());
+    assert!(!crate::core::paths::test_mode());
+    assert_eq!(
+        std::env::var("OMG_RUNTIME_PUBLIC_FIXTURE").as_deref(),
+        Ok("isolated-namespaces")
+    );
+    for namespace in ["mnt", "net"] {
+        assert_ne!(
+            std::fs::read_link(format!("/proc/self/ns/{namespace}")).unwrap(),
+            std::fs::read_link(format!("/proc/1/ns/{namespace}")).unwrap()
+        );
+    }
+    let directory = Path::new("/tmp/omg-runtime-public-fixture");
+    let metadata = std::fs::symlink_metadata(directory).expect("private native fixture control");
+    assert!(metadata.is_dir() && !metadata.is_symlink());
+    assert_eq!(metadata.uid(), 0);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    assert!(!routes.is_empty() && routes.len() <= 32);
+    assert!(routes.iter().map(|(_, _, body)| body.len()).sum::<usize>() <= 4 * 1024 * 1024);
+    let plan = routes.iter().map(|(host, path, body)| {
+        serde_json::json!({"host": host, "path": path, "status": 200, "body": body})
+    }).collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&plan).expect("serialize exact fixed-origin fixture routes");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("routes.json"))
+        .expect("fresh owned native fixture manifest");
+    file.write_all(&bytes)
+        .expect("publish exact fixed-origin fixture routes");
+}
+
 pub(super) struct HttpsFixture {
     certificate: reqwest::Certificate,
     proxy: reqwest::Proxy,

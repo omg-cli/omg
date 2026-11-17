@@ -448,6 +448,76 @@ fn python_target() -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "3.12.0";
+        let archive = tar_gz_entries(
+            "python",
+            &[
+                ("bin/python3", b"fixture launcher"),
+                ("lib/owned.data", b"complete Python implementation"),
+            ],
+        )
+        .unwrap();
+        let target = python_target().unwrap();
+        let filename =
+            format!("cpython-{version}%2B20260901-{target}-install_only_stripped.tar.gz");
+        let path =
+            format!("/astral-sh/python-build-standalone/releases/download/20260901/{filename}");
+        let key = format!("cpython-{version}-linux-{}-gnu", std::env::consts::ARCH);
+        let metadata = serde_json::to_vec(&serde_json::json!({key: {
+            "name":"cpython", "arch":{"family":std::env::consts::ARCH,"variant":null},
+            "os":"linux", "libc":"gnu", "major":3,"minor":12,"patch":0,
+            "prerelease":"", "variant":null, "build":"20260901",
+            "url":format!("https://github.com{path}"), "sha256":hex::encode(Sha256::digest(&archive))
+        }})).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            (
+                "raw.githubusercontent.com",
+                "/astral-sh/uv/main/crates/uv-python-managed/download-metadata.json",
+                &metadata,
+            ),
+            ("github.com", &path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("python", "bin/python3");
+        let manager = PythonManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/python3")).unwrap(),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete Python implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/python3")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "python",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
 
     #[tokio::test]

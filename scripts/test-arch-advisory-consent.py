@@ -170,9 +170,11 @@ def inside(args):
                 if key.startswith("SUDO_") or key.startswith("XDG_") or key.startswith("OMG_TEST"):
                     environment.pop(key)
             expected = (b"possible match", b"1-1", b"https://security.archlinux.org/CVE-OMG-QEMU-616") if args.coverage == "finding" else (b"coverage", b"unknown", b"1-1")
+            expected += (b"Arch advisory source: https://security.archlinux.org/issues/all.json",)
             code, transcript = terminal_case(args.unit, case, environment, expected=expected)
             (args.output / (case + ".log")).write_bytes(transcript)
             (args.output / (case + "-requests.json")).write_text(json.dumps(events[start:], indent=2) + "\n")
+            assert expected[-1] in transcript, "even missing-terminal refusals must disclose the actual advisory source"
             assert code == 0 and b"test result: ok. 1 passed; 0 failed; 0 ignored;" in transcript, transcript.decode(errors="replace")
             assert not any(value in transcript for value in (b"[omg-skip]", b"skipped:", b"LLVM Profile Error", b"LLVM Profile Warning")), transcript.decode(errors="replace")
             marker = re.findall(MARKER.encode() + rb"(\{[^\r\n]*\})", transcript)

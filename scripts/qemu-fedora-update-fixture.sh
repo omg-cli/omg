@@ -168,7 +168,7 @@ dnf history info --json last > "$base/history.json"
 jq -e --arg package "$package" '
   type == "array" and length == 1 and .[0].status == "Ok" and
   any(.[0].packages[];
-    .action == "Upgrade" and .repository == "omg-qa-update" and
+    .action == "Upgrade" and .repository == "@stored_transaction(omg-qa-update)" and
     (.nevra | test("^" + $package + "-(?:[0-9]+:)?2-1[.]noarch$")))
 ' "$base/history.json" > /dev/null || {
   echo 'DNF native history did not record fixture upgrade' >&2

@@ -287,6 +287,65 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_xz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "0.15.0";
+        let archive = tar_xz_entries(
+            "zig",
+            &[
+                ("zig", b"fixture launcher"),
+                ("lib/owned.data", b"complete Zig implementation"),
+            ],
+        )
+        .unwrap();
+        let target = zig_target().unwrap();
+        let path = format!("/download/{version}/zig-{target}-{version}.tar.xz");
+        let metadata = serde_json::to_vec(&serde_json::json!({version:{target:{
+            "tarball":format!("https://ziglang.org{path}"),"shasum":hex::encode(Sha256::digest(&archive))
+        }}})).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            ("ziglang.org", "/download/index.json", &metadata),
+            ("ziglang.org", &path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("zig", "bin/zig");
+        let manager = ZigManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/zig")).unwrap(),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete Zig implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/zig")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "zig",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
     use serde_json::json;
 

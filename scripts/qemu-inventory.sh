@@ -2971,7 +2971,7 @@ while IFS=$'\t' read -r case args_json safety _expected_exit expected_ux require
   supervisor=$(jq -rn --arg s 'rc=0; "$@" 3>&- || rc=$?; printf "%s\n" "$rc" >&3' '$s | @sh')
   remote+="; status_file=\$(mktemp \"\$HOME/inventory-status.XXXXXX\"); trap 'rm -f \"\$status_file\"' EXIT"
   remote+="; run_omg() { local deadline=\$1; shift; execution_phase=executor; rc=0; timeout --kill-after=5s \"\$deadline\" bash -c $supervisor _ \"\$@\" 3>\"\$status_file\" || rc=\$?; if [ \"\$rc\" = 0 ]; then if IFS= read -r rc < \"\$status_file\"; then execution_phase=product; else rc=125; fi; fi; }"
-  if [[ "$safety" == package-mutation && "$distro" != arch ]]; then
+  if [[ "$safety" == package-mutation ]]; then
     remote+="; printf '%s' $runtime_consent_source > qemu-runtime-advisory-oracle.py; native_review_binary=$quoted_binary"
     remote+="; run_native_omg() { local deadline=\$1; shift; if [[ \$1 == \"\$native_review_binary\" && ( \${2:-} == install || \${2:-} == update || \${2:-} == rollback ) ]]; then run_omg \"\$deadline\" python3 qemu-runtime-advisory-oracle.py --native --accept-only --timeout \"\$deadline\" -- \"\$@\"; else run_omg \"\$deadline\" \"\$@\"; fi; }"
   else

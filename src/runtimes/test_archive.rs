@@ -93,8 +93,24 @@ pub(super) struct PublicationFixture {
 
 impl PublicationFixture {
     pub(super) fn new(runtime: &str, launcher: &str) -> Self {
+        Self::with_owner(
+            runtime,
+            launcher,
+            tempfile::tempdir().expect("private archive publication fixture"),
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "pgp"))]
+    pub(super) fn new_in(runtime: &str, launcher: &str, parent: &std::path::Path) -> Self {
+        Self::with_owner(
+            runtime,
+            launcher,
+            tempfile::tempdir_in(parent).expect("budgeted private archive publication fixture"),
+        )
+    }
+
+    fn with_owner(runtime: &str, launcher: &str, owner: tempfile::TempDir) -> Self {
         use std::{fs, os::unix::fs::symlink};
-        let owner = tempfile::tempdir().expect("private archive publication fixture");
         let versions = owner.path().join("versions").join(runtime);
         let previous = versions.join("1.0.0");
         let binary = previous.join(launcher);
@@ -143,7 +159,6 @@ impl PublicationFixture {
                 .any(|entry| {
                     let entry = entry.expect("owned fixture entry");
                     entry.file_name().to_string_lossy().starts_with(".install-")
-                        && entry.path().is_dir()
                 }),
             "temporary publication trees must be retired by their owner"
         );

@@ -247,6 +247,75 @@ fn ruby_platform() -> Result<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "3.4.2";
+        let archive = tar_gz_entries(
+            "ruby",
+            &[
+                ("bin/ruby", b"fixture launcher"),
+                ("lib/owned.data", b"complete Ruby implementation"),
+            ],
+        )
+        .unwrap();
+        let arch = [("x86_64", "x64"), ("aarch64", "arm64")]
+            .into_iter()
+            .find(|(host, _)| *host == std::env::consts::ARCH)
+            .expect("supported native fixture architecture")
+            .1;
+        let filename = format!("ruby-{version}-{}-{arch}.tar.gz", ruby_platform().unwrap());
+        let path = format!("/ruby/ruby-builder/releases/download/ruby-{version}/{filename}");
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "tag_name":format!("ruby-{version}"), "prerelease":false,
+            "assets":[{"name":filename,"browser_download_url":format!("https://github.com{path}"),"digest":format!("sha256:{}",hex::encode(Sha256::digest(&archive)))}]
+        })).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            (
+                "api.github.com",
+                "/repos/ruby/ruby-builder/releases/tags/ruby-3.4.2",
+                &metadata,
+            ),
+            ("github.com", &path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("ruby", "bin/ruby");
+        let manager = RubyManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/ruby")).unwrap(),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete Ruby implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/ruby")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "ruby",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
 
     #[tokio::test]

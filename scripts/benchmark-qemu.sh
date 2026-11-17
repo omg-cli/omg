@@ -1219,11 +1219,7 @@ if [[ "$distro" == fedora ]]; then
   cmp evidence/native-advisory-denial-before.tsv evidence/native-advisory-denial-after.tsv
   if installed >/dev/null 2>&1; then echo 'denied advisory risk changed tree state' >&2; exit 1; fi
 fi
-if [[ "$distro" == arch ]]; then
-  sudo -n "$bin" install --yes tree
-else
-  python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --accept-only --timeout 600 -- sudo -n "$native_bin" install --yes tree
-fi
+python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --accept-only --timeout 600 -- sudo -n "$native_bin" install --yes tree
 installed
 "$bin" info tree > evidence/omg-info.txt
 "${native[@]}" > evidence/native-info.txt

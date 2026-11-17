@@ -1511,6 +1511,32 @@ mod tests {
         assert!(file_has_capability_xattr(&file.path().with_extension("missing")).is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an explicitly provisioned native root fixture with CAP_SETFCAP"]
+    fn native_capability_probe_recognizes_an_empty_capability_attribute() {
+        assert!(crate::core::is_root());
+        assert_eq!(
+            std::env::var("OMG_ARCH_INSTALL_FIXTURE").as_deref(),
+            Ok("isolated-container")
+        );
+        let file = tempfile::NamedTempFile::new().expect("owned inert capability fixture");
+        assert!(!file_has_capability_xattr(file.path()).expect("no initial capability attribute"));
+        let mut empty_v2 = [0_u8; 20];
+        empty_v2[..4].copy_from_slice(&0x0200_0000_u32.to_le_bytes());
+        rustix::fs::setxattr(
+            file.path(),
+            "security.capability",
+            &empty_v2,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .expect("set a real empty Linux capability attribute on the owned inert file");
+        assert!(file_has_capability_xattr(file.path()).expect("empty attribute remains present"));
+        rustix::fs::removexattr(file.path(), "security.capability")
+            .expect("remove only the owned fixture attribute");
+        assert!(!file_has_capability_xattr(file.path()).expect("removed capability attribute"));
+    }
+
     #[test]
     fn doctor_network_targets_match_selected_backend() {
         let (mac_endpoints, mac_dns) = network_targets(Distro::MacOS);

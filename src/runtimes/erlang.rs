@@ -573,6 +573,69 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "27.0.1";
+        let launcher = b"#!/bin/sh\nexit 0\n";
+        let archive = tar_gz_entries(
+            "otp",
+            &[
+                ("Install", b"#!/bin/sh\nexit 0\n"),
+                ("bin/erl", launcher),
+                ("lib/owned.data", b"complete OTP implementation"),
+            ],
+        )
+        .unwrap();
+        let metadata = format!(
+            "OTP-{version} {} 2026-09-01T00:00:00Z {}\n",
+            "a".repeat(40),
+            hex::encode(Sha256::digest(&archive))
+        );
+        let index = reqwest::Url::parse(&index_url().unwrap()).unwrap();
+        let url = reqwest::Url::parse(&tarball_url(version).unwrap()).unwrap();
+        super::super::test_https::fixed_public_routes(&[
+            (index.host_str().unwrap(), index.path(), metadata.as_bytes()),
+            (url.host_str().unwrap(), url.path(), &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("erlang", "bin/erl");
+        let manager = ErlangManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("complete authenticated public installation");
+        let installed = fixture.versions.join(version);
+        assert_eq!(
+            fs::read(fixture.versions.join("current").join("bin/erl")).unwrap(),
+            launcher
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete OTP implementation"
+        );
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bin/erl")).unwrap(),
+            b"previous reviewed runtime"
+        );
+        super::super::security::admit_installed(
+            "erlang",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact authenticated publisher authority")
+        .verify(&installed)
+        .expect("complete published tree matches its admission");
+    }
+
     use super::*;
 
     const BUILDS_TXT: &str = "OTP-24.3.4 0863bd30aabd035c83158c78046c5ffda16127e1 2024-04-26T03:41:09Z\n\

@@ -259,6 +259,64 @@ fn bun_platform() -> Result<String> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{Launcher, PublicationFixture, zip};
+        use sha2::{Digest as _, Sha256};
+
+        let version = "1.4.0";
+        let filename = format!(
+            "bun-{}.zip",
+            bun_platform().expect("supported native Bun host")
+        );
+        let archive = zip("runtime", "bun", Launcher::Regular).expect("owned Bun vendor ZIP");
+        let metadata = serde_json::to_vec(&serde_json::json!({
+            "tag_name": format!("bun-v{version}"), "prerelease": false,
+            "assets": [{"name": filename, "digest": format!("sha256:{}", hex::encode(Sha256::digest(&archive)))}]
+        })).expect("controlled Bun publisher metadata");
+        let metadata_path = format!("/repos/oven-sh/bun/releases/tags/bun-v{version}");
+        let archive_path = format!("/oven-sh/bun/releases/download/bun-v{version}/{filename}");
+        super::super::test_https::fixed_public_routes(&[
+            ("api.github.com", &metadata_path, &metadata),
+            ("github.com", &archive_path, &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("bun", "bun");
+        let manager = BunManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install(version)
+            .await
+            .expect("public verified Bun installation");
+        let installed = fixture.versions.join(version);
+        assert!(super::super::common::is_valid_version_dir(&installed));
+        assert_eq!(
+            fs::read(installed.join("bun")).expect("complete Bun launcher"),
+            b"fixture launcher"
+        );
+        assert_eq!(
+            fs::canonicalize(fixture.versions.join("current")).unwrap(),
+            fs::canonicalize(&installed).unwrap()
+        );
+        super::super::security::admit_installed(
+            "bun",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("exact public Bun admission")
+        .verify(&installed)
+        .expect("published Bun tree remains bound");
+        assert_eq!(
+            fs::read(fixture.versions.join("1.0.0/bun")).unwrap(),
+            b"previous reviewed runtime"
+        );
+    }
+
     #[tokio::test]
     async fn incomplete_bun_archive_is_not_published_and_can_be_retried() -> Result<()> {
         check_archive_publication(super::super::test_archive::Launcher::Missing).await

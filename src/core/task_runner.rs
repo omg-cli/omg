@@ -1830,6 +1830,7 @@ mod tests {
                     .unwrap(),
                 );
                 assert!(system_runtime_satisfies("node", "24.22.3"));
+                assert!(system_runtime_satisfies("node", "latest"));
                 assert_eq!(ensure_node_runtime("v24.22.3").unwrap(), "24.22.3");
                 assert_eq!(std::fs::read(&marker).unwrap(), b"reviewed");
                 assert!(!system_runtime_satisfies("node", "24.22.4"));
@@ -1847,9 +1848,13 @@ mod tests {
                     !marker.exists(),
                     "changed runtime executed without renewed review"
                 );
+                let missing_interpreter = owner.path().join("missing-interpreter");
+                assert!(!missing_interpreter.exists());
                 for invalid_executable in [
-                    b"invalid executable image".as_slice(),
-                    b"#!/bin/sh\nexit 7\n",
+                    b"invalid executable image".to_vec(),
+                    b"#!/bin/sh\nexit 7\n".to_vec(),
+                    format!("#!{}\n", missing_interpreter.display()).into_bytes(),
+                    b"#!/bin/sh\nprintf '\\377'\n".to_vec(),
                 ] {
                     std::fs::write(&executable, invalid_executable).unwrap();
                     drop(
