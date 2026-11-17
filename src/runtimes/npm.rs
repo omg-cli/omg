@@ -766,6 +766,13 @@ mod admission_tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "policy fixtures must run as an ordinary user"
+        );
         let fixture = Fixture::new();
         let config = fixture.owner.path().join("config");
         fs::create_dir(&config).expect("private npm policy directory");
@@ -788,6 +795,17 @@ mod admission_tests {
         fs::write(lock_path, serde_json::to_vec(&lock).unwrap())
             .expect("exact transitive registry graph");
         temp_env::with_var("OMG_CONFIG_DIR", Some(config.as_os_str()), || {
+            assert_eq!(
+                crate::core::paths::config_dir(),
+                config,
+                "the private npm policy must be the effective policy"
+            );
+            assert_eq!(
+                crate::core::security::policy::SecurityPolicy::load_current()
+                    .expect("load the actual private npm policy")
+                    .banned_packages,
+                ["blocked-dependency"],
+            );
             let error = fixture
                 .install()
                 .err()
@@ -910,10 +928,28 @@ mod admission_tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "policy fixtures must run as an ordinary user"
+        );
         let fixture = Fixture::new();
         let config = fixture.owner.path().join("config");
         fs::create_dir(&config).expect("owned npm policy directory");
         temp_env::with_var("OMG_CONFIG_DIR", Some(config.as_os_str()), || {
+            assert_eq!(
+                crate::core::paths::config_dir(),
+                config,
+                "the private npm policy must be the effective policy"
+            );
+            assert!(
+                crate::core::security::policy::SecurityPolicy::load_current()
+                    .expect("load the initial private npm policy")
+                    .banned_packages
+                    .is_empty()
+            );
             let admission = fixture
                 .install()
                 .expect("initial permitted dependency graph");
@@ -925,6 +961,12 @@ mod admission_tests {
                 "banned_packages = ['@earendil-works/pi-coding-agent']\n",
             )
             .expect("new policy bans the installed package");
+            assert_eq!(
+                crate::core::security::policy::SecurityPolicy::load_current()
+                    .expect("load the changed private npm policy")
+                    .banned_packages,
+                ["@earendil-works/pi-coding-agent"],
+            );
             let error = admission
                 .verify(&fixture.prefix)
                 .expect_err("changed policy must invalidate retained publication authority");

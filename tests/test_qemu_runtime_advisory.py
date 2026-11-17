@@ -263,25 +263,37 @@ print('runtime-install-complete')
         source = (ROOT / 'benchmark-hyperfine.sh').read_text()
         begin = source.index('        if [[ "$GUEST_TOOL" == omg ]]; then')
         end = source.index('        command_json "$transaction_label"', begin)
-        for distro in ('debian', 'fedora'):
-            with self.subTest(distro=distro), tempfile.TemporaryDirectory() as directory:
+        for distro, known in ((distro, known) for distro in ('arch', 'debian', 'ubuntu', 'fedora') for known in (False, True)):
+            with self.subTest(distro=distro, disclosed_finding=known), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                command = self.command(root, native=True, known=False)
+                evidence = root / 'evidence'
+                evidence.mkdir()
+                command = self.command(root, native=True, known=known)
                 executable = Path(command[1])
                 executable.write_text('#!' + sys.executable + '\n' +
+                                      "import sys\nassert sys.argv[1:] == ['install', '--yes', 'tree']\n" +
                                       "with open('attempts.log','a') as attempts: attempts.write('attempt\\n')\n" +
-                                      executable.read_text())
+                                      executable.read_text().replace("os.write(tty,", "assert os.tcgetpgrp(tty) == os.getpgrp()\nos.write(tty,"))
                 executable.chmod(0o755)
-                shutil.copyfile(ROOT / 'scripts/qemu-runtime-advisory-oracle.py', root / 'qemu-runtime-advisory-oracle.py')
+                shutil.copyfile(ROOT / 'scripts/attend-unknown-fixture.py', root / 'attend-unknown-fixture.py')
                 recipe = ('set -euo pipefail\nGUEST_TOOL=omg\nGUEST_TRANSACTION=install\n'
                           + f'distro={shlex.quote(distro)}\nREPO_ROOT={shlex.quote(str(root))}\n'
+                          + f'EXPORT_DIR={shlex.quote(str(evidence))}\n'
                           + f'OMG={shlex.quote(str(executable))}\nprivileged=()\n'
                           + source[begin:end] + '\n"${transaction[@]}"\n')
                 result = subprocess.run(['bash', '-c', recipe], cwd=root, capture_output=True,
                                         start_new_session=True, timeout=10)
-                self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
                 self.assertEqual((root / 'attempts.log').read_text().splitlines(), ['attempt'])
-                self.assertTrue((root / 'accepted.marker').exists())
+                receipt = evidence / 'security-review.json'
+                if known:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(b'Unknown-only', result.stderr)
+                    self.assertFalse((root / 'accepted.marker').exists())
+                    self.assertFalse(receipt.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+                    self.assertTrue((root / 'accepted.marker').exists())
+                    self.assertEqual(json.loads(receipt.read_text()), {'reviews': ['a' * 64], 'cli_exit_code': 0})
 
 
 if __name__ == '__main__': unittest.main()
