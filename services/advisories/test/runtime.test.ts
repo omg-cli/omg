@@ -51,9 +51,9 @@ const nodePayload = { "1": { cve: ["CVE-2026-12345"], vulnerable: "20.x || 18.x"
 async function report(store: Store, runtime: string, version: string, vendor: string, fetcher: (url: string, init?: RequestInit) => Promise<Response>, at = now, force = false) {
     return object(await (await handle(request(runtime, version, vendor, force ? { "cache-control": "no-cache" } : undefined), store, undefined, at, fetcher)).json());
 }
-async function zipFixture(repo: string, files: Record<string, string>) {
+async function zipFixture(repo: string, files: Record<string, string>, revision = "a".repeat(40)) {
     const writer = new ZipWriter(new Uint8ArrayWriter(), { useWebWorkers: false, useCompressionStream: true, level: 0 });
-    for (const [path, raw] of Object.entries(files)) await writer.add(`${repo.split("/")[1]}-${"a".repeat(40)}/${path}`, new TextReader(raw));
+    for (const [path, raw] of Object.entries(files)) await writer.add(`${repo.split("/")[1]}-${revision}/${path}`, new TextReader(raw));
     return await writer.close();
 }
 async function archiveFetcher(repo: string, files: Record<string, string>, fallback?: (url: string) => Promise<Response>) {
@@ -576,4 +576,124 @@ test("public post-consent revalidation rereads fresh GitHub snapshots without po
         const stale = await handle(request("bun", "1.1.0", "oven-sh", { "cache-control": "no-cache" }), store, undefined, expired, async () => { calls++; return new Response(null, { status: 403 }); });
         expect(object(await stale.json()).coverage).toBe("partial"); expect(stale.headers.get("cache-control")).toBe("no-store"); expect(calls).toBe(2);
     } finally { db.close(); }
+});
+
+const rustHeadroomFiles = (title = "Published standard-library finding") => ({
+    "rust/std/RUSTSEC-2026-0001.md": '```toml\n[advisory]\nid = "RUSTSEC-2026-0001"\n[versions]\npatched = [">= 1.85.1"]\nunaffected = []\n```\n# ' + title + '\n',
+});
+const nearExpiry = "2026-11-17T02:29:55.000Z";
+
+test("forced public GitHub revalidation begins at exactly five minutes of remaining freshness", async () => {
+    const { store, db, setClock } = setup();
+    try {
+        const payload = [advisory("bun", "<1.2.0")];
+        const original = await report(store, "bun", "1.1.0", "oven-sh", async () => Response.json(payload));
+        const before = "2026-11-17T02:24:59.999Z", boundary = "2026-11-17T02:25:00.000Z";
+        let calls = 0;
+        setClock(before);
+        const cached = await report(store, "bun", "1.1.0", "oven-sh", async () => { calls++; throw new Error("freshness headroom remains"); }, before, true);
+        expect(calls).toBe(0);
+        expect(cached.sources).toEqual(original.sources);
+        setClock(boundary);
+        const renewed = await report(store, "bun", "1.1.0", "oven-sh", async () => { calls++; return Response.json(payload); }, boundary, true);
+        expect(calls).toBe(1);
+        expect(renewed.sources).toMatchObject([{ checked_at: boundary, complete: true }]);
+    } finally { db.close(); }
+});
+
+test("forced public Rust reads renew near-expiry proof only after actual unchanged publisher revalidation", async () => {
+    const { store, db, setClock } = setup();
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    try {
+        const original = await report(store, "rust", "1.85.0", "rust-lang", await archiveFetcher("rustsec/advisory-db", rustHeadroomFiles()));
+        expect(original.findings).toMatchObject([{ id: "RUSTSEC-2026-0001", applicability: "applicable" }]);
+        let calls = 0;
+        setClock(nearExpiry);
+        const unchanged = await report(store, "rust", "1.85.0", "rust-lang", async () => { calls++; throw new Error("unforced fresh read must not fetch"); }, nearExpiry);
+        expect(calls).toBe(0);
+        expect(unchanged.sources).toEqual(original.sources);
+        const renewed = report(store, "rust", "1.85.0", "rust-lang", async (url, init) => {
+            calls++;
+            expect(url).toBe("https://api.github.com/repos/rustsec/advisory-db/commits/main");
+            expect(init?.redirect).toBe("manual");
+            expect(new Headers(init?.headers).get("authorization")).toBeNull();
+            expect(new Headers(init?.headers).get("cache-control")).toBe("no-cache");
+            entered.resolve();
+            await release.promise;
+            return Response.json({ sha: "a".repeat(40) });
+        }, nearExpiry, true);
+        try {
+            await Promise.race([entered.promise, renewed]);
+            expect(calls).toBe(1);
+            expect(db.query<{ successful_at: string }, []>("SELECT successful_at FROM runtime_source").get()?.successful_at).toBe(now);
+        } finally { release.resolve(); }
+        const body = await renewed;
+        expect(body.findings).toEqual(original.findings);
+        expect(body.gaps).toEqual(original.gaps);
+        expect(body.coverage).toBe(original.coverage);
+        if (!Array.isArray(body.sources) || !Array.isArray(original.sources)) throw new Error("missing Rust source receipts");
+        expect(body.sources).toEqual(original.sources.map((source) => ({ ...object(source), checked_at: nearExpiry })));
+        expect(db.query<{ successful_at: string; error: string | null }, []>("SELECT successful_at,error FROM runtime_source").get()).toEqual({ successful_at: nearExpiry, error: null });
+    } finally { release.resolve(); db.close(); }
+});
+
+test("near-expiry Rust publisher changes replace semantic evidence after actual archive validation", async () => {
+    const { store, db, setClock } = setup();
+    try {
+        const original = await report(store, "rust", "1.85.0", "rust-lang", await archiveFetcher("rustsec/advisory-db", rustHeadroomFiles()));
+        const revision = "b".repeat(40), archive = await zipFixture("rustsec/advisory-db", rustHeadroomFiles("Changed published finding"), revision);
+        const urls: string[] = [];
+        setClock(nearExpiry);
+        const changed = await report(store, "rust", "1.85.0", "rust-lang", async (url, init) => {
+            urls.push(url);
+            expect(new Headers(init?.headers).get("authorization")).toBeNull();
+            expect(new Headers(init?.headers).get("cache-control")).toBe("no-cache");
+            if (url === "https://api.github.com/repos/rustsec/advisory-db/commits/main") return Response.json({ sha: revision });
+            expect(url).toBe(`https://codeload.github.com/rustsec/advisory-db/zip/${revision}`);
+            return new Response(archive);
+        }, nearExpiry, true);
+        expect(urls.length).toBe(2);
+        expect(changed.findings).toMatchObject([{ id: "RUSTSEC-2026-0001", summary: "Changed published finding" }]);
+        if (!Array.isArray(changed.sources) || !Array.isArray(original.sources)) throw new Error("missing Rust source receipts");
+        expect(object(changed.sources[0]).payload_sha256).not.toBe(object(original.sources[0]).payload_sha256);
+        expect(changed.sources).toMatchObject([{ checked_at: nearExpiry, revision, complete: true }]);
+    } finally { db.close(); }
+});
+
+test("failed near-expiry Rust revalidation never renews last-success dates or drops findings", async () => {
+    for (const failure of ["http", "commit", "archive"]) {
+        const { store, db, setClock } = setup();
+        try {
+            const original = await report(store, "rust", "1.85.0", "rust-lang", await archiveFetcher("rustsec/advisory-db", rustHeadroomFiles()));
+            let calls = 0;
+            setClock(nearExpiry);
+            const failed = await report(store, "rust", "1.85.0", "rust-lang", async (url) => {
+                calls++;
+                if (failure === "http") return new Response(null, { status: 403 });
+                if (failure === "commit") return Response.json({ sha: "invalid" });
+                return url.startsWith("https://api.github.com/") ? Response.json({ sha: "b".repeat(40) }) : new Response("not a zip archive");
+            }, nearExpiry, true);
+            expect(calls).toBe(failure === "archive" ? 2 : 1);
+            expect(failed.coverage).toBe("partial");
+            expect(failed.findings).toEqual(original.findings);
+            expect(failed.sources).toMatchObject([{ checked_at: now, complete: false }]);
+            expect(db.query<{ successful_at: string }, []>("SELECT successful_at FROM runtime_source").get()?.successful_at).toBe(now);
+        } finally { db.close(); }
+    }
+});
+
+test("near-expiry Rust refresh contention cannot manufacture newer source proof", async () => {
+    const { store, db, setClock } = setup();
+    const lease = `runtime:${await sha256("v1:rust:components")}`, owner = "headroom-contender";
+    try {
+        const original = await report(store, "rust", "1.85.0", "rust-lang", await archiveFetcher("rustsec/advisory-db", rustHeadroomFiles()));
+        setClock(nearExpiry);
+        expect(await store.lease(lease, owner, nearExpiry)).toBe(true);
+        let calls = 0;
+        const contender = await report(store, "rust", "1.85.0", "rust-lang", async () => { calls++; throw new Error("lease holder owns upstream refresh"); }, nearExpiry, true);
+        expect(calls).toBe(0);
+        expect(contender.sources).toEqual(original.sources);
+        expect(contender.findings).toEqual(original.findings);
+        expect(db.query<{ successful_at: string }, []>("SELECT successful_at FROM runtime_source").get()?.successful_at).toBe(now);
+    } finally { await store.release(lease, owner); db.close(); }
 });

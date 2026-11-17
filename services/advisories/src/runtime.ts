@@ -10,6 +10,7 @@ import { type Store } from "./storage";
 
 const MINUTE = 60_000;
 const SOURCE_TTL = 30 * MINUTE;
+const SOURCE_REVIEW_HEADROOM = 5 * MINUTE;
 const SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_FINDINGS = 512;
 const VENDORS = {
@@ -195,7 +196,8 @@ class Sources {
         };
         let previous = await stored(cached);
         const scheduledGitHubSource = key.startsWith("ghsa:") || ["python:psf", "rust:components", "ruby:mri", "java:temurin-vdr"].includes(key);
-        if (!this.credential && scheduledGitHubSource && previous?.receipt.complete) return use(previous);
+        const hasReviewHeadroom = previous !== null && Date.parse(this.now) - Date.parse(previous.receipt.checked_at) < SOURCE_TTL - SOURCE_REVIEW_HEADROOM;
+        if (!this.credential && scheduledGitHubSource && previous?.receipt.complete && (!this.force || hasReviewHeadroom)) return use(previous);
         const age = cached ? Date.parse(this.now) - Date.parse(cached.checked_at) : Infinity;
         if (!this.force && age >= 0 && age < (cached?.error ? MINUTE : SOURCE_TTL)) return use(previous);
         const lease = `runtime:${await sha256(cacheKey)}`, owner = crypto.randomUUID();

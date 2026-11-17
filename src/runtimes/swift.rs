@@ -42,9 +42,10 @@ use std::path::{Path, PathBuf};
 
 use super::common::{
     GithubRelease, activate_version_with_linked_binary, begin_staged_install,
-    complete_staged_install, download_to_temp_for_signature, extract_tar_gz, fetch_github_releases,
-    is_valid_version_dir, normalize_version, print_already_installed, print_installed, print_using,
-    remove_file_best_effort, uninstall_version, validate_download_filename,
+    complete_staged_install, download_to_temp_for_signature, extract_tar_gz_with_budget,
+    fetch_github_releases, is_valid_version_dir, normalize_version, print_already_installed,
+    print_installed, print_using, remove_file_best_effort, uninstall_version,
+    validate_download_filename,
 };
 
 // Published at https://www.swift.org/keys/active/. Keep this list explicit so
@@ -74,6 +75,11 @@ const SWIFT_DOWNLOAD_BASE: &str = "https://download.swift.org";
 /// Binary path inside the extracted `usr/` tree, also used as the activation
 /// probe and the smoke-test target.
 const SWIFT_BINARY: &str = "usr/bin/swift";
+
+// The signed Swift 6.0.3 Ubuntu archive expands to 2,652,651,520 bytes including
+// TAR headers and padding. This finite SDK-specific budget is available only
+// after the existing pinned vendor-signature verification succeeds.
+const MAX_SWIFT_DECOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// A stable upstream Swift release. `prerelease` is always false today (the
 /// parser drops prerelease entries); the field mirrors sibling managers so a
@@ -227,7 +233,7 @@ async fn verify_and_extract_tarball(
     println!("{} Extracting (pure Rust)...", style::informative("→"));
     let staging = begin_staged_install(versions_dir)?;
     // Strip only the vendor's top directory, preserving its usr/ tree.
-    extract_tar_gz(tarball, staging.path(), 1).await?;
+    extract_tar_gz_with_budget(tarball, staging.path(), 1, MAX_SWIFT_DECOMPRESSED_BYTES).await?;
     Ok(staging)
 }
 

@@ -154,9 +154,9 @@ pub(crate) struct BudgetedReader<R> {
 }
 
 impl<R> BudgetedReader<R> {
-    /// Explicit budget: production callers pass [`MAX_DECOMPRESSED_BYTES`],
-    /// tests pass a small budget so the abort path is exercisable without
-    /// gigabyte allocations.
+    /// Explicit finite budget: ordinary archives use [`MAX_DECOMPRESSED_BYTES`].
+    /// Authenticated larger components can select a separate bound; tests use
+    /// small budgets without gigabyte allocations.
     pub(crate) fn new(inner: R, budget: u64) -> Self {
         Self {
             inner,
@@ -1029,6 +1029,23 @@ pub(crate) async fn extract_tar_gz(
     dest_dir: &Path,
     strip_components: usize,
 ) -> Result<()> {
+    extract_tar_gz_with_budget(
+        archive_path,
+        dest_dir,
+        strip_components,
+        MAX_DECOMPRESSED_BYTES,
+    )
+    .await
+}
+
+/// Extract through the same bounded archive owner with an explicit expansion limit.
+/// Callers selecting a larger limit must authenticate the archive first.
+pub(crate) async fn extract_tar_gz_with_budget(
+    archive_path: &Path,
+    dest_dir: &Path,
+    strip_components: usize,
+    max_bytes: u64,
+) -> Result<()> {
     let archive_path = archive_path.to_path_buf();
     let dest_dir = dest_dir.to_path_buf();
 
@@ -1037,8 +1054,7 @@ pub(crate) async fn extract_tar_gz(
             stripped_archive_path(path, strip_components)
         };
         let task = extract_task(&archive_path);
-        let result =
-            extract_component_tar_gz(&archive_path, &dest_dir, MAX_DECOMPRESSED_BYTES, &select);
+        let result = extract_component_tar_gz(&archive_path, &dest_dir, max_bytes, &select);
         task.finish(Outcome::Done);
         result
     })
@@ -4100,6 +4116,37 @@ mod tests {
         assert!(try_lock_runtime_install(temp.path(), "1.0.0").is_err());
         drop(lease);
         let _next = try_lock_runtime_install(temp.path(), "1.0.0")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gzip_explicit_budget_covers_the_complete_decompressed_stream() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let raw = tar_archive(tar::EntryType::Regular);
+        let length = u64::try_from(raw.len())?;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut encoder, &raw)?;
+        let archive = temp.path().join("runtime.tar.gz");
+        fs::write(&archive, encoder.finish()?)?;
+        for (name, budget, accepted) in [
+            ("below", length - 1, false),
+            ("exact", length, true),
+            ("above", length + 1, true),
+        ] {
+            let output = temp.path().join(name);
+            let result = extract_tar_gz_with_budget(&archive, &output, 1, budget).await;
+            if accepted {
+                result.expect("complete archive within its finite budget");
+                assert_eq!(fs::read(output.join("bin/tool"))?, b"tool");
+            } else {
+                let error = result.expect_err("even one byte beyond the stream budget must refuse");
+                assert!(format!("{error:#}").contains("configured limit"));
+            }
+        }
+        assert_eq!(MAX_DECOMPRESSED_BYTES, 2 * 1024 * 1024 * 1024);
+        let default_output = temp.path().join("default");
+        extract_tar_gz(&archive, &default_output, 1).await?;
+        assert_eq!(fs::read(default_output.join("bin/tool"))?, b"tool");
         Ok(())
     }
 
