@@ -1391,10 +1391,9 @@ mod tests {
         use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::PermissionsExt as _;
         const NAME: &str = "core::container::tests::generated_recipe_requires_unknown_review_even_with_generic_yes";
-        if crate::core::testing::run_isolated_test(NAME) {
-            return;
-        }
-        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
             return;
         }
         nix::unistd::setsid().expect("detach unattended generated-build fixture");

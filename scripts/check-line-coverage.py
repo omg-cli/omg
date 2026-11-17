@@ -1595,6 +1595,55 @@ def index_compiled_owner_sources(owners, files, work, source_names=None):
         {name: tuple(rows) for name, rows in inventories.items()}, names, source_names)
 
 
+def qualified_function_completion(sides, work):
+    """Bind only the closing brace of a free function after its parameters change."""
+    witnesses = []
+    for source, groups, inventory, line in sides:
+        if source[line - 1] != '}':
+            return None
+        _construct_charge(work, len(groups))
+        choices = [group for group in groups.values() if group[1] == line]
+        if len(choices) != 1:
+            return None
+        start, end, owners = choices[0]
+        header = source[start - 1]
+        _construct_charge(work, len(header) + sum(len(owner['name']) + 1 for owner in owners))
+        declaration = re.fullmatch(r'fn ([A-Za-z_]\w*)\(([^(){}]*)\)([^{}]*)\{\s*', header)
+        paths = [plain_rust_function_symbol(owner['name']) for owner in owners]
+        if declaration is None or any(path is None or path.identifiers[-1] != declaration[1]
+                                      for path in paths):
+            return None
+        identities = {path.identity for path in paths}
+        if len(identities) != 1:
+            return None
+        _construct_charge(work, len(inventory) + sum(len(owner['regions']) for owner in inventory))
+        touching = {id(owner): [region for region in owner['regions']
+                                if tuple(region[:2]) < (line, 2) and tuple(region[2:4]) > (line, 1)]
+                    for owner in inventory}
+        touching = {key: rows for key, rows in touching.items() if rows}
+        if set(touching) != {id(owner) for owner in owners}:
+            return None
+        if any(len(rows) != 1 or rows[0][:4] != [line, 1, line, 2]
+               for rows in touching.values()):
+            return None
+        states = [[int(touching[id(owner)][0][4] > 0)] for owner in owners]
+        if not any(row[0] for row in states):
+            return None
+        witnesses.append((next(iter(identities)), declaration[2], declaration[3].strip(),
+                          states, [owner['name'] for owner in owners], (start, end)))
+    left, right = witnesses
+    if left[0] != right[0] or left[1] == right[1] or left[2] != right[2]:
+        return None
+    _construct_charge(work, len(left[3]) + len(right[3]) + len(left[3]) * len(right[3]))
+    matching = compiled_hit_state_matching(left[3], right[3])
+    if matching is None:
+        return None
+    return dict(kind='qualified-function-completion', owners=[left[4], right[4]],
+                base_range=list(left[5]), head_range=list(right[5]),
+                instance_states=sorted(left[3]), head_instance_states=sorted(right[3]),
+                instance_matching=matching)
+
+
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
                               fragments, work=None, construct_inventories=None, compiled_groups=None,
                               callback_functions=(), owner_indexes=None):
@@ -1646,12 +1695,28 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
     for prefix, (group, _) in forwarders.items():
         groups[1][prefix] = group
     claimed = {}; pairs = {}; excerpts = {}; callback_sources = {}; callback_inventories = {}; callback_work = 20_000_000
+    receipts = []
     nominal_phase_cache = {}
     for a, b, c, d, pending in fragments:
         current_fragment = (a, b, c, d, pending)
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
                       and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
+        if (not candidates and b == a + 1 and d == c + 1 and pending == [b]
+                and before.get(b, 0) > 0 and after.get(d, 0) > 0):
+            witness = qualified_function_completion(
+                zip((old, new), groups, inventories, (b, d)), work)
+            if witness is not None:
+                if b in pairs and pairs[b] != d:
+                    refuse()
+                pairs[b] = d
+                receipts.append(dict(file=name, pairs=[[b, d]], **witness))
+                for side, (source, span) in enumerate(zip((old, new),
+                        (witness['base_range'], witness['head_range']))):
+                    start, end = span
+                    _construct_charge(work, sum(len(text) + 1 for text in source[start - 1:end]))
+                    excerpts[side, start, end] = ('\n'.join(source[start - 1:end]) + '\n').encode()
+                continue
         if (len(candidates) != 1 or old[a:b] != new[c:d]
                 or any(line not in before for line in pending)):
             refuse()
@@ -1844,7 +1909,6 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 refuse()
             pairs[line] = target
             entry["pairs"].append([line, target])
-    receipts = []
     for entry in claimed.values():
         states = entry.pop("states")
         matching = compiled_hit_state_matching(*states)
@@ -5340,9 +5404,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             'callback': {tuple(pair) for receipt in receipts
                          for fragment in receipt.get('callback_fragments', []) for pair in fragment['pairs']},
         }
-        if any((line, fragment.target) not in proof_pairs[fragment.kind]
-               for line, fragment in deferred_fragments.items()):
-            raise ValueError('Unproved retained execution: complete callback/phase evidence required')
+        for line, fragment in deferred_fragments.items():
+            if (line, fragment.target) not in proof_pairs[fragment.kind]:
+                raise ValueError('Unproved retained execution: complete callback/phase evidence required '
+                                 f'at {name}:{line} -> {fragment.target} ({fragment.kind})')
         retained.update(positive)
         positive_receipts.extend(receipts)
         gone.difference_update(anchored)

@@ -400,20 +400,16 @@ mod runtime_matrix {
 
     #[cfg(all(target_os = "linux", debug_assertions))]
     #[test]
-    fn attended_pip_source_refuses_without_a_reviewed_python() -> anyhow::Result<()> {
+    fn attended_tool_sources_require_a_reviewed_runtime() -> anyhow::Result<()> {
         use std::process::Command;
 
-        let owner = tempfile::tempdir_in("/var/tmp")?;
-        let home = owner.path();
-        let data = home.join("data/omg");
-        std::fs::create_dir_all(data.join("versions/python"))?;
         let driver = r#"
 import contextlib, errno, fcntl, os, pty, select, signal, struct, sys, termios, time
 
-binary = sys.argv[1]
+binary, moves, source, package, expected = sys.argv[1:]
 pid, terminal = pty.fork()
 if pid == 0:
-    os.execv(binary, [binary, 'tool', 'install', 'omg-pip-source-fixture'])
+    os.execv(binary, [binary, 'tool', 'install', package])
 
 transcript = bytearray()
 status = None
@@ -431,8 +427,8 @@ try:
                 text = b''
             transcript.extend(text)
             assert len(transcript) <= 128 * 1024, 'tool output exceeded its fixture bound'
-            if not selected and b'Source?' in transcript and b'Pip (Isolated)' in transcript:
-                os.write(terminal, b'\x1b[B' * 3 + b'\r')
+            if not selected and b'Source?' in transcript and source.encode() in transcript:
+                os.write(terminal, b'\x1b[B' * int(moves) + b'\r')
                 selected = True
             if not text:
                 child, value = os.waitpid(pid, os.WNOHANG)
@@ -441,7 +437,7 @@ try:
                     break
     assert status is not None, 'tool process exceeded its fixture deadline'
     assert selected and os.waitstatus_to_exitcode(status) == 1
-    assert b'Package installation requires a selected OMG-managed python' in transcript
+    assert expected.encode() in transcript
 finally:
     os.close(terminal)
     if status is None:
@@ -450,34 +446,89 @@ finally:
         os.waitpid(pid, 0)
     sys.stdout.buffer.write(transcript)
 "#;
-        let mut command = Command::new("/usr/bin/python3");
-        command
-            .args(["-I", "-c", driver, env!("CARGO_BIN_EXE_omg")])
-            .env_clear()
-            .env("HOME", home)
-            .env("XDG_DATA_HOME", home.join("data"))
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_CACHE_HOME", home.join("cache"))
-            .env("TERM", "xterm")
-            .env("PATH", "/usr/bin:/bin")
-            .env("OMG_DISABLE_DAEMON", "1")
-            .env("OMG_NATIVE_TEST_DATA_DIR", "1")
-            .env("OMG_DATA_DIR", &data)
-            .current_dir(home);
-        for key in ["LLVM_PROFILE_FILE", "LD_LIBRARY_PATH"] {
-            if let Some(value) = std::env::var_os(key) {
-                command.env(key, value);
+        for (moves, source, runtime, package, expected) in [
+            (
+                "1",
+                "Cargo (Isolated)",
+                "rust",
+                "omg-tool-source-fixture",
+                "Package installation requires a selected OMG-managed rust",
+            ),
+            (
+                "2",
+                "NPM (Isolated)",
+                "node",
+                "omg-tool-source-fixture",
+                "NPM admission requires an active OMG-managed Node runtime",
+            ),
+            (
+                "3",
+                "Pip (Isolated)",
+                "python",
+                "omg-tool-source-fixture",
+                "Package installation requires a selected OMG-managed python",
+            ),
+            (
+                "4",
+                "Go (Isolated)",
+                "go",
+                "example.invalid/omg-tool-source-fixture",
+                "Package installation requires a selected OMG-managed go",
+            ),
+        ] {
+            let owner = tempfile::tempdir_in("/var/tmp")?;
+            let home = owner.path();
+            let data = home.join("data/omg");
+            std::fs::create_dir_all(data.join("versions").join(runtime))?;
+            let mut command = Command::new("/usr/bin/python3");
+            command
+                .args([
+                    "-I",
+                    "-c",
+                    driver,
+                    env!("CARGO_BIN_EXE_omg"),
+                    moves,
+                    source,
+                    package,
+                    expected,
+                ])
+                .env_clear()
+                .env("HOME", home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_CACHE_HOME", home.join("cache"))
+                .env("TERM", "xterm")
+                .env("PATH", "/usr/bin:/bin")
+                .env("OMG_DISABLE_DAEMON", "1")
+                .env("OMG_NATIVE_TEST_DATA_DIR", "1")
+                .env("OMG_DATA_DIR", &data)
+                .current_dir(home);
+            for key in ["LLVM_PROFILE_FILE", "LD_LIBRARY_PATH"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "{source} PTY refusal failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(std::fs::read_dir(data.join("bin"))?.next().is_none());
+            let mut directories = vec![data.join("tools")];
+            while let Some(directory) = directories.pop() {
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    assert!(
+                        entry.file_type()?.is_dir(),
+                        "{source} left installed content"
+                    );
+                    assert!(!entry.file_name().to_string_lossy().contains(".staging-"));
+                    directories.push(entry.path());
+                }
             }
         }
-        let output = command.output()?;
-        assert!(
-            output.status.success(),
-            "PTY source refusal failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(std::fs::read_dir(data.join("tools/pip"))?.next().is_none());
-        assert!(std::fs::read_dir(data.join("bin"))?.next().is_none());
         Ok(())
     }
 }

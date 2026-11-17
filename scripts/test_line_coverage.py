@@ -197,6 +197,53 @@ class CompiledPlainParentFilesTests(unittest.TestCase):
             lookup('5tests')
 
 
+class QualifiedFunctionCompletionTests(unittest.TestCase):
+    def compare(self, fault=None):
+        before = ['fn scaffold(name: &str) -> Result<()> {', '    write(name)', '}']
+        after = ['fn scaffold(root: &Path, name: &str) -> Result<()> {',
+                 '    write_at(root, name)', '}']
+        if fault == 'different-result':
+            after[0] = after[0].replace('Result<()>', 'Result<bool>')
+        files = {'/src/example.rs': 'example.rs'}
+        base, head = [[dict(name=f'_RNvNtCs{crate}_7omg_lib3cli8scaffold', count=1,
+                            filenames=['/src/example.rs'], regions=[
+                                [1, 1, 1, len(source[0]) + 1, 1, 0, 0, 0],
+                                [3, 1, 3, 2, 1, 0, 0, 0]])
+                       for crate in crates]
+                      for source, crates in ((before, 'ab'), (after, 'cd'))]
+        if fault == 'cold-copy':
+            head[1]['regions'][-1][4] = 0
+        elif fault == 'missing-copy':
+            head.pop()
+        elif fault == 'wrong-owner':
+            head[0]['name'] = head[0]['name'].replace('3cli', '3pkg')
+        elif fault == 'duplicate-name':
+            head[1]['name'] = head[0]['name']
+        elif fault == 'foreign-region':
+            head.append(dict(name='foreign', count=1, filenames=['/src/example.rs'],
+                             regions=[[3, 1, 3, 2, 1, 0, 0, 0]]))
+        line = 2 if fault == 'body-line' else 3
+        if line == 2:
+            after[1] = before[1]
+        return coverage.positive_source_fragments('example.rs', before, after,
+            {line: 2}, {line: 2}, base, head, files, files,
+            [(line - 1, line, line - 1, line, [line])])
+
+    def test_retains_only_the_exact_closing_regions_under_a_new_parameter_list(self):
+        pairs, receipts = self.compare()
+        self.assertEqual(pairs, {3: 3})
+        receipt, = receipts
+        self.assertEqual(receipt['kind'], 'qualified-function-completion')
+        self.assertEqual(receipt['pairs'], [[3, 3]])
+        self.assertEqual([len(side) for side in receipt['owners']], [2, 2])
+
+    def test_incomplete_or_different_owner_evidence_is_refused(self):
+        for fault in ('cold-copy', 'missing-copy', 'wrong-owner', 'duplicate-name',
+                      'foreign-region', 'different-result', 'body-line'):
+            with self.subTest(fault=fault), self.assertRaisesRegex(ValueError, 'Ambiguous'):
+                self.compare(fault)
+
+
 class SourceConstructCapacityTests(unittest.TestCase):
     @contextlib.contextmanager
     def fixture(self):

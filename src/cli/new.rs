@@ -12,12 +12,12 @@ fn require_command_success(status: std::process::ExitStatus, operation: &str) ->
 
 fn canonical_stack(stack: &str) -> Option<ProjectStack> {
     match stack.to_ascii_lowercase().as_str() {
-        "rust" | "rs" => Some(ProjectStack::Rust),
-        "react" | "react-ts" => Some(ProjectStack::React),
-        "node" | "ts" | "typescript" => Some(ProjectStack::Node),
-        "python" | "py" => Some(ProjectStack::Python),
-        "go" | "golang" => Some(ProjectStack::Go),
-        _ => None,
+        "rs" => Some(ProjectStack::Rust),
+        "react-ts" => Some(ProjectStack::React),
+        "ts" | "typescript" => Some(ProjectStack::Node),
+        "py" => Some(ProjectStack::Python),
+        "golang" => Some(ProjectStack::Go),
+        canonical => <ProjectStack as clap::ValueEnum>::from_str(canonical, false).ok(),
     }
 }
 
@@ -335,6 +335,7 @@ mod tests {
         assert_eq!(canonical_stack("py"), Some(ProjectStack::Python));
         assert_eq!(canonical_stack("golang"), Some(ProjectStack::Go));
         assert_eq!(canonical_stack("rs"), Some(ProjectStack::Rust));
+        assert_eq!(canonical_stack("RUST"), Some(ProjectStack::Rust));
         assert_eq!(canonical_stack("unknown"), None);
     }
 
