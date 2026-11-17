@@ -4,6 +4,7 @@
 certificate files from [nodejs/release-keys at commit
 481637f813e912c4aa3622d7964ab426c97b8e8d](https://github.com/nodejs/release-keys/tree/481637f813e912c4aa3622d7964ab426c97b8e8d/keys).
 The upstream MIT license is preserved in `LICENSE-node-release-keys.md`.
+Only its trailing blank line is removed; provenance records both license hashes.
 
 The active primary fingerprints match Node's [release-key list](https://github.com/nodejs/node#release-keys)
 observed on 2026-11-16, README Git blob

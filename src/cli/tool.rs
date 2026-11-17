@@ -1309,15 +1309,7 @@ fn install_managed_blocking(
     // directory is always cleaned up on failure.
     let run_install = || -> Result<()> {
         match manager {
-            "npm" => {
-                return install_reviewed_npm(
-                    pkg,
-                    &staging_dir,
-                    &install_dir,
-                    tools_dir,
-                    advisories,
-                );
-            }
+            "npm" => install_reviewed_npm(pkg, &staging_dir, &install_dir, tools_dir, advisories),
             "cargo" => {
                 let install_path = staging_dir
                     .to_str()
@@ -2539,7 +2531,7 @@ esac
             changed.id = "CVE-2026-12345".into();
             source.replacement = Some(vec![changed]);
         }
-        let mut paths = vec![managers.clone()];
+        let mut paths = vec![managers];
         paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
         let path = std::env::join_paths(paths).unwrap();
         with_managed_fixture_environment(&path, || {

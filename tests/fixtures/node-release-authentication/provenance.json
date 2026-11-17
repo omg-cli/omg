@@ -79,5 +79,6 @@
   "filename": "node-v24.22.3-linux-x64.tar.xz",
   "archive_sha256": "4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb",
   "scope": "Public signature interoperability fixture; no runtime archive downloaded or executed",
-  "license_sha256": "596beb1080a8b35a36e6d20ec3a461f603eee71839cd8cd1646f85e32979a9c2"
+  "license_sha256": "2a1c09c9cd49df9740a0731aebd71a5cc929242e332faa72cb3292cdef0c1588",
+  "upstream_license_sha256": "596beb1080a8b35a36e6d20ec3a461f603eee71839cd8cd1646f85e32979a9c2"
 }
