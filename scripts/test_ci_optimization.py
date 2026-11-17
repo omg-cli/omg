@@ -382,7 +382,13 @@ git() { printf '%040d\\n' 1; }
         capability_test = 'cli::doctor::tests::native_capability_probe_recognizes_an_empty_capability_attribute'
         self.assertIn(capability_test, selected)
         self.assertIn('"$test_name" == ' + capability_test, script)
-        self.assertEqual(len(selected), 27)
+        for policy_test in ('banned_transitive_dependency_stops_npm_before_materialization',
+                            'retained_npm_admission_refuses_policy_changes_before_publication'):
+            name = 'runtimes::npm::admission_tests::' + policy_test
+            self.assertIn(name, selected)
+            self.assertIn('"$test_name" == ' + name, script)
+        self.assertIn('runner=(env OMG_ISOLATED_FIXTURE_TEST="$test_name")', script)
+        self.assertEqual(len(selected), 29)
         for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
             name = 'package_managers::arch_install::native_tests::' + test
             self.assertIn(name, selected)

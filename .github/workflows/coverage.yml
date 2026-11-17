@@ -413,6 +413,10 @@ jobs:
                 local case_id=${test_name//::/_}
                 local log="$fixture_evidence/$case_id.log"
                 local runner=()
+                if [[ "$test_name" == runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization ||
+                      "$test_name" == runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication ]]; then
+                  runner=(env OMG_ISOLATED_FIXTURE_TEST="$test_name")
+                fi
                 if [ "$test_name" = package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction ]; then
                   grep -Fx "$test_name: test" "$fixture_evidence/registry.txt"
                   for coverage in finding unavailable unmapped; do
@@ -456,7 +460,9 @@ jobs:
                 if grep -Eq "\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)" "$log"; then
                   return 1
                 fi
-                if [ "$test_name" = config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options ]; then
+                if [[ "$test_name" == config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options ||
+                      "$test_name" == runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization ||
+                      "$test_name" == runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication ]]; then
                   grep -F "[omg-unprivileged-fixture]" "$log" | grep -F "parent_uid=0"
                   grep -F "[omg-unprivileged-fixture-child]" "$log" | grep -F "uid=65534 "
                 fi
@@ -482,6 +488,8 @@ jobs:
                 package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing
                 package_managers::aur::client::tests::native_isolated_history_requires_hardened_review
                 config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options
+                runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization
+                runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication
                 package_managers::aur::client::tests::final_install_rechecks_current_hardened_profile_before_elevation
                 package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents
                 package_managers::arch_install::native_tests::descriptor_creation_denial_refuses_installation_handoff

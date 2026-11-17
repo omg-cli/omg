@@ -159,10 +159,39 @@ fn cargo_extra_args_pass_through_without_double_dash() {
     let shims = tempfile::tempdir().expect("shim dir");
     write_shim(shims.path(), "cargo", &echo_shim_body("ARGS"));
 
-    let result = project.run_with_env(
+    let refused = project.run_with_env(
         &["run", "build", "--", "--release"],
         &[path_env(shims.path())],
     );
+    refused.assert_failure();
+    refused.assert_stderr_contains("no managed advisory identity");
+    assert!(
+        !refused.stdout.contains("ARGS:"),
+        "unreviewed Cargo executed"
+    );
+
+    let host = match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
+        ("x86_64", "macos") => "x86_64-apple-darwin",
+        ("aarch64", "macos") => "aarch64-apple-darwin",
+        _ => panic!("unsupported test platform"),
+    };
+    let version = format!("1.95.0-{host}");
+    let bin = project
+        .data_dir
+        .path()
+        .join("versions/rust")
+        .join(&version)
+        .join("bin");
+    fs::create_dir_all(&bin).expect("owned Rust fixture");
+    write_shim(&bin, "cargo", &echo_shim_body("ARGS"));
+    write_shim(&bin, "rustc", "#!/bin/sh\nprintf 'rustc 1.95.0\\n'\n");
+    project.create_file(".tool-versions", &format!("rust {version}\n"));
+    seed_runtime_advisory_fixture(&project, "rust", &version)
+        .expect("review controlled Rust fixture");
+
+    let result = project.run_with_env(&["run", "build", "--", "--release"], &[path_env(&bin)]);
 
     result.assert_success();
     result.assert_stdout_contains("ARGS: build --release");
