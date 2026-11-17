@@ -293,6 +293,166 @@ pub(crate) fn read_metadata(path: &std::path::Path, limit: usize) -> Result<Vec<
     Ok(bytes)
 }
 
+pub(crate) fn manager_identity(release: &std::path::Path) -> Result<BTreeMap<String, String>> {
+    use std::fs;
+    use std::io::Read as _;
+    let root = release.canonicalize()?;
+    let npm = root.join("lib/node_modules/npm");
+    ensure!(
+        fs::symlink_metadata(&npm)?.is_dir(),
+        "Bundled npm must have a real implementation directory"
+    );
+    let mut pending = vec![npm.clone(), root.join("bin/npm"), root.join("bin/node")];
+    let mut directories = std::collections::BTreeSet::new();
+    let mut identity = BTreeMap::new();
+    let mut entries = 0usize;
+    let mut npm_bytes = 0u64;
+    let mut buffer = vec![0u8; 64 * 1024];
+    while let Some(path) = pending.pop() {
+        entries += 1;
+        ensure!(
+            entries <= 16_384,
+            "Bundled npm implementation exceeds its entry limit"
+        );
+        let relative = path
+            .strip_prefix(&root)?
+            .to_str()
+            .context("npm implementation path is not UTF-8")?
+            .replace('\\', "/");
+        let target = path.canonicalize()?;
+        ensure!(
+            target.starts_with(&root),
+            "npm implementation escapes its managed release"
+        );
+        if path.starts_with(&npm) || path == root.join("bin/npm") {
+            ensure!(
+                target.starts_with(&npm),
+                "npm implementation escapes its package directory"
+            );
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_symlink() {
+            let target_name = target
+                .strip_prefix(&root)?
+                .to_str()
+                .context("npm link target is not UTF-8")?;
+            identity.insert(
+                format!("link:{relative}"),
+                hex::encode(Sha256::digest(target_name.as_bytes())),
+            );
+        }
+        let expected = fs::symlink_metadata(&target)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            identity.insert(
+                format!("metadata:{relative}"),
+                hex::encode(Sha256::digest(
+                    format!("{}:{}:{}", expected.mode(), expected.uid(), expected.gid()).as_bytes(),
+                )),
+            );
+        }
+        if expected.is_dir() {
+            ensure!(
+                directories.insert(target.clone()),
+                "npm implementation contains a directory alias or cycle"
+            );
+            identity.insert(
+                format!("directory:{relative}"),
+                hex::encode(Sha256::digest([])),
+            );
+            for entry in fs::read_dir(&path)? {
+                ensure!(
+                    entries + pending.len() < 16_384,
+                    "Bundled npm implementation exceeds its entry limit"
+                );
+                pending.push(entry?.path());
+            }
+            continue;
+        }
+        ensure!(
+            expected.is_file(),
+            "npm implementation contains a special file"
+        );
+        let is_node = path == root.join("bin/node");
+        let binary = is_node || path == root.join("bin/npm");
+        #[cfg(unix)]
+        if binary {
+            use std::os::unix::fs::PermissionsExt as _;
+            ensure!(
+                expected.permissions().mode() & 0o111 != 0,
+                "Managed Node/npm entry point is not executable"
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = binary;
+        let limit = if is_node {
+            512 * 1024 * 1024
+        } else {
+            32 * 1024 * 1024
+        };
+        ensure!(
+            expected.len() <= limit,
+            "npm implementation file exceeds its byte limit"
+        );
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+        }
+        let mut file = options.open(&target)?;
+        let opened = file.metadata()?;
+        ensure!(opened.is_file(), "npm implementation is not a regular file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            ensure!(
+                opened.dev() == expected.dev() && opened.ino() == expected.ino(),
+                "npm implementation changed while opening it"
+            );
+        }
+        let mut bytes = 0u64;
+        let mut digest = Sha256::new();
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            bytes += count as u64;
+            ensure!(
+                bytes <= limit,
+                "npm implementation grew beyond its byte limit"
+            );
+            if !is_node {
+                npm_bytes += count as u64;
+                ensure!(
+                    npm_bytes <= 128 * 1024 * 1024,
+                    "Bundled npm implementation exceeds 128 MiB"
+                );
+            }
+            digest.update(&buffer[..count]);
+        }
+        let after = file.metadata()?;
+        ensure!(
+            bytes == opened.len()
+                && after.len() == opened.len()
+                && after.modified()? == opened.modified()?
+                && path.canonicalize()? == target,
+            "npm implementation changed while hashing it"
+        );
+        identity.insert(relative, hex::encode(digest.finalize()));
+    }
+    ensure!(
+        identity.contains_key("bin/node")
+            && identity.contains_key("bin/npm")
+            && identity.contains_key("lib/node_modules/npm/package.json"),
+        "Managed Node/npm content identity is incomplete"
+    );
+    Ok(identity)
+}
+
 fn exact_version(version: &str) -> Result<()> {
     ensure!(version.len() <= 160, "npm version exceeds its limit");
     let parsed =
@@ -347,6 +507,99 @@ struct RawPackage {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[cfg(unix)]
+    fn manager_tree(root: &std::path::Path) {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join("lib/node_modules/npm/lib")).unwrap();
+        std::fs::write(root.join("bin/node"), b"node").unwrap();
+        std::fs::set_permissions(
+            root.join("bin/node"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("lib/node_modules/npm/lib/cli.js"),
+            b"module.exports = 1;\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            root.join("lib/node_modules/npm/lib/cli.js"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("lib/node_modules/npm/package.json"),
+            br#"{"version":"11.15.0"}"#,
+        )
+        .unwrap();
+        symlink("../lib/node_modules/npm/lib/cli.js", root.join("bin/npm")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_identity_binds_imported_code_metadata_and_internal_link_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        manager_tree(root);
+        let original = manager_identity(root).unwrap();
+        assert_eq!(original["bin/node"], hex::encode(Sha256::digest(b"node")));
+        let imported = root.join("lib/node_modules/npm/lib/cli.js");
+        std::fs::write(&imported, b"module.exports = 2;\n").unwrap();
+        assert_ne!(manager_identity(root).unwrap(), original);
+        std::fs::write(&imported, b"module.exports = 1;\n").unwrap();
+        assert_eq!(manager_identity(root).unwrap(), original);
+        std::fs::write(
+            root.join("lib/node_modules/npm/package.json"),
+            br#"{"version":"11.16.0"}"#,
+        )
+        .unwrap();
+        assert_ne!(manager_identity(root).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_identity_rejects_external_links_and_directory_cycles() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("node");
+        manager_tree(&root);
+        let external = directory.path().join("external.js");
+        std::fs::write(&external, b"unreviewed").unwrap();
+        let imported = root.join("lib/node_modules/npm/lib/external.js");
+        symlink(&external, &imported).unwrap();
+        assert!(manager_identity(&root).is_err());
+        std::fs::remove_file(&imported).unwrap();
+        symlink("..", root.join("lib/node_modules/npm/lib/cycle")).unwrap();
+        assert!(manager_identity(&root).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manager_identity_rejects_special_files_and_oversized_content_before_reading() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        manager_tree(root);
+        let fifo = root.join("lib/node_modules/npm/lib/pipe");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+        assert!(manager_identity(root).is_err());
+        std::fs::remove_file(&fifo).unwrap();
+        let oversized = root.join("lib/node_modules/npm/lib/oversized");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(32 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(manager_identity(root).is_err());
+        std::fs::remove_file(oversized).unwrap();
+        std::fs::set_permissions(
+            root.join("bin/node"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(manager_identity(root).is_err());
+    }
 
     fn spec() -> NpmSpec {
         NpmSpec {

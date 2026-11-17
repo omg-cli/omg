@@ -290,7 +290,6 @@ impl SecurityPolicy {
         Self::load_optional(paths::config_dir().join("policy.toml"))
     }
 
-    #[cfg(feature = "arch")]
     pub(crate) fn load_current() -> anyhow::Result<Self> {
         let current = Self::load_optional(paths::config_dir().join("policy.toml"))?;
         if let Some(inherited) = INHERITED_POLICY.get() {
@@ -354,6 +353,7 @@ impl SecurityPolicy {
             SecurityOrigin::AurArchive
             | SecurityOrigin::LocalArchive
             | SecurityOrigin::NpmRegistry
+            | SecurityOrigin::RuntimeVendor { .. }
             | SecurityOrigin::Unknown => SecurityGrade::Community,
         }
     }
@@ -1638,6 +1638,10 @@ mod tests {
             SecurityOrigin::AurArchive,
             SecurityOrigin::LocalArchive,
             SecurityOrigin::NpmRegistry,
+            SecurityOrigin::RuntimeVendor {
+                runtime: "node".into(),
+                vendor: "nodejs".into(),
+            },
             SecurityOrigin::Unknown,
         ] {
             assert!(matches!(

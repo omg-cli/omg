@@ -3,7 +3,7 @@ import { object, sha256 } from "./domain";
 function publicRead(request: Request): boolean {
     return request.method === "GET" && !request.headers.has("authorization") &&
         !request.headers.has("cookie") &&
-        /^\/v1\/(?:arch\/advisories|cves\/(?:recent|CVE-\d{4}-\d{4,19})|epss\/CVE-\d{4}-\d{4,19})$/.test(new URL(request.url).pathname);
+        /^\/v1\/(?:arch\/advisories|cves\/(?:recent|CVE-\d{4}-\d{4,19})|epss\/CVE-\d{4}-\d{4,19}|runtimes\/[a-z]+)$/.test(new URL(request.url).pathname);
 }
 function conditional(request: Request, response: Response): Response {
     const etag = response.headers.get("etag");
@@ -17,10 +17,17 @@ export async function publicResponse(request: Request, response: Response, now: 
     if (!publicRead(request) || response.status !== 200) return response;
     const text = await response.text();
     const body = object(JSON.parse(text));
-    const checked = [body.checked_at, body.cve_checked_at, body.kev_checked_at]
+    const checked: unknown[] = [body.checked_at, body.cve_checked_at, body.kev_checked_at]
         .filter((value) => value !== undefined);
     const milliseconds = Date.parse(now);
     const epss = new URL(request.url).pathname.startsWith("/v1/epss/");
+    const runtime = new URL(request.url).pathname.startsWith("/v1/runtimes/");
+    if (runtime) {
+        if (body.coverage !== "assessed" || !Array.isArray(body.sources) || body.sources.length === 0 ||
+            body.sources.some((source: unknown) => object(source).complete !== true))
+            return new Response(text, { status: response.status, headers: response.headers });
+        checked.push(...body.sources.map((source: unknown) => object(source).checked_at));
+    }
     if (epss && body.status === "unavailable")
         return new Response(text, { status: response.status, headers: response.headers });
     const freshness = epss ? 6 * 60 * 60_000 : 30 * 60_000;
@@ -63,7 +70,7 @@ export async function cachedRead(
             console.error("advisory_cache_read_failed", error);
         }
     }
-    const response = await load(key);
+    const response = await load(request);
     if (!noStore && response.status === 200 && response.headers.get("Cache-Control")?.startsWith("public,")) {
         try { await cache.put(key, response.clone()); }
         catch (error) { console.error("advisory_cache_write_failed", error); }

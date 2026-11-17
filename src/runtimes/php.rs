@@ -79,6 +79,7 @@ pub(crate) struct PhpVersion {
 }
 
 pub(crate) struct PhpManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -355,6 +356,7 @@ fn pathdiff_relative(target: &Path, base: &Path) -> PathBuf {
 impl PhpManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/php"),
             client: download_client(),
         }
@@ -473,6 +475,8 @@ impl PhpManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher =
+            super::security::record_download("php", &version, &version_dir, &download_path, &url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         // System-root tarballs unwrap one level (`usr/bin/php8.5` becomes
         // `bin/php8.5`); flat archives fall back to strip 0.
@@ -490,6 +494,10 @@ impl PhpManager {
         })?;
         make_staged_executable(&found)?;
         link_staged_php(staging.path(), &found)?;
+        let admission =
+            self.security
+                .prepare_staged("php", &version, staging.path(), &version_dir)?;
+        admission.before_execution(staging.path())?;
         println!("{} Verifying installation...", style::informative("→"));
         if let Err(error) = smoke_php(staging.path()) {
             return Err(error.context(format!(
@@ -502,6 +510,7 @@ impl PhpManager {
         } else {
             complete_staged_install(&staging, &version_dir, &version)?;
         }
+        publisher.commit();
         remove_file_best_effort(&download_path, "runtime archive");
         print_installed("PHP", &version);
         self.use_version(&version)?;
@@ -512,6 +521,17 @@ impl PhpManager {
     /// Switch to a specific version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_internal_runtime_binary(
+            &self.versions_dir.join(&version),
+            Path::new("bin/php"),
+        )?;
+        let admission = self.security.installed(
+            "php",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(&self.versions_dir, &version, Path::new("bin/php"))?;
         print_using("PHP", &version, &self.versions_dir.join("current"));
         Ok(())

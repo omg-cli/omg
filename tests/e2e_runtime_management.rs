@@ -84,6 +84,7 @@ fn seed_installed_runtime(project: &TestProject, runtime: &str, version: &str, e
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        seed_runtime_advisory_fixture(project, runtime, version).unwrap();
     }
 }
 
@@ -322,6 +323,7 @@ fn rust_mutations_respect_another_process_lock() -> anyhow::Result<()> {
     }
 
     drop(lock);
+    seed_runtime_advisory_fixture(&project, "rust", version)?;
     project.run(&["use", "rust", version]).assert_success();
     assert_eq!(std::fs::read_link(versions.join("current"))?, toolchain);
     Ok(())
@@ -352,14 +354,14 @@ fn test_use_node_with_version() {
     require_network_tests!();
     let project = TestProject::new();
     let result = project.run_with_env(
-        &["use", "node", "20.10.0"],
+        &["use", "node", "24.22.3"],
         &[
             ("OMG_TEST_COMMAND_TIMEOUT_SECS", INSTALL_TIMEOUT_SECS),
             ("OMG_TEST_MODE", "0"),
         ],
     );
     result.assert_success();
-    assert_downloaded_runtime(&project, "node", "20.10.0", "node");
+    assert_downloaded_runtime(&project, "node", "24.22.3", "node");
     project.close_checked();
 }
 

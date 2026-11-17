@@ -1,0 +1,34 @@
+name: Refresh runtime advisory feeds
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/advisory-refresh.yml
+      - scripts/refresh-runtime-advisories.py
+      - services/advisories/**
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-advisory-feed-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Refresh fixed vendor sources
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUNTIME_REFRESH_SECRET: ${{ secrets.RUNTIME_REFRESH_SECRET }}
+        run: python3 scripts/refresh-runtime-advisories.py

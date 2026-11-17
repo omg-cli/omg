@@ -251,6 +251,12 @@ enum BinaryAdvisoryProvenance<T> {
         ecosystem: T,
     },
     NativeDnf,
+    RuntimeSnapshot {
+        runtime: T,
+        source: T,
+        payload_sha256: T,
+        checked_at: jiff::Timestamp,
+    },
 }
 
 fn serialize_security_audit<S: serde::Serializer>(
@@ -286,6 +292,17 @@ fn serialize_security_audit<S: serde::Serializer>(
                         ecosystem: ecosystem.as_str(),
                     },
                     AdvisoryProvenance::NativeDnf => BinaryAdvisoryProvenance::NativeDnf,
+                    AdvisoryProvenance::RuntimeSnapshot {
+                        runtime,
+                        source,
+                        payload_sha256,
+                        checked_at,
+                    } => BinaryAdvisoryProvenance::RuntimeSnapshot {
+                        runtime: runtime.as_str(),
+                        source: source.as_str(),
+                        payload_sha256: payload_sha256.as_str(),
+                        checked_at: *checked_at,
+                    },
                 })
                 .collect::<Vec<_>>(),
         },
@@ -340,6 +357,17 @@ fn deserialize_security_audit<'de, D: serde::Deserializer<'de>>(
                         AdvisoryProvenance::Osv { ecosystem }
                     }
                     BinaryAdvisoryProvenance::NativeDnf => AdvisoryProvenance::NativeDnf,
+                    BinaryAdvisoryProvenance::RuntimeSnapshot {
+                        runtime,
+                        source,
+                        payload_sha256,
+                        checked_at,
+                    } => AdvisoryProvenance::RuntimeSnapshot {
+                        runtime,
+                        source,
+                        payload_sha256,
+                        checked_at,
+                    },
                 })
                 .collect(),
         },
@@ -808,6 +836,12 @@ mod tests {
                         ecosystem: "Debian:12".into(),
                     },
                     AdvisoryProvenance::NativeDnf,
+                    AdvisoryProvenance::RuntimeSnapshot {
+                        runtime: "node".into(),
+                        source: "https://advisories.example/node".into(),
+                        payload_sha256: "cd".repeat(32),
+                        checked_at: now,
+                    },
                 ],
             },
             total_vulnerabilities: 1,

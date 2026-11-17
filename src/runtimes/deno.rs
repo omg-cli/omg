@@ -33,6 +33,7 @@ pub(crate) struct DenoVersion {
 }
 
 pub(crate) struct DenoManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -40,6 +41,7 @@ pub(crate) struct DenoManager {
 impl DenoManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/deno"),
             client: download_client(),
         }
@@ -48,6 +50,7 @@ impl DenoManager {
     #[cfg(test)]
     fn with_paths(versions_dir: PathBuf) -> Self {
         Self {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir,
             client: download_client(),
         }
@@ -124,6 +127,8 @@ impl DenoManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting...", style::informative("→"));
+        let publisher =
+            super::security::record_download("deno", &version, &version_dir, &download_path, &url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         // Vendor ZIPs carry `deno` at the archive root, so strip 0 lands it
         // at `<version>/bin/deno` and any future sibling tools beside it.
@@ -132,7 +137,11 @@ impl DenoManager {
         // Publish only a complete vendor tree: the native command must be a
         // real regular file before the version directory can exist at all.
         require_regular_file(&staging.path().join("bin").join("deno"))?;
+        let _admission =
+            self.security
+                .prepare_staged("deno", &version, staging.path(), &version_dir)?;
         complete_staged_install(&staging, &version_dir, &version)?;
+        publisher.commit();
 
         print_installed("Deno", &version);
         self.use_version(&version)?;
@@ -197,6 +206,14 @@ impl DenoManager {
         // Activation requires `<version>/bin/deno` to be a regular file and
         // then exposes the whole `<version>/bin` directory through the
         // current link, so sibling tools pass through without shims.
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("bin/deno"))?;
+        let admission = self.security.installed(
+            "deno",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bin/deno"))?;
         print_using("Deno", &version, &self.versions_dir.join("current/bin"));
         Ok(())
@@ -749,6 +766,13 @@ mod tests {
         fs::write(version_dir.join("bin/deno-lsp"), b"#!/bin/sh\n").unwrap();
 
         let manager = DenoManager::with_paths(versions_dir.clone());
+        crate::runtimes::security::fixture_bind_candidate(
+            "deno",
+            "2.9.6",
+            &version_dir,
+            &version_dir,
+        )
+        .unwrap();
         manager
             .use_version("2.9.6")
             .expect("activation must succeed");

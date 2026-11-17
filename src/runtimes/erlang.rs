@@ -51,6 +51,7 @@ pub(crate) struct OtpVersion {
 }
 
 pub(crate) struct ErlangManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -256,6 +257,7 @@ fn sort_versions_desc(versions: &mut [OtpVersion]) {
 impl ErlangManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/erlang"),
             client: download_client(),
         }
@@ -383,6 +385,13 @@ impl ErlangManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher = super::security::record_download(
+            "erlang",
+            &version,
+            &version_dir,
+            &download_path,
+            &url,
+        )?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
         if std::env::consts::OS == "linux" {
@@ -390,18 +399,27 @@ impl ErlangManager {
         }
         fs::File::create_new(staging.path().join(super::common::INSTALL_PENDING_MARKER))?
             .sync_all()?;
+        let admission =
+            self.security
+                .prepare_staged("erlang", &version, staging.path(), &version_dir)?;
         complete_staged_install(&staging, &version_dir, &version)?;
+        publisher.commit();
         remove_file_best_effort(&download_path, "runtime archive");
 
         // OTP's `Install` bakes absolute paths, so it runs after publication
         // in the final directory — never in staging, whose path is temporary.
         if std::env::consts::OS == "linux" {
+            admission.before_execution(&version_dir)?;
             println!("{} Running OTP Install script...", style::informative("→"));
             if let Err(error) = run_install_script(&version_dir) {
                 cleanup_broken_install(&version_dir);
                 return Err(error);
             }
         }
+        let after_setup =
+            self.security
+                .prepare_staged("erlang", &version, &version_dir, &version_dir)?;
+        after_setup.before_execution(&version_dir)?;
         println!("{} Verifying installation...", style::informative("→"));
         if let Err(error) = smoke_erl(&version_dir) {
             cleanup_broken_install(&version_dir);
@@ -414,6 +432,10 @@ impl ErlangManager {
         make_staged_executable(&version_dir.join("bin/erl"))?;
         fs::remove_file(version_dir.join(super::common::INSTALL_PENDING_MARKER))?;
 
+        let _finished =
+            self.security
+                .prepare_staged("erlang", &version, &version_dir, &version_dir)?;
+
         print_installed("Erlang/OTP", &version);
         self.use_version(&version)?;
 
@@ -423,6 +445,17 @@ impl ErlangManager {
     /// Switch to a specific version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_internal_runtime_binary(
+            &self.versions_dir.join(&version),
+            Path::new("bin/erl"),
+        )?;
+        let admission = self.security.installed(
+            "erlang",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(&self.versions_dir, &version, Path::new("bin/erl"))?;
         print_using("Erlang/OTP", &version, &self.versions_dir.join("current"));
         Ok(())

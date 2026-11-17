@@ -138,7 +138,7 @@ pub(crate) async fn fetch_public_download(
     raw: &str,
     user_agent: &str,
 ) -> anyhow::Result<reqwest::Response> {
-    fetch_public_download_with_options(raw, user_agent, None, None, true).await
+    fetch_public_download_with_options(raw, user_agent, None, None, true, false).await
 }
 
 pub(crate) async fn fetch_public_download_with_timeout(
@@ -146,7 +146,16 @@ pub(crate) async fn fetch_public_download_with_timeout(
     user_agent: &str,
     total_timeout: Option<Duration>,
 ) -> anyhow::Result<reqwest::Response> {
-    fetch_public_download_with_options(raw, user_agent, total_timeout, None, false).await
+    fetch_public_download_with_options(raw, user_agent, total_timeout, None, false, false).await
+}
+
+/// Revalidate public metadata through the same pinned-DNS download boundary.
+pub(crate) async fn fetch_public_download_fresh(
+    raw: &str,
+    user_agent: &str,
+    total_timeout: Option<Duration>,
+) -> anyhow::Result<reqwest::Response> {
+    fetch_public_download_with_options(raw, user_agent, total_timeout, None, false, true).await
 }
 
 /// Request the remaining bytes of a public archive using a strong entity tag.
@@ -157,7 +166,15 @@ pub(crate) async fn fetch_public_download_with_range(
     offset: u64,
     validator: reqwest::header::HeaderValue,
 ) -> anyhow::Result<reqwest::Response> {
-    fetch_public_download_with_options(raw, user_agent, None, Some((offset, validator)), true).await
+    fetch_public_download_with_options(
+        raw,
+        user_agent,
+        None,
+        Some((offset, validator)),
+        true,
+        false,
+    )
+    .await
 }
 
 async fn fetch_public_download_with_options(
@@ -166,6 +183,7 @@ async fn fetch_public_download_with_options(
     total_timeout: Option<Duration>,
     range: Option<(u64, reqwest::header::HeaderValue)>,
     binary_transfer: bool,
+    fresh: bool,
 ) -> anyhow::Result<reqwest::Response> {
     let mut url = Url::parse(raw).map_err(|_| anyhow::anyhow!("Invalid download URL"))?;
     for hop in 0..=MAX_REDIRECTS {
@@ -207,6 +225,9 @@ async fn fetch_public_download_with_options(
         let mut request = client
             .get(url.clone())
             .header(reqwest::header::USER_AGENT, user_agent);
+        if fresh {
+            request = request.header(reqwest::header::CACHE_CONTROL, "no-cache");
+        }
         if binary_transfer {
             request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
         }
@@ -829,7 +850,7 @@ mod metadata_limit_tests {
                     let request = String::from_utf8(headers)?;
                     let line = request.lines().next().unwrap().to_owned();
                     anyhow::ensure!(line == "GET /manifest HTTP/1.1", "unexpected request");
-                    requests.push(line);
+                    requests.push(request);
                     let header_end = response
                         .windows(4)
                         .position(|bytes| bytes == b"\r\n\r\n")
@@ -869,6 +890,37 @@ mod metadata_limit_tests {
 
     fn metadata_client() -> Client {
         Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[test]
+    #[expect(unsafe_code)] // Process-wide environment is changed only in the isolated child.
+    fn fresh_public_download_revalidates_every_redirect_without_changing_ordinary_requests()
+    -> anyhow::Result<()> {
+        const NAME: &str = "core::http::metadata_limit_tests::fresh_public_download_revalidates_every_redirect_without_changing_ordinary_requests";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        // SAFETY: this is a fresh single-test child with no concurrent environment users.
+        unsafe {
+            std::env::set_var("OMG_TEST_MODE", "1");
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+            let redirect = b"HTTP/1.1 302 Found\r\nLocation: /manifest\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+            let success = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec();
+            let fixture = RetryFixture::new(vec![redirect.clone(), success.clone(), redirect, success], false).await?;
+            let fresh = fetch_public_download_fresh(&fixture.url, "omg-runtime-security-fixture", Some(Duration::from_secs(5))).await?;
+            assert_eq!(fresh.text().await?, "ok");
+            let ordinary = fetch_public_download_with_timeout(&fixture.url, "omg-runtime-security-fixture", Some(Duration::from_secs(5))).await?;
+            assert_eq!(ordinary.text().await?, "ok");
+            let requests = fixture.finish().await?;
+            assert_eq!(requests.len(), 4, "both requests must follow the real redirect");
+            for (index, request) in requests.iter().enumerate() {
+                let headers = request.to_ascii_lowercase();
+                assert!(headers.lines().any(|line| line == "user-agent: omg-runtime-security-fixture"));
+                assert_eq!(headers.lines().filter(|line| line.starts_with("cache-control:")).collect::<Vec<_>>(), if index < 2 { vec!["cache-control: no-cache"] } else { Vec::new() }, "request {index} must preserve its cache policy across redirects");
+            }
+            Ok(())
+        })
     }
 
     #[tokio::test]

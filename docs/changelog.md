@@ -5,7 +5,7 @@ All notable changes to OMG are documented here.
 OMG is the fastest unified package manager for Linux, replacing pacman, yay, nvm, pyenv, rustup, and more with a single tool.
 
 **Performance**: 22x faster searches than pacman, 59-483x faster than apt-cache on Debian/Ubuntu
-**Unified**: System packages + 8 language runtimes in one CLI
+**Unified**: System packages + 13 language runtimes and managed tools in one CLI
 **Secure**: Built-in SLSA, PGP, SBOM, and audit logs
 
 ---
@@ -19,7 +19,10 @@ See the [beta release overview, security coverage and upgrade notes](releases/v0
 - Require a separate transaction-bound decision for disclosed CVE/watch-list risk in native Arch admission and managed npm tools; preserve signature, source and artifact checks.
 - Resolve and review exact npm dependencies before materialization, then verify the frozen install and preserve the old tool on failure.
 - Authenticate Node release manifests with pinned active publisher keys before downloading or executing candidate archives.
+- Require fresh, content-bound advisory admission for 13 runtimes and route the Pi coding harness through shared npm tool checks.
+- Preserve prior runtime authority on failed updates, retain shared use leases for parallel tasks, and bind virtualenv activation to its reviewed Python base.
 - Serve indexed recent CVE revisions and cached FIRST EPSS history through Cloudflare with explicit incomplete/unavailable states.
+- Refresh vendor feeds with an ephemeral read-only Actions token; compare genuine Ruby versions and exact .NET SDK components.
 - Include the accumulated native package, daemon, runtime/environment, QEMU and CI fixes since the previous release.
 - Add Sponsors, governance, a code of conduct, OpenSSF Scorecard and downloadable Sigstore provenance bundles.
 

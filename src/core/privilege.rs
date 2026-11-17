@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Require an exact, bounded decision from the owning foreground terminal.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn confirm_security_review(
     details: &str,
     digest: &str,
@@ -15,9 +15,8 @@ pub(crate) fn confirm_security_review(
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
     use std::fmt::Write as _;
-    use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
+    check_cancelled()?;
     let tty = std::fs::OpenOptions::new().read(true).write(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
         .open("/dev/tty").with_context(|| format!("{details}\nSecurity review requires an attended controlling terminal; --yes cannot accept advisory risk or unknown coverage"))?;
@@ -25,6 +24,25 @@ pub(crate) fn confirm_security_review(
         nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
         "Security acknowledgement must run in the terminal foreground"
     );
+    verify_review_terminal(&tty, invoking_uid)?;
+    let mut prompt = details.to_owned();
+    write!(
+        prompt,
+        "\nType accept {digest} within 60 seconds to continue (default: cancel): "
+    )?;
+    anyhow::ensure!(
+        prompt.len() <= 64 * 1024,
+        "Security acknowledgement display exceeds limit"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    read_security_review(&tty, &prompt, digest, deadline, check_cancelled)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_review_terminal(tty: &std::fs::File, invoking_uid: u32) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let mut session: nix::libc::pid_t = 0;
     // SAFETY: TIOCGSID writes one session identifier into this valid stack value.
     #[expect(
@@ -68,16 +86,80 @@ pub(crate) fn confirm_security_review(
             && (metadata.uid() == invoking_uid || metadata.uid() == 0),
         "Security acknowledgement terminal is not owned by root or the invoking user"
     );
-    let mut prompt = details.to_owned();
-    write!(
-        prompt,
-        "\nType accept {digest} within 60 seconds to continue (default: cancel): "
-    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_review_terminal(_tty: &std::fs::File, invoking_uid: u32) -> anyhow::Result<()> {
+    use nix::libc;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    // SAFETY: the kernel receives a writable typed buffer of the supplied size.
+    #[expect(
+        unsafe_code,
+        reason = "Darwin exposes controlling-terminal identity through proc_pidinfo"
+    )]
+    let actual = unsafe {
+        libc::proc_pidinfo(
+            nix::unistd::getpid().as_raw(),
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(size)?,
+        )
+    };
     anyhow::ensure!(
-        prompt.len() <= 64 * 1024,
-        "Security acknowledgement display exceeds limit"
+        usize::try_from(actual).ok() == Some(size),
+        "Cannot establish acknowledgement terminal identity"
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    // SAFETY: only an exact-sized successful BSDINFO response is read.
+    #[expect(
+        unsafe_code,
+        reason = "the kernel initialized the complete BSDINFO response"
+    )]
+    let info = unsafe { info.assume_init() };
+    anyhow::ensure!(
+        info.pbi_pid == nix::unistd::getpid().as_raw().cast_unsigned()
+            && info.pbi_pgid == nix::unistd::getpgrp().as_raw().cast_unsigned()
+            && info.e_tpgid == info.pbi_pgid
+            && info.e_tdev != u32::MAX,
+        "Security acknowledgement terminal identity changed"
+    );
+    // /dev/tty is an alias; bind ownership to the kernel's actual device instead.
+    for (index, entry) in std::fs::read_dir("/dev")?.enumerate() {
+        anyhow::ensure!(
+            index < 8192,
+            "Acknowledgement terminal device inventory exceeds limit"
+        );
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.as_encoded_bytes();
+        if !name.starts_with(b"tty") && name != b"console" {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_char_device() && metadata.rdev() == u64::from(info.e_tdev) {
+            anyhow::ensure!(
+                metadata.uid() == invoking_uid || metadata.uid() == 0,
+                "Security acknowledgement terminal is not owned by root or the invoking user"
+            );
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Cannot resolve acknowledgement terminal device")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_security_review(
+    tty: &std::fs::File,
+    prompt: &str,
+    digest: &str,
+    deadline: std::time::Instant,
+    check_cancelled: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::{Read, Write};
     fn ready(
         tty: &std::fs::File,
         events: rustix::event::PollFlags,
@@ -144,12 +226,12 @@ pub(crate) fn confirm_security_review(
     let mut remaining = prompt.as_bytes();
     while !remaining.is_empty() {
         ready(
-            &tty,
+            tty,
             rustix::event::PollFlags::OUT,
             deadline,
             check_cancelled,
         )?;
-        match foreground_io(&tty, |mut tty| tty.write(remaining))? {
+        match foreground_io(tty, |mut tty| tty.write(remaining))? {
             Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
             Ok(count) => remaining = &remaining[count..],
             Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {}
@@ -158,14 +240,9 @@ pub(crate) fn confirm_security_review(
     }
     let mut answer = Vec::new();
     loop {
-        ready(
-            &tty,
-            rustix::event::PollFlags::IN,
-            deadline,
-            check_cancelled,
-        )?;
+        ready(tty, rustix::event::PollFlags::IN, deadline, check_cancelled)?;
         let mut buffer = [0_u8; 128];
-        let count = match foreground_io(&tty, |mut tty| tty.read(&mut buffer))? {
+        let count = match foreground_io(tty, |mut tty| tty.read(&mut buffer))? {
             Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
             Ok(count) => count,
             Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {
@@ -183,7 +260,7 @@ pub(crate) fn confirm_security_review(
         }
     }
     anyhow::ensure!(
-        nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
+        nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
         "Security terminal foreground changed during acknowledgement"
     );
     anyhow::ensure!(
@@ -195,14 +272,14 @@ pub(crate) fn confirm_security_review(
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn confirm_security_review(
-    _details: &str,
+    details: &str,
     _digest: &str,
     _invoking_uid: u32,
     _check_cancelled: &dyn Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    anyhow::bail!("Security acknowledgement requires Linux terminal ownership checks")
+    anyhow::bail!("{details}\nSecurity acknowledgement requires a supported foreground terminal")
 }
 
 /// Privileged command lookup never consults the invoking user's PATH.
@@ -1205,6 +1282,71 @@ pub async fn run_privileged_child(args: &[&str]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn security_review_requires_exact_foreground_terminal_consent() {
+        let Ok(case) = std::env::var("OMG_TERMINAL_REVIEW_CASE") else {
+            let output =
+                std::process::Command::new(super::root_controlled_program_path("python3").unwrap())
+                    .arg(
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("scripts/test-security-review-terminal.py"),
+                    )
+                    .arg("--unit")
+                    .arg(std::env::current_exe().unwrap())
+                    .output()
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["passed"], 10);
+            return;
+        };
+        assert!(
+            [
+                "accept",
+                "generic-yes",
+                "blank",
+                "wrong-review",
+                "eof",
+                "no-tty",
+                "interrupt",
+                "terminate",
+                "hangup",
+                "cancelled"
+            ]
+            .contains(&case.as_str())
+        );
+        let result = super::confirm_security_review(
+            "fixture-runtime 1.2.3 has CVE-2021-23337\nhttps://www.cve.org/CVERecord?id=CVE-2021-23337",
+            &"a".repeat(64),
+            nix::unistd::geteuid().as_raw(),
+            &|| {
+                anyhow::ensure!(case != "cancelled", "fixture cancellation");
+                Ok(())
+            },
+        );
+        assert_eq!(result.is_ok(), case == "accept", "{result:?}");
+        if case == "no-tty" {
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("CVE-2021-23337") && error.contains("--yes"),
+                "{error}"
+            );
+        } else if case == "cancelled" {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fixture cancellation")
+            );
+        }
+    }
+
     #[test]
     fn install_snapshot_preserves_flow_markers_and_rejects_invalid_argv() {
         for args in [

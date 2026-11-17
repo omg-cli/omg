@@ -82,6 +82,12 @@ pub enum AdvisoryProvenance {
         ecosystem: String,
     },
     NativeDnf,
+    RuntimeSnapshot {
+        runtime: String,
+        source: String,
+        payload_sha256: String,
+        checked_at: jiff::Timestamp,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

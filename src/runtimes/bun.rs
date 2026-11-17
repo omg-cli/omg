@@ -30,6 +30,7 @@ pub(crate) struct BunVersion {
 }
 
 pub(crate) struct BunManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -37,6 +38,7 @@ pub(crate) struct BunManager {
 impl BunManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/bun"),
             client: download_client(),
         }
@@ -106,9 +108,12 @@ impl BunManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher =
+            super::security::record_download("bun", &version, &version_dir, &download_path, &url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_zip(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
+        publisher.commit();
 
         print_installed("Bun", &version);
         self.use_version(&version)?;
@@ -118,6 +123,12 @@ impl BunManager {
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bun"))?;
+        let _admission = self.security.prepare_staged(
+            "bun",
+            version,
+            staging.path(),
+            &self.versions_dir.join(version),
+        )?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -167,6 +178,14 @@ impl BunManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("bun"))?;
+        let admission = self.security.installed(
+            "bun",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bun"))?;
         print_using("Bun", &version, &self.versions_dir.join("current"));
         Ok(())
@@ -249,6 +268,7 @@ mod tests {
         use super::super::test_archive::{Launcher, zip};
         let versions = tempfile::tempdir()?;
         let manager = BunManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -271,7 +291,19 @@ mod tests {
         let staging = begin_staged_install(versions.path())?;
         fs::write(&archive_path, zip("runtime", "bun", Launcher::Regular)?)?;
         extract_zip(&archive_path, staging.path(), 1).await?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "bun",
+            "1.4.0",
+            staging.path(),
+            &manager.versions_dir.join("1.4.0"),
+        )?;
         manager.publish_install(&staging, "1.4.0")?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "bun",
+            "1.4.0",
+            &manager.versions_dir.join("1.4.0"),
+            &manager.versions_dir.join("1.4.0"),
+        )?;
         manager.use_version("1.4.0")?;
         assert_eq!(manager.list_installed()?, vec!["1.4.0"]);
         assert_eq!(manager.current_version().as_deref(), Some("1.4.0"));

@@ -25,6 +25,18 @@ use crate::{cli::style, core::http::download_client};
 const ADOPTIUM_API: &str = "https://api.adoptium.net/v3";
 
 #[derive(Debug, Deserialize)]
+struct AdoptiumAsset {
+    binary: AdoptiumBinary,
+    version: AdoptiumReleaseVersion,
+    release_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdoptiumReleaseVersion {
+    semver: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AdoptiumBinary {
     package: AdoptiumPackage,
 }
@@ -44,6 +56,7 @@ pub(crate) struct JavaVersion {
 }
 
 pub(crate) struct JavaManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -51,6 +64,7 @@ pub(crate) struct JavaManager {
 impl JavaManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/java"),
             client: download_client(),
         }
@@ -117,7 +131,7 @@ impl JavaManager {
 
         println!("{} Querying Adoptium API...", style::informative("→"));
 
-        let binaries: Vec<AdoptiumBinary> = self
+        let binaries: Vec<AdoptiumAsset> = self
             .client
             .get(format!(
                 "{ADOPTIUM_API}/assets/latest/{version}/hotspot?\
@@ -133,10 +147,16 @@ impl JavaManager {
             .await
             .context("Failed to parse JDK data")?;
 
-        let binary = binaries.first().ok_or_else(|| {
+        let asset = binaries.first().ok_or_else(|| {
             anyhow::anyhow!("No JDK {version} found for {arch}. Try: omg list java --available")
         })?;
 
+        let binary = &asset.binary;
+        crate::core::security::validate_runtime_version(&asset.version.semver)?;
+        anyhow::ensure!(
+            asset.version.semver.split('.').next() == Some(version.as_str()),
+            "Adoptium exact release does not match requested Java feature"
+        );
         fs::create_dir_all(&self.versions_dir)?;
 
         let archive_name = validate_download_filename(&binary.package.name)?;
@@ -152,9 +172,23 @@ impl JavaManager {
             .await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher = super::security::record_download(
+            "java",
+            &version,
+            &version_dir,
+            &download_path,
+            &binary.package.link,
+        )?;
+        super::security::record_exact_release(
+            &version_dir,
+            &asset.version.semver,
+            &asset.release_name,
+            std::collections::BTreeMap::new(),
+        )?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
+        publisher.commit();
 
         print_installed("Java", &version);
         self.use_version(&version)
@@ -163,6 +197,13 @@ impl JavaManager {
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         normalize_java_home(staging.path())?;
         super::common::require_regular_file(&staging.path().join("bin/java"))?;
+        super::security::validate_java_release(staging.path(), &self.versions_dir.join(version))?;
+        let _admission = self.security.prepare_staged(
+            "java",
+            version,
+            staging.path(),
+            &self.versions_dir.join(version),
+        )?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -170,6 +211,14 @@ impl JavaManager {
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = java_feature_number(version)?;
         let version_dir = self.versions_dir.join(&version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("bin/java"))?;
+        let admission = self.security.installed(
+            "java",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bin/java"))?;
 
         println!("{} Now using Java {version}", style::positive("✓"));
@@ -316,10 +365,18 @@ mod tests {
     async fn publication_normalizes_mac_bundle_home_before_activation() -> Result<()> {
         let versions = tempfile::tempdir()?;
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
         let staging = stage_java_archive(versions.path(), "Contents/Home/").await?;
+
+        crate::runtimes::security::fixture_bind_candidate(
+            "java",
+            "21",
+            staging.path(),
+            &manager.versions_dir.join("21"),
+        )?;
 
         manager.publish_install(&staging, "21")?;
         manager.use_version("21")?;
@@ -341,10 +398,18 @@ mod tests {
     async fn publication_keeps_linux_home_at_the_runtime_root() -> Result<()> {
         let versions = tempfile::tempdir()?;
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
         let staging = stage_java_archive(versions.path(), "").await?;
+
+        crate::runtimes::security::fixture_bind_candidate(
+            "java",
+            "21",
+            staging.path(),
+            &manager.versions_dir.join("21"),
+        )?;
 
         manager.publish_install(&staging, "21")?;
         manager.use_version("21")?;
@@ -357,6 +422,7 @@ mod tests {
     fn publication_refuses_a_home_without_java_before_creating_a_version() -> Result<()> {
         let versions = tempfile::tempdir()?;
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -372,6 +438,7 @@ mod tests {
     fn publication_refuses_bundle_links_that_would_escape_the_normalized_home() -> Result<()> {
         let versions = tempfile::tempdir()?;
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -395,6 +462,7 @@ mod tests {
     fn publication_preserves_internal_bundle_links_after_normalizing_the_home() -> Result<()> {
         let versions = tempfile::tempdir()?;
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -404,6 +472,13 @@ mod tests {
         fs::write(staging.path().join("Contents/Home/bin/java"), b"java")?;
         fs::write(staging.path().join("Contents/Home/lib/server/jvm"), b"jvm")?;
         std::os::unix::fs::symlink("server", staging.path().join("Contents/Home/lib/current"))?;
+
+        crate::runtimes::security::fixture_bind_candidate(
+            "java",
+            "21",
+            staging.path(),
+            &manager.versions_dir.join("21"),
+        )?;
 
         manager.publish_install(&staging, "21")?;
 
@@ -419,6 +494,7 @@ mod tests {
     fn publication_refuses_home_links_that_leave_and_reenter_before_flattening() -> Result<()> {
         let versions = tempfile::tempdir()?;
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -468,10 +544,13 @@ mod tests {
         fs::create_dir_all(version_dir.join("bin")).expect("bin dir");
         fs::write(version_dir.join("bin/java"), b"java").expect("java binary");
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: temp.path().to_path_buf(),
             client: download_client(),
         };
 
+        crate::runtimes::security::fixture_bind_candidate("java", "17", &version_dir, &version_dir)
+            .unwrap();
         manager.use_version("v17").expect("v prefix must normalize");
 
         assert_eq!(
@@ -486,6 +565,7 @@ mod tests {
         let version_dir = directory.path().join("21");
         fs::create_dir(&version_dir)?;
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
@@ -541,10 +621,13 @@ mod tests {
         fs::write(version_dir.join("bin/java"), b"java").expect("java binary");
         fs::write(version_dir.join("bin/javac"), b"javac").expect("javac binary");
         let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: temp.path().to_path_buf(),
             client: download_client(),
         };
 
+        crate::runtimes::security::fixture_bind_candidate("java", "21", &version_dir, &version_dir)
+            .unwrap();
         manager
             .use_version("21")
             .expect("feature request must activate");

@@ -87,6 +87,7 @@ pub(crate) struct SwiftVersion {
 }
 
 pub(crate) struct SwiftManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     keyring_path: PathBuf,
     client: &'static reqwest::Client,
@@ -267,6 +268,7 @@ fn verify_tarball_signature(keyring: &Path, tarball: &Path, signature: &Path) ->
 impl SwiftManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/swift"),
             keyring_path: super::DATA_DIR.join("swift/all-keys.asc"),
             client: download_client(),
@@ -276,6 +278,7 @@ impl SwiftManager {
     #[cfg(test)]
     fn with_paths(versions_dir: PathBuf, keyring_path: PathBuf) -> Self {
         Self {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir,
             keyring_path,
             client: download_client(),
@@ -461,9 +464,21 @@ impl SwiftManager {
             );
         }
         make_staged_executable(&staging.path().join(SWIFT_BINARY))?;
+        let publisher = super::security::record_download(
+            "swift",
+            &version,
+            &version_dir,
+            &download_path,
+            &url,
+        )?;
+        let admission =
+            self.security
+                .prepare_staged("swift", &version, staging.path(), &version_dir)?;
+        admission.before_execution(staging.path())?;
         println!("{} Verifying installation...", style::informative("→"));
         smoke_swift(staging.path(), &version)?;
         complete_staged_install(&staging, &version_dir, &version)?;
+        publisher.commit();
         remove_file_best_effort(&download_path, "runtime archive");
 
         print_installed("Swift", &version);
@@ -475,6 +490,17 @@ impl SwiftManager {
     /// Switch to a specific version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_internal_runtime_binary(
+            &self.versions_dir.join(&version),
+            Path::new("usr/bin/swift"),
+        )?;
+        let admission = self.security.installed(
+            "swift",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(&self.versions_dir, &version, Path::new(SWIFT_BINARY))?;
         print_using(
             "Swift",

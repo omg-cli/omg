@@ -626,6 +626,172 @@ pub struct TestProject {
     pub config: TestConfig,
 }
 
+/// Seed the real owned runtime cache format for a synthetic installed fixture.
+///
+/// This establishes controlled test evidence only; downloaded runtimes must use
+/// the production publisher and advisory providers.
+#[cfg(unix)]
+pub fn seed_runtime_advisory_fixture(
+    project: &TestProject,
+    runtime: &str,
+    requested: &str,
+) -> Result<()> {
+    use serde::Serialize;
+    use sha2::{Digest as _, Sha256};
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[derive(Serialize)]
+    struct Identity<'a> {
+        schema_version: u32,
+        runtime: &'a str,
+        requested: &'a str,
+        version: String,
+        vendor: &'a str,
+        build: &'a str,
+        source_url: &'a str,
+        artifact_sha256: String,
+        components: BTreeMap<String, String>,
+    }
+
+    let root = project
+        .data_dir
+        .path()
+        .join("versions")
+        .join(runtime)
+        .join(requested)
+        .canonicalize()?;
+    let mut pending = vec![root.clone()];
+    let mut rows: BTreeMap<PathBuf, (&str, u32, String, u64)> = BTreeMap::new();
+    let mut total = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            let relative = path.strip_prefix(&root)?.to_path_buf();
+            if relative.components().count() == 1
+                && matches!(
+                    relative.to_str(),
+                    Some(".omg-install-complete" | ".omg-installing")
+                )
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                rows.len() < 4096,
+                "Synthetic runtime fixture exceeds entry bound"
+            );
+            let metadata = fs::symlink_metadata(&path)?;
+            let mode = metadata.permissions().mode() & 0o777;
+            if metadata.is_dir() {
+                rows.insert(relative, ("directory", mode, String::new(), 0));
+                pending.push(path);
+            } else if metadata.is_file() {
+                anyhow::ensure!(
+                    metadata.len() <= 64 * 1024 * 1024,
+                    "Synthetic runtime fixture file exceeds bound"
+                );
+                let mut file = fs::File::open(&path)?;
+                let mut digest = Sha256::new();
+                let mut bytes = 0_u64;
+                let mut buffer = vec![0_u8; 65536];
+                loop {
+                    let count = file.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes += count as u64;
+                    total += count as u64;
+                    anyhow::ensure!(
+                        total <= 64 * 1024 * 1024,
+                        "Synthetic runtime fixture exceeds byte bound"
+                    );
+                    digest.update(&buffer[..count]);
+                }
+                anyhow::ensure!(
+                    bytes == metadata.len(),
+                    "Synthetic runtime fixture changed while hashing"
+                );
+                rows.insert(
+                    relative,
+                    ("file", mode, hex::encode(digest.finalize()), bytes),
+                );
+            } else if metadata.is_symlink() {
+                anyhow::ensure!(
+                    path.canonicalize()?.starts_with(&root),
+                    "Synthetic runtime fixture link escapes its version"
+                );
+                rows.insert(
+                    relative,
+                    (
+                        "symlink",
+                        mode,
+                        fs::read_link(path)?
+                            .to_str()
+                            .ok_or_else(|| anyhow::anyhow!("Non-UTF8 fixture link"))?
+                            .to_owned(),
+                        0,
+                    ),
+                );
+            } else {
+                anyhow::bail!("Synthetic runtime fixture contains a special file");
+            }
+        }
+    }
+    let content_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&rows)?));
+    let vendor = match runtime {
+        "node" => "nodejs",
+        "python" => "cpython",
+        "go" => "golang",
+        "rust" => "rust-lang",
+        _ => anyhow::bail!("No synthetic advisory fixture mapping for {runtime}"),
+    };
+    let mut exact = requested.split('-').next().unwrap_or(requested).to_owned();
+    while exact.split('.').count() < 3 {
+        exact.push_str(".0");
+    }
+    let identity = Identity {
+        schema_version: 1,
+        runtime,
+        requested,
+        version: exact.clone(),
+        vendor,
+        build: "controlled integration fixture",
+        source_url: "https://github.com/omg-cli/omg",
+        artifact_sha256: content_sha256.clone(),
+        components: BTreeMap::new(),
+    };
+    let identity_bytes = serde_json::to_vec(&identity)?;
+    let identity_sha256 = hex::encode(Sha256::digest(&identity_bytes));
+    let policy = omg_lib::core::security::policy::SecurityPolicy::load_optional(
+        project.config_dir.path().join("policy.toml"),
+    )?;
+    let policy_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&policy)?));
+    let now = jiff::Timestamp::now();
+    let query = serde_json::json!({"runtime":runtime,"vendor":vendor,"version":exact,"os":std::env::consts::OS,"arch":std::env::consts::ARCH});
+    let report = serde_json::json!({"schema_version":1,"identity":query,"checked_at":now,"coverage":"assessed","findings":[],"gaps":[],"sources":[{
+        "name":"controlled-integration-fixture","url":"https://github.com/omg-cli/omg","revision":"fixture-v1",
+        "payload_sha256":hex::encode(Sha256::digest(b"controlled integration fixture")),"checked_at":now,"complete":true
+    }]});
+    let record = serde_json::json!({"schema_version":1,"destination":root,"query":query,"content_sha256":content_sha256,
+        "identity_sha256":identity_sha256,"policy_sha256":policy_sha256,"uid":nix::unistd::getuid().as_raw(),"euid":nix::unistd::geteuid().as_raw(),"report":report,"accepted_review":null});
+    let directory = root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Fixture has no versions parent"))?
+        .join(".security");
+    fs::create_dir_all(&directory)?;
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+    let key = hex::encode(Sha256::digest(serde_json::to_vec(&root)?));
+    for (suffix, bytes) in [
+        ("identity", identity_bytes),
+        ("admission", serde_json::to_vec(&record)?),
+    ] {
+        let path = directory.join(format!("{key}.{suffix}.json"));
+        fs::write(&path, bytes)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 impl TestProject {
     /// Successful behavioral receipts require observed cleanup, not silent Drop.
     pub fn close_checked(self) {

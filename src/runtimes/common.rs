@@ -1334,6 +1334,7 @@ pub(crate) fn complete_staged_install_with_lease(
     version: &str,
     _mutation_lease: &RuntimeLease,
 ) -> Result<()> {
+    super::security::require_prepared(staging.path(), version_dir)?;
     write_install_marker(staging.path(), version)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -1382,6 +1383,7 @@ pub(crate) fn replace_staged_install_with_lease(
     version: &str,
     _mutation_lease: &RuntimeLease,
 ) -> Result<()> {
+    super::security::require_prepared(staging.path(), version_dir)?;
     write_install_marker(staging.path(), version)?;
     if !is_valid_version_dir(version_dir) {
         anyhow::bail!(
@@ -1490,6 +1492,11 @@ impl RuntimeLease {
         file.try_lock()?;
         Ok(Self { file })
     }
+
+    fn try_lock_shared(file: File) -> std::result::Result<Self, fs::TryLockError> {
+        file.try_lock_shared()?;
+        Ok(Self { file })
+    }
 }
 
 impl Drop for RuntimeLease {
@@ -1507,6 +1514,24 @@ pub(crate) fn try_lock_runtime_install(versions_dir: &Path, version: &str) -> Re
 }
 
 pub(crate) fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<RuntimeLease> {
+    lock_runtime_file(versions_dir, name, RuntimeLockMode::Mutation)
+}
+
+pub(crate) fn try_lock_runtime_use(versions_dir: &Path) -> Result<RuntimeLease> {
+    lock_runtime_file(versions_dir, ".mutation.lock", RuntimeLockMode::Use)
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeLockMode {
+    Mutation,
+    Use,
+}
+
+fn lock_runtime_file(
+    versions_dir: &Path,
+    name: &str,
+    mode: RuntimeLockMode,
+) -> Result<RuntimeLease> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     crate::core::paths::create_private_data_directory(versions_dir)?;
     let lock = fs::OpenOptions::new()
@@ -1522,8 +1547,10 @@ pub(crate) fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<R
         metadata.is_file() && metadata.nlink() == 1,
         "Unsafe runtime install lock"
     );
-    RuntimeLease::try_lock(lock)
-        .context("Another runtime mutation is in progress; retry when it finishes")
+    match mode {
+        RuntimeLockMode::Mutation => RuntimeLease::try_lock(lock),
+        RuntimeLockMode::Use => RuntimeLease::try_lock_shared(lock),
+    }.context("Another runtime mutation or active use conflicts with this operation; retry when it finishes")
 }
 
 /// Return whether a runtime version path is a real production directory.
@@ -1732,13 +1759,14 @@ pub(crate) fn uninstall_version_with_lease(
 }
 
 /// Create or update the "current" symlink
+#[cfg(test)]
 pub(crate) fn set_current_version(versions_dir: &Path, version: &str) -> Result<()> {
     crate::core::security::validate_runtime_version(version)?;
     let mutation_lease = try_lock_runtime_file(versions_dir, ".mutation.lock")?;
     set_current_version_with_lease(versions_dir, version, &mutation_lease)
 }
 
-/// [`set_current_version`] for a caller that already holds the mutation lease.
+/// Create or update the current symlink while holding the mutation lease.
 pub(crate) fn set_current_version_with_lease(
     versions_dir: &Path,
     version: &str,
@@ -1754,6 +1782,8 @@ pub(crate) fn set_current_version_with_lease(
             "Version {version} is not installed as a valid directory. Install it first with: omg use <runtime>@{version}"
         );
     }
+
+    super::security::require_prepared(&version_dir, &version_dir)?;
 
     #[cfg(not(unix))]
     anyhow::bail!("Runtime version switching is unsupported on this platform");
@@ -2215,6 +2245,15 @@ where
 #[cfg(test)]
 #[expect(clippy::unwrap_used, clippy::expect_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
+    fn prepare_runtime_fixture(
+        tree: &std::path::Path,
+        destination: &std::path::Path,
+        version: &str,
+    ) -> anyhow::Result<()> {
+        crate::runtimes::security::fixture_prepare("node", version, tree, destination)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn runtime_download_reports_stalled_body_without_exposing_urls() -> anyhow::Result<()> {
         if crate::core::testing::run_isolated_test(
@@ -3988,6 +4027,7 @@ mod tests {
         assert!(uninstall_version(temp.path(), "1.0.0").is_err());
         assert!(version.exists());
         drop(lease);
+        prepare_runtime_fixture(&version, &version, "1.0.0")?;
         set_current_version(temp.path(), "1.0.0")?;
         assert!(uninstall_version(temp.path(), "1.0.0").is_err());
         assert!(version.exists());
@@ -4558,6 +4598,7 @@ mod tests {
 
         let staging = begin_staged_install(&versions_dir)?;
         fs::write(staging.path().join("bin"), "binary")?;
+        prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
         complete_staged_install(&staging, &version_dir, "1.0.0")?;
 
         assert!(version_dir.join("bin").is_file());
@@ -4602,6 +4643,7 @@ mod tests {
         fs::create_dir_all(&version_dir)?;
 
         let staging = begin_staged_install(&versions_dir)?;
+        prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
         let error = complete_staged_install(&staging, &version_dir, "1.0.0")
             .expect_err("must refuse to publish over an existing version");
         assert_eq!(
@@ -4624,6 +4666,7 @@ mod tests {
 
         let staging = begin_staged_install(&versions_dir)?;
         fs::write(staging.path().join("bin"), "new")?;
+        prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
         replace_staged_install(&staging, &version_dir, "1.0.0")?;
 
         assert_eq!(fs::read_to_string(staging.path().join("bin"))?, "old");
@@ -4651,6 +4694,7 @@ mod tests {
         fs::write(version_dir.join("bin"), "old")?;
         let staging = begin_staged_install(&version_dir)?;
         fs::write(staging.path().join("bin"), "new")?;
+        prepare_runtime_fixture(staging.path(), &version_dir, "1.0.0")?;
 
         replace_staged_install(&staging, &version_dir, "1.0.0")
             .expect_err("cannot exchange a directory with its descendant");
@@ -4863,6 +4907,9 @@ mod tests {
         fs::create_dir(&first_version).unwrap();
         fs::create_dir(&second_version).unwrap();
 
+        prepare_runtime_fixture(&first_version, &first_version, "1.0.0").unwrap();
+        prepare_runtime_fixture(&second_version, &second_version, "2.0.0").unwrap();
+
         set_current_version(temp.path(), "1.0.0").unwrap();
         set_current_version(temp.path(), "2.0.0").unwrap();
 
@@ -4880,6 +4927,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let installed_version = temp.path().join("1.0.0");
         fs::create_dir(&installed_version).unwrap();
+        prepare_runtime_fixture(&installed_version, &installed_version, "1.0.0").unwrap();
         set_current_version(temp.path(), "1.0.0").unwrap();
 
         let error = set_current_version(temp.path(), "2.0.0").unwrap_err();
@@ -4898,6 +4946,8 @@ mod tests {
         fs::create_dir(temp.path().join("1.0.0")).unwrap();
         let current_path = temp.path().join("current");
         fs::write(&current_path, "sentinel").unwrap();
+        let version = temp.path().join("1.0.0");
+        prepare_runtime_fixture(&version, &version, "1.0.0").unwrap();
 
         let error = set_current_version(temp.path(), "1.0.0").unwrap_err();
 
@@ -4914,6 +4964,24 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let error = set_current_version(temp.path(), "1.0.0").unwrap_err();
         assert!(error.to_string().contains("is not installed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activation_without_advisory_authority_preserves_current_link() -> Result<()> {
+        let root = TempDir::new()?;
+        let versions = root.path().join("versions/node");
+        let previous = versions.join("20.0.0");
+        let candidate = versions.join("24.22.3");
+        fs::create_dir_all(previous.join("bin"))?;
+        fs::create_dir_all(candidate.join("bin"))?;
+        fs::write(candidate.join("bin/node"), b"unreviewed executable bytes")?;
+        std::os::unix::fs::symlink(&previous, versions.join("current"))?;
+        let error = set_current_version(&versions, "24.22.3")
+            .expect_err("an installation without advisory authority must not become active");
+        assert!(format!("{error:#}").to_lowercase().contains("advisory"));
+        assert_eq!(fs::read_link(versions.join("current"))?, previous);
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -4961,6 +5029,7 @@ mod tests {
         }
 
         fs::write(version_dir.join("bin/node"), b"node").unwrap();
+        prepare_runtime_fixture(&version_dir, &version_dir, "1.0.0").unwrap();
         activate_version(temp.path(), "1.0.0", Path::new("bin/node")).unwrap();
         #[cfg(unix)]
         assert_eq!(
@@ -4977,6 +5046,7 @@ mod tests {
         fs::create_dir_all(version_dir.join("bin")).unwrap();
         fs::write(version_dir.join("bin/python3.12"), b"python").unwrap();
         std::os::unix::fs::symlink("python3.12", version_dir.join("bin/python3")).unwrap();
+        prepare_runtime_fixture(&version_dir, &version_dir, "3.12.0").unwrap();
 
         activate_version_with_linked_binary(temp.path(), "3.12.0", Path::new("bin/python3"))
             .expect("an internal vendor symlink is safe");

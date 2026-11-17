@@ -2,12 +2,13 @@ import { handle } from "./service";
 import { refresh } from "./ingestion";
 import { Store, d1Sql } from "./storage";
 import { cachedRead } from "./cache";
-type Environment = Env & { INGEST_TOKEN?: string };
+type Environment = Env & { INGEST_TOKEN?: string; RUNTIME_REFRESH_SECRET?: string };
 export default {
     fetch(request, env) {
         return cachedRead(
             request, caches.default,
-            (input) => handle(input, new Store(d1Sql(env.DB), env.RAW), env.INGEST_TOKEN),
+            (input) => handle(input, new Store(d1Sql(env.DB), env.RAW), env.INGEST_TOKEN,
+                new Date().toISOString(), undefined, env.RUNTIME_REFRESH_SECRET),
         );
     },
     scheduled(_event, env, context) {

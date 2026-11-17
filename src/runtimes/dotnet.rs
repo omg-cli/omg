@@ -9,6 +9,7 @@
 //! - Flat SDK layout with a root `dotnet` binary (Bun-style activation)
 
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,7 @@ pub(crate) struct DotnetVersion {
 }
 
 pub(crate) struct DotnetManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -41,6 +43,7 @@ pub(crate) struct DotnetManager {
 impl DotnetManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/dotnet"),
             client: download_client(),
         }
@@ -145,7 +148,7 @@ impl DotnetManager {
             style::caution(&version)
         );
 
-        let (url, checksum) = self.sdk_artifact(&version).await?;
+        let (url, checksum, components) = self.sdk_artifact(&version).await?;
         let filename = url
             .rsplit('/')
             .next()
@@ -163,13 +166,25 @@ impl DotnetManager {
         download_with_progress_sha512(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher = super::security::record_download(
+            "dotnet",
+            &version,
+            &version_dir,
+            &download_path,
+            &url,
+        )?;
+        super::security::record_exact_release(&version_dir, &version, &version, components)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         // SDK tarballs extract flat (no top-level directory).
         extract_tar_gz(&download_path, staging.path(), 0).await?;
         let binary = staging.path().join("dotnet");
         require_staged_dotnet(&binary)?;
         make_staged_executable(&binary)?;
+        let _admission =
+            self.security
+                .prepare_staged("dotnet", &version, staging.path(), &version_dir)?;
         complete_staged_install(&staging, &version_dir, &version)?;
+        publisher.commit();
 
         remove_file_best_effort(&download_path, "runtime archive");
 
@@ -180,7 +195,10 @@ impl DotnetManager {
     }
 
     /// Locate the SDK tarball URL and validated SHA-512 for one version.
-    async fn sdk_artifact(&self, version: &str) -> Result<(String, String)> {
+    async fn sdk_artifact(
+        &self,
+        version: &str,
+    ) -> Result<(String, String, BTreeMap<String, String>)> {
         let index = self.fetch_metadata(DOTNET_RELEASE_INDEX_URL).await?;
         let channels = index
             .get("releases-index")
@@ -213,7 +231,39 @@ impl DotnetManager {
                 .cloned()
                 .unwrap_or_default();
             if let Some((url, checksum)) = select_sdk_file(&files, dotnet_rid()?) {
-                return Ok((url, checksum));
+                let mut components = BTreeMap::from([("sdk".to_owned(), version.to_owned())]);
+                if let Some(release) = releases
+                    .get("releases")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|release| {
+                        std::iter::once(release.get("sdk"))
+                            .flatten()
+                            .chain(
+                                release
+                                    .get("sdks")
+                                    .and_then(serde_json::Value::as_array)
+                                    .into_iter()
+                                    .flatten(),
+                            )
+                            .any(|sdk| {
+                                sdk.get("version").and_then(serde_json::Value::as_str)
+                                    == Some(version)
+                            })
+                    })
+                {
+                    for component in ["runtime", "aspnetcore-runtime", "windowsdesktop"] {
+                        if let Some(value) = release
+                            .get(component)
+                            .and_then(|value| value.get("version"))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            components.insert(component.to_owned(), value.to_owned());
+                        }
+                    }
+                }
+                return Ok((url, checksum, components));
             }
         }
         anyhow::bail!(
@@ -224,6 +274,14 @@ impl DotnetManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("dotnet"))?;
+        let admission = self.security.installed(
+            "dotnet",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("dotnet"))?;
         print_using(".NET", &version, &self.versions_dir.join("current"));
         Ok(())

@@ -24,6 +24,11 @@ pub enum SecurityOrigin {
     DistributionPackage,
     /// Exact coordinates from a validated public npm registry lock.
     NpmRegistry,
+    /// Vendor runtime coordinates are independent of registry package names.
+    RuntimeVendor {
+        runtime: String,
+        vendor: String,
+    },
     Unknown,
 }
 

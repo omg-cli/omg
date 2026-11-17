@@ -113,6 +113,7 @@ impl LtsStatus {
 
 /// Node.js runtime manager
 pub(crate) struct NodeManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -120,6 +121,7 @@ pub(crate) struct NodeManager {
 impl NodeManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/node"),
             client: download_client(),
         }
@@ -210,9 +212,12 @@ impl NodeManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher =
+            super::security::record_download("node", &version, &version_dir, &download_path, &url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_xz(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
+        publisher.commit();
 
         print_installed("Node.js", &version);
         self.use_version(&version)?;
@@ -222,6 +227,13 @@ impl NodeManager {
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bin/node"))?;
+        let admission = self.security.prepare_staged(
+            "node",
+            version,
+            staging.path(),
+            &self.versions_dir.join(version),
+        )?;
+        admission.before_execution(staging.path())?;
         smoke_node(staging.path(), version)?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
@@ -280,6 +292,12 @@ impl NodeManager {
             "Node.js version {version} is not installed as a valid directory"
         );
         super::common::require_regular_file(&version_dir.join("bin/node"))?;
+        let admission = self.security.installed(
+            "node",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         smoke_node(&version_dir, &version)?;
         activate_version_with_lease(&self.versions_dir, &version, Path::new("bin/node"), &lease)?;
         print_using("Node.js", &version, &self.versions_dir.join("current/bin"));
@@ -917,6 +935,7 @@ mod tests {
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -966,6 +985,7 @@ mod tests {
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -988,6 +1008,7 @@ mod tests {
         let fixture = super::super::test_https::HttpsFixture::new("nodejs.org", vec![]).await?;
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1378,6 +1399,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let client = fixture.client(true)?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(client)),
         };
@@ -1412,6 +1434,7 @@ mod tests {
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1462,6 +1485,7 @@ mod tests {
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1481,6 +1505,7 @@ mod tests {
     fn incomplete_node_install_is_not_published_and_can_be_retried() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
@@ -1493,6 +1518,12 @@ mod tests {
         let staging = begin_staged_install(directory.path())?;
         fs::create_dir(staging.path().join("bin"))?;
         write_node_probe(staging.path(), "printf 'v22.0.0\\n'", true)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "22.0.0",
+            staging.path(),
+            &manager.versions_dir.join("22.0.0"),
+        )?;
         manager.publish_install(&staging, "22.0.0")?;
         assert_eq!(manager.list_installed()?, vec!["22.0.0"]);
         Ok(())
@@ -1557,11 +1588,18 @@ mod tests {
         }
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
         let previous = directory.path().join("20.0.0");
         write_node_probe(&previous, "printf 'v20.0.0\\n'", true)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "20.0.0",
+            &manager.versions_dir.join("20.0.0"),
+            &manager.versions_dir.join("20.0.0"),
+        )?;
         manager.use_version("20.0.0")?;
         let original = fs::read(previous.join("bin/node"))?;
         let staging = begin_staged_install(directory.path())?;
@@ -1571,6 +1609,12 @@ mod tests {
             directory.path().join("22.0.0")
         };
         write_node_probe(&candidate, body, executable)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "22.0.0",
+            &candidate,
+            &directory.path().join("22.0.0"),
+        )?;
         let candidate_bytes = fs::read(candidate.join("bin/node"))?;
         let result = if publication {
             manager.publish_install(&staging, "22.0.0")
@@ -2034,28 +2078,43 @@ mod tests {
     fn node_activation_holds_the_mutation_lease_during_execution_validation() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
         let previous = directory.path().join("20.0.0");
         write_node_probe(&previous, "printf 'v20.0.0\\n'", true)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "20.0.0",
+            &manager.versions_dir.join("20.0.0"),
+            &manager.versions_dir.join("20.0.0"),
+        )?;
         manager.use_version("20.0.0")?;
         let candidate = directory.path().join("22.0.0");
+        let control = tempfile::tempdir()?;
         write_node_probe(
             &candidate,
-            "printf ready > ready; while [ ! -f release ]; do /bin/sleep 0.01; done; printf 'v22.0.0\\n'",
+            &format!(
+                "printf ready > '{}/ready'; while [ ! -f '{}/release' ]; do /bin/sleep 0.01; done; printf 'v22.0.0\\n'",
+                control.path().display(),
+                control.path().display()
+            ),
             true,
+        )?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node", "22.0.0", &candidate, &candidate,
         )?;
         let worker = std::thread::spawn(move || manager.use_version("22.0.0"));
         let start = std::time::Instant::now();
-        while !candidate.join("ready").try_exists()?
+        while !control.path().join("ready").try_exists()?
             && start.elapsed() < std::time::Duration::from_secs(2)
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let ready = candidate.join("ready").is_file();
+        let ready = control.path().join("ready").is_file();
         let refusal = super::super::common::uninstall_version(directory.path(), "22.0.0");
-        fs::write(candidate.join("release"), "continue")?;
+        fs::write(control.path().join("release"), "continue")?;
         let activation = worker.join().expect("activation worker panicked");
         assert!(ready, "candidate execution never reached held probe");
         assert!(format!("{:#}", refusal.unwrap_err()).contains("Another runtime mutation"));
@@ -2075,6 +2134,7 @@ mod tests {
     -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
@@ -2082,6 +2142,12 @@ mod tests {
             &directory.path().join("20.0.0"),
             "printf 'v20.0.0\\n'",
             true,
+        )?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "20.0.0",
+            &manager.versions_dir.join("20.0.0"),
+            &manager.versions_dir.join("20.0.0"),
         )?;
         manager.use_version("20.0.0")?;
         let outside = tempfile::tempdir()?;
@@ -2104,12 +2170,25 @@ mod tests {
     async fn node_sync_activation_works_inside_current_thread_runtime() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
         let staging = begin_staged_install(directory.path())?;
         write_node_probe(staging.path(), "printf 'v22.0.0\\n'", true)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "22.0.0",
+            staging.path(),
+            &manager.versions_dir.join("22.0.0"),
+        )?;
         manager.publish_install(&staging, "22.0.0")?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "node",
+            "22.0.0",
+            &manager.versions_dir.join("22.0.0"),
+            &manager.versions_dir.join("22.0.0"),
+        )?;
         manager.use_version("22.0.0")?;
         assert_eq!(manager.current_version(), Some("22.0.0".to_owned()));
         Ok(())
@@ -2210,6 +2289,7 @@ mod tests {
         .await?;
         let versions = tempfile::TempDir::new()?;
         let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };

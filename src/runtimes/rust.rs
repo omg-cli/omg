@@ -11,7 +11,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -99,6 +99,7 @@ struct RustToolchainMetadata {
 }
 
 pub(crate) struct RustManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -106,6 +107,7 @@ pub(crate) struct RustManager {
 impl RustManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/rust"),
             client: download_client(),
         }
@@ -376,6 +378,13 @@ impl RustManager {
         mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let toolchain_name = toolchain.name();
+        let version_dir = self.toolchain_dir(toolchain);
+        let admission = self.security.installed(
+            "rust",
+            &version_dir,
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&version_dir)?;
         activate_version_with_lease(
             &self.versions_dir,
             &toolchain_name,
@@ -491,6 +500,22 @@ impl RustManager {
             .extend(required_components.iter().cloned());
         metadata.targets.extend(targets.iter().cloned());
         Self::write_metadata(dest_dir, &metadata)?;
+        let publisher = super::security::record_manifest(
+            "rust",
+            &toolchain.name(),
+            &version_dir,
+            "https://static.rust-lang.org/dist/",
+            &serde_json::to_vec(manifest)?,
+        )?;
+        super::security::record_exact_release(
+            &version_dir,
+            &manifest_version(manifest).context("Rust manifest has no exact release")?,
+            &manifest_release(manifest)?,
+            BTreeMap::new(),
+        )?;
+        let _admission =
+            self.security
+                .prepare_staged("rust", &toolchain.name(), dest_dir, &version_dir)?;
         match publication {
             ToolchainPublication::Create => {
                 complete_staged_install_with_lease(
@@ -510,6 +535,7 @@ impl RustManager {
             }
         }
 
+        publisher.commit();
         print_installed("Rust", &toolchain.name());
 
         Ok(())
@@ -579,7 +605,33 @@ impl RustManager {
         metadata.components.extend(components.iter().cloned());
         metadata.targets.extend(targets.iter().cloned());
         Self::write_metadata(staging.path(), &metadata)?;
-        replace_staged_install_with_lease(&staging, &version_dir, &toolchain.name(), mutation_lease)
+        let publisher = super::security::record_manifest(
+            "rust",
+            &toolchain.name(),
+            &version_dir,
+            "https://static.rust-lang.org/dist/",
+            &serde_json::to_vec(manifest)?,
+        )?;
+        super::security::record_exact_release(
+            &version_dir,
+            &manifest_version(manifest).context("Rust manifest has no exact release")?,
+            &manifest_release(manifest)?,
+            BTreeMap::new(),
+        )?;
+        let _admission = self.security.prepare_staged(
+            "rust",
+            &toolchain.name(),
+            staging.path(),
+            &version_dir,
+        )?;
+        replace_staged_install_with_lease(
+            &staging,
+            &version_dir,
+            &toolchain.name(),
+            mutation_lease,
+        )?;
+        publisher.commit();
+        Ok(())
     }
 
     async fn install_component(
@@ -880,6 +932,7 @@ mod tests {
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -903,6 +956,7 @@ mod tests {
         .await?;
         let directory = tempfile::tempdir()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1056,6 +1110,7 @@ mod tests {
         .await?;
         let versions = TempDir::new()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1148,9 +1203,24 @@ mod tests {
             names,
             BTreeSet::from([
                 ".mutation.lock".into(),
+                format!(".admission-{}.lock", toolchain.name()).into(),
+                ".security".into(),
                 "current".into(),
                 toolchain.name().into()
             ])
+        );
+        manager
+            .security
+            .installed(
+                "rust",
+                &directory,
+                crate::runtimes::security::ReviewMode::CachedOnly,
+            )?
+            .verify(&directory)?;
+        assert_eq!(
+            fs::read_dir(versions.path().join(".security"))?.count(),
+            2,
+            "published identity and admission must be durable without leaked temporary evidence"
         );
         Ok(())
     }
@@ -1299,6 +1369,7 @@ mod tests {
         .await?;
         let versions = TempDir::new()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
@@ -1322,6 +1393,12 @@ mod tests {
             },
         )?;
         let lease = manager.lock_mutations()?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "rust",
+            &previous.name(),
+            &previous_dir,
+            &previous_dir,
+        )?;
         manager.activate_toolchain(&previous, &lease)?;
         drop(lease);
         let metadata_before = fs::read(previous_dir.join(RUST_METADATA_FILE))?;
@@ -1689,6 +1766,7 @@ mod tests {
     async fn ensure_toolchain_locks_before_reading_and_releases_after_error() -> Result<()> {
         let versions = TempDir::new()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -1726,6 +1804,7 @@ mod tests {
     fn mutation_lock_rejects_symlinks_without_changing_the_target() -> Result<()> {
         let versions = TempDir::new()?;
         let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -1778,6 +1857,7 @@ mod tests {
         ] {
             let versions = TempDir::new()?;
             let manager = RustManager {
+                security: crate::runtimes::security::RuntimeSecurity::fixture(),
                 versions_dir: versions.path().to_path_buf(),
                 client: download_client(),
             };
@@ -1986,6 +2066,12 @@ mod tests {
         assert!(!version_dir.exists());
         assert!(crate::runtimes::common::list_installed_versions(versions.path())?.is_empty());
 
+        crate::runtimes::security::fixture_prepare(
+            "rust",
+            "stable-x86_64-unknown-linux-gnu",
+            staging.path(),
+            &version_dir,
+        )?;
         crate::runtimes::common::complete_staged_install(
             &staging,
             &version_dir,
@@ -2020,6 +2106,12 @@ mod tests {
         let mut metadata = RustManager::read_metadata(staging.path())?;
         metadata.components.insert("clippy".to_string());
         RustManager::write_metadata(staging.path(), &metadata)?;
+        crate::runtimes::security::fixture_prepare(
+            "rust",
+            "stable-x86_64-unknown-linux-gnu",
+            staging.path(),
+            &version_dir,
+        )?;
         crate::runtimes::common::replace_staged_install(
             &staging,
             &version_dir,

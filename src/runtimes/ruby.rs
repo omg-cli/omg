@@ -28,6 +28,7 @@ pub(crate) struct RubyVersion {
 }
 
 pub(crate) struct RubyManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -35,6 +36,7 @@ pub(crate) struct RubyManager {
 impl RubyManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/ruby"),
             client: download_client(),
         }
@@ -149,9 +151,17 @@ impl RubyManager {
             })?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher = super::security::record_download(
+            "ruby",
+            &version,
+            &version_dir,
+            &download_path,
+            download_url,
+        )?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
+        publisher.commit();
 
         print_installed("Ruby", &version);
         self.use_version(&version)?;
@@ -161,6 +171,12 @@ impl RubyManager {
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bin/ruby"))?;
+        let _admission = self.security.prepare_staged(
+            "ruby",
+            version,
+            staging.path(),
+            &self.versions_dir.join(version),
+        )?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -181,6 +197,14 @@ impl RubyManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("bin/ruby"))?;
+        let admission = self.security.installed(
+            "ruby",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bin/ruby"))?;
         print_using("Ruby", &version, &self.versions_dir.join("current/bin"));
         Ok(())
@@ -239,6 +263,7 @@ mod tests {
         use super::super::test_archive::{Launcher, tar_gz};
         let versions = tempfile::tempdir()?;
         let manager = RubyManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: versions.path().to_path_buf(),
             client: download_client(),
         };
@@ -264,7 +289,19 @@ mod tests {
             tar_gz("runtime", "bin/ruby", Launcher::Regular)?,
         )?;
         extract_tar_gz(&archive_path, staging.path(), 1).await?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "ruby",
+            "3.4.10",
+            staging.path(),
+            &manager.versions_dir.join("3.4.10"),
+        )?;
         manager.publish_install(&staging, "3.4.10")?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "ruby",
+            "3.4.10",
+            &manager.versions_dir.join("3.4.10"),
+            &manager.versions_dir.join("3.4.10"),
+        )?;
         manager.use_version("3.4.10")?;
         assert_eq!(manager.list_installed()?, vec!["3.4.10"]);
         assert_eq!(manager.current_version().as_deref(), Some("3.4.10"));

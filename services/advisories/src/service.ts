@@ -12,6 +12,7 @@ import { ingestCveGroups, parseBatch } from "./ingestion";
 import { Store, type Checkpoint, type RecordRow } from "./storage";
 import { recentCves } from "./recent";
 import { epss } from "./epss";
+import { runtimeReport, refreshRuntime } from "./runtime";
 import { type Fetcher } from "./ingestion";
 import { publicResponse } from "./cache";
 async function authorized(
@@ -82,8 +83,9 @@ export async function handle(
     token?: string,
     now = new Date().toISOString(),
     fetcher: Fetcher = (url, init) => fetch(url, init),
+    runtimeRefreshSecret?: string,
 ): Promise<Response> {
-    return publicResponse(request, await route(request, store, token, now, fetcher), now);
+    return publicResponse(request, await route(request, store, token, now, fetcher, runtimeRefreshSecret), now);
 }
 async function route(
     request: Request,
@@ -91,9 +93,16 @@ async function route(
     token: string | undefined,
     now: string,
     fetcher: Fetcher,
+    runtimeRefreshSecret: string | undefined,
 ): Promise<Response> {
     const url = new URL(request.url);
     try {
+        if (url.pathname === "/internal/runtime-refresh") {
+            if (request.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
+            if (!await authorized(request, runtimeRefreshSecret)) return Response.json({ error: "unauthorized" }, { status: 401 });
+            const input: unknown = JSON.parse(await boundedBody(request.body, 4096));
+            return Response.json(await refreshRuntime(input, store, now, fetcher));
+        }
         if (url.pathname === "/internal/ingest") {
             if (request.method !== "POST")
                 return Response.json(
@@ -343,6 +352,10 @@ async function route(
                 })),
                 package_applicability: "Arch feed only; AUR mapping unknown",
             });
+        }
+        if (url.pathname.startsWith("/v1/runtimes/")) {
+            const force = /(?:^|,)\s*(?:no-cache|max-age\s*=\s*0)\s*(?:,|$)/i.test(request.headers.get("cache-control") ?? "");
+            return Response.json(await runtimeReport(url, store, now, fetcher, force));
         }
         const epssMatch = /^\/v1\/epss\/(CVE-\d{4}-\d{4,19})$/.exec(url.pathname);
         if (epssMatch?.[1]) {

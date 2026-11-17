@@ -338,6 +338,7 @@ fn names_foreign_arch(name: &str) -> bool {
 
 /// Generic manager for one [`RegistryTool`].
 pub(crate) struct GenericToolManager {
+    security: super::security::RuntimeSecurity,
     spec: &'static RegistryTool,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
@@ -348,6 +349,7 @@ impl GenericToolManager {
     pub fn for_spec(spec: &'static RegistryTool) -> Self {
         let versions_dir = super::DATA_DIR.join("versions").join(spec.name);
         Self {
+            security: super::security::RuntimeSecurity::default(),
             spec,
             versions_dir,
             client: download_client(),
@@ -569,7 +571,18 @@ impl GenericToolManager {
         let staging = begin_staged_install(&self.versions_dir)?;
         self.populate_staging(&download_path, kind, staging.path())
             .await?;
+        let publisher = super::security::record_download(
+            self.spec.name,
+            &version,
+            &version_dir,
+            &download_path,
+            &url,
+        )?;
+        let _admission =
+            self.security
+                .prepare_staged(self.spec.name, &version, staging.path(), &version_dir)?;
         complete_staged_install(&staging, &version_dir, &version)?;
+        publisher.commit();
 
         remove_file_best_effort(&download_path, "tool archive");
 
@@ -679,6 +692,12 @@ impl GenericToolManager {
     /// Switch to an installed version.
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        let admission = self.security.installed(
+            self.spec.name,
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         let expected = Path::new("bin").join(self.spec.binary);
         activate_version_with_linked_binary(&self.versions_dir, &version, &expected)?;
         print_using(

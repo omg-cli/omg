@@ -28,6 +28,7 @@ pub(crate) struct ZigVersion {
 }
 
 pub(crate) struct ZigManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -35,6 +36,7 @@ pub(crate) struct ZigManager {
 impl ZigManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/zig"),
             client: download_client(),
         }
@@ -127,9 +129,15 @@ impl ZigManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher =
+            super::security::record_download("zig", &version, &version_dir, &download_path, &url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         stage_zig_tree(&download_path, staging.path()).await?;
+        let _admission =
+            self.security
+                .prepare_staged("zig", &version, staging.path(), &version_dir)?;
         complete_staged_install(&staging, &version_dir, &version)?;
+        publisher.commit();
 
         remove_file_best_effort(&download_path, "runtime archive");
 
@@ -142,6 +150,14 @@ impl ZigManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_regular_file(&self.versions_dir.join(&version).join("bin/zig"))?;
+        let admission = self.security.installed(
+            "zig",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bin/zig"))?;
         print_using("Zig", &version, &self.versions_dir.join("current/bin"));
         Ok(())

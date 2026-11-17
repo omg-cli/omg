@@ -38,6 +38,7 @@ pub(crate) struct PythonVersion {
 }
 
 pub(crate) struct PythonManager {
+    security: super::security::RuntimeSecurity,
     versions_dir: PathBuf,
     client: &'static reqwest::Client,
 }
@@ -45,6 +46,7 @@ pub(crate) struct PythonManager {
 impl PythonManager {
     pub fn new() -> Self {
         Self {
+            security: super::security::RuntimeSecurity::default(),
             versions_dir: super::DATA_DIR.join("versions/python"),
             client: download_client(),
         }
@@ -285,9 +287,17 @@ impl PythonManager {
         .await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let publisher = super::security::record_download(
+            "python",
+            &version,
+            &version_dir,
+            &download_path,
+            &download.url,
+        )?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
+        publisher.commit();
 
         print_installed("Python", &version);
         self.use_version(&version)?;
@@ -349,6 +359,12 @@ impl PythonManager {
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_internal_runtime_binary(staging.path(), Path::new("bin/python3"))?;
+        let _admission = self.security.prepare_staged(
+            "python",
+            version,
+            staging.path(),
+            &self.versions_dir.join(version),
+        )?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -386,6 +402,17 @@ impl PythonManager {
     /// Switch to a specific version
     pub fn use_version(&self, version: &str) -> Result<()> {
         let version = normalize_version(version);
+        crate::core::security::validate_runtime_version(&version)?;
+        super::common::require_internal_runtime_binary(
+            &self.versions_dir.join(&version),
+            Path::new("bin/python3"),
+        )?;
+        let admission = self.security.installed(
+            "python",
+            &self.versions_dir.join(&version),
+            super::security::ReviewMode::FreshAttended,
+        )?;
+        admission.verify(&self.versions_dir.join(&version))?;
         activate_version_with_linked_binary(
             &self.versions_dir,
             &version,
@@ -985,6 +1012,7 @@ mod tests {
     fn python_publication_rejects_missing_and_external_launchers() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let manager = PythonManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: directory.path().to_path_buf(),
             client: download_client(),
         };
@@ -1004,7 +1032,19 @@ mod tests {
         fs::remove_file(&launcher)?;
         fs::write(staging.path().join("bin/python3.12"), "fixture")?;
         std::os::unix::fs::symlink("python3.12", &launcher)?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "python",
+            "3.12.0",
+            staging.path(),
+            &manager.versions_dir.join("3.12.0"),
+        )?;
         manager.publish_install(&staging, "3.12.0")?;
+        crate::runtimes::security::fixture_bind_candidate(
+            "python",
+            "3.12.0",
+            &manager.versions_dir.join("3.12.0"),
+            &manager.versions_dir.join("3.12.0"),
+        )?;
         manager.use_version("3.12.0")?;
         assert_eq!(manager.list_installed()?, vec!["3.12.0"]);
         Ok(())
@@ -1020,10 +1060,18 @@ mod tests {
         std::os::unix::fs::symlink("python3.12", version_dir.join("bin/python3"))
             .expect("vendor launcher link");
         let manager = PythonManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
             versions_dir: temp.path().to_path_buf(),
             client: download_client(),
         };
 
+        crate::runtimes::security::fixture_bind_candidate(
+            "python",
+            "3.12.0",
+            &version_dir,
+            &version_dir,
+        )
+        .unwrap();
         manager
             .use_version("3.12.0")
             .expect("vendor layout must activate");
