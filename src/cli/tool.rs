@@ -2773,6 +2773,7 @@ exit 1
             ("npm", "@scope/name/extra"),
             ("pip", "relative/package"),
             ("cargo", "relative/crate"),
+            ("unknown-manager", "eslint"),
         ] {
             assert!(
                 validate_managed_package(manager, package).is_err(),

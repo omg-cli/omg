@@ -2519,6 +2519,25 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                         !marker.exists(),
                         "the failed command unexpectedly ran Python"
                     );
+                    if !pinned {
+                        let _mutation = crate::runtimes::common::try_lock_runtime_file(
+                            &data.join("versions/python"),
+                            ".mutation.lock",
+                        )
+                        .unwrap();
+                        let error = execute_process_in(
+                            "python3",
+                            &[],
+                            &[],
+                            None,
+                            owner.path(),
+                            owner.path(),
+                            owner.path(),
+                        )
+                        .expect_err("an implicit virtualenv must respect the base mutation lease");
+                        assert!(format!("{error:#}").contains("runtime mutation or active use"));
+                        assert!(!marker.exists(), "locked runtime unexpectedly executed");
+                    }
                 },
             );
         }

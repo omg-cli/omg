@@ -721,18 +721,28 @@ pub(crate) trait BoundedResponseExt {
 /// Each attempt includes the bounded body read; permanent errors retain their
 /// cause. Reuse the caller's client so trust and redirect policy stay intact.
 pub(crate) async fn fetch_metadata_text(client: &Client, url: &str) -> anyhow::Result<String> {
-    fetch_metadata_text_limited(client, url, 16 * 1024 * 1024).await
+    fetch_metadata_text_with_budget(client, url, Duration::from_secs(30)).await
 }
+
+const DEFAULT_METADATA_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 pub(crate) async fn fetch_metadata_text_limited(
     client: &Client,
     url: &str,
     limit: usize,
 ) -> anyhow::Result<String> {
-    fetch_metadata_text_with_budget(client, url, Duration::from_secs(30), limit).await
+    fetch_metadata_text_with_limits(client, url, Duration::from_secs(30), limit).await
 }
 
 async fn fetch_metadata_text_with_budget(
+    client: &Client,
+    url: &str,
+    total: Duration,
+) -> anyhow::Result<String> {
+    fetch_metadata_text_with_limits(client, url, total, DEFAULT_METADATA_BODY_LIMIT).await
+}
+
+async fn fetch_metadata_text_with_limits(
     client: &Client,
     url: &str,
     total: Duration,
@@ -776,14 +786,14 @@ async fn fetch_metadata_text_with_budget(
 }
 
 pub(crate) async fn bounded_metadata_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
-    bounded_metadata_body_with_limit(response, 16 * 1024 * 1024).await
+    bounded_metadata_body_with_limit(response, DEFAULT_METADATA_BODY_LIMIT).await
 }
 
 async fn bounded_metadata_body_with_limit(
     mut response: reqwest::Response,
     limit: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    let limit_error = if limit == 16 * 1024 * 1024 {
+    let limit_error = if limit == DEFAULT_METADATA_BODY_LIMIT {
         "Metadata exceeds 16 MiB limit".to_owned()
     } else {
         format!("Metadata exceeds {limit}-byte limit")
@@ -986,7 +996,6 @@ mod metadata_limit_tests {
             &metadata_client(),
             &fixture.url,
             Duration::from_millis(250),
-            16 * 1024 * 1024,
         )
         .await
         .unwrap_err();
@@ -1008,13 +1017,7 @@ mod metadata_limit_tests {
         .await?;
         let start = tokio::time::Instant::now();
         assert_eq!(
-            fetch_metadata_text_with_budget(
-                &metadata_client(),
-                &fixture.url,
-                budget,
-                16 * 1024 * 1024
-            )
-            .await?,
+            fetch_metadata_text_with_budget(&metadata_client(), &fixture.url, budget).await?,
             "ok"
         );
         assert!(start.elapsed() > budget / 3);

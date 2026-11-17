@@ -939,13 +939,44 @@ pub(crate) mod tests {
             .expect("real write-only source descriptor");
         let error = PgpVerifier::read_cleartext_plaintext(&mut write_only, 1024)
             .expect_err("reading an invalid source descriptor must refuse plaintext");
-        let PgpError::CleartextVerification { source } = error else {
-            panic!("wrong typed plaintext read error");
-        };
+        assert!(matches!(&error, PgpError::CleartextVerification { .. }));
+        let source = std::error::Error::source(&error)
+            .expect("typed cleartext refusal must expose its public error source")
+            .downcast_ref::<SequoiaSource>()
+            .expect("public error source must retain the typed Sequoia bridge");
         assert!(
             source.0.downcast_ref::<std::io::Error>().is_some(),
             "the underlying OS read failure must remain inspectable"
         );
+    }
+
+    #[test]
+    fn bounded_cleartext_reader_discards_plaintext_before_a_later_os_read_failure() {
+        use std::io::Read as _;
+        let file = NamedTempFile::new().expect("owned failing plaintext source");
+        let write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file.path())
+            .expect("real write-only descriptor for the later read");
+        let prefix = b"plaintext read before the OS failure\n";
+        let mut reader = Cursor::new(prefix.as_slice()).chain(write_only);
+        let error = PgpVerifier::read_cleartext_plaintext(&mut reader, 1024)
+            .expect_err("partial plaintext must not escape after a later source read fails");
+        assert_eq!(
+            reader.get_ref().0.position(),
+            u64::try_from(prefix.len()).expect("bounded fixture prefix length"),
+            "the failure must follow a successful plaintext read"
+        );
+        assert!(matches!(&error, PgpError::CleartextVerification { .. }));
+        let source = std::error::Error::source(&error)
+            .expect("partial-read refusal must expose its public error source")
+            .downcast_ref::<SequoiaSource>()
+            .expect("public source must remain the typed Sequoia bridge");
+        let io = source
+            .0
+            .downcast_ref::<std::io::Error>()
+            .expect("the real OS read cause must survive the public error chain");
+        assert!(io.raw_os_error().is_some());
     }
 
     #[test]

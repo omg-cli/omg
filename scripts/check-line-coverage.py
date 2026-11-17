@@ -2571,14 +2571,19 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         result = []; all_children = set()
         for parent in descriptor['group'][2]:
             shape = plain_rust_function_symbol(parent['name']); children = {}
-            _construct_charge(work, len(compiled[0]))
+            prefix = '_RNC' + parent['name'][2:]
+            _construct_charge(work, len(prefix) + len(compiled[0]))
             for child in compiled[0]:
-                _construct_charge(work, len(child['regions']) * (len(ordered) + 1) + len(child['name']))
+                _construct_charge(work, len(child['name']))
+                if shape is None or not child['name'].startswith(prefix):
+                    continue
+                _construct_charge(work, len(prefix))
+                if not direct_rust_callback_symbol(child['name'], parent['name'], shape.modules):
+                    continue
+                _construct_charge(work, len(child['regions']) * (len(ordered) + 1))
                 if not any(tuple(region[:2]) < (pair[side], len(source[pair[side] - 1].encode()) + 1)
                            and tuple(region[2:4]) > (pair[side], 1)
                            for region in child['regions'] for pair in ordered):
-                    continue
-                if shape is None or not direct_rust_callback_symbol(child['name'], parent['name'], shape.modules):
                     continue
                 if compiled[2][child['name']] != 1 or len(child['filenames']) != 1:
                     return None
@@ -5004,14 +5009,17 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
         retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
-        _construct_charge(construct_work, sum(len(line) + 1 for line in new) if old != new else 0)
-        head_text = '\n'.join(new) if old != new else ''
+        _construct_charge(construct_work, len(base_groups) + len(head_groups))
+        missing_prefixes = base_groups.keys() - head_groups.keys()
+        head_functions = set()
+        if missing_prefixes and old != new:
+            _construct_charge(construct_work, sum(len(line) + 1 for line in new))
+            head_functions.update(re.findall(r'(?=\bfn\s+(\w+)\b)', '\n'.join(new)))
         removed_prefixes = set()
-        for prefix in base_groups:
-            if prefix not in head_groups:
-                _construct_charge(construct_work, len(head_text) + len(prefix))
-                if re.search(r'\bfn\s+' + re.escape(re.search(r'\bfn\s+(\w+)', prefix)[1]) + r'\b', head_text) is None:
-                    removed_prefixes.add(prefix)
+        for prefix in missing_prefixes:
+            _construct_charge(construct_work, len(prefix))
+            if re.search(r'\bfn\s+(\w+)', prefix)[1] not in head_functions:
+                removed_prefixes.add(prefix)
         partitions = []
         for groups in (base_groups, head_groups):
             rows = {}
