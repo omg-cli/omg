@@ -954,16 +954,15 @@ mod tests {
             ],
         )
         .expect("build the controlled GitHub tool archive");
-        let asset_name = if cfg!(target_arch = "aarch64") {
-            "fixture-tool-linux-aarch64.tar.gz"
-        } else {
-            "fixture-tool-linux-x86_64.tar.gz"
-        };
-        let asset_name = if cfg!(target_os = "macos") {
-            asset_name.replace("linux", "darwin")
-        } else {
-            asset_name.to_owned()
-        };
+        #[cfg(target_arch = "aarch64")]
+        let architecture = "aarch64";
+        #[cfg(not(target_arch = "aarch64"))]
+        let architecture = "x86_64";
+        #[cfg(target_os = "macos")]
+        let platform = "darwin";
+        #[cfg(not(target_os = "macos"))]
+        let platform = "linux";
+        let asset_name = format!("fixture-tool-{platform}-{architecture}.tar.gz");
         let asset_path = format!("/omg-fixtures/registry/releases/download/v1.2.3/{asset_name}");
         let digest = if invalid_digest {
             "not-a-sha256".to_owned()

@@ -793,19 +793,17 @@ mod tests {
                 .is_err()
         );
         fixture.assert_previous();
-        let cases: &[&str] = if cfg!(target_os = "linux") {
-            &[
-                "tamper",
-                "setup-failure",
-                "setup-escape",
-                "smoke-failure",
-                "smoke-escape",
-                "success",
-            ]
-        } else {
-            &["tamper", "smoke-failure", "smoke-escape", "success"]
-        };
-        for &case in cases {
+        let cases = [
+            "tamper",
+            #[cfg(target_os = "linux")]
+            "setup-failure",
+            #[cfg(target_os = "linux")]
+            "setup-escape",
+            "smoke-failure",
+            "smoke-escape",
+            "success",
+        ];
+        for case in cases {
             let install = match case {
                 "setup-failure" => b"#!/bin/sh\nexit 19\n".as_slice(),
                 "setup-escape" => {

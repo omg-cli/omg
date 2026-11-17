@@ -2108,13 +2108,13 @@ print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
         );
         let venv_config = venv.join("pyvenv.cfg");
         let original_config = fs::read_to_string(&venv_config).unwrap();
-        let actual_base = validate_venv_python(&venv, Some(&bin)).unwrap_or_else(|error| {
-            panic!(
-                "owned venv base mismatch: expected={} config={original_config:?}: {error:#}",
-                bin.display()
-            )
-        });
-        assert_eq!(actual_base, bin.canonicalize().unwrap());
+        let expected_base = bin.canonicalize().unwrap();
+        let actual_base = validate_venv_python(&venv, Some(&bin));
+        assert_eq!(
+            actual_base.as_ref().ok(),
+            Some(&expected_base),
+            "owned venv base mismatch with config {original_config:?}: {actual_base:#?}"
+        );
         let external_base = owner.path().join("external-base");
         fs::create_dir(&external_base).unwrap();
         let wrong_config = original_config

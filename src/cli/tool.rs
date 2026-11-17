@@ -835,6 +835,15 @@ fn get_dirs() -> (PathBuf, PathBuf) {
 }
 
 pub async fn install(name: &str) -> Result<()> {
+    #[derive(Clone, Copy)]
+    enum Source {
+        System,
+        Cargo,
+        Npm,
+        Pip,
+        Go,
+    }
+
     // SECURITY: Validate tool name
     crate::core::security::validate_package_name(name)?;
 
@@ -871,29 +880,30 @@ pub async fn install(name: &str) -> Result<()> {
         );
     }
     let choices = [
-        "Pacman (System)",
-        "Cargo (Isolated)",
-        "NPM (Isolated)",
-        "Pip (Isolated)",
-        "Go (Isolated)",
+        ("Pacman (System)", Source::System),
+        ("Cargo (Isolated)", Source::Cargo),
+        ("NPM (Isolated)", Source::Npm),
+        ("Pip (Isolated)", Source::Pip),
+        ("Go (Isolated)", Source::Go),
     ];
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt(format!("Tool '{name}' not in registry. Source?"))
         .default(0)
-        .items(choices.as_slice())
+        .items(choices.map(|(label, _)| label))
         .interact()?;
 
-    match selection {
-        0 => crate::cli::packages::install(&[name.to_string()], false, false, false).await,
-        1 => install_managed("cargo", name, name, &tools_dir, &bin_dir).await,
-        2 => {
+    match choices[selection].1 {
+        Source::System => {
+            crate::cli::packages::install(&[name.to_string()], false, false, false).await
+        }
+        Source::Cargo => install_managed("cargo", name, name, &tools_dir, &bin_dir).await,
+        Source::Npm => {
             let spec = crate::core::security::npm::NpmSpec::parse(name)?;
             let install_name = spec.name.replace('/', "__");
             install_managed("npm", name, &install_name, &tools_dir, &bin_dir).await
         }
-        3 => install_managed("pip", name, name, &tools_dir, &bin_dir).await,
-        4 => install_managed("go", name, name, &tools_dir, &bin_dir).await,
-        _ => Ok(()),
+        Source::Pip => install_managed("pip", name, name, &tools_dir, &bin_dir).await,
+        Source::Go => install_managed("go", name, name, &tools_dir, &bin_dir).await,
     }
 }
 

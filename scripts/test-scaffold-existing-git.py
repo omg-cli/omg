@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Verify a new scaffold leaves a concurrently initialized Git repository alone."""
+
+import ctypes
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+
+
+PTRACE_TRACEME = 0
+PTRACE_DETACH = 17
+PTRACE_SYSCALL = 24
+PTRACE_SETOPTIONS = 0x4200
+PTRACE_O_TRACESYSGOOD = 0x00000001
+PTRACE_O_EXITKILL = 0x00100000
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def preserve_repository(binary, owner):
+    command = ctypes.CDLL(None, use_errno=True).ptrace
+    command.argtypes = (ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    command.restype = ctypes.c_long
+
+    def trace(request, pid=0, data=None):
+        if command(request, pid, None, data) == -1:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+    target = owner / 'project'
+    git = owner / 'git'
+    git.write_text('#!/bin/sh\nprintf "Unexpected git invocation\\n" >&2\nexit 73\n')
+    git.chmod(0o700)
+    # The fixture owns every path and supplies a Git command that must stay unused.
+    env = dict(PATH=str(owner), HOME=str(owner), XDG_CONFIG_HOME=str(owner / 'config'),
+               XDG_DATA_HOME=str(owner / 'data'), XDG_CACHE_HOME=str(owner / 'cache'),
+               OMG_DISABLE_DAEMON='1', OMG_DISABLE_TELEMETRY='1')
+    for name in ('LD_LIBRARY_PATH', 'LLVM_PROFILE_FILE'):
+        if name in os.environ:
+            env[name] = os.environ[name]
+
+    def stop_at_exec():
+        trace(PTRACE_TRACEME)
+
+    with tempfile.TemporaryFile() as output:
+        with subprocess.Popen([binary, 'new', 'rust', target.name], cwd=owner, env=env,
+                              stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                              preexec_fn=stop_at_exec) as cli:
+            try:
+                pid = cli.pid
+                _, status = os.waitpid(pid, 0)
+                require(os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP,
+                        'expected the traced child exec stop')
+                trace(PTRACE_SETOPTIONS, pid, PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD)
+                syscall_stop = signal.SIGTRAP | 0x80
+                while not target.is_dir():
+                    trace(PTRACE_SYSCALL, pid)
+                    _, status = os.waitpid(pid, 0)
+                    require(os.WIFSTOPPED(status) and os.WSTOPSIG(status) == syscall_stop,
+                            'scaffolder did not stop at successful directory creation')
+
+                # The child has created the directory and will only continue after Git initializes it.
+                subprocess.run(['/usr/bin/git', 'init', '--quiet', '--initial-branch=existing'],
+                               cwd=target, env={**env, 'PATH': '/usr/bin:/bin'}, check=True, timeout=5)
+                head = target / '.git/HEAD'
+                config = target / '.git/config'
+                before = head.read_bytes(), config.read_bytes()
+                trace(PTRACE_DETACH, pid)
+                exit_code = cli.wait(timeout=10)
+                output.seek(0)
+                transcript = output.read(64 * 1024).decode(errors='replace')
+                require(exit_code == 0, f'scaffold exited {exit_code}: {transcript}')
+                require((target / 'Cargo.toml').is_file(), 'Rust scaffold did not create its manifest')
+                require('Unexpected git invocation' not in transcript, 'scaffold reran git init')
+                require((head.read_bytes(), config.read_bytes()) == before,
+                        'scaffold changed the existing Git repository')
+            finally:
+                if cli.returncode is None:
+                    cli.kill()
+
+    return {'scaffold': 'rust', 'git_head': before[0].decode().strip(), 'exit': exit_code}
+
+
+def main(binary):
+    require(os.getuid() != 0, 'scaffold fixture requires an ordinary user')
+
+    def deadline(_signum, _frame):
+        raise TimeoutError('scaffold fixture exceeded its deadline')
+
+    signal.signal(signal.SIGALRM, deadline)
+    signal.alarm(20)
+    try:
+        with tempfile.TemporaryDirectory(prefix='omg-scaffold-') as work:
+            print(json.dumps(preserve_repository(Path(binary).resolve(strict=True), Path(work))))
+    finally:
+        signal.alarm(0)
+
+
+if __name__ == '__main__':
+    main(sys.argv[1])
