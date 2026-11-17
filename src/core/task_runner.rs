@@ -2004,22 +2004,51 @@ mod tests {
             return;
         }
         let python = crate::core::privilege::root_controlled_program_path("python3").unwrap();
-        let output = Command::new(&python).args(["-c", "import json,sys;print(json.dumps(['.'.join(map(str,sys.version_info[:3])),'.'.join(map(str,sys.version_info[:2]))]))"]).output().unwrap();
-        assert!(output.status.success());
-        let versions: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        // The test needs the interpreter itself. Darwin's developer-tool and
+        // framework launchers can replace argv[0] before Python sees it.
+        const PYTHON_IDENTITY: &str = r"
+import json, os, sys
+image = sys.executable
+if sys.platform == 'darwin':
+    import ctypes
+    path = ctypes.create_string_buffer(4096)
+    size = ctypes.c_uint32(len(path))
+    assert ctypes.CDLL(None)._NSGetExecutablePath(path, ctypes.byref(size)) == 0
+    image = os.fsdecode(path.value)
+assert os.path.isabs(image)
+print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
+                  '.'.join(map(str, sys.version_info[:2])),
+                  os.path.realpath(image))))
+";
+        let output = Command::new(&python)
+            .env_remove("PYTHONEXECUTABLE")
+            .env_remove("__PYVENV_LAUNCHER__")
+            .args(["-I", "-c", PYTHON_IDENTITY])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let (version, major_minor, image): (String, String, PathBuf) =
+            serde_json::from_slice(&output.stdout).unwrap();
+        assert!(image.is_absolute() && fs::symlink_metadata(&image).unwrap().is_file());
         let owner = tempfile::tempdir().unwrap();
         let data = owner.path().join("data");
         let config = owner.path().join("config");
-        let runtime = data.join("versions/python").join(&versions[0]);
+        let runtime = data.join("versions/python").join(&version);
         let bin = runtime.join("bin");
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir(&config).unwrap();
-        fs::copy(python, bin.join("python3")).unwrap();
+        fs::copy(&image, bin.join("python3")).unwrap();
         let venv = owner.path().join(".venv");
         // Framework launchers may report an external sys._base_executable
         // after being copied. Bind stock venv construction to this owned base.
         const CREATE_VENV: &str = "import sys,venv\nsys._base_executable=sys.argv[1]\nvenv.EnvBuilder(with_pip=False,symlinks=True).create(sys.argv[2])\n";
         let status = Command::new(bin.join("python3"))
+            .env_remove("PYTHONEXECUTABLE")
+            .env_remove("__PYVENV_LAUNCHER__")
             .args(["-c", CREATE_VENV])
             .arg(bin.join("python3"))
             .arg(&venv)
@@ -2056,17 +2085,27 @@ mod tests {
             .expect_err("external framework base cannot stand in for the selected owned base");
         assert!(format!("{error:#}").contains("differs from the selected reviewed Python"));
         fs::write(&venv_config, &original_config).unwrap();
-        let packages = venv.join(format!("lib/python{}/site-packages", versions[1]));
+        let packages = venv.join(format!("lib/python{major_minor}/site-packages"));
         fs::create_dir_all(&packages).unwrap();
         fs::write(
             packages.join("omg_local_venv_probe.py"),
             "VALUE = 'local-package'\n",
         )
         .unwrap();
-        fs::write(owner.path().join(".python-version"), &versions[0]).unwrap();
+        fs::write(owner.path().join(".python-version"), &version).unwrap();
         let observed = owner.path().join("prefix-and-package");
         let program = format!(
-            "import sys,pathlib,omg_local_venv_probe;pathlib.Path({}).write_text(sys.prefix+'|'+omg_local_venv_probe.VALUE)",
+            r"
+import os, pathlib, sys
+try:
+    import omg_local_venv_probe
+except ImportError:
+    print('venv import failed', sys.executable, sys._base_executable,
+          sys.prefix, sys.path, os.getenv('PYTHONEXECUTABLE'),
+          os.getenv('__PYVENV_LAUNCHER__'), file=sys.stderr)
+    raise
+pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
+",
             serde_json::to_string(&observed).unwrap(),
         );
         let path = format!("{}:/usr/bin:/bin", bin.display());
@@ -2077,14 +2116,13 @@ mod tests {
                 ("OMG_CONFIG_DIR", Some(config.as_os_str())),
                 ("OMG_NATIVE_TEST_DATA_DIR", Some(std::ffi::OsStr::new("1"))),
                 ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("0"))),
+                ("PYTHONEXECUTABLE", None),
+                ("__PYVENV_LAUNCHER__", None),
             ],
             || {
                 drop(
                     crate::runtimes::security::fixture_prepare(
-                        "python",
-                        &versions[0],
-                        &runtime,
-                        &runtime,
+                        "python", &version, &runtime, &runtime,
                     )
                     .unwrap(),
                 );
