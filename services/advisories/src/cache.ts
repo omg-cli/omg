@@ -21,6 +21,8 @@ export async function publicResponse(request: Request, response: Response, now: 
         .filter((value) => value !== undefined);
     const milliseconds = Date.parse(now);
     const epss = new URL(request.url).pathname.startsWith("/v1/epss/");
+    if (epss && body.status === "unavailable")
+        return new Response(text, { status: response.status, headers: response.headers });
     const freshness = epss ? 6 * 60 * 60_000 : 30 * 60_000;
     let ttl = checked.length ? 60 : 0;
     for (const value of checked) {

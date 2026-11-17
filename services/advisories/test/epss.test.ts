@@ -157,6 +157,10 @@ test("EPSS HTTP routing supports ETags and rejects invalid queries without upstr
         const invalid = await handle(new Request(`${url}?cve=other`), store, undefined, now, fetcher);
         expect(invalid.status).toBe(400);
         expect(invalid.headers.get("Cache-Control")).toBe("no-store");
+        db.exec("UPDATE epss_cache SET error=1");
+        const unavailable = await handle(new Request(url), store, undefined, now, fetcher);
+        expect(object(await unavailable.json()).status).toBe("unavailable");
+        expect(unavailable.headers.get("Cache-Control")).toBe("no-store");
         expect(calls).toBe(1);
     } finally { db.close(); }
 });

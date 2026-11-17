@@ -79,13 +79,13 @@ The five-minute Cron reads only fixed official Arch, CISA and CVEProject URLs. T
 
 Bounds are explicit. CVE records are 3 MiB, snapshots 16 MiB, delta transport 64 MiB, a streamed event about 8 MiB, an archive 1 GiB compressed, a CVE ZIP entry 3 MiB, and compression ratio 500. Oversized input fails partial. KEV normalized annotation JSON is capped below D1's 2,000,000-byte string limit. Updates replace its annotation index atomically only when content changes. Ingestion-run rows are retired after seven days. R2 retains historical payload hashes and SQL-failure orphans; a reviewed garbage collection policy remains future operator work.
 
-## Archive bootstrap
-
 ## EPSS enrichment
 
 `GET /v1/epss/CVE-YYYY-NNNN` enriches an already imported CVE with [FIRST EPSS](https://www.first.org/epss/data). It returns the score, percentile, score date, attribution and up to 30 days of history as of the response's `as_of` time. `scored`, `missing` and `unavailable` are separate states; a real zero is retained as zero, and a failed lookup never supplies a zero or claims safety. Scores older than two days remain unavailable. EPSS forecasts observed exploitation over the next 30 days; it does not establish package applicability or override CISA KEV, CVEs or required consent.
 
 The bounded fixed-origin lookup uses the [official time-series API](https://api.first.org/epss/) for individual requested CVEs. It does not mirror the whole EPSS dataset through that API. D1 caches successful results for six hours, backs off failures for one minute and retains the last successful history on upstream failure. Lease fencing prevents expired writers from replacing that history. Public responses use ETags and at most 60 seconds of edge caching. Unknown CVEs do not trigger upstream queries. Apply migration `0004_epss_cache.sql` before deploying this route. The [FIRST service terms](https://www.first.org/about/policies/terms) permit preventative cybersecurity use; attribution is included in every result.
+
+Migration 0004 and Worker version `2d494aaa-c66b-4333-b3dd-a92609663004` are deployed from `440de96f`. Live EPSS lookup, warm-body identity, conditional 304, D1 cache reuse and invalid/unknown request controls pass; see `docs/superpowers/plans/2026-11-16-epss-enrichment.md` at the repository root. The underlying CVE baseline remains incomplete, so CVEs missing from that baseline receive unavailable coverage rather than an invented EPSS score.
 
 ## Archive bootstrap
 
