@@ -980,13 +980,14 @@ mod tests {
 
     #[test]
     fn install_policy_rejects_known_vulnerabilities() {
-        use crate::core::security::vulnerability::{AssessmentUse, VulnerabilitySource as _};
         const NAME: &str =
             "cli::packages::install::arch::tests::install_policy_rejects_known_vulnerabilities";
         if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
         temp_env::with_var_unset("OMG_TEST_MODE", || {
+            use crate::core::security::vulnerability::{AssessmentUse, VulnerabilitySource as _};
+
             let policy = crate::core::security::SecurityPolicy {
                 advisory_requirement: crate::core::security::policy::AdvisoryRequirement::Review,
                 ..crate::core::security::SecurityPolicy::default()

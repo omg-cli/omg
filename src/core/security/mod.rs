@@ -1,10 +1,10 @@
-#[cfg(any(feature = "arch", test))]
 pub(crate) mod advisory_review;
 #[cfg(unix)]
 pub mod artifact;
 pub mod audit;
 #[cfg(feature = "pgp")]
 pub mod keyserver;
+pub(crate) mod npm;
 #[cfg(feature = "pgp")]
 pub mod pgp;
 pub mod policy;

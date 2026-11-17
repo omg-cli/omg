@@ -5,6 +5,206 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Require an exact, bounded decision from the owning foreground terminal.
+#[cfg(target_os = "linux")]
+pub(crate) fn confirm_security_review(
+    details: &str,
+    digest: &str,
+    invoking_uid: u32,
+    check_cancelled: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::fmt::Write as _;
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    let tty = std::fs::OpenOptions::new().read(true).write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
+        .open("/dev/tty").with_context(|| format!("{details}\nSecurity review requires an attended controlling terminal; --yes cannot accept advisory risk or unknown coverage"))?;
+    anyhow::ensure!(
+        nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
+        "Security acknowledgement must run in the terminal foreground"
+    );
+    let mut session: nix::libc::pid_t = 0;
+    // SAFETY: TIOCGSID writes one session identifier into this valid stack value.
+    #[expect(
+        unsafe_code,
+        reason = "the acknowledgement must use this process's controlling terminal session"
+    )]
+    let status =
+        unsafe { nix::libc::ioctl(tty.as_raw_fd(), nix::libc::TIOCGSID, &raw mut session) };
+    if status == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("Cannot establish acknowledgement terminal session");
+    }
+    anyhow::ensure!(
+        nix::unistd::getsid(None)?.as_raw() == session,
+        "Security acknowledgement terminal belongs to another session"
+    );
+    let mut device: nix::libc::c_uint = 0;
+    // SAFETY: TIOCGDEV writes one kernel device number into this valid stack value.
+    #[expect(
+        unsafe_code,
+        reason = "kernel terminal identity must be resolved independently of the /dev/tty alias"
+    )]
+    let status = unsafe { nix::libc::ioctl(tty.as_raw_fd(), nix::libc::TIOCGDEV, &raw mut device) };
+    if status == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context("Cannot establish acknowledgement terminal identity");
+    }
+    let major = (device >> 8) & 0xfff;
+    let minor = (device & 0xff) | ((device >> 12) & 0xfff00);
+    let path = if (136..=143).contains(&major) {
+        format!("/dev/pts/{minor}")
+    } else if major == 4 && (1..=63).contains(&minor) {
+        format!("/dev/tty{minor}")
+    } else {
+        anyhow::bail!("Unsupported terminal identity for Security acknowledgement");
+    };
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_char_device()
+            && metadata.rdev() == u64::from(device)
+            && (metadata.uid() == invoking_uid || metadata.uid() == 0),
+        "Security acknowledgement terminal is not owned by root or the invoking user"
+    );
+    let mut prompt = details.to_owned();
+    write!(
+        prompt,
+        "\nType accept {digest} within 60 seconds to continue (default: cancel): "
+    )?;
+    anyhow::ensure!(
+        prompt.len() <= 64 * 1024,
+        "Security acknowledgement display exceeds limit"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    fn ready(
+        tty: &std::fs::File,
+        events: rustix::event::PollFlags,
+        deadline: std::time::Instant,
+        check_cancelled: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        loop {
+            check_cancelled()?;
+            anyhow::ensure!(
+                nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+                "Security terminal foreground changed during acknowledgement"
+            );
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .context("Security acknowledgement timed out")?;
+            let timeout = Timespec::try_from(remaining.min(std::time::Duration::from_millis(100)))
+                .context("Invalid acknowledgement timeout")?;
+            let mut items = [PollFd::new(tty, events)];
+            let result =
+                poll(&mut items, Some(&timeout)).context("Security acknowledgement interrupted")?;
+            check_cancelled()?;
+            anyhow::ensure!(
+                nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+                "Security terminal foreground changed during acknowledgement"
+            );
+            if result == 0 {
+                continue;
+            }
+            anyhow::ensure!(
+                !items[0]
+                    .revents()
+                    .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
+                "Security acknowledgement terminal disconnected"
+            );
+            anyhow::ensure!(
+                items[0].revents().contains(events),
+                "Security acknowledgement terminal is not ready"
+            );
+            return Ok(());
+        }
+    }
+    fn foreground_io<T>(
+        tty: &std::fs::File,
+        operation: impl FnOnce(&std::fs::File) -> std::io::Result<T>,
+    ) -> anyhow::Result<std::io::Result<T>> {
+        use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+        // Foreground ownership can change between the check and the syscall.
+        // Blocking job-control signals makes that race return EIO rather than
+        // suspending the privileged transaction with its database lock held.
+        let mut blocked = SigSet::empty();
+        blocked.add(Signal::SIGTTIN);
+        blocked.add(Signal::SIGTTOU);
+        let mut previous = SigSet::empty();
+        pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&blocked), Some(&mut previous))?;
+        let result = operation(tty);
+        previous.thread_set_mask()?;
+        anyhow::ensure!(
+            nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
+            "Security terminal foreground changed during acknowledgement"
+        );
+        Ok(result)
+    }
+    let mut remaining = prompt.as_bytes();
+    while !remaining.is_empty() {
+        ready(
+            &tty,
+            rustix::event::PollFlags::OUT,
+            deadline,
+            check_cancelled,
+        )?;
+        match foreground_io(&tty, |mut tty| tty.write(remaining))? {
+            Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
+            Ok(count) => remaining = &remaining[count..],
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut answer = Vec::new();
+    loop {
+        ready(
+            &tty,
+            rustix::event::PollFlags::IN,
+            deadline,
+            check_cancelled,
+        )?;
+        let mut buffer = [0_u8; 128];
+        let count = match foreground_io(&tty, |mut tty| tty.read(&mut buffer))? {
+            Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
+            Ok(count) => count,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        answer.extend_from_slice(&buffer[..count]);
+        anyhow::ensure!(
+            answer.len() <= 96,
+            "Security acknowledgement input exceeds limit"
+        );
+        if answer.contains(&b'\n') {
+            break;
+        }
+    }
+    anyhow::ensure!(
+        nix::unistd::tcgetpgrp(&tty)? == nix::unistd::getpgrp(),
+        "Security terminal foreground changed during acknowledgement"
+    );
+    anyhow::ensure!(
+        answer == format!("accept {digest}\n").as_bytes()
+            || answer == format!("accept {digest}\r\n").as_bytes(),
+        "Security acknowledgement declined"
+    );
+    check_cancelled()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn confirm_security_review(
+    _details: &str,
+    _digest: &str,
+    _invoking_uid: u32,
+    _check_cancelled: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    anyhow::bail!("Security acknowledgement requires Linux terminal ownership checks")
+}
+
 /// Privileged command lookup never consults the invoking user's PATH.
 pub const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 

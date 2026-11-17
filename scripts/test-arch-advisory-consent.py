@@ -52,7 +52,7 @@ def certificates(root, host):
     setup(["openssl", "x509", "-req", "-in", str(root / "server.csr"), "-CA", str(root / "ca.crt"), "-CAkey", str(root / "ca.key"), "-CAcreateserial", "-days", "1", "-extfile", str(root / "server.ext"), "-out", str(root / "server.crt")])
 
 
-def terminal_case(unit, case, environment):
+def terminal_case(unit, case, environment, expected=(b"possible match", b"1-1", b"https://security.archlinux.org/CVE-OMG-QEMU-616"), before_answer=None):
     command = [str(unit), "--exact", NAME, "--include-ignored", "--nocapture", "--test-threads=1"]
     if case == "no-tty":
         result = subprocess.run(command, env=environment, capture_output=True, start_new_session=True, timeout=20)
@@ -80,8 +80,9 @@ def terminal_case(unit, case, environment):
                 assert len(transcript) <= 128 * 1024, "terminal capture exceeded limit"
                 prompt = re.search(rb"Type accept ([0-9a-f]{64}).*default: cancel", transcript)
                 if prompt and not sent:
-                    assert b"possible match" in transcript and b"1-1" in transcript
-                    assert b"https://security.archlinux.org/CVE-OMG-QEMU-616" in transcript
+                    assert all(fragment in transcript for fragment in expected), transcript.decode(errors="replace")
+                    if before_answer:
+                        before_answer()
                     if case in ("terminate", "hangup"):
                         os.kill(pid, {"terminate": signal.SIGTERM, "hangup": signal.SIGHUP}[case])
                     else:

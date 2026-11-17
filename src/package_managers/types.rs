@@ -22,6 +22,8 @@ pub enum SecurityOrigin {
     AurArchive,
     LocalArchive,
     DistributionPackage,
+    /// Exact coordinates from a validated public npm registry lock.
+    NpmRegistry,
     Unknown,
 }
 

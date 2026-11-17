@@ -351,9 +351,10 @@ impl SecurityPolicy {
             SecurityOrigin::ArchRepository { .. }
             | SecurityOrigin::OtherRepository { .. }
             | SecurityOrigin::DistributionPackage => SecurityGrade::Verified,
-            SecurityOrigin::AurArchive | SecurityOrigin::LocalArchive | SecurityOrigin::Unknown => {
-                SecurityGrade::Community
-            }
+            SecurityOrigin::AurArchive
+            | SecurityOrigin::LocalArchive
+            | SecurityOrigin::NpmRegistry
+            | SecurityOrigin::Unknown => SecurityGrade::Community,
         }
     }
 
@@ -1636,6 +1637,7 @@ mod tests {
         for origin in [
             SecurityOrigin::AurArchive,
             SecurityOrigin::LocalArchive,
+            SecurityOrigin::NpmRegistry,
             SecurityOrigin::Unknown,
         ] {
             assert!(matches!(

@@ -4,7 +4,7 @@
 //!
 //! Features:
 //! - Automatic LTS detection
-//! - Checksum verification (SHASUMS256.txt)
+//! - Publisher-authenticated checksums (SHASUMS256.txt.asc)
 //! - Pure Rust XZ extraction
 //! - Version aliasing (latest, lts, lts/iron, etc.)
 
@@ -16,12 +16,45 @@ use std::path::{Path, PathBuf};
 
 use super::common::{
     activate_version_with_lease, begin_download, begin_staged_install, complete_staged_install,
-    download_with_progress, extract_tar_xz, normalize_version, parse_sha256_digest,
-    print_already_installed, print_installed, print_using,
+    download_with_progress, extract_tar_xz, normalize_version, print_already_installed,
+    print_installed, print_using,
 };
 use crate::{cli::style, core::http::download_client};
 
+#[cfg(feature = "pgp")]
+use super::common::parse_sha256_digest;
+
 const NODE_DIST_URL: &str = "https://nodejs.org/dist";
+
+#[cfg(feature = "pgp")]
+const NODE_RELEASE_FINGERPRINTS: [&str; 8] = [
+    "108F52B48DB57BB0CC439B2997B01419BD92F80A",
+    "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+    "655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD",
+    "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4",
+    "A363A499291CBBC940DD62E41F10027AF002F8B0",
+    "C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C",
+    "CC68F5A3106FF448322E48ED27F5E38D5B0A215F",
+    "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7",
+];
+
+#[cfg(feature = "pgp")]
+fn node_release_verifier() -> Result<crate::core::security::pgp::PgpVerifier> {
+    crate::core::security::pgp::PgpVerifier::from_public_key_bytes(
+        include_bytes!("keys/node-release-keys.asc"),
+        &NODE_RELEASE_FINGERPRINTS,
+    )
+    .context("Cannot load pinned Node release certificates")
+}
+
+#[cfg(feature = "pgp")]
+fn checksum_for_filename(text: &str, filename: &str, source: &str) -> Result<String> {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some(filename))
+        .ok_or_else(|| anyhow::anyhow!("Checksum not found for {filename}"))?;
+    parse_sha256_digest(line, source)
+}
 
 /// Node.js version info from nodejs.org.
 ///
@@ -209,17 +242,24 @@ impl NodeManager {
         ))
     }
 
-    /// Fetch SHA256 checksum from nodejs.org
+    /// Authenticate the publisher before selecting its exact archive checksum.
+    #[cfg(feature = "pgp")]
     async fn fetch_checksum(&self, version: &str, filename: &str) -> Result<String> {
-        let url = format!("{NODE_DIST_URL}/v{version}/SHASUMS256.txt");
-        let text = crate::core::http::fetch_metadata_text(self.client, &url)
+        let verifier = node_release_verifier()?;
+        let url = format!("{NODE_DIST_URL}/v{version}/SHASUMS256.txt.asc");
+        let signed = crate::core::http::fetch_metadata_text_limited(self.client, &url, 1024 * 1024)
             .await
             .context("Failed to fetch Node.js checksum manifest")?;
-        let digest_line = text
-            .lines()
-            .find(|line| line.split_whitespace().nth(1) == Some(filename))
-            .ok_or_else(|| anyhow::anyhow!("Checksum not found for {filename}"))?;
-        parse_sha256_digest(digest_line, &url)
+        let plaintext = verifier.verify_cleartext_memory(signed.as_bytes(), 1024 * 1024)
+            .context("Node checksum manifest is not authenticated by a currently trusted releaser; update OMG's reviewed release keys if the signing authority changed")?;
+        let text =
+            std::str::from_utf8(&plaintext).context("Authenticated Node manifest is not UTF-8")?;
+        checksum_for_filename(text, filename, &url)
+    }
+
+    #[cfg(not(feature = "pgp"))]
+    async fn fetch_checksum(&self, _version: &str, _filename: &str) -> Result<String> {
+        anyhow::bail!("Authenticated Node installation requires an OMG build with PGP support")
     }
 
     /// Switch to a specific version
@@ -816,6 +856,144 @@ pub(crate) fn get_lts_name(version: &NodeVersion) -> Option<&str> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "pgp")]
+    const SIGNED_NODE_MANIFEST: &[u8] = include_bytes!(
+        "../../tests/fixtures/node-release-authentication/SHASUMS256-v24.22.3.txt.asc"
+    );
+    #[cfg(feature = "pgp")]
+    const SIGNED_NODE_ARCHIVE_SHA256: &str =
+        "4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb";
+
+    #[test]
+    #[cfg(feature = "pgp")]
+    fn node_manifest_interoperates_with_exact_pinned_public_authorities() -> Result<()> {
+        use sequoia_openpgp::parse::Parse as _;
+        let certs = sequoia_openpgp::cert::CertParser::from_bytes(include_bytes!(
+            "keys/node-release-keys.asc"
+        ))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(certs.len(), NODE_RELEASE_FINGERPRINTS.len());
+        assert!(certs.iter().all(|cert| !cert.is_tsk()));
+        let mut fingerprints = certs
+            .iter()
+            .map(|cert| cert.fingerprint().to_hex())
+            .collect::<Vec<_>>();
+        fingerprints.sort();
+        assert_eq!(fingerprints, NODE_RELEASE_FINGERPRINTS);
+        let plaintext =
+            node_release_verifier()?.verify_cleartext_memory(SIGNED_NODE_MANIFEST, 1024 * 1024)?;
+        assert!(
+            std::str::from_utf8(&plaintext)?.lines().any(|line| line
+                == format!("{SIGNED_NODE_ARCHIVE_SHA256}  node-v24.22.3-linux-x64.tar.xz"))
+        );
+        let text = std::str::from_utf8(&plaintext)?;
+        assert_eq!(
+            checksum_for_filename(text, "node-v24.22.3-linux-x64.tar.xz", "fixture")?,
+            SIGNED_NODE_ARCHIVE_SHA256
+        );
+        assert!(checksum_for_filename(text, "node-v24.22.4-linux-x64.tar.xz", "fixture").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pgp")]
+    async fn node_install_authenticates_the_signed_manifest_before_selecting_a_checksum()
+    -> Result<()> {
+        let filename = "node-v24.22.3-linux-x64.tar.xz";
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "nodejs.org",
+            vec![(
+                "/dist/v24.22.3/SHASUMS256.txt.asc".into(),
+                SIGNED_NODE_MANIFEST.to_vec(),
+            )],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        assert_eq!(
+            manager.fetch_checksum("24.22.3", filename).await?,
+            SIGNED_NODE_ARCHIVE_SHA256
+        );
+        assert_eq!(
+            fixture.finish().await?,
+            ["GET /dist/v24.22.3/SHASUMS256.txt.asc HTTP/1.1"]
+        );
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pgp")]
+    async fn node_install_refuses_a_tampered_signature_before_any_archive_request() -> Result<()> {
+        let tampered = std::str::from_utf8(SIGNED_NODE_MANIFEST)?
+            .replace(SIGNED_NODE_ARCHIVE_SHA256, &"a".repeat(64));
+        assert_ne!(tampered.as_bytes(), SIGNED_NODE_MANIFEST);
+        refused_node_manifest(tampered.into_bytes()).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "pgp")]
+    async fn node_install_refuses_a_valid_foreign_signature_before_any_archive_request()
+    -> Result<()> {
+        let filename = format!("node-v24.22.3-{}.tar.xz", node_platform()?);
+        let (_, signed) = crate::core::security::pgp::tests::cleartext_fixture(
+            format!("{}  {filename}\n", "a".repeat(64)).as_bytes(),
+            sequoia_openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        refused_node_manifest(signed).await
+    }
+
+    #[cfg(feature = "pgp")]
+    async fn refused_node_manifest(signed: Vec<u8>) -> Result<()> {
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "nodejs.org",
+            vec![("/dist/v24.22.3/SHASUMS256.txt.asc".into(), signed)],
+        )
+        .await?;
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        let error = manager
+            .install("24.22.3")
+            .await
+            .expect_err("an untrusted signature must prevent installation");
+        assert!(format!("{error:#}").contains("Node checksum manifest is not authenticated"));
+        assert_eq!(
+            fixture.finish().await?,
+            ["GET /dist/v24.22.3/SHASUMS256.txt.asc HTTP/1.1"]
+        );
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "pgp"))]
+    async fn node_install_without_pgp_refuses_before_contacting_the_publisher() -> Result<()> {
+        let fixture = super::super::test_https::HttpsFixture::new("nodejs.org", vec![]).await?;
+        let directory = tempfile::tempdir()?;
+        let manager = NodeManager {
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+        let error = manager
+            .install("24.22.3")
+            .await
+            .expect_err("PGP-free builds cannot authenticate a release");
+        assert!(format!("{error:#}").contains("requires an OMG build with PGP support"));
+        assert!(fixture.finish().await?.is_empty());
+        assert_eq!(fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
+
     mod terminal_group_tests {
         use super::super::terminal_group::{self, Identity, Member, State};
         use anyhow::Result;
@@ -1177,19 +1355,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "pgp")]
     async fn metadata_retry_recovers_node_checksum_without_skipping_integrity() -> Result<()> {
-        let filename = "node-v24.21.0-linux-x64.tar.xz";
-        let digest = "a".repeat(64);
-        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        let filename = "node-v24.22.3-linux-x64.tar.xz";
+        let digest = SIGNED_NODE_ARCHIVE_SHA256;
+        let path = "/dist/v24.22.3/SHASUMS256.txt.asc";
         let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
             "nodejs.org",
             vec![
                 (path.into(), 503, b"temporarily unavailable".to_vec()),
-                (
-                    path.into(),
-                    200,
-                    format!("{digest}  {filename}\n").into_bytes(),
-                ),
+                (path.into(), 200, SIGNED_NODE_MANIFEST.to_vec()),
             ],
         )
         .await?;
@@ -1199,7 +1374,7 @@ mod tests {
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(client)),
         };
-        assert_eq!(manager.fetch_checksum("24.21.0", filename).await?, digest);
+        assert_eq!(manager.fetch_checksum("24.22.3", filename).await?, digest);
         assert_eq!(
             fixture.finish().await?,
             vec![format!("GET {path} HTTP/1.1"); 2]
@@ -1209,13 +1384,22 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "pgp")]
     async fn metadata_retry_does_not_retry_invalid_node_checksum() -> Result<()> {
-        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        assert!(
+            checksum_for_filename(
+                "invalid node-v24.22.3-linux-x64.tar.xz\n",
+                "node-v24.22.3-linux-x64.tar.xz",
+                "fixture"
+            )
+            .is_err()
+        );
+        let path = "/dist/v24.22.3/SHASUMS256.txt.asc";
         let fixture = super::super::test_https::HttpsFixture::new(
             "nodejs.org",
             vec![(
                 path.into(),
-                b"invalid node-v24.21.0-linux-x64.tar.xz\n".to_vec(),
+                b"invalid node-v24.22.3-linux-x64.tar.xz\n".to_vec(),
             )],
         )
         .await?;
@@ -1226,7 +1410,7 @@ mod tests {
         };
         assert!(
             manager
-                .fetch_checksum("24.21.0", "node-v24.21.0-linux-x64.tar.xz")
+                .fetch_checksum("24.22.3", "node-v24.22.3-linux-x64.tar.xz")
                 .await
                 .is_err()
         );
@@ -1236,8 +1420,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "pgp")]
     async fn metadata_retry_recovers_real_connection_interruption() -> Result<()> {
-        let path = "/dist/v24.21.0/SHASUMS256.txt";
+        let path = "/dist/v24.22.3/SHASUMS256.txt.asc";
         let interrupted = super::super::test_https::HttpsFixture::new_with_statuses(
             "nodejs.org",
             vec![(path.into(), 0, vec![])],
@@ -1258,17 +1443,13 @@ mod tests {
             ["CONNECT nodejs.org:443 HTTP/1.1"]
         );
 
-        let filename = "node-v24.21.0-linux-x64.tar.xz";
-        let digest = "b".repeat(64);
+        let filename = "node-v24.22.3-linux-x64.tar.xz";
+        let digest = SIGNED_NODE_ARCHIVE_SHA256;
         let fixture = super::super::test_https::HttpsFixture::new_with_statuses(
             "nodejs.org",
             vec![
                 (path.into(), 0, vec![]),
-                (
-                    path.into(),
-                    200,
-                    format!("{digest}  {filename}\n").into_bytes(),
-                ),
+                (path.into(), 200, SIGNED_NODE_MANIFEST.to_vec()),
             ],
         )
         .await?;
@@ -1277,7 +1458,7 @@ mod tests {
             versions_dir: directory.path().to_path_buf(),
             client: Box::leak(Box::new(fixture.client(true)?)),
         };
-        assert_eq!(manager.fetch_checksum("24.21.0", filename).await?, digest);
+        assert_eq!(manager.fetch_checksum("24.22.3", filename).await?, digest);
         assert_eq!(
             fixture.finish().await?,
             [

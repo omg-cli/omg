@@ -1,0 +1,83 @@
+{
+  "source_commit": "481637f813e912c4aa3622d7964ab426c97b8e8d",
+  "authorities_source": "https://github.com/nodejs/node/blob/main/README.md",
+  "authorities_source_git_blob": "3b7d93827ae99ff451a4ff9016dbd254cd5776b8",
+  "active_fingerprints": [
+    "108F52B48DB57BB0CC439B2997B01419BD92F80A",
+    "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356",
+    "655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD",
+    "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4",
+    "A363A499291CBBC940DD62E41F10027AF002F8B0",
+    "C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C",
+    "CC68F5A3106FF448322E48ED27F5E38D5B0A215F",
+    "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7"
+  ],
+  "keys": [
+    {
+      "path": "keys/108F52B48DB57BB0CC439B2997B01419BD92F80A.asc",
+      "bytes": 3074,
+      "gitBlob": "195596d5ff1246dfc4f8807bdc11ca8b8491cbfc",
+      "sha256": "3e9f8034fe87785bc987817f00c687df936d372ab14d04d904e7655bac9ac154",
+      "expectedPrimaryFingerprint": "108F52B48DB57BB0CC439B2997B01419BD92F80A"
+    },
+    {
+      "path": "keys/5BE8A3F6C8A5C01D106C0AD820B1A390B168D356.asc",
+      "bytes": 924,
+      "gitBlob": "d7d9090d3b37bbaee829a490609543b9e096c3dc",
+      "sha256": "5115095e2f8010c75da052ecb1cfb3af630e084f0f8daa93a863557b01b0f90a",
+      "expectedPrimaryFingerprint": "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356"
+    },
+    {
+      "path": "keys/655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD.asc",
+      "bytes": 660,
+      "gitBlob": "3aaa459ac6669aa8a1c80055bb6ee6595d3b5a02",
+      "sha256": "9eb52ca2b3e991c32654ddf9b5f99938f8217f975cd2358013299b7857e4c360",
+      "expectedPrimaryFingerprint": "655F3B5C1FB3FA8D1A0CA6BDE4A7D232B936D2FD"
+    },
+    {
+      "path": "keys/890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4.asc",
+      "bytes": 2456,
+      "gitBlob": "e4137937416a695bd78c933ee2bc261c99180bcd",
+      "sha256": "34fb01c735f875ec1a1efc44619b0a45ed1ce81341171ad24fc5a6282dfeaaa5",
+      "expectedPrimaryFingerprint": "890C08DB8579162FEE0DF9DB8BEAB4DFCF555EF4"
+    },
+    {
+      "path": "keys/A363A499291CBBC940DD62E41F10027AF002F8B0.asc",
+      "bytes": 11781,
+      "gitBlob": "3fa037f68d93c9f716590d98228750235aa17f4a",
+      "sha256": "823a379e79867300348f6d67c13f9a44b2fdc2e11c26d9b66f2a8e7636768ed2",
+      "expectedPrimaryFingerprint": "A363A499291CBBC940DD62E41F10027AF002F8B0"
+    },
+    {
+      "path": "keys/C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C.asc",
+      "bytes": 5613,
+      "gitBlob": "dfeea1499c4097c1a14b75037584dd24705824fb",
+      "sha256": "84b1ca614406f341cb86e72920f5a64687a13ab67ab84038bcf2abba97898a84",
+      "expectedPrimaryFingerprint": "C82FA3AE1CBEDC6BE46B9360C43CEC45C17AB93C"
+    },
+    {
+      "path": "keys/CC68F5A3106FF448322E48ED27F5E38D5B0A215F.asc",
+      "bytes": 3163,
+      "gitBlob": "0ea9c21cf2e933c8fc75659c30c74c70d8d92c0f",
+      "sha256": "e31e1aa40a8331f01d753cef475f7b9eab934fc25f5f0b36995bfd80bd66ad27",
+      "expectedPrimaryFingerprint": "CC68F5A3106FF448322E48ED27F5E38D5B0A215F"
+    },
+    {
+      "path": "keys/DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7.asc",
+      "bytes": 660,
+      "gitBlob": "1e3f56f74b40602abc54c1655a9c65bd878a253a",
+      "sha256": "acf8c1f1d1df8b68c87bde1ccff9754cd29a0671ec92fd2b190f38b3305938f1",
+      "expectedPrimaryFingerprint": "DD792F5973C6DE52C432CBDAC77ABFA00DDBF2B7"
+    }
+  ],
+  "bundle_sha256": "00308f9791e6ccfafe96179770dc1b4c6acdb3a23b771965bdd01084ccc92a32",
+  "manifest": {
+    "source": "https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt.asc",
+    "bytes": 3449,
+    "sha256": "aaaff9ec5c8c5f0997786c06088134ddb4b21a41f74e872b30ed1acca309e2b5"
+  },
+  "filename": "node-v24.22.3-linux-x64.tar.xz",
+  "archive_sha256": "4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb",
+  "scope": "Public signature interoperability fixture; no runtime archive downloaded or executed",
+  "license_sha256": "596beb1080a8b35a36e6d20ec3a461f603eee71839cd8cd1646f85e32979a9c2"
+}

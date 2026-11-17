@@ -168,7 +168,7 @@ fn advisory_link(id: &str) -> Option<String> {
     }) {
         return Some(format!("https://security.archlinux.org/{id}"));
     }
-    if ["GHSA-", "RUSTSEC-", "OSV-", "GO-", "PYSEC-"]
+    if ["GHSA-", "RUSTSEC-", "OSV-", "GO-", "PYSEC-", "MAL-"]
         .iter()
         .any(|prefix| id.starts_with(prefix))
     {
@@ -337,6 +337,14 @@ mod tests {
             assert!(safe_reference(url).is_none(), "{url:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn malware_watch_list_ids_link_to_the_osv_record() {
+        assert_eq!(
+            advisory_link("MAL-2026-1234").as_deref(),
+            Some("https://osv.dev/vulnerability/MAL-2026-1234")
+        );
     }
 
     #[test]

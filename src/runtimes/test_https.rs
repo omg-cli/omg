@@ -9,6 +9,7 @@ use tokio_rustls::{TlsAcceptor, rustls};
 pub(super) struct HttpsFixture {
     certificate: reqwest::Certificate,
     proxy: reqwest::Proxy,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<Vec<String>>>>,
 }
 
@@ -49,6 +50,7 @@ impl HttpsFixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let proxy = reqwest::Proxy::all(format!("http://{}", listener.local_addr()?))?;
         let host = host.to_owned();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
             for (path, status, body) in routes {
@@ -90,11 +92,18 @@ impl HttpsFixture {
                 stream.write_all(&body).await?;
                 stream.shutdown().await?;
             }
-            Ok(requests)
+            tokio::select! {
+                _ = stopped => Ok(requests),
+                connection = listener.accept() => {
+                    let (_stream, _) = connection?;
+                    anyhow::bail!("unexpected additional HTTPS connection after declared responses")
+                }
+            }
         });
         Ok(Self {
             certificate,
             proxy,
+            stop: Some(stop),
             task: Some(task),
         })
     }
@@ -112,6 +121,9 @@ impl HttpsFixture {
     }
 
     pub(super) async fn finish(mut self) -> Result<Vec<String>> {
+        if let Some(stop) = self.stop.take() {
+            let _server_already_finished = stop.send(());
+        }
         let task = self.task.as_mut().context("HTTPS fixture task is absent")?;
         let requests = tokio::time::timeout(Duration::from_secs(5), task).await???;
         self.task = None;
@@ -125,6 +137,37 @@ impl Drop for HttpsFixture {
             task.abort();
         }
     }
+}
+
+#[tokio::test]
+async fn fixture_refuses_connections_after_its_declared_responses() -> Result<()> {
+    let fixture = HttpsFixture::new(
+        "nodejs.org",
+        vec![("/manifest".into(), b"manifest".to_vec())],
+    )
+    .await?;
+    let client = fixture.client(true)?;
+    assert_eq!(
+        client
+            .get("https://nodejs.org/manifest")
+            .send()
+            .await?
+            .text()
+            .await?,
+        "manifest"
+    );
+    assert!(
+        client
+            .get("https://nodejs.org/unexpected-archive")
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture.finish().await.is_err(),
+        "additional archive attempts must be observable"
+    );
+    Ok(())
 }
 
 #[tokio::test]

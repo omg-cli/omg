@@ -104,6 +104,17 @@ An incremental Rust component or target addition must match the installed toolch
 ## Integrity and storage
 
 Provider verification differs. Native archive managers use their supported published checksum or release-digest paths. Pi installation delegates to npm with `--global --ignore-scripts` and checks the installed version; it does not use OMG's archive-digest path. npm's registry and integrity settings apply. Do not bypass a failed download or checksum check to make an installation succeed.
+
+New Node.js downloads authenticate `SHASUMS256.txt.asc` with OMG's bundled,
+fingerprint-pinned active release certificates before selecting the exact archive
+checksum. Invalid signatures, unrecognized signers and expired or revoked
+authorities are refused before archive download or candidate execution. There is
+no unsigned fallback or automatic key import. A new signing authority requires a
+reviewed OMG key update; historical releases signed only by excluded authorities
+may also be refused. Builds without PGP support cannot authenticate new Node.js
+downloads. Selecting an existing installation does not reverify its provenance.
+Publisher authentication does not establish that a runtime is free of CVEs.
+
 Official runtime downloads use HTTPS with certificate validation. The shared
 HTTP client rejects an HTTPS-to-HTTP redirect. npm-managed installation
 follows npm's own transport settings.

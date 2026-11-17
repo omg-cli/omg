@@ -700,25 +700,35 @@ pub(crate) trait BoundedResponseExt {
 /// Each attempt includes the bounded body read; permanent errors retain their
 /// cause. Reuse the caller's client so trust and redirect policy stay intact.
 pub(crate) async fn fetch_metadata_text(client: &Client, url: &str) -> anyhow::Result<String> {
-    fetch_metadata_text_with_budget(client, url, Duration::from_secs(30)).await
+    fetch_metadata_text_limited(client, url, 16 * 1024 * 1024).await
+}
+
+pub(crate) async fn fetch_metadata_text_limited(
+    client: &Client,
+    url: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    fetch_metadata_text_with_budget(client, url, Duration::from_secs(30), limit).await
 }
 
 async fn fetch_metadata_text_with_budget(
     client: &Client,
     url: &str,
     total: Duration,
+    limit: usize,
 ) -> anyhow::Result<String> {
     tokio::time::timeout(total, async {
         for attempt in 0..3 {
             let result = async {
-                client
+                let response = client
                     .get(url)
                     .timeout(total)
                     .send()
                     .await?
-                    .error_for_status()?
-                    .bounded_text()
-                    .await
+                    .error_for_status()?;
+                Ok::<_, anyhow::Error>(String::from_utf8(
+                    bounded_metadata_body_with_limit(response, limit).await?,
+                )?)
             }
             .await;
             match result {
@@ -744,23 +754,29 @@ async fn fetch_metadata_text_with_budget(
     .map_err(|_| anyhow::anyhow!("Metadata request exceeded its total deadline"))?
 }
 
-pub(crate) async fn bounded_metadata_body(
+pub(crate) async fn bounded_metadata_body(response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    bounded_metadata_body_with_limit(response, 16 * 1024 * 1024).await
+}
+
+async fn bounded_metadata_body_with_limit(
     mut response: reqwest::Response,
+    limit: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    const LIMIT: usize = 16 * 1024 * 1024;
+    let limit_error = if limit == 16 * 1024 * 1024 {
+        "Metadata exceeds 16 MiB limit".to_owned()
+    } else {
+        format!("Metadata exceeds {limit}-byte limit")
+    };
     tokio::time::timeout(Duration::from_secs(30), async move {
         anyhow::ensure!(
             response
                 .content_length()
-                .is_none_or(|length| length <= LIMIT as u64),
-            "Metadata exceeds 16 MiB limit"
+                .is_none_or(|length| length <= limit as u64),
+            "{limit_error}"
         );
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
-            anyhow::ensure!(
-                chunk.len() <= LIMIT - bytes.len(),
-                "Metadata exceeds 16 MiB limit"
-            );
+            anyhow::ensure!(chunk.len() <= limit - bytes.len(), "{limit_error}");
             bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
@@ -918,6 +934,7 @@ mod metadata_limit_tests {
             &metadata_client(),
             &fixture.url,
             Duration::from_millis(250),
+            16 * 1024 * 1024,
         )
         .await
         .unwrap_err();
@@ -939,7 +956,13 @@ mod metadata_limit_tests {
         .await?;
         let start = tokio::time::Instant::now();
         assert_eq!(
-            fetch_metadata_text_with_budget(&metadata_client(), &fixture.url, budget).await?,
+            fetch_metadata_text_with_budget(
+                &metadata_client(),
+                &fixture.url,
+                budget,
+                16 * 1024 * 1024
+            )
+            .await?,
             "ok"
         );
         assert!(start.elapsed() > budget / 3);
@@ -996,6 +1019,47 @@ mod metadata_limit_tests {
                 .to_string()
                 .contains("16 MiB")
         );
+    }
+
+    #[tokio::test]
+    async fn metadata_supports_smaller_signed_manifest_bounds_without_retries() -> anyhow::Result<()>
+    {
+        for header in ["Content-Length: 9\r\n", ""] {
+            let fixture = RetryFixture::new_with_body_delay(
+                vec![
+                    format!("HTTP/1.1 200 OK\r\n{header}Connection: close\r\n\r\n123456789")
+                        .into_bytes(),
+                ],
+                false,
+                Duration::ZERO,
+            )
+            .await?;
+            let result = fetch_metadata_text_limited(&metadata_client(), &fixture.url, 4).await;
+            assert!(
+                result.is_err(),
+                "a smaller signed-input cap must reject the body"
+            );
+            assert_eq!(
+                fixture.finish().await?.len(),
+                1,
+                "an excessive body is not retryable"
+            );
+        }
+        let fixture = RetryFixture::new_with_body_delay(
+            vec![
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789"
+                    .to_vec(),
+            ],
+            false,
+            Duration::ZERO,
+        )
+        .await?;
+        assert_eq!(
+            fetch_metadata_text_limited(&metadata_client(), &fixture.url, 9).await?,
+            "123456789"
+        );
+        assert_eq!(fixture.finish().await?.len(), 1);
+        Ok(())
     }
 
     #[test]
