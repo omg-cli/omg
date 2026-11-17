@@ -12,6 +12,17 @@ OMG is the fastest unified package manager for Linux, replacing pacman, yay, nvm
 
 ## [Unreleased]
 
+## [0.1.225] - 2026-11-16
+
+See the [beta release overview, security coverage and upgrade notes](releases/v0.1.225.md), plus the [complete changes since v0.1.224](https://github.com/omg-cli/omg/compare/v0.1.224...v0.1.225).
+
+- Require a separate transaction-bound decision for disclosed CVE/watch-list risk in native Arch admission and managed npm tools; preserve signature, source and artifact checks.
+- Resolve and review exact npm dependencies before materialization, then verify the frozen install and preserve the old tool on failure.
+- Authenticate Node release manifests with pinned active publisher keys before downloading or executing candidate archives.
+- Serve indexed recent CVE revisions and cached FIRST EPSS history through Cloudflare with explicit incomplete/unavailable states.
+- Include the accumulated native package, daemon, runtime/environment, QEMU and CI fixes since the previous release.
+- Add Sponsors, governance, a code of conduct, OpenSSF Scorecard and downloadable Sigstore provenance bundles.
+
 ## [0.1.223] - 2026-09-16
 
 See the [release overview and complete commit ledger](releases/v0.1.223.md).
