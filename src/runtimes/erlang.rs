@@ -385,15 +385,21 @@ impl ErlangManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let publisher = super::security::record_download(
-            "erlang",
-            &version,
-            &version_dir,
-            &download_path,
-            &url,
-        )?;
+        self.publish_download(&download_path, &url, &version)
+            .await?;
+
+        print_installed("Erlang/OTP", &version);
+        self.use_version(&version)?;
+
+        Ok(())
+    }
+
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        let publisher =
+            super::security::record_download("erlang", version, &version_dir, download_path, url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
-        extract_tar_gz(&download_path, staging.path(), 1).await?;
+        extract_tar_gz(download_path, staging.path(), 1).await?;
         if std::env::consts::OS == "linux" {
             require_staged_install_script(&staging.path().join("Install"))?;
         }
@@ -401,10 +407,10 @@ impl ErlangManager {
             .sync_all()?;
         let admission =
             self.security
-                .prepare_staged("erlang", &version, staging.path(), &version_dir)?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+                .prepare_staged("erlang", version, staging.path(), &version_dir)?;
+        complete_staged_install(&staging, &version_dir, version)?;
         publisher.commit();
-        remove_file_best_effort(&download_path, "runtime archive");
+        remove_file_best_effort(download_path, "runtime archive");
 
         // OTP's `Install` bakes absolute paths, so it runs after publication
         // in the final directory — never in staging, whose path is temporary.
@@ -418,7 +424,7 @@ impl ErlangManager {
         }
         let after_setup =
             self.security
-                .prepare_staged("erlang", &version, &version_dir, &version_dir)?;
+                .prepare_staged("erlang", version, &version_dir, &version_dir)?;
         after_setup.before_execution(&version_dir)?;
         println!("{} Verifying installation...", style::informative("→"));
         if let Err(error) = smoke_erl(&version_dir) {
@@ -434,11 +440,7 @@ impl ErlangManager {
 
         let _finished =
             self.security
-                .prepare_staged("erlang", &version, &version_dir, &version_dir)?;
-
-        print_installed("Erlang/OTP", &version);
-        self.use_version(&version)?;
-
+                .prepare_staged("erlang", version, &version_dir, &version_dir)?;
         Ok(())
     }
 
@@ -700,5 +702,110 @@ mod tests {
             "aarch64" => assert!(index.contains("arm") || index.contains("aarch")),
             arch => panic!("unexpected test host arch: {arch}"),
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_otp_publication_reviews_setup_and_smoke_phases_without_changing_prior_selection()
+     {
+        use super::super::test_archive::{PublicationFixture, mutation_security, tar_gz_entries};
+        let fixture = PublicationFixture::new("erlang", "bin/erl");
+        let mut manager = ErlangManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://builds.hex.pm/builds/otp/amd64/ubuntu-24.04/OTP-27.0.0.tar.gz";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "27.0.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"invalid compressed OTP archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "27.0.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        let cases: &[&str] = if cfg!(target_os = "linux") {
+            &[
+                "tamper",
+                "setup-failure",
+                "setup-escape",
+                "smoke-failure",
+                "smoke-escape",
+                "success",
+            ]
+        } else {
+            &["tamper", "smoke-failure", "smoke-escape", "success"]
+        };
+        for &case in cases {
+            let install = match case {
+                "setup-failure" => b"#!/bin/sh\nexit 19\n".as_slice(),
+                "setup-escape" => {
+                    b"#!/bin/sh\nln -s /bin/sh \"$HOME/escaped-after-setup\"\n".as_slice()
+                }
+                _ => b"#!/bin/sh\nexit 0\n".as_slice(),
+            };
+            let launcher = match case {
+                "smoke-failure" => b"#!/bin/sh\nexit 23\n".as_slice(),
+                "smoke-escape" => {
+                    b"#!/bin/sh\nln -s /bin/sh \"$HOME/escaped-after-smoke\"\n".as_slice()
+                }
+                _ => b"#!/bin/sh\nexit 0\n".as_slice(),
+            };
+            let bytes = tar_gz_entries("otp", &[("Install", install), ("bin/erl", launcher)])
+                .expect("controlled OTP archive with setup and interpreter");
+            fixture.write(&bytes);
+            manager.security = if case == "tamper" {
+                mutation_security(&fixture.versions)
+            } else {
+                super::super::security::RuntimeSecurity::fixture()
+            };
+            let result = manager
+                .publish_download(&fixture.archive, url, "27.0.0")
+                .await;
+            if case == "success" {
+                result.expect("publish fully reviewed OTP setup and interpreter");
+            } else {
+                let error = result.expect_err("OTP setup or interpreter must not bypass admission");
+                let message = format!("{error:#}");
+                if case == "tamper" {
+                    assert!(
+                        message.contains("Runtime content changed after advisory review"),
+                        "{message}"
+                    );
+                }
+                if case == "setup-failure" {
+                    assert!(message.contains("Install script failed"), "{message}");
+                }
+                if case == "smoke-failure" {
+                    assert!(message.contains("smoke test failed"), "{message}");
+                }
+                if case.ends_with("escape") {
+                    assert!(
+                        message.contains("symbolic link") || message.contains("symlink"),
+                        "{message}"
+                    );
+                }
+                let failed = fixture.versions.join("27.0.0");
+                if failed.exists() {
+                    fs::remove_dir_all(failed).expect("retire only the owned failed OTP fixture");
+                }
+            }
+            fixture.assert_previous();
+        }
+        manager
+            .use_version("27.0.0")
+            .expect("select fully reviewed OTP runtime");
+        fs::remove_file(fixture.versions.join("current")).expect("restore prior OTP selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("prior OTP selection");
+        fixture.corrupt_identity("27.0.0");
+        assert!(manager.use_version("27.0.0").is_err());
+        fixture.assert_previous();
     }
 }

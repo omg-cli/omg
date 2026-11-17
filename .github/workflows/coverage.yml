@@ -200,6 +200,68 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Cover authenticated root native dispatch without rebuilding
+        id: native_protocol_tests
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess
+          from pathlib import Path
+          assert os.geteuid() == 0, 'This protocol control must execute as actual root'
+          name = 'tests::native_dnf_root_marker_requires_fixed_separator_and_validates_before_dispatch'
+          target = Path('target/llvm-cov-target').resolve(strict=True)
+          evidence = Path('native-protocol-coverage')
+          evidence.mkdir()
+          registry_environment = os.environ.copy()
+          registry_environment['LLVM_PROFILE_FILE'] = str(target / 'omg-root-native-registry-%p-%m.profraw')
+          selected = []
+          for candidate in sorted((target / 'debug/deps').glob('omg-*')):
+              if (candidate.is_symlink() or not candidate.is_file()
+                      or not re.fullmatch(r'omg-[0-9a-f]{16}', candidate.name)
+                      or not os.access(candidate, os.X_OK)):
+                  continue
+              registry = subprocess.run([str(candidate), '--list', '--format', 'terse'],
+                  env=registry_environment, capture_output=True, timeout=30, check=False)
+              if registry.returncode == 0 and (name + ': test').encode() in registry.stdout.splitlines():
+                  selected.append(candidate)
+          assert len(selected) == 1, 'Expected exactly one existing instrumented bin unit harness'
+          binary = selected[0]
+          environment = os.environ.copy()
+          environment['LLVM_PROFILE_FILE'] = str(target / 'omg-root-native-protocol-%p-%m.profraw')
+          assert not list(target.glob('omg-root-native-protocol-*.profraw')), 'Root profiles must be fresh'
+          result = subprocess.run([str(binary), '--exact', name, '--nocapture', '--test-threads=1'],
+              env=environment, capture_output=True, timeout=30, check=False)
+          log = result.stdout + result.stderr
+          assert len(log) <= 128 * 1024, 'Native protocol control exceeded its output bound'
+          (evidence / 'test.log').write_bytes(log)
+          print(log.decode('utf-8', errors='strict'))
+          assert result.returncode == 0
+          assert re.search(rb'^test result: ok\. 1 passed; 0 failed; 0 ignored;', log, re.M)
+          assert re.findall(rb'^test (tests::\S+) \.\.\. ok$', log, re.M) == [name.encode()]
+          assert not re.search(rb'\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)', log)
+          profiles = sorted(target.glob('omg-root-native-protocol-*.profraw'))
+          assert profiles and all(path.is_file() and path.stat().st_size > 0 for path in profiles)
+          def digest(path):
+              with path.open('rb') as stream:
+                  return hashlib.file_digest(stream, 'sha256').hexdigest()
+          receipt = {'test': name, 'result': 'PASS', 'attempts': 1, 'effective_uid': os.geteuid(),
+              'binary': str(binary), 'binary_sha256': digest(binary),
+              'profiles': [{'path': str(path), 'bytes': path.stat().st_size, 'sha256': digest(path)}
+                  for path in profiles]}
+          (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2), encoding='utf-8')
+          PY
+
+      - name: Preserve authenticated root dispatch coverage evidence
+        if: ${{ !cancelled() && (steps.native_protocol_tests.outcome == 'success' || steps.native_protocol_tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage-native-protocol
+          path: native-protocol-coverage
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Cover sandbox descendant cancellation
         id: native_fixture_tests
         shell: bash

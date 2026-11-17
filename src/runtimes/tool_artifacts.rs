@@ -59,7 +59,7 @@ fn observe_child_exit(process: u32) -> Result<ChildObservation> {
 }
 
 fn read_bounded(
-    mut reader: impl std::io::Read,
+    reader: &mut dyn std::io::Read,
     limit: usize,
     exceeded: &AtomicBool,
     completed: &AtomicBool,
@@ -98,7 +98,7 @@ pub(crate) fn run(command: Command, phase: &str, build: bool) -> Result<Vec<u8>>
         command,
         phase,
         Instant::now() + Duration::from_secs(if build { 3600 } else { 600 }),
-        observe_child_exit,
+        &mut observe_child_exit,
     )
 }
 
@@ -106,7 +106,7 @@ fn run_owned(
     mut command: Command,
     phase: &str,
     deadline: Instant,
-    mut observe: impl FnMut(u32) -> Result<ChildObservation>,
+    observe: &mut dyn FnMut(u32) -> Result<ChildObservation>,
 ) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
@@ -154,8 +154,8 @@ fn run_owned(
         reaped: false,
     };
     let child = &mut owner.child;
-    let stdout = child.stdout.take().context("Missing manager stdout")?;
-    let stderr = child.stderr.take().context("Missing manager stderr")?;
+    let mut stdout = child.stdout.take().context("Missing manager stdout")?;
+    let mut stderr = child.stderr.take().context("Missing manager stderr")?;
     #[cfg(unix)]
     {
         use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
@@ -165,10 +165,17 @@ fn run_owned(
     let exceeded = AtomicBool::new(false);
     let completed = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let out =
-            scope.spawn(|| read_bounded(stdout, 32 * 1024 * 1024, &exceeded, &completed, deadline));
+        let out = scope.spawn(|| {
+            read_bounded(
+                &mut stdout,
+                32 * 1024 * 1024,
+                &exceeded,
+                &completed,
+                deadline,
+            )
+        });
         let err =
-            scope.spawn(|| read_bounded(stderr, 1024 * 1024, &exceeded, &completed, deadline));
+            scope.spawn(|| read_bounded(&mut stderr, 1024 * 1024, &exceeded, &completed, deadline));
         let status = loop {
             if exceeded.load(Ordering::Acquire) || Instant::now() >= deadline {
                 owner.stop();
@@ -1238,7 +1245,7 @@ esac
         let deadline = Instant::now() + Duration::from_secs(1);
         assert_eq!(
             read_bounded(
-                Interrupted {
+                &mut Interrupted {
                     first: true,
                     bytes: std::io::Cursor::new(b"complete".to_vec())
                 },
@@ -1253,7 +1260,7 @@ esac
         assert!(!exceeded.load(Ordering::Acquire));
         assert_eq!(
             read_bounded(
-                std::io::Cursor::new(b"oversized"),
+                &mut std::io::Cursor::new(b"oversized"),
                 3,
                 &exceeded,
                 &completed,
@@ -1263,13 +1270,13 @@ esac
             b"oversized"
         );
         assert!(exceeded.swap(false, Ordering::AcqRel));
-        let error = read_bounded(Broken, 8, &exceeded, &completed, deadline).unwrap_err();
+        let error = read_bounded(&mut Broken, 8, &exceeded, &completed, deadline).unwrap_err();
         assert!(error.to_string().contains("controlled pipe failure"));
         assert!(exceeded.swap(false, Ordering::AcqRel));
         completed.store(true, Ordering::Release);
-        assert!(read_bounded(OpenPipe, 8, &exceeded, &completed, deadline)?.is_empty());
+        assert!(read_bounded(&mut OpenPipe, 8, &exceeded, &completed, deadline)?.is_empty());
         completed.store(false, Ordering::Release);
-        assert!(read_bounded(OpenPipe, 8, &exceeded, &completed, Instant::now())?.is_empty());
+        assert!(read_bounded(&mut OpenPipe, 8, &exceeded, &completed, Instant::now())?.is_empty());
         Ok(())
     }
 
@@ -1295,7 +1302,7 @@ esac
             command,
             "controlled wait",
             Instant::now() + Duration::from_secs(2),
-            |pid| {
+            &mut |pid| {
                 owned_pid = Some(pid);
                 Err(anyhow::anyhow!("controlled wait failure"))
             },
@@ -1315,7 +1322,7 @@ esac
             command,
             "controlled deadline",
             started + Duration::from_millis(50),
-            observe_child_exit,
+            &mut observe_child_exit,
         )
         .unwrap_err();
         assert!(
@@ -1330,7 +1337,7 @@ esac
                 command,
                 "controlled retry",
                 Instant::now() + Duration::from_secs(2),
-                |pid| {
+                &mut |pid| {
                     if interrupted {
                         observe_child_exit(pid)
                     } else {

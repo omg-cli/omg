@@ -31,14 +31,16 @@ pub fn status_snapshot(
     runtime_versions: Vec<(String, String)>,
     scanned_vulnerabilities: Option<(usize, usize)>,
 ) -> (StatusResult, bool) {
+    let security_vulnerabilities = scanned_vulnerabilities.map_or(0, |(count, _)| count);
+    let security_unknown_packages = scanned_vulnerabilities.map(|(_, unknown)| unknown);
     (
         StatusResult {
             total_packages,
             explicit_packages,
             orphan_packages,
             updates_available,
-            security_vulnerabilities: scanned_vulnerabilities.map_or(0, |(count, _)| count),
-            security_unknown_packages: scanned_vulnerabilities.map(|(_, unknown)| unknown),
+            security_vulnerabilities,
+            security_unknown_packages,
             vulnerabilities_scanned: scanned_vulnerabilities.is_some(),
             runtime_versions,
         },
@@ -91,5 +93,14 @@ mod tests {
         assert!(status.vulnerabilities_scanned);
         assert_eq!(status.scanned_vulnerability_summary(), Some((7, 0)));
         assert_eq!(status.security_vulnerabilities, 7);
+    }
+
+    #[test]
+    fn completed_scan_preserves_known_findings_and_unknown_package_count() {
+        let (status, cacheable) = status_snapshot(10, 4, 1, 2, vec![], Some((7, 4)));
+        assert!(cacheable);
+        assert!(status.vulnerabilities_scanned);
+        assert_eq!(status.security_vulnerabilities, 7);
+        assert_eq!(status.security_unknown_packages, Some(4));
     }
 }

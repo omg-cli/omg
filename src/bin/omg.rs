@@ -2252,6 +2252,57 @@ mod tests {
     }
 
     #[test]
+    fn native_dnf_root_marker_requires_fixed_separator_and_validates_before_dispatch() {
+        let root = omg_lib::core::privilege::is_root();
+        for tail in [
+            vec!["dnf-native"],
+            vec!["dnf-native", "not-a-separator"],
+            vec!["dnf-native", "--"],
+        ] {
+            let mut arguments = vec![
+                "omg".to_owned(),
+                omg_lib::core::privilege::ELEVATED_MARKER.to_owned(),
+            ];
+            arguments.extend(tail.iter().map(|argument| (*argument).to_owned()));
+            let original = arguments.clone();
+            let (authenticated, parent_records) =
+                super::strip_internal_invocation_markers(&mut arguments, root);
+            assert!(!parent_records);
+            if !root {
+                assert!(
+                    !authenticated,
+                    "A positional marker cannot grant root privilege"
+                );
+                assert_eq!(arguments, original);
+                assert!(super::try_native_dnf_admission(&arguments, authenticated).is_none());
+                continue;
+            }
+            assert!(
+                authenticated,
+                "Actual root must consume the reserved re-exec marker"
+            );
+            let error = super::try_native_dnf_admission(&arguments, authenticated)
+                .expect("reserved native dispatch")
+                .expect_err("Missing protocol fields must refuse before native execution");
+            if tail.get(1) == Some(&"--") {
+                #[cfg(not(feature = "fedora"))]
+                assert!(
+                    error
+                        .to_string()
+                        .contains("does not include native DNF admission")
+                );
+                #[cfg(feature = "fedora")]
+                assert!(
+                    !error.to_string().contains("authenticated root"),
+                    "Authenticated empty DNF arguments must reach validation, never replay"
+                );
+            } else {
+                assert!(error.to_string().contains("fixed argument separator"));
+            }
+        }
+    }
+
+    #[test]
     fn audit_exit_fixture() -> anyhow::Result<()> {
         use omg_lib::core::security::audit::{
             AuditEventType, AuditSeverity, audit_log_nonblocking, init_audit_logger,

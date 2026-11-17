@@ -117,12 +117,8 @@ impl GoManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let publisher =
-            super::security::record_download("go", &version, &version_dir, &download_path, &url)?;
-        let staging = begin_staged_install(&self.versions_dir)?;
-        extract_tar_gz(&download_path, staging.path(), 1).await?;
-        self.publish_install(&staging, &version)?;
-        publisher.commit();
+        self.publish_download(&download_path, &url, &version)
+            .await?;
 
         print_installed("Go", &version);
         self.use_version(&version)
@@ -173,6 +169,17 @@ impl GoManager {
 
         let bin_dir = self.versions_dir.join("current/bin");
         Self::print_version_info(&version, &version_dir, &bin_dir);
+        Ok(())
+    }
+
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        let publisher =
+            super::security::record_download("go", version, &version_dir, download_path, url)?;
+        let staging = begin_staged_install(&self.versions_dir)?;
+        extract_tar_gz(download_path, staging.path(), 1).await?;
+        self.publish_install(&staging, version)?;
+        publisher.commit();
         Ok(())
     }
 
@@ -267,14 +274,16 @@ mod tests {
             "1.27.0",
             staging.path(),
             &manager.versions_dir.join("1.27.0"),
-        )?;
+        )
+        .expect("seed controlled publisher authority");
         manager.publish_install(&staging, "1.27.0")?;
         crate::runtimes::security::fixture_bind_candidate(
             "go",
             "1.27.0",
             &manager.versions_dir.join("1.27.0"),
             &manager.versions_dir.join("1.27.0"),
-        )?;
+        )
+        .expect("seed controlled publisher authority");
         manager.use_version("1.27.0")?;
         assert_eq!(manager.list_installed()?, vec!["1.27.0"]);
         assert_eq!(manager.current_version().as_deref(), Some("1.27.0"));
@@ -454,5 +463,68 @@ mod tests {
         } else {
             assert!(!platform.starts_with("linux-"));
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_publication_preserves_prior_authority_and_rejects_changed_reviewed_content()
+    {
+        use super::super::test_archive::{Launcher, tar_gz};
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        let fixture = PublicationFixture::new("go", "bin/go");
+        let mut manager = GoManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://go.dev/dl/go1.27.0.linux-amd64.tar.gz";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "1.27.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"not an archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "1.27.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        let bytes =
+            tar_gz("runtime", "bin/go", Launcher::Regular).expect("controlled publisher archive");
+        fixture.write(&bytes);
+        manager.security = mutation_security(&fixture.versions);
+        let error = manager
+            .publish_download(&fixture.archive, url, "1.27.0")
+            .await
+            .expect_err("changed reviewed payload must not publish");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join("1.27.0").exists());
+        fixture.assert_previous();
+        manager.security = super::super::security::RuntimeSecurity::fixture();
+        manager
+            .publish_download(&fixture.archive, url, "1.27.0")
+            .await
+            .expect("publish complete reviewed publisher tree");
+        fixture.assert_previous();
+        manager
+            .use_version("1.27.0")
+            .expect("activate admitted publisher tree");
+        assert_eq!(
+            fs::read(fixture.versions.join("current/bin/go")).expect("selected reviewed launcher"),
+            b"fixture launcher"
+        );
+        fs::remove_file(fixture.versions.join("current"))
+            .expect("restore controlled prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("restore prior selection");
+        fixture.corrupt_identity("1.27.0");
+        assert!(manager.use_version("1.27.0").is_err());
+        fixture.assert_previous();
     }
 }

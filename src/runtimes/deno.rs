@@ -127,25 +127,32 @@ impl DenoManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting...", style::informative("→"));
+        self.publish_download(&download_path, &url, &version)
+            .await?;
+
+        print_installed("Deno", &version);
+        self.use_version(&version)?;
+
+        Ok(())
+    }
+
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
         let publisher =
-            super::security::record_download("deno", &version, &version_dir, &download_path, &url)?;
+            super::security::record_download("deno", version, &version_dir, download_path, url)?;
         let staging = begin_staged_install(&self.versions_dir)?;
         // Vendor ZIPs carry `deno` at the archive root, so strip 0 lands it
         // at `<version>/bin/deno` and any future sibling tools beside it.
         let staging_bin = staging.path().join("bin");
-        extract_zip(&download_path, &staging_bin, 0).await?;
+        extract_zip(download_path, &staging_bin, 0).await?;
         // Publish only a complete vendor tree: the native command must be a
         // real regular file before the version directory can exist at all.
         require_regular_file(&staging.path().join("bin").join("deno"))?;
         let _admission =
             self.security
-                .prepare_staged("deno", &version, staging.path(), &version_dir)?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+                .prepare_staged("deno", version, staging.path(), &version_dir)?;
+        complete_staged_install(&staging, &version_dir, version)?;
         publisher.commit();
-
-        print_installed("Deno", &version);
-        self.use_version(&version)?;
-
         Ok(())
     }
 
@@ -808,5 +815,81 @@ mod tests {
             "activation must name the missing binary, got: {error:#}"
         );
         assert!(manager.current_version().is_none());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_publication_preserves_prior_authority_and_rejects_changed_reviewed_content()
+    {
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+
+        let fixture = PublicationFixture::new("deno", "bin/deno");
+        let mut manager = DenoManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://github.com/denoland/deno/releases/download/v2.3.4/deno.zip";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "2.3.4")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"not an archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "2.3.4")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        let bytes = {
+            use std::io::Write as _;
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zip.start_file(
+                "deno",
+                zip::write::SimpleFileOptions::default().unix_permissions(0o755),
+            )
+            .expect("flat Deno launcher");
+            zip.write_all(b"fixture launcher")
+                .expect("controlled Deno payload");
+            zip.finish()
+                .expect("finish controlled Deno ZIP")
+                .into_inner()
+        };
+        fixture.write(&bytes);
+        manager.security = mutation_security(&fixture.versions);
+        let error = manager
+            .publish_download(&fixture.archive, url, "2.3.4")
+            .await
+            .expect_err("changed reviewed payload must not publish");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join("2.3.4").exists());
+        fixture.assert_previous();
+        manager.security = super::super::security::RuntimeSecurity::fixture();
+        manager
+            .publish_download(&fixture.archive, url, "2.3.4")
+            .await
+            .expect("publish complete reviewed publisher tree");
+        fixture.assert_previous();
+        manager
+            .use_version("2.3.4")
+            .expect("activate admitted publisher tree");
+        assert_eq!(
+            fs::read(fixture.versions.join("current/bin/deno"))
+                .expect("selected reviewed launcher"),
+            b"fixture launcher"
+        );
+        fs::remove_file(fixture.versions.join("current"))
+            .expect("restore controlled prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("restore prior selection");
+        fixture.corrupt_identity("2.3.4");
+        assert!(manager.use_version("2.3.4").is_err());
+        fixture.assert_previous();
     }
 }

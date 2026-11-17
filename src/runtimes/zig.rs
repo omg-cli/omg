@@ -129,21 +129,28 @@ impl ZigManager {
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
 
         println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let publisher =
-            super::security::record_download("zig", &version, &version_dir, &download_path, &url)?;
-        let staging = begin_staged_install(&self.versions_dir)?;
-        stage_zig_tree(&download_path, staging.path()).await?;
-        let _admission =
-            self.security
-                .prepare_staged("zig", &version, staging.path(), &version_dir)?;
-        complete_staged_install(&staging, &version_dir, &version)?;
-        publisher.commit();
+        self.publish_download(&download_path, &url, &version)
+            .await?;
 
         remove_file_best_effort(&download_path, "runtime archive");
 
         print_installed("Zig", &version);
         self.use_version(&version)?;
 
+        Ok(())
+    }
+
+    async fn publish_download(&self, download_path: &Path, url: &str, version: &str) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        let publisher =
+            super::security::record_download("zig", version, &version_dir, download_path, url)?;
+        let staging = begin_staged_install(&self.versions_dir)?;
+        stage_zig_tree(download_path, staging.path()).await?;
+        let _admission =
+            self.security
+                .prepare_staged("zig", version, staging.path(), &version_dir)?;
+        complete_staged_install(&staging, &version_dir, version)?;
+        publisher.commit();
         Ok(())
     }
 
@@ -327,5 +334,68 @@ mod tests {
             target.contains(std::env::consts::OS),
             "{target} should name the host OS"
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloaded_publication_preserves_prior_authority_and_rejects_changed_reviewed_content()
+    {
+        use super::super::test_archive::tar_xz_entries;
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        let fixture = PublicationFixture::new("zig", "bin/zig");
+        let mut manager = ZigManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let url = "https://ziglang.org/download/0.15.0/zig.tar.xz";
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "0.15.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        fixture.write(b"not an archive");
+        assert!(
+            manager
+                .publish_download(&fixture.archive, url, "0.15.0")
+                .await
+                .is_err()
+        );
+        fixture.assert_previous();
+        let bytes = tar_xz_entries("runtime", &[("zig", b"fixture launcher")])
+            .expect("controlled publisher archive");
+        fixture.write(&bytes);
+        manager.security = mutation_security(&fixture.versions);
+        let error = manager
+            .publish_download(&fixture.archive, url, "0.15.0")
+            .await
+            .expect_err("changed reviewed payload must not publish");
+        assert!(
+            format!("{error:#}").contains("Runtime content changed after advisory review"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join("0.15.0").exists());
+        fixture.assert_previous();
+        manager.security = super::super::security::RuntimeSecurity::fixture();
+        manager
+            .publish_download(&fixture.archive, url, "0.15.0")
+            .await
+            .expect("publish complete reviewed publisher tree");
+        fixture.assert_previous();
+        manager
+            .use_version("0.15.0")
+            .expect("activate admitted publisher tree");
+        assert_eq!(
+            fs::read(fixture.versions.join("current/bin/zig")).expect("selected reviewed launcher"),
+            b"fixture launcher"
+        );
+        fs::remove_file(fixture.versions.join("current"))
+            .expect("restore controlled prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("restore prior selection");
+        fixture.corrupt_identity("0.15.0");
+        assert!(manager.use_version("0.15.0").is_err());
+        fixture.assert_previous();
     }
 }

@@ -85,6 +85,12 @@ def terminal_case(unit, case, environment, expected=(b"possible match", b"1-1", 
                         before_answer()
                     if case in ("terminate", "hangup"):
                         os.kill(pid, {"terminate": signal.SIGTERM, "hangup": signal.SIGHUP}[case])
+                    elif case == "split-accept":
+                        # Canonical EOF after pending bytes delivers a partial
+                        # read without closing the terminal or accepting a line.
+                        os.write(descriptor, b"accept " + prompt[1][:24] + b"\x04")
+                        time.sleep(0.15)
+                        os.write(descriptor, prompt[1][24:] + b"\n")
                     else:
                         answer = {"generic-yes": b"yes\n", "blank": b"\n", "wrong-review": b"accept another-review\n", "eof": b"\x04", "interrupt": b"\x03"}.get(case, b"accept " + prompt[1] + b"\n")
                         os.write(descriptor, answer)

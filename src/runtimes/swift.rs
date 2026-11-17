@@ -456,34 +456,41 @@ impl SwiftManager {
         let staging =
             verify_and_extract_tarball(&keyring, &download_path, &sig_path, &self.versions_dir)
                 .await?;
+        self.publish_install(&staging, &version, &download_path, &url)?;
+        remove_file_best_effort(&download_path, "runtime archive");
+
+        print_installed("Swift", &version);
+        self.use_version(&version)?;
+
+        Ok(())
+    }
+
+    fn publish_install(
+        &self,
+        staging: &tempfile::TempDir,
+        version: &str,
+        download_path: &Path,
+        url: &str,
+    ) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
         if !staging.path().join(SWIFT_BINARY).is_file() {
-            remove_file_best_effort(&download_path, "runtime archive");
+            remove_file_best_effort(download_path, "runtime archive");
             anyhow::bail!(
                 "Installed Swift archive but found no `{SWIFT_BINARY}` inside; \
                  refusing to publish an incomplete toolchain"
             );
         }
         make_staged_executable(&staging.path().join(SWIFT_BINARY))?;
-        let publisher = super::security::record_download(
-            "swift",
-            &version,
-            &version_dir,
-            &download_path,
-            &url,
-        )?;
+        let publisher =
+            super::security::record_download("swift", version, &version_dir, download_path, url)?;
         let admission =
             self.security
-                .prepare_staged("swift", &version, staging.path(), &version_dir)?;
+                .prepare_staged("swift", version, staging.path(), &version_dir)?;
         admission.before_execution(staging.path())?;
         println!("{} Verifying installation...", style::informative("→"));
-        smoke_swift(staging.path(), &version)?;
-        complete_staged_install(&staging, &version_dir, &version)?;
+        smoke_swift(staging.path(), version)?;
+        complete_staged_install(staging, &version_dir, version)?;
         publisher.commit();
-        remove_file_best_effort(&download_path, "runtime archive");
-
-        print_installed("Swift", &version);
-        self.use_version(&version)?;
-
         Ok(())
     }
 
@@ -1025,5 +1032,74 @@ mod tests {
             "aarch64" => assert_eq!(suffix, "-aarch64"),
             arch => panic!("unexpected test host arch: {arch}"),
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn verified_swift_publication_refuses_changed_content_before_execution_and_keeps_prior_version()
+    {
+        use super::super::test_archive::{PublicationFixture, mutation_security};
+        // Signature authentication remains at install's sole call site; this
+        // exercises its following private publication phase with owned inputs.
+        let fixture = PublicationFixture::new("swift", SWIFT_BINARY);
+        let mut manager = SwiftManager::with_paths(
+            fixture.versions.clone(),
+            fixture.owner.path().join("keys.asc"),
+        );
+        let url = "https://download.swift.org/swift-6.2.0-release/ubuntu2404/swift-6.2.0-RELEASE/swift-6.2.0-RELEASE-ubuntu24.04.tar.gz";
+        for case in [
+            "missing-archive",
+            "missing-binary",
+            "tamper",
+            "wrong-version",
+            "success",
+        ] {
+            if case != "missing-archive" {
+                fixture.write(b"controlled already-authenticated archive");
+            }
+            let staging = begin_staged_install(&fixture.versions).expect("owned Swift staging");
+            if case != "missing-binary" {
+                let binary = staging.path().join(SWIFT_BINARY);
+                fs::create_dir_all(binary.parent().expect("Swift binary parent"))
+                    .expect("Swift vendor layout");
+                let script = if case == "wrong-version" {
+                    b"#!/bin/sh\nprintf 'Swift version 6.1.0\\n'\n".as_slice()
+                } else {
+                    b"#!/bin/sh\nprintf 'Swift version 6.2.0\\n'\n".as_slice()
+                };
+                fs::write(binary, script).expect("controlled Swift interpreter");
+            }
+            manager.security = if case == "tamper" {
+                mutation_security(&fixture.versions)
+            } else {
+                super::super::security::RuntimeSecurity::fixture()
+            };
+            let result = manager.publish_install(&staging, "6.2.0", &fixture.archive, url);
+            drop(staging);
+            if case == "success" {
+                result.expect("publish exact reviewed Swift version");
+            } else {
+                let error = result.expect_err("unreviewed or incorrect Swift cannot publish");
+                if case == "tamper" {
+                    assert!(
+                        format!("{error:#}")
+                            .contains("Runtime content changed after advisory review")
+                    );
+                }
+                if case == "wrong-version" {
+                    assert!(format!("{error:#}").contains("does not match requested"));
+                }
+                assert!(!fixture.versions.join("6.2.0").exists());
+            }
+            fixture.assert_previous();
+        }
+        manager
+            .use_version("6.2.0")
+            .expect("select reviewed Swift version");
+        fs::remove_file(fixture.versions.join("current")).expect("restore prior Swift selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("prior Swift selection");
+        fixture.corrupt_identity("6.2.0");
+        assert!(manager.use_version("6.2.0").is_err());
+        fixture.assert_previous();
     }
 }

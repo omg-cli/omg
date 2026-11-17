@@ -763,10 +763,12 @@ fn assessments(report: &Envelope) -> Result<Vec<PackageAssessment>> {
 }
 
 fn fresh(checked: jiff::Timestamp, now: jiff::Timestamp) -> Result<()> {
-    ensure!(
-        checked <= now && now.as_second() - checked.as_second() <= MAX_AGE_SECONDS,
-        "Runtime advisory evidence is stale or future-dated: checked={checked}, now={now}, maximum_age_seconds={MAX_AGE_SECONDS}"
-    );
+    let valid = checked <= now && now.as_second() - checked.as_second() <= MAX_AGE_SECONDS;
+    if !valid {
+        tracing::warn!(%checked, %now, maximum_age_seconds = MAX_AGE_SECONDS,
+            "Runtime advisory evidence is stale or future-dated");
+    }
+    ensure!(valid, "Runtime advisory evidence is stale or future-dated");
     Ok(())
 }
 fn text(value: &str, limit: usize) -> Result<()> {
@@ -1588,7 +1590,10 @@ mod tests {
     }
 
     fn node_fixture() -> Result<(tempfile::TempDir, PathBuf)> {
-        let owner = tempfile::tempdir()?;
+        node_fixture_with_owner(tempfile::tempdir()?)
+    }
+
+    fn node_fixture_with_owner(owner: tempfile::TempDir) -> Result<(tempfile::TempDir, PathBuf)> {
         let root = owner.path().join("versions/node/24.22.3");
         fs::create_dir_all(root.join("bin"))?;
         fs::create_dir_all(root.join("lib/node_modules/npm/lib"))?;
@@ -2244,6 +2249,75 @@ mod tests {
     }
 
     #[test]
+    fn repeated_stale_provider_failures_preserve_the_exact_unknown_review() {
+        struct Frozen(Vec<u8>);
+        impl RuntimeEvidenceSource for Frozen {
+            fn read(&self, _: &RuntimeQuery) -> Result<Vec<u8>> {
+                Ok(self.0.clone())
+            }
+        }
+        let query = RuntimeQuery {
+            runtime: "node".into(),
+            vendor: "nodejs".into(),
+            version: "24.22.3".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let mut previous: Envelope = serde_json::from_slice(
+            &fixture_runtime_report(&query).expect("controlled prior provider report"),
+        )
+        .expect("controlled prior report schema");
+        previous.findings.push(Finding {
+            id: "CVE-2026-7000".into(),
+            summary: "Previously disclosed runtime finding".into(),
+            applicability: FindingApplicability::Applicable,
+            severity: None,
+            urls: vec!["https://www.cve.org/CVERecord?id=CVE-2026-7000".into()],
+        });
+        let mut stale = previous.clone();
+        stale.checked_at = jiff::Timestamp::from_second(1).expect("fixed stale evidence time");
+        stale.sources[0].checked_at = stale.checked_at;
+        let source =
+            Frozen(serde_json::to_vec(&stale).expect("serialize unchanged stale response"));
+        let first = read_report(&source, &query, Some(&previous));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = read_report(&source, &query, Some(&first));
+        assert_eq!(first.coverage, Coverage::Unknown);
+        assert_eq!(second.coverage, Coverage::Unknown);
+        assert_eq!(first.gaps, second.gaps);
+        assert_eq!(second.findings[0].id, "CVE-2026-7000");
+        let review = |report: &Envelope| {
+            AdvisoryRiskReview::new_with_unknown(
+                &assessments(report).expect("assess actual unavailable-provider envelope"),
+                "same content, principal and transaction",
+            )
+            .expect("construct unavailable-provider review")
+            .expect("Unknown evidence requires review")
+        };
+        let first_review = review(&first);
+        let second_review = review(&second);
+        assert_eq!(first_review.id(), second_review.id());
+        let acceptance = first_review
+            .accept(&format!("accept {}", first_review.id()))
+            .expect("accept the exact disclosed Unknown decision");
+        assert!(acceptance.matches(&second_review));
+        let mut changed = second;
+        changed
+            .gaps
+            .push("A genuinely different provider failure".into());
+        assert!(!acceptance.matches(&review(&changed)));
+        assert!(fresh(stale.checked_at, jiff::Timestamp::now()).is_err());
+        let now = jiff::Timestamp::from_second(10).expect("fixed validation time");
+        assert!(
+            fresh(
+                jiff::Timestamp::from_second(11).expect("future evidence"),
+                now
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn legacy_vendor_metadata_recovers_exact_queries_but_never_publisher_authority() -> Result<()> {
         let owner = tempfile::tempdir()?;
         fs::write(
@@ -2388,8 +2462,8 @@ mod tests {
         temp_env::with_vars(
             [
                 (
-                    "XDG_CONFIG_HOME",
-                    Some(config.to_str().expect("fixture config path")),
+                    "OMG_CONFIG_DIR",
+                    Some(policy_dir.to_str().expect("fixture config path")),
                 ),
                 ("SUDO_USER", None),
                 ("DOAS_USER", None),
@@ -2495,7 +2569,7 @@ mod tests {
     #[test]
     fn changed_authority_types_and_special_runtime_files_fail_closed() -> Result<()> {
         use std::os::unix::fs::symlink;
-        let (_owner, root) = node_fixture()?;
+        let (_owner, root) = node_fixture_with_owner(tempfile::tempdir_in("/var/tmp")?)?;
         let security = RuntimeSecurity::fixture();
         security.installed("node", &root, ReviewMode::FreshAttended)?;
         let identity = state_path(&root, "identity")?;
@@ -2549,6 +2623,7 @@ mod tests {
         let owner = tempfile::tempdir()?;
         let root = owner.path().join("25.0.1+7");
         fs::create_dir(&root)?;
+        let root = root.canonicalize()?;
         fs::write(root.join("release"), "JAVA_VERSION=\"25.0.1+7\"\n")?;
         fixture_install_identity("java", &root)?;
         validate_java_release(&root, &root)?;
@@ -2577,24 +2652,29 @@ mod tests {
         ] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             let address = listener.local_addr()?;
-            let server = std::thread::spawn(move || -> Result<()> {
-                let (mut stream, _) = listener.accept()?;
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("accept the owned HTTP probe client");
                 let mut request = [0; 4096];
-                let _ = stream.read(&mut request)?;
+                let _ = stream
+                    .read(&mut request)
+                    .expect("read the owned HTTP fixture request");
                 write!(
                     stream,
                     "HTTP/1.1 {status} Controlled\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
-                )?;
-                if let Err(error) = stream.write_all(&body) {
-                    ensure!(
-                        matches!(
-                            error.kind(),
+                ).expect("write the controlled HTTP fixture headers");
+                let written = stream.write_all(&body);
+                let error_kind = written.as_ref().err().map(std::io::Error::kind);
+                assert!(
+                    matches!(
+                        error_kind,
+                        None | Some(
                             std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                        ),
-                        "unexpected fixture write: {error}"
-                    );
-                }
-                Ok(())
+                        )
+                    ),
+                    "unexpected fixture write: {written:?}"
+                );
             });
             let response = reqwest::Client::builder()
                 .no_proxy()
@@ -2607,7 +2687,7 @@ mod tests {
             if accepted {
                 assert_eq!(result?, b"[]");
             }
-            server.join().expect("owned HTTP fixture thread")?;
+            server.join().expect("owned HTTP fixture thread");
         }
         Ok(())
     }

@@ -26,10 +26,10 @@ pub(crate) fn confirm_security_review(
     );
     verify_review_terminal(&tty, invoking_uid)?;
     let mut prompt = details.to_owned();
-    write!(
+    let _ = write!(
         prompt,
         "\nType accept {digest} within 60 seconds to continue (default: cancel): "
-    )?;
+    );
     anyhow::ensure!(
         prompt.len() <= 64 * 1024,
         "Security acknowledgement display exceeds limit"
@@ -51,10 +51,9 @@ fn verify_review_terminal(tty: &std::fs::File, invoking_uid: u32) -> anyhow::Res
     )]
     let status =
         unsafe { nix::libc::ioctl(tty.as_raw_fd(), nix::libc::TIOCGSID, &raw mut session) };
-    if status == -1 {
-        return Err(std::io::Error::last_os_error())
-            .context("Cannot establish acknowledgement terminal session");
-    }
+    nix::errno::Errno::result(status)
+        .map_err(std::io::Error::from)
+        .context("Cannot establish acknowledgement terminal session")?;
     anyhow::ensure!(
         nix::unistd::getsid(None)?.as_raw() == session,
         "Security acknowledgement terminal belongs to another session"
@@ -66,19 +65,10 @@ fn verify_review_terminal(tty: &std::fs::File, invoking_uid: u32) -> anyhow::Res
         reason = "kernel terminal identity must be resolved independently of the /dev/tty alias"
     )]
     let status = unsafe { nix::libc::ioctl(tty.as_raw_fd(), nix::libc::TIOCGDEV, &raw mut device) };
-    if status == -1 {
-        return Err(std::io::Error::last_os_error())
-            .context("Cannot establish acknowledgement terminal identity");
-    }
-    let major = (device >> 8) & 0xfff;
-    let minor = (device & 0xff) | ((device >> 12) & 0xfff00);
-    let path = if (136..=143).contains(&major) {
-        format!("/dev/pts/{minor}")
-    } else if major == 4 && (1..=63).contains(&minor) {
-        format!("/dev/tty{minor}")
-    } else {
-        anyhow::bail!("Unsupported terminal identity for Security acknowledgement");
-    };
+    nix::errno::Errno::result(status)
+        .map_err(std::io::Error::from)
+        .context("Cannot establish acknowledgement terminal identity")?;
+    let path = review_terminal_device_path(device)?;
     let metadata = std::fs::symlink_metadata(path)?;
     anyhow::ensure!(
         metadata.file_type().is_char_device()
@@ -87,6 +77,19 @@ fn verify_review_terminal(tty: &std::fs::File, invoking_uid: u32) -> anyhow::Res
         "Security acknowledgement terminal is not owned by root or the invoking user"
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn review_terminal_device_path(device: u32) -> anyhow::Result<String> {
+    let major = (device >> 8) & 0xfff;
+    let minor = (device & 0xff) | ((device >> 12) & 0xfff00);
+    Ok(if (136..=143).contains(&major) {
+        format!("/dev/pts/{minor}")
+    } else if major == 4 && (1..=63).contains(&minor) {
+        format!("/dev/tty{minor}")
+    } else {
+        anyhow::bail!("Unsupported terminal identity for Security acknowledgement");
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -148,6 +151,16 @@ fn verify_review_terminal(_tty: &std::fs::File, invoking_uid: u32) -> anyhow::Re
         }
     }
     anyhow::bail!("Cannot resolve acknowledgement terminal device")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn review_io_count(result: std::io::Result<usize>) -> anyhow::Result<Option<usize>> {
+    match result {
+        Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
+        Ok(count) => Ok(Some(count)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -234,25 +247,16 @@ fn read_security_review(
     let mut remaining = prompt.as_bytes();
     while !remaining.is_empty() {
         ready(tty, true, deadline, check_cancelled)?;
-        match foreground_io(tty, |mut tty| tty.write(remaining))? {
-            Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
-            Ok(count) => remaining = &remaining[count..],
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {}
-            Err(error) => return Err(error.into()),
-        }
+        let count =
+            review_io_count(foreground_io(tty, |mut tty| tty.write(remaining))?)?.unwrap_or(0);
+        remaining = &remaining[count..];
     }
     let mut answer = Vec::new();
     loop {
         ready(tty, false, deadline, check_cancelled)?;
         let mut buffer = [0_u8; 128];
-        let count = match foreground_io(tty, |mut tty| tty.read(&mut buffer))? {
-            Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
-            Ok(count) => count,
-            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock) => {
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let count =
+            review_io_count(foreground_io(tty, |mut tty| tty.read(&mut buffer))?)?.unwrap_or(0);
         answer.extend_from_slice(&buffer[..count]);
         anyhow::ensure!(
             answer.len() <= 96,
@@ -1297,6 +1301,88 @@ pub(crate) async fn run_privileged_dnf(args: &[String]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_terminal_device_paths_accept_only_kernel_pts_and_virtual_terminals() {
+        for (major, minor, expected) in [
+            (136, 0, "/dev/pts/0"),
+            (143, 0x12345, "/dev/pts/74565"),
+            (4, 1, "/dev/tty1"),
+            (4, 63, "/dev/tty63"),
+        ] {
+            let device = u32::try_from(nix::sys::stat::makedev(major, minor)).unwrap();
+            assert_eq!(
+                super::review_terminal_device_path(device).unwrap(),
+                expected
+            );
+        }
+        for (major, minor) in [(0, 0), (4, 0), (4, 64), (135, 1), (144, 1)] {
+            let device = u32::try_from(nix::sys::stat::makedev(major, minor)).unwrap();
+            assert!(
+                super::review_terminal_device_path(device)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unsupported terminal identity")
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn review_io_preserves_nonblocking_progress_closure_and_kernel_errors() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            super::review_io_count(receiver.read(&mut byte)).unwrap(),
+            None
+        );
+        assert_eq!(super::review_io_count(sender.write(b"x")).unwrap(), Some(1));
+        assert_eq!(
+            super::review_io_count(receiver.read(&mut byte)).unwrap(),
+            Some(1)
+        );
+        assert_eq!(byte, *b"x");
+        let payload = vec![0_u8; 64 * 1024];
+        let pending = (0..1024)
+            .find_map(|_| sender.write(&payload).err())
+            .expect("the bounded real socket buffer must apply backpressure");
+        assert_eq!(super::review_io_count(Err(pending)).unwrap(), None);
+        drop(receiver);
+        let error = super::review_io_count(sender.write(b"closed")).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        drop(sender);
+        assert!(
+            super::review_io_count(receiver.read(&mut byte))
+                .unwrap_err()
+                .to_string()
+                .contains("terminal closed")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_terminal_rejects_a_real_non_terminal_and_preserves_ioctl_errno() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let error =
+            super::verify_review_terminal(&file, nix::unistd::geteuid().as_raw()).unwrap_err();
+        assert!(error.to_string().contains("terminal session"));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(nix::libc::ENOTTY)
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn security_review_requires_exact_foreground_terminal_consent() {
@@ -1311,14 +1397,11 @@ mod tests {
                     .arg(std::env::current_exe().unwrap())
                     .output()
                     .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
             let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(result["passed"], 10);
+            assert_eq!(result["passed"], 11);
             return;
         };
         assert!(

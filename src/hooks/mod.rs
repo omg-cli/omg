@@ -1321,10 +1321,12 @@ mod tests {
                         "3.12.0",
                         version_root,
                         version_root,
-                    )?;
+                    )
+                    .expect("prepare reviewed Python path fixture");
                     hook_env_output("fish", &project)
                 },
-            )?;
+            )
+            .expect("render the reviewed Python Fish hook");
             anyhow::ensure!(
                 emitted.contains("_OMG_PATH_ADDITIONS"),
                 "fixture must emit a path"
@@ -1605,13 +1607,12 @@ path = "hostile"
         temp_env::with_var("OMG_DATA_DIR", Some(data.path()), || {
             assert!(crate::runtimes::common::is_trusted_runtime_bin_dir(&bin));
             let versions = HashMap::from([("python".to_string(), "3.12.0".to_string())]);
-            match super::build_path_additions(&versions) {
-                Ok(paths) => assert!(
-                    paths.is_empty(),
-                    "unreviewed runtime reached PATH: {paths:?}"
-                ),
-                Err(error) => assert!(format!("{error:#}").to_lowercase().contains("advisory")),
-            }
+            let paths = super::build_path_additions(&versions)
+                .expect("an unreviewed exact pin must refuse softly in the automatic hook");
+            assert!(
+                paths.is_empty(),
+                "unreviewed runtime reached PATH: {paths:?}"
+            );
         });
     }
 
@@ -1864,6 +1865,7 @@ path = "hostile"
             ("python", "3.12.0", "bin", "python3", "pip"),
             ("bun", "1.2.0", "", "bun", "bunx"),
             ("deno", "2.9.6", "bin", "deno", "deno-lsp"),
+            ("swift", "6.2.0", "usr/bin", "swift", "swiftc"),
         ] {
             let selected = if relative_bin.is_empty() {
                 data.path().join("versions").join(runtime).join(version)

@@ -241,12 +241,6 @@ impl PgpVerifier {
         signed: &[u8],
         max_plaintext: usize,
     ) -> Result<Vec<u8>, PgpError> {
-        use openpgp::parse::stream::{
-            MessageLayer, MessageStructure, VerificationHelper, VerifierBuilder,
-        };
-        use openpgp::types::RevocationStatus;
-        use std::io::Read as _;
-
         const LIMIT: usize = 1024 * 1024;
         if signed.len() > LIMIT {
             return Err(PgpError::CleartextLimit {
@@ -257,6 +251,19 @@ impl PgpVerifier {
         if !signed.starts_with(b"-----BEGIN PGP SIGNED MESSAGE-----") {
             return Err(PgpError::CleartextFormat);
         }
+        self.verify_cleartext_message(signed, max_plaintext)
+    }
+
+    fn verify_cleartext_message(
+        &self,
+        signed: &[u8],
+        max_plaintext: usize,
+    ) -> Result<Vec<u8>, PgpError> {
+        use openpgp::parse::stream::{
+            MessageLayer, MessageStructure, VerificationHelper, VerifierBuilder,
+        };
+        use openpgp::types::RevocationStatus;
+
         struct Helper<'a>(&'a PgpVerifier);
         impl VerificationHelper for Helper<'_> {
             fn get_certs(&mut self, _ids: &[openpgp::KeyHandle]) -> openpgp::Result<Vec<Cert>> {
@@ -314,9 +321,21 @@ impl PgpVerifier {
             .map_err(|source| PgpError::CleartextVerification {
                 source: source.into(),
             })?;
-        let limit = max_plaintext.min(LIMIT);
+        let plaintext = Self::read_cleartext_plaintext(&mut verifier, max_plaintext)?;
+        if verifier.processing_csf_message() != Some(true) {
+            return Err(PgpError::CleartextFormat);
+        }
+        Ok(plaintext)
+    }
+
+    fn read_cleartext_plaintext(
+        reader: &mut impl std::io::Read,
+        max_plaintext: usize,
+    ) -> Result<Vec<u8>, PgpError> {
+        use std::io::Read as _;
+        let limit = max_plaintext.min(1024 * 1024);
         let mut plaintext = Vec::new();
-        verifier
+        reader
             .by_ref()
             .take((limit + 1) as u64)
             .read_to_end(&mut plaintext)
@@ -328,9 +347,6 @@ impl PgpVerifier {
                 kind: "plaintext",
                 limit,
             });
-        }
-        if verifier.processing_csf_message() != Some(true) {
-            return Err(PgpError::CleartextFormat);
         }
         Ok(plaintext)
     }
@@ -849,6 +865,194 @@ pub(crate) mod tests {
                 limit: 1_048_576
             })
         ));
+    }
+
+    #[test]
+    fn cleartext_inner_authentication_refuses_real_attached_messages_and_compression_containers() {
+        use openpgp::cert::prelude::CertBuilder;
+        use openpgp::serialize::stream::{Armorer, Compressor, LiteralWriter, Message, Signer};
+        let (certificate, _) =
+            CertBuilder::general_purpose(Some("format-boundary@example.invalid"))
+                .set_cipher_suite(openpgp::cert::CipherSuite::Cv25519)
+                .generate()
+                .expect("controlled signing certificate");
+        let verifier = PgpVerifier {
+            policy: StandardPolicy::new(),
+            certs: vec![certificate.clone().strip_secret_key_material()],
+        };
+        for compressed in [false, true] {
+            let signing_key = certificate
+                .keys()
+                .secret()
+                .with_policy(&verifier.policy, None)
+                .for_signing()
+                .next()
+                .expect("controlled valid signing authority")
+                .key()
+                .clone()
+                .into_keypair()
+                .expect("controlled private signing key");
+            let mut encoded = Vec::new();
+            let message = Armorer::new(Message::new(&mut encoded))
+                .kind(openpgp::armor::Kind::Message)
+                .build()
+                .expect("actual attached-message armor");
+            // Algorithm 0 is a real OpenPGP compression container without an optional codec.
+            let message = if compressed {
+                Compressor::new(message)
+                    .algo(openpgp::types::CompressionAlgorithm::Uncompressed)
+                    .build()
+                    .expect("actual OpenPGP compression container")
+            } else {
+                message
+            };
+            let message = Signer::new(message, signing_key)
+                .expect("actual message signer")
+                .hash_algo(openpgp::types::HashAlgorithm::SHA256)
+                .expect("strong message digest")
+                .build()
+                .expect("actual signed message");
+            let mut writer = LiteralWriter::new(message)
+                .build()
+                .expect("actual literal payload");
+            writer
+                .write_all(b"authenticated but not cleartext framed\n")
+                .expect("controlled signed payload");
+            writer.finalize().expect("complete attached signature");
+            assert!(matches!(
+                verifier.verify_cleartext_memory(&encoded, 1024),
+                Err(PgpError::CleartextFormat)
+            ));
+            assert!(
+                matches!(
+                    verifier.verify_cleartext_message(&encoded, 1024),
+                    Err(PgpError::CleartextFormat)
+                ),
+                "even a cryptographically valid message must retain the inner cleartext format boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_cleartext_reader_keeps_real_io_failure_typed_and_never_returns_plaintext() {
+        let file = NamedTempFile::new().expect("owned plaintext source");
+        let mut write_only = std::fs::OpenOptions::new()
+            .write(true)
+            .open(file.path())
+            .expect("real write-only source descriptor");
+        let error = PgpVerifier::read_cleartext_plaintext(&mut write_only, 1024)
+            .expect_err("reading an invalid source descriptor must refuse plaintext");
+        let PgpError::CleartextVerification { source } = error else {
+            panic!("wrong typed plaintext read error");
+        };
+        assert!(
+            source.0.downcast_ref::<std::io::Error>().is_some(),
+            "the underlying OS read failure must remain inspectable"
+        );
+    }
+
+    #[test]
+    fn embedded_bundle_rejects_a_truncated_certificate_after_a_valid_pinned_one() {
+        use openpgp::serialize::Serialize as _;
+        let (verifier, _) = signed_fixture(openpgp::types::HashAlgorithm::SHA256);
+        let certificate = &verifier.certs[0];
+        let mut encoded = Vec::new();
+        certificate
+            .serialize(&mut encoded)
+            .expect("serialize controlled public certificate");
+        let fingerprint = certificate.fingerprint().to_hex();
+        for end in [encoded.len() / 2, encoded.len() - 1] {
+            let mut bundle = encoded.clone();
+            bundle.extend_from_slice(&encoded[..end]);
+            let error = PgpVerifier::from_public_key_bytes(&bundle, &[&fingerprint])
+                .err()
+                .expect("a partial trailing certificate must invalidate the complete bundle");
+            assert!(
+                matches!(error, PgpError::PublicKeyBundleParse { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleartext_refuses_a_future_signature_inside_the_upstream_clock_tolerance() {
+        let (verifier, signed) = cleartext_fixture(
+            b"exact publisher manifest\n",
+            openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now() + std::time::Duration::from_mins(1),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        assert!(matches!(
+            verifier.verify_cleartext_memory(&signed, 1024),
+            Err(PgpError::CleartextVerification { .. })
+        ));
+    }
+
+    #[test]
+    fn cleartext_uses_a_policy_valid_certificate_among_same_fingerprint_variants() {
+        let (mut verifier, signed) = cleartext_fixture(
+            b"same primary fingerprint is not a certificate policy decision\n",
+            openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        let bare = Cert::from_packets(verifier.certs[0].clone().into_packets().take(1))
+            .expect("parse the real public primary packet without certification bindings");
+        assert_eq!(bare.fingerprint(), verifier.certs[0].fingerprint());
+        assert!(bare.with_policy(&verifier.policy, None).is_err());
+        let unbound = PgpVerifier {
+            policy: StandardPolicy::new(),
+            certs: vec![bare.clone()],
+        };
+        assert!(unbound.verify_cleartext_memory(&signed, 1024).is_err());
+        verifier.certs.insert(0, bare);
+        assert_eq!(
+            verifier.verify_cleartext_memory(&signed, 1024).expect(
+                "valid authority must remain usable beside an unbound same-fingerprint copy"
+            ),
+            b"same primary fingerprint is not a certificate policy decision\n"
+        );
+    }
+
+    #[test]
+    fn large_cleartext_payload_authentication_never_returns_tampered_or_truncated_plaintext() {
+        let data = b"authenticated manifest row\n".repeat(20_000);
+        let (verifier, signed) = cleartext_fixture(
+            &data,
+            openpgp::types::HashAlgorithm::SHA256,
+            std::time::SystemTime::now(),
+            std::time::Duration::from_hours(1),
+            std::time::Duration::from_hours(48),
+            false,
+        );
+        assert!(signed.len() < 1024 * 1024);
+        assert_eq!(
+            verifier
+                .verify_cleartext_memory(&signed, data.len())
+                .expect("complete bounded publisher manifest"),
+            data
+        );
+        let mut tampered = signed.clone();
+        let offset = tampered
+            .windows(b"authenticated manifest row".len())
+            .rposition(|bytes| bytes == b"authenticated manifest row")
+            .expect("owned manifest plaintext before its signature");
+        tampered[offset] = b'u';
+        let signature_start = signed
+            .windows(b"-----BEGIN PGP SIGNATURE-----".len())
+            .position(|bytes| bytes == b"-----BEGIN PGP SIGNATURE-----")
+            .expect("controlled signature framing");
+        let truncated_at = signature_start + (signed.len() - signature_start) / 2;
+        for invalid in [tampered.as_slice(), &signed[..truncated_at]] {
+            assert!(matches!(
+                verifier.verify_cleartext_memory(invalid, data.len()),
+                Err(PgpError::CleartextVerification { .. })
+            ));
+        }
     }
 
     #[test]

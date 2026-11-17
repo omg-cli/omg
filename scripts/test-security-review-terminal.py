@@ -20,10 +20,10 @@ def main():
     terminal = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(terminal)
     terminal.NAME = "core::privilege::tests::security_review_requires_exact_foreground_terminal_consent"
-    cases = ("accept", "generic-yes", "blank", "wrong-review", "eof", "no-tty",
+    cases = ("accept", "split-accept", "generic-yes", "blank", "wrong-review", "eof", "no-tty",
              "interrupt", "terminate", "hangup", "cancelled")
     for case in cases:
-        environment = os.environ | {"OMG_TERMINAL_REVIEW_CASE": case}
+        environment = os.environ | {"OMG_TERMINAL_REVIEW_CASE": "accept" if case == "split-accept" else case}
         if case == "cancelled":
             # Cancellation precedes prompting, so no terminal response is expected.
             result = subprocess.run(
