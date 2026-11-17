@@ -397,6 +397,89 @@ mod runtime_matrix {
             "rejected scaffold executed an ambient command"
         );
     }
+
+    #[cfg(all(target_os = "linux", debug_assertions))]
+    #[test]
+    fn attended_pip_source_refuses_without_a_reviewed_python() -> anyhow::Result<()> {
+        use std::process::Command;
+
+        let owner = tempfile::tempdir_in("/var/tmp")?;
+        let home = owner.path();
+        let data = home.join("data/omg");
+        std::fs::create_dir_all(data.join("versions/python"))?;
+        let driver = r#"
+import contextlib, errno, fcntl, os, pty, select, signal, struct, sys, termios, time
+
+binary = sys.argv[1]
+pid, terminal = pty.fork()
+if pid == 0:
+    os.execv(binary, [binary, 'tool', 'install', 'omg-pip-source-fixture'])
+
+transcript = bytearray()
+status = None
+selected = False
+deadline = time.monotonic() + 20
+try:
+    fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 120, 0, 0))
+    while time.monotonic() < deadline:
+        if terminal in select.select([terminal], [], [], 0.1)[0]:
+            try:
+                text = os.read(terminal, 8192)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                text = b''
+            transcript.extend(text)
+            assert len(transcript) <= 128 * 1024, 'tool output exceeded its fixture bound'
+            if not selected and b'Source?' in transcript and b'Pip (Isolated)' in transcript:
+                os.write(terminal, b'\x1b[B' * 3 + b'\r')
+                selected = True
+            if not text:
+                child, value = os.waitpid(pid, os.WNOHANG)
+                if child:
+                    status = value
+                    break
+    assert status is not None, 'tool process exceeded its fixture deadline'
+    assert selected and os.waitstatus_to_exitcode(status) == 1
+    assert b'Package installation requires a selected OMG-managed python' in transcript
+finally:
+    os.close(terminal)
+    if status is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    sys.stdout.buffer.write(transcript)
+"#;
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .args(["-I", "-c", driver, env!("CARGO_BIN_EXE_omg")])
+            .env_clear()
+            .env("HOME", home)
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("TERM", "xterm")
+            .env("PATH", "/usr/bin:/bin")
+            .env("OMG_DISABLE_DAEMON", "1")
+            .env("OMG_NATIVE_TEST_DATA_DIR", "1")
+            .env("OMG_DATA_DIR", &data)
+            .current_dir(home);
+        for key in ["LLVM_PROFILE_FILE", "LD_LIBRARY_PATH"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = command.output()?;
+        assert!(
+            output.status.success(),
+            "PTY source refusal failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(std::fs::read_dir(data.join("tools/pip"))?.next().is_none());
+        assert!(std::fs::read_dir(data.join("bin"))?.next().is_none());
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

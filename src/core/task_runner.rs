@@ -2055,8 +2055,7 @@ mod tests {
                 .expect("execute the owned relocatable interpreter");
             assert!(
                 output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
+                "Python identity probe failed: {output:?}"
             );
             assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "3.13.7");
             ("3.13.7".to_owned(), "3.13".to_owned(), runtime)
@@ -2080,8 +2079,7 @@ print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
                 .unwrap();
             assert!(
                 output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
+                "Python identity probe failed: {output:?}"
             );
             let (version, major_minor, image): (String, String, PathBuf) =
                 serde_json::from_slice(&output.stdout).unwrap();

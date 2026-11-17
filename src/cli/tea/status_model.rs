@@ -394,6 +394,7 @@ mod tests {
             (false, Some(0), None),
         ] {
             let socket = owner.path().join("status.sock");
+            crate::core::client::validate_socket_with_context(&socket)?;
             let listener = UnixListener::bind(&socket)?;
             listener.set_nonblocking(true)?;
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -413,6 +414,9 @@ mod tests {
                         }
                     }
                 };
+                // BSD can inherit O_NONBLOCK from the listener. Timeouts alone
+                // do not make this synchronous frame reader blocking.
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(Duration::from_secs(3)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(3)))?;
                 let frame = protocol::read_frame(&mut stream)?;
@@ -453,14 +457,15 @@ mod tests {
                     let mut model = StatusModel::new().with_fast_mode(true);
                     let message = run_status_load(model.update(StatusMsg::Load))?;
                     let data = loaded_status(&message)?;
+                    let counters = (
+                        data.total_packages,
+                        data.explicit_packages,
+                        data.orphan_packages,
+                        data.updates_available,
+                    );
                     anyhow::ensure!(
-                        (
-                            data.total_packages,
-                            data.explicit_packages,
-                            data.orphan_packages,
-                            data.updates_available
-                        ) == (42, 17, 3, 5),
-                        "daemon inventory counters were lost"
+                        counters == (42, 17, 3, 5),
+                        "daemon inventory counters were lost: {counters:?}"
                     );
                     anyhow::ensure!(
                         data.advisory_coverage == expected && data.fast_mode,
@@ -487,8 +492,8 @@ mod tests {
             let served = server
                 .join()
                 .map_err(|_| anyhow::anyhow!("status fixture panicked"))?;
-            observed?;
             served?;
+            observed?;
             std::fs::remove_file(socket)?;
         }
         Ok(())

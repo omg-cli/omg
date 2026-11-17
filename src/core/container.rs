@@ -1388,6 +1388,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn generated_recipe_requires_unknown_review_even_with_generic_yes() {
+        use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::PermissionsExt as _;
         const NAME: &str = "core::container::tests::generated_recipe_requires_unknown_review_even_with_generic_yes";
         if crate::core::testing::run_isolated_test(NAME) {
@@ -1445,6 +1446,36 @@ mod tests {
                     !marker.exists(),
                     "builder ran before explicit Unknown acceptance"
                 );
+                for (key, value, expected) in [
+                    (
+                        std::ffi::OsStr::from_bytes(b"OMG_CONTAINER_ENV_\xff"),
+                        std::ffi::OsStr::new("valid"),
+                        "Generated build environment key is not UTF-8",
+                    ),
+                    (
+                        std::ffi::OsStr::new("OMG_CONTAINER_ENV_VALUE"),
+                        std::ffi::OsStr::from_bytes(b"invalid-\xff"),
+                        "Generated build environment value is not UTF-8",
+                    ),
+                ] {
+                    temp_env::with_var(key, Some(value), || {
+                        let error = manager
+                            .build_with_options(
+                                Path::new("Dockerfile.omg"),
+                                "fixture:review",
+                                &project,
+                                false,
+                                &[],
+                                None,
+                            )
+                            .expect_err("generated builds must reject non-UTF-8 environment data");
+                        assert_eq!(error.to_string(), expected);
+                        assert!(
+                            !marker.exists(),
+                            "invalid generated-build environment invoked its builder"
+                        );
+                    });
+                }
                 for policy in [
                     "banned_packages = ['glibc']\n",
                     "require_pgp = true\n",

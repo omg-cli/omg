@@ -151,8 +151,7 @@ fn scaffold_rust(root: &Path, name: &str) -> Result<()> {
         root.join("src/main.rs"),
         "fn main() {\n    println!(\"Hello from OMG!\");\n}\n",
     )?;
-    fs::write(root.join(".gitignore"), "/target\n")?;
-    Ok(())
+    fs::write(root.join(".gitignore"), "/target\n").context("Failed to write the Rust .gitignore")
 }
 
 fn scaffold_react(root: &Path, name: &str) -> Result<()> {
@@ -221,8 +220,8 @@ if (root) {
 }
 "#,
     )?;
-    fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")?;
-    Ok(())
+    fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")
+        .context("Failed to write the React .gitignore")
 }
 
 fn scaffold_node(root: &Path, name: &str) -> Result<()> {
@@ -265,8 +264,8 @@ fn scaffold_node(root: &Path, name: &str) -> Result<()> {
         root.join("src/index.ts"),
         "console.log(\"Hello from OMG!\");\n",
     )?;
-    fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")?;
-    Ok(())
+    fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")
+        .context("Failed to write the Node .gitignore")
 }
 
 fn scaffold_python(root: &Path, name: &str) -> Result<()> {
@@ -276,8 +275,8 @@ fn scaffold_python(root: &Path, name: &str) -> Result<()> {
     )?;
     fs::write(root.join("requirements.txt"), "")?;
     fs::write(root.join("main.py"), "print('Hello from OMG!')\n")?;
-    fs::write(root.join(".gitignore"), ".venv/\n__pycache__/\n.env\n")?;
-    Ok(())
+    fs::write(root.join(".gitignore"), ".venv/\n__pycache__/\n.env\n")
+        .context("Failed to write the Python .gitignore")
 }
 
 fn scaffold_go(root: &Path, name: &str) -> Result<()> {
@@ -305,8 +304,8 @@ tasks:
     cmds:
       - go run main.go
 ",
-    )?;
-    Ok(())
+    )
+    .context("Failed to write the Go Taskfile.yml")
 }
 
 fn lock_runtimes(target_dir: &Path, stack: &str) -> Result<()> {
@@ -337,6 +336,31 @@ mod tests {
         assert_eq!(canonical_stack("golang"), Some(ProjectStack::Go));
         assert_eq!(canonical_stack("rs"), Some(ProjectStack::Rust));
         assert_eq!(canonical_stack("unknown"), None);
+    }
+
+    #[test]
+    fn scaffold_diagnostics_name_the_file_that_cannot_be_written() -> Result<()> {
+        type Scaffold = fn(&Path, &str) -> Result<()>;
+        let cases: [(&str, &str, Scaffold); 5] = [
+            ("Rust", ".gitignore", scaffold_rust),
+            ("React", ".gitignore", scaffold_react),
+            ("Node", ".gitignore", scaffold_node),
+            ("Python", ".gitignore", scaffold_python),
+            ("Go", "Taskfile.yml", scaffold_go),
+        ];
+        for (stack, file, scaffold) in cases {
+            let owner = tempfile::tempdir()?;
+            let existing = owner.path().join(file);
+            fs::create_dir(&existing)?;
+            let error = scaffold(owner.path(), "scaffold-fixture")
+                .expect_err("an existing directory cannot be replaced by a scaffold file");
+            assert_eq!(
+                error.to_string(),
+                format!("Failed to write the {stack} {file}")
+            );
+            assert!(existing.is_dir());
+        }
+        Ok(())
     }
 
     #[test]
