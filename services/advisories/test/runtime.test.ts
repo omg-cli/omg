@@ -143,6 +143,42 @@ test("Go uses both exact OSV standard-library and toolchain coordinates with ful
         expect(queries.every((query) => query.version === "1.24.0" && object(query.package).ecosystem === "Go")).toBe(true);
     } finally { db.close(); }
 });
+test("fresh Go OSV evidence ignores object key order but binds every field and ordered array", async () => {
+    const { store, db } = setup();
+    const reverseKeys=(value:unknown):unknown=>{
+        if(Array.isArray(value))return value.map(reverseKeys);
+        if(value!==null && typeof value==="object")return Object.fromEntries(Object.entries(object(value)).reverse().map(([key,item])=>[key,reverseKeys(item)]));
+        return value;
+    };
+    let variant="original";
+    const fetcher=async(url:string,init?:RequestInit)=>{
+        expect(url).toBe("https://api.osv.dev/v1/query");
+        const query=object(JSON.parse(String(init?.body))),name=object(query.package).name;
+        const record={id:name==="stdlib"?"GO-2026-1111":"GO-2026-1112",summary:"Exact Go disclosure",modified:now,
+            aliases:[name==="stdlib"?"CVE-2026-12345":"CVE-2026-12346"],database_specific:{severity:"HIGH"},
+            affected:[{package:{ecosystem:"Go",name},ranges:[{type:"SEMVER",events:[{introduced:"0"},{fixed:variant==="field"?"1.29.0":"1.28.0"}]}],
+                ecosystem_specific:{imports:[{path:"net/http",symbols:variant==="array"?["Server.Serve","Serve"]:["Serve","Server.Serve"]}]}}]};
+        return Response.json({vulns:[variant==="keys"?reverseKeys(record):record]});
+    };
+    const hashes=(value:Record<string,unknown>)=>{
+        const sources=value.sources;if(!Array.isArray(sources))throw new Error("missing controlled OSV source receipts");
+        return sources.map(source=>object(source).payload_sha256);
+    };
+    try {
+        const first=await report(store,"go","1.27.1","golang",fetcher,now,true);
+        variant="keys";
+        const reordered=await report(store,"go","1.27.1","golang",fetcher,now,true);
+        expect(first.coverage).toBe("assessed");expect(reordered.coverage).toBe("assessed");
+        expect(reordered.findings).toEqual(first.findings);
+        expect(hashes(reordered)).toEqual(hashes(first));
+        for(const changed of ["field","array"]){
+            variant=changed;
+            const update=await report(store,"go","1.27.1","golang",fetcher,now,true);
+            expect(update.coverage).toBe("assessed");expect(update.findings).toEqual(first.findings);
+            expect(hashes(update)).not.toEqual(hashes(first));
+        }
+    }finally{db.close();}
+});
 test("Pi scans its actual npm package and cyclic OSV pagination cannot become clean", async () => {
     const { store, db } = setup();
     try {

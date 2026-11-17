@@ -342,6 +342,15 @@ async function node(identity: RuntimeIdentity, sources: Sources, result: Assessm
             result.add(id, row.description ?? "Published Node.js core advisory", certain ? "applicable" : "possible", row.severity, [row.ref, url]);
     }
 }
+function osvSnapshot(rows: unknown[]): string {
+    // OSV can reorder object keys between otherwise identical responses.
+    // Keep every field and array position in the owned evidence snapshot.
+    return JSON.stringify(rows, (_key: string, value: unknown) => {
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+        const row = object(value);
+        return Object.fromEntries(Object.keys(row).sort().map((key) => [key, row[key]]));
+    });
+}
 async function osv(identity: RuntimeIdentity, sources: Sources, result: Assessment, ecosystem: string, packageName: string) {
     const url = "https://api.osv.dev/v1/query";
     const loaded = await sources.read(`osv:${ecosystem}:${packageName}:${identity.version}`, `OSV ${ecosystem} ${packageName}`, url, async () => {
@@ -359,7 +368,7 @@ async function osv(identity: RuntimeIdentity, sources: Sources, result: Assessme
                 if (bytes > SOURCE_BYTES) throw new Error("OSV paginated source exceeds limit");
                 ids.add(id); rows.push(row);
             }
-            if (response.next_page_token === undefined || response.next_page_token === "") return { raw: JSON.stringify(rows.sort((a, b) => string(object(a).id).localeCompare(string(object(b).id)))), revision: null, complete: true };
+            if (response.next_page_token === undefined || response.next_page_token === "") return { raw: osvSnapshot(rows.sort((a, b) => string(object(a).id).localeCompare(string(object(b).id)))), revision: null, complete: true };
             token = string(response.next_page_token);
             if (token.length > 4096 || tokens.has(token)) throw new Error("invalid OSV pagination");
             tokens.add(token);
