@@ -165,6 +165,38 @@ class CompiledMethodParentFilesTests(unittest.TestCase):
                 coverage.compiled_method_parent_files(owners, {}, [len(owners)])
 
 
+class CompiledPlainParentFilesTests(unittest.TestCase):
+    def test_lookup_preserves_literal_scopes_and_conservative_opaque_owners(self):
+        scope = '7omg_lib3pkg5tests'
+        owners = [dict(name=name, filenames=paths) for name, paths in (
+            ('_RNvNtC' + scope + '3one', ['/src/first.rs']),
+            ('_RNvNtC' + scope + '3one', ['/src/duplicate.rs']),
+            ('_Runsupported_' + scope + '.llvm.1', ['/outside.rs']),
+            ('_ZNembedded' + scope + 'E', ['/src/legacy.rs']),
+            ('_R7omg_lib3pkg5other', ['/src/nonmatch.rs']),
+            ('_Rprefixletters', ['/src/short.rs']),
+            ('opaque', ['/src/opaque.rs']))]
+        files = {path: path[5:] for owner in owners for path in owner['filenames']
+                 if path.startswith('/src/')}
+        lookup = coverage.compiled_plain_parent_files(owners, files, [64_000_000])
+        for needle in (scope, '3pkg', '5tests', 'letters', '7absent', '', 'R'):
+            with self.subTest(needle=needle):
+                expected = {files.get(path, '<unattributed source>') for owner in owners
+                            if needle in owner['name'] or not owner['name'].startswith(('_R', '_ZN'))
+                            for path in owner['filenames']}
+                self.assertEqual(lookup(needle), expected)
+
+    def test_index_and_lookup_charge_before_decoding_or_traversal(self):
+        owners = [dict(name='_R7omg_lib3pkg5tests', filenames=['/src/test.rs'])]
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage.compiled_plain_parent_files(owners, {}, [len(owners)])
+        work = [64_000_000]
+        lookup = coverage.compiled_plain_parent_files(owners, {}, work)
+        work[0] = 0
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            lookup('5tests')
+
+
 class SourceConstructCapacityTests(unittest.TestCase):
     @contextlib.contextmanager
     def fixture(self):

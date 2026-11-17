@@ -55,9 +55,9 @@ SWIFT_SOURCES = {
     "swift.tar.gz": (SWIFT_ARCHIVE_URL, 1024 ** 3, 783919592),
     "swift.tar.gz.sig": (SWIFT_ARCHIVE_URL + ".sig", 1024 ** 2, 819),
 }
-PROVIDERS = ("bun", "deno", "erlang", "github_tool", "go", "php", "python", "ruby", "zig")
+PROVIDERS = ("bun", "deno", "erlang", "github_tool", "go", "java", "php", "python", "ruby", "zig")
 HOSTS = (
-    "api.github.com", "github.com", "raw.githubusercontent.com", "go.dev", "dl.google.com",
+    "api.github.com", "github.com", "raw.githubusercontent.com", "go.dev", "dl.google.com", "api.adoptium.net",
     "www.python.org", "downloads.python.org", "cache.ruby-lang.org", "www.ruby-lang.org",
     "builds.hex.pm", "get.erlware.org", "ziglang.org", "php.net", "www.php.net", "downloads.php.net",
     "download.swift.org", "www.swift.org",

@@ -1255,6 +1255,33 @@ mod tests {
             .expect("restore controlled prior selection");
         std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
             .expect("restore prior selection");
+        let launcher = fixture.versions.join("3.12.0/bin/python3");
+        let original = fs::read(&launcher).expect("published controlled launcher");
+        let permissions = fs::metadata(&launcher)
+            .expect("published controlled launcher mode")
+            .permissions();
+        fs::remove_file(&launcher).expect("remove only the candidate launcher");
+        let error = manager
+            .use_version("3.12.0")
+            .expect_err("a missing candidate launcher must fail before advisory review");
+        assert!(format!("{error:#}").contains("Failed to inspect runtime binary"));
+        fixture.assert_previous();
+        let outside = fixture.versions.join("outside-python");
+        fs::write(&outside, b"outside controlled runtime bytes")
+            .expect("outside candidate payload");
+        std::os::unix::fs::symlink(&outside, &launcher).expect("escaping candidate alias");
+        let error = manager
+            .use_version("3.12.0")
+            .expect_err("an escaping candidate launcher must not replace the active runtime");
+        assert!(format!("{error:#}").contains("Runtime binary symlink escapes version directory"));
+        fixture.assert_previous();
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            b"outside controlled runtime bytes"
+        );
+        fs::remove_file(&launcher).expect("remove only the escaping candidate alias");
+        fs::write(&launcher, original).expect("restore the controlled launcher");
+        fs::set_permissions(&launcher, permissions).expect("restore its exact published mode");
         fixture.corrupt_identity("3.12.0");
         assert!(manager.use_version("3.12.0").is_err());
         fixture.assert_previous();

@@ -331,6 +331,147 @@ fn java_platform() -> Result<(&'static str, &'static str)> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() {
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha256};
+
+        let archive = tar_gz_entries(
+            "jdk-21",
+            &[
+                ("bin/java", b"fixture Java launcher"),
+                ("bin/javac", b"fixture Java compiler"),
+                ("release", b"JAVA_VERSION=\"21.0.9\"\n"),
+                ("lib/owned.data", b"complete Java implementation"),
+            ],
+        )
+        .unwrap();
+        let wrong_release = tar_gz_entries(
+            "jdk-24",
+            &[
+                ("bin/java", b"fixture Java launcher"),
+                ("release", b"JAVA_VERSION=\"25.0.1\"\n"),
+            ],
+        )
+        .unwrap();
+        let (os, arch) = java_platform().unwrap();
+        let api = |feature| {
+            format!(
+                "/v3/assets/latest/{feature}/hotspot?architecture={arch}&image_type=jdk&os={os}&vendor=eclipse"
+            )
+        };
+        let package = |feature, version: &str, digest: String| {
+            serde_json::to_vec(&serde_json::json!([{
+                "binary":{"package":{
+                    "link":format!("https://github.com/adoptium/temurin{feature}-binaries/releases/download/jdk-{version}/jdk-{feature}.tar.gz"),
+                    "name":format!("jdk-{feature}.tar.gz"), "checksum":digest
+                }},
+                "version":{"semver":version}, "release_name":format!("jdk-{version}")
+            }])).unwrap()
+        };
+        let digest = hex::encode(Sha256::digest(&archive));
+        let success = package(21, "21.0.9+10", digest.clone());
+        let corrupt = package(
+            22,
+            "22.0.1+1",
+            hex::encode(Sha256::digest(b"different bytes")),
+        );
+        let wrong_feature = package(23, "24.0.1+1", digest);
+        let mismatch = package(24, "24.0.1+1", hex::encode(Sha256::digest(&wrong_release)));
+        super::super::test_https::fixed_public_routes(&[
+            ("api.adoptium.net", &api(21), &success),
+            (
+                "github.com",
+                "/adoptium/temurin21-binaries/releases/download/jdk-21.0.9+10/jdk-21.tar.gz",
+                &archive,
+            ),
+            ("api.adoptium.net", &api(22), &corrupt),
+            (
+                "github.com",
+                "/adoptium/temurin22-binaries/releases/download/jdk-22.0.1+1/jdk-22.tar.gz",
+                &archive,
+            ),
+            ("api.adoptium.net", &api(23), &wrong_feature),
+            ("api.adoptium.net", &api(24), &mismatch),
+            (
+                "github.com",
+                "/adoptium/temurin24-binaries/releases/download/jdk-24.0.1+1/jdk-24.tar.gz",
+                &wrong_release,
+            ),
+        ]);
+
+        let fixture = PublicationFixture::new("java", "bin/java");
+        let manager = JavaManager {
+            security: super::super::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install("21")
+            .await
+            .expect("complete public Java installation");
+        let installed = fixture.versions.join("21");
+        assert_eq!(
+            fs::read(fixture.versions.join("current/bin/java")).unwrap(),
+            b"fixture Java launcher"
+        );
+        assert_eq!(
+            fs::read(installed.join("bin/javac")).unwrap(),
+            b"fixture Java compiler"
+        );
+        assert_eq!(
+            fs::read(installed.join("release")).unwrap(),
+            b"JAVA_VERSION=\"21.0.9\"\n"
+        );
+        assert_eq!(
+            fs::read(installed.join("lib/owned.data")).unwrap(),
+            b"complete Java implementation"
+        );
+        for (feature, message) in [
+            ("22", "Checksum mismatch"),
+            (
+                "23",
+                "Adoptium exact release does not match requested Java feature",
+            ),
+            (
+                "24",
+                "Java archive release disagrees with exact publisher metadata",
+            ),
+        ] {
+            let error = manager
+                .install(feature)
+                .await
+                .expect_err("invalid publisher input cannot install Java");
+            assert!(
+                format!("{error:#}").contains(message),
+                "{feature}: {error:#}"
+            );
+            assert!(!fixture.versions.join(feature).exists());
+            assert_eq!(
+                fs::read_link(fixture.versions.join("current")).unwrap(),
+                installed
+            );
+        }
+        let admission = super::super::security::admit_installed(
+            "java",
+            &installed,
+            super::super::security::ReviewMode::CachedOnly,
+        )
+        .expect("retain exact Java publisher authority");
+        admission
+            .verify(&installed)
+            .expect("complete Java tree remains admitted");
+        let identity: serde_json::Value =
+            serde_json::from_str(&admission.identity_context().unwrap()).unwrap();
+        assert_eq!(identity[0]["version"], "21.0.9+10");
+        assert_eq!(identity[0]["vendor"], "temurin");
+        fs::remove_file(fixture.versions.join("current")).unwrap();
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current")).unwrap();
+        fixture.assert_previous();
+    }
+
     #[cfg(unix)]
     async fn stage_java_archive(
         versions_dir: &Path,

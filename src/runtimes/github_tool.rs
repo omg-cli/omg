@@ -952,7 +952,8 @@ mod tests {
                 ("bin/fixture-tool", b"#!/bin/sh\nexit 0\n"),
                 ("lib/owned.data", b"complete tool implementation"),
             ],
-        )?;
+        )
+        .expect("build the controlled GitHub tool archive");
         let asset_name = if cfg!(target_arch = "aarch64") {
             "fixture-tool-linux-aarch64.tar.gz"
         } else {

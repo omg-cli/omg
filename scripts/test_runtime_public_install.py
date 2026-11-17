@@ -24,6 +24,14 @@ def route(host="github.com", path="/release/archive.zip", body=None):
 
 
 class PublicRuntimeDriver(unittest.TestCase):
+    def test_java_public_installer_requires_fixed_adoptium_metadata_route(self):
+        self.assertIn("java", DRIVER.PROVIDERS)
+        self.assertIn("api.adoptium.net", DRIVER.HOSTS)
+        metadata = route(host="api.adoptium.net", path="/v3/assets/latest/21/hotspot?architecture=x64&image_type=jdk&os=linux&vendor=eclipse")
+        parsed, = DRIVER.parse_routes(json.dumps([metadata]).encode())
+        self.assertEqual((parsed.host, parsed.path, parsed.body),
+                         (metadata["host"], metadata["path"], bytes(metadata["body"])))
+
     @unittest.skipIf(os.name == "nt", "Native mounts and input ownership require POSIX")
     def test_swift_namespace_adds_only_private_disk_work_inputs_and_os_identity(self):
         with tempfile.TemporaryDirectory() as directory:

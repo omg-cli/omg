@@ -2089,6 +2089,52 @@ def compiled_method_parent_files(owners, files, work):
     return scopes, unknown
 
 
+_PLAIN_PARENT_ANCHOR = re.compile(r'(?=([0-9][A-Za-z_][A-Za-z0-9_]))')
+
+
+def compiled_plain_parent_files(owners, files, work):
+    """Prefilter literal scope searches without interpreting the raw owner names."""
+    _construct_charge(work, len(owners))
+    anchors = {}
+    unknown = set()
+    for owner in owners:
+        name = owner['name']
+        _construct_charge(work, len(name) + 1)
+        if not name.startswith(('_R', '_ZN')):
+            _construct_charge(work, len(owner['filenames']))
+            unknown.update(files.get(path, '<unattributed source>') for path in owner['filenames'])
+            continue
+        occurrences = _PLAIN_PARENT_ANCHOR.findall(name)
+        _construct_charge(work, len(occurrences))
+        keys = set(occurrences)
+        _construct_charge(work, len(keys))
+        for key in keys:
+            anchors.setdefault(key, []).append(owner)
+
+    def locations(scope):
+        _construct_charge(work, len(scope) + 1)
+        keys = _PLAIN_PARENT_ANCHOR.findall(scope)
+        _construct_charge(work, len(keys))
+        if keys:
+            key = min(keys, key=lambda value: (len(anchors.get(value, ())), value))
+            candidates = anchors.get(key, ())
+            _construct_charge(work, len(unknown))
+            matches = set(unknown)
+        else:
+            candidates = owners
+            matches = set()
+        _construct_charge(work, len(candidates))
+        for owner in candidates:
+            name = owner['name']
+            _construct_charge(work, len(name) + 1)
+            if scope in name or not name.startswith(('_R', '_ZN')):
+                _construct_charge(work, len(owner['filenames']))
+                matches.update(files.get(path, '<unattributed source>') for path in owner['filenames'])
+        return matches
+
+    return locations
+
+
 def replacement_raw_parent(symbol, declaration=None):
     if type(symbol) is not str or len(symbol) > 4096:
         return None
@@ -4905,9 +4951,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
-    parent_file_cache = {}; method_parent_files = None; owner_indexes = None
+    parent_file_cache = {}; method_parent_files = None; plain_parent_files = None; owner_indexes = None
     def parent_files(parent):
-        nonlocal method_parent_files
+        nonlocal method_parent_files, plain_parent_files
         method_scope = parent[0].startswith('method:')
         key = method_scope, parent[1]
         if key not in parent_file_cache:
@@ -4919,14 +4965,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 _construct_charge(construct_work, len(parent[1]) + len(locations) + len(unknown))
                 parent_file_cache[key] = locations | unknown
             else:
-                locations = set()
-                _construct_charge(construct_work, len(bf))
-                for owner in bf:
-                    _construct_charge(construct_work, len(owner['name']) + 1)
-                    if parent[1] in owner['name'] or not owner['name'].startswith(('_R', '_ZN')):
-                        _construct_charge(construct_work, len(owner['filenames']))
-                        locations.update(base_files.get(path, '<unattributed source>') for path in owner['filenames'])
-                parent_file_cache[key] = locations
+                if plain_parent_files is None:
+                    plain_parent_files = compiled_plain_parent_files(bf, base_files, construct_work)
+                parent_file_cache[key] = plain_parent_files(parent[1])
         return parent_file_cache[key]
     def head_constructs(name):
         if name not in head_inventories:

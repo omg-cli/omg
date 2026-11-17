@@ -950,10 +950,15 @@ mod tests {
             } else {
                 b"#!/bin/sh\nprintf 'PHP 8.5.1 (cli)\\n'\n".as_slice()
             };
+            let (root, launcher) = if case == "replace" {
+                (".", "php8.5")
+            } else {
+                ("usr", "bin/php8.5")
+            };
             let bytes = tar_xz_entries(
-                "usr",
+                root,
                 &[
-                    ("bin/php8.5", script),
+                    (launcher, script),
                     (
                         "include/php/main/php_version.h",
                         b"#define PHP_VERSION \"8.5.1\"\n",
@@ -970,7 +975,14 @@ mod tests {
             let result = manager.publish_download(&fixture.archive, url, "8.5").await;
             if matches!(case, "success" | "replace") {
                 result.expect("publish and replace the complete reviewed PHP channel");
-                assert!(fixture.versions.join("8.5/bin/php").is_symlink());
+                assert_eq!(
+                    fs::read_link(fixture.versions.join("8.5/bin/php")).unwrap(),
+                    Path::new(if case == "replace" {
+                        "../php8.5"
+                    } else {
+                        "php8.5"
+                    })
+                );
             } else {
                 let error = result.expect_err("changed or unexecutable PHP cannot publish");
                 let message = format!("{error:#}");
