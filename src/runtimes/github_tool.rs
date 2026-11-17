@@ -566,28 +566,40 @@ impl GenericToolManager {
             .tempdir_in(&self.versions_dir)?;
         let download_path = downloads.path().join(&asset.name);
         download_with_progress(self.client, &url, &download_path, &checksum).await?;
-
-        println!("{} Extracting (pure Rust)...", style::informative("→"));
-        let staging = begin_staged_install(&self.versions_dir)?;
-        self.populate_staging(&download_path, kind, staging.path())
+        self.publish_download(&download_path, &url, &version, kind)
             .await?;
-        let publisher = super::security::record_download(
-            self.spec.name,
-            &version,
-            &version_dir,
-            &download_path,
-            &url,
-        )?;
-        let _admission =
-            self.security
-                .prepare_staged(self.spec.name, &version, staging.path(), &version_dir)?;
-        complete_staged_install(&staging, &version_dir, &version)?;
-        publisher.commit();
-
-        remove_file_best_effort(&download_path, "tool archive");
 
         print_installed(&self.display(), &version);
         self.use_version(&version)?;
+        Ok(())
+    }
+
+    async fn publish_download(
+        &self,
+        download_path: &Path,
+        url: &str,
+        version: &str,
+        kind: ArchiveKind,
+    ) -> Result<()> {
+        let version_dir = self.versions_dir.join(version);
+        println!("{} Extracting (pure Rust)...", style::informative("→"));
+        let staging = begin_staged_install(&self.versions_dir)?;
+        self.populate_staging(download_path, kind, staging.path())
+            .await?;
+        let publisher = super::security::record_download(
+            self.spec.name,
+            version,
+            &version_dir,
+            download_path,
+            url,
+        )?;
+        let _admission =
+            self.security
+                .prepare_staged(self.spec.name, version, staging.path(), &version_dir)?;
+        complete_staged_install(&staging, &version_dir, version)?;
+        publisher.commit();
+
+        remove_file_best_effort(download_path, "tool archive");
         Ok(())
     }
 
@@ -857,7 +869,7 @@ mod tests {
 
     async fn registry_publication_fixture(
         versions: &Path,
-        corrupt_download: bool,
+        invalid_digest: bool,
         mutate_candidate: bool,
     ) -> Result<(GenericToolManager, super::super::test_https::HttpsFixture)> {
         use sha2::{Digest as _, Sha256};
@@ -879,8 +891,8 @@ mod tests {
             asset_name.to_owned()
         };
         let asset_path = format!("/omg-fixtures/registry/releases/download/v1.2.3/{asset_name}");
-        let digest = if corrupt_download {
-            "0".repeat(64)
+        let digest = if invalid_digest {
+            "not-a-sha256".to_owned()
         } else {
             hex::encode(Sha256::digest(&archive))
         };
@@ -888,17 +900,16 @@ mod tests {
             "tag_name":"v1.2.3", "prerelease":false,
             "assets":[{"name":asset_name,"browser_download_url":format!("https://api.github.com{asset_path}"),"digest":format!("sha256:{digest}")}]
         }]))?;
-        let fixture = super::super::test_https::HttpsFixture::new(
-            "api.github.com",
-            vec![
-                (
-                    "/repos/omg-fixtures/registry/releases?per_page=30&page=1".into(),
-                    release,
-                ),
-                (asset_path, archive),
-            ],
-        )
-        .await?;
+        let mut responses = vec![(
+            "/repos/omg-fixtures/registry/releases?per_page=30&page=1".into(),
+            release,
+        )];
+        if !invalid_digest {
+            responses.push((asset_path, archive));
+        }
+        let fixture =
+            super::super::test_https::HttpsFixture::new("api.github.com", responses).await?;
+        fs::create_dir_all(versions)?;
         let security = if mutate_candidate {
             super::super::test_archive::mutation_security(versions)
         } else {
@@ -915,17 +926,55 @@ mod tests {
         ))
     }
 
+    // The public downloader deliberately owns its transport; this fixture exercises
+    // TLS metadata and the shared publication owner after authenticating fixture bytes.
+    async fn authenticated_registry_archive(
+        manager: &GenericToolManager,
+        owner: &Path,
+    ) -> Result<(PathBuf, String, ArchiveKind)> {
+        use sha2::{Digest as _, Sha256};
+        let release = manager.release_for_version("1.2.3").await?;
+        let (asset, kind) =
+            select_asset(&release.assets, None, None).expect("host-compatible fixture archive");
+        let checksum = manager.checksum_for_asset(&release, asset).await?;
+        let url = asset
+            .browser_download_url
+            .clone()
+            .expect("fixture archive URL");
+        let archive = manager
+            .client
+            .get(&url)
+            .send()
+            .await
+            .expect("fixture archive response")
+            .error_for_status()
+            .expect("successful fixture archive")
+            .bytes()
+            .await
+            .expect("complete fixture archive");
+        assert_eq!(hex::encode(Sha256::digest(&archive)), checksum);
+        let path = owner.join("authenticated-runtime.archive");
+        fs::write(&path, archive).expect("owned authenticated archive");
+        Ok((path, url, kind))
+    }
+
     #[tokio::test]
-    async fn https_registry_installation_commits_only_reviewed_complete_tool_content() {
+    async fn tls_registry_metadata_and_authenticated_archive_publish_reviewed_complete_content() {
         let owner = tempfile::tempdir().expect("owned registry publication root");
         let versions = owner.path().join("versions/node");
         let (manager, transport) = registry_publication_fixture(&versions, false, false)
             .await
             .expect("real fixed-origin TLS registry fixture");
+        let (archive, url, kind) = authenticated_registry_archive(&manager, owner.path())
+            .await
+            .expect("authenticated TLS fixture archive");
         manager
-            .install("1.2.3")
+            .publish_download(&archive, &url, "1.2.3", kind)
             .await
             .expect("verified and admitted generic publication");
+        manager
+            .use_version("1.2.3")
+            .expect("activate reviewed publication");
         let installed = versions.join("1.2.3");
         assert_eq!(
             fs::read(installed.join("bin/fixture-tool")).expect("published contained launcher"),
@@ -969,14 +1018,20 @@ mod tests {
             let (manager, transport) = registry_publication_fixture(&versions, corrupt, mutate)
                 .await
                 .expect("real refused registry TLS fixture");
-            let error = manager
-                .install("1.2.3")
-                .await
-                .expect_err("integrity changes must refuse publication");
+            let candidate = authenticated_registry_archive(&manager, owner.path()).await;
+            let error = if corrupt {
+                candidate.expect_err("malformed publisher digest must refuse before download")
+            } else {
+                let (archive, url, kind) = candidate.expect("authenticated fixture archive");
+                manager
+                    .publish_download(&archive, &url, "1.2.3", kind)
+                    .await
+                    .expect_err("changed candidate must refuse publication")
+            };
             let detail = format!("{error:#}");
             assert!(
                 detail.contains(if corrupt {
-                    "Checksum mismatch"
+                    "Invalid SHA-256 digest"
                 } else {
                     "changed"
                 }),
@@ -999,7 +1054,7 @@ mod tests {
                     .await
                     .expect("refusal settled real TLS transport")
                     .len(),
-                2
+                if corrupt { 1 } else { 2 }
             );
         }
     }
@@ -1027,8 +1082,11 @@ mod tests {
         let (manager, transport) = registry_publication_fixture(&versions, false, false)
             .await
             .expect("real competing registry TLS fixture");
+        let (archive, url, kind) = authenticated_registry_archive(&manager, owner.path())
+            .await
+            .expect("authenticated competing fixture archive");
         let error = manager
-            .install("1.2.3")
+            .publish_download(&archive, &url, "1.2.3", kind)
             .await
             .expect_err("a second candidate must not overwrite live authority");
         assert!(format!("{error:#}").contains("conflicts"));

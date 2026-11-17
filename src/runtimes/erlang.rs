@@ -787,8 +787,21 @@ mod tests {
                 }
                 if case.ends_with("escape") {
                     assert!(
-                        message.contains("symbolic link") || message.contains("symlink"),
+                        message.contains("Runtime advisory inventory contains an escaping link"),
                         "{message}"
+                    );
+                    let injected =
+                        fixture
+                            .versions
+                            .join("27.0.0")
+                            .join(if case == "setup-escape" {
+                                "escaped-after-setup"
+                            } else {
+                                "escaped-after-smoke"
+                            });
+                    assert_eq!(
+                        fs::read_link(injected).expect("intended post-execution escape control"),
+                        Path::new("/bin/sh")
                     );
                 }
                 let failed = fixture.versions.join("27.0.0");

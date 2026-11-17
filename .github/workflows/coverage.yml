@@ -215,7 +215,7 @@ jobs:
           evidence = Path('native-protocol-coverage')
           evidence.mkdir()
           registry_environment = os.environ.copy()
-          registry_environment['LLVM_PROFILE_FILE'] = str(target / 'omg-root-native-registry-%p-%m.profraw')
+          registry_environment['LLVM_PROFILE_FILE'] = str(target / 'omg-fixture-native_protocol_registry-%p-%m.profraw')
           selected = []
           for candidate in sorted((target / 'debug/deps').glob('omg-*')):
               if (candidate.is_symlink() or not candidate.is_file()
@@ -229,8 +229,8 @@ jobs:
           assert len(selected) == 1, 'Expected exactly one existing instrumented bin unit harness'
           binary = selected[0]
           environment = os.environ.copy()
-          environment['LLVM_PROFILE_FILE'] = str(target / 'omg-root-native-protocol-%p-%m.profraw')
-          assert not list(target.glob('omg-root-native-protocol-*.profraw')), 'Root profiles must be fresh'
+          environment['LLVM_PROFILE_FILE'] = str(target / 'omg-fixture-native_protocol-%p-%m.profraw')
+          assert not list(target.glob('omg-fixture-native_protocol-*.profraw')), 'Root profiles must be fresh'
           result = subprocess.run([str(binary), '--exact', name, '--nocapture', '--test-threads=1'],
               env=environment, capture_output=True, timeout=30, check=False)
           log = result.stdout + result.stderr
@@ -241,7 +241,7 @@ jobs:
           assert re.search(rb'^test result: ok\. 1 passed; 0 failed; 0 ignored;', log, re.M)
           assert re.findall(rb'^test (tests::\S+) \.\.\. ok$', log, re.M) == [name.encode()]
           assert not re.search(rb'\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)', log)
-          profiles = sorted(target.glob('omg-root-native-protocol-*.profraw'))
+          profiles = sorted(target.glob('omg-fixture-native_protocol-*.profraw'))
           assert profiles and all(path.is_file() and path.stat().st_size > 0 for path in profiles)
           def digest(path):
               with path.open('rb') as stream:

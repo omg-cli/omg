@@ -805,7 +805,11 @@ fn principal() -> (u32, u32) {
     )
 }
 fn policy_digest() -> Result<String> {
-    let policy = SecurityPolicy::load_current()?;
+    loaded_policy_digest(SecurityPolicy::load_current())
+}
+
+fn loaded_policy_digest(policy: Result<SecurityPolicy>) -> Result<String> {
+    let policy = policy?;
     let bytes = serde_json::to_vec(&policy)?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
@@ -2450,30 +2454,31 @@ mod tests {
 
     #[test]
     fn malformed_current_policy_refuses_runtime_authority_digest() {
-        const NAME: &str =
-            "runtimes::security::tests::malformed_current_policy_refuses_runtime_authority_digest";
-        if crate::core::testing::run_isolated_test(NAME) {
-            return;
-        }
         let owner = tempfile::tempdir().expect("owned runtime policy fixture");
-        let config = owner.path().join("config");
-        let policy_dir = config.join("omg");
-        fs::create_dir_all(&policy_dir).expect("owned runtime policy directory");
-        temp_env::with_vars(
-            [
-                (
-                    "OMG_CONFIG_DIR",
-                    Some(policy_dir.to_str().expect("fixture config path")),
-                ),
-                ("SUDO_USER", None),
-                ("DOAS_USER", None),
-            ],
-            || {
-                assert_eq!(crate::core::paths::config_dir(), policy_dir);
-                fs::write(policy_dir.join("policy.toml"), b"invalid = [")
-                    .expect("write malformed runtime policy fixture");
-                assert!(policy_digest().is_err());
-            },
+        let path = owner.path().join("policy.toml");
+        fs::write(&path, b"invalid = [").expect("write malformed runtime policy fixture");
+        // The production loader selects protected root configuration. Exercise
+        // its actual file/parser phase using an explicit owned fixture instead.
+        let invalid = SecurityPolicy::load_optional(&path).map_err(anyhow::Error::from);
+        let error = loaded_policy_digest(invalid).expect_err(
+            "malformed policy must never receive runtime authority or default fallback",
+        );
+        assert!(matches!(
+            error.downcast_ref::<crate::core::security::policy::PolicyError>(),
+            Some(crate::core::security::policy::PolicyError::Parse { .. })
+        ));
+        let valid = SecurityPolicy::default();
+        fs::write(
+            &path,
+            toml::to_string(&valid).expect("serialize valid private policy"),
+        )
+        .expect("write valid private policy");
+        let loaded = SecurityPolicy::load_optional(&path).map_err(anyhow::Error::from);
+        assert_eq!(
+            loaded_policy_digest(loaded).expect("actual valid policy receives an authority digest"),
+            hex::encode(Sha256::digest(
+                serde_json::to_vec(&valid).expect("exact valid policy bytes")
+            ))
         );
     }
 
