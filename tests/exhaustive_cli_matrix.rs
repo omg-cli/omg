@@ -321,6 +321,82 @@ mod runtime_matrix {
         res.assert_stdout_contains("running tests");
         res.assert_no_ansi();
     }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn new_scaffolds_without_ambient_package_managers_or_runtimes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = TestProject::new();
+        let fake_bin = project.path().join("fake-bin");
+        std::fs::create_dir(&fake_bin).unwrap();
+        for command in ["npm", "node", "cargo", "rustc", "poetry", "python", "go"] {
+            let path = fake_bin.join(command);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\nprintf '%s\\n' \"$0\" >> \"$OMG_SCAFFOLD_MARKER\"\nexit 73\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let marker = project.path().join("ambient-executed");
+        let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+        let env = [
+            ("PATH", path.as_str()),
+            ("OMG_SCAFFOLD_MARKER", marker.to_str().unwrap()),
+        ];
+        for (stack, manifest) in [
+            ("rust", "Cargo.toml"),
+            ("react", "package.json"),
+            ("node", "package.json"),
+            ("python", "pyproject.toml"),
+            ("go", "go.mod"),
+        ] {
+            let name = format!("samples/{stack}-starter");
+            project
+                .run_with_env(&["new", stack, &name], &env)
+                .assert_success();
+            let target = project.path().join(name);
+            assert!(target.join(manifest).is_file(), "{stack}");
+            assert!(target.join(".git").is_dir(), "{stack}");
+            assert!(!target.join("node_modules").exists(), "{stack}");
+            assert!(!target.join(".venv").exists(), "{stack}");
+        }
+        assert!(
+            !marker.exists(),
+            "scaffold executed an ambient manager or runtime"
+        );
+        assert!(
+            project
+                .path()
+                .join("samples/react-starter/src/main.tsx")
+                .is_file()
+        );
+        let package: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(project.path().join("samples/react-starter/package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package["name"], "react-starter");
+        assert_eq!(package["scripts"]["dev"], "vite");
+        for (stack, name) in [
+            ("rust", "invalid/with.dot"),
+            ("react", "invalid/Uppercase"),
+            ("node", "invalid/with+plus"),
+            ("python", "invalid/trailing_"),
+            ("go", "invalid@module/go-starter"),
+        ] {
+            let result = project.run_with_env(&["new", stack, name], &env);
+            result.assert_failure();
+            assert!(result.combined_output().contains("project manifest name"));
+            assert!(!project.path().join(name).exists(), "{stack} wrote files");
+        }
+        assert!(!project.path().join("invalid").exists());
+        assert!(
+            !marker.exists(),
+            "rejected scaffold executed an ambient command"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

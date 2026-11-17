@@ -1096,6 +1096,8 @@ omg run build,test,lint --parallel
 
 Create new projects from templates.
 
+The templates generate project files locally. React and Node write a dependency manifest for you to review before installing dependencies. Python writes a project manifest and starter script. When OMG has a selected runtime for the stack, the template records its version in `.tool-versions`.
+
 ```bash
 omg new <stack> <name> [aliases: create]
 ```

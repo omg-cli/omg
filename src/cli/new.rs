@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::fmt::Write as _;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -19,6 +19,42 @@ fn canonical_stack(stack: &str) -> Option<&'static str> {
         "go" | "golang" => Some("go"),
         _ => None,
     }
+}
+
+fn validate_manifest_name(stack: &str, name: &str, path: &str) -> Result<()> {
+    let first = name.as_bytes().first().copied().unwrap_or_default();
+    let last = name.as_bytes().last().copied().unwrap_or_default();
+    let valid = match stack {
+        "rust" => {
+            (first.is_ascii_alphabetic() || first == b'_')
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+        }
+        "react" | "node" => {
+            name.len() <= 214
+                && (first.is_ascii_lowercase() || first.is_ascii_digit())
+                && name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_.".contains(&byte)
+                })
+        }
+        "python" => {
+            first.is_ascii_alphanumeric()
+                && last.is_ascii_alphanumeric()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        }
+        "go" => path.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+        }),
+        _ => false,
+    };
+    anyhow::ensure!(valid, "Invalid {stack} project manifest name: {name}");
+    Ok(())
 }
 
 /// Create a new project
@@ -55,12 +91,21 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
     let canonical_stack = canonical_stack(stack).ok_or_else(|| {
         anyhow::anyhow!("Unknown stack: {stack}. Supported: rust, react, node, python, go")
     })?;
+    let project_name = target_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name);
+    validate_manifest_name(canonical_stack, project_name, name)?;
+    if let Some(parent) = target_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir(&target_dir)?;
     match canonical_stack {
-        "rust" => scaffold_rust(name)?,
-        "react" => scaffold_react(name)?,
-        "node" => scaffold_node(name)?,
-        "python" => scaffold_python(name)?,
-        "go" => scaffold_go(name)?,
+        "rust" => scaffold_rust(&target_dir, project_name)?,
+        "react" => scaffold_react(&target_dir, project_name)?,
+        "node" => scaffold_node(&target_dir, project_name)?,
+        "python" => scaffold_python(&target_dir, project_name)?,
+        "go" => scaffold_go(&target_dir, name)?,
         _ => unreachable!("canonical_stack returned an unknown family"),
     }
 
@@ -85,163 +130,159 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
     println!("\n{}", style::success("Project created successfully! 🚀"));
     println!("\nTo get started:");
     println!("  cd {name}");
-    println!("  omg run dev  (or build/start)");
+    if matches!(canonical_stack, "react" | "node") {
+        println!(
+            "  Review and install the dependencies listed in package.json before running the project."
+        );
+    }
 
     Ok(())
 }
 
-fn scaffold_rust(name: &str) -> Result<()> {
-    let pb = style::spinner("Running cargo new...");
-    let status = Command::new("cargo").args(["new", name]).status()?;
-    pb.finish_and_clear();
-
-    require_command_success(status, "cargo new")?;
-
-    println!("  {} Created Cargo project", style::success("✓"));
+fn scaffold_rust(root: &Path, name: &str) -> Result<()> {
+    fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+    )?;
+    fs::create_dir(root.join("src"))?;
+    fs::write(
+        root.join("src/main.rs"),
+        "fn main() {\n    println!(\"Hello from OMG!\");\n}\n",
+    )?;
+    fs::write(root.join(".gitignore"), "/target\n")?;
     Ok(())
 }
 
-fn scaffold_react(name: &str) -> Result<()> {
-    let pb = style::spinner("Running npm create vite...");
-    // npm create vite@latest my-app -- --template react-ts
-    let status = Command::new("npm")
-        .args([
-            "create",
-            "vite@latest",
-            "--",
-            name,
-            "--template",
-            "react-ts",
-        ])
-        .status()?;
-    pb.finish_and_clear();
-
-    require_command_success(status, "npm create vite")?;
-
-    println!("  {} Created React (Vite+TS) project", style::success("✓"));
-
-    // Auto install
-    println!("  {} Installing dependencies...", style::dim("→"));
-    let status = Command::new("npm")
-        .args(["install", "--ignore-scripts"])
-        .current_dir(name)
-        .status()
-        .context("Failed to launch npm install")?;
-    require_command_success(status, "npm install")?;
-
-    Ok(())
-}
-
-fn scaffold_node(name: &str) -> Result<()> {
-    // Minimal Node+TS setup
-    std::fs::create_dir_all(name)?;
-    let root = Path::new(name);
-
-    // package.json
-    let pkg_json = format!(
-        r#"{{
-  "name": "{name}",
-  "version": "0.1.0",
-  "scripts": {{
-    "start": "ts-node src/index.ts",
-    "build": "tsc",
-    "dev": "ts-node-dev --respawn src/index.ts"
-  }},
-  "dependencies": {{}},
-  "devDependencies": {{
-    "typescript": "latest",
-    "ts-node": "latest",
-    "ts-node-dev": "latest",
-    "@types/node": "latest"
-  }}
-}}"#
-    );
-    std::fs::write(root.join("package.json"), pkg_json)?;
-
-    // tsconfig.json
-    std::fs::write(
+fn scaffold_react(root: &Path, name: &str) -> Result<()> {
+    let package = serde_json::json!({
+        "name": name,
+        "version": "0.1.0",
+        "private": true,
+        "type": "module",
+        "scripts": {
+            "dev": "vite",
+            "build": "tsc --noEmit && vite build",
+            "preview": "vite preview"
+        },
+        "dependencies": {"react": "^19.3.1", "react-dom": "^19.3.1"},
+        "devDependencies": {
+            "@types/react": "^19.3.0",
+            "@types/react-dom": "^19.3.0",
+            "typescript": "^5.9.3",
+            "vite": "^8.3.8"
+        }
+    });
+    fs::write(
+        root.join("package.json"),
+        serde_json::to_vec_pretty(&package)?,
+    )?;
+    fs::write(
         root.join("tsconfig.json"),
         r#"{
   "compilerOptions": {
-    "target": "es2020",
-    "module": "commonjs",
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
     "strict": true,
-    "esModuleInterop": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "outDir": "./dist"
-  }
-}"#,
+    "noEmit": true
+  },
+  "include": ["src"]
+}
+"#,
     )?;
-
-    // src/index.ts
-    std::fs::create_dir_all(root.join("src"))?;
-    std::fs::write(
-        root.join("src/index.ts"),
-        r#"console.log("Hello from OMG!");"#,
+    fs::write(
+        root.join("index.html"),
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>React starter</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+"#,
     )?;
+    fs::create_dir(root.join("src"))?;
+    fs::write(
+        root.join("src/main.tsx"),
+        r#"import { createRoot } from "react-dom/client";
 
-    // .gitignore
-    std::fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")?;
-
-    println!("  {} Created Node+TS template", style::success("✓"));
-
-    println!("  {} Installing dependencies...", style::dim("→"));
-    let status = Command::new("npm")
-        .args(["install", "--ignore-scripts"])
-        .current_dir(root)
-        .status()
-        .context("Failed to launch npm install")?;
-    require_command_success(status, "npm install")?;
-
+const root = document.getElementById("root");
+if (root) {
+  createRoot(root).render(<h1>Hello from OMG!</h1>);
+}
+"#,
+    )?;
+    fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")?;
     Ok(())
 }
 
-fn scaffold_python(name: &str) -> Result<()> {
-    let pb = style::spinner("Running poetry new...");
-    let status = Command::new("poetry").args(["new", name]).status();
-
-    pb.finish_and_clear();
-
-    match status {
-        Ok(status) => require_command_success(status, "poetry new")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            println!(
-                "  {} Poetry not found, using venv fallback...",
-                style::warning("⚠")
-            );
-            std::fs::create_dir_all(name)?;
-            let status = Command::new("python")
-                .args(["-m", "venv", ".venv"])
-                .current_dir(name)
-                .status()
-                .context("Failed to launch python venv")?;
-            require_command_success(status, "python venv")?;
-            std::fs::write(Path::new(name).join("requirements.txt"), "")?;
-            std::fs::write(Path::new(name).join("main.py"), "print('Hello from OMG!')")?;
-            return Ok(());
+fn scaffold_node(root: &Path, name: &str) -> Result<()> {
+    let package = serde_json::json!({
+        "name": name,
+        "version": "0.1.0",
+        "private": true,
+        "type": "module",
+        "scripts": {
+            "start": "tsx src/index.ts",
+            "build": "tsc",
+            "dev": "tsx watch src/index.ts"
+        },
+        "devDependencies": {
+            "typescript": "^5.9.3",
+            "tsx": "^4.23.15",
+            "@types/node": "^22.0.0"
         }
-        Err(error) => return Err(error).context("Failed to launch poetry new"),
-    }
-
-    println!("  {} Created Python (Poetry) project", style::success("✓"));
+    });
+    fs::write(
+        root.join("package.json"),
+        serde_json::to_vec_pretty(&package)?,
+    )?;
+    fs::write(
+        root.join("tsconfig.json"),
+        r#"{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "strict": true,
+    "skipLibCheck": true,
+    "outDir": "./dist"
+  },
+  "include": ["src"]
+}
+"#,
+    )?;
+    fs::create_dir(root.join("src"))?;
+    fs::write(
+        root.join("src/index.ts"),
+        "console.log(\"Hello from OMG!\");\n",
+    )?;
+    fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")?;
     Ok(())
 }
 
-fn scaffold_go(name: &str) -> Result<()> {
-    std::fs::create_dir_all(name)?;
-    let root = Path::new(name);
+fn scaffold_python(root: &Path, name: &str) -> Result<()> {
+    fs::write(
+        root.join("pyproject.toml"),
+        format!(
+            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\nrequires-python = \">=3.10\"\ndependencies = []\n"
+        ),
+    )?;
+    fs::write(root.join("requirements.txt"), "")?;
+    fs::write(root.join("main.py"), "print('Hello from OMG!')\n")?;
+    fs::write(root.join(".gitignore"), ".venv/\n__pycache__/\n.env\n")?;
+    Ok(())
+}
 
-    // go mod init
-    let status = Command::new("go")
-        .args(["mod", "init", name])
-        .current_dir(root)
-        .status()
-        .context("Failed to launch go mod init")?;
-    require_command_success(status, "go mod init")?;
-
-    // main.go
-    std::fs::write(
+fn scaffold_go(root: &Path, name: &str) -> Result<()> {
+    fs::write(root.join("go.mod"), format!("module {name}\n\ngo 1.21.0\n"))?;
+    fs::write(
         root.join("main.go"),
         r#"package main
 
@@ -252,9 +293,7 @@ func main() {
 }
 "#,
     )?;
-
-    // Taskfile.yml
-    std::fs::write(
+    fs::write(
         root.join("Taskfile.yml"),
         r"version: '3'
 
@@ -267,80 +306,22 @@ tasks:
       - go run main.go
 ",
     )?;
-
-    println!("  {} Created Go project", style::success("✓"));
     Ok(())
 }
 
-/// Detect current runtime versions and lock them
 fn lock_runtimes(target_dir: &Path, stack: &str) -> Result<()> {
-    let mut content = String::new();
-
-    // Helper to get version
-    let get_ver = |cmd: &str, args: &[&str]| -> Option<String> {
-        if let Ok(output) = Command::new(cmd).args(args).output() {
-            let s = String::from_utf8_lossy(&output.stdout);
-            // Parse "v1.2.3" or "cargo 1.2.3 (date)"
-            // Simple approach: look for first thing that looks like a version
-            // For now, let's just grab the whole string or format it
-            // Node: "v18.1.0\n" -> "18.1.0"
-            if cmd == "node" {
-                return Some(s.trim().trim_start_matches('v').to_string());
-            }
-            // Python: "Python 3.11.0\n" -> "3.11.0"
-            if cmd == "python"
-                && let Some(v) = s.split_whitespace().nth(1)
-            {
-                return Some(v.to_string());
-            }
-            // Go: "go version go1.21.0 linux/amd64" -> "1.21.0"
-            if cmd == "go"
-                && let Some(v) = s.split_whitespace().nth(2)
-            {
-                return Some(v.trim_start_matches("go").to_string());
-            }
-            // Rust: "rustc 1.75.0 (....)" -> "1.75.0"
-            if cmd == "rustc"
-                && let Some(v) = s.split_whitespace().nth(1)
-            {
-                return Some(v.to_string());
-            }
-        }
-        None
-    };
-
-    match stack.to_lowercase().as_str() {
-        "react" | "node" | "ts" => {
-            if let Some(v) = get_ver("node", &["--version"]) {
-                let _ = writeln!(content, "node {v}");
-                println!("  {} Locked node to {}", style::success("✓"), v);
-            }
-        }
-        "python" => {
-            if let Some(v) = get_ver("python", &["--version"]) {
-                let _ = writeln!(content, "python {v}");
-                println!("  {} Locked python to {}", style::success("✓"), v);
-            }
-        }
-        "go" => {
-            if let Some(v) = get_ver("go", &["version"]) {
-                let _ = writeln!(content, "go {v}");
-                println!("  {} Locked go to {}", style::success("✓"), v);
-            }
-        }
-        "rust" => {
-            if let Some(v) = get_ver("rustc", &["--version"]) {
-                let _ = writeln!(content, "rust {v}");
-                println!("  {} Locked rust to {}", style::success("✓"), v);
-            }
-        }
-        _ => {}
+    let runtime = if stack == "react" { "node" } else { stack };
+    let versions = crate::core::paths::data_dir()
+        .join("versions")
+        .join(runtime);
+    if let Some(version) = crate::runtimes::common::get_current_version(&versions) {
+        crate::core::security::validate_runtime_version(&version)?;
+        fs::write(
+            target_dir.join(".tool-versions"),
+            format!("{runtime} {version}\n"),
+        )?;
+        println!("  {} Locked {runtime} to {version}", style::success("✓"));
     }
-
-    if !content.is_empty() {
-        std::fs::write(target_dir.join(".tool-versions"), content)?;
-    }
-
     Ok(())
 }
 
