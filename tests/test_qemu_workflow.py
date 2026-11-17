@@ -352,6 +352,59 @@ exit "$rc"
         self.assertEqual(result.returncode, 0, result.stderr)
         return controller
 
+    def test_current_offline_scaffold_has_exact_reviewed_inventory_projection(self):
+        repository = WORKFLOW.parents[2]
+        inventory = repository / 'tests/cli_behavior_inventory.tsv'
+        result = subprocess.run(
+            [sys.executable, str(repository / 'scripts/check-qemu-inventory.py'),
+             '--policy', str(repository / 'tests/qemu-inventory-policy.json'),
+             '--inventory', str(inventory), '--network-scopes'],
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        projection = json.loads(result.stdout)
+        self.assertEqual(projection['inventory_sha256'], hashlib.sha256(inventory.read_bytes()).hexdigest())
+        self.assertEqual(projection['scopes']['new'], 'offline')
+        row, = [line.split('\t') for line in inventory.read_text().splitlines()
+                if line.startswith('new\t')]
+        self.assertEqual(json.loads(row[1]), ['new', 'rust', 'smoke-app'])
+        self.assertEqual(row[2:], ['isolated-write', '0', 'pass', '-', 'hermetic',
+                                   'hermetic:pass', '-', 'tempdir-drop'])
+
+    def test_scaffold_projection_rejects_unreviewed_bytes_and_relabelled_tier(self):
+        repository = WORKFLOW.parents[2]
+        original = (repository / 'tests/cli_behavior_inventory.tsv').read_bytes()
+        original_policy = json.loads((repository / 'tests/qemu-inventory-policy.json').read_text())
+        current_digest = hashlib.sha256(original).hexdigest()
+        original_snapshot = repository / 'tests/qemu-inventory-policy.d' / (current_digest + '.json')
+        for mode in ('unreviewed-bytes', 'relabelled-tier'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                lines = original.decode().splitlines()
+                row_number, = [number for number, line in enumerate(lines) if line.startswith('new\t')]
+                fields = lines[row_number].split('\t')
+                fields[1 if mode == 'unreviewed-bytes' else 6] = (
+                    '["new","rust","different-project"]' if mode == 'unreviewed-bytes' else 'network')
+                lines[row_number] = '\t'.join(fields)
+                inventory = root / 'cases.tsv'
+                inventory.write_text('\n'.join(lines) + '\n')
+                policy = repository / 'tests/qemu-inventory-policy.json'
+                if mode == 'relabelled-tier':
+                    # Even an index that authenticates these changed bytes must
+                    # not borrow the reviewed case's offline/hermetic policy.
+                    policy = root / 'policy.json'
+                    digest = hashlib.sha256(inventory.read_bytes()).hexdigest()
+                    private_index = dict(original_policy, inventories={digest: original_policy['inventories'][current_digest]})
+                    policy.write_text(json.dumps(private_index))
+                    snapshots = root / 'policy.d'
+                    snapshots.mkdir()
+                    (snapshots / (digest + '.json')).write_bytes(original_snapshot.read_bytes())
+                result = subprocess.run(
+                    [sys.executable, str(repository / 'scripts/check-qemu-inventory.py'),
+                     '--policy', str(policy), '--inventory', str(inventory), '--network-scopes'],
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertFalse(json.loads(result.stdout)['passed'])
+
     @unittest.skipIf(os.name == 'nt', 'Controller packaging needs POSIX shell paths')
     def test_controller_ships_exact_executed_inventory_helpers(self):
         with tempfile.TemporaryDirectory() as directory:

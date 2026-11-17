@@ -2039,6 +2039,7 @@ mod tests {
                 .env_remove("__PYVENV_LAUNCHER__")
                 .args([
                     "-I",
+                    "-B",
                     "-c",
                     "import sys; print('.'.join(map(str, sys.version_info[:3])))",
                 ])
@@ -2066,7 +2067,7 @@ print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
             let output = Command::new(&python)
                 .env_remove("PYTHONEXECUTABLE")
                 .env_remove("__PYVENV_LAUNCHER__")
-                .args(["-I", "-c", PYTHON_IDENTITY])
+                .args(["-I", "-B", "-c", PYTHON_IDENTITY])
                 .output()
                 .unwrap();
             assert!(
@@ -2090,7 +2091,7 @@ print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
         let status = Command::new(bin.join("python3"))
             .env_remove("PYTHONEXECUTABLE")
             .env_remove("__PYVENV_LAUNCHER__")
-            .args(["-c", CREATE_VENV])
+            .args(["-B", "-c", CREATE_VENV])
             .arg(bin.join("python3"))
             .arg(&venv)
             .status()
@@ -2138,6 +2139,7 @@ print(json.dumps(('.'.join(map(str, sys.version_info[:3])),
         let program = format!(
             r"
 import os, pathlib, sys
+assert sys.dont_write_bytecode, 'fixture execution must not modify the reviewed Python tree'
 try:
     import omg_local_venv_probe
 except ImportError:
@@ -2161,15 +2163,15 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                 ("__PYVENV_LAUNCHER__", None),
             ],
             || {
-                drop(
-                    crate::runtimes::security::fixture_prepare(
-                        "python", &version, &runtime, &runtime,
-                    )
-                    .unwrap(),
-                );
+                // Keep the original full-content authority so every execution
+                // must leave the reviewed base tree unchanged, including caches.
+                let base_admission = crate::runtimes::security::fixture_prepare(
+                    "python", &version, &runtime, &runtime,
+                )
+                .unwrap();
                 execute_process_in(
                     "python3",
-                    &["-c".into(), program.clone()],
+                    &["-B".into(), "-c".into(), program.clone()],
                     &[],
                     None,
                     owner.path(),
@@ -2183,6 +2185,9 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     fs::read_to_string(&observed).unwrap(),
                     format!("{}|local-package", venv.display())
                 );
+                base_admission
+                    .verify_before_execution()
+                    .expect("venv task must not change the reviewed base Python tree");
                 use std::os::unix::{
                     fs::{PermissionsExt as _, symlink},
                     process::CommandExt as _,
@@ -2220,10 +2225,13 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     admission.verify_before_execution().unwrap();
                     let status = Command::new(kernel)
                         .arg0(argv0.unwrap())
-                        .args(["-c", &program])
+                        .args(["-B", "-c", &program])
                         .status()
                         .unwrap();
                     assert!(status.success());
+                    base_admission
+                        .verify_before_execution()
+                        .expect("retargeted venv execution must not change the reviewed base tree");
                     assert!(
                         !replaced.exists(),
                         "replaced virtualenv entry executed after admission"

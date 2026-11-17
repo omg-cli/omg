@@ -447,6 +447,8 @@ fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<P
         "Missing package name in {} from repository {repo_name}",
         entry_path.display()
     );
+    let package_version = pkg.canonical_version();
+    require_package_version(&package_version)?;
     let directory = entry_path
         .parent()
         .and_then(Path::to_str)
@@ -470,7 +472,7 @@ fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<P
         .context("Missing sync package version in directory identity")?;
     let native_version = require_package_version(&directory[native_name.len() + 1..])?;
     anyhow::ensure!(
-        native_name == pkg.name() && native_version.to_string() == pkg.canonical_version(),
+        native_name == pkg.name() && native_version.to_string() == package_version,
         "Inconsistent package identity in {} from repository {repo_name}",
         entry_path.display()
     );
@@ -3166,6 +3168,43 @@ mod tests {
         format!(
             "%FILENAME%\n{name}-{file_version}-x86_64.pkg.tar.zst\n\n%NAME%\n{name}\n\n%BASE%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nComplete typed metadata\n\n%GROUPS%\nfixture-group\n\n%CSIZE%\n1024\n\n%ISIZE%\n4096\n\n%SHA256SUM%\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\n{v1_fields}%URL%\nhttps://example.invalid/widget\n\n%LICENSE%\nMIT\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n1700000000\n\n%PACKAGER%\nOMG Fixture <fixture@example.invalid>\n\n%DEPENDS%\nglibc>=2.40\n\n%MAKEDEPENDS%\ncmake>=3\n\n%CHECKDEPENDS%\npytest\n\n%OPTDEPENDS%\noptional: runtime support\n\n%PROVIDES%\nvirtual-widget=1\n\n%CONFLICTS%\nincompatible-widget<2\n\n%REPLACES%\nolder-widget\n\n"
         )
+    }
+
+    #[test]
+    fn typed_sync_versions_enforce_the_project_nul_boundary() {
+        let directory = tempfile::tempdir().expect("private typed-version repository");
+        let path = directory.path().join("extra.db");
+        let selected = typed_sync_projection_fixture("selected", "1-1", false);
+        for v1 in [false, true] {
+            let malformed = typed_sync_projection_fixture("unrelated", "1-1", v1)
+                .replace("%VERSION%\n1-1", "%VERSION%\n1\0-1");
+            // The pinned native grammar accepts ASCII NUL; OMG's shared
+            // version boundary rejects it, including on typed-parser success.
+            if v1 {
+                alpm_repo_db::desc::RepoDescFileV1::from_str(&malformed)
+                    .expect("pinned V1 grammar accepts NUL in pkgver");
+            } else {
+                alpm_repo_db::desc::RepoDescFileV2::from_str(&malformed)
+                    .expect("pinned V2 grammar accepts NUL in pkgver");
+            }
+            assert!(require_package_version("1\0-1").is_err());
+            write_sync_identity_fixture(
+                &path,
+                &[
+                    ("selected-1-1/desc", &selected),
+                    ("unrelated-1-1/desc", &malformed),
+                ],
+            );
+            let full = parse_sync_db(&path, "extra")
+                .expect_err("typed full catalog must apply the project version boundary");
+            let exact = parse_sync_db_package(&path, "extra", "selected")
+                .expect_err("selected target must not conceal an invalid typed version");
+            assert!(
+                format!("{full:#}").contains("Invalid package version"),
+                "{full:#}"
+            );
+            assert_eq!(format!("{exact:#}"), format!("{full:#}"));
+        }
     }
 
     #[test]
