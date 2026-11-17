@@ -379,6 +379,20 @@ trap 'printf "exit-trap\\n"' EXIT
 
 
 class OutputContracts(unittest.TestCase):
+    def test_update_output_accepts_terminal_gradient_without_losing_required_evidence(self):
+        for mode, header, phase in [('fast', 'Fast System Update', 'Synced in 0.09s'),
+                                     ('turbo', 'TURBO System Update', 'cached, no sync')]:
+            colored = ''.join('\x1b[38;2;122;162;247m' + char + '\x1b[0m' for char in header)
+            with self.subTest(mode=mode):
+                for title in (header, colored):
+                    output = title + '\n' + phase + '\nUpgraded 1 packages\n'
+                    result = self.run_oracle(assertion=f'update-{mode}-output', stdout=output)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                for output in (colored + '\n' + phase, colored + '\nUpgraded 1 packages\n',
+                               phase + '\nUpgraded 1 packages\n', ''):
+                    result = self.run_oracle(assertion=f'update-{mode}-output', stdout=output)
+                    self.assertNotEqual(result.returncode, 0, 'Formatting normalization cannot replace required update evidence')
+
     def test_fedora_firefox_requires_one_exact_compatible_official_identity(self):
         showrc = 'compatible archs : x86_64 noarch i686\n'
         header = '  | Search\n    firefox\n'

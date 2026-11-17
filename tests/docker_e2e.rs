@@ -114,9 +114,16 @@ fn run_in_docker_with_options(options: &[&str], cmd: &[&str]) -> (bool, String, 
     (success, stdout, stderr)
 }
 
-/// Run a shell script in a single Docker container (preserves state between commands)
-fn run_script_in_docker(script: &str) -> (bool, String, String) {
-    run_in_docker(&["sh", "-c", script])
+fn run_install_fixture(package: &str, executable: &str, removal: &str) -> (bool, String, String) {
+    run_in_docker(&[
+        "python3",
+        "-c",
+        include_str!("../scripts/docker-install-fixture.py"),
+        include_str!("../scripts/attend-unknown-fixture.py"),
+        package,
+        executable,
+        removal,
+    ])
 }
 
 /// Strip ANSI escape codes from text for reliable string matching
@@ -187,9 +194,7 @@ fn test_docker_real_install() {
     require_docker_tests();
     assert!(ensure_docker_image(), "Docker image not ready");
 
-    // Install and verify in a single container (state persists within one docker run)
-    let (success, stdout, stderr) =
-        run_script_in_docker("sudo omg install -y ripgrep && pacman -Qi ripgrep");
+    let (success, stdout, stderr) = run_install_fixture("ripgrep", "rg", "keep");
 
     if !success {
         eprintln!("STDOUT: {stdout}");
@@ -201,6 +206,8 @@ fn test_docker_real_install() {
         stdout.contains("ripgrep"),
         "Should find installed package in pacman -Qi output"
     );
+    assert!(stdout.contains("INSTALL_FIXTURE_PASS package=ripgrep no_tty=1 yes_denied=1 native_state_unchanged=1 explicit_unknown_review=1 removed=0"),
+        "Install must prove unattended refusal, unchanged native state, and explicit security review: {stdout}");
 }
 
 // NOTE: `test_docker_real_remove` was merged into
@@ -322,16 +329,12 @@ fn test_docker_install_removes_work_together() {
     require_docker_tests();
     assert!(ensure_docker_image(), "Docker image not ready");
 
-    // All operations in a single container to preserve state
-    let (success, _stdout, _stderr) = run_script_in_docker(
-        "sudo omg install -y tree \
-         && which tree \
-         && sudo omg remove -y tree \
-         && ! which tree",
-    );
+    let (success, stdout, stderr) = run_install_fixture("tree", "tree", "remove");
 
     assert!(
         success,
-        "Install, verify, remove, and verify-removed should all succeed"
+        "Install, verify, remove, and verify-removed should all succeed: {stdout}\n{stderr}"
     );
+    assert!(stdout.contains("INSTALL_FIXTURE_PASS package=tree no_tty=1 yes_denied=1 native_state_unchanged=1 explicit_unknown_review=1 removed=1"),
+        "Lifecycle must prove unattended refusal, unchanged native state, explicit security review, and removal: {stdout}");
 }

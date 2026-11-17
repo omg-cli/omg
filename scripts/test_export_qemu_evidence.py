@@ -15,7 +15,7 @@ exporter = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(exporter)
 
 TRANSACTION_DIAGNOSTICS = (
-    "command.json", "expected-identity.tsv",
+    "command.json", "expected-identity.tsv", "security-review.json",
     "transaction.stdout", "transaction.stderr",
     "omg-info-before.stdout", "omg-info-before.stderr",
     "native-info-before.stdout", "native-info-before.stderr",
@@ -24,6 +24,7 @@ TRANSACTION_DIAGNOSTICS = (
     "cache-before-paths.txt", "cache-after-paths.txt",
 )
 TRANSACTION_PRIVATE = (
+    "data/security-review.json", "cache/security-review.json", "security-review.json.bak",
     "data/usage.json", "cache/command.json", "config/expected-identity.tsv",
     "data/manual-before.stderr", "private/omg-info-before.stdout",
     "installed-before.raw", "omg-info-before.raw", "manual-before.raw",

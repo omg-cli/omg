@@ -99,14 +99,14 @@ impl ManagedNpm {
     }
 }
 
-pub(crate) fn install_reviewed_npm(
+pub(crate) fn install_reviewed_npm<'a>(
     package: &str,
     staging_dir: &Path,
     install_dir: &Path,
     tools_dir: &Path,
-    advisories: &dyn crate::core::security::vulnerability::VulnerabilitySource,
+    advisories: &'a dyn crate::core::security::vulnerability::VulnerabilitySource,
     security: &crate::runtimes::security::RuntimeSecurity,
-) -> Result<ReviewedNpm> {
+) -> Result<ReviewedNpm<'a>> {
     use crate::core::security::npm::{NpmLock, NpmSpec};
 
     anyhow::ensure!(
@@ -168,6 +168,7 @@ pub(crate) fn install_reviewed_npm(
         advisories,
     )?;
     let unchanged = || -> Result<()> {
+        review.verify(advisories)?;
         runtime.verify()?;
         node_admission.verify(&runtime.version_dir)?;
         anyhow::ensure!(
@@ -219,7 +220,7 @@ pub(crate) fn install_reviewed_npm(
     }
     lock.verify_installed(staging_dir, &spec)?;
     write_receipt(
-        staging_dir,
+        (staging_dir, install_dir),
         package,
         &runtime,
         &lock,
@@ -234,20 +235,58 @@ pub(crate) fn install_reviewed_npm(
         lock,
         package: package.to_owned(),
         overrides,
+        advisory: NpmAdmission::Fresh {
+            review,
+            source: advisories,
+        },
     })
 }
 
-pub(crate) struct ReviewedNpm {
+pub(crate) struct ReviewedNpm<'a> {
     runtime: ManagedNpm,
     node_admission: crate::runtimes::security::RuntimeAdmission,
     spec: crate::core::security::npm::NpmSpec,
     lock: crate::core::security::npm::NpmLock,
     package: String,
     overrides: Vec<&'static str>,
+    advisory: NpmAdmission<'a>,
 }
 
-impl ReviewedNpm {
+enum NpmAdmission<'a> {
+    Fresh {
+        review: crate::core::security::package_review::PackageReview,
+        source: &'a dyn crate::core::security::vulnerability::VulnerabilitySource,
+    },
+    Cached {
+        receipt_sha256: String,
+    },
+}
+
+impl ReviewedNpm<'_> {
     pub(crate) fn verify(&self, prefix: &Path) -> Result<()> {
+        match &self.advisory {
+            NpmAdmission::Fresh { review, source } => review.verify(*source)?,
+            NpmAdmission::Cached { receipt_sha256 } => {
+                let receipt = read_advisory_receipt(prefix)?;
+                verify_receipt_freshness(&receipt)?;
+                anyhow::ensure!(
+                    receipt["coverage"] == "assessed"
+                        && super::tool_artifacts::hash(&serde_json::to_vec(&receipt)?)
+                            == *receipt_sha256,
+                    "Cached npm receipt changed before activation"
+                );
+                super::security::admit_installed(
+                    "pi",
+                    prefix,
+                    super::security::ReviewMode::CachedOnly,
+                )?
+                .verify(prefix)?;
+                let policy = crate::core::security::policy::SecurityPolicy::load_current()?;
+                for package in npm_inventory(&self.lock) {
+                    policy.check_source(&package.name, &package.origin, None)?;
+                }
+            }
+        }
         self.runtime.verify()?;
         self.node_admission.verify(&self.runtime.version_dir)?;
         anyhow::ensure!(
@@ -268,29 +307,14 @@ impl ReviewedNpm {
     }
 }
 
-struct NpmReview {
-    assessments: Vec<crate::core::security::vulnerability::PackageAssessment>,
-    review: Option<crate::core::security::advisory_review::AdvisoryRiskReview>,
-    acceptance: Option<crate::core::security::advisory_review::AdvisoryRiskAcceptance>,
-}
-
-fn review_lock(
-    package: &str,
-    install_dir: &Path,
-    runtime: &ManagedNpm,
+fn npm_inventory(
     lock: &crate::core::security::npm::NpmLock,
-    overrides: &[&str],
-    advisories: &dyn crate::core::security::vulnerability::VulnerabilitySource,
-) -> Result<NpmReview> {
-    use crate::core::security::advisory_review::AdvisoryRiskReview;
-    use crate::core::security::vulnerability::validate_assessment_inventory;
+) -> Vec<crate::package_managers::types::SecurityPackage> {
     use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
-    let coordinates = lock
-        .packages
+    lock.packages
         .values()
         .map(|item| (item.name.clone(), item.version.clone()))
-        .collect::<std::collections::BTreeSet<_>>();
-    let inventory = coordinates
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .map(|(name, version)| SecurityPackage {
             origin: SecurityOrigin::NpmRegistry,
@@ -301,69 +325,42 @@ fn review_lock(
             description: String::new(),
             licenses: Vec::new(),
         })
-        .collect::<Vec<_>>();
-    let assessments = assess(advisories, &inventory)
-        .context("NPM advisory coverage is UNKNOWN; no clean result was established and installation was cancelled")?;
-    validate_assessment_inventory(&inventory, &assessments)?;
-    anyhow::ensure!(
-        assessments.iter().all(|item| item.coverage.is_assessed()),
-        "NPM advisory coverage is UNKNOWN; installation cancelled"
-    );
-    let transaction = serde_json::to_string(&(
+        .collect()
+}
+
+fn transaction_context(
+    package: &str,
+    install_dir: &Path,
+    runtime: &ManagedNpm,
+    lock: &crate::core::security::npm::NpmLock,
+    overrides: &[&str],
+) -> Result<String> {
+    Ok(serde_json::to_string(&(
         package,
         install_dir,
         &lock.sha256,
         &runtime.version,
         &runtime.identity,
-        &overrides,
+        overrides,
         nix::unistd::getuid().as_raw(),
         nix::unistd::geteuid().as_raw(),
-    ))?;
-    let review = AdvisoryRiskReview::new(&assessments, &transaction)?;
-    let acceptance = if let Some(review) = &review {
-        crate::core::privilege::confirm_security_review(
-            review.details(),
-            review.id(),
-            nix::unistd::getuid().as_raw(),
-            &|| Ok(()),
-        )?;
-        Some(review.accept(&format!("accept {}", review.id()))?)
-    } else {
-        None
-    };
-    if let Some(acceptance) = &acceptance {
-        let current = assess(advisories, &inventory)?;
-        validate_assessment_inventory(&inventory, &current)?;
-        let current_review = AdvisoryRiskReview::new(&current, &transaction)?;
-        anyhow::ensure!(
-            current.iter().all(|item| item.coverage.is_assessed())
-                && current_review
-                    .as_ref()
-                    .is_some_and(|review| acceptance.matches(review)),
-            "NPM advisory evidence changed after acceptance; review the new report before installing"
-        );
-    }
-    Ok(NpmReview {
-        assessments,
-        review,
-        acceptance,
-    })
+    ))?)
 }
 
-fn assess(
-    source: &dyn crate::core::security::vulnerability::VulnerabilitySource,
-    inventory: &[crate::package_managers::types::SecurityPackage],
-) -> Result<Vec<crate::core::security::vulnerability::PackageAssessment>> {
-    super::tool_artifacts::scoped_future(async {
-        source
-            .assess_packages(
-                inventory,
-                crate::core::security::vulnerability::AssessmentUse::Admission,
-            )
-            .await
-            .map_err(anyhow::Error::from)
-    })
-    .context("NPM advisory worker failed")
+fn review_lock(
+    package: &str,
+    install_dir: &Path,
+    runtime: &ManagedNpm,
+    lock: &crate::core::security::npm::NpmLock,
+    overrides: &[&str],
+    advisories: &dyn crate::core::security::vulnerability::VulnerabilitySource,
+) -> Result<crate::core::security::package_review::PackageReview> {
+    crate::core::security::package_review::review(
+        &npm_inventory(lock),
+        &transaction_context(package, install_dir, runtime, lock, overrides)?,
+        &[],
+        advisories,
+    )
 }
 
 fn read_advisory_receipt(prefix: &Path) -> Result<serde_json::Value> {
@@ -375,41 +372,72 @@ fn read_advisory_receipt(prefix: &Path) -> Result<serde_json::Value> {
 }
 
 fn write_receipt(
-    prefix: &Path,
+    paths: (&Path, &Path),
     package: &str,
     runtime: &ManagedNpm,
     lock: &crate::core::security::npm::NpmLock,
-    review: &NpmReview,
+    review: &crate::core::security::package_review::PackageReview,
     scripts_ran: bool,
     signatures_verified: bool,
 ) -> Result<()> {
     use crate::core::security::advisory_review::AdvisoryRiskReview;
     use sha2::{Digest as _, Sha256};
+    let (prefix, destination) = paths;
     let runtime_content_sha256 =
         hex::encode(Sha256::digest(serde_json::to_vec(&runtime.identity)?));
-    let receipt = serde_json::json!({
+    let legacy_risk = AdvisoryRiskReview::new(
+        review.assessments(),
+        &transaction_context(
+            package,
+            destination,
+            runtime,
+            lock,
+            &active_security_overrides("npm", package),
+        )?,
+    )?;
+    let assessed = review
+        .assessments()
+        .iter()
+        .all(|item| item.coverage.is_assessed());
+    let mut receipt = serde_json::json!({
         "schema_version":2,"package":package,"lock_sha256":lock.sha256,"node_version":runtime.version,
         "node_path":runtime.node,"runtime_content_sha256":runtime_content_sha256,
         "node_root":runtime.version_dir,"reviewed_at":jiff::Timestamp::now().to_string(),
-        "review_id":review.review.as_ref().map(AdvisoryRiskReview::id),
-        "risk_accepted":review.acceptance.is_some(),"coverage":"assessed",
+        "review_id":legacy_risk.as_ref().map(AdvisoryRiskReview::id),
+        "risk_accepted":review.accepted(),"coverage":if assessed { "assessed" } else { "unknown" },
         "security_overrides":active_security_overrides("npm", package),
         "lifecycle_scripts_ran":scripts_ran,"npm_signatures_verified":signatures_verified,
-        "assessments":review.assessments.iter().map(|item|serde_json::json!({"name":item.package.name,"version":item.package.version,"source":item.coverage.provenance(),"findings":item.findings})).collect::<Vec<_>>(),
+        "assessments":review.assessments().iter().map(|item|serde_json::json!({"name":item.package.name,"version":item.package.version,"source":item.coverage.provenance(),"findings":item.findings})).collect::<Vec<_>>(),
     });
+    if !assessed {
+        receipt["coverage_review_id"] = serde_json::to_value(review.id())?;
+        receipt["unknown_coverage"] =
+            serde_json::to_value(
+                review
+                    .assessments()
+                    .iter()
+                    .filter_map(|item| {
+                        item.coverage.unknown_reason().map(|reason| serde_json::json!({
+                "name":item.package.name,"version":item.package.version,"reason":reason,
+                "source":item.coverage.provenance(),
+            }))
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+    }
     crate::core::safe_ops::atomic_write_file_sync(
         prefix.join(".omg-npm-advisory-review.json"),
         serde_json::to_vec_pretty(&receipt)?,
     )
 }
 
-pub(crate) fn review_installed_npm(
+pub(crate) fn review_installed_npm<'a>(
     package: &str,
     prefix: &Path,
     tools_dir: &Path,
-    advisories: &dyn crate::core::security::vulnerability::VulnerabilitySource,
+    advisories: &'a dyn crate::core::security::vulnerability::VulnerabilitySource,
     security: &crate::runtimes::security::RuntimeSecurity,
-) -> Result<ReviewedNpm> {
+) -> Result<ReviewedNpm<'a>> {
     use crate::core::security::npm::{NpmLock, NpmSpec};
     anyhow::ensure!(
         !host_environment_is_allowed("npm", package),
@@ -441,6 +469,10 @@ pub(crate) fn review_installed_npm(
         lock,
         package: package.to_owned(),
         overrides,
+        advisory: NpmAdmission::Fresh {
+            review,
+            source: advisories,
+        },
     };
     binding.verify(prefix)?;
     let require_signatures = !package_is_allowed(ALLOW_UNVERIFIED_ENV, &format!("npm:{package}"));
@@ -460,15 +492,33 @@ pub(crate) fn review_installed_npm(
     }
     binding.verify(prefix)?;
     write_receipt(
-        prefix,
+        (prefix, prefix),
         package,
         &binding.runtime,
         &binding.lock,
-        &review,
+        match &binding.advisory {
+            NpmAdmission::Fresh { review, .. } => review,
+            NpmAdmission::Cached { .. } => {
+                anyhow::bail!("Cannot publish a new receipt from cached npm authority")
+            }
+        },
         previous["lifecycle_scripts_ran"].as_bool().unwrap_or(false),
         require_signatures,
     )?;
     Ok(binding)
+}
+
+fn verify_receipt_freshness(receipt: &serde_json::Value) -> Result<()> {
+    let reviewed_at: jiff::Timestamp = receipt["reviewed_at"]
+        .as_str()
+        .context("Cached npm review has no timestamp")?
+        .parse()?;
+    let now = jiff::Timestamp::now();
+    anyhow::ensure!(
+        reviewed_at <= now && now.as_second() - reviewed_at.as_second() <= 1800,
+        "Cached npm review expired"
+    );
+    Ok(())
 }
 
 /// Reuse an intact complete review only while its Pi and Node authorities,
@@ -479,7 +529,7 @@ pub(crate) fn cached_installed_npm(
     tools_dir: &Path,
     security: &crate::runtimes::security::RuntimeSecurity,
     pi_admission: &crate::runtimes::security::RuntimeAdmission,
-) -> Result<ReviewedNpm> {
+) -> Result<ReviewedNpm<'static>> {
     use crate::core::security::advisory_review::AdvisoryRiskReview;
     use crate::core::security::npm::{NpmLock, NpmSpec};
     use crate::core::security::vulnerability::{PackageAssessment, PackageCoverage};
@@ -519,15 +569,7 @@ pub(crate) fn cached_installed_npm(
             && receipt["lifecycle_scripts_ran"].is_boolean(),
         "Cached npm review identity or security choices changed"
     );
-    let reviewed_at: jiff::Timestamp = receipt["reviewed_at"]
-        .as_str()
-        .context("Cached npm review has no timestamp")?
-        .parse()?;
-    let now = jiff::Timestamp::now();
-    anyhow::ensure!(
-        reviewed_at <= now && now.as_second() - reviewed_at.as_second() <= 1800,
-        "Cached npm review expired"
-    );
+    verify_receipt_freshness(&receipt)?;
     let coordinates = lock
         .packages
         .values()
@@ -596,6 +638,9 @@ pub(crate) fn cached_installed_npm(
         lock,
         package: package.to_owned(),
         overrides,
+        advisory: NpmAdmission::Cached {
+            receipt_sha256: super::tool_artifacts::hash(&serde_json::to_vec(&receipt)?),
+        },
     };
     binding.verify(prefix)?;
     pi_admission.verify(prefix)?;
@@ -650,6 +695,324 @@ mod admission_tests {
         tools: PathBuf,
         prefix: PathBuf,
         node: PathBuf,
+    }
+
+    struct ChangingSource {
+        phases: PathBuf,
+        after_phase: Option<&'static str>,
+        unknown: bool,
+        changed: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::core::security::vulnerability::VulnerabilitySource for ChangingSource {
+        fn assess_packages<'a>(
+            &'a self,
+            packages: &'a [crate::package_managers::types::SecurityPackage],
+            use_case: crate::core::security::vulnerability::AssessmentUse,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
+                            crate::core::security::vulnerability::VulnerabilityError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let mut reports =
+                    crate::core::security::vulnerability::VulnerabilitySource::assess_packages(
+                        &CleanSource,
+                        packages,
+                        use_case,
+                    )
+                    .await?;
+                if self.unknown {
+                    for report in &mut reports {
+                        report.coverage = crate::core::security::vulnerability::PackageCoverage::Unknown {
+                            reason: crate::core::security::vulnerability::UnknownCoverage::EvidenceUnavailable,
+                            provenance: None,
+                        };
+                    }
+                }
+                let changed = self.changed.load(std::sync::atomic::Ordering::SeqCst)
+                    || self.after_phase.is_some_and(|phase| {
+                        fs::read_to_string(&self.phases)
+                            .is_ok_and(|phases| phases.lines().any(|item| item == phase))
+                    });
+                if changed {
+                    reports[0]
+                        .findings
+                        .push(crate::core::security::scan::Vulnerability {
+                            applicability:
+                                crate::core::security::scan::FindingApplicability::Applicable,
+                            id: "CVE-2021-23337".into(),
+                            summary: "Newly disclosed npm dependency finding".into(),
+                            score: Some("9.8".into()),
+                            advisory_severity: None,
+                            native_advisory: None,
+                            affected_installed: vec![],
+                        });
+                }
+                Ok(reports)
+            })
+        }
+    }
+
+    #[test]
+    fn banned_transitive_dependency_stops_npm_before_materialization() {
+        const NAME: &str = "runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        let fixture = Fixture::new();
+        let config = fixture.owner.path().join("config");
+        fs::create_dir(&config).expect("private npm policy directory");
+        fs::write(
+            config.join("policy.toml"),
+            "banned_packages = ['blocked-dependency']\n",
+        )
+        .expect("ban an exact transitive dependency");
+        let lock_path = fixture.owner.path().join("lock.fixture.json");
+        let mut lock: serde_json::Value =
+            serde_json::from_slice(&fs::read(&lock_path).unwrap()).unwrap();
+        let mut dependency =
+            lock["packages"]["node_modules/@earendil-works/pi-coding-agent"].clone();
+        dependency["version"] = "1.2.3".into();
+        dependency["resolved"] =
+            "https://registry.npmjs.org/blocked-dependency/-/blocked-dependency-1.2.3.tgz".into();
+        lock["packages"]["node_modules/blocked-dependency"] = dependency;
+        lock["packages"]["node_modules/@earendil-works/pi-coding-agent"]["dependencies"] =
+            serde_json::json!({"blocked-dependency":"1.2.3"});
+        fs::write(lock_path, serde_json::to_vec(&lock).unwrap())
+            .expect("exact transitive registry graph");
+        temp_env::with_var("OMG_CONFIG_DIR", Some(config.as_os_str()), || {
+            let error = fixture
+                .install()
+                .err()
+                .expect("banned transitive dependency must refuse");
+            assert!(format!("{error:#}").contains("blocked-dependency"));
+            assert_eq!(
+                fs::read_to_string(fixture.owner.path().join("phases")).unwrap(),
+                "install\n"
+            );
+            assert!(!fixture.prefix.join("node_modules").exists());
+            assert!(
+                !fixture
+                    .prefix
+                    .join(".omg-npm-advisory-review.json")
+                    .exists()
+            );
+        });
+    }
+
+    #[test]
+    fn changed_advisories_after_ci_refuse_the_next_npm_execution() {
+        let fixture = Fixture::new();
+        let source = ChangingSource {
+            phases: fixture.owner.path().join("phases"),
+            after_phase: Some("ci"),
+            unknown: false,
+            changed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let error = install_reviewed_npm(
+            PACKAGE,
+            &fixture.prefix,
+            &fixture.prefix,
+            &fixture.tools,
+            &source,
+            &super::super::security::RuntimeSecurity::fixture(),
+        )
+        .err()
+        .expect("new disclosed finding must stop later execution");
+        assert!(format!("{error:#}").contains("advisory evidence changed"));
+        assert_eq!(fs::read_to_string(&source.phases).unwrap(), "install\nci\n");
+        assert!(
+            !fixture
+                .prefix
+                .join(".omg-npm-advisory-review.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn changed_advisories_after_signatures_refuse_opted_in_lifecycle_scripts() {
+        const NAME: &str = "runtimes::npm::admission_tests::changed_advisories_after_signatures_refuse_opted_in_lifecycle_scripts";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        temp_env::with_var(ALLOW_NPM_SCRIPTS_ENV, Some(PACKAGE), || {
+            let fixture = Fixture::new();
+            let source = ChangingSource {
+                phases: fixture.owner.path().join("phases"),
+                after_phase: Some("audit"),
+                unknown: false,
+                changed: std::sync::atomic::AtomicBool::new(false),
+            };
+            let error = install_reviewed_npm(
+                PACKAGE,
+                &fixture.prefix,
+                &fixture.prefix,
+                &fixture.tools,
+                &source,
+                &super::super::security::RuntimeSecurity::fixture(),
+            )
+            .err()
+            .expect("changed finding must stop even explicitly enabled scripts");
+            assert!(format!("{error:#}").contains("advisory evidence changed"));
+            assert_eq!(
+                fs::read_to_string(&source.phases).unwrap(),
+                "install\nci\naudit\n"
+            );
+            assert!(
+                !fixture
+                    .prefix
+                    .join(".omg-npm-advisory-review.json")
+                    .exists()
+            );
+        });
+    }
+
+    #[test]
+    fn retained_npm_admission_rechecks_evidence_before_publication() {
+        let fixture = Fixture::new();
+        let source = ChangingSource {
+            phases: fixture.owner.path().join("phases"),
+            after_phase: None,
+            unknown: false,
+            changed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let admission = install_reviewed_npm(
+            PACKAGE,
+            &fixture.prefix,
+            &fixture.prefix,
+            &fixture.tools,
+            &source,
+            &super::super::security::RuntimeSecurity::fixture(),
+        )
+        .expect("initial complete clean admission");
+        admission
+            .verify(&fixture.prefix)
+            .expect("unchanged evidence remains valid");
+        source
+            .changed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = admission
+            .verify(&fixture.prefix)
+            .expect_err("new finding must invalidate retained publication authority");
+        assert!(format!("{error:#}").contains("advisory evidence changed"));
+    }
+
+    #[test]
+    fn retained_npm_admission_refuses_policy_changes_before_publication() {
+        const NAME: &str = "runtimes::npm::admission_tests::retained_npm_admission_refuses_policy_changes_before_publication";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        let fixture = Fixture::new();
+        let config = fixture.owner.path().join("config");
+        fs::create_dir(&config).expect("owned npm policy directory");
+        temp_env::with_var("OMG_CONFIG_DIR", Some(config.as_os_str()), || {
+            let admission = fixture
+                .install()
+                .expect("initial permitted dependency graph");
+            admission
+                .verify(&fixture.prefix)
+                .expect("unchanged policy and source");
+            fs::write(
+                config.join("policy.toml"),
+                "banned_packages = ['@earendil-works/pi-coding-agent']\n",
+            )
+            .expect("new policy bans the installed package");
+            let error = admission
+                .verify(&fixture.prefix)
+                .expect_err("changed policy must invalidate retained publication authority");
+            assert!(format!("{error:#}").contains("policy"));
+        });
+    }
+
+    #[test]
+    fn attended_unknown_npm_review_stays_unknown_and_cannot_supply_cached_clean_authority() {
+        const NAME: &str = "runtimes::npm::admission_tests::attended_unknown_npm_review_stays_unknown_and_cannot_supply_cached_clean_authority";
+        if std::env::var_os("OMG_NPM_UNKNOWN_REVIEW_FIXTURE").is_none() {
+            const DRIVER: &str = r"
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('npm_review_terminal', sys.argv[2])
+terminal = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(terminal)
+terminal.NAME = sys.argv[3]
+code, transcript = terminal.terminal_case(Path(sys.argv[1]), 'accept', dict(os.environ), expected=(b'Coverage: unknown', b'pi-coding-agent', b'https://www.cve.org/'))
+assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(errors='replace')
+";
+            let mut command = std::process::Command::new(
+                crate::core::privilege::root_controlled_program_path("python3")
+                    .expect("existing terminal fixture Python"),
+            );
+            command
+                .arg("-c")
+                .arg(DRIVER)
+                .arg(std::env::current_exe().expect("current npm fixture executable"))
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("scripts/test-arch-advisory-consent.py"),
+                )
+                .arg(NAME)
+                .env("OMG_NPM_UNKNOWN_REVIEW_FIXTURE", "1");
+            let output = command
+                .output()
+                .expect("run real controlling-PTY npm review");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            return;
+        }
+        let fixture = Fixture::new();
+        let source = ChangingSource {
+            phases: fixture.owner.path().join("phases"),
+            after_phase: None,
+            unknown: true,
+            changed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let admission = install_reviewed_npm(
+            PACKAGE,
+            &fixture.prefix,
+            &fixture.prefix,
+            &fixture.tools,
+            &source,
+            &super::super::security::RuntimeSecurity::fixture(),
+        )
+        .expect("exact attended Unknown acceptance permits this graph only");
+        admission
+            .verify(&fixture.prefix)
+            .expect("unchanged accepted Unknown evidence");
+        let receipt =
+            read_advisory_receipt(&fixture.prefix).expect("published honest Unknown receipt");
+        assert_eq!(receipt["coverage"], "unknown");
+        assert_eq!(receipt["risk_accepted"], true);
+        assert!(
+            receipt["coverage_review_id"]
+                .as_str()
+                .is_some_and(|id| id.len() == 64)
+        );
+        assert_eq!(
+            receipt["unknown_coverage"][0]["reason"],
+            "evidence_unavailable"
+        );
+        drop(admission);
+        let security = super::super::security::RuntimeSecurity::fixture();
+        let pi = super::super::security::fixture_prepare(
+            "pi",
+            "0.83.0",
+            &fixture.prefix,
+            &fixture.prefix,
+        )
+        .expect("content-bound Pi fixture authority");
+        let error = cached_installed_npm(PACKAGE, &fixture.prefix, &fixture.tools, &security, &pi)
+            .err()
+            .expect("accepted Unknown must never become cached assessed evidence");
+        assert!(format!("{error:#}").contains("Cached npm review identity"));
     }
     impl Fixture {
         fn new() -> Self {
@@ -728,7 +1091,7 @@ esac
                 node,
             }
         }
-        fn install(&self) -> Result<ReviewedNpm> {
+        fn install(&self) -> Result<ReviewedNpm<'static>> {
             install_reviewed_npm(
                 PACKAGE,
                 &self.prefix,
@@ -967,6 +1330,68 @@ esac
         assert!(
             cached_installed_npm(PACKAGE, &fixture.prefix, &fixture.tools, &security, &pi).is_err()
         );
+    }
+
+    #[test]
+    fn retained_cached_npm_admission_refuses_changed_receipt_expiry_or_imported_content() {
+        for case in ["receipt", "expired", "implementation"] {
+            let fixture = Fixture::new();
+            drop(
+                fixture
+                    .install()
+                    .expect("initial controlled signed installation"),
+            );
+            let security = super::super::security::RuntimeSecurity::fixture();
+            let pi = super::super::security::fixture_prepare(
+                "pi",
+                "0.83.0",
+                &fixture.prefix,
+                &fixture.prefix,
+            )
+            .expect("complete Pi content authority");
+            let cached =
+                cached_installed_npm(PACKAGE, &fixture.prefix, &fixture.tools, &security, &pi)
+                    .expect("initial fresh cached authority");
+            cached
+                .verify(&fixture.prefix)
+                .expect("unchanged cached content and receipt");
+            if case == "implementation" {
+                fs::write(
+                    fixture
+                        .prefix
+                        .join("node_modules/@earendil-works/pi-coding-agent/bin/run"),
+                    b"changed imported implementation",
+                )
+                .expect("replace only the owned imported implementation");
+            } else {
+                let mut receipt =
+                    read_advisory_receipt(&fixture.prefix).expect("owned cached receipt");
+                if case == "expired" {
+                    receipt["reviewed_at"] =
+                        jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() - 1801)
+                            .expect("expired controlled timestamp")
+                            .to_string()
+                            .into();
+                } else {
+                    receipt["coverage"] = "unknown".into();
+                }
+                fs::write(
+                    fixture.prefix.join(".omg-npm-advisory-review.json"),
+                    serde_json::to_vec(&receipt).unwrap(),
+                )
+                .expect("change only the owned cached receipt");
+            }
+            let error = cached
+                .verify(&fixture.prefix)
+                .expect_err("retained cache must revalidate receipt and complete imported content");
+            let detail = format!("{error:#}");
+            assert!(
+                detail.contains("changed")
+                    || detail.contains("match")
+                    || detail.contains("expired"),
+                "{case}: {detail}"
+            );
+        }
     }
 
     #[test]

@@ -32,6 +32,57 @@ UNKNOWN = importlib.util.module_from_spec(UNKNOWN_SPEC)
 UNKNOWN_SPEC.loader.exec_module(UNKNOWN)
 
 
+class NativeAdvisoryCoverage(unittest.TestCase):
+    @staticmethod
+    def fixture():
+        spec = importlib.util.spec_from_file_location(
+            'native_advisory_consent', ROOT / 'scripts/test-arch-advisory-consent.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        return fixture
+
+    def test_unmapped_snapshot_contains_real_unrelated_advisories(self):
+        fixture = self.fixture()
+        source = fixture.oracle()
+        observed = '2026-11-17T15:00:00.000000Z'
+        status, response = fixture.coverage_response(
+            source, 'unmapped', source.ARCH_HOST, source.ARCH_PATH, observed)
+        self.assertEqual(status, 200)
+        self.assertTrue(response['complete'])
+        self.assertEqual(response['source_url'], source.ARCH_UPSTREAM)
+        payload = response['payload_json'].encode()
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), response['payload_sha256'])
+        rows = json.loads(payload)
+        self.assertTrue(rows, 'empty feeds mean unavailable evidence, not an unmapped package')
+        self.assertTrue(all(row['packages'] == ['omg-unrelated-fixture'] for row in rows))
+        self.assertEqual([row['name'] for row in rows],
+                         [row['name'] for row in source.arch_feed('1-1')])
+
+    def test_finding_snapshot_retains_original_exact_advisories(self):
+        fixture = self.fixture()
+        source = fixture.oracle()
+        observed = '2026-11-17T15:00:00.000000Z'
+        self.assertEqual(fixture.coverage_response(
+            source, 'finding', source.ARCH_HOST, source.ARCH_PATH, observed),
+            source.snapshot_response(source.ARCH_HOST, source.ARCH_PATH, '1-1', observed))
+
+    def test_unavailable_snapshot_retains_actual_http_failure(self):
+        fixture = self.fixture()
+        source = fixture.oracle()
+        self.assertEqual(fixture.coverage_response(
+            source, 'unavailable', source.ARCH_HOST, source.ARCH_PATH,
+            '2026-11-17T15:00:00.000000Z'),
+            (503, {'error': 'controlled unavailable advisory source'}))
+
+    def test_unmapped_fixture_does_not_invent_an_unexpected_destination(self):
+        fixture = self.fixture()
+        source = fixture.oracle()
+        self.assertEqual(fixture.coverage_response(
+            source, 'unmapped', source.ARCH_HOST, '/unexpected',
+            '2026-11-17T15:00:00.000000Z'),
+            (404, {'error': 'unexpected native snapshot destination'}))
+
+
 class UnknownFixtureTerminal(unittest.TestCase):
     @staticmethod
     def prompt(digest='a' * 64):

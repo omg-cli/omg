@@ -412,7 +412,8 @@ async function github(identity: RuntimeIdentity, sources: Sources, result: Asses
         if (row.withdrawn_at !== null && row.withdrawn_at !== undefined && date(row.withdrawn_at) <= sources.now) continue;
         const entries = array(row.vulnerabilities, 256).map(object);
         const hasRuntimeEntry = entries.some((entry) => knownNames.includes(string(object(entry.package).name)));
-        let applicable = false, possible = false;
+        let applicable = false, possible = entries.length === 0;
+        if (possible) result.gap(`${repo} published an advisory without vulnerability applicability entries`);
         for (const entry of entries) {
             const packageRow = object(entry.package), name = string(packageRow.name);
             const componentVersion = components?.get(name);

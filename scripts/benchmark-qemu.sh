@@ -1072,13 +1072,14 @@ fi
 if [[ -z "$inventory_tiers" ]]; then cp "$here/qemu-runtime-advisory-oracle.py" "$work/qemu-runtime-advisory-oracle.py"; fi
 if [[ "$benchmark" == true ]]; then
   cp "$here/../benchmark-hyperfine.sh" "$work/benchmark-hyperfine.sh"
+  cp "$here/attend-unknown-fixture.py" "$work/attend-unknown-fixture.py"
   cp "$here/record-benchmark-run.py" "$work/record-benchmark-run.py"
   if [[ "$transaction_samples" != 0 ]]; then
     cp "$here/qemu-transactions.sh" "$work/qemu-transactions.sh"
     cp "$here/check-qemu-health.py" "$work/check-qemu-health.py"
     sha256sum "$work/qemu-transactions.sh" > "$work/transaction-runner-sha256.txt"
   fi
-  sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" > "$work/benchmark-driver-sha256.txt"
+  sha256sum "$work/benchmark-hyperfine.sh" "$work/record-benchmark-run.py" "$work/attend-unknown-fixture.py" > "$work/benchmark-driver-sha256.txt"
 fi
 if [[ "$distro" == fedora ]]; then
   cp "$here/qemu-fedora-advisory-check.sh" "$here/qemu-fedora-advisory-oracle.py" "$work/"
@@ -1416,6 +1417,7 @@ fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/daemon-advisory-shutdown.sh bench@127.0.0.1:daemon-advisory-shutdown.sh
 if [[ "$benchmark" == true ]]; then
   timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/benchmark-hyperfine.sh bench@127.0.0.1:benchmark-hyperfine.sh
+  timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/attend-unknown-fixture.py bench@127.0.0.1:attend-unknown-fixture.py
 fi
 rc=0
 timeout "$guest_timeout" docker exec -w /work/guest "$controller" ssh "${opts[@]}" -p 2222 bench@127.0.0.1 "bash guest-check.sh '$distro' '$tag' '$digest' '$benchmark' '$arch' '$guest_uname' '$inventory_tiers' '$qemu_accel'" > "$work/guest-check.log" 2>&1 || rc=$?

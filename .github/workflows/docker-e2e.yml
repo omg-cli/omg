@@ -10,6 +10,9 @@ on:
       - "tests/docker_e2e.rs"
       - "scripts/test_docker_workflow.py"
       - "scripts/docker-info-fixture.py"
+      - "scripts/docker-install-fixture.py"
+      - "scripts/test_docker_install_fixture.py"
+      - "scripts/attend-unknown-fixture.py"
       - "scripts/qemu-aur-fixture.py"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -50,6 +53,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Verify Docker install consent fixture controls
+        run: python3 -B -m unittest scripts.test_docker_install_fixture scripts.test_native_cli_coverage.UnknownFixtureTerminal -v
 
       - name: Set up Rust
         # Match rust-toolchain.toml (1.95.0) instead of floating "stable".

@@ -1673,7 +1673,10 @@ PY_DNF_LOG
 }
 
 check_product_output() {
-  local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch}
+  local safety=$1 assertion=$2 code=$3 stdout=$4 stderr=$5 distro=${6:-arch} update_output
+  if [[ "$assertion" == update-fast-output || "$assertion" == update-turbo-output ]]; then
+    update_output=$(sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' "$stdout") || return 1
+  fi
   if [[ "$assertion" == local:* ]]; then
     python3 .qemu-local-oracle.py check "${assertion#local:}" "$code" "$stdout" "$stderr" || return 1
     if [[ "$assertion" == local:team-golden-create-flags ]] \
@@ -2171,15 +2174,15 @@ PY
           printf 'assertion failed: inventory-only SBOM lacks the advisory-scan marker or warning\n' >&2; return 1
         fi ;;
       update-fast-output)
-        if ! grep -Fq 'Fast System Update' "$stdout" \
-          || ! grep -Eqi 'Syncing package|Synced' "$stdout" \
-          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' "$stdout"; then
+        if ! grep -Fq 'Fast System Update' <<< "$update_output" \
+          || ! grep -Eqi 'Syncing package|Synced' <<< "$update_output" \
+          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' <<< "$update_output"; then
           printf 'assertion failed: update --fast lacked sync and completion evidence\n' >&2; return 1
         fi ;;
       update-turbo-output)
-        if ! grep -Fq 'TURBO System Update' "$stdout" \
-          || ! grep -Eqi 'Turbo upgrade|cached, no sync|Checking for updates.*cached' "$stdout" \
-          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' "$stdout"; then
+        if ! grep -Fq 'TURBO System Update' <<< "$update_output" \
+          || ! grep -Eqi 'Turbo upgrade|cached, no sync|Checking for updates.*cached' <<< "$update_output" \
+          || ! grep -Eqi 'System is up to date|System updated successfully|Upgraded [0-9]+ packages?' <<< "$update_output"; then
           printf 'assertion failed: update --turbo lacked cached-mode and completion evidence\n' >&2; return 1
         fi ;;
       daemon-foreground-lifecycle)

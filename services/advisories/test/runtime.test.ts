@@ -269,6 +269,43 @@ test("Bun and Deno publisher advisories distinguish affected, fixed and withdraw
         } finally { db.close(); }
     }
 });
+test("publisher disclosures without applicability entries remain possible risks", async () => {
+    for (const { runtime, vendor, version } of [
+        { runtime: "bun", vendor: "oven-sh", version: "1.1.0" },
+        { runtime: "deno", vendor: "denoland", version: "1.1.0" },
+        { runtime: "php", vendor: "php", version: "8.2.33" },
+        { runtime: "erlang", vendor: "erlang", version: "28.5.0.8" },
+    ]) {
+        const { store, db } = setup();
+        try {
+            const row = { ...advisory(runtime, "*"), vulnerabilities: [] };
+            const body = await report(store, runtime, version, vendor, async (url) =>
+                url.endsWith("otp_versions.table")
+                    ? new Response("OTP-28.5.0.8 : ssl-11.6.0.7 # compiler-9.0.1 :")
+                    : Response.json([row]));
+            expect(body.coverage).toBe("partial");
+            expect(body.findings).toMatchObject([{ id: row.cve_id, applicability: "possible",
+                urls: expect.arrayContaining([row.html_url]) }]);
+            expect(body.gaps).not.toEqual([]);
+            if (!Array.isArray(body.sources)) throw new Error("missing publisher sources");
+            expect(body.sources.length).toBe(runtime === "erlang" ? 2 : 1);
+            expect(body.sources.every((value) => object(value).complete === true)).toBe(true);
+        } finally { db.close(); }
+    }
+});
+
+test("empty publisher lists and withdrawn incomplete disclosures do not fabricate findings", async () => {
+    for (const rows of [[], [{ ...advisory("bun", "*"), vulnerabilities: [], withdrawn_at: now }]]) {
+        const { store, db } = setup();
+        try {
+            const body = await report(store, "bun", "1.1.0", "oven-sh", async () => Response.json(rows));
+            expect(body.coverage).toBe("assessed");
+            expect(body.findings).toEqual([]);
+            expect(body.gaps).toEqual([]);
+        } finally { db.close(); }
+    }
+});
+
 test("PHP maintenance-branch fixes are not ORed into a false affected result", async () => {
     const { store, db } = setup();
     try {

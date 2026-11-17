@@ -40,6 +40,19 @@ def oracle():
     return module
 
 
+def coverage_response(source, coverage, host, path, observed):
+    status, response = source.snapshot_response(host, path, "1-1", observed)
+    if coverage == "unavailable":
+        return 503, {"error": "controlled unavailable advisory source"}
+    if coverage == "unmapped" and status == 200:
+        rows = json.loads(response["payload_json"])
+        for row in rows:
+            row["packages"] = ["omg-unrelated-fixture"]
+        response["payload_json"] = json.dumps(rows)
+        response["payload_sha256"] = hashlib.sha256(response["payload_json"].encode()).hexdigest()
+    return status, response
+
+
 def setup(command):
     result = subprocess.run(command, capture_output=True, timeout=30)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
@@ -143,12 +156,7 @@ def inside(args):
 
         def do_GET(self):
             observed = source.iso_timestamp(datetime.now(timezone.utc))
-            status, response = source.snapshot_response(self.headers.get("Host"), self.path, "1-1", observed)
-            if args.coverage == "unavailable":
-                status, response = 503, {"error": "controlled unavailable advisory source"}
-            elif args.coverage == "unmapped":
-                response["payload_json"] = "[]"
-                response["payload_sha256"] = hashlib.sha256(b"[]").hexdigest()
+            status, response = coverage_response(source, args.coverage, self.headers.get("Host"), self.path, observed)
             encoded = json.dumps(response).encode()
             events.append(dict(host=self.headers.get("Host"), path=self.path, status=status, response=response))
             self.send_response(status)

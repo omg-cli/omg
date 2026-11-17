@@ -129,7 +129,7 @@ BENCH_FILES = {
 # Additional files emitted by benchmark-hyperfine.sh --guest-transaction.
 # Admit these only at the transaction-trial root, never in cache/data/config.
 TRANSACTION_FILES = {
-    "command.json", "expected-identity.tsv",
+    "command.json", "expected-identity.tsv", "security-review.json",
     "transaction.stdout", "transaction.stderr",
     "omg-info-before.stdout", "omg-info-before.stderr",
     "native-info-before.stdout", "native-info-before.stderr",
