@@ -265,14 +265,19 @@ impl Default for LocalDbPackage {
 /// Returns a `HashMap` of package name -> `SyncDbPackage`
 pub fn parse_sync_db(path: &Path, repo_name: &str) -> Result<HashMap<String, SyncDbPackage>> {
     let mut packages = HashMap::new();
-    parse_sync_db_into(path, repo_name, &mut |entry, package| {
-        anyhow::ensure!(
-            packages.insert(package.name.clone(), package).is_none(),
-            "Duplicate package identity in {} from repository {repo_name}",
-            entry.display()
-        );
-        Ok(())
-    })?;
+    parse_sync_db_into(
+        path,
+        repo_name,
+        &|desc| desc.into_package(repo_name),
+        &mut |entry, package| {
+            anyhow::ensure!(
+                packages.insert(package.name.clone(), package).is_none(),
+                "Duplicate package identity in {} from repository {repo_name}",
+                entry.display()
+            );
+            Ok(())
+        },
+    )?;
     Ok(packages)
 }
 
@@ -285,24 +290,34 @@ pub(crate) fn parse_sync_db_package(
 ) -> Result<Option<SyncDbPackage>> {
     let mut names = std::collections::HashSet::new();
     let mut selected = None;
-    parse_sync_db_into(path, repo_name, &mut |entry, package| {
-        anyhow::ensure!(
-            names.insert(package.name.clone()),
-            "Duplicate package identity in {} from repository {repo_name}",
-            entry.display()
-        );
-        if package.name == name {
-            selected = Some(package);
-        }
-        Ok(())
-    })?;
+    parse_sync_db_into(
+        path,
+        repo_name,
+        &|desc| {
+            let identity = desc.name().to_owned();
+            let package = (identity == name).then(|| desc.into_package(repo_name));
+            (identity, package)
+        },
+        &mut |entry, (identity, package)| {
+            anyhow::ensure!(
+                names.insert(identity),
+                "Duplicate package identity in {} from repository {repo_name}",
+                entry.display()
+            );
+            if let Some(package) = package {
+                selected = Some(package);
+            }
+            Ok(())
+        },
+    )?;
     Ok(selected)
 }
 
-fn parse_sync_db_into(
+fn parse_sync_db_into<T: Send>(
     path: &Path,
     repo_name: &str,
-    collect: &mut impl FnMut(&Path, SyncDbPackage) -> Result<()>,
+    project: &(impl Fn(ParsedSyncDesc) -> T + Sync),
+    collect: &mut impl FnMut(&Path, T) -> Result<()>,
 ) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -397,13 +412,13 @@ fn parse_sync_db_into(
             buffered_bytes += raw.len() + entry_path.as_os_str().len();
             descriptions.push((entry_path, raw));
             if descriptions.len() == 512 || buffered_bytes >= 1024 * 1024 {
-                parse_sync_descriptions(&mut descriptions, repo_name, collect)?;
+                parse_sync_descriptions(&mut descriptions, repo_name, project, collect)?;
                 buffered_bytes = 0;
             }
         }
     }
 
-    parse_sync_descriptions(&mut descriptions, repo_name, collect)?;
+    parse_sync_descriptions(&mut descriptions, repo_name, project, collect)?;
 
     std::io::copy(&mut archive.into_inner(), &mut std::io::sink()).with_context(|| {
         format!(
@@ -414,7 +429,7 @@ fn parse_sync_db_into(
     Ok(())
 }
 
-fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<SyncDbPackage> {
+fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<ParsedSyncDesc> {
     let content = String::from_utf8(raw).with_context(|| {
         format!(
             "Invalid UTF-8 in {} from repository {repo_name}",
@@ -428,7 +443,7 @@ fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<S
         )
     })?;
     anyhow::ensure!(
-        !pkg.name.is_empty(),
+        !pkg.name().is_empty(),
         "Missing package name in {} from repository {repo_name}",
         entry_path.display()
     );
@@ -441,7 +456,7 @@ fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<S
         "Nested sync package directory identity in {} from repository {repo_name}",
         entry_path.display()
     );
-    alpm_types::Name::from_str(&pkg.name).with_context(|| {
+    alpm_types::Name::from_str(pkg.name()).with_context(|| {
         format!(
             "Invalid package name in {} from repository {repo_name}",
             entry_path.display()
@@ -455,17 +470,18 @@ fn parse_sync_desc(entry_path: &Path, raw: Vec<u8>, repo_name: &str) -> Result<S
         .context("Missing sync package version in directory identity")?;
     let native_version = require_package_version(&directory[native_name.len() + 1..])?;
     anyhow::ensure!(
-        native_name == pkg.name && native_version.to_string() == pkg.version.to_string(),
+        native_name == pkg.name() && native_version.to_string() == pkg.canonical_version(),
         "Inconsistent package identity in {} from repository {repo_name}",
         entry_path.display()
     );
     Ok(pkg)
 }
 
-fn parse_sync_descriptions(
+fn parse_sync_descriptions<T: Send>(
     descriptions: &mut Vec<(PathBuf, Vec<u8>)>,
     repo_name: &str,
-    collect: &mut impl FnMut(&Path, SyncDbPackage) -> Result<()>,
+    project: &(impl Fn(ParsedSyncDesc) -> T + Sync),
+    collect: &mut impl FnMut(&Path, T) -> Result<()>,
 ) -> Result<()> {
     static POOL: std::sync::LazyLock<Option<rayon::ThreadPool>> = std::sync::LazyLock::new(|| {
         let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
@@ -486,7 +502,7 @@ fn parse_sync_descriptions(
     let minimum_records = descriptions.len().div_ceil(4).max(16);
     let entries = std::mem::take(descriptions);
     let parse = |(path, raw): (PathBuf, Vec<u8>)| {
-        let package = parse_sync_desc(&path, raw, repo_name);
+        let package = parse_sync_desc(&path, raw, repo_name).map(project);
         (path, package)
     };
     let parsed: Vec<_> = match &*POOL {
@@ -571,7 +587,39 @@ macro_rules! sync_pkg_from_desc {
     };
 }
 
-fn parse_desc_content(content: &str, repo: &str) -> Result<SyncDbPackage> {
+enum ParsedSyncDesc {
+    V2(alpm_repo_db::desc::RepoDescFileV2),
+    V1(alpm_repo_db::desc::RepoDescFileV1),
+    Manual(SyncDbPackage),
+}
+
+impl ParsedSyncDesc {
+    fn name(&self) -> &str {
+        match self {
+            Self::V2(desc) => desc.name.as_ref(),
+            Self::V1(desc) => desc.name.as_ref(),
+            Self::Manual(package) => &package.name,
+        }
+    }
+
+    fn canonical_version(&self) -> String {
+        match self {
+            Self::V2(desc) => desc.version.to_string(),
+            Self::V1(desc) => desc.version.to_string(),
+            Self::Manual(package) => package.version.to_string(),
+        }
+    }
+
+    fn into_package(self, repo: &str) -> SyncDbPackage {
+        match self {
+            Self::V2(desc) => sync_pkg_from_desc!(desc, repo),
+            Self::V1(desc) => sync_pkg_from_desc!(desc, repo),
+            Self::Manual(package) => package,
+        }
+    }
+}
+
+fn parse_desc_content(content: &str, repo: &str) -> Result<ParsedSyncDesc> {
     // Try V2 first (newer format without MD5SUM).
     // Wrap in catch_unwind because alpm_repo_db can panic on corrupted data
     // (e.g., PackageRelation::from_str panics on malformed dependency strings).
@@ -580,7 +628,7 @@ fn parse_desc_content(content: &str, repo: &str) -> Result<SyncDbPackage> {
     }));
 
     match v2_result {
-        Ok(Ok(desc)) => return Ok(sync_pkg_from_desc!(desc, repo)),
+        Ok(Ok(desc)) => return Ok(ParsedSyncDesc::V2(desc)),
         Ok(Err(_)) => {}
         Err(panic_info) => {
             tracing::warn!(
@@ -597,7 +645,7 @@ fn parse_desc_content(content: &str, repo: &str) -> Result<SyncDbPackage> {
     }));
 
     match v1_result {
-        Ok(Ok(desc)) => return Ok(sync_pkg_from_desc!(desc, repo)),
+        Ok(Ok(desc)) => return Ok(ParsedSyncDesc::V1(desc)),
         Ok(Err(_)) => {}
         Err(panic_info) => {
             tracing::warn!(
@@ -610,7 +658,7 @@ fn parse_desc_content(content: &str, repo: &str) -> Result<SyncDbPackage> {
 
     // Both V2 and V1 failed - use manual lenient parser as final fallback
     // This handles cases like "Unknown Packager" without email (common in custom repos)
-    parse_desc_manual(content, repo)
+    parse_desc_manual(content, repo).map(ParsedSyncDesc::Manual)
 }
 
 fn parse_desc_manual(content: &str, repo: &str) -> Result<SyncDbPackage> {
@@ -3051,6 +3099,114 @@ mod tests {
             format!("{error:#}").contains("Inconsistent package identity"),
             "long path buffering consumed the damaged later header first: {error:#}"
         );
+    }
+
+    #[test]
+    fn exact_sync_projection_preserves_complete_typed_and_manual_metadata() {
+        let directory = tempfile::tempdir().expect("private mixed-format repository");
+        let path = directory.path().join("extra.db");
+        let v2 = typed_sync_projection_fixture("typed-v2", "1:2.3-01", false);
+        let v1 = typed_sync_projection_fixture("typed-v1", "0:2.3-01", true);
+        let manual = "%NAME%\nmanual\n\n%VERSION%\n2.3-01\n\n%PACKAGER%\nUnknown Packager\n\n%ISIZE%\n4096\n\n%CSIZE%\n1024\n\n%DEPENDS%\ntyped-v2>=1\n\n%LICENSE%\nMIT\n\n";
+        alpm_repo_db::desc::RepoDescFileV2::from_str(&v2).expect("genuine complete V2 metadata");
+        alpm_repo_db::desc::RepoDescFileV1::from_str(&v1).expect("genuine complete V1 metadata");
+        assert!(alpm_repo_db::desc::RepoDescFileV2::from_str(&v1).is_err());
+        write_sync_identity_fixture(
+            &path,
+            &[
+                ("typed-v2-1:2.3-01/desc", &v2),
+                ("typed-v1-0:2.3-01/desc", &v1),
+                ("manual-2.3-01/desc", manual),
+            ],
+        );
+        let all = parse_sync_db(&path, "extra").expect("full mixed-format repository");
+        assert_eq!(all.len(), 3);
+        for name in ["typed-v2", "typed-v1", "manual"] {
+            let exact = parse_sync_db_package(&path, "extra", name)
+                .expect("exact lookup validates every typed and manual record")
+                .expect("selected package");
+            assert_eq!(
+                serde_json::to_value(&exact).expect("exact complete metadata"),
+                serde_json::to_value(&all[name]).expect("original full metadata"),
+                "every projected field and canonical version must match for {name}"
+            );
+            assert!(!exact.depends.is_empty());
+            assert!(!exact.licenses.is_empty());
+            assert_eq!(exact.repo, "extra");
+        }
+        assert_eq!(all["typed-v2"].version.to_string(), "1:2.3-1");
+        assert_eq!(all["typed-v1"].version.to_string(), "0:2.3-1");
+        assert_eq!(all["typed-v2"].groups, ["fixture-group"]);
+        assert_eq!(all["typed-v2"].makedepends, ["cmake>=3"]);
+        assert_eq!(all["typed-v2"].optdepends, ["optional: runtime support"]);
+        assert_eq!(all["typed-v2"].provides, ["virtual-widget=1"]);
+        assert_eq!(all["typed-v2"].conflicts, ["incompatible-widget<2"]);
+        assert_eq!(all["typed-v2"].replaces, ["older-widget"]);
+        assert!(
+            parse_sync_db_package(&path, "extra", "absent")
+                .expect("absence requires complete typed/manual validation")
+                .is_none()
+        );
+    }
+
+    fn typed_sync_projection_fixture(name: &str, version: &str, md5: bool) -> String {
+        let file_version = version
+            .rsplit(':')
+            .next()
+            .expect("version has a final component");
+        let checksum = if md5 {
+            "%MD5SUM%\n0123456789abcdef0123456789abcdef\n\n"
+        } else {
+            ""
+        };
+        format!(
+            "%FILENAME%\n{name}-{file_version}-x86_64.pkg.tar.zst\n\n%NAME%\n{name}\n\n%BASE%\n{name}\n\n%VERSION%\n{version}\n\n%DESC%\nComplete typed metadata\n\n%GROUPS%\nfixture-group\n\n%CSIZE%\n1024\n\n%ISIZE%\n4096\n\n%SHA256SUM%\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n\n{checksum}%URL%\nhttps://example.invalid/widget\n\n%LICENSE%\nMIT\n\n%ARCH%\nx86_64\n\n%BUILDDATE%\n1700000000\n\n%PACKAGER%\nOMG Fixture <fixture@example.invalid>\n\n%DEPENDS%\nglibc>=2.40\n\n%MAKEDEPENDS%\ncmake>=3\n\n%CHECKDEPENDS%\npytest\n\n%OPTDEPENDS%\noptional: runtime support\n\n%PROVIDES%\nvirtual-widget=1\n\n%CONFLICTS%\nincompatible-widget<2\n\n%REPLACES%\nolder-widget\n\n"
+        )
+    }
+
+    #[test]
+    fn exact_sync_projection_rejects_unrelated_typed_failures_in_archive_order() {
+        let directory = tempfile::tempdir().expect("private typed-corruption repository");
+        let path = directory.path().join("extra.db");
+        let selected = typed_sync_projection_fixture("selected", "1-1", false);
+        let unrelated = typed_sync_projection_fixture("unrelated", "1-1", true);
+        for (entry, content, diagnostic) in [
+            (
+                "unrelated-1-1/desc",
+                unrelated.replace("%ISIZE%\n4096", "%ISIZE%\ninvalid"),
+                "Invalid installed size",
+            ),
+            (
+                "unrelated-1-1/desc",
+                unrelated.replace("%VERSION%\n1-1", "%VERSION%\n1\0-1"),
+                "Invalid package version",
+            ),
+            (
+                "nested/unrelated-1-1/desc",
+                unrelated.clone(),
+                "Nested sync package directory identity",
+            ),
+            (
+                "unrelated-2-1/desc",
+                unrelated,
+                "Inconsistent package identity",
+            ),
+            (
+                "selected-1-1/desc",
+                selected.clone(),
+                "Duplicate package identity",
+            ),
+        ] {
+            write_sync_identity_fixture(
+                &path,
+                &[("selected-1-1/desc", &selected), (entry, &content)],
+            );
+            let full = parse_sync_db(&path, "extra").expect_err("invalid full repository");
+            let exact = parse_sync_db_package(&path, "extra", "selected")
+                .expect_err("found target cannot conceal unrelated typed failure");
+            assert!(format!("{exact:#}").contains(diagnostic), "{exact:#}");
+            assert_eq!(format!("{exact:#}"), format!("{full:#}"));
+        }
     }
 
     #[test]
