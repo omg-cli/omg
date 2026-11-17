@@ -1146,16 +1146,13 @@ def guarded_async_context(code, row, modules, work):
                    tuple(tuple(attribute) for attribute in attributes))
 
 
-def compiled_async_function_groups(name, owners, files, source, work=None, inventory=None):
+def compiled_async_function_groups(name, owners, files, source, work=None, inventory=None, owner_counts=None):
     """Bind separate v0 constructor/body owners without merging their counters."""
     work = [20_000_000] if work is None else work
     inventory = _construct_inventory(source, work) if inventory is None else inventory
     if inventory is None:
         return {}
     code = inventory[0]
-    counts = Counter(owner['name'] for owner in owners)
-    eligible = [owner for owner in owners
-                if source_owner_span(owner, name, files, source) is not None]
     result = {}; declarations = []
     closing_kinds = {}
     _construct_charge(work, len(inventory[1]))
@@ -1184,34 +1181,46 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
         span = first[0], closing[0]
         declarations.append((declaration, first, opening, closing, span, context))
     prefixes = source_function_prefixes(source, [row[4] for row in declarations], work)
+    if not prefixes:
+        return {}
+    if owner_counts is None:
+        _construct_charge(work, len(owners))
+        owner_counts = Counter(owner['name'] for owner in owners)
+    constructors = {}; bodies = {}
+    for owner in owners:
+        regions = owner['regions']
+        _construct_charge(work, len(owner['name']) + len(owner['filenames']) + 3 * len(regions))
+        if source_owner_span(owner, name, files, source) is None:
+            continue
+        if len(regions) == 1:
+            constructors.setdefault(tuple(regions[0][:4]), []).append(owner)
+        first = min(tuple(region[:2]) for region in regions)
+        last = max(tuple(region[2:4]) for region in regions)
+        bodies.setdefault((first, last), []).append(owner)
     for declaration, first, opening, closing, span, context in declarations:
         if span not in prefixes:
             continue
         parents = []; module_path = context[0] if context else ()
         qualified_name = (*module_path, declaration)
-        for owner in eligible:
-            _construct_charge(work, len(owner['name']) + len(owner['regions']))
+        for owner in constructors.get((*first, opening[0], opening[1] - 1), ()):
+            _construct_charge(work, len(owner['name']))
             shape = plain_rust_function_symbol(owner['name'])
-            if (shape is not None and shape.identifiers[-len(qualified_name):] == qualified_name
-                    and len(owner['regions']) == 1
-                    and tuple(owner['regions'][0][:4]) == (*first, opening[0], opening[1] - 1)):
+            if shape is not None and shape.identifiers[-len(qualified_name):] == qualified_name:
                 parents.append((owner, shape))
         if not parents or len({shape.identity for _, shape in parents}) != 1:
             continue
         copies = []
         for parent, shape in parents:
             children = []
-            for owner in eligible:
+            for owner in bodies.get((opening, closing), ()):
                 _construct_charge(work, len(owner['name']) + len(owner['regions']))
                 if not direct_rust_callback_symbol(owner['name'], parent['name'], shape.modules):
                     continue
-                regions = owner['regions']
-                if (min(tuple(region[:2]) for region in regions) == opening
-                        and max(tuple(region[2:4]) for region in regions) == closing
-                        and sum(tuple(region[:4]) == (*opening, opening[0], opening[1] + 1)
-                                for region in regions) == 1):
+                if sum(tuple(region[:4]) == (*opening, opening[0], opening[1] + 1)
+                       for region in owner['regions']) == 1:
                     children.append(owner)
-            if len(children) != 1 or counts[parent['name']] != 1 or counts[children[0]['name']] != 1:
+            if (len(children) != 1 or owner_counts[parent['name']] != 1
+                    or owner_counts[children[0]['name']] != 1):
                 copies = []
                 break
             copies.append(AsyncCompiledCopy(parent, children[0]))
@@ -1568,8 +1577,8 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             valid = {prefix: group for prefix, group in valid.items()
                      if all(names[owner['name']] == 1 for owner in group[2])}
         valid = dict(valid)
-        phases = compiled_async_function_groups(name, owners, files, source, work,
-                    None if construct_inventories is None else construct_inventories[side])
+        phases = compiled_async_function_groups(name, inventory, files, source, work,
+                    None if construct_inventories is None else construct_inventories[side], names)
         phase_bodies = {id(copy.body) for group in phases.values() for copy in group.copies}
         valid = {key: group for key, group in valid.items()
                  if not any(id(owner) in phase_bodies for owner in group[2])}

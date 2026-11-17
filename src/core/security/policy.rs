@@ -242,17 +242,21 @@ impl SecurityPolicy {
             path: path.display().to_string(),
             source,
         })?;
-        let parse_error = |source| PolicyError::Parse {
+        let parsed = toml::from_str(&content).and_then(Self::decode_document);
+        let policy = parsed.map_err(|source| PolicyError::Parse {
             path: path.display().to_string(),
             source,
-        };
-        let value: toml::Value = toml::from_str(&content).map_err(parse_error)?;
+        })?;
+        policy.validate_advisory_scope()?;
+        Ok(policy)
+    }
+
+    fn decode_document(value: toml::Value) -> Result<Self, toml::de::Error> {
         let legacy = value.get("advisory_requirement").is_none();
-        let mut policy: Self = value.try_into().map_err(parse_error)?;
+        let mut policy: Self = value.try_into()?;
         if legacy {
             policy.advisory_requirement = AdvisoryRequirement::Review;
         }
-        policy.validate_advisory_scope()?;
         Ok(policy)
     }
 
@@ -990,6 +994,16 @@ mod tests {
         );
         let inherited: SecurityPolicy = serde_json::from_slice(&serde_json::to_vec(&policy)?)?;
         assert_eq!(inherited, policy);
+        for invalid in [
+            "advisory_requirement = [",
+            "advisory_requirement = 'unsupported'",
+        ] {
+            fs::write(&path, invalid)?;
+            assert!(matches!(
+                SecurityPolicy::load(&path),
+                Err(PolicyError::Parse { path: reported, .. }) if reported == path.display().to_string()
+            ));
+        }
         fs::write(&path, "arch_advisory_repositories = ['core\nspoof']\n")?;
         assert!(SecurityPolicy::load(&path).is_err());
         let oversized = SecurityPolicy {
