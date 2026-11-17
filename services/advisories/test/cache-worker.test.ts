@@ -21,7 +21,7 @@ test("real Worker caches public reads, isolates private reads and uses indexed r
     }));
     try {
         const db = await runtime.getD1Database("DB");
-        for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql"]) {
+        for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql", "0004_epss_cache.sql"]) {
             const source = await readFile(new NodeURL(`../migrations/${name}`, import.meta.url), "utf8");
             await db.batch(unstable_splitSqlQuery(source).map((query) => db.prepare(query)));
         }
@@ -54,6 +54,22 @@ test("real Worker caches public reads, isolates private reads and uses indexed r
         expect(object(await refreshed.json()).kev).toEqual({ cveID: id });
         expect(refreshed.headers.get("etag")).not.toBe(tag);
         expect((await worker.fetch("https://advisories.example/v1/status")).headers.get("cache-control")).toBe("no-store");
+
+        await db.prepare("INSERT INTO epss_cache VALUES(?,?,?,?,0)").bind(id, now, now, JSON.stringify({
+            status: "OK", "status-code": 200, total: 1, offset: 0,
+            data: [{ cve: id, epss: "0.25", percentile: "0.9", date: now.slice(0, 10), "time-series": [] }],
+        })).run();
+        const epssUrl = `https://advisories.example/v1/epss/${id}`;
+        const scored = await worker.fetch(epssUrl);
+        const epssTag = scored.headers.get("etag");
+        expect(object(await scored.json()).status).toBe("scored");
+        expect(scored.headers.get("cache-control")).toContain("public");
+        expect((await worker.fetch(epssUrl, { headers: { "if-none-match": String(epssTag) } })).status).toBe(304);
+        await db.prepare("UPDATE epss_cache SET error=1 WHERE cve_id=?").bind(id).run();
+        expect(object(await (await worker.fetch(epssUrl)).json()).status).toBe("scored");
+        const failedEpss = object(await (await worker.fetch(epssUrl, { headers: { "cache-control": "no-cache" } })).json());
+        expect(failedEpss.status).toBe("unavailable");
+        expect(failedEpss.score).toBeNull();
 
         await db.prepare("INSERT INTO source_record SELECT 'CVE-2020-'||(1000+value),'cve','https://example.invalid','5.2','PUBLISHED','2020-01-01T00:00:00.000Z','2020-01-01T00:00:00.000Z',?,'hash','fixture',1,1 FROM json_each(?)")
             .bind(now, JSON.stringify(Array.from({ length: 4096 }, (_, n) => n))).run();

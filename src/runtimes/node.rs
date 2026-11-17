@@ -264,7 +264,8 @@ impl NodeManager {
         _filename: &str,
     ) -> std::future::Ready<Result<String>> {
         std::future::ready(Err(anyhow::anyhow!(
-            "Authenticated Node installation requires an OMG build with PGP support"
+            "Authenticated Node installation requires an OMG build with PGP support (installation root: {})",
+            self.versions_dir.display()
         )))
     }
 

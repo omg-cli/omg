@@ -3,7 +3,7 @@ import { object, sha256 } from "./domain";
 function publicRead(request: Request): boolean {
     return request.method === "GET" && !request.headers.has("authorization") &&
         !request.headers.has("cookie") &&
-        /^\/v1\/(?:arch\/advisories|cves\/(?:recent|CVE-\d{4}-\d{4,19}))$/.test(new URL(request.url).pathname);
+        /^\/v1\/(?:arch\/advisories|cves\/(?:recent|CVE-\d{4}-\d{4,19})|epss\/CVE-\d{4}-\d{4,19})$/.test(new URL(request.url).pathname);
 }
 function conditional(request: Request, response: Response): Response {
     const etag = response.headers.get("etag");
@@ -20,11 +20,18 @@ export async function publicResponse(request: Request, response: Response, now: 
     const checked = [body.checked_at, body.cve_checked_at, body.kev_checked_at]
         .filter((value) => value !== undefined);
     const milliseconds = Date.parse(now);
+    const epss = new URL(request.url).pathname.startsWith("/v1/epss/");
+    const freshness = epss ? 6 * 60 * 60_000 : 30 * 60_000;
     let ttl = checked.length ? 60 : 0;
     for (const value of checked) {
         const at = typeof value === "string" ? Date.parse(value) : NaN;
         ttl = Math.min(ttl, Number.isFinite(at) && at <= milliseconds
-            ? Math.max(0, Math.floor((at + 30 * 60_000 - milliseconds) / 1000)) : 0);
+            ? Math.max(0, Math.floor((at + freshness - milliseconds) / 1000)) : 0);
+    }
+    if (epss && body.status === "scored") {
+        const day = object(body.score).date;
+        const at = typeof day === "string" ? Date.parse(`${day}T00:00:00Z`) : NaN;
+        ttl = Math.min(ttl, Number.isFinite(at) ? Math.max(0, Math.floor((at + 2 * 24 * 60 * 60_000 - milliseconds) / 1000)) : 0);
     }
     response.headers.set("ETag", `"${await sha256(text)}"`);
     if (ttl > 0) {

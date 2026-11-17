@@ -11,6 +11,8 @@ import {
 import { ingestCveGroups, parseBatch } from "./ingestion";
 import { Store, type Checkpoint, type RecordRow } from "./storage";
 import { recentCves } from "./recent";
+import { epss } from "./epss";
+import { type Fetcher } from "./ingestion";
 import { publicResponse } from "./cache";
 async function authorized(
     request: Request,
@@ -79,14 +81,16 @@ export async function handle(
     store: Store,
     token?: string,
     now = new Date().toISOString(),
+    fetcher: Fetcher = (url, init) => fetch(url, init),
 ): Promise<Response> {
-    return publicResponse(request, await route(request, store, token, now), now);
+    return publicResponse(request, await route(request, store, token, now, fetcher), now);
 }
 async function route(
     request: Request,
     store: Store,
     token: string | undefined,
     now: string,
+    fetcher: Fetcher,
 ): Promise<Response> {
     const url = new URL(request.url);
     try {
@@ -339,6 +343,13 @@ async function route(
                 })),
                 package_applicability: "Arch feed only; AUR mapping unknown",
             });
+        }
+        const epssMatch = /^\/v1\/epss\/(CVE-\d{4}-\d{4,19})$/.exec(url.pathname);
+        if (epssMatch?.[1]) {
+            if (url.search) throw new Error("invalid EPSS query");
+            if (!await store.sql.first("SELECT id FROM source_record WHERE id=?", [epssMatch[1]]))
+                return Response.json({ error: "CVE unavailable", status: "unavailable" }, { status: 404 });
+            return Response.json(await epss(store, epssMatch[1], now, fetcher));
         }
         if (url.pathname === "/v1/arch/advisories") {
             const checkpoint = await store.checkpoint("arch");

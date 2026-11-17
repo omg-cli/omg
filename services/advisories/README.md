@@ -81,6 +81,14 @@ Bounds are explicit. CVE records are 3 MiB, snapshots 16 MiB, delta transport 64
 
 ## Archive bootstrap
 
+## EPSS enrichment
+
+`GET /v1/epss/CVE-YYYY-NNNN` enriches an already imported CVE with [FIRST EPSS](https://www.first.org/epss/data). It returns the score, percentile, score date, attribution and up to 30 days of history as of the response's `as_of` time. `scored`, `missing` and `unavailable` are separate states; a real zero is retained as zero, and a failed lookup never supplies a zero or claims safety. Scores older than two days remain unavailable. EPSS forecasts observed exploitation over the next 30 days; it does not establish package applicability or override CISA KEV, CVEs or required consent.
+
+The bounded fixed-origin lookup uses the [official time-series API](https://api.first.org/epss/) for individual requested CVEs. It does not mirror the whole EPSS dataset through that API. D1 caches successful results for six hours, backs off failures for one minute and retains the last successful history on upstream failure. Lease fencing prevents expired writers from replacing that history. Public responses use ETags and at most 60 seconds of edge caching. Unknown CVEs do not trigger upstream queries. Apply migration `0004_epss_cache.sql` before deploying this route. The [FIRST service terms](https://www.first.org/about/policies/terms) permit preventative cybersecurity use; attribution is included in every result.
+
+## Archive bootstrap
+
 Download the official full ZIP only after reserving local and Cloudflare capacity. The script accepts an existing archive and never downloads the corpus or extracts record paths. A sole `cves.zip` wrapper is decoded into a fixed private temporary file before the inner ZIP is scanned. Stored and DEFLATE wrappers require matching decoded size and CRC32, with a 1 GiB decoded limit and a 500:1 compression limit. Mixed or recursive wrappers and archives without CVE records are rejected. Source release filenames can include a doubled `.zip.zip` suffix. Select the exact official asset name, not an assumed filename.
 
 The script fetches bounded metadata from the fixed official GitHub release API, matches asset size, and verifies its published SHA-256 before any ingest. Pinned `yauzl` 3.4.0 reads ZIP entries lazily. It validates CVE filename/year/bucket consistency, entry size and compression bounds. Paths are never extracted. An atomic local resume file advances only after an accepted HTTP batch. Replay after a lost response is safe.
