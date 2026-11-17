@@ -790,31 +790,32 @@ mod tests {
             } if status.scanned_vulnerability_summary() == Some((2, 7))
         ));
 
-        let mut previous = frame;
+        let mut previous = frame.clone();
         previous[..4].copy_from_slice(&4u32.to_le_bytes());
-        assert!(
-            matches!(
-                split_frame(&previous),
-                Err(FrameError::VersionMismatch {
-                    peer: 4,
-                    ours: PROTOCOL_VERSION
-                })
+        let mut invalid_previous = previous.clone();
+        invalid_previous.truncate(4);
+        invalid_previous.extend_from_slice(b"not a bitcode response");
+        for (name, candidate, previous_version) in [
+            ("current security status", frame, false),
+            ("previous security status", previous, true),
+            (
+                "previous header with invalid payload",
+                invalid_previous,
+                true,
             ),
-            "previous security semantics cannot decode as current coverage"
-        );
-
-        previous.truncate(4);
-        previous.extend_from_slice(b"not a bitcode response");
-        assert!(
-            matches!(
-                split_frame(&previous),
-                Err(FrameError::VersionMismatch {
-                    peer: 4,
-                    ours: PROTOCOL_VERSION
-                })
-            ),
-            "the version boundary must reject before attempting payload decoding"
-        );
+        ] {
+            assert_eq!(
+                matches!(
+                    split_frame(&candidate),
+                    Err(FrameError::VersionMismatch {
+                        peer: 4,
+                        ours: PROTOCOL_VERSION
+                    })
+                ),
+                previous_version,
+                "{name}: only the previous header must be refused before payload decoding"
+            );
+        }
     }
 
     #[test]

@@ -1366,6 +1366,25 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    #[cfg(unix)]
+    fn generated_recipe_distinguishes_an_owned_directory_from_a_regular_recipe() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let directory = owner.path().join("Dockerfile.omg");
+        fs::create_dir(&directory)?;
+        assert!(
+            generated_recipe(&directory)?.is_none(),
+            "an opened directory must not be classified as a generated recipe"
+        );
+        assert!(directory.is_dir());
+
+        let regular = owner.path().join("regular.Dockerfile");
+        let recipe = format!("{GENERATED_RECIPE_MARKER}\nFROM scratch\n");
+        fs::write(&regular, &recipe)?;
+        assert_eq!(generated_recipe(&regular)?, Some(recipe));
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn generated_recipe_requires_unknown_review_even_with_generic_yes() {

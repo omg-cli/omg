@@ -1225,14 +1225,22 @@ fn admitted_runtime_for_command(
             .into_iter()
             .map(|name| base.join(name))
             .find(|path| path.is_file())
-            .context("Task runtime executable has no reviewed virtualenv base")?;
+            .context("Task runtime executable has no reviewed virtualenv base")?
+            .canonicalize()?;
+        let runtime_root = base
+            .parent()
+            .context("Task virtualenv base has no reviewed runtime root")?;
+        anyhow::ensure!(
+            original.starts_with(runtime_root),
+            "Task virtualenv base Python executable escapes its reviewed runtime"
+        );
         anyhow::ensure!(
             same_executable_file(&executable, &original)
                 || crate::runtimes::security::file_digest(&executable, 512 * 1024 * 1024)?.0
                     == crate::runtimes::security::file_digest(&original, 512 * 1024 * 1024)?.0,
             "Task runtime executable differs from its reviewed virtualenv base"
         );
-        executable = original.canonicalize()?;
+        executable = original;
         binary_dir = base;
         true
     } else {
@@ -2496,13 +2504,14 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
             std::fs::create_dir_all(&base).unwrap();
             std::fs::create_dir(&config).unwrap();
             std::fs::create_dir_all(venv.join("bin")).unwrap();
-            let executable = base.join("python3");
+            let executable = base.join("python3.12");
             std::fs::write(
                 &executable,
                 format!("#!/bin/sh\nprintf reviewed > '{}'\n", marker.display()),
             )
             .unwrap();
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("python3.12", base.join("python3")).unwrap();
             std::os::unix::fs::symlink(&executable, venv.join("bin/python3")).unwrap();
             std::fs::write(
                 venv.join("pyvenv.cfg"),
@@ -2553,6 +2562,30 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     .unwrap();
                     assert_eq!(std::fs::read(&marker).unwrap(), b"reviewed");
                     std::fs::remove_file(&marker).unwrap();
+                    let metadata = venv.join("pyvenv.cfg");
+                    let original_metadata = std::fs::read(&metadata).unwrap();
+                    std::fs::remove_file(&metadata).unwrap();
+                    let error = execute_process_in(
+                        "python3",
+                        &[],
+                        &[],
+                        None,
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .expect_err("a reviewed interpreter cannot replace missing venv metadata");
+                    assert!(
+                        format!("{error:#}")
+                            .contains("Virtualenv has no base interpreter metadata"),
+                        "pinned={pinned}: {error:#}"
+                    );
+                    assert!(
+                        !marker.exists(),
+                        "virtualenv without base metadata executed Python"
+                    );
+                    assert!(!metadata.exists(), "refusal must not invent venv metadata");
+                    std::fs::write(&metadata, original_metadata).unwrap();
                     let error = execute_process_in(
                         "omg-missing-reviewed-task-fixture",
                         &[],
@@ -2587,6 +2620,39 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                         assert!(format!("{error:#}").contains("runtime mutation or active use"));
                         assert!(!marker.exists(), "locked runtime unexpectedly executed");
                     }
+                    let external = owner.path().join("external-python");
+                    std::fs::copy(&executable, &external).unwrap();
+                    let alias = base.join("python3");
+                    std::fs::remove_file(&alias).unwrap();
+                    std::os::unix::fs::symlink(&external, &alias).unwrap();
+                    let mut command = Command::new("python3");
+                    command
+                        .current_dir(owner.path())
+                        .env("PATH", venv.join("bin"));
+                    let selected = if pinned {
+                        vec![("python".to_owned(), base.clone())]
+                    } else {
+                        vec![]
+                    };
+                    let error = admitted_runtime_for_command(&command, &selected, Some(&venv))
+                        .expect_err("same-byte external base alias cannot become a pinned kernel");
+                    assert!(
+                        format!("{error:#}").contains("escapes its reviewed runtime"),
+                        "{error:#}"
+                    );
+                    execute_process_in(
+                        "python3",
+                        &[],
+                        &[],
+                        None,
+                        owner.path(),
+                        owner.path(),
+                        owner.path(),
+                    )
+                    .expect_err("live full-tree authority must also refuse the escaping alias");
+                    assert!(!marker.exists(), "escaping base alias executed Python");
+                    std::fs::remove_file(&alias).unwrap();
+                    std::os::unix::fs::symlink("python3.12", &alias).unwrap();
                 },
             );
         }

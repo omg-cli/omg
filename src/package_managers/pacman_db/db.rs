@@ -369,7 +369,7 @@ fn parse_sync_db_into<T: Send>(
         }
     };
 
-    let mut archive = tar::Archive::new(reader);
+    let mut archive = tar::Archive::new(BufReader::with_capacity(64 * 1024, reader));
     let mut entry_count = 0usize;
     let mut descriptions = Vec::new();
     let mut buffered_bytes = 0usize;

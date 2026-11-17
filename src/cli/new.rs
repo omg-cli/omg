@@ -3,57 +3,60 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use crate::cli::style;
+use crate::cli::{args::ProjectStack, style};
 
 fn require_command_success(status: std::process::ExitStatus, operation: &str) -> Result<()> {
     anyhow::ensure!(status.success(), "{operation} failed with {status}");
     Ok(())
 }
 
-fn canonical_stack(stack: &str) -> Option<&'static str> {
+fn canonical_stack(stack: &str) -> Option<ProjectStack> {
     match stack.to_ascii_lowercase().as_str() {
-        "rust" | "rs" => Some("rust"),
-        "react" | "react-ts" => Some("react"),
-        "node" | "ts" | "typescript" => Some("node"),
-        "python" | "py" => Some("python"),
-        "go" | "golang" => Some("go"),
+        "rust" | "rs" => Some(ProjectStack::Rust),
+        "react" | "react-ts" => Some(ProjectStack::React),
+        "node" | "ts" | "typescript" => Some(ProjectStack::Node),
+        "python" | "py" => Some(ProjectStack::Python),
+        "go" | "golang" => Some(ProjectStack::Go),
         _ => None,
     }
 }
 
-fn validate_manifest_name(stack: &str, name: &str, path: &str) -> Result<()> {
+fn validate_manifest_name(stack: ProjectStack, name: &str, path: &str) -> Result<()> {
     let first = name.as_bytes().first().copied().unwrap_or_default();
     let last = name.as_bytes().last().copied().unwrap_or_default();
     let valid = match stack {
-        "rust" => {
+        ProjectStack::Rust => {
             (first.is_ascii_alphabetic() || first == b'_')
                 && name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
         }
-        "react" | "node" => {
+        ProjectStack::React | ProjectStack::Node => {
             name.len() <= 214
                 && (first.is_ascii_lowercase() || first.is_ascii_digit())
                 && name.bytes().all(|byte| {
                     byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_.".contains(&byte)
                 })
         }
-        "python" => {
+        ProjectStack::Python => {
             first.is_ascii_alphanumeric()
                 && last.is_ascii_alphanumeric()
                 && name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
         }
-        "go" => path.split('/').all(|part| {
+        ProjectStack::Go => path.split('/').all(|part| {
             !part.is_empty()
                 && part
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
         }),
-        _ => false,
     };
-    anyhow::ensure!(valid, "Invalid {stack} project manifest name: {name}");
+    anyhow::ensure!(
+        valid,
+        "Invalid {} project manifest name: {name}",
+        stack.as_str()
+    );
     Ok(())
 }
 
@@ -101,12 +104,11 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
     }
     fs::create_dir(&target_dir)?;
     match canonical_stack {
-        "rust" => scaffold_rust(&target_dir, project_name)?,
-        "react" => scaffold_react(&target_dir, project_name)?,
-        "node" => scaffold_node(&target_dir, project_name)?,
-        "python" => scaffold_python(&target_dir, project_name)?,
-        "go" => scaffold_go(&target_dir, name)?,
-        _ => unreachable!("canonical_stack returned an unknown family"),
+        ProjectStack::Rust => scaffold_rust(&target_dir, project_name)?,
+        ProjectStack::React => scaffold_react(&target_dir, project_name)?,
+        ProjectStack::Node => scaffold_node(&target_dir, project_name)?,
+        ProjectStack::Python => scaffold_python(&target_dir, project_name)?,
+        ProjectStack::Go => scaffold_go(&target_dir, name)?,
     }
 
     // Post-scaffold setup
@@ -114,7 +116,7 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
 
     let tool_versions_path = target_dir.join(".tool-versions");
     if !tool_versions_path.exists() {
-        lock_runtimes(&target_dir, canonical_stack)?;
+        lock_runtimes(&target_dir, canonical_stack.as_str())?;
     }
 
     if !target_dir.join(".git").exists() {
@@ -130,7 +132,7 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
     println!("\n{}", style::success("Project created successfully! 🚀"));
     println!("\nTo get started:");
     println!("  cd {name}");
-    if matches!(canonical_stack, "react" | "node") {
+    if matches!(canonical_stack, ProjectStack::React | ProjectStack::Node) {
         println!(
             "  Review and install the dependencies listed in package.json before running the project."
         );
@@ -329,11 +331,12 @@ mod tests {
 
     #[test]
     fn stack_aliases_share_their_runtime_lock_family() {
-        assert_eq!(canonical_stack("react-ts"), Some("react"));
-        assert_eq!(canonical_stack("typescript"), Some("node"));
-        assert_eq!(canonical_stack("py"), Some("python"));
-        assert_eq!(canonical_stack("golang"), Some("go"));
-        assert_eq!(canonical_stack("rs"), Some("rust"));
+        assert_eq!(canonical_stack("react-ts"), Some(ProjectStack::React));
+        assert_eq!(canonical_stack("typescript"), Some(ProjectStack::Node));
+        assert_eq!(canonical_stack("py"), Some(ProjectStack::Python));
+        assert_eq!(canonical_stack("golang"), Some(ProjectStack::Go));
+        assert_eq!(canonical_stack("rs"), Some(ProjectStack::Rust));
+        assert_eq!(canonical_stack("unknown"), None);
     }
 
     #[test]

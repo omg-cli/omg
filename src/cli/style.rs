@@ -390,6 +390,27 @@ mod tests {
 
     #[test]
     #[serial]
+    fn spinner_keeps_the_message_until_finished() {
+        for (color, unicode) in [("always", "1"), ("never", "0")] {
+            temp_env::with_vars(
+                [
+                    ("NO_COLOR", None),
+                    ("OMG_COLORS", Some(color)),
+                    ("OMG_UNICODE", Some(unicode)),
+                ],
+                || {
+                    let progress = spinner("Checking package sources");
+                    assert_eq!(progress.message(), "Checking package sources");
+                    assert!(!progress.is_finished());
+                    progress.finish_and_clear();
+                    assert!(progress.is_finished());
+                },
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
     fn test_no_color_disables_colors() {
         temp_env::with_var("NO_COLOR", Some("1"), || {
             assert!(!colors_enabled());
