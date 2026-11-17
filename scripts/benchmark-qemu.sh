@@ -514,6 +514,7 @@ if [[ -n "${native_cli_coverage_dir:-}" ]]; then
   cp -a "$native_cli_coverage_dir/bin" "$work/native-cli/bin"
   cp "$native_cli_coverage_dir/native-cli-manifest.json" "$work/native-cli/native-cli-manifest.json"
   cp "$here/native-cli-coverage.py" "$work/native-cli/native-cli-coverage.py"
+  cp "$here/attend-unknown-fixture.py" "$work/native-cli/attend-unknown-fixture.py"
 fi
 cat > "$work/boot.sh" <<'BOOT'
 #!/usr/bin/env bash
@@ -1008,7 +1009,7 @@ chmod 440 /etc/sudoers.d/omg-native-coverage
 visudo -cf /etc/sudoers.d/omg-native-coverage
 NATIVE_SETUP
 # Tar is only transport: the guest independently checks every admitted digest.
-tar -C /work/native-cli -cf - . | ssh "${opts[@]}" bench@127.0.0.1   'sudo -n sh -c "install -d -m 755 /native-cli-inputs; tar -C /native-cli-inputs -xf -; install -m 644 /native-cli-inputs/native-cli-coverage.py /native-cli-coverage.py; install -m 644 /native-cli-inputs/native-cli-manifest.json /native-cli-manifest.json; install -m 755 /native-cli-inputs/bin/* /omg-extra-bin/"'
+tar -C /work/native-cli -cf - . | ssh "${opts[@]}" bench@127.0.0.1   'sudo -n sh -c "install -d -m 755 /native-cli-inputs; tar -C /native-cli-inputs -xf -; install -m 644 /native-cli-inputs/native-cli-coverage.py /native-cli-coverage.py; install -m 644 /native-cli-inputs/attend-unknown-fixture.py /attend-unknown-fixture.py; install -m 644 /native-cli-inputs/native-cli-manifest.json /native-cli-manifest.json; install -m 755 /native-cli-inputs/bin/* /omg-extra-bin/"'
 status=0
 printf '[native-coverage] running admitted producer\n'
 ssh "${opts[@]}" bench@127.0.0.1 'sudo -n python3 /native-cli-coverage.py run' || status=$?

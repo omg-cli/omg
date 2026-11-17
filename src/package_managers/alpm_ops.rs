@@ -2418,6 +2418,21 @@ struct PreparedAdvisoryAdmission {
     acknowledgement: Option<UnknownArchiveAcknowledgement>,
     risk_acceptance: Option<crate::core::security::advisory_review::AdvisoryRiskAcceptance>,
     operation: Option<crate::core::security::vulnerability::ArchOperationAssessment>,
+    assessments: Vec<crate::core::security::vulnerability::PackageAssessment>,
+}
+
+fn prepared_risk_review(
+    assessments: &[crate::core::security::vulnerability::PackageAssessment],
+    context: &str,
+    requirement: crate::core::security::policy::AdvisoryRequirement,
+) -> Result<Option<crate::core::security::advisory_review::AdvisoryRiskReview>> {
+    use crate::core::security::advisory_review::AdvisoryRiskReview;
+    if requirement == crate::core::security::policy::AdvisoryRequirement::FreshSnapshot {
+        // FreshSnapshot already owns the separate exact-archive gap acknowledgement.
+        AdvisoryRiskReview::new(assessments, context)
+    } else {
+        AdvisoryRiskReview::new_with_unknown(assessments, context)
+    }
 }
 
 impl PreparedAdvisoryAdmission {
@@ -2430,7 +2445,9 @@ impl PreparedAdvisoryAdmission {
         signals: &mut Option<AdmissionSignals>,
     ) -> Result<Self> {
         use crate::core::security::policy::{AdvisoryRequirement, SecurityPolicy};
-        use crate::core::security::vulnerability::{AssessmentUse, VulnerabilityScanner};
+        use crate::core::security::vulnerability::{
+            AssessmentUse, PackageAssessment, UnknownCoverage, VulnerabilityScanner,
+        };
         if initial_policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot
             && !alpm.trans_add().is_empty()
         {
@@ -2539,30 +2556,6 @@ impl PreparedAdvisoryAdmission {
                             .all(|(assessment, item)| assessment.package == item.package),
                     "Prepared Arch assessment identity mismatch"
                 );
-                if let Some(review) =
-                    crate::core::security::advisory_review::AdvisoryRiskReview::new(
-                        operation.assessments(),
-                        &advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?,
-                    )?
-                {
-                    if signals.is_none() {
-                        AdmissionSignals::begin_in(signals).with_context(|| {
-                            format!(
-                                "{}\nAdvisory risk review requires an attended native OMG CLI",
-                                review.details(),
-                            )
-                        })?;
-                    }
-                    confirm_advisory_prompt(
-                        review.details(),
-                        review.id(),
-                        invoking_uid,
-                        signals
-                            .as_ref()
-                            .context("Advisory risk signal owner is missing")?,
-                    )?;
-                    risk_acceptance = Some(review.accept(&format!("accept {}", review.id()))?);
-                }
                 if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot {
                     for assessment in operation.assessments() {
                         anyhow::ensure!(
@@ -2579,6 +2572,43 @@ impl PreparedAdvisoryAdmission {
             }
             operation
         };
+        let assessments = operation.as_ref().map_or_else(
+            || {
+                packages
+                    .iter()
+                    .map(|item| {
+                        PackageAssessment::unknown(
+                            item.package.clone(),
+                            UnknownCoverage::EvidenceUnavailable,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+            |operation| operation.assessments().to_vec(),
+        );
+        if let Some(review) = prepared_risk_review(
+            &assessments,
+            &advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?,
+            policy.advisory_requirement,
+        )? {
+            if signals.is_none() {
+                AdmissionSignals::begin_in(signals).with_context(|| {
+                    format!(
+                        "{}\nAdvisory risk review requires an attended native OMG CLI",
+                        review.details(),
+                    )
+                })?;
+            }
+            confirm_advisory_prompt(
+                review.details(),
+                review.id(),
+                invoking_uid,
+                signals
+                    .as_ref()
+                    .context("Advisory risk signal owner is missing")?,
+            )?;
+            risk_acceptance = Some(review.accept(&format!("accept {}", review.id()))?);
+        }
         if let Some(signals) = signals.as_ref() {
             signals.check()?;
         }
@@ -2590,6 +2620,7 @@ impl PreparedAdvisoryAdmission {
             acknowledgement,
             risk_acceptance,
             operation,
+            assessments,
         })
     }
 
@@ -2626,17 +2657,18 @@ impl PreparedAdvisoryAdmission {
         }
         if let Some(operation) = &self.operation {
             operation.validate_now()?;
-            if let Some(review) = crate::core::security::advisory_review::AdvisoryRiskReview::new(
-                operation.assessments(),
-                &advisory_batch_digest(&current, &policy, &profile, invoking_uid)?,
-            )? {
-                anyhow::ensure!(
-                    self.risk_acceptance
-                        .as_ref()
-                        .is_some_and(|accepted| accepted.matches(&review)),
-                    "Advisory risk acceptance no longer matches this transaction; review again"
-                );
-            }
+        }
+        if let Some(review) = prepared_risk_review(
+            &self.assessments,
+            &advisory_batch_digest(&current, &policy, &profile, invoking_uid)?,
+            policy.advisory_requirement,
+        )? {
+            anyhow::ensure!(
+                self.risk_acceptance
+                    .as_ref()
+                    .is_some_and(|accepted| accepted.matches(&review)),
+                "Advisory risk acceptance no longer matches this transaction; review again"
+            );
         }
         if let Some(signals) = signals.as_mut() {
             signals.check()?;
@@ -2856,6 +2888,58 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_unknown_review_is_required_and_bound_without_fabricating_snapshot_authority()
+    -> anyhow::Result<()> {
+        use crate::core::security::policy::AdvisoryRequirement;
+        use crate::core::security::vulnerability::{PackageAssessment, UnknownCoverage};
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        let assessment = PackageAssessment::unknown(
+            SecurityPackage {
+                name: "fixture".into(),
+                version: "1-1".into(),
+                architecture: Some("x86_64".into()),
+                origin: SecurityOrigin::ArchRepository {
+                    repository: "core".into(),
+                },
+                advisory_source: None,
+                description: String::new(),
+                licenses: vec!["MIT".into()],
+            },
+            UnknownCoverage::EvidenceUnavailable,
+        );
+        for requirement in [AdvisoryRequirement::Optional, AdvisoryRequirement::Review] {
+            let review = super::prepared_risk_review(
+                std::slice::from_ref(&assessment),
+                "prepared-batch",
+                requirement,
+            )?
+            .expect("Unknown-only mutation requires an explicit decision");
+            assert!(review.details().contains("EvidenceUnavailable"));
+            assert!(review.accept("yes").is_err());
+            let accepted = review.accept(&format!("accept {}", review.id()))?;
+            assert!(accepted.matches(&review));
+            let mut changed = assessment.clone();
+            changed.package.version = "2-1".into();
+            let changed = super::prepared_risk_review(&[changed], "prepared-batch", requirement)?
+                .expect("changed version remains Unknown");
+            assert!(!accepted.matches(&changed));
+            assert!(super::prepared_risk_review(&[], "empty-batch", requirement)?.is_none());
+        }
+        let mut archive = assessment;
+        archive.package.origin = SecurityOrigin::LocalArchive;
+        // FreshSnapshot retains its existing separate exact-archive acknowledgement.
+        assert!(
+            super::prepared_risk_review(
+                &[archive],
+                "fresh-private-archive",
+                AdvisoryRequirement::FreshSnapshot,
+            )?
+            .is_none()
+        );
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn advisory_risk_terminal_requires_exact_attended_acceptance() -> anyhow::Result<()> {
@@ -3332,6 +3416,12 @@ mod tests {
             );
         }
         let case = std::env::var("OMG_ADVISORY_INSTALL_CASE")?;
+        let coverage =
+            std::env::var("OMG_ADVISORY_INSTALL_COVERAGE").unwrap_or_else(|_| "finding".to_owned());
+        anyhow::ensure!(
+            ["finding", "unavailable", "unmapped"].contains(&coverage.as_str()),
+            "unknown advisory coverage fixture"
+        );
         anyhow::ensure!(
             [
                 "accept",
@@ -3449,18 +3539,31 @@ mod tests {
             let admission = prepared?;
             assert!(
                 admission.risk_acceptance.is_some(),
-                "the actual finding needs a bound acceptance"
+                "both actual findings and Unknown coverage need a bound acceptance"
             );
-            let operation = admission
-                .operation
-                .as_ref()
-                .context("missing actual advisory request")?;
-            assert_eq!(operation.assessments().len(), 1);
-            assert_eq!(operation.assessments()[0].findings.len(), 1);
-            assert_eq!(
-                operation.assessments()[0].findings[0].applicability,
-                crate::core::security::scan::FindingApplicability::Possible
-            );
+            if coverage == "unavailable" {
+                assert!(
+                    admission.operation.is_none(),
+                    "no fabricated snapshot authority"
+                );
+            } else {
+                let operation = admission
+                    .operation
+                    .as_ref()
+                    .context("missing actual advisory request")?;
+                assert_eq!(operation.assessments().len(), 1);
+                assert!(!operation.assessments()[0].coverage.is_assessed());
+                assert_eq!(
+                    operation.assessments()[0].findings.len(),
+                    usize::from(coverage == "finding")
+                );
+                if coverage == "finding" {
+                    assert_eq!(
+                        operation.assessments()[0].findings[0].applicability,
+                        crate::core::security::scan::FindingApplicability::Possible
+                    );
+                }
+            }
             if case == "archive-change" {
                 std::fs::OpenOptions::new()
                     .append(true)

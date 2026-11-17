@@ -26,6 +26,84 @@ SPEC = importlib.util.spec_from_file_location('native_cli_coverage',
 PRODUCER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PRODUCER)
 
+UNKNOWN_SPEC = importlib.util.spec_from_file_location(
+    'attend_unknown_fixture', ROOT / 'scripts/attend-unknown-fixture.py')
+UNKNOWN = importlib.util.module_from_spec(UNKNOWN_SPEC)
+UNKNOWN_SPEC.loader.exec_module(UNKNOWN)
+
+
+class UnknownFixtureTerminal(unittest.TestCase):
+    @staticmethod
+    def prompt(digest='a' * 64):
+        return (b'SECURITY WARNING: advisory coverage for the selected transaction is unknown.\n'
+                b'No clean security result was established.\nPackage: fixture 1-1\n'
+                + f'Type accept {digest} within 60 seconds to continue (default: cancel): '.encode())
+
+    def test_only_complete_fresh_unknown_prompts_receive_exact_answers(self):
+        first = self.prompt()
+        offset, answers = UNKNOWN.review_answers(first[:-1], 0)
+        self.assertEqual((offset, answers), (0, []))
+        offset, answers = UNKNOWN.review_answers(first, offset)
+        self.assertEqual(answers, [b'accept ' + b'a' * 64 + b'\n'])
+        self.assertEqual(UNKNOWN.review_answers(first, offset), (offset, []))
+        second = first + b'accepted\n' + self.prompt('b' * 64)
+        end, answers = UNKNOWN.review_answers(second, offset)
+        self.assertEqual(end, len(second))
+        self.assertEqual(answers, [b'accept ' + b'b' * 64 + b'\n'])
+
+    def test_fixture_never_accepts_a_disclosed_finding_or_unidentified_prompt(self):
+        for prefix in [b'', b'SECURITY WARNING: the selected transaction has disclosed advisory findings.\n',
+                       self.prompt().split(b'Type accept', 1)[0]
+                       + b'SECURITY WARNING: the selected transaction has disclosed advisory findings.\n']:
+            prompt = prefix + b'Type accept' + self.prompt().split(b'Type accept', 1)[1]
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, 'Unknown-only'):
+                UNKNOWN.review_answers(prompt, 0)
+        with self.assertRaisesRegex(ValueError, 'Unknown-only'):
+            UNKNOWN.review_answers(self.prompt() + b'Type accept' + self.prompt().split(b'Type accept', 1)[1], 0)
+
+    @unittest.skipIf(os.name == 'nt', 'Actual controlling-terminal behavior requires POSIX')
+    def test_real_terminal_accepts_each_unknown_digest_and_records_the_decisions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = Path(directory) / 'review.json'
+            program = ('import os,sys\n'
+                       'assert os.isatty(0) and os.tcgetpgrp(0)==os.getpgrp()\n'
+                       'for digest in ["a"*64,"b"*64]:\n'
+                       ' print("SECURITY WARNING: advisory coverage for the selected transaction is unknown.")\n'
+                       ' print("Package: owned-fixture 1-1")\n'
+                       ' print("Type accept "+digest+" within 60 seconds to continue (default: cancel): ",end="",flush=True)\n'
+                       ' assert sys.stdin.readline()=="accept "+digest+"\\n"\n'
+                       'print("all exact reviews accepted")\n')
+            result = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/attend-unknown-fixture.py'),
+                                     '--timeout', '3', '--receipt', str(receipt), '--',
+                                     sys.executable, '-c', program], capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(b'all exact reviews accepted', result.stdout)
+            self.assertEqual(json.loads(receipt.read_text()),
+                             dict(reviews=['a' * 64, 'b' * 64], cli_exit_code=0))
+
+    @unittest.skipIf(os.name == 'nt', 'Actual controlling-terminal behavior requires POSIX')
+    def test_real_terminal_refuses_disclosed_findings_and_reaps_timed_out_children(self):
+        for finding in [True, False]:
+            with self.subTest(finding=finding), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                receipt = root / 'review.json'
+                child_pid = root / 'child.pid'
+                program = ('import os,sys,time\n'
+                           f'open({str(child_pid)!r},"w").write(str(os.getpid()))\n'
+                           + ('print("SECURITY WARNING: the selected transaction has disclosed advisory findings.")\n'
+                              'print("Type accept "+"c"*64+" within 60 seconds to continue (default: cancel): ",end="",flush=True)\n'
+                              if finding else 'print("no complete review prompt",flush=True)\n')
+                           + 'time.sleep(30)\n')
+                result = subprocess.run([sys.executable, '-B', str(ROOT / 'scripts/attend-unknown-fixture.py'),
+                                         '--timeout', '0.5', '--receipt', str(receipt), '--',
+                                         sys.executable, '-c', program], capture_output=True, timeout=3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b'Unknown-only' if finding else b'owned deadline', result.stderr)
+                self.assertFalse(receipt.exists())
+                pid = int(child_pid.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
 
 @unittest.skipIf(os.name == 'nt', 'Native identity ownership requires POSIX metadata')
 class MachineIdentityFixture(unittest.TestCase):
@@ -415,6 +493,7 @@ with socket.socket(socket.AF_UNIX) as server:
             commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
             manifest = dict(source_commit=commit,
                             producer_sha256=PRODUCER.sha(ROOT / 'scripts/native-cli-coverage.py'),
+                            unknown_driver_sha256=PRODUCER.sha(ROOT / 'scripts/attend-unknown-fixture.py'),
                             artifacts=artifacts)
             (inputs / 'native-cli-manifest.json').write_text(json.dumps(manifest))
             fake_tools = owner / 'tools'
@@ -619,29 +698,42 @@ with socket.socket(socket.AF_UNIX) as server:
         function = 'run_case() {' + native.split('run_case() {', 1)[1].split('\n              cases=(', 1)[0]
         name = 'package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction'
         case_id = name.replace('::', '_')
-        for produce_profiles in [True, False]:
-            with self.subTest(produce_profiles=produce_profiles), tempfile.TemporaryDirectory() as directory:
+        groups = ('finding', 'unavailable', 'unmapped')
+        for missing, stale in [(None, None), *((group, None) for group in groups),
+                               *((None, group) for group in groups)]:
+            with self.subTest(missing=missing, stale=stale), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / 'bin').mkdir()
                 (root / 'evidence').mkdir()
                 (root / 'profiles').mkdir()
                 (root / 'evidence/registry.txt').write_text(name + ': test\n')
+                calls = root / 'calls.txt'
+                if stale:
+                    (root / 'profiles' / f'omg-fixture-{case_id}-{stale}-stale-1-1.profraw').write_text('old profile')
                 fake = root / 'bin/python3'
                 fake.write_text('#!/bin/bash\nset -euo pipefail\n'
                                 'test "$1" = /advisory-fixture/test-arch-advisory-consent.py\n'
                                 'test "$2" = --unit\n'
-                                + ('printf profile > "$PROFILE_OUTPUT"\n' if produce_profiles else '')
+                                'test "$6" = --profiles\ntest "$8" = --coverage\n'
+                                'printf "%s\\n" "${9}" >> "$CALLS"\n'
+                                'if test "${9}" != "$MISSING"; then\n'
+                                '  printf profile > "${7}/omg-fixture-$CASE_ID-${9}-accept-1-1.profraw"\n'
+                                'fi\n'
                                 + 'printf \'{"passed":8}\\n\'\n')
                 fake.chmod(0o755)
                 script = 'set -euo pipefail\n' + function + '\nrun_case ' + shlex.quote(name)
                 result = subprocess.run([BASH, '-c', script], capture_output=True, text=True,
                                         env=os.environ | {'PATH': str(root / 'bin') + os.pathsep + os.environ['PATH'],
                                             'fixture_evidence': str(root / 'evidence'), 'fixture_profiles': str(root / 'profiles'),
-                                            'fixture_binary': '/fixture', 'PROFILE_OUTPUT': str(root / 'profiles' / ('omg-fixture-' + case_id + '-accept-1-1.profraw'))})
-                self.assertEqual(result.returncode == 0, produce_profiles, result.stdout + result.stderr)
+                                            'fixture_binary': '/fixture', 'CASE_ID': case_id, 'CALLS': str(calls),
+                                            'MISSING': missing or ''})
+                self.assertEqual(result.returncode == 0, not missing and not stale, result.stdout + result.stderr)
+                expected = groups[:groups.index(missing) + 1] if missing else (
+                    groups[:groups.index(stale)] if stale else groups)
+                self.assertEqual(calls.read_text().splitlines() if calls.exists() else [], list(expected))
                 passed = root / 'evidence/passed.tsv'
-                if produce_profiles:
-                    self.assertEqual(passed.read_text(), name + '\t1\n')
+                if not missing and not stale:
+                    self.assertEqual(passed.read_text(), name + '\t3\n')
                 else:
                     self.assertFalse(passed.exists(), 'Missing profiles must not be reported as a passed native fixture')
 
@@ -1033,6 +1125,9 @@ def evidence_fixture(root):
             (evidence / f'{stage}-interaction.json').write_text(json.dumps(dict(
                 prompt_observed=True, answer=case.reboot_answer, resize_sent=1,
                 cli_exit_code=case.exit_status)))
+        if case.native_phase not in ('initial', 'cache-pruned') and not case.control:
+            (evidence / f'{stage}-unknown.json').write_text(json.dumps(dict(
+                reviews=['a' * 64], cli_exit_code=case.exit_status)))
         if case.absent_helper:
             (evidence / f'{stage}-layout.txt').write_text(
                 'absent helper restored after genuine CLI execution\n')
@@ -1080,6 +1175,8 @@ def evidence_fixture(root):
             log = f'Omarchy stage {case.failure_command} did not complete: exit status: {case.failure_status}'
             if case.native_phase == 'complete':
                 log += '\nSystem is up to date\nOmarchy cleanup failed'
+        if case.native_phase not in ('initial', 'cache-pruned') and not case.control:
+            log += '\n' + UnknownFixtureTerminal.prompt().decode()
         (evidence / f'{stage}.log').write_text(log)
     for stage in PRODUCER.ARCH_READONLY_STAGES:
         (evidence / f'{stage}.log').write_text('System is up to date\n')
@@ -1090,6 +1187,25 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_native_unknown_decisions_require_nonempty_exact_prompt_fingerprints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            path = evidence / 'omarchy-success-unknown.json'
+            original = path.read_text()
+            for receipt in [dict(reviews=[], cli_exit_code=0),
+                            dict(reviews=['b' * 64], cli_exit_code=0),
+                            dict(reviews=['a' * 64], cli_exit_code=1),
+                            dict(reviews=['a' * 64], cli_exit_code=0, ignored=True)]:
+                path.write_text(json.dumps(receipt))
+                with self.subTest(receipt=receipt), self.assertRaisesRegex(ValueError, 'Unknown decisions'):
+                    PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            path.write_text(original)
+            log = evidence / 'omarchy-success.log'
+            log.write_text('System is up to date\n')
+            with self.assertRaisesRegex(ValueError, 'Unknown decisions'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_debug_backend_cannot_claim_fresh_native_admission(self):
         stage = 'cli-fresh-mock-refused'
         self.assertIn(stage, PRODUCER.PROCESS_STAGES,
@@ -1224,7 +1340,7 @@ class SupplementalEvidence(unittest.TestCase):
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             log = evidence / f'{stage}.log'
-            log.write_text('System is up to date\n')
+            log.write_text('System is up to date\n' + UnknownFixtureTerminal.prompt().decode())
             with self.assertRaisesRegex(ValueError, 'runtime hint'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
@@ -1268,7 +1384,9 @@ class SupplementalEvidence(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Current kernel'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             state.write_text(original)
-            (evidence / 'omarchy-current-kernel.log').write_text('System is up to date\nRun omarchy-system reboot when ready.')
+            (evidence / 'omarchy-current-kernel.log').write_text(
+                'System is up to date\nRun omarchy-system reboot when ready.\n'
+                + UnknownFixtureTerminal.prompt().decode())
             with self.assertRaisesRegex(ValueError, 'Current kernel'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
@@ -1277,7 +1395,8 @@ class SupplementalEvidence(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
             PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
-            (evidence / 'omarchy-reboot-helper-missing.log').write_text('System is up to date\nReboot now?')
+            (evidence / 'omarchy-reboot-helper-missing.log').write_text(
+                'System is up to date\nReboot now?\n' + UnknownFixtureTerminal.prompt().decode())
             with self.assertRaisesRegex(ValueError, 'Missing reboot helper'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
@@ -1421,7 +1540,7 @@ class ArtifactAdmission(unittest.TestCase):
                 PRODUCER.prepare(root, 'b' * 40)
 
     def test_manifest_refuses_changed_producer_source_or_incomplete_artifacts(self):
-        for scenario in ('complete', 'wrong-producer', 'missing-artifact', 'invalid-commit', 'invalid-size'):
+        for scenario in ('complete', 'wrong-producer', 'wrong-unknown-driver', 'missing-artifact', 'invalid-commit', 'invalid-size'):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 self.make_target(root)
@@ -1430,6 +1549,8 @@ class ArtifactAdmission(unittest.TestCase):
                     manifest = PRODUCER.prepare(root, 'b' * 40)
                 if scenario == 'wrong-producer':
                     manifest['producer_sha256'] = '0' * 64
+                elif scenario == 'wrong-unknown-driver':
+                    manifest['unknown_driver_sha256'] = '0' * 64
                 elif scenario == 'missing-artifact':
                     del manifest['artifacts']['cli-unit']
                 elif scenario == 'invalid-commit':

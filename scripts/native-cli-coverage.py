@@ -34,6 +34,13 @@ def sha(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def unknown_fixture_driver():
+    path = Path(__file__).with_name('attend-unknown-fixture.py')
+    require(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 16 * 1024,
+            'Unknown fixture driver is absent, unsafe or exceeds its bound')
+    return path
+
+
 def verify_machine_identity_fixture(owner, system_source, original_digest, uid, gid):
     require(type(uid) is int and type(gid) is int and uid > 0 and gid > 0,
             'Native machine identity requires an ordinary user')
@@ -1314,7 +1321,7 @@ for name in omarchy-snapshot omarchy-restart-shell omarchy-update-mise omarchy-u
 done
 chmod 755 "$fixture/stage"
 cat > "$fixture/attended.py" <<'OMG_ATTENDED_OMARCHY_DRIVER'
-import errno, fcntl, json, os, pty, select, signal, struct, sys, termios, time
+import errno, fcntl, json, os, pty, runpy, select, signal, struct, sys, termios, time
 from pathlib import Path
 
 answer = sys.argv[1]
@@ -1325,6 +1332,9 @@ if child == 0:
 status = None
 responded = False
 output = bytearray()
+review_answers = runpy.run_path('/attend-unknown-fixture.py')['review_answers']
+review_offset = 0
+unknown_reviews = []
 deadline = time.monotonic() + 30
 try:
     fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
@@ -1341,6 +1351,11 @@ try:
                 sys.stdout.buffer.flush()
                 output.extend(chunk)
                 assert len(output) <= 1024 * 1024, 'Attended transcript budget exceeded'
+                review_offset, answers = review_answers(output, review_offset)
+                assert len(unknown_reviews) + len(answers) <= 64, 'Attended review count exceeded'
+                for review_answer in answers:
+                    os.write(terminal, review_answer)
+                    unknown_reviews.append(review_answer[7:-1].decode('ascii'))
                 if not responded and b'Reboot now?' in output:
                     fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 100, 0, 0))
                     os.kill(child, signal.SIGWINCH)
@@ -1381,6 +1396,8 @@ finally:
 code = os.waitstatus_to_exitcode(status)
 receipt = dict(prompt_observed=responded, answer=answer, resize_sent=1, cli_exit_code=code)
 Path(os.environ['OMARCHY_HELPER_TRACE']).with_name('interaction.json').write_text(json.dumps(receipt)+'\n')
+Path(os.environ['OMARCHY_HELPER_TRACE']).with_name('unknown.json').write_text(
+    json.dumps(dict(reviews=unknown_reviews, cli_exit_code=code))+'\n')
 sys.exit(code)
 OMG_ATTENDED_OMARCHY_DRIVER
 test -u /usr/bin/sudo
@@ -1566,6 +1583,10 @@ OMARCHY_CASE_SETUP
   if test -n "$control"; then
     launch=(python3 "$fixture/control.py" "$control")
   fi
+  if test "$native_phase" != initial && test "$native_phase" != cache-pruned && test -z "$reboot_answer" && test -z "$control"; then
+    launch=(python3 /attend-unknown-fixture.py --timeout "$((stage_timeout-2))" \
+      --receipt "$case_dir/unknown.json" -- "${launch[@]}")
+  fi
   if test -n "$authorization"; then
     printf 'Defaults logfile="/evidence/cli/%s-authorization.log"\nDefaults log_denied\n' "$stage" > /etc/sudoers.d/zz-omg-authorization-log
     chmod 440 /etc/sudoers.d/zz-omg-authorization-log
@@ -1694,6 +1715,9 @@ OMG_AUTHORIZATION_RECEIPT
   fi
   if test -n "$reboot_answer"; then
     cp "$case_dir/interaction.json" "/evidence/cli/$stage-interaction.json"
+  fi
+  if test -f "$case_dir/unknown.json"; then
+    cp "$case_dir/unknown.json" "/evidence/cli/$stage-unknown.json"
   fi
   if test -n "$control"; then
     cp "$case_dir/control.json" "/evidence/cli/$stage-control.json"
@@ -2138,6 +2162,14 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         modules = {PROFILE.fullmatch(p.name)[3] for p in grouped[stage]}
         require(modules == cli_modules, 'Omarchy profiles do not match the actual CLI: ' + stage)
         log = (evidence / f'{stage}.log').read_text()
+        if case.native_phase not in ('initial', 'cache-pruned') and not case.control:
+            consent = json.loads((evidence / f'{stage}-unknown.json').read_text())
+            observed = re.findall(r'Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): ', log)
+            require(set(consent) == {'reviews', 'cli_exit_code'}
+                    and consent['cli_exit_code'] == case.exit_status
+                    and type(consent['reviews']) is list and 0 < len(consent['reviews']) <= 64
+                    and consent['reviews'] == observed,
+                    'Native Unknown decisions are missing or differ from the real prompts: ' + stage)
         if stage == 'omarchy-runtime-unset':
             require(log.splitlines().count('caller_runtime_hint=unset') == 1,
                     'Native caller runtime hint absence was not witnessed')
@@ -2340,16 +2372,20 @@ def prepare(target, commit):
         require('__llvm_covmap' in sections and '__llvm_prf' in sections,
                 'Artifact lacks LLVM instrumentation: ' + role)
         artifacts[role] = dict(path=str(path), sha256=sha(path), bytes=path.stat().st_size)
-    return dict(source_commit=commit, producer_sha256=sha(Path(__file__)), artifacts=artifacts)
+    return dict(source_commit=commit, producer_sha256=sha(Path(__file__)),
+                unknown_driver_sha256=sha(unknown_fixture_driver()), artifacts=artifacts)
 
 
 def read_manifest(path):
     require(path.is_file() and not path.is_symlink() and path.stat().st_size <= 65536,
             'Unsafe or oversized supplemental manifest')
     value = json.loads(path.read_text())
-    require(set(value) == {'source_commit', 'producer_sha256', 'artifacts'}, 'Unknown manifest schema')
+    require(set(value) == {'source_commit', 'producer_sha256', 'unknown_driver_sha256', 'artifacts'},
+            'Unknown manifest schema')
     require(re.fullmatch(r'[0-9a-f]{40}', value['source_commit']), 'Invalid source identity')
     require(value['producer_sha256'] == sha(Path(__file__)), 'Producer source changed after admission')
+    require(value['unknown_driver_sha256'] == sha(unknown_fixture_driver()),
+            'Unknown fixture driver changed after admission')
     require(set(value['artifacts']) == set(ROLES), 'Supplemental artifacts are incomplete')
     for role, artifact in value['artifacts'].items():
         require(set(artifact) == {'path', 'sha256', 'bytes'}, 'Unknown artifact schema: ' + role)
@@ -2390,7 +2426,7 @@ def run_guest_script(script, timeout=660):
 def run_guest(manifest):
     require(os.geteuid() == 0, 'Supplemental execution requires a disposable root guest')
     directory = Path('/omg-extra-bin')
-    paths = [directory, Path(__file__), Path('/native-cli-manifest.json')]
+    paths = [directory, Path(__file__), unknown_fixture_driver(), Path('/native-cli-manifest.json')]
     paths += [directory / role for role in ROLES]
     for path in paths:
         info = path.lstat()
@@ -2399,6 +2435,8 @@ def run_guest(manifest):
     validate_artifact_copies(directory, manifest['artifacts'])
     script = guest_script(manifest['artifacts'], manifest['artifacts']['cli']['path'])
     run_guest_script(script)
+    require(sha(unknown_fixture_driver()) == manifest['unknown_driver_sha256'],
+            'Unknown fixture driver changed during execution')
     for role, artifact in manifest['artifacts'].items():
         require(sha(directory / role) == artifact['sha256'], 'Artifact changed during execution: ' + role)
     validate_evidence(Path('/evidence/cli'), Path('/profiles'), manifest['artifacts'], manifest['source_commit'])

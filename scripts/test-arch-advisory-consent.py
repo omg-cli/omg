@@ -144,6 +144,11 @@ def inside(args):
         def do_GET(self):
             observed = source.iso_timestamp(datetime.now(timezone.utc))
             status, response = source.snapshot_response(self.headers.get("Host"), self.path, "1-1", observed)
+            if args.coverage == "unavailable":
+                status, response = 503, {"error": "controlled unavailable advisory source"}
+            elif args.coverage == "unmapped":
+                response["payload_json"] = "[]"
+                response["payload_sha256"] = hashlib.sha256(b"[]").hexdigest()
             encoded = json.dumps(response).encode()
             events.append(dict(host=self.headers.get("Host"), path=self.path, status=status, response=response))
             self.send_response(status)
@@ -159,22 +164,24 @@ def inside(args):
     try:
         for case in CASES:
             start = len(events)
-            profile = "omg-fixture-" + NAME.replace("::", "_") + "-" + case + "-%p-%m.profraw"
-            environment = os.environ | {"HOME": "/root", "TMPDIR": "/tmp", "OMG_ARCH_INSTALL_FIXTURE": "isolated-container", "OMG_ADVISORY_INSTALL_CASE": case, "SSL_CERT_FILE": str(args.output / "ca.crt"), "LLVM_PROFILE_FILE": str(args.profiles / profile)}
+            profile = "omg-fixture-" + NAME.replace("::", "_") + "-" + args.coverage + "-" + case + "-%p-%m.profraw"
+            environment = os.environ | {"HOME": "/root", "TMPDIR": "/tmp", "OMG_ARCH_INSTALL_FIXTURE": "isolated-container", "OMG_ADVISORY_INSTALL_CASE": case, "OMG_ADVISORY_INSTALL_COVERAGE": args.coverage, "SSL_CERT_FILE": str(args.output / "ca.crt"), "LLVM_PROFILE_FILE": str(args.profiles / profile)}
             for key in list(environment):
                 if key.startswith("SUDO_") or key.startswith("XDG_") or key.startswith("OMG_TEST"):
                     environment.pop(key)
-            code, transcript = terminal_case(args.unit, case, environment)
+            expected = (b"possible match", b"1-1", b"https://security.archlinux.org/CVE-OMG-QEMU-616") if args.coverage == "finding" else (b"coverage", b"unknown", b"1-1")
+            code, transcript = terminal_case(args.unit, case, environment, expected=expected)
             (args.output / (case + ".log")).write_bytes(transcript)
+            (args.output / (case + "-requests.json")).write_text(json.dumps(events[start:], indent=2) + "\n")
             assert code == 0 and b"test result: ok. 1 passed; 0 failed; 0 ignored;" in transcript, transcript.decode(errors="replace")
             assert not any(value in transcript for value in (b"[omg-skip]", b"skipped:", b"LLVM Profile Error", b"LLVM Profile Warning")), transcript.decode(errors="replace")
             marker = re.findall(MARKER.encode() + rb"(\{[^\r\n]*\})", transcript)
             assert len(marker) == 1, "missing or duplicate native state result"
             record = json.loads(marker[0])
             assert record["case"] == case and record["installed"] == (case == "accept")
-            assert len(events) == start + 1 and events[-1]["status"] == 200, "the default native owner must query the actual HTTPS fixture once"
+            assert len(events) == start + 1 and events[-1]["status"] == (503 if args.coverage == "unavailable" else 200), "the default native owner must query the actual HTTPS fixture once"
             records.append(record | {"exit_code": code, "requests": events[start:]})
-            (args.output / "receipt.json").write_text(json.dumps(dict(scope="local native owner plus real private-root ALPM install; not full CLI/QEMU/release acceptance", unit_sha256=sha(args.unit), namespaces=namespaces, cases=records), indent=2) + "\n")
+            (args.output / "receipt.json").write_text(json.dumps(dict(scope="local native owner plus real private-root ALPM install; not full CLI/QEMU/release acceptance", coverage=args.coverage, unit_sha256=sha(args.unit), namespaces=namespaces, cases=records), indent=2) + "\n")
     finally:
         server.shutdown()
         worker.join(timeout=5)
@@ -188,6 +195,7 @@ def main():
     parser.add_argument("--unit", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profiles", type=Path)
+    parser.add_argument("--coverage", choices=("finding", "unavailable", "unmapped"), default="finding")
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.unit = args.unit.resolve(strict=True)
@@ -208,7 +216,7 @@ def main():
     command = ["bwrap", "--die-with-parent", "--unshare-net", "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--tmpfs", "/root", "--size", str(64 * 1024 * 1024), "--tmpfs", "/tmp", "--tmpfs", "/run", "--bind", str(args.output), str(args.output), "--bind", str(args.profiles), str(args.profiles)]
     for filename, destination in (("hosts", "/etc/hosts"), ("nsswitch.conf", "/etc/nsswitch.conf"), ("ca.crt", "/etc/ssl/certs/ca-certificates.crt")):
         command.extend(["--ro-bind", str(args.output / filename), str(Path(destination).resolve(strict=True))])
-    command.extend(["--", "/usr/bin/python3", str(Path(__file__).resolve()), "--inside", "--unit", str(args.unit), "--output", str(args.output), "--profiles", str(args.profiles)])
+    command.extend(["--", "/usr/bin/python3", str(Path(__file__).resolve()), "--inside", "--unit", str(args.unit), "--output", str(args.output), "--profiles", str(args.profiles), "--coverage", args.coverage])
     try:
         result = subprocess.run(command, timeout=180)
         assert result.returncode == 0, "isolated native consent drill failed"

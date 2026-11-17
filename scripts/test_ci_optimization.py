@@ -119,7 +119,8 @@ class OptimizationContracts(unittest.TestCase):
             producer.write_bytes(b'print("fixture producer")\n')
             producer.chmod(0o666)
             advisory_sources = []
-            for name in ('test-arch-advisory-consent.py', 'qemu-arch-advisory-oracle.py'):
+            for name in ('test-arch-advisory-consent.py', 'qemu-arch-advisory-oracle.py',
+                         'attend-unknown-fixture.py'):
                 source = scripts / name
                 source.write_bytes((ROOT / 'scripts' / name).read_bytes())
                 source.chmod(0o666)
@@ -167,6 +168,7 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
                 self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o644)
                 self.assertEqual(staged.read_bytes(), original.read_bytes())
             for original, name in ((producer, 'native-cli-coverage.py'),
+                                   (scripts / 'attend-unknown-fixture.py', 'attend-unknown-fixture.py'),
                                    (manifest, 'native-cli-manifest.json')):
                 staged = runner / 'native-cli-inputs' / name
                 self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o644,
@@ -218,7 +220,7 @@ jq() { "$TEST_PYTHON" "$MANIFEST_ROWS" "$3"; }
             binary.chmod(0o755)
             (root / 'scripts').mkdir()
             for name in ('native-cli-coverage.py', 'test-arch-advisory-consent.py',
-                         'qemu-arch-advisory-oracle.py'):
+                         'qemu-arch-advisory-oracle.py', 'attend-unknown-fixture.py'):
                 (root / 'scripts' / name).write_bytes((ROOT / 'scripts' / name).read_bytes())
             from test_native_cli_coverage import PRODUCER
             artifacts = ['debug/omg', 'debug/omgd'] + [

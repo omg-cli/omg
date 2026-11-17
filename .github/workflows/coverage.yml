@@ -388,9 +388,17 @@ jobs:
                 local runner=()
                 if [ "$test_name" = package_managers::alpm_ops::tests::native_advisory_consent_installs_only_the_accepted_transaction ]; then
                   grep -Fx "$test_name: test" "$fixture_evidence/registry.txt"
-                  timeout --kill-after=2s 35s python3 /advisory-fixture/test-arch-advisory-consent.py \
-                    --unit "$fixture_binary" --output "$fixture_evidence/advisory-consent" \
-                    --profiles "$fixture_profiles" 2>&1 | tee "$log"
+                  for coverage in finding unavailable unmapped; do
+                    if compgen -G "$fixture_profiles/omg-fixture-$case_id-$coverage-*.profraw" > /dev/null; then
+                      echo "Advisory consent profiles must be fresh" >&2
+                      return 1
+                    fi
+                    timeout --kill-after=2s 35s python3 /advisory-fixture/test-arch-advisory-consent.py \
+                      --unit "$fixture_binary" --output "$fixture_evidence/advisory-consent-$coverage" \
+                      --profiles "$fixture_profiles" --coverage "$coverage" 2>&1 | tee -a "$log"
+                    local group_profiles=("$fixture_profiles/omg-fixture-$case_id-$coverage-"*.profraw)
+                    for profile in "${group_profiles[@]}"; do test -s "$profile"; done
+                  done
                   local profiles=("$fixture_profiles/omg-fixture-$case_id-"*.profraw)
                   for profile in "${profiles[@]}"; do test -s "$profile"; done
                   printf "%s\t%s\n" "$test_name" "${#profiles[@]}" >> "$fixture_evidence/passed.tsv"
@@ -403,6 +411,10 @@ jobs:
                       "$test_name" == package_managers::aur::utils::tests::native_lifecycle_original_user_ownership ||
                       "$test_name" == cli::packages::install::arch::tests::aur_source_denial_precedes_confirmation_history_and_build ]]; then
                   runner=(env OMG_ARCH_INSTALL_FIXTURE=isolated-container)
+                  if [ "$test_name" = package_managers::arch_install::native_tests::native_installation_preserves_mixed_intents ]; then
+                    runner+=(python3 /advisory-fixture/attend-unknown-fixture.py --timeout 30 \
+                      --receipt "$fixture_evidence/$case_id-consent.json" --)
+                  fi
                 elif [[ "$test_name" == package_managers::aur::client::tests::native_isolated_* ]]; then
                   runner=(runuser -u nobody -- env HOME=/home/omg-fixture
                     OMG_CACHE_DIR=/var/tmp/omg-fixture-cache OMG_DATA_DIR=/var/tmp/omg-fixture-state
@@ -471,11 +483,13 @@ jobs:
           docker cp "$binary" "$container:/fixture"
           advisory_fixture="$RUNNER_TEMP/advisory-fixture"
           mkdir "$advisory_fixture"
-          install -m 644 scripts/test-arch-advisory-consent.py scripts/qemu-arch-advisory-oracle.py "$advisory_fixture/"
+          install -m 644 scripts/test-arch-advisory-consent.py scripts/qemu-arch-advisory-oracle.py \
+            scripts/attend-unknown-fixture.py "$advisory_fixture/"
           docker cp "$advisory_fixture" "$container:/advisory-fixture"
           staging="$RUNNER_TEMP/native-cli-inputs"
           mkdir -m 755 "$staging" "$staging/bin"
           install -m 644 scripts/native-cli-coverage.py "$staging/native-cli-coverage.py"
+          install -m 644 scripts/attend-unknown-fixture.py "$staging/attend-unknown-fixture.py"
           install -m 644 "$evidence_dir/cli-manifest.json" "$staging/native-cli-manifest.json"
           while IFS=$'\t' read -r role artifact; do
             install -m 755 "$artifact" "$staging/bin/$role"
