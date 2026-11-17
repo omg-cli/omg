@@ -2250,6 +2250,70 @@ def eager_call_prefix_obligations(name, sources, counts, descriptors, inventorie
     return dict(mapped), receipt
 
 
+def qualified_test_retained_statements(sources, descriptors, inventories, grouped, file_counts,
+                                       selected, seeds, full_receipt, work):
+    """Reconcile retained statement regions only after complete positive owner proof."""
+    _construct_charge(work, len(seeds) + len(selected))
+    required = {row['digest'] for row, target in seeds}
+    retained_sets = {id(row['retained_statements']): row['retained_statements']
+                     for row in selected if row.get('retained_statements')}
+    _construct_charge(work, sum(len(values) for values in retained_sets.values()))
+    for values in retained_sets.values():
+        required.update(values)
+    _construct_charge(work, len(required) * (len(required).bit_length() + 1))
+    pairs = {}; statements = []
+    for digest in sorted(required):
+        rows = [descriptor['statements'].get(digest, []) for descriptor in descriptors]
+        if any(len(side) != 1 or counts[digest] != 1 for side, counts in zip(rows, file_counts)):
+            return None
+        evidence = []; shapes = []; states = []; lines = []; texts = []
+        for side, (source, inventory, compiled, matches) in enumerate(zip(sources, inventories, grouped, rows)):
+            row, = matches; code = inventory[0]
+            first = code.position(code.starts[row['first']]); end = code.position(code.ends[row['end']])
+            if row['kind'] != 'statement' or not row['supported'] or first[0] != end[0]:
+                return None
+            line = first[0]; text = source[line - 1]; indent = len(text) - len(text.lstrip())
+            if first[1] != len(text[:indent].encode()) + 1 or end[1] != len(text.rstrip().encode()) + 1:
+                return None
+            low, high = first, end
+            allowed = {owner['name'] for owner in full_receipt['fully_covered_replacement_owners'][side]}
+            contributors = []; geometry = []; vectors = []
+            _construct_charge(work, len(text) + sum(len(owner['regions']) + 1 for owner in compiled[0]))
+            for owner in compiled[0]:
+                regions = [region for region in owner['regions']
+                           if tuple(region[:2]) < high and low < tuple(region[2:4])]
+                if not regions:
+                    continue
+                if (owner['name'] not in allowed or not 0 < owner.get('count', 0) < COUNTER_LIMIT
+                        or any(not 0 < region[4] < COUNTER_LIMIT for region in regions)):
+                    return None
+                clipped = [(max(tuple(region[:2]), low)[1] - low[1],
+                            min(tuple(region[2:4]), high)[1] - low[1], *region[5:]) for region in regions]
+                if any(start >= finish for start, finish, *flags in clipped):
+                    return None
+                _construct_charge(work, len(clipped) * (len(clipped).bit_length() + 3))
+                geometry.append(tuple(sorted(clipped)))
+                vectors.append(tuple(1 for region in regions))
+                contributors.append(dict(name=owner['name'], count=owner['count'], regions=regions))
+            if not contributors:
+                return None
+            lines.append(line); texts.append(text.strip()); evidence.append(contributors)
+            shapes.append(geometry); states.append(vectors)
+        if (texts[0] != texts[1] or len(shapes[0]) != len(shapes[1])
+                or any(shape != shapes[0][0] for side in shapes for shape in side)):
+            return None
+        _construct_charge(work, len(states[0]) * len(states[1]) * len(states[0][0]))
+        matching = compiled_hit_state_matching(*states)
+        if matching is None:
+            return None
+        if lines[0] in pairs and pairs[lines[0]] != lines[1]:
+            return None
+        pairs[lines[0]] = lines[1]
+        statements.append(dict(digest=digest, pair=lines, owners=evidence, geometry=shapes[0][0],
+            base_instance_states=states[0], head_instance_states=states[1], instance_matching=matching))
+    return pairs, statements
+
+
 def test_declaration_header_obligations(name, sources, counts, descriptors, inventories, grouped, work):
     """Bind unchanged test declaration lines to the same closed entry projection."""
     left, right = descriptors
@@ -2697,7 +2761,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     or left['attributes'] != right['attributes']
                     or left['signature'] != right['signature'] and not method_migration and not prefix_only)):
                 continue
-            seeds = []; parent = None
+            seeds = []; qualified_seeds = []; parent = None
             renamed = left_prefix != right_prefix
             if renamed:
                 public_method = method_migration and left['attributes'] in (
@@ -2719,25 +2783,33 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     tokens = inventories[0][0].words[rows[0]['first']:rows[0]['end'] + 1]
                     _construct_charge(work, len(tokens))
                     if (len(rows) == len(targets) == file_counts[0][digest] == file_counts[1][digest] == 1
-                            and (head_counts is None or head_counts[digest] == 1)
                             and rows[0]['supported'] and targets[0]['supported']
                             and len(tokens) >= 12 and tokens[0] not in
                                 ('let', 'Ok', 'Err', 'return', 'fn', 'struct', 'enum', 'impl', 'mod',
                                  'static', 'const', 'type', 'use', 'extern', '#')):
-                        seeds.append((rows[0], targets[0]))
+                        if head_counts is None or head_counts[digest] == 1:
+                            seeds.append((rows[0], targets[0]))
+                        elif (method_migration and parent_files is not None and head_counts[digest] > 1
+                                and any(tuple(header[:7]) == ('#', '[', 'cfg', '(', 'test', ')', ']')
+                                        for header in left['context'][0])
+                                and statement_context(left, inventories[0][0], rows[0]) is not None
+                                and statement_context(left, inventories[0][0], rows[0])
+                                    == statement_context(right, inventories[1][0], targets[0])):
+                            qualified_seeds.append((rows[0], targets[0]))
                 if (not seeds and not method_migration
                         or parent_files is not None and parent_files(parent) != {name}):
                     continue
                 if method_migration:
                     receiver_candidates.append((left_prefix, right_prefix, left, right))
-                if not seeds:
+                if not seeds and not qualified_seeds:
                     _construct_charge(work, sum(descriptor['row']['end'] - descriptor['row']['opening']
                         for descriptor in (left, right)))
                     if any(any(word in ('async', 'fn', '|', '||', '!') for word in
                             inventory[0].words[descriptor['row']['opening'] + 1:descriptor['row']['end']])
                             for descriptor, inventory in zip((left, right), inventories)):
                         continue
-            candidates.append((left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite, prefix_only))
+            candidates.append((left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite,
+                               prefix_only, qualified_seeds))
     left_counts = Counter(row[0] for row in candidates); right_counts = Counter(row[1] for row in candidates)
     pairs = {}; receipts = []; proved_functions = set(); excerpts = []
     receiver_left = Counter(row[0] for row in receiver_candidates)
@@ -2757,7 +2829,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                   for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
                   if tag == 'equal' for line in range(a, b)]
     equal_positions = [row[0] for row in equal_rows]
-    for left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite, prefix_only in candidates:
+    for left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite, prefix_only, qualified_seeds in candidates:
         if left_counts[left_prefix] != 1 or right_counts[right_prefix] != 1:
             continue
         groups = left['group'], right['group']
@@ -2785,9 +2857,23 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 and (left['signature'] != right['signature'] or not seeds)):
             covered = fully_covered_replacement(name, old, new, before, after, (left, right),
                 grouped, selected, equal_rows, work)
-            if covered is not None and (seeds or all(len(owners) == len(group[2])
+            if covered is not None and (seeds or qualified_seeds or all(len(owners) == len(group[2])
                     for owners, group in zip(covered[1]['fully_covered_replacement_owners'], groups))):
                 mapped, receipt = covered
+                if qualified_seeds and not seeds:
+                    retained = qualified_test_retained_statements((old, new), (left, right), inventories,
+                        grouped, file_counts, selected, qualified_seeds, receipt, work)
+                    if retained is None:
+                        continue
+                    additional, statements = retained
+                    if any(line in mapped and mapped[line] != target for line, target in additional.items()):
+                        raise ValueError('Ambiguous qualified test statement correspondence')
+                    mapped.update(additional)
+                    receipt['pairs'] = [list(pair) for pair in sorted(mapped.items())]
+                    receipt['qualified_test_statement'] = dict(parent=parent, statements=statements,
+                        seed_digests=[row['digest'] for row, target in qualified_seeds],
+                        global_head_occurrences=[head_counts[row['digest']] for row, target in qualified_seeds],
+                        claim='Qualified identity only after complete positive owner trees; never partial proof')
                 if any(line in pairs and pairs[line] != target for line, target in mapped.items()):
                     raise ValueError('Ambiguous fully covered replacement correspondence')
                 pairs.update(mapped); receipts.append(receipt)

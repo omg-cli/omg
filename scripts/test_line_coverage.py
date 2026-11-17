@@ -368,7 +368,8 @@ class SourceAwareCoverageTests(unittest.TestCase):
                             decoded.copy_identity)
 
     def migrated_trait_compare(self, mutation=None, callback=False, method_kind='X', receiver_only=False,
-                               multiline_header=False):
+                               multiline_header=False, duplicate_seed=False, retained_tail=False,
+                               local_duplicate=False, test_scope=True):
         old = b"impl Source for FixtureSource {\n    fn scan_package<'a>(\n        &'a self,\n        name: &'a str,\n    ) -> Result<Value> {\n        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n        old_step();\n    }\n}\n"
         if method_kind == 'M':
             old = old.replace(b'impl Source for FixtureSource {', b'impl FixtureSource {')
@@ -376,14 +377,21 @@ class SourceAwareCoverageTests(unittest.TestCase):
             old = old.replace(b'impl Source for FixtureSource {', b'trait Source {')
         if callback:
             old = old.replace(b'        old_step();', b'        Box::pin(async move {\n            old_step();\n        })')
+        if retained_tail:
+            old = old.replace(b'            old_step();', b'            old_step();\n            Vec::new()')
         if multiline_header:
             old = old.replace(b') -> Result<Value> {',
                 b') -> Pin<\n        Box<\n            Result<Value>,\n        >,\n    > {')
         new = old.replace(b'scan_package', b'assess_packages').replace(
             b"name: &'a str", b"packages: &'a [Package]").replace(b'Result<Value>', b'Result<Assessment>').replace(b'old_step()', b'new_step()')
+        if retained_tail:
+            new = new.replace(b'            Vec::new()', b'                    Vec::new()')
         if receiver_only:
             old = old.replace(b'impl Source', b'#[cfg(test)] impl Source')
             new = new.replace(b'impl Source', b'#[cfg(test)] impl Source').replace(b'fetch_add', b'fetch_sub')
+        elif duplicate_seed and test_scope:
+            old = old.replace(b'impl Source', b'#[cfg(test)] impl Source')
+            new = new.replace(b'impl Source', b'#[cfg(test)] impl Source')
         original = '_RNvXNtNtNtNtNtCs40j12eeWnis_7omg_lib3cli8packages7install4arch5testsNtB2_13FixtureSourceNtNtNtNtBc_4core8security13vulnerability19VulnerabilitySource12scan_package'
         crate = 'Cs40j12eeWnis_7omg_lib'
         if method_kind == 'M':
@@ -412,13 +420,24 @@ class SourceAwareCoverageTests(unittest.TestCase):
                         child = '_RNC' + symbol[2:-len(root)] + '0' + root
                     document['data'][0]['functions'].append(dict(name=child,
                         count=1, filenames=['/src/example.rs'], regions=[
-                            [body + 1, lines[body].index('{') + 1, body + 3, 10, 1, 0, 0, 0],
-                            [body + 2, 13, body + 2, len(lines[body + 1]) + 1, 1, 0, 0, 0]]))
+                            [body + 1, lines[body].index('{') + 1, end - 1, 10, 1, 0, 0, 0],
+                            *[[line, len(lines[line - 1]) - len(lines[line - 1].lstrip()) + 1,
+                               line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
+                              for line in range(body + 2, end - 1)]]))
             if mutation:
                 mutation(base, head)
+        source_maps = ({'example.rs': old}, {'example.rs': new})
+        if duplicate_seed:
+            unrelated = (b'impl OtherTransport {\n    fn record(&self) {\n'
+                b'        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n    }\n}\n')
+            for source_map in source_maps:
+                if local_duplicate:
+                    source_map['example.rs'] += unrelated
+                else:
+                    source_map['other.rs'] = unrelated
         return self.compare(before=[(line, 1) for line in range(2, len(old.splitlines()))],
             after=[(line, 1) for line in range(2, len(new.splitlines()))], mutate=owners,
-            sources=({'example.rs': old}, {'example.rs': new}))
+            sources=source_maps)
 
     def test_migrated_trait_retains_seed_and_header_without_deletion_credit(self):
         receipt = self.migrated_trait_compare()
@@ -567,6 +586,118 @@ class SourceAwareCoverageTests(unittest.TestCase):
                                                  'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
         proofs = receipt['retained_replacement_obligations']
         self.assertTrue(any(row.get('fully_covered_replacement_owners') for row in proofs))
+
+    def test_qualified_test_seed_requires_full_owner_proof_when_other_type_repeats_statement(self):
+        receipt = self.migrated_trait_compare(callback=True, duplicate_seed=True)
+        proof, = [row for row in receipt['retained_replacement_obligations']
+                  if row.get('qualified_test_statement')]
+        self.assertIn([6, 6], proof['pairs'])
+        self.assertEqual([len(side) for side in proof['fully_covered_replacement_owners']], [2, 2])
+        self.assertEqual(proof['summary_credit'], [0, 0])
+        self.assertEqual(proof['mapped_credit'], [0, 0])
+        self.assertEqual(receipt['deleted_mapped'], 0)
+
+    def test_qualified_test_seed_explicitly_proves_reindented_short_retained_body_statement(self):
+        receipt = self.migrated_trait_compare(callback=True, duplicate_seed=True, retained_tail=True)
+        proof, = [row for row in receipt['retained_replacement_obligations']
+                  if row.get('qualified_test_statement')]
+        statements = proof['qualified_test_statement']['statements']
+        self.assertEqual(len(statements), 2)
+        self.assertTrue(any(row['pair'] == [9, 9] for row in statements))
+        self.assertIn([9, 9], proof['pairs'])
+        self.assertTrue(all(row['owners'][0] and row['owners'][1] for row in statements))
+
+    def test_qualified_test_seed_has_no_partial_fallback_when_full_owner_proof_fails(self):
+        with patch.object(coverage, 'fully_covered_replacement', return_value=None):
+            with self.assertRaisesRegex(ValueError, r'example.rs:6 -> 6'):
+                self.migrated_trait_compare(callback=True, duplicate_seed=True)
+
+    def test_qualified_test_seed_refuses_file_ambiguity_and_production_scope(self):
+        for options in ({'local_duplicate': True}, {'test_scope': False}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.migrated_trait_compare(callback=True, duplicate_seed=True, **options)
+
+    def test_qualified_statement_requires_complete_unique_matching_positive_region_evidence(self):
+        observed = []
+        original = coverage.qualified_test_retained_statements
+        def inspect(*arguments):
+            observed.append(arguments)
+            return original(*arguments)
+        with patch.object(coverage, 'qualified_test_retained_statements', side_effect=inspect):
+            self.migrated_trait_compare(callback=True, duplicate_seed=True, retained_tail=True)
+        arguments, = observed
+        digest = arguments[6][0][0]['digest']
+        for mode in ('duplicate-row', 'duplicate-file', 'missing-digest', 'unowned-paint',
+                     'cold-region', 'changed-geometry', 'changed-source', 'missing-full-owner'):
+            with self.subTest(mode=mode):
+                current = copy.deepcopy(list(arguments)); current[-1] = [20_000_000]
+                if mode == 'duplicate-row':
+                    current[1][1]['statements'][digest].append(copy.deepcopy(current[1][1]['statements'][digest][0]))
+                elif mode == 'duplicate-file':
+                    current[4][1][digest] = 2
+                elif mode == 'missing-digest':
+                    current[5].append({'retained_statements': ['missing-statement']})
+                elif mode == 'unowned-paint':
+                    current[3][1][0].append(dict(name='unowned', count=1,
+                        regions=[[6, 9, 6, 20, 1, 0, 0, 0]]))
+                elif mode in ('cold-region', 'changed-geometry'):
+                    parent = next(owner for owner in current[3][1][0] if owner['name'].startswith('_RNv'))
+                    region = next(region for region in parent['regions'] if region[0] == 6)
+                    if mode == 'cold-region':
+                        region[4] = 0
+                    else:
+                        region[3] -= 1
+                elif mode == 'changed-source':
+                    current[0][1][5] = current[0][1][5].replace('fetch_add', 'fetch_sub')
+                elif mode == 'missing-full-owner':
+                    current[7]['fully_covered_replacement_owners'][1].clear()
+                self.assertIsNone(original(*current))
+
+    def test_qualified_test_seed_refuses_cold_missing_foreign_or_duplicate_child(self):
+        observed = []
+        original = coverage.fully_covered_replacement
+        def inspect(*arguments):
+            observed.append(arguments)
+            return original(*arguments)
+        with patch.object(coverage, 'fully_covered_replacement', side_effect=inspect):
+            self.migrated_trait_compare(callback=True, duplicate_seed=True)
+        arguments, = observed
+        for mode in ('cold-entry', 'cold-region', 'missing-child', 'foreign-child', 'duplicate-child'):
+            with self.subTest(mode=mode):
+                current = copy.deepcopy(list(arguments)); current[-1] = [20_000_000]
+                owners = current[6][1][0]
+                child = next(owner for owner in owners if owner['name'].startswith('_RNC'))
+                if mode == 'cold-entry':
+                    child['count'] = 0
+                elif mode == 'cold-region':
+                    child['regions'][-1][4] = 0
+                elif mode == 'missing-child':
+                    owners.remove(child)
+                elif mode == 'foreign-child':
+                    child['name'] = child['name'].replace('13FixtureSource', '13AnotherSource')
+                    current[6][1][2][child['name']] = 1
+                elif mode == 'duplicate-child':
+                    owners.append(copy.deepcopy(child))
+                    current[6][1][2][child['name']] = 2
+                self.assertIsNone(original(*current))
+
+    def test_qualified_statement_admits_union_work_before_traversing_retained_lists(self):
+        observed = []
+        original = coverage.qualified_test_retained_statements
+        def inspect(*arguments):
+            observed.append(arguments)
+            return original(*arguments)
+        with patch.object(coverage, 'qualified_test_retained_statements', side_effect=inspect):
+            self.migrated_trait_compare(callback=True, duplicate_seed=True)
+        arguments, = observed
+        class UnadmittedList(list):
+            def __iter__(self):
+                raise AssertionError('retained list traversed before work admission')
+        current = copy.deepcopy(list(arguments))
+        current[5] = [{'retained_statements': UnadmittedList(['digest'] * 100)}]
+        current[-1] = [len(current[6]) + len(current[5])]
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            original(*current)
 
     def test_fully_covered_nominal_method_migrations_preserve_every_owner(self):
         for kind in ('M', 'Y'):
