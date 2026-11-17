@@ -171,6 +171,16 @@ print('runtime-install-complete')
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse((root / 'accepted.marker').exists())
 
+    def test_native_unknown_review_accepts_a_public_https_homepage_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            command=self.command(root,native=True,known=False)
+            script=Path(command[1])
+            script.write_text(script.read_text().replace('https://www.cve.org/CVERecord?id=CVE-2026-12345','https://www.cve.org/'))
+            result=subprocess.run([sys.executable,str(ROOT/'scripts/qemu-runtime-advisory-oracle.py'),'--native','--accept-only','--require-review','--timeout','5','--',*command],cwd=root,capture_output=True,start_new_session=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr.decode(errors='replace'))
+            self.assertTrue((root/'accepted.marker').exists())
+
     def test_native_clean_success_can_run_without_inventing_acceptance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

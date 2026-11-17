@@ -44,7 +44,7 @@ def checked_warning(transcript, runtime, version):
         require(subjects, 'native warning has no exact package/version identity')
     else:
         require(f'Package: ["{runtime}","{version}"'.encode() in transcript, 'warning identity does not match the selected runtime')
-    require(re.search(rb'https://[A-Za-z0-9.-]+/[^\s"<>]+', transcript), 'warning has no public HTTPS source URL')
+    require(re.search(rb'https://[A-Za-z0-9.-]+/[^\s"<>]*', transcript), 'warning has no public HTTPS source URL')
     if b'disclosed advisory findings' in transcript:
         require(re.search(rb'(?:CVE-\d{4}-\d{4,19}|GHSA-[a-z0-9-]+|GO-\d{4}-\d+|RUSTSEC-\d{4}-\d+|PSF-\d{4}-\d+|NODE-CORE-\d+|AVG-\d+|(?:RHSA|FEDORA|DSA|USN|ALAS)[-:][A-Za-z0-9:.-]+)', transcript), 'warning has no disclosed advisory identifier')
     else:

@@ -189,6 +189,13 @@ class RustOracleBoundaryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual([row["result"] for row in evidence], ["FAIL"])
         self.assertIn("assertion failed: native Rust installation", logs["runtime-rust-install.log"])
+        transcript=logs["runtime-rust-install.log"]
+        self.assertIn('Coverage gap: controlled runtime product fixture',transcript)
+        receipt_line=next(line for line in transcript.splitlines() if line.startswith('OMG_QEMU_RUNTIME_CONSENT='))
+        consent=json.loads(receipt_line.split('=',1)[1])
+        self.assertEqual(consent['denied_exit_code'],7)
+        self.assertEqual(consent['accepted_exit_code'],0)
+        self.assertRegex(consent['accepted_review'],r'^[0-9a-f]{64}$')
 
     def test_actual_executor_rejects_unreviewed_pin_before_running_product(self):
         if self.rerun_row_body_unprivileged():

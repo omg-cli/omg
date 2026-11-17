@@ -61,13 +61,13 @@ impl AdvisoryRiskReview {
                 assessment.coverage.unknown_reason(),
                 &provenance,
             ))?);
-            writeln!(
+            let _ = writeln!(
                 details,
                 "Package: {}\nCoverage: unknown ({:?})\nSource: {}",
                 serde_json::to_string(&identity)?,
                 assessment.coverage.unknown_reason(),
                 serde_json::to_string(&assessment.coverage.provenance())?
-            )?;
+            );
         }
         records.sort();
         let id = hex::encode(Sha256::digest(serde_json::to_vec(&(
@@ -194,7 +194,7 @@ impl AdvisoryRiskReview {
                 "\nSECURITY WARNING: the selected transaction has disclosed advisory findings.\nAccepting the risk does not mark these versions safe or establish missing coverage.\nCondensed review: every advisory is listed below. Open its link for the full description.\n",
             );
             for assessment in assessments.iter().filter(|item| !item.findings.is_empty()) {
-                writeln!(
+                let _ = writeln!(
                     details,
                     "Package: {}",
                     serde_json::to_string(&(
@@ -202,8 +202,8 @@ impl AdvisoryRiskReview {
                         &assessment.package.version,
                         &assessment.package.architecture,
                     ))?
-                )?;
-                writeln!(
+                );
+                let _ = writeln!(
                     details,
                     "Coverage: {}",
                     if assessment.coverage.is_assessed() {
@@ -211,12 +211,12 @@ impl AdvisoryRiskReview {
                     } else {
                         "unknown"
                     }
-                )?;
-                writeln!(
+                );
+                let _ = writeln!(
                     details,
                     "Source: {}",
                     serde_json::to_string(&assessment.coverage.provenance())?
-                )?;
+                );
                 for finding in &assessment.findings {
                     let confidence = match finding.applicability {
                         FindingApplicability::Applicable => "affected version",
@@ -224,11 +224,11 @@ impl AdvisoryRiskReview {
                             "possible match; applicability unconfirmed"
                         }
                     };
-                    writeln!(
+                    let _ = writeln!(
                         details,
                         "  {} ({confidence})",
                         serde_json::to_string(&finding.id)?
-                    )?;
+                    );
                     let url = advisory_link(&finding.id).or_else(|| {
                         finding
                             .native_advisory
@@ -238,9 +238,9 @@ impl AdvisoryRiskReview {
                             .find_map(|reference| safe_reference(&reference.url))
                     });
                     if let Some(url) = url {
-                        writeln!(details, "  {url}")?;
+                        let _ = writeln!(details, "  {url}");
                     } else {
-                        writeln!(details, "  {}", serde_json::to_string(&finding.summary)?)?;
+                        let _ = writeln!(details, "  {}", serde_json::to_string(&finding.summary)?);
                     }
                 }
             }
@@ -335,6 +335,7 @@ mod tests {
     use crate::core::security::scan::{FindingApplicability, Vulnerability};
     use crate::core::security::vulnerability::{PackageAssessment, UnknownCoverage};
     use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+    use anyhow::Context as _;
 
     fn package(name: &str) -> PackageAssessment {
         PackageAssessment::unknown(
@@ -383,7 +384,7 @@ mod tests {
             assessment.findings.push(item);
         }
         let review = AdvisoryRiskReview::new(&[assessment], "single-runtime-selection")?
-            .ok_or_else(|| anyhow::anyhow!("All disclosed findings must remain reviewable"))?;
+            .context("All disclosed findings must remain reviewable")?;
         assert!(review.details().len() <= 60 * 1024);
         for number in 10000..10132 {
             assert!(review.details().contains(&format!("CVE-2026-{number}")));
@@ -446,9 +447,7 @@ mod tests {
     fn unresolved_runtime_coverage_requires_its_own_explicit_decision() -> anyhow::Result<()> {
         let assessment = package("runtime:swift");
         let review = AdvisoryRiskReview::new_with_unknown(&[assessment], "runtime-selection")?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Unknown runtime coverage must require explicit review")
-            })?;
+            .context("Unknown runtime coverage must require explicit review")?;
         assert!(review.details().contains("Coverage: unknown"));
         assert!(review.accept("yes").is_err());
         assert!(review.accept("").is_err());
@@ -750,6 +749,109 @@ mod tests {
         ));
         assessment.coverage = evidence("changed", "2026-11-16T00:01:00Z");
         assert!(!accepted.matches(&AdvisoryRiskReview::new(&[assessment], "batch")?.unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_arch_review_binds_content_without_expiring_on_receipt_refresh() -> anyhow::Result<()>
+    {
+        use super::super::vulnerability::PackageCoverage;
+        let mut assessment = package("arch-unknown");
+        let coverage = |digest: &str, time: &str| PackageCoverage::Unknown {
+            reason: UnknownCoverage::OriginUnestablished,
+            provenance: Some(AdvisoryProvenance::ArchSnapshot {
+                payload_sha256: digest.into(),
+                fetched_at: time.parse().expect("fixture fetch timestamp"),
+                checked_at: time.parse().expect("fixture check timestamp"),
+            }),
+        };
+        assessment.coverage = coverage("original", "2026-11-16T00:00:00Z");
+        let original = AdvisoryRiskReview::new_with_unknown(
+            std::slice::from_ref(&assessment),
+            "arch-private-origin",
+        )
+        .expect("valid unknown Arch review")
+        .unwrap();
+        assert!(original.details().contains("Coverage: unknown"));
+        let acceptance = original.accept(&format!("accept {}", original.id()))?;
+        assessment.coverage = coverage("original", "2026-11-16T00:01:00Z");
+        assert!(
+            acceptance.matches(
+                &AdvisoryRiskReview::new_with_unknown(
+                    std::slice::from_ref(&assessment),
+                    "arch-private-origin",
+                )
+                .expect("valid refreshed unknown Arch review")
+                .unwrap()
+            )
+        );
+        assessment.coverage = coverage("changed", "2026-11-16T00:01:00Z");
+        assert!(!acceptance.matches(
+            &AdvisoryRiskReview::new_with_unknown(&[assessment], "arch-private-origin",)?.unwrap()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn condensed_mixed_coverage_preserves_native_reference_and_possible_applicability()
+    -> anyhow::Result<()> {
+        use super::super::scan::{AdvisoryReference, NativeAdvisory};
+        use super::super::vulnerability::PackageCoverage;
+        let mut known = package("assessed-native");
+        known.coverage = PackageCoverage::Assessed {
+            provenance: AdvisoryProvenance::NativeDnf,
+        };
+        let mut advisory = finding("vendor:issue-one", FindingApplicability::Possible);
+        advisory.summary = "Detailed native publisher evidence. ".repeat(2100);
+        advisory.native_advisory = Some(NativeAdvisory {
+            source: "native vendor".into(),
+            advisory_nevra: "1.0-2".into(),
+            published_severity: "high".into(),
+            description: "Native package applicability remains possible".into(),
+            references: vec![
+                AdvisoryReference {
+                    id: "unsafe".into(),
+                    kind: "vendor".into(),
+                    url: "http://example.invalid/unsafe".into(),
+                },
+                AdvisoryReference {
+                    id: "safe".into(),
+                    kind: "vendor".into(),
+                    url: "https://example.invalid/vendor-advisory".into(),
+                },
+            ],
+        });
+        known.findings.push(advisory);
+        let mut unknown = package("unassessed-native");
+        unknown
+            .findings
+            .push(finding("CVE-2026-12345", FindingApplicability::Applicable));
+        let subjects = vec![known, unknown];
+        let original = AdvisoryRiskReview::new(&subjects, "native-mixed")?.unwrap();
+        assert!(original.details().contains("Condensed review"));
+        assert!(original.details().contains("Coverage: assessed"));
+        assert!(original.details().contains("Coverage: unknown"));
+        assert!(
+            original
+                .details()
+                .contains("possible match; applicability unconfirmed")
+        );
+        assert!(
+            original
+                .details()
+                .contains("https://example.invalid/vendor-advisory")
+        );
+        assert!(!original.details().contains("http://example.invalid/unsafe"));
+        let accepted = original.accept(&format!("accept {}", original.id()))?;
+        let mut changed = subjects;
+        changed[0].findings[0]
+            .native_advisory
+            .as_mut()
+            .unwrap()
+            .references[1]
+            .url
+            .push_str("-changed");
+        assert!(!accepted.matches(&AdvisoryRiskReview::new(&changed, "native-mixed")?.unwrap()));
         Ok(())
     }
 }

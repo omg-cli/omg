@@ -1033,7 +1033,7 @@ fn apt_repository_matches_vendor(expected: &str, record: &AptRepositoryEvidence)
     if normalized.contains("%2f")
         || normalized.contains("%5c")
         || normalized.contains("%2e")
-        || !path.ends_with(".deb")
+        || std::path::Path::new(path).extension() != Some(std::ffi::OsStr::new("deb"))
     {
         return false;
     }
@@ -1340,9 +1340,19 @@ mod tests {
                 .version(),
             "3:2.0-1"
         );
+        let root_request = format!("omg-pin-fixture-app:{architecture}=2:1.0~rc1-3");
+        // Native APT will not silently select an older dependency candidate.
+        // The CLI simulation also refuses this unresolved root-only request.
+        assert!(super::plan_apt_install(&cache, std::slice::from_ref(&root_request)).is_err());
+        drop(cache);
+        let cache = rust_apt::Cache::new(&[packages.to_string_lossy().as_ref()])
+            .map_err(|error| anyhow::anyhow!("fresh pinned fixture cache: {error:?}"))?;
         super::plan_apt_install(
             &cache,
-            &[format!("omg-pin-fixture-app:{architecture}=2:1.0~rc1-3")],
+            &[
+                root_request,
+                format!("omg-pin-fixture-dep:{architecture}=2:0.9-1"),
+            ],
         )?;
         let (inventory, actions, gaps) = super::apt_transaction_evidence(&cache)?;
         assert_eq!(inventory.len(), 2);

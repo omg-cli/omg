@@ -1,4 +1,5 @@
 import { parseCve, sha256, cveUrl } from "./domain";
+import { packRecords } from "./raw-pack";
 export type Command = { sql: string; values: (string | number | null)[] };
 export interface Sql {
     first<T>(
@@ -151,7 +152,8 @@ export class Store {
             },
         ]);
     }
-    async cveBatch(records:readonly {id:string;raw:string}[],fetchedAt:string,after:Command[]=[]):Promise<void> {
+    async cveBatch(records:readonly {id:string;raw:string}[],fetchedAt:string,after:Command[]=[],layout:"individual"|"packed"="individual"):Promise<void> {
+        const started=performance.now();
         if(records.length<1 || records.length>64 || new Set(records.map(record=>record.id)).size!==records.length)throw new Error("bulk CVE admission requires one to 64 distinct IDs");
         let bytes=0;
         const parsed=records.map(({id,raw})=>{
@@ -165,16 +167,37 @@ export class Store {
             const hash=await sha256(raw);
             return {record,raw,hash,key:`cve/${record.id}/${hash}.json`};
         }));
+        const preparedAt=performance.now();
         const oldRows=await this.sql.all<RecordRow>(`SELECT * FROM source_record WHERE id IN (${records.map(()=>"?").join(",")})`,records.map(record=>record.id));
+        const readAt=performance.now();
         const oldById=new Map(oldRows.map(record=>[record.id,record]));
         const changed=prepared.filter(({record,hash})=>cveChanged(record,hash,oldById.get(record.id)));
-        for(let start=0;start<changed.length;start+=6) {
-            const outcomes=await Promise.allSettled(changed.slice(start,start+6).map(({key,raw})=>this.raw.put(key,raw)));
-            const failed=outcomes.find(value=>value.status==="rejected");
-            if(failed)throw failed.reason;
+        if(layout==="packed" && changed.length) {
+            const packed=await packRecords(changed.map(candidate=>candidate.raw));
+            for(const [index,candidate] of changed.entries()) {
+                const key=packed.pointers[index];
+                if(!key || !key.endsWith(`:${candidate.hash}`))throw new Error("packed original payload identity mismatch");
+                candidate.key=key;
+            }
+            await this.raw.put(packed.key,packed.body);
+        } else {
+            let next=0;
+            const failures:unknown[]=[];
+            await Promise.all(Array.from({length:Math.min(6,changed.length)},async()=>{
+                while(failures.length===0) {
+                    const candidate=changed[next++];
+                    if(!candidate)return;
+                    try {await this.raw.put(candidate.key,candidate.raw);}
+                    catch(error){failures.push(error);}
+                }
+            }));
+            if(failures.length)throw failures[0];
         }
+        const rawAt=performance.now();
         const commands=changed.flatMap(({record,hash,key})=>cveCommands(record,hash,key,fetchedAt));
         if(commands.length || after.length)await this.sql.batch([...commands,...after]);
+        console.info(JSON.stringify({event:"baseline_write_phases",records:records.length,changed:changed.length,
+            prepare_ms:preparedAt-started,read_ms:readAt-preparedAt,raw_ms:rawAt-readAt,metadata_ms:performance.now()-rawAt}));
     }
     async cve(
         raw: string,

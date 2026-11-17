@@ -1130,25 +1130,25 @@ fi
 printf '%s  release.tar.gz\n' "$digest" | sha256sum -c -
 tar -xzf release.tar.gz
 bin="$HOME/omg-${tag}-${guest_arch}-linux-${distro}/omg"
-native_release="/opt/omg-qemu/omg-${tag}-${guest_arch}-linux-${distro}"
-sudo -n install -d -o root -g root -m 0755 /opt/omg-qemu "$native_release"
-sudo -n install -o root -g root -m 0755 "$bin" "$native_release/omg"
-cmp "$bin" "$native_release/omg"
-native_bin="$native_release/omg"
 daemon="${bin%/*}/omgd"
 if [[ ! -x "$daemon" ]]; then
   printf 'Release %s for %s is missing executable omgd; publish an archive containing both omg and omgd.\n' "$tag" "$distro" >&2
   exit 1
 fi
-sudo -n install -o root -g root -m 0755 "$daemon" "$native_release/omgd"
-cmp "$daemon" "$native_release/omgd"
-stat -c '%n uid=%u gid=%g mode=%a type=%F' / /opt /opt/omg-qemu "$native_release" "$native_bin" > evidence/native-executable-trust.txt
-sha256sum "$bin" "$native_bin" > evidence/native-executable-sha256.txt
 if [[ "$distro" == debian-trixie ]]; then
   timeout --kill-after=2s 45s python3 "$HOME/qemu-apt-abi.py" \
     --distro "$distro" --arch "$guest_arch" --omg "$bin" --omgd "$daemon" \
     --output "$HOME/evidence/apt-abi" || exit 120
 fi
+native_release="/opt/omg-qemu/omg-${tag}-${guest_arch}-linux-${distro}"
+sudo -n install -d -o root -g root -m 0755 /opt/omg-qemu "$native_release"
+sudo -n install -o root -g root -m 0755 "$bin" "$native_release/omg"
+cmp "$bin" "$native_release/omg"
+native_bin="$native_release/omg"
+sudo -n install -o root -g root -m 0755 "$daemon" "$native_release/omgd"
+cmp "$daemon" "$native_release/omgd"
+stat -c '%n uid=%u gid=%g mode=%a type=%F' / /opt /opt/omg-qemu "$native_release" "$native_bin" > evidence/native-executable-trust.txt
+sha256sum "$bin" "$native_bin" > evidence/native-executable-sha256.txt
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
 fedora_makecache_class() {

@@ -319,7 +319,7 @@ Words such as package, dependency, runtime, hook, and daemon are explained in
 - [Installation](./installation.md) — all installer options, source builds, and removal.
 - [Cheat sheet](./cheatsheet.md) — the everyday commands on one page.
 - [Package management](./packages.md) — search, install, update, remove, clean.
-- [Runtime management](./runtimes.md) — all 14 supported language runtimes.
+- [Runtime management](./runtimes.md) — all 13 supported language runtimes and the Pi coding harness.
 - [Troubleshooting](./troubleshooting.md) — what to check, and what not to do.
 - [FAQ](./faq.md) — short answers to common questions.
 

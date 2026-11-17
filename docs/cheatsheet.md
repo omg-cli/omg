@@ -91,7 +91,7 @@ omg use node 22
 
 > **Warning:** `omg use` can download and install software, and `omg run` (below) runs code from the project folder. Review a repository you do not trust before using either.
 
-Supported native runtime names are `node`, `python`, `go`, `rust`, `ruby`, `java`, `bun`, `deno`, `pi`, `zig`, `dotnet`, `erlang`, `php`, and `swift`.
+Supported language runtime names are `node`, `python`, `go`, `rust`, `ruby`, `java`, `bun`, `deno`, `zig`, `dotnet`, `erlang`, `php`, and `swift`. The Pi coding harness also supports selection through `omg use pi`.
 
 For Rust, `rust-toolchain.toml` must contain TOML, not a bare channel name:
 

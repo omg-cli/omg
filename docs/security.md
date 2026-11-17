@@ -49,9 +49,8 @@ omg audit scan
 omg audit scan --fail-on-findings # CI gate: nonzero when findings exist
 ```
 
-Published v0.1.223 requires a running `omgd` for `omg audit scan`. The newer main checkout
-prefers the daemon so repeated scans can reuse its warm cache, but creates the selected
-backend and scanner itself when the daemon is unavailable. In that newer checkout, Arch uses
+OMG prefers the daemon so repeated scans can reuse its warm cache, but creates the selected
+backend and scanner itself when the daemon is unavailable. Arch uses
 Arch Linux Security Advisory data. Fedora uses native DNF advisories. Debian and Ubuntu
 query OSV using their distribution release as the ecosystem. Missing findings are not
 proof that a package is free of vulnerabilities. Do not treat one distribution's
@@ -60,6 +59,14 @@ advisories as coverage for another.
 Reports separate advisory coverage from findings. Packages whose advisory applicability is unknown stay visible even when no published record matches. Current Arch installed-package metadata does not prove historical repository origin. An observed repository match is not installation provenance; tracker matches for an unproved origin are reported as possible matches. Possible matches retain their alerts and finding counts, but they are not automatic remediation targets. A legacy JSON report without coverage information is unreported, not a complete scan. The CLI and daemon must both speak IPC protocol 5; mismatched binary frames are rejected before decoding. Update the pair together. The current CLI can perform a direct native audit when an older daemon cannot answer.
 
 The default scan reports findings without failing solely because it found them. Use `--fail-on-findings` when a CI job must fail on any finding. This does not make its human-readable output a documented JSON alert interface. `omg audit fix --dry-run` previews available package updates on the Arch backend; an available update is not proof that every advisory is fixed.
+
+## Install-time vulnerability review
+
+In v0.1.225, OMG checks proposed package versions and managed runtimes before installation or activation. Managed npm, Cargo, Go and Python tools include their resolved public-registry dependencies. Native transaction and provider coverage varies; Homebrew, unresolved sources and incomplete native mappings remain Unknown.
+
+When a review finds a disclosed vulnerability, OMG displays the affected version and advisory links. To proceed, the terminal owner must type the exact `accept <review-id>` response shown by the prompt. Missing coverage also requires explicit risk acceptance. Blank input, generic `--yes` and unattended execution do not accept either risk. Consent is checked again against the reviewed versions, artifacts, policy and caller before installation; it cannot bypass signature or integrity failures.
+
+This covers operations performed through OMG. Public advisory feeds cannot establish the absence of undisclosed zero-days. EPSS scores help prioritize known CVEs; a low score does not prove safety. See the [v0.1.225 release notes](releases/v0.1.225.md) for backend-specific limits and upgrade requirements.
 
 ## Security grades
 

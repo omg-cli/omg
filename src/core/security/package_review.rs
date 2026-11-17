@@ -250,6 +250,7 @@ mod tests {
     const KNOWN: usize = 1;
     const UNAVAILABLE: usize = 2;
     const MISMATCH: usize = 3;
+    const PANIC: usize = 4;
     const TEST: &str = "core::security::package_review::tests::shared_package_admission_preserves_evidence_and_requires_exact_consent";
 
     struct FixtureSource {
@@ -296,6 +297,7 @@ mod tests {
                     });
                 }
                 let state = self.state.load(Ordering::SeqCst);
+                assert_ne!(state, PANIC, "controlled advisory worker panic");
                 if state == UNAVAILABLE {
                     return Err(VulnerabilityError::Unavailable {
                         reason: "controlled feed unavailable".into(),
@@ -351,6 +353,16 @@ mod tests {
     async fn mixed_private_dependencies_retain_public_findings_and_original_inventory_order()
     -> Result<()> {
         let source = FixtureSource::new(KNOWN);
+        let foreign = [subject(SecurityOrigin::Unknown)];
+        let rejected = source
+            .assess_packages(&foreign, AssessmentUse::Admission)
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(VulnerabilityError::Unavailable { .. })
+        ));
+        assert_eq!(source.calls.swap(0, Ordering::SeqCst), 1);
+        source.seen.lock().expect("queries").clear();
         let mut inventory = vec![
             subject(SecurityOrigin::Unknown),
             subject(SecurityOrigin::NpmRegistry),
@@ -418,6 +430,8 @@ mod tests {
             "retained-principal-mismatch",
             "inventory-mismatch",
             "initial-inventory-mismatch",
+            "initial-worker-panic",
+            "verify-worker-panic",
             "clean",
             "clean-sync",
         ] {
@@ -426,17 +440,24 @@ mod tests {
             command.args(["--exact", TEST, "--nocapture", "--test-threads=1"]);
             configure_child(&mut command, root.path(), case);
             let output = command.stdin(std::process::Stdio::null()).output()?;
-            ensure!(
-                output.status.success(),
-                "case {case}:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            ensure!(output.status.success(), "case {case}:\n{stdout}\n{stderr}");
             ensure!(
                 String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
                 "fixture test did not run for {case}"
             );
         }
+        let root = tempfile::tempdir()?;
+        let mut invalid = std::process::Command::new(&executable);
+        invalid.args(["--exact", TEST, "--nocapture", "--test-threads=1"]);
+        configure_child(&mut invalid, root.path(), "unrecognized-review-kind");
+        let refused = invalid.stdin(std::process::Stdio::null()).output()?;
+        assert!(!refused.status.success());
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("unknown controlled review case")
+        );
+        assert!(!root.path().join("mutation-started").exists());
         // Reuse the existing real controlling-PTY owner and exact-digest parser.
         // Each response is sent only after the package, warning and URL are visible.
         const DRIVER: &str = r"
@@ -469,11 +490,11 @@ print('controlling-PTY case passed:', kind)
                 .arg(TEST);
             configure_child(&mut command, root.path(), case);
             let output = command.output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
             ensure!(
                 output.status.success(),
-                "PTY case {case}:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                "PTY case {case}:\n{stdout}\n{stderr}"
             );
         }
         Ok(())
@@ -511,6 +532,8 @@ print('controlling-PTY case passed:', kind)
             UNAVAILABLE
         } else if case == "initial-inventory-mismatch" {
             MISMATCH
+        } else if case == "initial-worker-panic" {
+            PANIC
         } else {
             CLEAN
         };
@@ -535,7 +558,7 @@ print('controlling-PTY case passed:', kind)
         };
         let marker = root.join("mutation-started");
         let context = "exact controlled archive SHA256 and requested install";
-        let reviewed = if case == "clean-sync" {
+        let reviewed = if matches!(case.as_str(), "clean-sync" | "initial-worker-panic") {
             review(&inventory, context, &gaps, &source)
         } else {
             review_async(&inventory, context, &gaps, &source).await
@@ -550,12 +573,18 @@ print('controlling-PTY case passed:', kind)
                 | "known-mixed-private-no-tty"
                 | "unknown-no-source"
                 | "initial-inventory-mismatch"
+                | "initial-worker-panic"
         ) {
             let error = reviewed
                 .err()
                 .expect("unaccepted risk or mismatched inventory must refuse mutation");
             let details = format!("{error:#}");
-            if case == "initial-inventory-mismatch" {
+            if case == "initial-worker-panic" {
+                assert!(
+                    details.contains("Package admission worker failed"),
+                    "{details}"
+                );
+            } else if case == "initial-inventory-mismatch" {
                 assert!(details.contains("inventory differs"), "{details}");
             } else if case == "known-generic-yes" {
                 assert!(
@@ -624,6 +653,7 @@ print('controlling-PTY case passed:', kind)
             "new-cve" => source.state.store(KNOWN, Ordering::SeqCst),
             "source-failure" => source.state.store(UNAVAILABLE, Ordering::SeqCst),
             "inventory-mismatch" => source.state.store(MISMATCH, Ordering::SeqCst),
+            "verify-worker-panic" => source.state.store(PANIC, Ordering::SeqCst),
             "policy-change" => {
                 let mut policy = SecurityPolicy::default();
                 policy.banned_packages.push(inventory[0].name.clone());
@@ -634,7 +664,7 @@ print('controlling-PTY case passed:', kind)
             "clean" | "clean-sync" => {}
             _ => anyhow::bail!("unknown controlled review case: {case}"),
         }
-        let verification = if case == "clean-sync" {
+        let verification = if matches!(case.as_str(), "clean-sync" | "verify-worker-panic") {
             reviewed.verify(&source)
         } else {
             reviewed.verify_async(&source).await
@@ -649,6 +679,8 @@ print('controlling-PTY case passed:', kind)
             assert!(
                 details.contains(if case == "inventory-mismatch" {
                     "inventory differs"
+                } else if case == "verify-worker-panic" {
+                    "Package admission verification worker failed"
                 } else {
                     "changed"
                 }),

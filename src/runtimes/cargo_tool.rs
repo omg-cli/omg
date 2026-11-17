@@ -137,6 +137,24 @@ fn inventory(
     Ok((packages.into_values().collect(), checksums, gaps))
 }
 
+fn configuration_free_directory(cargo_home: &Path) -> Result<&'static Path> {
+    for directory in [Path::new("/.cargo"), cargo_home] {
+        for name in ["config", "config.toml"] {
+            let path = directory.join(name);
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("Could not inspect Cargo configuration"),
+                Ok(_) => anyhow::bail!(
+                    "Frozen Cargo admission requires configuration-free execution: {}",
+                    path.display()
+                ),
+            }
+        }
+    }
+    // Cargo discovers configuration from its working directory's ancestors.
+    Ok(Path::new("/"))
+}
+
 fn command(
     runtime: &ManagedRuntime,
     staging: &Path,
@@ -150,7 +168,7 @@ fn command(
         request,
     )?;
     command
-        .current_dir(work.join("plan"))
+        .current_dir(configuration_free_directory(&work.join("cargo-home"))?)
         .env("CARGO_HOME", work.join("cargo-home"))
         .env("CARGO_TARGET_DIR", work.join("target"))
         .env("RUSTC", runtime.command_path("rustc")?)
@@ -550,6 +568,163 @@ pub(crate) fn install_reviewed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_execution_excludes_ancestor_and_private_home_configuration() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let cargo_home = owner.path().join("nested/cargo-home");
+        fs::create_dir_all(&cargo_home)?;
+        let invalid_home = owner.path().join("not-a-directory");
+        fs::write(
+            &invalid_home,
+            b"regular file cannot contain Cargo configuration",
+        )
+        .expect("write non-directory Cargo configuration fixture");
+        let error = configuration_free_directory(&invalid_home)
+            .expect_err("Cargo configuration stat errors must refuse execution");
+        assert!(format!("{error:#}").contains("Could not inspect Cargo configuration"));
+        fs::create_dir(owner.path().join(".cargo"))?;
+        fs::write(owner.path().join(".cargo/config.toml"), b"invalid TOML [")?;
+        assert_eq!(configuration_free_directory(&cargo_home)?, Path::new("/"));
+        for name in ["config", "config.toml"] {
+            let config = cargo_home.join(name);
+            fs::write(&config, b"[source.crates-io]\nreplace-with='private'\n")?;
+            assert!(configuration_free_directory(&cargo_home).is_err());
+            fs::remove_file(config)?;
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("missing", cargo_home.join("config.toml"))?;
+            assert!(configuration_free_directory(&cargo_home).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_command_refuses_a_project_local_manager_before_spawn() -> Result<()> {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        const NAME: &str = "runtimes::cargo_tool::tests::cargo_command_refuses_a_project_local_manager_before_spawn";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let (owner, data, stage) = fixtures::fixture("rust", "cargo", fixtures::CARGO)?;
+        fs::create_dir(owner.path().join(".git"))?;
+        let runtime = ManagedRuntime::open(
+            "rust",
+            &owner.path().join("tools"),
+            &crate::runtimes::security::RuntimeSecurity::fixture(),
+        )
+        .expect("open sealed Cargo fixture runtime");
+        let original = std::env::current_dir()?;
+        std::env::set_current_dir(owner.path())?;
+        let result = command(&runtime, &stage, "fixture-tool", &data);
+        std::env::set_current_dir(original)?;
+        let error = result.expect_err("Project-local Cargo must not start");
+        assert!(format!("{error:#}").contains("Refusing project-local cargo executable"));
+        assert!(!data.join("phases").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_owner_refuses_malformed_lock_and_checksum_valid_wrong_crate_root() -> Result<()> {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        const SCRIPT: &str = r#"#!/bin/sh
+set -eu
+fixture=@FIXTURE@
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = '--manifest-path' ]; then manifest="$argument"; fi
+  previous="$argument"
+done
+cp "$fixture/seed.lock" "$(dirname "$manifest")/Cargo.lock"
+if [ -f "$fixture/tool-1.0.0.crate" ]; then
+  mkdir -p "$CARGO_HOME/registry/cache/public"
+  cp "$fixture/tool-1.0.0.crate" "$CARGO_HOME/registry/cache/public/fixture-tool-1.0.0.crate"
+fi
+printf '{}'
+"#;
+        for wrong_root in [false, true] {
+            let (owner, data, stage) = fixtures::fixture("rust", "cargo", SCRIPT)?;
+            if wrong_root {
+                let (_, digest) = archive_fixture(&data)?;
+                fs::write(data.join("seed.lock"), format!("[[package]]\nname='omg-admission-plan'\nversion='0.0.0'\ndependencies=['fixture-tool']\n[[package]]\nname='fixture-tool'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{digest}'\n")).expect("write wrong-root archive resolution fixture");
+            } else {
+                fs::write(data.join("seed.lock"), b"not valid TOML [")?;
+            }
+            let source = Arc::new(fixtures::TransitiveFinding::default());
+            let result = install_reviewed(
+                "fixture-tool@1.0.0",
+                &stage,
+                &owner.path().join("destination"),
+                &owner.path().join("tools"),
+                source.clone(),
+                &crate::runtimes::security::RuntimeSecurity::fixture(),
+            );
+            let error = result
+                .err()
+                .context("Malformed Cargo source identity was admitted")?;
+            if wrong_root {
+                assert!(format!("{error:#}").contains("different crate root"));
+            }
+            assert!(source.seen.lock().unwrap().is_empty());
+            assert!(!stage.join("bin").exists());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cargo_plan_write_failure_never_starts_metadata_resolution() -> Result<()> {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        const NAME: &str = "runtimes::cargo_tool::tests::cargo_plan_write_failure_never_starts_metadata_resolution";
+        if std::env::var("OMG_CARGO_PLAN_WRITE_CHILD").as_deref() != Ok("1") {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", "trap '' XFSZ; exec \"$@\"", "sh"])
+                .arg(std::env::current_exe()?)
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env("OMG_CARGO_PLAN_WRITE_CHILD", "1")
+                .output()?;
+            assert!(output.status.success(), "{output:?}");
+            return Ok(());
+        }
+        let (owner, data, stage) = fixtures::fixture("rust", "cargo", fixtures::CARGO)?;
+        let source = Arc::new(fixtures::TransitiveFinding::default());
+        let saved = getrlimit(Resource::Fsize);
+        setrlimit(
+            Resource::Fsize,
+            Rlimit {
+                current: Some(64),
+                maximum: saved.maximum,
+            },
+        )
+        .expect("restrict only disposable child plan writes");
+        let result = install_reviewed(
+            "fixture-tool@1.0.0",
+            &stage,
+            &owner.path().join("destination"),
+            &owner.path().join("tools"),
+            source.clone(),
+            &crate::runtimes::security::RuntimeSecurity::fixture(),
+        );
+        setrlimit(Resource::Fsize, saved)
+            .expect("restore child file-size budget before profile flush");
+        let error = result
+            .err()
+            .context("Partial Cargo plan write was admitted")?;
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(nix::libc::EFBIG)
+        );
+        assert!(!data.join("phases").exists());
+        assert!(source.seen.lock().unwrap().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn cargo_lock_binds_full_registry_coordinates_and_preserves_unknown_sources() -> Result<()> {
         let lock = format!(
@@ -576,6 +751,201 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    fn archive_fixture(directory: &Path) -> Result<(PathBuf, String)> {
+        let writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut archive = tar::Builder::new(writer);
+        for (name, bytes) in [
+            (
+                "Cargo.toml",
+                b"[package]\nname='tool'\nversion='1.0.0'\n".as_slice(),
+            ),
+            ("src/main.rs", b"fn main() {}\n".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, format!("tool-1.0.0/{name}"), bytes)?;
+        }
+        let bytes = archive.into_inner()?.finish()?;
+        let path = directory.join("tool-1.0.0.crate");
+        fs::write(&path, &bytes)?;
+        Ok((path, artifacts::hash(&bytes)))
+    }
+
+    #[test]
+    fn cargo_cache_requires_one_matching_archive_and_authentic_extracted_source() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let cache = owner.path().join("cache");
+        let index = cache.join("registry/cache/public");
+        let source = cache.join("registry/src/public/tool-1.0.0");
+        fs::create_dir_all(&index)?;
+        fs::create_dir_all(source.parent().context("Missing source parent")?)?;
+        fs::create_dir(cache.join("registry/src/unrelated-index"))?;
+        let (archive, digest) = archive_fixture(owner.path())?;
+        assert!(checked_cache_archive(&cache, "tool", "1.0.0", &digest).is_err());
+        let cached = index.join("tool-1.0.0.crate");
+        fs::copy(&archive, &cached)?;
+        assert_eq!(
+            checked_cache_archive(&cache, "tool", "1.0.0", &digest)?,
+            cached
+        );
+        extract_verified_archive(&archive, &digest, &source, "tool-1.0.0", owner.path())?;
+        fs::write(source.join(".cargo-ok"), b"local Cargo extraction marker")?;
+        fs::write(source.join(".cargo-checksum.json"), b"{}")?;
+        verify_extracted_archive(&cache, &archive, &digest, "tool", "1.0.0", owner.path())?;
+        fs::write(source.join("src/main.rs"), b"fn main() { panic!(); }\n")?;
+        assert!(
+            verify_extracted_archive(&cache, &archive, &digest, "tool", "1.0.0", owner.path())
+                .is_err()
+        );
+        fs::write(&cached, b"changed downloaded bytes")?;
+        assert!(checked_cache_archive(&cache, "tool", "1.0.0", &digest).is_err());
+        fs::copy(&archive, &cached)?;
+        let second = cache.join("registry/cache/other");
+        fs::create_dir(&second)?;
+        fs::copy(&archive, second.join("tool-1.0.0.crate"))?;
+        assert!(checked_cache_archive(&cache, "tool", "1.0.0", &digest).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_rejects_corrupt_archives_wrong_roots_and_embedded_configuration() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let (archive, digest) = archive_fixture(owner.path())?;
+        assert!(
+            extract_verified_archive(
+                &archive,
+                &"0".repeat(64),
+                &owner.path().join("hash"),
+                "tool-1.0.0",
+                owner.path()
+            )
+            .is_err()
+        );
+        assert!(
+            extract_verified_archive(
+                &archive,
+                &digest,
+                &owner.path().join("root"),
+                "other-1.0.0",
+                owner.path()
+            )
+            .is_err()
+        );
+        let broken = owner.path().join("broken.crate");
+        fs::write(&broken, b"not gzip")?;
+        assert!(
+            extract_verified_archive(
+                &broken,
+                &artifacts::hash(b"not gzip"),
+                &owner.path().join("gzip"),
+                "tool-1.0.0",
+                owner.path()
+            )
+            .is_err()
+        );
+        let project = owner.path().join("project");
+        fs::create_dir_all(project.join("nested/.cargo"))?;
+        fs::write(project.join("config.toml"), b"ordinary package data")?;
+        reject_config(&project)?;
+        for name in ["config", "config.toml"] {
+            let path = project.join("nested/.cargo").join(name);
+            fs::write(&path, b"[source.crates-io]\nreplace-with='private'\n")?;
+            assert!(reject_config(&project).is_err());
+            fs::remove_file(path)?;
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("config.toml", project.join("linked-source"))?;
+            assert!(source_files(&project, false).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_owner_binds_explicit_registry_coordinates_and_refuses_generated_lock_gaps()
+    -> Result<()> {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        const NAME: &str = "runtimes::cargo_tool::tests::cargo_owner_binds_explicit_registry_coordinates_and_refuses_generated_lock_gaps";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        nix::unistd::setsid()?;
+        for generated in [false, true] {
+            let script = fixtures::CARGO
+                .replace("fetch) ;;", "fetch) mkdir -p \"$CARGO_HOME/git\"; printf 'controlled cache data' > \"$CARGO_HOME/git/fixture\" ;;")
+                .replace("*) printf '{\"packages\":[", "*) cp \"$fixture/resolved.lock\" \"$(dirname \"$manifest\")/Cargo.lock\"; printf '{\"packages\":[");
+            let (owner, data, stage) = fixtures::fixture("rust", "cargo", &script)?;
+            let dependency = fixtures::crate_archive(
+                &data,
+                "fixture-dependency",
+                "2.3.4",
+                &[(
+                    "Cargo.toml",
+                    b"[package]\nname='fixture-dependency'\nversion='2.3.4'\n".to_vec(),
+                )],
+            )
+            .expect("create controlled checksum-bound dependency archive");
+            let lock = format!(
+                "[[package]]\nname='fixture-tool'\nversion='1.0.0'\n[[package]]\nname='fixture-dependency'\nversion='2.3.4'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{dependency}'\n"
+            );
+            fs::write(data.join("resolved.lock"), &lock)?;
+            let mut files = vec![
+                (
+                    "Cargo.toml",
+                    b"[package]\nname='fixture-tool'\nversion='1.0.0'\n".to_vec(),
+                ),
+                ("src/main.rs", b"fn main() {}".to_vec()),
+            ];
+            if !generated {
+                files.push(("Cargo.lock", lock.into_bytes()));
+            }
+            let digest = fixtures::crate_archive(&data, "fixture-tool", "1.0.0", &files)?;
+            fs::write(
+                data.join("seed.lock"),
+                format!(
+                    "[[package]]\nname='omg-admission-plan'\nversion='0.0.0'\ndependencies=['fixture-tool 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)']\n[[package]]\nname='fixture-tool'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{digest}'\n"
+                ),
+            ).expect("write explicit registry-coordinate seed lock");
+            let destination = fixtures::previous(owner.path(), "cargo")?;
+            let source = Arc::new(fixtures::TransitiveFinding {
+                no_findings: true,
+                ..Default::default()
+            });
+            let result = install_reviewed(
+                "fixture-tool@1.0.0",
+                &stage,
+                &destination,
+                &owner.path().join("tools"),
+                source.clone(),
+                &crate::runtimes::security::RuntimeSecurity::fixture(),
+            );
+            if generated {
+                let error = result
+                    .err()
+                    .context("Generated lock gap bypassed unattended refusal")?;
+                let error = format!("{error:#}");
+                assert!(
+                    error.contains("terminal") || error.contains("accept"),
+                    "{error}"
+                );
+                assert!(!data.join("MATERIALIZED").exists());
+            } else {
+                let capability = result?;
+                capability.verify(&stage)?;
+                assert!(data.join("MATERIALIZED").is_dir());
+            }
+            assert_eq!(source.seen.lock().unwrap().len(), 2);
+            assert_eq!(
+                fs::read(destination.join("bin/fixture-tool"))?,
+                b"previous reviewed tool"
+            );
+        }
         Ok(())
     }
 }

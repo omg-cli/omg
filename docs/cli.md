@@ -63,7 +63,7 @@ surface and nested commands easy to audit when a release changes.
 | Surface | Commands or values |
 | --- | --- |
 | Package | `search`, `install`, `remove`, `update`, `info`, `why`, `outdated`, `size`, `blame`, `diff`, `snapshot`, `ci`, `migrate`, `clean`, `explicit`, `ec`, `tc`, `oc`, `uc`, `sync` |
-| Runtime | `use`, `list`, `which`; 14 native runtimes: `node`, `python`, `go`, `rust`, `ruby`, `java`, `bun`, `pi`, `deno`, `zig`, `dotnet`, `erlang`, `php`, `swift` |
+| Runtime | `use`, `list`, `which`; 13 language runtimes: `node`, `python`, `go`, `rust`, `ruby`, `java`, `bun`, `deno`, `zig`, `dotnet`, `erlang`, `php`, `swift`; `pi` selects the npm-installed coding harness |
 | Shell and monorepo | `hook`, `completions`, `hooks install/uninstall/status/run`, `workspace init/add/remove/list/run/diff/check/status` |
 | Diagnostics | `status`, `doctor`, `audit scan/sbom/secrets/log/verify/policy/slsa/licenses/fix/export/eol` |
 | Development | `run`, `new`, `tool install/list/remove/update/search/registry`, `init` |
@@ -1182,7 +1182,7 @@ actionlint hyperfine tokei dust duf procs ruff uv fnm protoc terragrunt packer
 dive golangci-lint delve stylua kotlin scala elixir ghcup
 ```
 
-The registry is separate from the 14 native runtime managers. Together they
+The registry is separate from the 13 language runtimes and the Pi coding harness. Together they
 make 68 registered runtime/tool names, but each publisher may expose only
 some operating systems or architectures.
 

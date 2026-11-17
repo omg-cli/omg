@@ -238,12 +238,12 @@ pub(crate) fn install_reviewed(
                 if !message.contains("404") && !message.contains("410") {
                     return Err(error);
                 }
-                let Some((parent, _)) = candidate.rsplit_once('/') else {
+                let Some((parent, _)) = candidate
+                    .rsplit_once('/')
+                    .filter(|(parent, _)| module_path(parent))
+                else {
                     break;
                 };
-                if !module_path(parent) {
-                    break;
-                }
                 candidate = parent.into();
             }
         }
@@ -533,6 +533,310 @@ mod tests {
         assert!(checksum("h1:not-a-checksum").is_err());
         assert!(!module_path("example.com/../local"));
         assert!(exact("v1.2.3-0.20260910120000-0123456789ab").is_ok());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_command_refuses_a_project_local_manager_before_spawn() -> Result<()> {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        const NAME: &str =
+            "runtimes::go_tool::tests::go_command_refuses_a_project_local_manager_before_spawn";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let (owner, data, stage) = fixtures::fixture("go", "go", fixtures::GO)?;
+        fs::create_dir(owner.path().join(".git"))?;
+        let runtime = ManagedRuntime::open(
+            "go",
+            &owner.path().join("tools"),
+            &crate::runtimes::security::RuntimeSecurity::fixture(),
+        )
+        .expect("open sealed Go fixture runtime");
+        let original = std::env::current_dir()?;
+        std::env::set_current_dir(owner.path())?;
+        let result = command(&runtime, &stage, "example.com/tool", &data, &stage, false);
+        std::env::set_current_dir(original)?;
+        let error = result.expect_err("Project-local Go must not start");
+        assert!(format!("{error:#}").contains("Refusing project-local go executable"));
+        assert!(!data.join("phases").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_owner_refuses_resolution_checksum_and_unattended_replacement_failures() -> Result<()> {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        const NAME: &str = "runtimes::go_tool::tests::go_owner_refuses_resolution_checksum_and_unattended_replacement_failures";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        nix::unistd::setsid()?;
+        for fault in [
+            "not-found",
+            "download-json",
+            "root-checksum",
+            "manifest-checksum",
+            "source-mutation",
+            "manifest-json",
+            "dependency-download",
+            "replacement",
+        ] {
+            let script = match fault {
+                "not-found" => fixtures::GO.replace("'list -m') printf '{\"Path\":\"example.com/tool\",\"Version\":\"v1.2.3\"}' ;;", "'list -m') printf '410 module not found' >&2; exit 1 ;;"),
+                "download-json" => fixtures::GO.replace("'mod download')", "'mod download') printf 'invalid module JSON'; exit 0;"),
+                "manifest-checksum" => fixtures::GO.replace("\"GoModSum\":\"h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"", "\"GoModSum\":\"h1:invalid\""),
+                "manifest-json" => fixtures::GO.replace("'mod edit') printf '{\"Module\":{\"Path\":\"example.com/tool\"},\"Replace\":[]}' ;;", "'mod edit') printf 'invalid manifest JSON' ;;"),
+                "dependency-download" => fixtures::GO.replace("if [ \"$4\" = 'all' ]; then", "if [ \"$4\" = 'all' ]; then printf 'dependency transport unavailable' >&2; exit 1;"),
+                "replacement" => fixtures::GO.replace("\"Replace\":[]", "\"Replace\":[{\"New\":{\"Path\":\"./private\"}}]"),
+                _ => fixtures::GO.to_owned(),
+            };
+            let (owner, data, stage) = fixtures::fixture("go", "go", &script)?;
+            fixtures::go_source(&data, "root", "example.com/tool", "v1.2.3")?;
+            fixtures::go_source(&data, "dependency", "example.com/dependency", "v2.3.4")?;
+            if fault == "root-checksum" {
+                fs::write(data.join("root.sum"), b"h1:invalid")?;
+            }
+            if fault == "source-mutation" {
+                fs::write(
+                    data.join("root/go.mod"),
+                    b"module different.example/unreviewed\n",
+                )
+                .expect("write mismatched Go module source fixture");
+            }
+            let destination = fixtures::previous(owner.path(), "go")?;
+            let source = Arc::new(fixtures::TransitiveFinding {
+                no_findings: true,
+                ..Default::default()
+            });
+            let result = install_reviewed(
+                "example.com/tool@v1.2.3",
+                &stage,
+                &destination,
+                &owner.path().join("tools"),
+                source.clone(),
+                &crate::runtimes::security::RuntimeSecurity::fixture(),
+            );
+            let error = result
+                .err()
+                .context(format!("Go {fault} failure was admitted"))?;
+            let error = format!("{error:#}");
+            if fault == "not-found" {
+                assert!(error.contains("no exact public module identity"), "{error}");
+            }
+            if fault == "replacement" {
+                assert!(
+                    error.contains("terminal") || error.contains("accept"),
+                    "{error}"
+                );
+            }
+            assert!(
+                source.seen.lock().unwrap().is_empty(),
+                "Unresolved {fault} graph reached public assessment"
+            );
+            assert!(
+                !data.join("MATERIALIZED").exists(),
+                "Unresolved {fault} graph reached build"
+            );
+            assert_eq!(
+                fs::read(destination.join("bin/fixture-tool"))?,
+                b"previous reviewed tool"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn go_module_checksum_authenticates_nested_source_and_rejects_mutation() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        fs::create_dir_all(owner.path().join("cmd/tool"))?;
+        fs::write(
+            owner.path().join("go.mod"),
+            b"module example.com/tool\n\ngo 1.20\n",
+        )
+        .expect("write exact Go checksum fixture manifest");
+        let main = owner.path().join("cmd/tool/main.go");
+        fs::write(&main, b"package main\nfunc main() {}\n")?;
+        let expected = "h1:l3Hn2tVlaVfKySuCI6EM3TnGNhovQeBjLOKxNdMT0jc=";
+        verify_module_files(owner.path(), "example.com/tool", "v1.2.3", expected)?;
+        assert!(
+            verify_module_files(owner.path(), "example.com/other", "v1.2.3", expected).is_err()
+        );
+        fs::write(&main, b"package main\nfunc main() { panic(1) }\n")?;
+        assert!(verify_module_files(owner.path(), "example.com/tool", "v1.2.3", expected).is_err());
+        fs::write(&main, b"package main\nfunc main() {}\n")?;
+        #[cfg(unix)]
+        {
+            let link = owner.path().join("cmd/tool/redirect.go");
+            std::os::unix::fs::symlink("main.go", &link)?;
+            assert!(
+                verify_module_files(owner.path(), "example.com/tool", "v1.2.3", expected).is_err()
+            );
+            fs::remove_file(link)?;
+            fs::write(
+                owner.path().join("ambiguous\nname"),
+                b"not a valid checksum path",
+            )
+            .expect("write ambiguous Go checksum fixture path");
+            assert!(
+                verify_module_files(owner.path(), "example.com/tool", "v1.2.3", expected).is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn go_requests_refuse_noncanonical_versions_and_unsafe_paths() {
+        for request in [
+            "example.com/tool",
+            "example.com/tool@latest",
+            "example.com/tool/cmd/cli@v1.2.3",
+        ] {
+            assert!(validate_request(request).is_ok(), "{request}");
+        }
+        for request in [
+            "example.com/tool@v1.2",
+            "example.com/tool@v01.2.3",
+            "example.com/tool@branch",
+            "example.com/tool@1.2.3",
+            "example.com/../tool",
+            "example.com/tool;sh",
+        ] {
+            assert!(validate_request(request).is_err(), "{request}");
+        }
+        assert!(modules(b" ").is_err());
+        assert!(modules(br#"{"Path":"example.com/tool"}garbage"#).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_owner_resolves_parent_module_and_freezes_dependency_free_subpackage_build() -> Result<()>
+    {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        const NAME: &str = "runtimes::go_tool::tests::go_owner_resolves_parent_module_and_freezes_dependency_free_subpackage_build";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let lookup = "'list -m') case \"$4\" in example.com/tool@*) printf '{\"Path\":\"example.com/tool\",\"Version\":\"v1.2.3\"}' ;; *) printf '404 module not found' >&2; exit 1 ;; esac ;;";
+        let script = fixtures::GO
+            .replace("'list -m') printf '{\"Path\":\"example.com/tool\",\"Version\":\"v1.2.3\"}' ;;", lookup)
+            .replace("printf '{\"Path\":\"example.com/dependency\",\"Version\":\"v2.3.4\",\"Dir\":\"%s/dependency\",\"Sum\":\"%s\",\"GoModSum\":\"h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}' \"$GOMODCACHE\" \"$(cat \"$fixture/dependency.sum\")\"", ":")
+            .replace("printf '{\"Path\":\"example.com/tool\",\"Main\":true}\\n{\"Path\":\"example.com/dependency\",\"Version\":\"v2.3.4\"}'", "printf '{\"Path\":\"example.com/tool\",\"Main\":true}'")
+            .replace("mkdir -p \"$fixture/MATERIALIZED\" \"$(dirname \"$destination\")\"", "[ \"$argument\" = './cmd/cli' ] || exit 97\n  mkdir -p \"$fixture/MATERIALIZED\" \"$(dirname \"$destination\")\"");
+        let (owner, data, stage) = fixtures::fixture("go", "go", &script)?;
+        fixtures::go_source(&data, "root", "example.com/tool", "v1.2.3")?;
+        fixtures::go_source(&data, "dependency", "example.com/dependency", "v2.3.4")?;
+        let destination = fixtures::previous(owner.path(), "go")?;
+        let source = Arc::new(fixtures::TransitiveFinding {
+            no_findings: true,
+            ..Default::default()
+        });
+        temp_env::with_var(
+            "OMG_TOOL_ALLOW_GO_CGO",
+            Some("example.com/tool/cmd/cli@v1.2.3"),
+            || {
+                let capability = install_reviewed(
+                    "example.com/tool/cmd/cli@v1.2.3",
+                    &stage,
+                    &destination,
+                    &owner.path().join("tools"),
+                    source.clone(),
+                    &crate::runtimes::security::RuntimeSecurity::fixture(),
+                )
+                .expect("admit exact controlled dependency-free Go graph");
+                capability.verify(&stage)
+            },
+        )
+        .expect("verify controlled Go owner with scoped CGO option");
+        assert!(data.join("MATERIALIZED").is_dir());
+        let seen = source.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].name, "example.com/tool");
+        assert_eq!(seen[0].version, "v1.2.3");
+        assert_eq!(
+            fs::read_to_string(data.join("phases"))?
+                .matches("list -m\n")
+                .count(),
+            3
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_replacement_graph_never_builds_after_exact_risk_acceptance() -> Result<()> {
+        const NAME: &str = "runtimes::go_tool::tests::go_replacement_graph_never_builds_after_exact_risk_acceptance";
+        if std::env::var("OMG_GO_REPLACEMENT_PTY").as_deref() != Ok("1") {
+            const DRIVER: &str = r"
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('consent', sys.argv[2])
+terminal = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(terminal)
+terminal.NAME = sys.argv[3]
+code, transcript = terminal.terminal_case(Path(sys.argv[1]), 'accept', dict(os.environ), expected=(b'Coverage: unknown', b'Go module declares replacements', b'https://www.cve.org/'))
+assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(errors='replace')
+";
+            let root = tempfile::tempdir()?;
+            let output = std::process::Command::new(
+                crate::core::privilege::root_controlled_program_path("python3")?,
+            )
+            .arg("-c")
+            .arg(DRIVER)
+            .arg(std::env::current_exe()?)
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/test-arch-advisory-consent.py"),
+            )
+            .arg(NAME)
+            .env("OMG_GO_REPLACEMENT_PTY", "1")
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("OMG_CONFIG_DIR", root.path().join("config/omg"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("OMG_DATA_DIR", root.path().join("data/omg"))
+            .env_remove("SUDO_USER")
+            .env_remove("DOAS_USER")
+            .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            return Ok(());
+        }
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        let script = fixtures::GO.replace("\"Replace\":[]", "\"Replace\":[{\"Old\":{\"Path\":\"example.com/dependency\"},\"New\":{\"Path\":\"./local\"}}]");
+        let (owner, data, stage) = fixtures::fixture("go", "go", &script)?;
+        fixtures::go_source(&data, "root", "example.com/tool", "v1.2.3")?;
+        fixtures::go_source(&data, "dependency", "example.com/dependency", "v2.3.4")?;
+        let destination = fixtures::previous(owner.path(), "go")?;
+        let source = Arc::new(fixtures::TransitiveFinding {
+            no_findings: true,
+            ..Default::default()
+        });
+        let result = install_reviewed(
+            "example.com/tool@v1.2.3",
+            &stage,
+            &destination,
+            &owner.path().join("tools"),
+            source.clone(),
+            &crate::runtimes::security::RuntimeSecurity::fixture(),
+        );
+        let error = result
+            .err()
+            .context("Unresolved replacement sources produced an installed tool")?;
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("Go replacement sources remain unresolved"),
+            "{error}"
+        );
+        assert!(
+            source.seen.lock().unwrap().is_empty(),
+            "Private replacement must not be queried as a public module"
+        );
+        assert!(!data.join("MATERIALIZED").exists());
+        assert_eq!(
+            fs::read_to_string(data.join("phases"))?,
+            "list -m\nmod download\nmod edit\n"
+        );
         Ok(())
     }
 }

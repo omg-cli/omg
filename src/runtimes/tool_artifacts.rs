@@ -8,6 +8,8 @@ use std::io::Read as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use super::package_manager::{ManagedRuntime, ReviewedTool};
 use crate::core::security::package_review::PackageReview;
@@ -21,9 +23,91 @@ pub(crate) fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-pub(crate) fn run(mut command: Command, phase: &str, build: bool) -> Result<Vec<u8>> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+#[derive(Debug, PartialEq, Eq)]
+enum ChildObservation {
+    Pending,
+    Exited,
+    Interrupted,
+}
+
+#[cfg(unix)]
+fn classify_child_wait<T>(result: rustix::io::Result<Option<T>>) -> Result<ChildObservation> {
+    match result {
+        Ok(Some(_)) => Ok(ChildObservation::Exited),
+        Ok(None) => Ok(ChildObservation::Pending),
+        Err(error) if error == rustix::io::Errno::INTR => Ok(ChildObservation::Interrupted),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn observe_child_exit(process: u32) -> Result<ChildObservation> {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let process =
+            Pid::from_raw(i32::try_from(process)?).context("Invalid manager process ID")?;
+        classify_child_wait(waitid(
+            WaitId::Pid(process),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = process;
+        Ok(ChildObservation::Pending)
+    }
+}
+
+fn read_bounded(
+    mut reader: impl std::io::Read,
+    limit: usize,
+    exceeded: &AtomicBool,
+    completed: &AtomicBool,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 16384];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                if bytes.len() > limit {
+                    exceeded.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if completed.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                exceeded.store(true, Ordering::Release);
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn run(command: Command, phase: &str, build: bool) -> Result<Vec<u8>> {
+    run_owned(
+        command,
+        phase,
+        Instant::now() + Duration::from_secs(if build { 3600 } else { 600 }),
+        observe_child_exit,
+    )
+}
+
+fn run_owned(
+    mut command: Command,
+    phase: &str,
+    deadline: Instant,
+    mut observe: impl FnMut(u32) -> Result<ChildObservation>,
+) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -35,7 +119,7 @@ pub(crate) fn run(mut command: Command, phase: &str, build: bool) -> Result<Vec<
     }
     let child = command
         .spawn()
-        .with_context(|| format!("Failed to start {phase}"))?;
+        .context(format!("Failed to start {phase}"))?;
     struct ChildOwner {
         child: std::process::Child,
         reaped: bool,
@@ -80,39 +164,11 @@ pub(crate) fn run(mut command: Command, phase: &str, build: bool) -> Result<Vec<
     }
     let exceeded = AtomicBool::new(false);
     let completed = AtomicBool::new(false);
-    let deadline = Instant::now() + Duration::from_secs(if build { 3600 } else { 600 });
     std::thread::scope(|scope| {
-        let bounded =
-            |mut reader: Box<dyn std::io::Read + Send>, limit: usize| -> Result<Vec<u8>> {
-                let mut bytes = Vec::new();
-                let mut buffer = [0u8; 16384];
-                loop {
-                    match reader.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(count) => {
-                            bytes.extend_from_slice(&buffer[..count]);
-                            if bytes.len() > limit {
-                                exceeded.store(true, Ordering::Release);
-                                break;
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            if completed.load(Ordering::Acquire) || Instant::now() >= deadline {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(error) => {
-                            exceeded.store(true, Ordering::Release);
-                            return Err(error.into());
-                        }
-                    }
-                }
-                Ok(bytes)
-            };
-        let out = scope.spawn(move || bounded(Box::new(stdout), 32 * 1024 * 1024));
-        let err = scope.spawn(move || bounded(Box::new(stderr), 1024 * 1024));
+        let out =
+            scope.spawn(|| read_bounded(stdout, 32 * 1024 * 1024, &exceeded, &completed, deadline));
+        let err =
+            scope.spawn(|| read_bounded(stderr, 1024 * 1024, &exceeded, &completed, deadline));
         let status = loop {
             if exceeded.load(Ordering::Acquire) || Instant::now() >= deadline {
                 owner.stop();
@@ -122,25 +178,19 @@ pub(crate) fn run(mut command: Command, phase: &str, build: bool) -> Result<Vec<
             }
             #[cfg(unix)]
             {
-                use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
-                let observed = Pid::from_raw(i32::try_from(owner.child.id())?)
-                    .context("Invalid manager process ID")?;
-                match waitid(
-                    WaitId::Pid(observed),
-                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-                ) {
-                    Ok(Some(_)) => {
+                match observe(owner.child.id()) {
+                    Ok(ChildObservation::Exited) => {
                         // Retain the unreaped leader until its process group is stopped.
                         owner.stop_group();
                         let status = owner.child.wait();
                         owner.reaped = status.is_ok();
                         break status.map_err(Into::into);
                     }
-                    Ok(None) => {}
-                    Err(error) if error == rustix::io::Errno::INTR => continue,
+                    Ok(ChildObservation::Pending) => {}
+                    Ok(ChildObservation::Interrupted) => continue,
                     Err(error) => {
                         owner.stop();
-                        break Err(error.into());
+                        break Err(error);
                     }
                 }
             }
@@ -161,10 +211,12 @@ pub(crate) fn run(mut command: Command, phase: &str, build: bool) -> Result<Vec<
         completed.store(true, Ordering::Release);
         let out = out
             .join()
-            .map_err(|_| anyhow::anyhow!("Manager stdout reader failed"))??;
+            .map_err(worker_panic)
+            .context("Manager stdout reader failed")??;
         let err = err
             .join()
-            .map_err(|_| anyhow::anyhow!("Manager stderr reader failed"))??;
+            .map_err(worker_panic)
+            .context("Manager stderr reader failed")??;
         ensure!(
             !exceeded.load(Ordering::Acquire),
             "{phase} exceeded the bounded output allowance"
@@ -327,10 +379,9 @@ impl InstalledReview {
         runtime.verify()?;
         review.verify(source.as_ref())?;
         let overrides = crate::cli::tool::active_security_overrides(manager, request);
-        let receipt = serde_json::to_vec_pretty(
-            &serde_json::json!({"schema_version":1,"manager":manager,"request":request,"runtime":runtime.identity_context()?,"graph":graph,"overrides":overrides,"review_id":review.id(),"risk_accepted":review.accepted(),
-            "assessments":review.assessments().iter().map(|row|serde_json::json!({"name":row.package.name,"version":row.package.version,"origin":row.package.origin,"coverage":format!("{:?}",row.coverage),"findings":row.findings})).collect::<Vec<_>>()}),
-        )?;
+        let receipt = serde_json::json!({"schema_version":1,"manager":manager,"request":request,"runtime":runtime.identity_context()?,"graph":graph,"overrides":overrides,"review_id":review.id(),"risk_accepted":review.accepted(),
+            "assessments":review.assessments().iter().map(|row|serde_json::json!({"name":row.package.name,"version":row.package.version,"origin":row.package.origin,"coverage":format!("{:?}",row.coverage),"findings":row.findings})).collect::<Vec<_>>()});
+        let receipt = format!("{receipt:#}").into_bytes();
         crate::core::safe_ops::atomic_write_file_sync(
             prefix.join(".omg-package-advisory-review.json"),
             &receipt,
@@ -377,6 +428,10 @@ impl ReviewedTool for InstalledReview {
     }
 }
 
+fn worker_panic(_: Box<dyn std::any::Any + Send>) -> anyhow::Error {
+    anyhow::anyhow!("Owned worker panicked")
+}
+
 pub(crate) fn scoped_future<T: Send>(
     future: impl std::future::Future<Output = Result<T>> + Send,
 ) -> Result<T> {
@@ -389,12 +444,13 @@ pub(crate) fn scoped_future<T: Send>(
                     .block_on(future)
             })
             .join()
-            .map_err(|_| anyhow::anyhow!("Registry metadata worker failed"))?
+            .map_err(worker_panic)
+            .context("Registry metadata worker failed")?
     })
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::core::security::scan::{AdvisoryProvenance, FindingApplicability, Vulnerability};
     use crate::core::security::vulnerability::{
@@ -405,10 +461,10 @@ mod tests {
     use std::path::PathBuf;
 
     #[derive(Default)]
-    struct TransitiveFinding {
-        seen: std::sync::Mutex<Vec<SecurityPackage>>,
-        bootstrap_vulnerable: bool,
-        no_findings: bool,
+    pub(in crate::runtimes) struct TransitiveFinding {
+        pub(in crate::runtimes) seen: std::sync::Mutex<Vec<SecurityPackage>>,
+        pub(in crate::runtimes) bootstrap_vulnerable: bool,
+        pub(in crate::runtimes) no_findings: bool,
     }
     impl VulnerabilitySource for TransitiveFinding {
         fn assess_packages<'a>(
@@ -437,7 +493,7 @@ mod tests {
     fn quote(path: &Path) -> String {
         format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
     }
-    fn fixture(
+    pub(in crate::runtimes) fn fixture(
         runtime: &str,
         command: &str,
         script: &str,
@@ -461,13 +517,14 @@ mod tests {
         fs::create_dir(&stage)?;
         Ok((owner, data, stage))
     }
-    fn previous(owner: &Path, manager: &str) -> Result<PathBuf> {
+    pub(in crate::runtimes) fn previous(owner: &Path, manager: &str) -> Result<PathBuf> {
         let destination = owner.join("tools").join(manager).join("fixture-tool");
         fs::create_dir_all(destination.join("bin"))?;
         fs::write(
             destination.join("bin/fixture-tool"),
             b"previous reviewed tool",
-        )?;
+        )
+        .expect("write the previous reviewed tool fixture");
         Ok(destination)
     }
     fn assert_refused(
@@ -477,10 +534,10 @@ mod tests {
         source: &TransitiveFinding,
         phases: &str,
     ) -> Result<()> {
-        let error = match result {
-            Ok(_) => anyhow::bail!("Disclosed transitive CVE was installed without consent"),
-            Err(error) => format!("{error:#}"),
-        };
+        let error = result
+            .err()
+            .context("Disclosed transitive CVE was installed without consent")?;
+        let error = format!("{error:#}");
         ensure!(
             error.contains("terminal") || error.contains("review") || error.contains("accept"),
             "Unexpected pre-admission failure: {error}"
@@ -502,7 +559,7 @@ mod tests {
         );
         Ok(())
     }
-    fn crate_archive(
+    pub(in crate::runtimes) fn crate_archive(
         data: &Path,
         name: &str,
         version: &str,
@@ -515,11 +572,13 @@ mod tests {
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
-            archive.append_data(
-                &mut header,
-                format!("{name}-{version}/{path}"),
-                bytes.as_slice(),
-            )?;
+            archive
+                .append_data(
+                    &mut header,
+                    format!("{name}-{version}/{path}"),
+                    bytes.as_slice(),
+                )
+                .expect("append the controlled crate archive member");
         }
         let bytes = archive.into_inner()?.finish()?;
         fs::write(data.join(format!("{name}-{version}.crate")), &bytes)?;
@@ -531,8 +590,9 @@ mod tests {
         Ok(hash(&bytes))
     }
 
-    const CARGO: &str = r#"#!/bin/sh
+    pub(in crate::runtimes) const CARGO: &str = r#"#!/bin/sh
 set -eu
+[ "$PWD" = / ] || exit 94
 fixture=@FIXTURE@
 printf '%s\n' "$1" >> "$fixture/phases"
 previous=''
@@ -584,7 +644,8 @@ esac
                 ),
                 ("src/lib.rs", b"pub fn dependency() {}".to_vec()),
             ],
-        )?;
+        )
+        .expect("build the dependency archive fixture");
         let lock = format!(
             "version=3\n[[package]]\nname='fixture-tool'\nversion='1.0.0'\n[[package]]\nname='fixture-dependency'\nversion='2.3.4'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{dep}'\n"
         );
@@ -600,13 +661,14 @@ esac
                 ("Cargo.lock", lock.into_bytes()),
                 ("src/main.rs", b"fn main() {}".to_vec()),
             ],
-        )?;
+        )
+        .expect("build the requested crate archive fixture");
         fs::write(
             data.join("seed.lock"),
             format!(
                 "[[package]]\nname='omg-admission-plan'\nversion='0.0.0'\ndependencies=['fixture-tool']\n[[package]]\nname='fixture-tool'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{top}'\n"
             ),
-        )?;
+        ).expect("write the synthetic direct-dependency lock");
         let destination = previous(owner.path(), "cargo")?;
         let source = Arc::new(TransitiveFinding::default());
         let result = super::super::cargo_tool::install_reviewed(
@@ -623,12 +685,13 @@ esac
             &destination,
             &source,
             "metadata\nmetadata\nfetch\n",
-        )?;
+        )
+        .expect("require transitive Cargo CVE refusal before build");
         assert!(!data.join("MATERIALIZED").exists());
         Ok(())
     }
 
-    const GO: &str = r#"#!/bin/sh
+    pub(in crate::runtimes) const GO: &str = r#"#!/bin/sh
 set -eu
 fixture=@FIXTURE@
 printf '%s %s\n' "$1" "${2:-}" >> "$fixture/phases"
@@ -658,7 +721,12 @@ case "$1 $2" in
 *) exit 92 ;;
 esac
 "#;
-    fn go_source(data: &Path, directory: &str, module: &str, version: &str) -> Result<()> {
+    pub(in crate::runtimes) fn go_source(
+        data: &Path,
+        directory: &str,
+        module: &str,
+        version: &str,
+    ) -> Result<()> {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let bytes = format!("module {module}\n\ngo 1.20\n");
         fs::create_dir(data.join(directory))?;
@@ -667,7 +735,8 @@ esac
         fs::write(
             data.join(format!("{directory}.sum")),
             format!("h1:{}", STANDARD.encode(Sha256::digest(row.as_bytes()))),
-        )?;
+        )
+        .expect("write the controlled Go source checksum");
         Ok(())
     }
     #[test]
@@ -696,7 +765,8 @@ esac
             &destination,
             &source,
             "list -m\nmod download\nmod edit\nmod download\nlist -mod=readonly\nmod verify\n",
-        )?;
+        )
+        .expect("require transitive Go CVE refusal before build");
         assert!(
             source
                 .seen
@@ -709,7 +779,7 @@ esac
         Ok(())
     }
 
-    const PYTHON: &str = r#"#!/bin/sh
+    pub(in crate::runtimes) const PYTHON: &str = r#"#!/bin/sh
 set -eu
 fixture=@FIXTURE@
 previous=''; module=''; report=''; last=''
@@ -761,8 +831,8 @@ esac
             data.join("report.json"),
             serde_json::to_vec(
                 &serde_json::json!({"version":"1","install":[item("fixture-tool",true),item("fixture-dependency",false)]}),
-            )?,
-        )?;
+            ).expect("encode the complete controlled wheel report"),
+        ).expect("write the complete controlled wheel report");
         let destination = previous(owner.path(), "pip")?;
         let source = Arc::new(TransitiveFinding::default());
         let result = super::super::pip_tool::install_reviewed(
@@ -789,7 +859,8 @@ esac
         fs::write(
             data.join("bootstrap-metadata"),
             b"Metadata-Version: 2.1\nName: pip\nVersion: 24.0\n\nControlled fixture\n",
-        )?;
+        )
+        .expect("write the controlled pip bootstrap metadata");
         let destination = previous(owner.path(), "pip")?;
         let source = Arc::new(TransitiveFinding {
             bootstrap_vulnerable: true,
@@ -877,26 +948,41 @@ esac
             b"previous reviewed tool"
         );
         let output = Command::new(destination.join("bin/fixture-tool")).output()?;
-        ensure!(
-            output.status.success(),
-            "Published tool failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(output.status.success(), "Published tool failed: {}", stderr);
         assert_eq!(output.stdout, b"reviewed-tool-success\n");
-        let receipt: serde_json::Value = serde_json::from_slice(&read(
+        let receipt = read(
             &destination.join(".omg-package-advisory-review.json"),
             1024 * 1024,
-        )?)?;
+        )
+        .expect("read the published advisory receipt");
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt)
+            .expect("published advisory receipt must remain valid JSON");
         assert_eq!(receipt["risk_accepted"], false);
         assert_eq!(
             receipt["assessments"].as_array().unwrap().len(),
             source.seen.lock().unwrap().len()
         );
         assert!(destination.join(".omg-security-receipt.json").is_file());
+        for name in [
+            ".omg-package-advisory-review.json",
+            ".omg-security-receipt.json",
+        ] {
+            let path = destination.join(name);
+            let original = fs::read(&path)?;
+            fs::write(&path, b"changed review receipt")?;
+            assert!(
+                capability.verify(destination).is_err(),
+                "Published review metadata must stay byte-bound"
+            );
+            fs::write(&path, &original)?;
+            capability.verify(destination)?;
+        }
         fs::write(
             destination.join("unreviewed-root-payload"),
             b"changed after publication",
-        )?;
+        )
+        .expect("create the post-publication tamper control");
         assert!(
             capability.verify(destination).is_err(),
             "Complete published prefix must remain bound, including root payloads"
@@ -918,7 +1004,8 @@ esac
                 ),
                 ("src/lib.rs", b"pub fn dependency() {}".to_vec()),
             ],
-        )?;
+        )
+        .expect("build the dependency archive fixture");
         let lock = format!(
             "version=3\n[[package]]\nname='fixture-tool'\nversion='1.0.0'\n[[package]]\nname='fixture-dependency'\nversion='2.3.4'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{dep}'\n"
         );
@@ -934,13 +1021,14 @@ esac
                 ("Cargo.lock", lock.into_bytes()),
                 ("src/main.rs", b"fn main() {}".to_vec()),
             ],
-        )?;
+        )
+        .expect("build the requested crate archive fixture");
         fs::write(
             data.join("seed.lock"),
             format!(
                 "[[package]]\nname='omg-admission-plan'\nversion='0.0.0'\ndependencies=['fixture-tool']\n[[package]]\nname='fixture-tool'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\nchecksum='{top}'\n"
             ),
-        )?;
+        ).expect("write the synthetic direct-dependency lock");
         let destination = previous(owner.path(), "cargo")?;
         let source = Arc::new(TransitiveFinding {
             no_findings: true,
@@ -953,7 +1041,8 @@ esac
             &owner.path().join("tools"),
             source.clone(),
             &super::super::security::RuntimeSecurity::fixture(),
-        )?;
+        )
+        .expect("install the admitted clean Cargo graph");
         assert!(data.join("MATERIALIZED").is_dir());
         assert_successful_publication(
             capability.as_ref(),
@@ -982,7 +1071,8 @@ esac
             &owner.path().join("tools"),
             source.clone(),
             &super::super::security::RuntimeSecurity::fixture(),
-        )?;
+        )
+        .expect("build the admitted clean Go module graph");
         assert!(data.join("MATERIALIZED").is_dir());
         assert_successful_publication(
             capability.as_ref(),
@@ -994,7 +1084,7 @@ esac
         )
     }
 
-    struct FixtureWheels {
+    pub(in crate::runtimes) struct FixtureWheels {
         bodies: BTreeMap<String, Vec<u8>>,
         corrupt: bool,
         downloads: std::sync::Mutex<Vec<String>>,
@@ -1019,7 +1109,7 @@ esac
             Ok(())
         }
     }
-    fn pip_wheels(data: &Path, corrupt: bool) -> Result<FixtureWheels> {
+    pub(in crate::runtimes) fn pip_wheels(data: &Path, corrupt: bool) -> Result<FixtureWheels> {
         use std::io::Write as _;
         let mut bodies = BTreeMap::new();
         let mut rows = Vec::new();
@@ -1028,10 +1118,12 @@ esac
             let metadata = format!("Metadata-Version: 2.1\nName: {name}\nVersion: 1.2.3\n\n");
             fs::write(data.join(format!("{name}.metadata")), &metadata)?;
             let mut wheel = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-            wheel.start_file(
-                format!("{distribution}-1.2.3.dist-info/METADATA"),
-                zip::write::SimpleFileOptions::default(),
-            )?;
+            wheel
+                .start_file(
+                    format!("{distribution}-1.2.3.dist-info/METADATA"),
+                    zip::write::SimpleFileOptions::default(),
+                )
+                .expect("create the controlled wheel metadata member");
             wheel.write_all(metadata.as_bytes())?;
             let bytes = wheel.finish()?.into_inner();
             let url = format!(
@@ -1043,7 +1135,8 @@ esac
         fs::write(
             data.join("report.json"),
             serde_json::to_vec(&serde_json::json!({"version":"1","install":rows}))?,
-        )?;
+        )
+        .expect("write the controlled frozen wheel report");
         Ok(FixtureWheels {
             bodies,
             corrupt,
@@ -1067,7 +1160,8 @@ esac
             source.clone(),
             &super::super::security::RuntimeSecurity::fixture(),
             &wheels,
-        )?;
+        )
+        .expect("install the admitted clean wheel graph");
         assert_eq!(wheels.downloads.lock().unwrap().len(), 2);
         assert!(data.join("MATERIALIZED").is_dir());
         assert_successful_publication(
@@ -1098,10 +1192,8 @@ esac
             &super::super::security::RuntimeSecurity::fixture(),
             &wheels,
         );
-        let error = match result {
-            Ok(_) => anyhow::bail!("Corrupt wheel was admitted"),
-            Err(error) => format!("{error:#}"),
-        };
+        let error = result.err().context("Corrupt wheel was admitted")?;
+        let error = format!("{error:#}");
         assert!(error.contains("differs from its reviewed hash"), "{error}");
         assert_eq!(fs::read_to_string(data.join("phases"))?, "venv\nresolve\n");
         assert_eq!(wheels.downloads.lock().unwrap().len(), 1);
@@ -1110,6 +1202,322 @@ esac
             fs::read(destination.join("bin/fixture-tool"))?,
             b"previous reviewed tool"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_reader_retries_interruptions_stops_completed_pipes_and_preserves_io_errors()
+    -> Result<()> {
+        struct Interrupted {
+            first: bool,
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+        impl std::io::Read for Interrupted {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.first {
+                    self.first = false;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                std::io::Read::read(&mut self.bytes, buffer)
+            }
+        }
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("controlled pipe failure"))
+            }
+        }
+        struct OpenPipe;
+        impl std::io::Read for OpenPipe {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+        let exceeded = AtomicBool::new(false);
+        let completed = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            read_bounded(
+                Interrupted {
+                    first: true,
+                    bytes: std::io::Cursor::new(b"complete".to_vec())
+                },
+                8,
+                &exceeded,
+                &completed,
+                deadline
+            )
+            .expect("retry an interrupted metadata read"),
+            b"complete"
+        );
+        assert!(!exceeded.load(Ordering::Acquire));
+        assert_eq!(
+            read_bounded(
+                std::io::Cursor::new(b"oversized"),
+                3,
+                &exceeded,
+                &completed,
+                deadline
+            )
+            .expect("report oversized output through the shared budget flag"),
+            b"oversized"
+        );
+        assert!(exceeded.swap(false, Ordering::AcqRel));
+        let error = read_bounded(Broken, 8, &exceeded, &completed, deadline).unwrap_err();
+        assert!(error.to_string().contains("controlled pipe failure"));
+        assert!(exceeded.swap(false, Ordering::AcqRel));
+        completed.store(true, Ordering::Release);
+        assert!(read_bounded(OpenPipe, 8, &exceeded, &completed, deadline)?.is_empty());
+        completed.store(false, Ordering::Release);
+        assert!(read_bounded(OpenPipe, 8, &exceeded, &completed, Instant::now())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn process_wait_error_and_timeout_stop_and_reap_the_owned_real_child() -> Result<()> {
+        assert_eq!(
+            classify_child_wait::<()>(Ok(Some(())))?,
+            ChildObservation::Exited
+        );
+        assert_eq!(
+            classify_child_wait::<()>(Ok(None))?,
+            ChildObservation::Pending
+        );
+        assert_eq!(
+            classify_child_wait::<()>(Err(rustix::io::Errno::INTR))?,
+            ChildObservation::Interrupted
+        );
+        assert!(classify_child_wait::<()>(Err(rustix::io::Errno::IO)).is_err());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let mut owned_pid = None;
+        let error = run_owned(
+            command,
+            "controlled wait",
+            Instant::now() + Duration::from_secs(2),
+            |pid| {
+                owned_pid = Some(pid);
+                Err(anyhow::anyhow!("controlled wait failure"))
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("controlled wait failure"));
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(owned_pid.unwrap())?);
+        assert_eq!(
+            nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD),
+            "The owner must reap its stopped child before returning"
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        let error = run_owned(
+            command,
+            "controlled deadline",
+            started + Duration::from_millis(50),
+            observe_child_exit,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("deadline") || error.to_string().contains("time allowance")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf complete"]);
+        let mut interrupted = false;
+        assert_eq!(
+            run_owned(
+                command,
+                "controlled retry",
+                Instant::now() + Duration::from_secs(2),
+                |pid| {
+                    if !interrupted {
+                        interrupted = true;
+                        Ok(ChildObservation::Interrupted)
+                    } else {
+                        observe_child_exit(pid)
+                    }
+                }
+            )
+            .expect("complete the owned child after an interrupted wait"),
+            b"complete"
+        );
+        assert!(interrupted);
+        Ok(())
+    }
+
+    #[test]
+    fn real_manager_output_overflow_fails_closed_and_failure_diagnostics_are_sanitized()
+    -> Result<()> {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "head -c 2097152 /dev/zero >&2; sleep 30"]);
+        let started = Instant::now();
+        let error = run(command, "controlled overflow", false).unwrap_err();
+        assert!(error.to_string().contains("allowance"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            r"printf '\033[31mcontrolled diagnostic\033[0m' >&2; exit 17",
+        ]);
+        let error = run(command, "controlled failure", true).unwrap_err();
+        assert!(error.to_string().contains("controlled diagnostic"));
+        assert!(!error.to_string().contains('\u{1b}'));
+        assert!(
+            run(
+                Command::new("/missing/omg-manager-fixture"),
+                "missing manager",
+                false
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn contained_links_bind_target_text_and_special_sources_cannot_be_reviewed() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        fs::create_dir(owner.path().join("nested"))?;
+        fs::write(owner.path().join("nested/first"), b"identical")?;
+        fs::write(owner.path().join("nested/second"), b"identical")?;
+        symlink("nested/first", owner.path().join("selected"))?;
+        let before = tree(owner.path())?;
+        fs::remove_file(owner.path().join("selected"))?;
+        symlink("nested/second", owner.path().join("selected"))?;
+        assert_ne!(
+            tree(owner.path())?,
+            before,
+            "Changing a contained link is an identity change even when bytes match"
+        );
+        nix::unistd::mkfifo(&owner.path().join("special"), nix::sys::stat::Mode::S_IRWXU)?;
+        assert!(tree(owner.path()).is_err());
+        fs::remove_file(owner.path().join("special"))?;
+        let oversized = fs::File::create(owner.path().join("oversized"))?;
+        oversized.set_len(1024 * 1024 * 1024 + 1)?;
+        assert!(tree(owner.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_metadata_worker_returns_values_errors_and_panics_without_losing_ownership()
+    -> Result<()> {
+        assert_eq!(scoped_future(async { Ok(42u32) })?, 42);
+        let error =
+            scoped_future(async { Err::<(), _>(anyhow::anyhow!("controlled metadata failure")) })
+                .unwrap_err();
+        assert!(error.to_string().contains("controlled metadata failure"));
+        async fn panicking_worker() -> Result<()> {
+            panic!("controlled metadata panic")
+        }
+        let error = scoped_future(panicking_worker()).unwrap_err();
+        assert!(error.to_string().contains("metadata worker failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn reviewed_context_refuses_non_utf8_destination_without_losing_real_guards() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let (owner, _, _) = fixture("go", "go", GO)?;
+        let runtime = ManagedRuntime::open(
+            "go",
+            &owner.path().join("tools"),
+            &super::super::security::RuntimeSecurity::fixture(),
+        )
+        .expect("open the admitted runtime for the non-UTF8 destination control");
+        let destination = owner
+            .path()
+            .join(std::ffi::OsString::from_vec(b"tool-\xff".to_vec()));
+        assert!(
+            context(
+                "go",
+                "example.com/tool@v1.2.3",
+                &destination,
+                &runtime,
+                &serde_json::json!({}),
+                &[]
+            )
+            .is_err()
+        );
+        runtime.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn json_value_display_preserves_compact_and_pretty_receipt_encoding() {
+        let value = serde_json::json!({"request":"quoted\n𝜋thon", "graph":[true, null, 23, {"nested":"value"}]});
+        assert_eq!(
+            value.to_string().into_bytes(),
+            serde_json::to_vec(&value).expect("serialize the controlled JSON value")
+        );
+        assert_eq!(
+            format!("{value:#}").into_bytes(),
+            serde_json::to_vec_pretty(&value).expect("pretty-print the controlled JSON value")
+        );
+    }
+
+    #[test]
+    fn receipt_publication_errors_and_missing_payload_never_yield_install_authority() -> Result<()>
+    {
+        use crate::package_managers::types::SecurityOrigin;
+
+        for obstruction in [
+            Some(".omg-package-advisory-review.json"),
+            Some(".omg-security-receipt.json"),
+            None,
+        ] {
+            let (owner, _, stage) = fixture("go", "go", GO)?;
+            let destination = previous(owner.path(), "go")?;
+            let runtime = ManagedRuntime::open(
+                "go",
+                &owner.path().join("tools"),
+                &super::super::security::RuntimeSecurity::fixture(),
+            )
+            .expect("open the admitted runtime for receipt publication failure controls");
+            let source = Arc::new(TransitiveFinding {
+                no_findings: true,
+                ..Default::default()
+            });
+            let inventory = [SecurityPackage {
+                name: "example.com/tool".into(),
+                version: "v1.2.3".into(),
+                origin: SecurityOrigin::GoModule,
+                advisory_source: None,
+                architecture: None,
+                description: String::new(),
+                licenses: vec![],
+            }];
+            let review = crate::core::security::package_review::review(
+                &inventory,
+                "controlled receipt failure",
+                &[],
+                source.as_ref(),
+            )
+            .expect("review the controlled clean receipt-failure inventory");
+            if let Some(name) = obstruction {
+                fs::create_dir(stage.join("bin"))?;
+                fs::write(stage.join("bin/fixture-tool"), b"controlled payload")?;
+                fs::create_dir(stage.join(name))?;
+            }
+            let error = InstalledReview::finish(
+                "go",
+                "example.com/tool@v1.2.3",
+                &stage,
+                runtime,
+                review,
+                source,
+                &serde_json::json!({}),
+            )
+            .err()
+            .context("Failed receipt publication must not yield install authority")?;
+            if obstruction.is_none() {
+                assert!(error.to_string().contains("no executable directory"));
+            }
+            assert_eq!(
+                fs::read(destination.join("bin/fixture-tool"))?,
+                b"previous reviewed tool"
+            );
+        }
         Ok(())
     }
 }

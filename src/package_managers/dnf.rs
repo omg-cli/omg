@@ -537,7 +537,7 @@ impl DnfPackageManager {
             );
             let mut command =
                 tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
-            command.env("OMG_EVR_PAIRS", input).args(["--eval", r#"%{lua:local left=nil; for value in string.gmatch(os.getenv("OMG_EVR_PAIRS"), "[^\n]+") do if left then print(rpm.vercmp(left,value)); left=nil else left=value end end; if left then error("incomplete comparison") end}"#]);
+            command.env("OMG_EVR_PAIRS", input).args(["--eval", r#"%{lua:local left=nil; for value in string.gmatch(os.getenv("OMG_EVR_PAIRS"), "[^\n]+") do if left then print(string.format("%d\n",rpm.vercmp(left,value))); left=nil else left=value end end; if left then error("incomplete comparison") end}"#]);
             let output = Self::query_output(command).await?;
             let compared = std::str::from_utf8(&output)?
                 .split_whitespace()
@@ -4109,7 +4109,7 @@ mod tests {
         let task = tokio::spawn(DnfPackageManager::owned_stored_transaction(
             command,
             directory,
-            std::time::Duration::from_secs(60),
+            std::time::Duration::from_mins(1),
         ));
         let started = std::time::Instant::now();
         while !pid_file.exists() {

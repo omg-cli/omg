@@ -66,40 +66,34 @@ impl RuntimeEvidenceSource for HttpSource {
             .append_pair("vendor", &query.vendor)
             .append_pair("os", &query.os)
             .append_pair("arch", &query.arch);
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?
-                        .block_on(async {
-                            let response = crate::core::http::fetch_public_download_fresh(
-                                url.as_str(),
-                                "omg-runtime-advisories/1",
-                                Some(std::time::Duration::from_secs(20)),
-                            )
-                            .await?;
-                            ensure!(
-                                response.status().is_success(),
-                                "Runtime advisory provider returned HTTP {}",
-                                response.status()
-                            );
-                            let mut response = response;
-                            let mut bytes = Vec::new();
-                            while let Some(chunk) = response.chunk().await? {
-                                ensure!(
-                                    bytes.len().saturating_add(chunk.len()) <= MAX_REPORT,
-                                    "Runtime advisory response exceeds its bound"
-                                );
-                                bytes.extend_from_slice(&chunk);
-                            }
-                            Ok(bytes)
-                        })
-                })
-                .join()
-                .map_err(|_| anyhow::anyhow!("Runtime advisory transport worker failed"))?
+        super::tool_artifacts::scoped_future(async move {
+            let response = crate::core::http::fetch_public_download_fresh(
+                url.as_str(),
+                "omg-runtime-advisories/1",
+                Some(std::time::Duration::from_secs(20)),
+            )
+            .await?;
+            runtime_response_bytes(response).await
         })
+        .context("Runtime advisory transport failed")
     }
+}
+
+async fn runtime_response_bytes(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    ensure!(
+        response.status().is_success(),
+        "Runtime advisory provider returned HTTP {}",
+        response.status()
+    );
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= MAX_REPORT,
+            "Runtime advisory response exceeds its bound"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -484,15 +478,15 @@ fn admit_tree(
         if !reusable {
             let mut details = review.details().to_owned();
             for gap in &record.report.gaps {
-                write!(details, "\nCoverage gap: {}", serde_json::to_string(gap)?)?;
+                let _ = write!(details, "\nCoverage gap: {}", serde_json::to_string(gap)?);
             }
             for source in &record.report.sources {
-                write!(
+                let _ = write!(
                     details,
                     "\nSource: {}\n{}",
                     serde_json::to_string(&source.name)?,
                     source.url
-                )?;
+                );
             }
             ensure!(
                 details.len() <= 60 * 1024,
@@ -771,7 +765,7 @@ fn assessments(report: &Envelope) -> Result<Vec<PackageAssessment>> {
 fn fresh(checked: jiff::Timestamp, now: jiff::Timestamp) -> Result<()> {
     ensure!(
         checked <= now && now.as_second() - checked.as_second() <= MAX_AGE_SECONDS,
-        "Runtime advisory evidence is stale or future-dated"
+        "Runtime advisory evidence is stale or future-dated: checked={checked}, now={now}, maximum_age_seconds={MAX_AGE_SECONDS}"
     );
     Ok(())
 }
@@ -794,9 +788,10 @@ fn digest(value: &str) -> Result<()> {
 }
 fn source_url(value: &str) -> Result<()> {
     text(value, 1024)?;
+    let url = reqwest::Url::parse(value)?;
     ensure!(
-        reqwest::Url::parse(value)?.scheme() == "https",
-        "Runtime advisory source must use HTTPS"
+        url.scheme() == "https" && url.username().is_empty() && url.password().is_none(),
+        "Runtime advisory source must use HTTPS without credentials"
     );
     crate::core::http::validate_download_url(value)?;
     Ok(())
@@ -808,9 +803,9 @@ fn principal() -> (u32, u32) {
     )
 }
 fn policy_digest() -> Result<String> {
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
-        &SecurityPolicy::load_current()?,
-    )?)))
+    let policy = SecurityPolicy::load_current()?;
+    let bytes = serde_json::to_vec(&policy)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn vendor(runtime: &str) -> &'static str {
@@ -1418,7 +1413,8 @@ impl RuntimeEvidenceSource for FixtureSource {
 
 #[cfg(test)]
 pub(crate) fn fixture_runtime_report(query: &RuntimeQuery) -> Result<Vec<u8>> {
-    let now = jiff::Timestamp::now();
+    // Model already-fetched evidence; completion-time ordering has a dedicated regression.
+    let now = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() - 1)?;
     Ok(serde_json::to_vec(&Envelope {
         schema_version: 1,
         identity: query.clone(),
@@ -1556,7 +1552,8 @@ mod tests {
         fs::write(
             root.join("lib/node_modules/npm/lib/install.js"),
             b"controlled imported npm implementation",
-        )?;
+        )
+        .expect("controlled Node tree fixture setup failed");
         fixture_install_identity("node", &root)?;
         let root = root.canonicalize()?;
         Ok((owner, root))
@@ -1564,17 +1561,32 @@ mod tests {
 
     #[test]
     fn provider_completion_timestamp_is_validated_after_transport_returns() -> Result<()> {
-        struct DelayedSource;
+        struct DelayedSource(jiff::Timestamp);
         impl RuntimeEvidenceSource for DelayedSource {
             fn read(&self, query: &RuntimeQuery) -> Result<Vec<u8>> {
                 std::thread::sleep(std::time::Duration::from_millis(2));
-                fixture_runtime_report(query)
+                let mut report: Envelope = serde_json::from_slice(
+                    &fixture_runtime_report(query).expect("controlled delayed report"),
+                )
+                .expect("controlled delayed report schema");
+                let completed = jiff::Timestamp::now();
+                assert!(
+                    completed > self.0,
+                    "timing fixture must advance beyond request start"
+                );
+                report.checked_at = completed;
+                for source in &mut report.sources {
+                    source.checked_at = completed;
+                }
+                Ok(serde_json::to_vec(&report).expect("serialize controlled completion timestamp"))
             }
         }
         let (_owner, root) = node_fixture()?;
         let identity = read_identity(&root)?;
         let (query, _) = resolve_identity("node", "24.22.3", &root, identity.as_ref())?;
-        let report = read_report(&DelayedSource, &query, None);
+        let started = jiff::Timestamp::now();
+        let report = read_report(&DelayedSource(started), &query, None);
+        assert!(report.checked_at > started);
         assert_eq!(
             report.coverage,
             Coverage::Assessed,
@@ -1600,15 +1612,18 @@ mod tests {
                 &root,
                 &archive,
                 "https://nodejs.org/dist/v24.22.3/controlled.tar.gz",
-            )?;
+            )
+            .expect("same-version rollback fixture setup failed");
             let staging = super::super::common::begin_staged_install(
                 root.parent().context("Missing versions directory")?,
-            )?;
+            )
+            .expect("same-version rollback fixture setup failed");
             fs::create_dir(staging.path().join("bin"))?;
             fs::write(
                 staging.path().join("bin/node"),
                 b"different verified candidate",
-            )?;
+            )
+            .expect("same-version rollback fixture setup failed");
             RuntimeSecurity::fixture().prepare_staged("node", "24.22.3", staging.path(), &root)?;
             assert!(
                 super::super::common::complete_staged_install(&staging, &root, "24.22.3").is_err(),
@@ -1641,7 +1656,8 @@ mod tests {
             &root,
             &archive,
             "https://nodejs.org/dist/controlled.tar.gz",
-        )?;
+        )
+        .expect("candidate cancellation fixture setup failed");
         assert!(
             admit_installed("node", &root, ReviewMode::CachedOnly).is_err(),
             "concurrent selection must not read a provisional publisher identity"
@@ -1678,7 +1694,8 @@ mod tests {
             &root,
             &archive,
             "https://nodejs.org/dist/controlled.tar.gz",
-        )?;
+        )
+        .expect("candidate publication fixture setup failed");
         RuntimeSecurity::fixture().prepare_staged("node", "24.22.3", staging.path(), &root)?;
         super::super::common::complete_staged_install(&staging, &root, "24.22.3")?;
         publisher.commit();
@@ -1698,11 +1715,13 @@ mod tests {
                 .env(CHILD, NAME)
                 .process_group(0)
                 .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
             ensure!(
                 output.status.success(),
                 "Identity-change security regression failed: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+                stdout,
+                stderr
             );
             return Ok(());
         }
@@ -1720,13 +1739,12 @@ mod tests {
         write_state(
             &state_path(&root, "identity")?,
             &serde_json::to_vec(&identity)?,
-        )?;
-        let result = security.installed("node", &root, ReviewMode::FreshAttended);
-        let Err(error) = result else {
-            anyhow::bail!(
-                "changed publisher identity silently rebound unchanged installed bytes without Unknown acceptance"
-            );
-        };
+        )
+        .expect("publisher identity change fixture setup failed");
+        let error = security
+            .installed("node", &root, ReviewMode::FreshAttended)
+            .err()
+            .context("changed publisher identity silently rebound installed bytes without Unknown acceptance")?;
         ensure!(
             format!("{error:#}").contains("Security"),
             "Expected explicit security acceptance refusal, got {error:#}"
@@ -1757,16 +1775,19 @@ mod tests {
             &destination,
             &archive,
             "https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u452-b09/controlled.tar.gz",
-        )?;
+        ).expect("Java8 publisher fixture setup failed");
         record_exact_release(&destination, "8.0.452+9", "jdk8u452-b09", BTreeMap::new())?;
         let staging = super::super::common::begin_staged_install(&versions)?;
         fs::write(
             staging.path().join("release"),
             "JAVA_VERSION=\"1.8.0_452\"\nIMPLEMENTOR=\"Eclipse Adoptium\"\n",
-        )?;
-        validate_java_release(staging.path(), &destination).context(
-            "historical Java8 JAVA_VERSION must match its exact Adoptium semver coordinate",
-        )?;
+        )
+        .expect("Java8 publisher fixture setup failed");
+        validate_java_release(staging.path(), &destination)
+            .context(
+                "historical Java8 JAVA_VERSION must match its exact Adoptium semver coordinate",
+            )
+            .expect("Java8 publisher fixture setup failed");
         Ok(())
     }
 
@@ -1779,20 +1800,24 @@ mod tests {
         fs::write(
             node.join("lib/node_modules/npm/package.json"),
             br#"{"name":"npm","version":"11.15.0"}"#,
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         fs::write(
             node.join("lib/node_modules/npm/bin/npm-cli.js"),
             b"controlled npm entry point",
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         fs::set_permissions(node.join("bin/node"), fs::Permissions::from_mode(0o755))?;
         fs::set_permissions(
             node.join("lib/node_modules/npm/bin/npm-cli.js"),
             fs::Permissions::from_mode(0o755),
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         symlink(
             "../lib/node_modules/npm/bin/npm-cli.js",
             node.join("bin/npm"),
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         fixture_install_identity("node", &node)?;
         RuntimeSecurity::fixture().installed("node", &node, ReviewMode::FreshAttended)?;
         let original_manager = crate::core::security::npm::manager_identity(&node)?;
@@ -1805,8 +1830,8 @@ mod tests {
                 "schema_version":2,"package":"@earendil-works/pi-coding-agent@0.83.0",
                 "reviewed_at":jiff::Timestamp::now().to_string(),"node_root":&node,"node_version":"24.22.3",
                 "node_path":node.join("bin/node"),"runtime_content_sha256":hex::encode(Sha256::digest(serde_json::to_vec(&original_manager)?))
-            }))?,
-        )?;
+            })).expect("serialize exact Pi dependency receipt"),
+        ).expect("Pi dependency binding fixture setup failed");
         fixture_prepare("pi", "0.83.0", &pi, &pi)?;
         admit_installed("pi", &pi, ReviewMode::CachedOnly)?.verify(&pi)?;
         let versions = node.parent().context("Missing Node versions directory")?;
@@ -1816,44 +1841,53 @@ mod tests {
         fs::write(
             staging.path().join("lib/node_modules/npm/package.json"),
             br#"{"name":"npm","version":"11.15.0"}"#,
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         fs::create_dir_all(staging.path().join("lib/node_modules/npm/lib"))?;
         fs::write(
             staging.path().join("bin/node"),
             b"controlled node executable",
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         fs::write(
             staging.path().join("lib/node_modules/npm/bin/npm-cli.js"),
             b"controlled npm entry point",
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         fs::write(
             staging.path().join("lib/node_modules/npm/lib/install.js"),
             b"new independently reviewed npm implementation",
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         fs::set_permissions(
             staging.path().join("bin/node"),
             fs::Permissions::from_mode(0o755),
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         fs::set_permissions(
             staging.path().join("lib/node_modules/npm/bin/npm-cli.js"),
             fs::Permissions::from_mode(0o755),
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         symlink(
             "../lib/node_modules/npm/bin/npm-cli.js",
             staging.path().join("bin/npm"),
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         let archive = owner.path().join("controlled-new-node-archive");
         fs::write(
             &archive,
             b"independently authenticated replacement Node archive",
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         let publisher = record_download(
             "node",
             "24.22.3",
             &node,
             &archive,
             "https://nodejs.org/dist/controlled.tar.gz",
-        )?;
+        )
+        .expect("Pi dependency binding fixture setup failed");
         RuntimeSecurity::fixture().prepare_staged("node", "24.22.3", staging.path(), &node)?;
         super::super::common::replace_staged_install(&staging, &node, "24.22.3")?;
         publisher.commit();
@@ -1868,12 +1902,7 @@ mod tests {
     #[test]
     fn rust_foreign_host_uses_artifact_platform_and_unknown_host_requires_review() -> Result<()> {
         let owner = tempfile::tempdir()?;
-        let foreign_arch = if std::env::consts::ARCH == "x86_64" {
-            "aarch64"
-        } else {
-            "x86_64"
-        };
-        let requested = format!("1.93.1-{foreign_arch}-unknown-linux-gnu");
+        let requested = "1.93.1-aarch64-unknown-linux-gnu".to_owned();
         let mut identity = InstallIdentity {
             schema_version: 1,
             runtime: "rust".into(),
@@ -1885,16 +1914,25 @@ mod tests {
             artifact_sha256: hex::encode(Sha256::digest(b"controlled compiler manifest")),
             components: BTreeMap::new(),
         };
-        let (query, gap) = resolve_identity("rust", &requested, owner.path(), Some(&identity))?;
-        assert_eq!(
-            query.arch, foreign_arch,
-            "Rust advisory query used the current process architecture instead of the downloaded compiler host"
-        );
-        assert_eq!(query.os, "linux");
-        assert!(
-            gap.is_none(),
-            "supported foreign compiler host should have exact artifact identity: {gap:?}"
-        );
+        for (host, os, arch) in [
+            ("x86_64-unknown-linux-gnu", "linux", "x86_64"),
+            ("aarch64-unknown-linux-gnu", "linux", "aarch64"),
+            ("x86_64-apple-darwin", "macos", "x86_64"),
+            ("aarch64-apple-darwin", "macos", "aarch64"),
+        ] {
+            identity.requested = format!("1.93.1-{host}");
+            let (query, gap) =
+                resolve_identity("rust", &identity.requested, owner.path(), Some(&identity))?;
+            assert_eq!(
+                query.arch, arch,
+                "advisory architecture must follow the artifact host"
+            );
+            assert_eq!(query.os, os);
+            assert!(
+                gap.is_none(),
+                "supported compiler host must retain exact identity: {gap:?}"
+            );
+        }
         identity.requested = "1.93.1-x86_64-acme-unrecognized".into();
         let (_, gap) =
             resolve_identity("rust", &identity.requested, owner.path(), Some(&identity))?;
@@ -1917,17 +1955,17 @@ mod tests {
         fs::write(
             root.join("lib/node_modules/npm/lib/install.js"),
             b"modified local implementation",
-        )?;
+        )
+        .expect("durable integrity gap fixture setup failed");
         let mut record = load_cache(&root)?.context("Missing fixture admission")?;
         record.content_sha256 = tree_digest(&root)?;
         record.local_gaps = vec!["Installed runtime content differs from the previous verified content; its declared version no longer establishes unchanged publisher identity".to_owned()];
         record.report.coverage = Coverage::Unknown;
         record.report.gaps = record.local_gaps.clone();
-        let review = AdvisoryRiskReview::new_with_unknown(
-            &assessments(&record.report)?,
-            &context(&record)?,
-        )?
-        .context("Expected local integrity review")?;
+        let review =
+            AdvisoryRiskReview::new_with_unknown(&assessments(&record.report)?, &context(&record)?)
+                .expect("construct local integrity review fixture")
+                .context("Expected local integrity review")?;
         let accepted = review.accept(&format!("accept {}", review.id()))?;
         ensure!(
             accepted.matches(&review),
@@ -1956,7 +1994,8 @@ mod tests {
         fs::write(
             staging.path().join("lib/node_modules/npm/lib/install.js"),
             b"verified replacement implementation",
-        )?;
+        )
+        .expect("durable integrity gap fixture setup failed");
         let archive = owner.path().join("controlled-authenticated-repair-archive");
         fs::write(&archive, b"controlled authenticated repair")?;
         let publisher = record_download(
@@ -1965,7 +2004,8 @@ mod tests {
             &root,
             &archive,
             "https://nodejs.org/dist/controlled.tar.gz",
-        )?;
+        )
+        .expect("durable integrity gap fixture setup failed");
         security.prepare_staged("node", "24.22.3", staging.path(), &root)?;
         super::super::common::replace_staged_install(&staging, &root, "24.22.3")?;
         publisher.commit();
@@ -2013,7 +2053,8 @@ mod tests {
         fs::write(
             root.join("lib/node_modules/npm/lib/install.js"),
             b"changed imported npm implementation",
-        )?;
+        )
+        .expect("mutate imported npm implementation fixture");
         assert!(admission.verify(&root).is_err());
         assert!(
             security
@@ -2157,6 +2198,457 @@ mod tests {
             AdvisoryRiskReview::new_with_unknown(&assessments(&report)?, "same bound transaction")?
                 .context("Expected Unknown review")?;
         assert_ne!(first.id(), changed.id());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_vendor_metadata_recovers_exact_queries_but_never_publisher_authority() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        fs::write(
+            owner.path().join(".omg-toolchain.toml"),
+            "release = \"1.93.1 (controlled build)\"\n",
+        )
+        .expect("legacy release metadata fixture setup failed");
+        let (rust, gap) = resolve_identity("rust", "stable", owner.path(), None)?;
+        assert_eq!(rust.version, "1.93.1");
+        assert!(gap.is_some());
+        fs::write(owner.path().join("release"), "JAVA_VERSION=\"25.0.1\"\n")?;
+        let (java, gap) = resolve_identity("java", "25", owner.path(), None)?;
+        assert_eq!(java.version, "25.0.1");
+        assert_eq!(java.vendor, "temurin");
+        assert!(gap.is_some());
+        fs::create_dir_all(owner.path().join("include/php/main"))?;
+        fs::write(
+            owner.path().join("include/php/main/php.h"),
+            "#define PHP_VERSION \"8.4.4\"\n",
+        )
+        .expect("legacy release metadata fixture setup failed");
+        let (php, gap) = resolve_identity("php", "8.4", owner.path(), None)?;
+        assert_eq!(php.version, "8.4.4");
+        assert!(gap.is_some());
+        assert!(
+            RuntimeSecurity::fixture()
+                .installed("php", owner.path(), ReviewMode::CachedOnly)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_legacy_and_unmapped_products_never_gain_exact_identity() {
+        let owner = tempfile::tempdir().expect("owned unresolved runtime fixtures");
+        for (runtime, requested) in [
+            ("rust", "stable"),
+            ("java", "25"),
+            ("php", "8.4"),
+            ("unsupported", "1.2.3"),
+        ] {
+            let (query, gap) = resolve_identity(runtime, requested, owner.path(), None)
+                .expect("bounded legacy identity query");
+            assert!(
+                gap.is_some(),
+                "unverified {runtime} must retain an explicit gap"
+            );
+            if runtime == "unsupported" {
+                assert_eq!(query.vendor, "unmapped");
+            }
+        }
+        fs::write(
+            owner.path().join(".omg-toolchain.toml"),
+            "release = 'nightly'\n",
+        )
+        .expect("unresolved Rust release metadata");
+        let (_, gap) = resolve_identity("rust", "stable", owner.path(), None)
+            .expect("unresolved Rust metadata query");
+        assert!(gap.unwrap().contains("Exact runtime identity"));
+        fs::write(owner.path().join("release"), "JAVA_VERSION=\"25\n")
+            .expect("incomplete Java release metadata");
+        let (_, gap) = resolve_identity("java", "25", owner.path(), None)
+            .expect("incomplete Java metadata query");
+        assert!(gap.unwrap().contains("Exact runtime identity"));
+        fs::write(owner.path().join(".omg-toolchain.toml"), "invalid = [")
+            .expect("malformed Rust metadata fixture");
+        assert!(resolve_identity("rust", "stable", owner.path(), None).is_err());
+    }
+
+    #[test]
+    fn native_vendor_severity_levels_retain_bounded_advisory_meaning() {
+        let (_owner, root) = node_fixture().expect("controlled severity fixture");
+        let identity = read_identity(&root).expect("controlled publisher metadata");
+        let (query, _) = resolve_identity("node", "24.22.3", &root, identity.as_ref())
+            .expect("exact severity query");
+        let mut report: Envelope =
+            serde_json::from_slice(&fixture_runtime_report(&query).expect("controlled report"))
+                .expect("valid report fixture");
+        for (severity, expected) in [
+            (Some("critical"), Some(AdvisorySeverity::Critical)),
+            (Some("important"), Some(AdvisorySeverity::Important)),
+            (Some("moderate"), Some(AdvisorySeverity::Moderate)),
+            (Some("low"), Some(AdvisorySeverity::Low)),
+            (None, None),
+        ] {
+            report.findings = vec![Finding {
+                id: "CVE-2026-7001".into(),
+                summary: "Controlled vendor disclosure".into(),
+                applicability: FindingApplicability::Applicable,
+                severity: severity.map(str::to_owned),
+                urls: vec!["https://example.org/disclosure".into()],
+            }];
+            let assessed = assessments(&report).expect("evaluate controlled severity");
+            assert_eq!(assessed[0].findings[0].advisory_severity, expected);
+            assert_eq!(
+                assessed[0].findings[0]
+                    .native_advisory
+                    .as_ref()
+                    .unwrap()
+                    .published_severity,
+                severity.unwrap_or("unspecified")
+            );
+        }
+        let mut second = report.findings[0].clone();
+        second.id = "CVE-2026-6000".into();
+        report.findings.push(second);
+        let ordered = assessments(&report).expect("ordered native vendor findings");
+        assert_eq!(ordered[0].findings.len(), 2);
+        report.findings.reverse();
+        let reordered = assessments(&report).expect("equivalent reordered vendor findings");
+        assert_eq!(ordered[0].coverage, reordered[0].coverage);
+    }
+
+    #[test]
+    fn advisory_text_and_reference_boundaries_reject_unsafe_provider_values() {
+        for value in ["", "too-long", "\n", "\u{1b}"] {
+            assert!(text(value, 3).is_err());
+        }
+        assert!(text("safe", 4).is_ok());
+        assert!(source_url("https://example.org/advisory").is_ok());
+        for url in [
+            "not a URL",
+            "http://example.org/advisory",
+            "https://127.0.0.1/private",
+            "https://user:secret@example.org/advisory",
+        ] {
+            assert!(source_url(url).is_err(), "{url}");
+        }
+    }
+
+    #[test]
+    fn malformed_current_policy_refuses_runtime_authority_digest() {
+        const NAME: &str =
+            "runtimes::security::tests::malformed_current_policy_refuses_runtime_authority_digest";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        let owner = tempfile::tempdir().expect("owned runtime policy fixture");
+        let config = owner.path().join("config");
+        let policy_dir = config.join("omg");
+        fs::create_dir_all(&policy_dir).expect("owned runtime policy directory");
+        temp_env::with_vars(
+            [
+                (
+                    "XDG_CONFIG_HOME",
+                    Some(config.to_str().expect("fixture config path")),
+                ),
+                ("SUDO_USER", None),
+                ("DOAS_USER", None),
+            ],
+            || {
+                assert_eq!(crate::core::paths::config_dir(), policy_dir);
+                fs::write(policy_dir.join("policy.toml"), b"invalid = [")
+                    .expect("write malformed runtime policy fixture");
+                assert!(policy_digest().is_err());
+            },
+        );
+    }
+
+    #[test]
+    fn swift_automatic_selection_binds_usr_bin_to_its_reviewed_root() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let root = owner.path().join("versions/swift/6.2.0");
+        fs::create_dir_all(root.join("usr/bin"))?;
+        fs::write(root.join("usr/bin/swift"), b"controlled compiler")?;
+        fixture_prepare("swift", "6.2.0", &root, &root)?;
+        let admission = require_selected_path("swift", &root.join("usr/bin"))?;
+        admission.verify(&root)?;
+        fs::write(root.join("usr/bin/swift"), b"unreviewed compiler")?;
+        assert!(admission.verify_before_execution().is_err());
+        assert!(admit_selected_path("swift", Path::new("bin"), ReviewMode::CachedOnly).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_vendor_reports_preserve_unknown_severity_and_reject_invalid_receipts() -> Result<()>
+    {
+        struct Report(Vec<u8>);
+        impl RuntimeEvidenceSource for Report {
+            fn read(&self, _: &RuntimeQuery) -> Result<Vec<u8>> {
+                Ok(self.0.clone())
+            }
+        }
+        let (_owner, root) = node_fixture()?;
+        let identity = read_identity(&root)?;
+        let (query, _) = resolve_identity("node", "24.22.3", &root, identity.as_ref())?;
+        let mut report: Envelope = serde_json::from_slice(&fixture_runtime_report(&query)?)?;
+        report.coverage = Coverage::Partial;
+        report.gaps = vec!["Component applicability is incomplete".into()];
+        report.findings.push(Finding {
+            id: "CVE-2026-7000".into(),
+            summary: "Vendor disclosure".into(),
+            applicability: FindingApplicability::Possible,
+            severity: Some("vendor-specific".into()),
+            urls: vec!["https://example.org/advisory".into()],
+        });
+        validate_envelope(&report, &query, jiff::Timestamp::now())?;
+        let evaluated = assessments(&report)?;
+        assert!(!evaluated[0].coverage.is_assessed());
+        assert_eq!(evaluated[0].findings[0].advisory_severity, None);
+        assert_eq!(
+            evaluated[0].findings[0]
+                .native_advisory
+                .as_ref()
+                .unwrap()
+                .published_severity,
+            "vendor-specific"
+        );
+        assert!(
+            AdvisoryRiskReview::new_with_unknown(&evaluated, "controlled partial transaction")?
+                .is_some()
+        );
+        let mut optional = report.clone();
+        optional.findings[0].severity = None;
+        optional.sources[0].revision = None;
+        validate_envelope(&optional, &query, jiff::Timestamp::now())
+            .expect("optional provider severity and revision do not invent coverage");
+        assert!(
+            !assessments(&optional).expect("partial optional provider evidence")[0]
+                .coverage
+                .is_assessed()
+        );
+        for invalid_revision in ["", "bad\nrevision"] {
+            let mut invalid = report.clone();
+            invalid.sources[0].revision = Some(invalid_revision.into());
+            let failed = read_report(
+                &Report(serde_json::to_vec(&invalid)?),
+                &query,
+                Some(&report),
+            );
+            assert_eq!(failed.coverage, Coverage::Unknown);
+            assert_eq!(failed.findings[0].id, "CVE-2026-7000");
+            assert!(!failed.gaps.is_empty());
+        }
+        let mut invalid = report.clone();
+        invalid.findings[0].severity = Some("bad\nseverity".into());
+        assert_eq!(
+            read_report(
+                &Report(serde_json::to_vec(&invalid)?),
+                &query,
+                Some(&report)
+            )
+            .coverage,
+            Coverage::Unknown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_authority_types_and_special_runtime_files_fail_closed() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let (_owner, root) = node_fixture()?;
+        let security = RuntimeSecurity::fixture();
+        security.installed("node", &root, ReviewMode::FreshAttended)?;
+        let identity = state_path(&root, "identity")?;
+        fs::remove_file(&identity)?;
+        symlink(root.join("bin/node"), &identity)?;
+        assert!(
+            format!(
+                "{:#}",
+                security
+                    .installed("node", &root, ReviewMode::CachedOnly)
+                    .unwrap_err()
+            )
+            .contains("Read runtime advisory metadata")
+        );
+        fs::remove_file(identity)?;
+        fixture_install_identity("node", &root)?;
+        let socket = std::os::unix::net::UnixListener::bind(root.join("unreviewed.sock"))?;
+        assert!(
+            format!(
+                "{:#}",
+                security
+                    .installed("node", &root, ReviewMode::CachedOnly)
+                    .unwrap_err()
+            )
+            .contains("special file")
+        );
+        drop(socket);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_rollback_cannot_publish_a_clean_authority() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let root = owner.path().join("24.22.3");
+        fs::create_dir(&root)?;
+        let transaction = PublisherTransaction::begin(&root)?;
+        let identity = state_path(&root, "identity")?;
+        fs::create_dir_all(&identity)?;
+        drop(transaction);
+        assert!(identity.is_dir());
+        assert!(
+            RuntimeSecurity::fixture()
+                .installed("node", &root, ReviewMode::CachedOnly)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn modern_java_release_build_metadata_is_checked_against_publisher_identity() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let root = owner.path().join("25.0.1+7");
+        fs::create_dir(&root)?;
+        fs::write(root.join("release"), "JAVA_VERSION=\"25.0.1+7\"\n")?;
+        fixture_install_identity("java", &root)?;
+        validate_java_release(&root, &root)?;
+        assert_eq!(read_identity(&root)?.unwrap().version, "25.0.1+7");
+        fs::write(root.join("release"), "JAVA_VERSION=\"25.0.2+7\"\n")?;
+        assert!(validate_java_release(&root, &root).is_err());
+        fs::write(root.join("release"), "IMPLEMENTOR=\"Eclipse Adoptium\"\n")
+            .expect("Java optional release metadata fixture");
+        validate_java_release(&root, &root)
+            .expect("optional release field does not replace publisher identity");
+        assert_eq!(read_identity(&root)?.unwrap().version, "25.0.1+7");
+        let invalid = owner.path().join("unresolved");
+        fs::create_dir(&invalid)?;
+        assert!(fixture_install_identity("node", &invalid).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_http_status_truncation_and_size_errors_do_not_return_evidence() -> Result<()> {
+        use std::io::{Read, Write};
+        for (status, declared, body, accepted) in [
+            (200, 2, vec![b'[', b']'], true),
+            (503, 2, vec![b'[', b']'], false),
+            (200, 10, b"short".to_vec(), false),
+            (200, MAX_REPORT + 1, vec![b'x'; MAX_REPORT + 1], false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let server = std::thread::spawn(move || -> Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request)?;
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Controlled\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                )?;
+                if let Err(error) = stream.write_all(&body) {
+                    ensure!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        ),
+                        "unexpected fixture write: {error}"
+                    );
+                }
+                Ok(())
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()?
+                .get(format!("http://{address}"))
+                .send()
+                .await?;
+            let result = runtime_response_bytes(response).await;
+            assert_eq!(result.is_ok(), accepted);
+            if accepted {
+                assert_eq!(result?, b"[]");
+            }
+            server.join().expect("owned HTTP fixture thread")?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_publisher_state_writes_preserve_previous_runtime_authority() -> Result<()> {
+        const NAME: &str = "runtimes::security::tests::failed_publisher_state_writes_preserve_previous_runtime_authority";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+        struct Restore {
+            limit: nix::libc::rlimit,
+            signal: SigAction,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: this isolated process restores its own saved resource and signal state.
+                assert_eq!(
+                    unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_FSIZE, &self.limit) },
+                    0,
+                    "restore fixture file limit failed"
+                );
+                // SAFETY: the saved handler belongs only to this isolated fixture process.
+                unsafe { sigaction(Signal::SIGXFSZ, &self.signal) }
+                    .expect("restore fixture signal failed");
+            }
+        }
+        let (owner, root) = node_fixture()?;
+        let security = RuntimeSecurity::fixture();
+        security.installed("node", &root, ReviewMode::FreshAttended)?;
+        let identity = state_path(&root, "identity")?;
+        let previous = fs::read(&identity)?;
+        let archive = owner.path().join("controlled-archive");
+        fs::write(&archive, b"authenticated fixture archive")?;
+        let mut limit = nix::libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: the kernel writes a valid rlimit into this process-local object.
+        ensure!(
+            unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_FSIZE, &mut limit) } == 0,
+            "read fixture resource limit"
+        );
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        // SAFETY: only this disposable child changes SIGXFSZ; Restore reinstates it before profile flush.
+        let signal = unsafe { sigaction(Signal::SIGXFSZ, &ignore) }?;
+        let restore = Restore { limit, signal };
+        let restricted = nix::libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: restore.limit.rlim_max,
+        };
+        // SAFETY: lowering this child's soft file-size limit does not affect any other process.
+        ensure!(
+            unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_FSIZE, &restricted) } == 0,
+            "set fixture resource limit"
+        );
+        let download = record_download(
+            "node",
+            "24.22.3",
+            &root,
+            &archive,
+            "https://nodejs.org/dist/controlled.tar.gz",
+        );
+        let manifest = record_manifest(
+            "node",
+            "24.22.3",
+            &root,
+            "https://nodejs.org/dist/manifest",
+            b"controlled authenticated manifest",
+        );
+        // Restore both states before assertions, error reporting, or LLVM profile persistence.
+        drop(restore);
+        assert!(download.is_err());
+        assert!(manifest.is_err());
+        assert_eq!(
+            fs::read(identity)?,
+            previous,
+            "failed atomic recording must not replace prior publisher bytes"
+        );
+        security
+            .installed("node", &root, ReviewMode::CachedOnly)?
+            .verify(&root)?;
         Ok(())
     }
 }

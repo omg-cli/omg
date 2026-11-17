@@ -550,11 +550,11 @@ pub(super) fn install_reviewed_with_downloader(
             "Frozen Python wheel inventory exceeds its byte allowance"
         );
         inspect_wheel(&path, wheel)?;
-        writeln!(
+        let _ = writeln!(
             requirements,
             "{}=={} --hash=sha256:{}",
             wheel.name, wheel.version, wheel.sha256
-        )?;
+        );
     }
     let requirements_path = work.join("requirements.txt");
     fs::write(&requirements_path, &requirements)?;
@@ -659,6 +659,36 @@ pub(super) fn install_reviewed_with_downloader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wheel_fixture(path: &Path, metadata: &str) -> Result<Wheel> {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "fixture/__init__.py",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("create controlled wheel payload entry");
+        writer.write_all(b"# controlled wheel payload\n")?;
+        writer
+            .start_file(
+                "fixture-1.2.3.dist-info/METADATA",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .expect("create controlled wheel metadata entry");
+        writer.write_all(metadata.as_bytes())?;
+        let bytes = writer.finish()?.into_inner();
+        fs::write(path, &bytes)?;
+        Ok(Wheel {
+            name: "fixture".into(),
+            version: "1.2.3".into(),
+            url: "https://files.pythonhosted.org/packages/fixture-1.2.3-py3-none-any.whl".into(),
+            filename: "fixture-1.2.3-py3-none-any.whl".into(),
+            sha256: artifacts::hash(&bytes),
+            public: true,
+        })
+    }
+
     #[test]
     fn pip_report_preserves_complete_exact_wheel_versions_and_hashes() -> Result<()> {
         let item = |name: &str, url: &str, requested: bool| serde_json::json!({"metadata":{"name":name,"version":"1.2.3"},"requested":requested,"is_direct":false,"download_info":{"url":url,"archive_info":{"hashes":{"sha256":"a".repeat(64)}}}});
@@ -669,6 +699,223 @@ mod tests {
         assert_eq!(inventory(&wheels)[0].origin, SecurityOrigin::Unknown);
         assert!(report(&serde_json::to_vec(&data)?, Some("other-tool")).is_err());
         assert_eq!(normalized("Foo...BAR___baz")?, "foo-bar-baz");
+        Ok(())
+    }
+
+    #[test]
+    fn pip_wheel_metadata_requires_exact_identity_and_refuses_direct_dependency_sources()
+    -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let archive = owner.path().join("fixture.whl");
+        let valid = "Metadata-Version: 2.3\nName: fixture\nVersion: 1.2.3\nRequires-Dist: dependency (>=1)\n\ncontrolled description\n";
+        let wheel = wheel_fixture(&archive, valid)?;
+        inspect_wheel(&archive, &wheel)?;
+        for metadata in [
+            valid.replace("Name: fixture", "Name: different"),
+            valid.replace("Version: 1.2.3", "Version: 9.9.9"),
+            valid.replace("Name: fixture", "Name: fixture\nName: fixture"),
+            valid.replace(
+                "Requires-Dist: dependency (>=1)",
+                "Requires-Dist: dependency @ https://private.example/dependency.whl",
+            ),
+            valid.replace(
+                "Requires-Dist: dependency (>=1)",
+                "Requires-Dist: dependency\n @ https://private.example/dependency.whl",
+            ),
+        ] {
+            wheel_fixture(&archive, &metadata)?;
+            assert!(inspect_wheel(&archive, &wheel).is_err(), "{metadata}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pip_inventory_ignores_ordinary_modules_but_rejects_ambiguous_distribution_identity()
+    -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let library = owner.path().join("lib");
+        fs::create_dir_all(library.join("python-without-site-packages"))?;
+        let packages = library.join("python3.14/site-packages");
+        fs::create_dir_all(packages.join("fixture-1.2.3.dist-info"))?;
+        fs::write(
+            packages.join("ordinary.py"),
+            b"# ordinary imported module\n",
+        )
+        .expect("write ordinary Python module fixture");
+        let metadata = packages.join("fixture-1.2.3.dist-info/METADATA");
+        fs::write(&metadata, b"Name: fixture\nVersion: 1.2.3\n\n")?;
+        assert_eq!(
+            installed_distributions(owner.path())?,
+            BTreeMap::from([("fixture".into(), "1.2.3".into())])
+        );
+        fs::write(&metadata, b"Name: fixture\nName: other\nVersion: 1.2.3\n\n")?;
+        assert!(installed_distributions(owner.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pip_private_wheel_refusal_precedes_any_transport_request() -> Result<()> {
+        struct RecordingTransport {
+            source: std::path::PathBuf,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl WheelDownloader for RecordingTransport {
+            fn download(&self, _: &str, path: &Path) -> Result<()> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                fs::copy(&self.source, path)?;
+                Ok(())
+            }
+        }
+        let owner = tempfile::tempdir()?;
+        let archive = owner.path().join("fixture.whl");
+        let mut wheel = wheel_fixture(&archive, "Name: fixture\nVersion: 1.2.3\n\n")?;
+        let transport = RecordingTransport {
+            source: archive.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        wheel.public = false;
+        let destination = owner.path().join("download.whl");
+        assert!(fetch_wheel(&wheel, &destination, &transport).is_err());
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!destination.exists());
+        wheel.public = true;
+        fetch_wheel(&wheel, &destination, &transport)?;
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&archive)?, fs::read(&destination)?);
+        Ok(())
+    }
+
+    #[test]
+    fn pip_public_downloader_streams_real_http_and_preserves_existing_files() -> Result<()> {
+        const NAME: &str = "runtimes::pip_tool::tests::pip_public_downloader_streams_real_http_and_preserves_existing_files";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+            artifacts::scoped_future(async {
+                let body = b"controlled bounded wheel bytes".to_vec();
+                let fixture = crate::runtimes::test_https::HttpFixture::new(vec![
+                    ("/fixture.whl".into(), body.clone()),
+                    (
+                        "/fixture.whl".into(),
+                        b"must not replace existing bytes".to_vec(),
+                    ),
+                ])
+                .await?;
+                let url = format!("http://{}/fixture.whl", fixture.address);
+                let owner = tempfile::tempdir()?;
+                let path = owner.path().join("fixture.whl");
+                let requested_path = path.clone();
+                let requested_url = url.clone();
+                tokio::task::spawn_blocking(move || {
+                    PublicWheelDownloader.download(&requested_url, &requested_path)
+                })
+                .await??;
+                assert_eq!(fs::read(&path)?, body);
+                let requested_path = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    PublicWheelDownloader.download(&url, &requested_path)
+                })
+                .await?;
+                assert!(
+                    result.is_err(),
+                    "Downloader must create a fresh owned artifact"
+                );
+                assert_eq!(fs::read(&path)?, body);
+                assert_eq!(fixture.finish().await?.len(), 2);
+                Ok(())
+            })
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pip_owner_retains_reviewed_bootstrap_through_frozen_install() -> Result<()> {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        let (owner, data, stage) = fixtures::fixture("python", "python3", fixtures::PYTHON)?;
+        fs::write(
+            data.join("bootstrap-metadata"),
+            b"Name: pip\nVersion: 24.0\n\n",
+        )
+        .expect("write controlled trusted pip bootstrap metadata");
+        let wheels = fixtures::pip_wheels(&data, false)?;
+        let destination = fixtures::previous(owner.path(), "pip")?;
+        let source = Arc::new(fixtures::TransitiveFinding {
+            no_findings: true,
+            ..Default::default()
+        });
+        let capability = install_reviewed_with_downloader(
+            "fixture-tool@1.2.3",
+            &stage,
+            &destination,
+            &owner.path().join("tools"),
+            source.clone(),
+            &crate::runtimes::security::RuntimeSecurity::fixture(),
+            &wheels,
+        )
+        .expect("install controlled complete bootstrap and wheel graph");
+        capability.verify(&stage)?;
+        let distributions = installed_distributions(&stage)?;
+        assert_eq!(distributions.len(), 3);
+        assert_eq!(distributions.get("pip").map(String::as_str), Some("24.0"));
+        let seen = source.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter()
+                .any(|row| row.name == "pip" && row.version == "24.0")
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("phases"))?,
+            "venv\nresolve\noffline-resolve\ninstall\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pip_owner_accepts_an_admitted_python_only_runtime_through_publication() -> Result<()> {
+        use crate::runtimes::tool_artifacts::tests as fixtures;
+        use std::process::Command;
+
+        let (owner, data, stage) = fixtures::fixture("python", "python3", fixtures::PYTHON)?;
+        let runtime = owner.path().join("versions/python/1.78.0");
+        fs::rename(runtime.join("bin/python3"), runtime.join("bin/python"))
+            .expect("create the controlled python-only managed layout");
+        crate::runtimes::security::fixture_prepare("python", "1.78.0", &runtime, &runtime)
+            .expect("admit the complete python-only managed fixture");
+        assert!(!runtime.join("bin/python3").exists());
+        let wheels = fixtures::pip_wheels(&data, false)?;
+        let destination = fixtures::previous(owner.path(), "pip")?;
+        let source = Arc::new(fixtures::TransitiveFinding {
+            no_findings: true,
+            ..Default::default()
+        });
+        let capability = install_reviewed_with_downloader(
+            "fixture-tool@1.2.3",
+            &stage,
+            &destination,
+            &owner.path().join("tools"),
+            source,
+            &crate::runtimes::security::RuntimeSecurity::fixture(),
+            &wheels,
+        )
+        .expect("install the fully reviewed wheel graph with managed bin/python");
+        capability.verify(&stage)?;
+        let backup = destination.with_extension("previous");
+        fs::rename(&destination, &backup)?;
+        fs::rename(&stage, &destination)?;
+        capability.verify(&destination)?;
+        let output = Command::new(destination.join("bin/fixture-tool")).output()?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"reviewed-tool-success\n");
+        assert_eq!(
+            fs::read(backup.join("bin/fixture-tool"))?,
+            b"previous reviewed tool"
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("phases"))?,
+            "venv\nresolve\noffline-resolve\ninstall\n"
+        );
         Ok(())
     }
 }

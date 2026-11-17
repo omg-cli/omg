@@ -156,7 +156,7 @@ async function route(
                 });
                 if (baseline && new Set(parsed.map((record) => record.id)).size === parsed.length && parsed.every((record) => record.supported)) {
                     const after = await baselineImportCommands(writer, baseline.session_id, parsed);
-                    await writer.cveBatch(parsed, now, after);
+                    await writer.cveBatch(parsed, now, after, "packed");
                 } else {
                     if (records.length > LIMITS.records) throw new Error("invalid duplicate or unsupported large ingest batch");
                     await ingestCveGroups(

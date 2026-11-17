@@ -8,6 +8,7 @@ import shlex
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -21,7 +22,7 @@ class NativeRemovalContracts(unittest.TestCase):
     def test_benchmark_search_smoke_accepts_only_exact_guest_package_identity(self):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text(encoding='utf-8')
         begin = source.index('"$bin" search tree > evidence/search.txt\n')
-        end = source.index('sudo -n "$bin" install --yes tree\n', begin)
+        end = source.index('\nfi\n',begin) + len('\nfi\n')
         assertion = source[begin:end].split('\n', 1)[1]
         cases = (
             ('fedora', 'x86_64', '  tree.x86_64 2.2.1-4.fc44  Official\n', True),
@@ -3874,6 +3875,10 @@ printf 'Usage: fixture\\n'
                     (ROOT / 'scripts/qemu-audit-log-oracle.py').read_bytes(),
                 'qemu-doctor-index-oracle.py':
                     (ROOT / 'scripts/qemu-doctor-index-oracle.py').read_bytes(),
+                'qemu-runtime-advisory-oracle.py':
+                    (ROOT / 'scripts/qemu-runtime-advisory-oracle.py').read_bytes(),
+                'runtime_advisory_fixture.py':
+                    (ROOT / 'tests/runtime_advisory_fixture.py').read_bytes(),
             }
             guest_files.update(home_files or {})
             for name, content in guest_files.items():
@@ -3886,7 +3891,36 @@ printf 'Usage: fixture\\n'
             # The real submitted product is an ELF executable and remains
             # launchable when its PATH is restricted. Use an absolute shell
             # interpreter for the fixture so it has that same property.
-            binary.write_text('#!/bin/bash\n' + product, encoding='utf-8', newline='\n')
+            review = ''
+            if any(re.match(r'^runtime-(?:node|python|go|rust)-install\t',row) for row in rows):
+                # The product below is a deliberate runtime fault fixture.
+                # Model its actual risk decision first so downstream compiler,
+                # usage and publication assertions remain independently reached.
+                review = 'case "${1-}:${2-}" in use:node|use:python|use:go|use:rust)\n' + shlex.quote(sys.executable) + ''' - "$2" "$3" <<'RUNTIME_FIXTURE_REVIEW' || exit "$?"
+import hashlib, json, os, select, sys
+runtime, version = sys.argv[1:]
+details = ('SECURITY WARNING: advisory coverage for the selected transaction is unknown.\\n'
+           + 'Package: ' + json.dumps([runtime, version, None], separators=(',', ':')) + '\\n'
+           + 'Coverage gap: controlled runtime product fixture; no clean security result was established.\\n'
+           + 'https://www.cve.org/About/Overview\\n')
+digest = hashlib.sha256(details.encode()).hexdigest()
+try:
+    tty = os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY)
+except OSError:
+    print(details + 'Security review requires an attended controlling terminal', file=sys.stderr)
+    raise SystemExit(7)
+try:
+    assert os.tcgetpgrp(tty) == os.getpgrp(), 'fixture review must own its terminal foreground'
+    os.write(tty, (details + '\\nType accept ' + digest + ' within 60 seconds to continue (default: cancel): ').encode())
+    assert select.select([tty], [], [], 5)[0], 'fixture security acknowledgement timed out'
+    answer = os.read(tty, 192)
+    assert answer == ('accept ' + digest + '\\n').encode(), 'fixture risk was not explicitly accepted'
+finally:
+    os.close(tty)
+RUNTIME_FIXTURE_REVIEW
+;; esac
+'''
+            binary.write_text('#!/bin/bash\n' + review + product, encoding='utf-8', newline='\n')
             binary.chmod(0o755)
             ssh = root / 'bin/ssh'
             ssh.write_text('#!/usr/bin/env bash\n' +
@@ -3911,6 +3945,7 @@ printf 'Usage: fixture\\n'
                 for helper in (ROOT / 'scripts').iterdir():
                     if helper.is_file() and helper.name != driver.name:
                         (fixture_scripts / helper.name).symlink_to(helper)
+                shutil.copyfile(ROOT / 'tests/runtime_advisory_fixture.py',fixture_scripts / 'runtime_advisory_fixture.py')
                 fixture_driver = fixture_scripts / driver.name
                 fixture_driver.write_text(driver.read_text(encoding='utf-8').replace(
                     '/usr/bin/tree', shell_path(root / 'home/tree-binary')),

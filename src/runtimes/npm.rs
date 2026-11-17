@@ -354,21 +354,24 @@ fn assess(
     source: &dyn crate::core::security::vulnerability::VulnerabilitySource,
     inventory: &[crate::package_managers::types::SecurityPackage],
 ) -> Result<Vec<crate::core::security::vulnerability::PackageAssessment>> {
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(source.assess_packages(
-                        inventory,
-                        crate::core::security::vulnerability::AssessmentUse::Admission,
-                    ))
-                    .map_err(anyhow::Error::from)
-            })
-            .join()
-            .map_err(|_| anyhow::anyhow!("NPM advisory worker failed"))?
+    super::tool_artifacts::scoped_future(async {
+        source
+            .assess_packages(
+                inventory,
+                crate::core::security::vulnerability::AssessmentUse::Admission,
+            )
+            .await
+            .map_err(anyhow::Error::from)
     })
+    .context("NPM advisory worker failed")
+}
+
+fn read_advisory_receipt(prefix: &Path) -> Result<serde_json::Value> {
+    let bytes = read_npm_metadata(
+        &prefix.join(".omg-npm-advisory-review.json"),
+        16 * 1024 * 1024,
+    )?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn write_receipt(
@@ -415,10 +418,7 @@ pub(crate) fn review_installed_npm(
     let spec = NpmSpec::parse(package)?;
     let lock = NpmLock::parse(&read_npm_metadata(&prefix.join("package-lock.json"), 16 * 1024 * 1024)
         .context("This Pi installation has no reviewed dependency lock; install a current Pi release before selecting it")?, &spec)?;
-    let previous: serde_json::Value = serde_json::from_slice(&read_npm_metadata(
-        &prefix.join(".omg-npm-advisory-review.json"),
-        16 * 1024 * 1024,
-    )?)?;
+    let previous = read_advisory_receipt(prefix)?;
     anyhow::ensure!(
         previous["schema_version"] == 2
             && previous["package"].as_str() == Some(package)
@@ -495,10 +495,7 @@ pub(crate) fn cached_installed_npm(
         &read_npm_metadata(&prefix.join("package-lock.json"), 16 * 1024 * 1024)?,
         &spec,
     )?;
-    let receipt: serde_json::Value = serde_json::from_slice(&read_npm_metadata(
-        &prefix.join(".omg-npm-advisory-review.json"),
-        16 * 1024 * 1024,
-    )?)?;
+    let receipt = read_advisory_receipt(prefix)?;
     let runtime = ManagedNpm::open(tools_dir)?;
     let node_admission = security.installed(
         "node",
@@ -603,4 +600,467 @@ pub(crate) fn cached_installed_npm(
     binding.verify(prefix)?;
     pi_admission.verify(prefix)?;
     Ok(binding)
+}
+
+#[cfg(all(test, unix))]
+mod admission_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    const PACKAGE: &str = "@earendil-works/pi-coding-agent@0.83.0";
+    struct CleanSource;
+    impl crate::core::security::vulnerability::VulnerabilitySource for CleanSource {
+        fn assess_packages<'a>(
+            &'a self,
+            packages: &'a [crate::package_managers::types::SecurityPackage],
+            _: crate::core::security::vulnerability::AssessmentUse,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<
+                            Vec<crate::core::security::vulnerability::PackageAssessment>,
+                            crate::core::security::vulnerability::VulnerabilityError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(packages
+                    .iter()
+                    .map(
+                        |package| crate::core::security::vulnerability::PackageAssessment {
+                            package: package.clone(),
+                            coverage:
+                                crate::core::security::vulnerability::PackageCoverage::Assessed {
+                                    provenance:
+                                        crate::core::security::scan::AdvisoryProvenance::Osv {
+                                            ecosystem: "npm".into(),
+                                        },
+                                },
+                            findings: vec![],
+                        },
+                    )
+                    .collect())
+            })
+        }
+    }
+    struct Fixture {
+        owner: tempfile::TempDir,
+        tools: PathBuf,
+        prefix: PathBuf,
+        node: PathBuf,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let owner = tempfile::tempdir().expect("owned npm fixture root");
+            let tools = owner.path().join("tools");
+            let node = owner.path().join("versions/node/24.22.3");
+            let prefix = owner.path().join("versions/pi/0.83.0");
+            fs::create_dir_all(node.join("bin")).expect("managed Node bin");
+            fs::create_dir_all(node.join("lib/node_modules/npm/bin"))
+                .expect("managed npm implementation");
+            fs::create_dir_all(&prefix).expect("owned Pi prefix");
+            fs::write(node.join("bin/node"), b"#!/bin/sh\nexec /bin/sh \"$@\"\n")
+                .expect("fixture Node dispatcher");
+            fs::set_permissions(node.join("bin/node"), fs::Permissions::from_mode(0o755))
+                .expect("fixture Node executable");
+            fs::write(
+                node.join("lib/node_modules/npm/package.json"),
+                br#"{"name":"npm","version":"11.15.0"}"#,
+            )
+            .expect("bundled npm metadata");
+            fs::write(node.join("lib/node_modules/npm/bin/npm-cli.js"),br#"#!/bin/sh
+set -eu
+fixture=$(cd "$(dirname "$0")/../../../../../../.." && pwd)
+while [ "${1#--}" != "$1" ]; do shift; done
+phase=$1
+shift
+printf '%s\n' "$phase" >> "$fixture/phases"
+prefix=''
+previous=''
+for arg in "$@"; do
+ if [ "$previous" = '--prefix' ]; then prefix=$arg; fi
+ previous=$arg
+done
+[ -n "$prefix" ]
+case "$phase" in
+ install) cp "$fixture/lock.fixture.json" "$prefix/package-lock.json" ;;
+ ci)
+  mkdir -p "$prefix/node_modules/@earendil-works/pi-coding-agent/bin" "$prefix/node_modules/.bin"
+  cp "$fixture/package.fixture.json" "$prefix/node_modules/@earendil-works/pi-coding-agent/package.json"
+  printf 'controlled executable\n' > "$prefix/node_modules/@earendil-works/pi-coding-agent/bin/run"
+  chmod 755 "$prefix/node_modules/@earendil-works/pi-coding-agent/bin/run"
+  ln -s ../@earendil-works/pi-coding-agent/bin/run "$prefix/node_modules/.bin/pi"
+  ;;
+ audit)
+  [ ! -f "$fixture/signature-reject" ] || exit 17
+  if [ -f "$fixture/receipt-directory" ]; then
+   rm -f "$prefix/.omg-npm-advisory-review.json"
+   mkdir "$prefix/.omg-npm-advisory-review.json"
+  fi
+  ;;
+ rebuild) ;;
+ *) exit 19 ;;
+esac
+"#).expect("owned npm phase fixture");
+            fs::set_permissions(
+                node.join("lib/node_modules/npm/bin/npm-cli.js"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("bundled npm entrypoint executable");
+            symlink(
+                "../lib/node_modules/npm/bin/npm-cli.js",
+                node.join("bin/npm"),
+            )
+            .expect("contained npm entrypoint");
+            symlink("24.22.3", node.parent().unwrap().join("current"))
+                .expect("selected managed Node");
+            let integrity = "sha512-AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+Pw==";
+            fs::write(owner.path().join("lock.fixture.json"),serde_json::to_vec(&serde_json::json!({"lockfileVersion":3,"packages":{"":{"dependencies":{"@earendil-works/pi-coding-agent":"0.83.0"}},"node_modules/@earendil-works/pi-coding-agent":{"version":"0.83.0","resolved":"https://registry.npmjs.org/@earendil-works/pi-coding-agent/-/pi-coding-agent-0.83.0.tgz","integrity":integrity}}})).unwrap()).expect("exact registry lock fixture");
+            fs::write(owner.path().join("package.fixture.json"),br#"{"name":"@earendil-works/pi-coding-agent","version":"0.83.0","bin":{"pi":"bin/run"}}"#).expect("package manifest fixture");
+            super::super::security::fixture_install_identity("node", &node)
+                .expect("explicit controlled runtime identity");
+            Self {
+                owner,
+                tools,
+                prefix,
+                node,
+            }
+        }
+        fn install(&self) -> Result<ReviewedNpm> {
+            install_reviewed_npm(
+                PACKAGE,
+                &self.prefix,
+                &self.prefix,
+                &self.tools,
+                &CleanSource,
+                &super::super::security::RuntimeSecurity::fixture(),
+            )
+        }
+        fn identity_file(&self) -> PathBuf {
+            fs::read_dir(self.node.parent().unwrap().join(".security"))
+                .expect("runtime state directory")
+                .map(|entry| entry.expect("owned runtime state entry").path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .ends_with(".identity.json")
+                })
+                .expect("controlled publisher identity")
+        }
+    }
+
+    #[test]
+    fn unsupported_or_unreadable_bundled_npm_metadata_never_runs_a_manager() {
+        let fixture = Fixture::new();
+        let metadata = fixture.node.join("lib/node_modules/npm/package.json");
+        fs::remove_file(&metadata).expect("remove fixture metadata");
+        assert!(ManagedNpm::open(&fixture.tools).is_err());
+        fs::write(&metadata, br#"{"version":"invalid-semver"}"#).expect("invalid version fixture");
+        assert!(ManagedNpm::open(&fixture.tools).is_err());
+        fs::write(&metadata, br#"{"version":"11.14.0"}"#).expect("old resolver fixture");
+        assert!(ManagedNpm::open(&fixture.tools).is_err());
+        assert!(!fixture.owner.path().join("phases").exists());
+    }
+
+    #[test]
+    fn missing_runtime_authority_and_unwritable_manifest_stop_before_resolution() {
+        let fixture = Fixture::new();
+        let identity = fixture.identity_file();
+        let prior = fs::read(&identity).unwrap();
+        fs::write(&identity, b"malformed publisher identity").expect("invalid identity fixture");
+        assert!(fixture.install().is_err());
+        assert!(!fixture.owner.path().join("phases").exists());
+        fs::write(identity, prior).expect("restore fixture publisher");
+        fs::create_dir(fixture.prefix.join("package.json")).expect("manifest write fault");
+        assert!(fixture.install().is_err());
+        assert!(!fixture.owner.path().join("phases").exists());
+    }
+
+    #[test]
+    fn failed_signatures_and_failed_receipt_publication_never_return_an_admission() {
+        for marker in ["signature-reject", "receipt-directory"] {
+            let fixture = Fixture::new();
+            fs::write(fixture.owner.path().join(marker), b"controlled fault")
+                .expect("owned failure marker");
+            assert!(fixture.install().is_err());
+            let phases = fs::read_to_string(fixture.owner.path().join("phases"))
+                .expect("observed manager phases");
+            assert!(phases.contains("audit"));
+            assert!(
+                !fixture
+                    .prefix
+                    .join(".omg-npm-advisory-review.json")
+                    .is_file()
+            );
+        }
+    }
+
+    #[test]
+    fn retained_npm_admission_refuses_a_malformed_dependency_lock() {
+        let fixture = Fixture::new();
+        let admission = fixture.install().expect("controlled signed installation");
+        admission
+            .verify(&fixture.prefix)
+            .expect("unchanged complete installation");
+        fs::write(
+            fixture.prefix.join("package-lock.json"),
+            b"invalid dependency lock",
+        )
+        .expect("mutated lock fixture");
+        assert!(admission.verify(&fixture.prefix).is_err());
+    }
+
+    #[test]
+    fn existing_npm_selection_rechecks_runtime_receipts_and_signature_results() {
+        let fixture = Fixture::new();
+        drop(fixture.install().expect("controlled initial installation"));
+        let security = super::super::security::RuntimeSecurity::fixture();
+        drop(
+            review_installed_npm(
+                PACKAGE,
+                &fixture.prefix,
+                &fixture.tools,
+                &CleanSource,
+                &security,
+            )
+            .expect("unchanged existing selection"),
+        );
+        fs::write(
+            fixture.owner.path().join("signature-reject"),
+            b"controlled rejection",
+        )
+        .expect("signature failure marker");
+        assert!(
+            review_installed_npm(
+                PACKAGE,
+                &fixture.prefix,
+                &fixture.tools,
+                &CleanSource,
+                &security
+            )
+            .is_err()
+        );
+        fs::remove_file(fixture.owner.path().join("signature-reject"))
+            .expect("clear signature failure");
+        let identity = fixture.identity_file();
+        let prior = fs::read(&identity).unwrap();
+        fs::write(&identity, b"invalid publisher").expect("corrupt runtime authority");
+        assert!(
+            review_installed_npm(
+                PACKAGE,
+                &fixture.prefix,
+                &fixture.tools,
+                &CleanSource,
+                &security
+            )
+            .is_err()
+        );
+        fs::write(identity, prior).expect("restore runtime authority");
+        fs::write(
+            fixture.prefix.join(".omg-npm-advisory-review.json"),
+            b"invalid receipt",
+        )
+        .expect("corrupt prior review receipt");
+        assert!(
+            review_installed_npm(
+                PACKAGE,
+                &fixture.prefix,
+                &fixture.tools,
+                &CleanSource,
+                &security
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_existing_receipt_write_does_not_return_a_replacement_review() {
+        let fixture = Fixture::new();
+        drop(fixture.install().expect("controlled initial installation"));
+        fs::write(
+            fixture.owner.path().join("receipt-directory"),
+            b"controlled publication failure",
+        )
+        .expect("receipt failure marker");
+        assert!(
+            review_installed_npm(
+                PACKAGE,
+                &fixture.prefix,
+                &fixture.tools,
+                &CleanSource,
+                &super::super::security::RuntimeSecurity::fixture()
+            )
+            .is_err()
+        );
+        assert!(
+            fixture
+                .prefix
+                .join(".omg-npm-advisory-review.json")
+                .is_dir()
+        );
+    }
+
+    #[test]
+    fn package_scoped_signature_override_remains_bound_through_existing_selection() {
+        const NAME: &str = "runtimes::npm::admission_tests::package_scoped_signature_override_remains_bound_through_existing_selection";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        temp_env::with_var(ALLOW_UNVERIFIED_ENV, Some(format!("npm:{PACKAGE}")), || {
+            let fixture = Fixture::new();
+            fs::write(
+                fixture.owner.path().join("signature-reject"),
+                b"unverified fixture",
+            )
+            .expect("explicit signature rejection marker");
+            let admission = fixture
+                .install()
+                .expect("explicit package override installation");
+            admission
+                .verify(&fixture.prefix)
+                .expect("bound explicit override");
+            drop(admission);
+            let existing = review_installed_npm(
+                PACKAGE,
+                &fixture.prefix,
+                &fixture.tools,
+                &CleanSource,
+                &super::super::security::RuntimeSecurity::fixture(),
+            )
+            .expect("same explicit override on existing selection");
+            existing
+                .verify(&fixture.prefix)
+                .expect("unchanged override authority");
+            let phases = fs::read_to_string(fixture.owner.path().join("phases"))
+                .expect("observed overridden phases");
+            assert!(!phases.lines().any(|phase| phase == "audit"));
+            temp_env::with_var(ALLOW_UNVERIFIED_ENV, None::<&str>, || {
+                assert!(
+                    existing.verify(&fixture.prefix).is_err(),
+                    "removing the explicit override must invalidate its capability"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn cached_npm_selection_requires_a_valid_lock_and_current_node_authority() {
+        let fixture = Fixture::new();
+        drop(fixture.install().expect("controlled initial installation"));
+        let security = super::super::security::RuntimeSecurity::fixture();
+        let pi = super::super::security::fixture_prepare(
+            "pi",
+            "0.83.0",
+            &fixture.prefix,
+            &fixture.prefix,
+        )
+        .expect("controlled Pi publication");
+        drop(
+            cached_installed_npm(PACKAGE, &fixture.prefix, &fixture.tools, &security, &pi)
+                .expect("complete cached npm authority"),
+        );
+        let identity = fixture.identity_file();
+        fs::write(identity, b"invalid publisher").expect("invalid cached Node authority");
+        assert!(
+            cached_installed_npm(PACKAGE, &fixture.prefix, &fixture.tools, &security, &pi).is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_advisory_receipt_cannot_establish_cached_authority() {
+        let fixture = Fixture::new();
+        drop(fixture.install().expect("controlled signed installation"));
+        fs::write(
+            fixture.prefix.join(".omg-npm-advisory-review.json"),
+            b"invalid published advisory receipt",
+        )
+        .expect("write malformed advisory receipt fixture");
+        let error = read_advisory_receipt(&fixture.prefix)
+            .expect_err("malformed cached advisory receipt must refuse parsing");
+        assert!(format!("{error:#}").contains("expected value"));
+        assert!(
+            super::super::security::fixture_prepare(
+                "pi",
+                "0.83.0",
+                &fixture.prefix,
+                &fixture.prefix,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cached_selection_rejects_invalid_lock_even_with_a_bound_candidate_tree() {
+        let fixture = Fixture::new();
+        drop(fixture.install().expect("controlled signed installation"));
+        fs::write(
+            fixture.prefix.join("package-lock.json"),
+            b"invalid dependency lock",
+        )
+        .expect("invalid published lock fixture");
+        let pi = super::super::security::fixture_prepare(
+            "pi",
+            "0.83.0",
+            &fixture.prefix,
+            &fixture.prefix,
+        )
+        .expect("controlled candidate content authority");
+        assert!(
+            cached_installed_npm(
+                PACKAGE,
+                &fixture.prefix,
+                &fixture.tools,
+                &super::super::security::RuntimeSecurity::fixture(),
+                &pi
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cached_selection_requires_admission_for_the_newly_selected_node() {
+        let fixture = Fixture::new();
+        drop(fixture.install().expect("controlled signed installation"));
+        let pi = super::super::security::fixture_prepare(
+            "pi",
+            "0.83.0",
+            &fixture.prefix,
+            &fixture.prefix,
+        )
+        .expect("controlled Pi authority");
+        let versions = fixture.node.parent().unwrap();
+        let changed = versions.join("24.22.4");
+        fs::create_dir(&changed).expect("new managed Node candidate");
+        for relative in [
+            "bin/node",
+            "lib/node_modules/npm/package.json",
+            "lib/node_modules/npm/bin/npm-cli.js",
+        ] {
+            let target = changed.join(relative);
+            fs::create_dir_all(target.parent().unwrap()).expect("new Node component directory");
+            fs::copy(fixture.node.join(relative), target).expect("copy controlled Node component");
+        }
+        symlink(
+            "../lib/node_modules/npm/bin/npm-cli.js",
+            changed.join("bin/npm"),
+        )
+        .expect("new Node contained npm link");
+        super::super::security::fixture_install_identity("node", &changed)
+            .expect("explicit publisher identity for new Node");
+        fs::remove_file(versions.join("current")).expect("clear prior Node selection");
+        symlink("24.22.4", versions.join("current")).expect("select unreviewed Node candidate");
+        let error = cached_installed_npm(
+            PACKAGE,
+            &fixture.prefix,
+            &fixture.tools,
+            &super::super::security::RuntimeSecurity::fixture(),
+            &pi,
+        )
+        .err()
+        .expect("new Node must have its own current evidence");
+        assert!(format!("{error:#}").contains("evidence is missing"));
+    }
 }

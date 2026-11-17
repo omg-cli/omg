@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath, URL as NodeURL } from "node:url";
@@ -96,5 +96,119 @@ test("bulk R2 phase waits for old-row reads and finishes before fenced metadata 
         }},()=>now);
         await store.writer("cve","owner").cveBatch(Array.from({length:19},(_,i)=>row(`CVE-2026-${2000+i}`)),now);
         expect(peak).toBe(6);expect(puts).toBe(19);expect(active).toBe(0);
+    }finally{f.db.close();}
+});
+
+test("a slow baseline put does not idle completed R2 slots or commit metadata early", async () => {
+    const f=fixture();
+    const slow=Promise.withResolvers<void>(), seventh=Promise.withResolvers<void>();
+    let work:Promise<void>|undefined;
+    try {
+        await f.store.lease("cve","owner",now);f.reset();
+        let active=0,peak=0,started=0,settled=0;
+        f.put(async()=>{
+            const position=++started;
+            active++;peak=Math.max(peak,active);
+            try {
+                if(position===1)await slow.promise;
+                else {if(position===7)seventh.resolve();await Bun.sleep(1);}
+            }finally{active--;settled++;}
+        });
+        work=f.writer.cveBatch(Array.from({length:19},(_,i)=>row(`CVE-2026-${3000+i}`)),now);
+        const seventhBeforeSlow=await Promise.race([seventh.promise.then(()=>true),Bun.sleep(100).then(()=>false)]);
+        const beforeRelease={active,batches:f.counts().batches};
+        slow.resolve();await work;
+        expect(seventhBeforeSlow).toBe(true);
+        expect(beforeRelease.active).toBeGreaterThanOrEqual(1);
+        expect(beforeRelease.batches).toBe(0);
+        expect(peak).toBe(6);expect(active).toBe(0);expect(settled).toBe(19);
+        expect(f.db.query("SELECT count(*) n FROM source_record").get()).toEqual({n:19});
+    }finally{slow.resolve();await work;f.db.close();}
+});
+
+test("a refilled R2 slot failure drains its slow peer and starts no further writes", async () => {
+    const f=fixture(),slow=Promise.withResolvers<void>(),failed=Promise.withResolvers<void>();
+    let work:Promise<unknown>|undefined;
+    try {
+        await f.store.lease("cve","owner",now);f.reset();
+        let active=0,started=0,settled=0;
+        f.put(async()=>{
+            const position=++started;active++;
+            try {
+                if(position===1)await slow.promise;
+                else if(position===7){failed.resolve();throw new Error("refilled slot failed");}
+                else await Bun.sleep(5);
+            }finally{active--;settled++;}
+        });
+        work=f.writer.cveBatch(Array.from({length:19},(_,i)=>row(`CVE-2026-${4000+i}`)),now)
+            .then(()=>{throw new Error("failed R2 transaction unexpectedly committed");},error=>error);
+        await failed.promise;
+        await Bun.sleep(10);
+        const observed={started,active,batches:f.counts().batches};
+        slow.resolve();
+        expect(await work).toBeInstanceOf(Error);
+        expect(String(await work)).toContain("refilled slot failed");
+        expect(observed).toEqual({started:7,active:1,batches:0});
+        expect(started).toBe(7);expect(active).toBe(0);expect(settled).toBe(7);
+        expect(f.db.query("SELECT count(*) n FROM source_record").get()).toEqual({n:0});
+    }finally{slow.resolve();await work;f.db.close();}
+});
+
+test("baseline phase diagnostics contain only fixed counts and finite durations", async () => {
+    const f=fixture(),log=spyOn(console,"info").mockImplementation(()=>{});
+    try {
+        await f.store.lease("cve","owner",now);
+        await f.writer.cveBatch([row("CVE-2026-5000")],now);
+        expect(log).toHaveBeenCalledTimes(1);
+        const metric:unknown=JSON.parse(String(log.mock.calls[0]?.[0]));
+        expect(metric).toEqual({event:"baseline_write_phases",records:1,changed:1,
+            prepare_ms:expect.any(Number),read_ms:expect.any(Number),raw_ms:expect.any(Number),metadata_ms:expect.any(Number)});
+        if(!metric || typeof metric!=="object")throw new Error("missing structured baseline metric");
+        for(const [name,value] of Object.entries(metric)){
+            if(name.endsWith("_ms")){expect(Number.isFinite(value)).toBe(true);expect(value).toBeGreaterThanOrEqual(0);}
+        }
+        expect(JSON.stringify(metric)).not.toContain("CVE-");
+    }finally{log.mockRestore();f.db.close();}
+});
+
+test("packed baseline writes keep originals and metadata atomic through R2 and fenced SQL failures",async()=>{
+    for(const fault of ["raw","expired","metadata","conflict"]){
+        const f=fixture();
+        try {
+            await f.store.lease("cve","owner",now);
+            if(fault==="conflict")await f.writer.cve(row("CVE-2026-7000").raw,now);
+            f.reset();let writes=0;
+            f.put(async()=>{
+                writes++;
+                if(fault==="raw")throw new Error("packed R2 unavailable");
+                if(fault==="expired")f.clock("2026-11-13T02:11:00.000Z");
+            });
+            const after=[{sql:"UPDATE source_checkpoint SET complete=1 WHERE source='cve'",values:[]}];
+            if(fault==="metadata")after.push({sql:"INSERT INTO missing_packed_metadata_table VALUES(1)",values:[]});
+            await expect(f.writer.cveBatch([row("CVE-2026-7000",now,"replacement"),row("CVE-2026-7001")],now,after,"packed")).rejects.toThrow();
+            expect(writes).toBe(fault==="conflict"?0:1);
+            expect(f.db.query("SELECT count(*) n FROM source_record").get()).toEqual({n:fault==="conflict"?1:0});
+            expect(f.db.query("SELECT count(*) n FROM cve").get()).toEqual({n:fault==="conflict"?1:0});
+            expect(f.db.query("SELECT complete FROM source_checkpoint WHERE source='cve'").get()).toEqual({complete:0});
+        }finally{f.db.close();}
+    }
+});
+
+test("64 packed originals make one immutable put and exact per-CVE pointers with no replay writes",async()=>{
+    const f=fixture();try{
+        await f.store.lease("cve","owner",now);f.reset();
+        const writes=new Map<string,string>();
+        f.put(async(key,raw)=>{writes.set(key,raw);});
+        const records=Array.from({length:64},(_,index)=>row(`CVE-2026-${8000+index}`));
+        await f.writer.cveBatch(records,now,[],"packed");
+        expect(writes.size).toBe(1);
+        const [key]=writes.keys();expect(key).toMatch(/^cve-pack-v1\/[a-f0-9]{64}\.raw$/);
+        expect(key && writes.get(key)).toBe(records.map(record=>record.raw).join(""));
+        const rows=f.db.query<{object_key:string;payload_sha256:string},[]>("SELECT object_key,payload_sha256 FROM source_record ORDER BY id").all();
+        expect(rows).toHaveLength(64);
+        for(const row of rows){expect(row.object_key.startsWith(`${key}#`)).toBe(true);expect(row.object_key.endsWith(`:${row.payload_sha256}`)).toBe(true);}
+        f.put(async()=>{throw new Error("unchanged packed replay attempted raw write");});
+        await f.writer.cveBatch(records,now,[],"packed");
+        expect(f.db.query("SELECT count(*) n FROM source_record").get()).toEqual({n:64});
     }finally{f.db.close();}
 });

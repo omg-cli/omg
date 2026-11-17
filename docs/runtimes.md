@@ -18,7 +18,7 @@ Runtime installation can download archives, invoke build tools, or require platf
 
 ## Supported runtimes
 
-The CLI has native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, Deno, Zig, .NET, Erlang, PHP, and Swift. It also has a curated tool registry exposed through the same `omg use` and `omg list` commands. An unknown name fails explicitly; OMG does not invoke a fallback version manager.
+The CLI has native managers for 13 language runtimes: Node.js, Python, Go, Rust, Ruby, Java, Bun, Deno, Zig, .NET, Erlang, PHP, and Swift. Pi is a coding harness installed through managed npm; its existing `omg use pi` and version-pin commands remain available. The curated tool registry also uses `omg use` and `omg list`. An unknown name fails explicitly; OMG does not invoke a fallback version manager.
 
 | Runtime | Project pin files |
 | --- | --- |
@@ -30,12 +30,13 @@ The CLI has native managers for Node.js, Python, Go, Rust, Ruby, Java, Bun, Pi, 
 | Java | `.java-version`, `.tool-versions` |
 | Bun | `.bun-version`, `.tool-versions`, `package.json` |
 | Deno | `.deno-version`, `.dvmrc`, `.tool-versions` |
-| Pi | `.tool-versions` |
 | Zig | `.zig-version`, `.tool-versions` |
 | .NET SDK | `global.json`, `.tool-versions` |
 | Erlang | `.tool-versions` |
 | PHP | `.php-version`, `.tool-versions` |
 | Swift | `.swift-version`, `.tool-versions` |
+
+The Pi coding harness can also be pinned in `.tool-versions`.
 
 Supported `[tools]` entries in layered mise project files can also pin native runtimes. See [mise project files](./mise-compatibility.md). OMG uses its own installation directory and does not import installations from nvm, pyenv, rustup, or mise.
 
@@ -103,7 +104,7 @@ An incremental Rust component or target addition must match the installed toolch
 
 ## Integrity and storage
 
-Provider verification differs. Native archive managers use their supported published checksum or release-digest paths. Pi installation delegates to npm with `--global --ignore-scripts` and checks the installed version; it does not use OMG's archive-digest path. npm's registry and integrity settings apply. Do not bypass a failed download or checksum check to make an installation succeed.
+Provider verification differs. Native archive managers use their supported published checksum or release-digest paths. Pi installation uses the shared managed npm dependency, advisory and signature checks with lifecycle scripts disabled. It requires an admitted OMG-managed Node installation. Do not bypass a failed download or checksum check to make an installation succeed.
 
 New Node.js downloads authenticate `SHASUMS256.txt.asc` with OMG's bundled,
 fingerprint-pinned active release certificates before selecting the exact archive

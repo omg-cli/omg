@@ -125,12 +125,13 @@ impl ManagedRuntime {
 
     pub(crate) fn identity_context(&self) -> Result<String> {
         let root = self.root()?;
-        Ok(serde_json::to_string(&serde_json::json!({
+        Ok(serde_json::json!({
             "runtime": self.runtime,
             "version": self.version,
             "root": root,
             "admission": self.admission.identity_context()?,
-        }))?)
+        })
+        .to_string())
     }
 }
 
@@ -149,23 +150,27 @@ mod tests {
             fs::write(
                 root.join("bin").join(command),
                 b"controlled fixture executable",
-            )?;
+            )
+            .expect("write controlled managed command");
             fs::set_permissions(
                 root.join("bin").join(command),
                 fs::Permissions::from_mode(0o755),
-            )?;
+            )
+            .expect("mark controlled managed command executable");
         }
         fs::write(
             root.join("lib/implementation"),
             b"controlled implementation",
-        )?;
+        )
+        .expect("write controlled imported runtime implementation");
         super::super::security::fixture_prepare(runtime, "1.78.0", &root, &root)?;
         symlink(
             "1.78.0",
             root.parent()
                 .context("Missing fixture parent")?
                 .join("current"),
-        )?;
+        )
+        .expect("select the controlled managed runtime");
         Ok((owner, root))
     }
 
@@ -202,15 +207,23 @@ mod tests {
             "go",
             &owner.path().join("tools"),
             &RuntimeSecurity::fixture(),
-        )?;
+        )
+        .expect("open the admitted Go fixture");
         let context = managed.identity_context()?;
         assert_eq!(context, managed.identity_context()?);
+        let encoded: serde_json::Value =
+            serde_json::from_str(&context).expect("managed runtime context must remain valid JSON");
+        assert_eq!(
+            context,
+            serde_json::to_string(&encoded).expect("serialize the controlled JSON value")
+        );
         fs::write(root.join("lib/implementation"), b"changed implementation")?;
         assert!(managed.verify().is_err());
         fs::write(
             root.join("lib/implementation"),
             b"controlled implementation",
-        )?;
+        )
+        .expect("restore the reviewed runtime implementation");
         managed.verify()?;
         fs::remove_file(root.parent().unwrap().join("current"))?;
         assert!(managed.command_path("go").is_err());
@@ -234,7 +247,8 @@ mod tests {
         symlink(
             external.path().join("1.78.0"),
             owner.path().join("versions/go/current"),
-        )?;
+        )
+        .expect("create the external-selection refusal control");
         assert!(
             ManagedRuntime::open(
                 "go",
@@ -255,7 +269,8 @@ mod tests {
         fs::set_permissions(
             root.join("bin/not-executable"),
             fs::Permissions::from_mode(0o644),
-        )?;
+        )
+        .expect("mark nonexecutable command control");
         let outside = owner.path().join("outside");
         fs::write(&outside, b"external executable")?;
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o755))?;
@@ -275,7 +290,8 @@ mod tests {
             "python",
             &owner.path().join("tools"),
             &RuntimeSecurity::fixture(),
-        )?;
+        )
+        .expect("open the Python command-validation fixture");
         assert!(managed.command_path("missing").is_err());
         assert!(managed.command_path("directory").is_err());
         assert!(managed.command_path("not-executable").is_err());
@@ -293,11 +309,29 @@ mod tests {
             "python",
             &owner.path().join("tools"),
             &RuntimeSecurity::fixture(),
-        )?;
+        )
+        .expect("open the contained Python-link fixture");
         assert_eq!(
             managed.command_path("python")?,
             root.join("bin/python3").canonicalize()?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn package_runtime_refuses_redirected_versions_roots_and_unsupported_managers() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let external = tempfile::tempdir()?;
+        let tools = owner.path().join("tools");
+        fs::create_dir(external.path().join("go"))?;
+        symlink(external.path(), owner.path().join("versions"))?;
+        assert!(ManagedRuntime::open("go", &tools, &RuntimeSecurity::fixture()).is_err());
+        fs::remove_file(owner.path().join("versions"))?;
+        fs::create_dir(owner.path().join("versions"))?;
+        symlink(external.path().join("go"), owner.path().join("versions/go"))?;
+        assert!(ManagedRuntime::open("go", &tools, &RuntimeSecurity::fixture()).is_err());
+        assert!(ManagedRuntime::open("node", &tools, &RuntimeSecurity::fixture()).is_err());
+        assert!(ManagedRuntime::open("go", Path::new("/"), &RuntimeSecurity::fixture()).is_err());
         Ok(())
     }
 }
