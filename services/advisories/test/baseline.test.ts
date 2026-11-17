@@ -291,3 +291,21 @@ test("replay conflict checks probe exact member keys instead of scanning the imp
         expect(plans.some((plan) => plan.endsWith("(session_id=?)"))).toBe(false);
     } finally { fixture.db.close(); }
 });
+
+test("publisher proof reports an active writer as retryable without upstream fetches or ownership changes", async () => {
+    const fixture = setup();
+    try {
+        const baseline = await binding(fixture.store);
+        await fixture.store.lease("cve", "active-import-owner", now);
+        let fetched = 0;
+        const response = await verify(fixture.store, baseline, async () => {
+            fetched++;
+            throw new Error("busy proof must not fetch");
+        });
+        expect(response.status).toBe(409);
+        expect(response.headers.get("Cache-Control")).toBe("no-store");
+        expect(fetched).toBe(0);
+        expect(fixture.db.query<{owner:string}, []>("SELECT owner FROM ingestion_lease WHERE source='cve'").get()?.owner).toBe("active-import-owner");
+        expect(fixture.db.query<{count:number}, []>("SELECT COUNT(*) AS count FROM baseline_publisher_proof").get()?.count).toBe(0);
+    } finally { fixture.db.close(); }
+});

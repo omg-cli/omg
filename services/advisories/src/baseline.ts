@@ -3,6 +3,7 @@ import type { Fetcher } from "./ingestion";
 import { Store, type Command } from "./storage";
 
 export type BaselineBinding = { digest: string; instance_id: string; session_id: string; endpoint: string; baseline_at: string };
+export class BaselineBusyError extends Error {}
 type Receipt = BaselineBinding & { exhausted: number; caught_up: number; completed_at: string | null; accepted: number };
 type Proof = { session_id: string; release_tag: string; asset_name: string; asset_size: number; archive_digest: string;
     commit_sha: string; root_tree_sha: string; cves_tree_sha: string; phase: "traversing" | "reconciling" | "verified";
@@ -72,7 +73,7 @@ export async function verifyBaseline(value: unknown, store: Store, endpoint: str
     const releaseTag = input.release_tag;
     const assetName = input.asset;
     const owner = crypto.randomUUID();
-    if (!await store.lease("cve", owner, now)) throw new Error("baseline verification busy");
+    if (!await store.lease("cve", owner, now)) throw new BaselineBusyError("baseline verification busy");
     const writer = store.writer("cve", owner);
     let bytesRead = 0;
     const signal = AbortSignal.timeout(25_000);

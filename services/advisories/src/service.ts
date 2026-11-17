@@ -6,6 +6,7 @@ import {
     object,
     date,
     parseCve,
+    sha256,
 } from "./domain";
 import { ingestCveGroups, parseBatch, refreshSource } from "./ingestion";
 import { Store, type Checkpoint, type RecordRow } from "./storage";
@@ -14,7 +15,7 @@ import { epss } from "./epss";
 import { runtimeReport, refreshRuntime } from "./runtime";
 import { type Fetcher } from "./ingestion";
 import { publicResponse } from "./cache";
-import { baselineImportCommands, verifyBaseline } from "./baseline";
+import { BaselineBusyError, baselineImportCommands, verifyBaseline } from "./baseline";
 async function authorized(
     request: Request,
     token: string | undefined,
@@ -433,8 +434,13 @@ async function route(
                     { error: "CVE unavailable", complete: false },
                     { status: 404 },
                 );
-            const raw = await store.raw.get(record.object_key);
+            const raw = await store.raw.get(record.object_key).catch((cause: unknown) => {
+                throw new Error("CVE storage unavailable", { cause });
+            });
             if (!raw) throw new Error("CVE object missing");
+            const payload = await raw.text();
+            if (await sha256(payload) !== record.payload_sha256)
+                throw new Error("CVE stored payload failed integrity");
             const kev = await store.checkpoint("kev");
             const cve = await store.checkpoint("cve");
             const annotation = await store.sql.first<{ payload_json: string }>(
@@ -443,7 +449,7 @@ async function route(
             );
             return Response.json({
                 schema_version: 1,
-                payload_json: await raw.text(),
+                payload_json: payload,
                 provenance: record,
                 cve_checked_at: cve?.checked_at ?? null,
                 cve_complete: !!cve?.complete && !!cve.bootstrap_complete &&
@@ -458,6 +464,7 @@ async function route(
         }
         return Response.json({ error: "not found" }, { status: 404 });
     } catch (error) {
+        if (error instanceof BaselineBusyError) return Response.json({ error: "ingestion busy" }, { status: 409 });
         const invalid =
             error instanceof Error &&
             /invalid|expected|exceeds|missing publication|mismatch|catchup|baseline|completeness/.test(

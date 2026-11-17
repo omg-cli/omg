@@ -2,19 +2,20 @@ import { handle } from "./service";
 import { refresh } from "./ingestion";
 import { Store, d1Sql } from "./storage";
 import { cachedRead } from "./cache";
+import { r2Raw } from "./raw-pack";
 type Environment = Env & { INGEST_TOKEN?: string; RUNTIME_REFRESH_SECRET?: string };
 export default {
     fetch(request, env) {
         return cachedRead(
             request, caches.default,
-            (input) => handle(input, new Store(d1Sql(env.DB), env.RAW), env.INGEST_TOKEN,
+            (input) => handle(input, new Store(d1Sql(env.DB), r2Raw(env.RAW)), env.INGEST_TOKEN,
                 new Date().toISOString(), undefined, env.RUNTIME_REFRESH_SECRET),
         );
     },
     scheduled(_event, env, context) {
         context.waitUntil(
             refresh(
-                new Store(d1Sql(env.DB), env.RAW),
+                new Store(d1Sql(env.DB), r2Raw(env.RAW)),
                 (url, init) => fetch(url, init),
                 new Date().toISOString(),
                 Number(env.CVE_BATCH_SIZE),
