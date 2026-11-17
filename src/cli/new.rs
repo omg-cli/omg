@@ -270,9 +270,7 @@ fn scaffold_node(root: &Path, name: &str) -> Result<()> {
 fn scaffold_python(root: &Path, name: &str) -> Result<()> {
     fs::write(
         root.join("pyproject.toml"),
-        format!(
-            "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\nrequires-python = \">=3.10\"\ndependencies = []\n"
-        ),
+        format!("[project]\nname = \"{name}\"\nversion = \"0.1.0\"\ndependencies = []\n"),
     )?;
     fs::write(root.join("requirements.txt"), "")?;
     fs::write(root.join("main.py"), "print('Hello from OMG!')\n")?;
