@@ -284,6 +284,86 @@ class SourceConstructCapacityTests(unittest.TestCase):
 
 
 class SourceAwareCoverageTests(unittest.TestCase):
+    def test_owner_inventory_index_retains_canonical_suffix_aliases_and_complete_duplicates(self):
+        first = dict(name='same', filenames=['/one/example.rs'])
+        second = dict(name='same', filenames=['/two/other.rs'])
+        owners = [first, second]
+        files = {'/one/example.rs': 'canonical.rs', '/two/other.rs': 'other.rs'}
+        index = coverage.index_compiled_owner_sources(owners, files, [20_000_000])
+        self.assertEqual(index.inventories['example.rs'], (first,))
+        self.assertEqual(index.inventories['canonical.rs'], (first,))
+        self.assertEqual(index.inventories['one/example.rs'], (first,))
+        self.assertEqual(index.name_counts['same'], 2)
+        self.assertIs(index.owners, owners)
+        self.assertIs(index.files, files)
+
+    def test_cached_positive_inventory_avoids_whole_owner_rescans_with_identical_proof(self):
+        original = coverage.positive_source_fragments
+        class ObservedOwners(list):
+            scans = 0
+            def __iter__(self):
+                self.scans += 1
+                return super().__iter__()
+        def compare(*arguments, **keywords):
+            expected = original(*arguments, **keywords)
+            current = list(arguments)
+            current[5:7] = [ObservedOwners(value) for value in current[5:7]]
+            groups = tuple(coverage._compiled_function_groups(current[0], current[5 + side],
+                current[7 + side], current[1 + side], [20_000_000]) for side in (0, 1))
+            indexes = tuple(coverage.index_compiled_owner_sources(current[5 + side], current[7 + side],
+                [20_000_000]) for side in (0, 1))
+            for owners in current[5:7]:
+                owners.scans = 0
+            observed = original(*current, **keywords, compiled_groups=groups, owner_indexes=indexes)
+            self.assertEqual(observed, expected)
+            self.assertEqual([owners.scans for owners in current[5:7]], [0, 0])
+            return observed
+        with patch.object(coverage, 'positive_source_fragments', side_effect=compare):
+            self.async_positive_fragment_compare()
+
+    def test_cached_positive_inventory_preserves_suffix_collisions_and_unrelated_duplicates(self):
+        original = coverage.positive_source_fragments
+        for mode in ('suffix-collision', 'unrelated-duplicate', 'incomplete-closed-inventory',
+                     'different-owners', 'different-files', 'missing-query', 'appended-owner'):
+            with self.subTest(mode=mode):
+                def compare(*arguments, **keywords):
+                    current = copy.deepcopy(list(arguments))
+                    groups = [coverage._compiled_function_groups(current[0], current[5 + side],
+                        current[7 + side], current[1 + side], [20_000_000]) for side in (0, 1)]
+                    if mode in ('suffix-collision', 'unrelated-duplicate'):
+                        owner = copy.deepcopy(current[6][0])
+                        owner['filenames'] = ['/other/example.rs' if mode == 'suffix-collision'
+                                              else '/other/unrelated.rs']
+                        if mode == 'suffix-collision':
+                            owner['name'] = 'different-owner'
+                        current[6].append(owner)
+                        current[8][owner['filenames'][0]] = 'different-canonical.rs'
+                        with self.assertRaises(ValueError):
+                            original(*current, **keywords, compiled_groups=groups)
+                    if mode == 'incomplete-closed-inventory':
+                        inventory, valid, names = groups[1]
+                        groups[1] = (inventory[:-1], valid, names)
+                    indexes = [coverage.index_compiled_owner_sources(current[5 + side], current[7 + side],
+                        [20_000_000], {'elsewhere.rs'} if mode == 'missing-query' else {'example.rs'})
+                        for side in (0, 1)]
+                    if mode == 'different-owners':
+                        current[6] = list(current[6])
+                    elif mode == 'different-files':
+                        current[8] = dict(current[8])
+                    elif mode == 'appended-owner':
+                        current[6].append(copy.deepcopy(current[6][0]))
+                    return original(*current, **keywords, compiled_groups=groups, owner_indexes=indexes)
+                with patch.object(coverage, 'positive_source_fragments', side_effect=compare):
+                    with self.assertRaises(ValueError):
+                        self.async_positive_fragment_compare()
+
+    def test_owner_inventory_index_refuses_before_unadmitted_owner_traversal(self):
+        class UnadmittedOwners(list):
+            def __iter__(self):
+                raise AssertionError('owner traversal before work admission')
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            coverage.index_compiled_owner_sources(UnadmittedOwners([{}]), {}, [0])
+
     def test_lifetime_method_prefixes_bind_the_complete_lexical_body(self):
         source = ["impl Source for Fixture {", "    fn assess<'a>(",
                   "        &'a self, packages: &'a [Package],", ") -> Result<Value> {",

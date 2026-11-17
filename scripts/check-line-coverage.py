@@ -1549,9 +1549,53 @@ def nominal_phase_fragment(source, group, owners, name_counts, first, last, inve
              limitation='Same lexical phase tree and compiled-copy execution; no callee-semantic equivalence'))
 
 
+@dataclass(frozen=True)
+class CompiledOwnerSourceIndex:
+    owners: list
+    files: dict
+    owner_count: int
+    file_count: int
+    inventories: dict
+    name_counts: Counter
+    source_names: frozenset | None
+
+
+def index_compiled_owner_sources(owners, files, work, source_names=None):
+    """Index the exact canonical-or-literal-suffix predicate once per owner set."""
+    _construct_charge(work, len(owners))
+    if source_names is not None:
+        _construct_charge(work, len(source_names) + sum(len(name) for name in source_names))
+        source_names = frozenset(source_names)
+    aliases = {}; inventories = {}; names = Counter()
+    for owner in owners:
+        names[owner['name']] += 1
+        targets = set()
+        _construct_charge(work, len(owner['filenames']))
+        for path in owner['filenames']:
+            if path not in aliases:
+                _construct_charge(work, len(path))
+                matches = ({files[path]} if path in files
+                           and (source_names is None or files[path] in source_names) else set())
+                for position, character in enumerate(path):
+                    if character == '/':
+                        _construct_charge(work, len(path) - position)
+                        suffix = path[position + 1:]
+                        if source_names is None or suffix in source_names:
+                            matches.add(suffix)
+                aliases[path] = matches
+            _construct_charge(work, len(aliases[path]))
+            targets.update(aliases[path])
+        _construct_charge(work, len(targets))
+        for target in targets:
+            inventories.setdefault(target, []).append(owner)
+    _construct_charge(work, sum(len(rows) for rows in inventories.values()))
+    return CompiledOwnerSourceIndex(owners, files, len(owners), len(files),
+        {name: tuple(rows) for name, rows in inventories.items()}, names, source_names)
+
+
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
                               fragments, work=None, construct_inventories=None, compiled_groups=None,
-                              callback_functions=()):
+                              callback_functions=(), owner_indexes=None):
     """Prove positive head pairs, retaining every base state, copy and candidate."""
     if not fragments:
         return {}, []
@@ -1568,12 +1612,22 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             refuse()
         inventory, valid, names = grouped
         if compiled_groups is not None:
-            _construct_charge(work, len(owners) + sum(len(owner['filenames']) for owner in owners))
-            expected_inventory = [owner for owner in owners if any(
-                files.get(path) == name or path.endswith('/' + name) for path in owner['filenames'])]
+            if owner_indexes is None:
+                _construct_charge(work, len(owners) + sum(len(owner['filenames']) for owner in owners))
+                expected_inventory = [owner for owner in owners if any(
+                    files.get(path) == name or path.endswith('/' + name) for path in owner['filenames'])]
+                names = Counter(owner['name'] for owner in owners)
+            else:
+                indexed = owner_indexes[side]
+                if (indexed.owners is not owners or indexed.files is not files
+                        or indexed.owner_count != len(owners) or indexed.file_count != len(files)
+                        or indexed.source_names is not None and name not in indexed.source_names):
+                    refuse()
+                expected_inventory = indexed.inventories.get(name, ())
+                names = indexed.name_counts
+                _construct_charge(work, len(inventory) + len(expected_inventory))
             if {id(owner) for owner in inventory} != {id(owner) for owner in expected_inventory}:
                 refuse()
-            names = Counter(owner['name'] for owner in owners)
             valid = {prefix: group for prefix, group in valid.items()
                      if all(names[owner['name']] == 1 for owner in group[2])}
         valid = dict(valid)
@@ -4849,7 +4903,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
-    parent_file_cache = {}; method_parent_files = None
+    parent_file_cache = {}; method_parent_files = None; owner_indexes = None
     def parent_files(parent):
         nonlocal method_parent_files
         method_scope = parent[0].startswith('method:')
@@ -5230,9 +5284,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     proposals.append((line - 1, line, target - 1, target, [line]))
                     seen_pairs.add((line, target))
             unresolved_fragments = proposals
+        if unresolved_fragments and owner_indexes is None:
+            owner_indexes = (index_compiled_owner_sources(bf, base_files, construct_work, bs.keys()),
+                             index_compiled_owner_sources(hf, head_files, construct_work, bs.keys()))
         positive, receipts = positive_source_fragments(
             name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments,
-            construct_work, inventories, grouped, callback_functions)
+            construct_work, inventories, grouped, callback_functions, owner_indexes)
         proof_pairs = {
             'async': {tuple(pair) for receipt in receipts
                       if 'async_copies' in receipt and 'async_fragment_regions' in receipt
