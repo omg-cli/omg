@@ -81,17 +81,10 @@ fn validate_managed_package(manager: &str, package: &str) -> Result<()> {
     };
     let valid = match manager {
         "npm" => crate::core::security::npm::NpmSpec::parse(package).is_ok(),
-        "cargo" | "pip" | "pacman" => {
-            !package.contains('/') && !package.contains('@') && registry_name(package)
-        }
-        "go" => {
-            let (module, version) = package
-                .rsplit_once('@')
-                .map_or((package, None), |(module, version)| (module, Some(version)));
-            module.split('/').all(registry_name)
-                && version
-                    .is_none_or(|version| crate::core::security::validate_version(version).is_ok())
-        }
+        "cargo" => crate::runtimes::cargo_tool::validate_request(package).is_ok(),
+        "pip" => crate::runtimes::pip_tool::validate_request(package).is_ok(),
+        "pacman" => !package.contains('/') && !package.contains('@') && registry_name(package),
+        "go" => crate::runtimes::go_tool::validate_request(package).is_ok(),
         _ => false,
     };
     if !valid {
@@ -128,7 +121,11 @@ pub(crate) fn active_security_overrides(manager: &str, package: &str) -> Vec<&'s
     active
 }
 
-fn write_security_receipt(staging_dir: &Path, manager: &str, package: &str) -> Result<()> {
+pub(crate) fn write_security_receipt(
+    staging_dir: &Path,
+    manager: &str,
+    package: &str,
+) -> Result<()> {
     let host_environment = host_environment_is_allowed(manager, package);
     let unverified = package_is_allowed(ALLOW_UNVERIFIED_ENV, &format!("{manager}:{package}"));
     let npm_scripts_disabled =
@@ -484,7 +481,7 @@ fn is_venv_base_entry(install_dir: &Path, path: &Path) -> Result<bool> {
     }
 }
 
-fn relocate_venv_entry_points(staging_dir: &Path, install_dir: &Path) -> Result<()> {
+pub(crate) fn relocate_venv_entry_points(staging_dir: &Path, install_dir: &Path) -> Result<()> {
     use std::io::{Seek as _, Write as _};
 
     if !staging_dir.join("pyvenv.cfg").is_file() {
@@ -546,27 +543,6 @@ fn relocate_venv_entry_points(staging_dir: &Path, install_dir: &Path) -> Result<
             .with_context(|| format!("Relocate venv entry point {}", path.display()))?;
     }
     Ok(())
-}
-
-/// Pick the best available CPython launcher.
-///
-/// PEP 394: upstream recommends `python3`, and minimal distributions may not
-/// provide an unversioned `python` at all, so probe `python3` first.
-/// https://peps.python.org/pep-0394/
-fn python_binary() -> &'static str {
-    for candidate in ["python3", "python"] {
-        let available = Command::new(candidate)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if available {
-            return candidate;
-        }
-    }
-    "python3" // default; the venv step surfaces a clear error when missing
 }
 
 impl LocalCommandRunner for ToolCommands {
@@ -1004,7 +980,7 @@ async fn install_managed_with_advisories(
             &tools_dir,
             &bin_dir,
             has_previous_install,
-            advisories.as_ref(),
+            &advisories,
             &runtime_security,
         );
         if let Err(error) = &outcome {
@@ -1023,7 +999,7 @@ fn install_managed_blocking(
     tools_dir: &Path,
     bin_dir: &Path,
     has_previous_install: bool,
-    advisories: &dyn crate::core::security::vulnerability::VulnerabilitySource,
+    advisories: &std::sync::Arc<dyn crate::core::security::vulnerability::VulnerabilitySource>,
     runtime_security: &crate::runtimes::security::RuntimeSecurity,
 ) -> Result<()> {
     let install_dir = tools_dir.join(manager).join(install_name);
@@ -1048,6 +1024,7 @@ fn install_managed_blocking(
     // The closure keeps `?`/`bail!` exits inside `outcome` so the staging
     // directory is always cleaned up on failure.
     let mut npm_admission = None;
+    let mut tool_admission: Option<Box<dyn crate::runtimes::package_manager::ReviewedTool>> = None;
     let mut run_install = || -> Result<()> {
         match manager {
             "npm" => {
@@ -1056,107 +1033,25 @@ fn install_managed_blocking(
                     &staging_dir,
                     &install_dir,
                     tools_dir,
-                    advisories,
+                    advisories.as_ref(),
                     runtime_security,
                 )?);
                 Ok(())
             }
-            "cargo" => {
-                let install_path = staging_dir
-                    .to_str()
-                    .context("Install directory path contains invalid UTF-8")?;
-                let mut command = secured_manager_command("cargo", &staging_dir, manager, pkg)?;
-                command.args(["install", "--root", install_path]);
-                if !package_is_allowed(ALLOW_CARGO_UNLOCKED_ENV, pkg) {
-                    command.arg("--locked");
-                }
-                let status = command
-                    .args(["--", pkg])
-                    .stdout(std::process::Stdio::null()) // Cargo is noisy
-                    .status()?;
-
-                if !status.success() {
-                    anyhow::bail!(
-                        "Cargo install of '{pkg}' failed. If the reviewed crate does not publish Cargo.lock, retry with {ALLOW_CARGO_UNLOCKED_ENV}={pkg}"
-                    );
-                }
-                Ok(())
-            }
-            "pip" => {
-                // 1. Create venv (PEP 394-aware launcher resolution, see python_binary)
-                let install_path = staging_dir
-                    .to_str()
-                    .context("Install directory path contains invalid UTF-8")?;
-                let status_venv =
-                    secured_manager_command(python_binary(), &staging_dir, manager, pkg)?
-                        .args(["-m", "venv", "--", install_path])
-                        .status()?;
-
-                if !status_venv.success() {
-                    anyhow::bail!("Failed to create python venv at '{install_path}'");
-                }
-
-                // 2. Install into venv
-                let pip_path = staging_dir.join("bin").join("pip");
-                let mut command = secured_manager_command(&pip_path, &staging_dir, manager, pkg)?;
-                command.args(["install", "--disable-pip-version-check"]);
-                if !host_environment_is_allowed(manager, pkg) {
-                    command.args(["--index-url", "https://pypi.org/simple"]);
-                }
-                if !package_is_allowed(ALLOW_PIP_SDISTS_ENV, pkg) {
-                    command.arg("--only-binary=:all:");
-                }
-                let status_install = command
-                    .args(["--", pkg])
-                    .stdout(std::process::Stdio::null())
-                    .status()?;
-
-                if !status_install.success() {
-                    anyhow::bail!(
-                        "Pip install of '{pkg}' failed. If the reviewed package has no wheel, retry with {ALLOW_PIP_SDISTS_ENV}={pkg}"
-                    );
-                }
-                Ok(())
-            }
-            "go" => {
-                // GOBIN=<dir>/bin go install <pkg>@latest
-                let target = if pkg.contains('@') {
-                    pkg.to_string()
-                } else {
-                    format!("{pkg}@latest")
+            "cargo" | "go" | "pip" => {
+                let install = match manager {
+                    "cargo" => crate::runtimes::cargo_tool::install_reviewed,
+                    "go" => crate::runtimes::go_tool::install_reviewed,
+                    _ => crate::runtimes::pip_tool::install_reviewed,
                 };
-
-                // Go installs to $GOBIN
-                let go_bin = staging_dir.join("bin");
-                fs::create_dir_all(&go_bin)?;
-
-                let mut command = secured_manager_command("go", &staging_dir, manager, pkg)?;
-                command
-                    .arg("install")
-                    .args(["--", &target])
-                    .env("GOBIN", &go_bin);
-                if !host_environment_is_allowed(manager, pkg) {
-                    command
-                        .env("GOPROXY", "https://proxy.golang.org")
-                        .env("GOSUMDB", "sum.golang.org")
-                        .env("GOPRIVATE", "")
-                        .env("GONOPROXY", "")
-                        .env("GONOSUMDB", "")
-                        .env("GOENV", "off");
-                }
-                if !package_is_allowed(ALLOW_GO_CGO_ENV, pkg) {
-                    command.env("CGO_ENABLED", "0");
-                }
-                if !package_is_allowed(ALLOW_GO_TOOLCHAIN_ENV, pkg) {
-                    command.env("GOTOOLCHAIN", "local");
-                }
-                let status = command.stdout(std::process::Stdio::null()).status()?;
-
-                if !status.success() {
-                    anyhow::bail!(
-                        "Go install of '{pkg}' failed. Reviewed packages may opt into CGO with {ALLOW_GO_CGO_ENV}={pkg} or toolchain downloads with {ALLOW_GO_TOOLCHAIN_ENV}={pkg}"
-                    );
-                }
+                tool_admission = Some(install(
+                    pkg,
+                    &staging_dir,
+                    &install_dir,
+                    tools_dir,
+                    std::sync::Arc::clone(advisories),
+                    runtime_security,
+                )?);
                 Ok(())
             }
             _ => anyhow::bail!(
@@ -1179,6 +1074,14 @@ fn install_managed_blocking(
         return Err(error);
     }
 
+    if let Some(admission) = &tool_admission
+        && let Err(error) = admission.verify(&staging_dir)
+    {
+        pb.finish_and_clear();
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+
     if let Err(error) = validate_tool_binary_containment(&staging_dir) {
         pb.finish_and_clear();
         let _ = fs::remove_dir_all(&staging_dir);
@@ -1190,6 +1093,14 @@ fn install_managed_blocking(
         return Err(error);
     }
     if let Err(error) = write_security_receipt(&staging_dir, manager, pkg) {
+        pb.finish_and_clear();
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+
+    if let Some(admission) = &tool_admission
+        && let Err(error) = admission.verify(&staging_dir)
+    {
         pb.finish_and_clear();
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
@@ -1233,6 +1144,11 @@ fn install_managed_blocking(
     let activation = npm_admission
         .as_ref()
         .map_or(Ok(()), |admission| admission.verify(&install_dir))
+        .and_then(|()| {
+            tool_admission
+                .as_ref()
+                .map_or(Ok(()), |admission| admission.verify(&install_dir))
+        })
         .and_then(|()| link_binaries(&install_dir, bin_dir, is_venv));
     if let Err(error) = activation {
         let failed_dir = tools_dir.join(manager).join(format!(
@@ -1834,7 +1750,6 @@ mod tests {
         if crate::core::testing::run_isolated_test(test_name) {
             return;
         }
-        use std::os::unix::fs::PermissionsExt as _;
         let directory = tempfile::Builder::new()
             .prefix("omg-pip-")
             .tempdir_in("/tmp")
@@ -1874,42 +1789,50 @@ with zipfile.ZipFile(sys.argv[1], 'w') as archive:
             "{}",
             String::from_utf8_lossy(&wheel_output.stderr)
         );
-        let wrapper = managers.join("python3");
-        let python_literal = serde_json::to_string(&python).expect("Python literal");
-        let wheel_literal = serde_json::to_string(&wheel).expect("wheel literal");
-        let source = format!(
-            r"#!{python_path}
-import pathlib, shlex, subprocess, sys
-python = {python_literal}
-if sys.argv[1:] == ['--version']:
-    raise SystemExit(subprocess.call([python, '--version']))
-result = subprocess.call([python, *sys.argv[1:3], '--copies', *sys.argv[3:]])
-if result:
-    raise SystemExit(result)
-venv = pathlib.Path(sys.argv[-1])
-pip = venv / 'bin/pip'
-command = shlex.join([str(venv / 'bin/python3'), '-m', 'pip', 'install', '--no-index', '--no-deps', {wheel_literal}])
-pip.write_text('#!/bin/sh\nexec ' + command + '\n')
-pip.chmod(0o755)
-",
-            python_path = python.display()
+        // This fixture exercises genuine pip-generated interpreter headers at
+        // the publication boundary; registry admission has separate owner tests.
+        let manager = tools.join("pip");
+        fs::create_dir_all(&manager).expect("manager directory");
+        let staging = manager.join(".black.staging-offline");
+        let installed = manager.join("black");
+        let created = Command::new(&python)
+            .args(["-I", "-B", "-m", "venv", "--copies"])
+            .arg(&staging)
+            .output()
+            .expect("real offline venv");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
         );
-        fs::write(&wrapper, source).expect("private offline manager redirect");
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
-            .expect("wrapper executable");
-        let mut paths = vec![managers];
-        paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
-        let path = std::env::join_paths(paths).expect("fixture PATH");
-        with_managed_fixture_environment(&path, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime")
-                .block_on(install_managed_fixture(
-                    "pip", "black", "black", &tools, &bin,
-                ))
-                .expect("actual pip installation must publish a runnable entry point");
-        });
+        let installed_wheel = Command::new(staging.join("bin/python"))
+            .args([
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--no-deps",
+            ])
+            .arg(&wheel)
+            .output()
+            .expect("genuine offline wheel installation");
+        assert!(
+            installed_wheel.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed_wheel.stderr)
+        );
+        validate_tool_binary_containment(&staging).expect("real pip payload is contained");
+        relocate_venv_entry_points(&staging, &installed)
+            .expect("production entry point relocation");
+        write_security_receipt(&staging, "pip", "black").expect("production executable receipt");
+        fs::rename(&staging, &installed).expect("promote genuine installed wheel");
+        link_binaries(&installed, &bin, true).expect("production shared-bin activation");
+        assert!(
+            !staging.exists(),
+            "the old staging interpreter path must disappear"
+        );
         let entry = fs::read_to_string(bin.join("black")).expect("installed console script");
         assert_eq!(
             entry.starts_with("#!/bin/sh\n'''exec' "),
@@ -2001,6 +1924,23 @@ pip.chmod(0o755)
             crate::runtimes::security::RuntimeSecurity::fixture(),
         )
         .await
+    }
+
+    #[cfg(unix)]
+    fn prepare_managed_registry_fixture(tools: &Path, runtime: &str, programs: &[(&str, &Path)]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let versions = tools.parent().unwrap().join("versions").join(runtime);
+        let version = versions.join("1.78.0");
+        fs::create_dir_all(version.join("bin")).expect("managed runtime directory");
+        for (name, source) in programs {
+            let target = version.join("bin").join(name);
+            fs::copy(source, &target).expect("contained synthetic manager implementation");
+            fs::set_permissions(target, fs::Permissions::from_mode(0o755))
+                .expect("managed command executable");
+        }
+        crate::runtimes::security::fixture_prepare(runtime, "1.78.0", &version, &version)
+            .expect("explicit real fixture admission");
+        symlink(&version, versions.join("current")).expect("selected owned fixture runtime");
     }
 
     #[cfg(unix)]
@@ -2114,6 +2054,67 @@ pip.chmod(0o755)
             ],
             test,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn language_installs_refuse_ambient_managers_before_execution() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::language_installs_refuse_ambient_managers_before_execution",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        for (manager, package, executable) in [
+            ("cargo", "fixture-crate", "cargo"),
+            ("go", "example.org/fixture", "go"),
+            ("pip", "fixture-python", "python3"),
+        ] {
+            let owner = tempfile::tempdir().unwrap();
+            let managers = owner.path().join("managers");
+            let tools = owner.path().join("tools");
+            let bin = owner.path().join("bin");
+            fs::create_dir_all(&managers).unwrap();
+            let marker = owner.path().join("ambient-executed");
+            let program = managers.join(executable);
+            fs::write(
+                &program,
+                format!(
+                    "#!/bin/sh\nprintf attempted > '{}'\nexit 1\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            let old = tools.join(manager).join("fixture-tool/bin/fixture-tool");
+            fs::create_dir_all(old.parent().unwrap()).unwrap();
+            fs::write(&old, b"previous version").unwrap();
+            let mut paths = vec![managers];
+            paths.extend(std::env::split_paths(TOOL_SYSTEM_PATH));
+            let path = std::env::join_paths(paths).unwrap();
+            with_managed_fixture_environment(&path, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                assert!(
+                    runtime
+                        .block_on(install_managed_fixture(
+                            manager,
+                            package,
+                            "fixture-tool",
+                            &tools,
+                            &bin
+                        ))
+                        .is_err()
+                );
+                assert!(
+                    !marker.exists(),
+                    "{manager} executed an ambient manager before managed-runtime admission"
+                );
+                assert_eq!(fs::read(&old).unwrap(), b"previous version");
+            });
+        }
     }
 
     #[cfg(unix)]
@@ -2630,17 +2631,35 @@ exit 1
         let tools = temp.path().join("tools");
         let bin = temp.path().join("bin");
         fs::create_dir_all(&managers).expect("manager directory");
+        let marker = managers
+            .join("started")
+            .to_string_lossy()
+            .replace('\'', "'\\''");
         for executable in ["npm", "cargo", "python3", "go"] {
             let program = managers.join(executable);
             fs::write(
                 &program,
-                b"#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf started > \"$(dirname \"$0\")/started\"\nsleep 1\nexit 1\n",
+                format!("#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nprintf started > '{marker}'\nsleep 1\nexit 1\n"),
             )
             .expect("disposable manager");
             fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
                 .expect("manager permissions");
         }
         prepare_managed_npm_fixture(&tools, &managers.join("npm"));
+        prepare_managed_registry_fixture(
+            &tools,
+            "rust",
+            &[
+                ("cargo", managers.join("cargo").as_path()),
+                ("rustc", managers.join("cargo").as_path()),
+            ],
+        );
+        prepare_managed_registry_fixture(
+            &tools,
+            "python",
+            &[("python3", managers.join("python3").as_path())],
+        );
+        prepare_managed_registry_fixture(&tools, "go", &[("go", managers.join("go").as_path())]);
         fs::create_dir_all(&bin).expect("shared bin directory");
 
         let mut paths = vec![managers.clone()];
@@ -2654,9 +2673,9 @@ exit 1
             let mut starved_managers = Vec::new();
             for (manager, expected_error) in [
                 ("npm", "NPM install"),
-                ("cargo", "Cargo install"),
-                ("pip", "Failed to create python venv"),
-                ("go", "Go install"),
+                ("cargo", "Cargo metadata resolution"),
+                ("pip", "Create isolated managed-Python installer"),
+                ("go", "Go public module metadata"),
             ] {
                 let previous = tools.join(manager).join("fixture-tool/bin/fixture-tool");
                 fs::create_dir_all(previous.parent().expect("previous tool directory"))
@@ -2664,9 +2683,14 @@ exit 1
                 fs::write(&previous, b"previous version").expect("previous tool");
                 runtime.block_on(async {
                     let started = Instant::now();
+                    let request = if manager == "go" {
+                        "example.com/fixture-tool"
+                    } else {
+                        "fixture-tool"
+                    };
                     let (outcome, tick_elapsed) = tokio::join!(
                         biased;
-                        install_managed_fixture(manager, "fixture-tool", "fixture-tool", &tools, &bin),
+                        install_managed_fixture(manager, request, "fixture-tool", &tools, &bin),
                         async {
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             started.elapsed()
@@ -2678,6 +2702,10 @@ exit 1
                         "{manager}: {error:#}"
                     );
                     assert!(managers.join("started").is_file(), "fixture must run");
+                    assert!(
+                        started.elapsed() >= Duration::from_millis(900),
+                        "the slow owned manager must actually execute its delay"
+                    );
                     fs::remove_file(managers.join("started")).expect("reset manager marker");
                     assert_eq!(
                         fs::read(&previous).expect("previous tool"),
@@ -3060,12 +3088,25 @@ exit 1
         fs::create_dir_all(install_dir.join("bin")).expect("tool fixture");
         let tool_binary = install_dir.join("bin").join("fake-tool");
         fs::write(&tool_binary, "#!/bin/sh\necho previous-tool-ok\n").expect("tool fixture");
+        let manager = temp.path().join("failing-cargo");
+        fs::write(
+            &manager,
+            b"#!/bin/sh\necho controlled Cargo metadata failure >&2\nexit 77\n",
+        )
+        .expect("controlled failing manager");
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&tool_binary, fs::Permissions::from_mode(0o755))
                 .expect("tool fixture");
+            fs::set_permissions(&manager, fs::Permissions::from_mode(0o755))
+                .expect("manager executable");
+            prepare_managed_registry_fixture(
+                &tools_dir,
+                "rust",
+                &[("cargo", manager.as_path()), ("rustc", manager.as_path())],
+            );
         }
 
         let error = install_managed_fixture(
@@ -3078,7 +3119,7 @@ exit 1
         .await
         .expect_err("installing a nonexistent crate must fail");
         assert!(
-            error.to_string().contains("Cargo install"),
+            error.to_string().contains("Cargo metadata resolution"),
             "error: {error}"
         );
 

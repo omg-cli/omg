@@ -808,6 +808,36 @@ fn direct_root_warning_required(args: &[String], is_root: bool, reexec_elevated:
         })
 }
 
+fn try_native_dnf_admission(args: &[String], reexec_elevated: bool) -> Option<Result<()>> {
+    if args.get(1).map(String::as_str) != Some("dnf-native") {
+        return None;
+    }
+    Some((|| {
+        anyhow::ensure!(
+            reexec_elevated && omg_lib::core::privilege::is_root(),
+            "Native DNF admission requires authenticated root re-execution"
+        );
+        anyhow::ensure!(
+            args.get(2).map(String::as_str) == Some("--"),
+            "Native DNF admission requires its fixed argument separator"
+        );
+        #[cfg(feature = "fedora")]
+        {
+            omg_lib::package_managers::dnf::DnfPackageManager::validate_admission_args(&args[3..])?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(
+                    omg_lib::package_managers::dnf::DnfPackageManager::execute_elevated_admission(
+                        &args[3..],
+                    ),
+                )
+        }
+        #[cfg(not(feature = "fedora"))]
+        anyhow::bail!("This build does not include native DNF admission")
+    })())
+}
+
 #[cfg(unix)]
 fn restore_sigpipe_default() -> Result<()> {
     use nix::sys::signal::{SigHandler, Signal, signal};
@@ -875,6 +905,10 @@ fn main() {
     // Preserve its history-ownership contract if flags route the child through
     // the full clap path instead of the minimal transaction path.
     omg_lib::core::privilege::set_parent_owns_history(parent_records);
+
+    if let Some(result) = try_native_dnf_admission(&args, reexec_elevated) {
+        finish(result);
+    }
 
     // FASTEST PATH: Elevated re-exec - skip ALL initialization
     // This runs when sudo omg re-execs us as root. Arch-only: the elevated
@@ -2199,6 +2233,24 @@ mod fast_path_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_dnf_private_entrypoint_refuses_unmarked_requests() {
+        let args = [
+            "omg",
+            "dnf-native",
+            "--",
+            "replay",
+            "-y",
+            "/tmp/caller-plan",
+        ]
+        .map(str::to_owned);
+        let error = super::try_native_dnf_admission(&args, false)
+            .expect("reserved native verb")
+            .expect_err("unmarked call");
+        assert!(error.to_string().contains("authenticated root"));
+        assert!(super::try_native_dnf_admission(&["omg".into(), "update".into()], false).is_none());
+    }
+
     #[test]
     fn audit_exit_fixture() -> anyhow::Result<()> {
         use omg_lib::core::security::audit::{

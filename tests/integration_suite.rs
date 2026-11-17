@@ -726,6 +726,8 @@ mod runtime_management {
             } else {
                 fs::write(version_dir.join("bin").join(binary), b"runtime fixture").unwrap();
             }
+            #[cfg(unix)]
+            common::seed_runtime_advisory_fixture(&project, runtime, version).unwrap();
             assert!(!versions_dir.join("current").exists());
 
             let result = project.run_with_env(&["use", runtime], &[("PATH", "")]);

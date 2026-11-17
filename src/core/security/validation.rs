@@ -112,22 +112,43 @@ pub fn validate_package_name(name: &str) -> Result<(), ValidationError> {
 
 /// Validate Debian package specs that may pin a version (`name=1.2-3`).
 ///
-/// The package name uses the normal package-name rules. A pinned version uses
+/// The package name uses the normal package-name rules, with an optional
+/// Debian architecture qualifier (`name:amd64`). A pinned version uses
 /// the same bounded, injection-safe version grammar as other package-manager
 /// input, including Debian epochs and tilde ordering.
 pub fn validate_debian_package_specs(specs: &[String]) -> Result<(), ValidationError> {
     for spec in specs {
         let Some((name, version)) = spec.split_once('=') else {
-            validate_package_name(spec)?;
+            validate_debian_package_selector(spec)?;
             continue;
         };
-        validate_package_name(name)?;
+        validate_debian_package_selector(name)?;
         if version.contains('=') {
             return Err(ValidationError::VersionInvalidChar { character: '=' });
         }
         validate_version(version)?;
     }
     Ok(())
+}
+
+fn validate_debian_package_selector(name: &str) -> Result<(), ValidationError> {
+    if name.len() > MAX_PACKAGE_NAME_LENGTH {
+        return Err(ValidationError::PackageNameTooLong {
+            max: MAX_PACKAGE_NAME_LENGTH,
+        });
+    }
+    if let Some((package, architecture)) = name.split_once(':') {
+        validate_package_name(package)?;
+        validate_package_name(architecture)?;
+        if let Some(character) = architecture.chars().find(|character| {
+            !character.is_ascii_lowercase() && !character.is_ascii_digit() && *character != '-'
+        }) {
+            return Err(ValidationError::PackageNameInvalidChar { character });
+        }
+        Ok(())
+    } else {
+        validate_package_name(name)
+    }
 }
 
 /// Validate multiple package names.
@@ -521,6 +542,40 @@ mod tests {
             validate_debian_package_specs(&["curl=1=2".to_string()]),
             Err(ValidationError::VersionInvalidChar { character: '=' })
         ));
+    }
+
+    #[test]
+    fn debian_architecture_qualified_pins_do_not_widen_generic_package_names() {
+        for spec in [
+            "libc6:amd64=2:2.36-9~deb12u1",
+            "libc6:arm64",
+            "example:linux-any=1.0-1",
+            "example:native",
+        ] {
+            assert!(
+                validate_debian_package_specs(&[spec.into()]).is_ok(),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "libc6:",
+            ":amd64",
+            "libc6:amd64:other",
+            "libc6:amd64/other",
+            "libc6:-amd64",
+            "libc6:amd64\nother",
+            "libc6:amd64=1=2",
+            "libc6:amd64=",
+            "libc6:AMD64",
+        ] {
+            assert!(
+                validate_debian_package_specs(&[spec.into()]).is_err(),
+                "{spec:?}"
+            );
+        }
+        assert!(validate_debian_package_specs(&[format!("{}:amd64", "a".repeat(255))]).is_err());
+        assert!(validate_package_name("libc6:amd64").is_err());
+        assert!(validate_package_name("libc6=1.0-1").is_err());
     }
 
     #[test]

@@ -22,7 +22,7 @@ opts=(-i client-key -p 2222 -o BatchMode=yes -o ConnectTimeout=5
   -o UserKnownHostsFile=known_hosts)
 scp_opts=(-i client-key -P 2222 -o BatchMode=yes -o ConnectTimeout=5
   -o StrictHostKeyChecking=yes -o UserKnownHostsFile=known_hosts)
-bin="/home/bench/omg-${tag}-${arch}-linux-${distro}/omg"
+bin="/opt/omg-qemu/omg-${tag}-${arch}-linux-${distro}/omg"
 # Same bounded setup/readiness/cloud-init/identity contract as initial boot.
 source /work/qemu-boot-budget.sh
 clone_boot_timeout=$CLONE_BOOT_TIMEOUT

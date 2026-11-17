@@ -2167,6 +2167,10 @@ fn prepare_owned_contract(project: &TestProject, raw: &str, environment: &[(&str
         ".qemu-local-oracle.py",
         include_str!("../scripts/qemu-local-oracle.py"),
     );
+    project.create_file(
+        "runtime_advisory_fixture.py",
+        include_str!("runtime_advisory_fixture.py"),
+    );
     if let Some(case) = raw.strip_prefix("local:") {
         if case == "init" {
             project
@@ -2190,16 +2194,6 @@ fn prepare_owned_contract(project: &TestProject, raw: &str, environment: &[(&str
             "{raw} fixture failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        if case == "hook-env" {
-            for (runtime, version) in [
-                ("node", "24.21.0"),
-                ("node", "22.16.0"),
-                ("python", "3.12.14"),
-            ] {
-                common::seed_runtime_advisory_fixture(project, runtime, version)
-                    .expect("seed controlled hook runtime advisory authority");
-            }
-        }
     } else if matches!(
         raw,
         "missing-lock-ci-refusal"

@@ -397,6 +397,117 @@ enum InstallReason {
     Dependency,
 }
 
+struct PlannedDnfAdvisories;
+
+struct CancelStoredQuery(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for CancelStoredQuery {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+impl crate::core::security::vulnerability::VulnerabilitySource for PlannedDnfAdvisories {
+    fn assess_packages<'a>(
+        &'a self,
+        packages: &'a [super::types::SecurityPackage],
+        _evidence_use: crate::core::security::vulnerability::AssessmentUse,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        Vec<crate::core::security::vulnerability::PackageAssessment>,
+                        crate::core::security::vulnerability::VulnerabilityError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use crate::core::security::scan::{AdvisoryProvenance, FindingApplicability};
+            use crate::core::security::vulnerability::{
+                PackageAssessment, PackageCoverage, UnknownCoverage, VulnerabilityError,
+            };
+            let assess = async {
+                // This installed-name-filtered source is supplemental evidence only.
+                // It never establishes complete coverage for proposed dependencies.
+                let native = super::dnf_advisory::audit_result(
+                    DnfPackageManager::native_advisories().await?,
+                )?;
+                let mut assessments = Vec::with_capacity(packages.len());
+                let mut comparisons = Vec::new();
+                let mut candidates = Vec::new();
+                for package in packages {
+                    let mut assessment = PackageAssessment::unknown(
+                        package.clone(),
+                        UnknownCoverage::SourceNotCovered,
+                    );
+                    assessment.coverage = PackageCoverage::Unknown {
+                        reason: UnknownCoverage::SourceNotCovered,
+                        provenance: Some(AdvisoryProvenance::NativeDnf),
+                    };
+                    for (_, findings) in native
+                        .vulnerabilities
+                        .iter()
+                        .filter(|(name, _)| name == &package.name)
+                    {
+                        for finding in findings {
+                            let native = finding
+                                .native_advisory
+                                .as_ref()
+                                .context("Missing native DNF advisory identity")?;
+                            let (name, architecture) =
+                                super::dnf_advisory::package_identity(&native.advisory_nevra)?;
+                            if package.architecture.as_deref() != Some(architecture) {
+                                continue;
+                            }
+                            let fixed = &native.advisory_nevra[name.len() + 1
+                                ..native.advisory_nevra.len() - architecture.len() - 1];
+                            anyhow::ensure!(
+                                comparisons.len() < 10_000,
+                                "Native advisory comparison exceeds its bound"
+                            );
+                            comparisons.push((package.version.clone(), fixed.to_owned()));
+                            candidates.push((assessments.len(), finding.clone()));
+                        }
+                    }
+                    assessments.push(assessment);
+                }
+                let compared = DnfPackageManager::compare_native_evrs(&comparisons).await?;
+                for ((index, mut finding), comparison) in candidates.into_iter().zip(compared) {
+                    if comparison < 0 {
+                        finding.applicability = FindingApplicability::Possible;
+                        assessments[index].findings.push(finding);
+                    }
+                }
+                for assessment in &mut assessments {
+                    assessment.findings.sort_by(|left, right| {
+                        left.id.cmp(&right.id).then_with(|| {
+                            left.native_advisory
+                                .as_ref()
+                                .map(|native| native.advisory_nevra.as_str())
+                                .cmp(
+                                    &right
+                                        .native_advisory
+                                        .as_ref()
+                                        .map(|native| native.advisory_nevra.as_str()),
+                                )
+                        })
+                    });
+                    assessment.findings.dedup();
+                }
+                Ok::<_, anyhow::Error>(assessments)
+            }
+            .await;
+            assess.map_err(|error| VulnerabilityError::Unavailable {
+                reason: format!("Native DNF planned-package advisories unavailable: {error:#}"),
+            })
+        })
+    }
+}
+
 impl Default for DnfPackageManager {
     fn default() -> Self {
         Self::new()
@@ -404,6 +515,50 @@ impl Default for DnfPackageManager {
 }
 
 impl DnfPackageManager {
+    async fn compare_native_evrs(pairs: &[(String, String)]) -> Result<Vec<i32>> {
+        let mut results = Vec::with_capacity(pairs.len());
+        for chunk in pairs.chunks(128) {
+            let mut input = String::new();
+            for (left, right) in chunk {
+                anyhow::ensure!(
+                    [left, right]
+                        .iter()
+                        .all(|value| !value.is_empty() && !value.chars().any(char::is_control)),
+                    "Invalid native comparison input"
+                );
+                input.push_str(left);
+                input.push('\n');
+                input.push_str(right);
+                input.push('\n');
+            }
+            anyhow::ensure!(
+                input.len() <= 64 * 1024,
+                "Native RPM comparison input exceeds limit"
+            );
+            let mut command =
+                tokio::process::Command::from(crate::core::privilege::system_command("rpm")?);
+            command.env("OMG_EVR_PAIRS", input).args(["--eval", r#"%{lua:local left=nil; for value in string.gmatch(os.getenv("OMG_EVR_PAIRS"), "[^\n]+") do if left then print(rpm.vercmp(left,value)); left=nil else left=value end end; if left then error("incomplete comparison") end}"#]);
+            let output = Self::query_output(command).await?;
+            let compared = std::str::from_utf8(&output)?
+                .split_whitespace()
+                .map(|value| match value {
+                    "-1" => Ok(-1),
+                    "0" => Ok(0),
+                    "1" => Ok(1),
+                    _ => Err(anyhow::anyhow!(
+                        "Invalid native RPM version comparison result"
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                compared.len() == chunk.len(),
+                "Incomplete native RPM version comparisons"
+            );
+            results.extend(compared);
+        }
+        Ok(results)
+    }
+
     fn parse_removal_plan(bytes: &[u8]) -> Result<Vec<super::types::RemovalPackage>> {
         let transaction: StoredRemovalTransaction = serde_json::from_slice(bytes)
             .context("DNF5 did not produce a valid stored removal transaction")?;
@@ -490,7 +645,6 @@ impl DnfPackageManager {
     }
 
     async fn simulate_removal(packages: &[String]) -> Result<Vec<super::types::RemovalPackage>> {
-        use tokio::io::AsyncReadExt;
         crate::core::security::validate_package_names(packages)?;
         let directory = Self::removal_preview_directory()?;
         let mut command =
@@ -505,20 +659,10 @@ impl DnfPackageManager {
                 format!("--store={}", directory.path().display()),
             ])
             .args(packages);
-        Self::query_output(command)
-            .await
-            .context("Could not simulate removal with DNF5 --store")?;
-        let file = tokio::fs::File::open(directory.path().join("transaction.json"))
-            .await
-            .context("DNF5 did not store a removal transaction")?;
-        let mut bytes = Vec::new();
-        file.take(64 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        anyhow::ensure!(
-            bytes.len() <= 64 * 1024 * 1024,
-            "DNF removal plan exceeds 64 MiB"
-        );
+        let (_directory, bytes) =
+            Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(1))
+                .await
+                .context("Could not simulate removal with DNF5 --store")?;
         Self::parse_removal_plan(&bytes)
     }
     fn cached_update_args() -> Vec<String> {
@@ -1279,36 +1423,109 @@ impl DnfPackageManager {
     }
 
     async fn query_output_with_deadline(
+        command: tokio::process::Command,
+        deadline: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        Self::controlled_query_output(command, deadline, None).await
+    }
+
+    async fn controlled_query_output(
         mut command: tokio::process::Command,
         deadline: std::time::Duration,
+        mut cancelled: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<Vec<u8>> {
         use tokio::io::AsyncReadExt;
         const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
-        let operation = async {
-            let mut child = command
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::inherit())
-                .kill_on_drop(true)
-                .spawn()
-                .context("Could not start DNF query")?;
-            let stdout = child.stdout.take().context("DNF stdout was not captured")?;
-            let mut bytes = Vec::new();
-            stdout
-                .take(MAX_OUTPUT_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .await?;
+        if let Some(cancelled) = cancelled.as_mut() {
             anyhow::ensure!(
-                bytes.len() as u64 <= MAX_OUTPUT_BYTES,
-                "DNF query output exceeds 64 MiB"
+                matches!(
+                    cancelled.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "DNF stored query cancelled before execution"
             );
-            let status = child.wait().await.context("Could not wait for DNF query")?;
-            anyhow::ensure!(status.success(), "DNF query failed: {status}");
-            Ok(bytes)
+        }
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Could not start DNF query")?;
+        let result = {
+            let operation = async {
+                let stdout = child.stdout.take().context("DNF stdout was not captured")?;
+                let mut bytes = Vec::new();
+                stdout
+                    .take(MAX_OUTPUT_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .await?;
+                anyhow::ensure!(
+                    bytes.len() as u64 <= MAX_OUTPUT_BYTES,
+                    "DNF query output exceeds 64 MiB"
+                );
+                let status = child.wait().await.context("Could not wait for DNF query")?;
+                anyhow::ensure!(status.success(), "DNF query failed: {status}");
+                Ok(bytes)
+            };
+            let cancellation = async {
+                match cancelled {
+                    Some(cancelled) => {
+                        let _ = cancelled.await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                result = tokio::time::timeout(deadline, operation) => match result {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::Error::new(error).context(format!("DNF query timed out after {} seconds", deadline.as_secs()))),
+                },
+                () = cancellation => Err(anyhow::anyhow!("DNF stored query cancelled")),
+            }
         };
-        tokio::time::timeout(deadline, operation)
-            .await
-            .with_context(|| format!("DNF query timed out after {} seconds", deadline.as_secs()))?
+        if result.is_err() {
+            if let Err(error) = child.start_kill() {
+                tracing::debug!(%error, "DNF query may have exited before cancellation kill");
+            }
+            child.wait().await.context("Could not reap DNF query")?;
+        }
+        result
+    }
+
+    async fn owned_stored_transaction(
+        command: tokio::process::Command,
+        directory: tempfile::TempDir,
+        deadline: std::time::Duration,
+    ) -> Result<(tempfile::TempDir, Vec<u8>)> {
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let _cancel_on_drop = CancelStoredQuery(Some(cancel));
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            use std::io::Read;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(Self::controlled_query_output(
+                    command,
+                    deadline,
+                    Some(cancelled),
+                ))?;
+            let file = std::fs::File::open(directory.path().join("transaction.json"))
+                .context("DNF5 did not store a transaction")?;
+            anyhow::ensure!(
+                file.metadata()?.is_file(),
+                "DNF stored transaction is not a regular file"
+            );
+            let mut bytes = Vec::new();
+            file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            anyhow::ensure!(
+                bytes.len() <= 64 * 1024 * 1024,
+                "DNF stored transaction exceeds 64 MiB"
+            );
+            Ok((directory, bytes))
+        })
+        .await
+        .context("DNF stored transaction owner failed")?
     }
 
     fn advisory_command() -> Result<tokio::process::Command> {
@@ -1522,14 +1739,18 @@ impl DnfPackageManager {
     }
 
     async fn execute_dnf(&self, args: Vec<String>) -> Result<()> {
-        if args
+        let guarded = args
             .iter()
             .find(|arg| !arg.starts_with('-'))
-            .is_some_and(|arg| matches!(arg.as_str(), "install" | "upgrade"))
-        {
+            .is_some_and(|arg| matches!(arg.as_str(), "install" | "upgrade"));
+        if guarded {
             crate::core::security::policy::require_native_plan_support("DNF")?;
         }
-        let operation = if is_root() {
+        let operation = if guarded && !is_root() {
+            crate::core::privilege::run_privileged_dnf(&args).await
+        } else if guarded {
+            self.execute_reviewed_transaction(&args).await
+        } else if is_root() {
             let manager = self.cache_handle();
             tokio::task::spawn_blocking(move || {
                 let arguments: Vec<_> = args.iter().map(String::as_str).collect();
@@ -1544,6 +1765,237 @@ impl DnfPackageManager {
         };
         self.invalidate_installed_cache();
         operation
+    }
+
+    /// Only fixed install/upgrade inputs cross the same-binary elevation boundary.
+    #[doc(hidden)]
+    pub fn validate_admission_args(args: &[String]) -> Result<()> {
+        anyhow::ensure!(
+            args.len() <= 10_004,
+            "DNF transaction has too many arguments"
+        );
+        let mut remaining = args;
+        if let Some(comment) = remaining
+            .first()
+            .and_then(|value| value.strip_prefix("--comment=omg-"))
+        {
+            let id = uuid::Uuid::parse_str(comment).context("Invalid DNF transaction comment")?;
+            anyhow::ensure!(
+                id.to_string() == comment,
+                "Noncanonical DNF transaction comment"
+            );
+            remaining = &remaining[1..];
+        }
+        let cached = remaining
+            .first()
+            .is_some_and(|value| value == "--setopt=cacheonly=metadata");
+        if cached {
+            remaining = &remaining[1..];
+        }
+        let [action, yes, packages @ ..] = remaining else {
+            anyhow::bail!("Incomplete DNF admission request");
+        };
+        anyhow::ensure!(
+            matches!(action.as_str(), "install" | "upgrade") && yes == "-y",
+            "Unsupported DNF admission request"
+        );
+        anyhow::ensure!(
+            !cached || action == "upgrade",
+            "Cached metadata mode is only supported for upgrades"
+        );
+        anyhow::ensure!(
+            action != "upgrade" || packages.is_empty(),
+            "System upgrade does not accept operands"
+        );
+        anyhow::ensure!(
+            action != "install" || !packages.is_empty(),
+            "Install requires package operands"
+        );
+        crate::core::security::validate_package_names(packages)?;
+        reject_unsealed_local_rpm_targets(packages)
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_elevated_admission(args: &[String]) -> Result<()> {
+        anyhow::ensure!(is_root(), "Native DNF admission requires root");
+        anyhow::ensure!(
+            super::resolve_backend()? == super::Backend::Fedora,
+            "Native DNF admission requires the Fedora backend"
+        );
+        Self::validate_admission_args(args)?;
+        Self::new().execute_reviewed_transaction(args).await
+    }
+
+    async fn execute_reviewed_transaction(&self, args: &[String]) -> Result<()> {
+        Self::validate_admission_args(args)?;
+        crate::core::security::policy::require_native_plan_support("DNF")?;
+        anyhow::ensure!(
+            is_root(),
+            "DNF stored transaction must be prepared by its root owner"
+        );
+        let directory = Self::removal_preview_directory()?;
+        let mut command =
+            tokio::process::Command::from(crate::core::privilege::system_command("dnf")?);
+        command
+            .args(args)
+            .arg(format!("--store={}", directory.path().display()));
+        let (directory, bytes) =
+            Self::owned_stored_transaction(command, directory, std::time::Duration::from_mins(30))
+                .await
+                .context("Could not prepare a stored DNF5 installation transaction")?;
+        let inventory = Self::proposed_inventory(&bytes)?;
+        if inventory.is_empty() {
+            return Ok(());
+        }
+        let (directory, digest) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let digest = Self::stored_tree_digest(directory.path())?;
+            Ok((directory, digest))
+        })
+        .await??;
+        let context = serde_json::to_string(&("omg-native-dnf-stored-v1", args, &digest))?;
+        let gaps = vec!["DNF5's native advisory CLI filters by currently installed package names; it cannot establish complete coverage for newly selected dependencies. Vendor fixed versions do not establish introduced ranges or branch applicability. Matching native advisories below remain possible; CVE/disclosed-zero-day coverage remains unknown. https://dnf5.readthedocs.io/en/stable/commands/advisory.8.html".into()];
+        let source = PlannedDnfAdvisories;
+        let review = crate::core::security::package_review::review_async(
+            &inventory, &context, &gaps, &source,
+        )
+        .await?;
+        review.verify_async(&source).await?;
+        let (directory, checked) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let digest = Self::stored_tree_digest(directory.path())?;
+            Ok((directory, digest))
+        })
+        .await??;
+        anyhow::ensure!(
+            checked == digest,
+            "DNF stored artifacts or repository evidence changed after review"
+        );
+        let mut replay = vec![
+            "replay".to_owned(),
+            directory.path().to_string_lossy().into_owned(),
+            "-y".into(),
+        ];
+        if let Some(comment) = args
+            .first()
+            .filter(|value| value.starts_with("--comment=omg-"))
+        {
+            replay.insert(0, comment.clone());
+        }
+        let manager = self.cache_handle();
+        tokio::task::spawn_blocking(move || {
+            let _stored_artifacts = directory;
+            manager.run_dnf(&replay.iter().map(String::as_str).collect::<Vec<_>>())
+        })
+        .await?
+    }
+
+    fn proposed_inventory(bytes: &[u8]) -> Result<Vec<super::types::SecurityPackage>> {
+        let transaction: StoredRemovalTransaction = serde_json::from_slice(bytes)
+            .context("Invalid DNF5 stored installation transaction")?;
+        anyhow::ensure!(
+            transaction.version == "1.0",
+            "Unsupported DNF stored transaction version"
+        );
+        anyhow::ensure!(
+            transaction.groups.is_empty() && transaction.environments.is_empty(),
+            "DNF group/environment changes require separate review support"
+        );
+        let mut inventory = Vec::new();
+        let mut seen = BTreeSet::new();
+        for package in transaction.rpms {
+            anyhow::ensure!(
+                seen.insert((package.nevra.clone(), package.action.clone())),
+                "Duplicate DNF stored transaction operation"
+            );
+            match package.action.as_str() {
+                "Remove" | "Replaced" => continue,
+                "Install" | "Upgrade" | "Downgrade" | "Reinstall" => {}
+                _ => anyhow::bail!("Unsupported DNF stored action: {}", package.action),
+            }
+            let (name, architecture) = super::dnf_advisory::package_identity(&package.nevra)?;
+            inventory.push(super::types::SecurityPackage {
+                origin: super::types::SecurityOrigin::DistributionPackage,
+                name: name.into(),
+                version: package.nevra
+                    [name.len() + 1..package.nevra.len() - architecture.len() - 1]
+                    .into(),
+                advisory_source: None,
+                architecture: Some(architecture.into()),
+                description: String::new(),
+                licenses: Vec::new(),
+            });
+        }
+        inventory.sort_by(|left, right| {
+            (&left.name, &left.version, &left.architecture).cmp(&(
+                &right.name,
+                &right.version,
+                &right.architecture,
+            ))
+        });
+        Ok(inventory)
+    }
+
+    fn stored_tree_digest(root: &Path) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let mut hash = Sha256::new();
+        let mut pending = vec![root.to_owned()];
+        let mut files = BTreeMap::new();
+        let mut count = 0usize;
+        let mut total = 0u64;
+        while let Some(path) = pending.pop() {
+            count += 1;
+            anyhow::ensure!(count <= 100_000, "DNF stored tree has too many entries");
+            let metadata = path.symlink_metadata()?;
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "DNF stored tree contains a symlink"
+            );
+            if metadata.is_dir() {
+                for entry in std::fs::read_dir(&path)? {
+                    anyhow::ensure!(
+                        pending.len() + count < 100_000,
+                        "DNF stored tree has too many entries"
+                    );
+                    pending.push(entry?.path());
+                }
+            } else {
+                anyhow::ensure!(
+                    metadata.is_file(),
+                    "DNF stored tree contains a nonregular file"
+                );
+                total = total
+                    .checked_add(metadata.len())
+                    .context("DNF stored tree size overflow")?;
+                anyhow::ensure!(
+                    total <= 32 * 1024 * 1024 * 1024,
+                    "DNF stored tree exceeds 32 GiB"
+                );
+                files.insert(path.strip_prefix(root)?.to_owned(), (path, metadata.len()));
+            }
+        }
+        for (relative, (path, length)) in files {
+            let encoded = serde_json::to_vec(&relative)?;
+            hash.update((encoded.len() as u64).to_be_bytes());
+            hash.update(encoded);
+            hash.update(length.to_be_bytes());
+            let mut file = std::fs::File::open(path)?;
+            let mut read = 0u64;
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let length = file.read(&mut buffer)?;
+                if length == 0 {
+                    break;
+                }
+                read += length as u64;
+                anyhow::ensure!(
+                    read <= 32 * 1024 * 1024 * 1024,
+                    "DNF stored file grew beyond limit"
+                );
+                hash.update(&buffer[..length]);
+            }
+            anyhow::ensure!(read == length, "DNF stored file changed while hashing");
+        }
+        Ok(hex::encode(hash.finalize()))
     }
 
     async fn recorded_mutation(
@@ -2268,6 +2720,120 @@ mod tests {
         ] {
             assert!(DnfPackageManager::parse_removal_plan(bad).is_err());
         }
+    }
+
+    #[test]
+    fn admission_handoff_accepts_only_fixed_native_modes_and_canonical_comments() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+        for values in [
+            vec!["install", "-y", "example"],
+            vec!["--setopt=cacheonly=metadata", "upgrade", "-y"],
+            vec![
+                "--comment=omg-550e8400-e29b-41d4-a716-446655440000",
+                "upgrade",
+                "-y",
+            ],
+        ] {
+            assert!(DnfPackageManager::validate_admission_args(&args(&values)).is_ok());
+        }
+        for values in [
+            vec!["replay", "-y", "/tmp/caller-plan"],
+            vec!["install", "-y", "--installroot=/tmp/root"],
+            vec!["--comment=attacker", "install", "-y", "example"],
+            vec!["--setopt=plugins=1", "upgrade", "-y"],
+            vec!["--setopt=cacheonly=metadata", "install", "-y", "example"],
+            vec!["upgrade", "-y", "unexpected-package"],
+            vec!["install", "-y"],
+            vec!["install", "-y", "/tmp/local.rpm"],
+        ] {
+            assert!(
+                DnfPackageManager::validate_admission_args(&args(&values)).is_err(),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_admission_evr_comparisons_preserve_rpm_order_and_batch_association()
+    -> Result<()> {
+        let mut pairs = vec![("1.0-1.fc44".to_owned(), "1.0-1.fc44".to_owned()); 129];
+        pairs[0] = ("2:1.0-1.fc44".into(), "1:9.9-9.fc44".into());
+        pairs[1] = ("1.0~rc1-1.fc44".into(), "1.0-1.fc44".into());
+        pairs[128] = ("1.0^git1-1.fc44".into(), "1.0.1-1.fc44".into());
+        let compared = DnfPackageManager::compare_native_evrs(&pairs).await?;
+        assert_eq!(compared.len(), 129);
+        assert_eq!((compared[0], compared[1], compared[128]), (1, -1, -1));
+        assert!(compared[2..128].iter().all(|value| *value == 0));
+        assert!(
+            DnfPackageManager::compare_native_evrs(&[("1.0\n2.0".into(), "3.0".into())])
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn proposed_admission_inventory_preserves_solver_dependencies_epochs_and_multilib() -> Result<()>
+    {
+        let inventory = DnfPackageManager::proposed_inventory(
+            br#"{"version":"1.0","rpms":[
+            {"nevra":"app-2:1.0-1.fc44.x86_64","action":"Upgrade"},
+            {"nevra":"app-1.0-1.fc44.x86_64","action":"Replaced"},
+            {"nevra":"lib-part-0:1.0~rc1-2.fc44.i686","action":"Install"}] }"#,
+        )?;
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(
+            (
+                &*inventory[0].name,
+                &*inventory[0].version,
+                inventory[0].architecture.as_deref()
+            ),
+            ("app", "2:1.0-1.fc44", Some("x86_64"))
+        );
+        assert_eq!(
+            (
+                &*inventory[1].name,
+                &*inventory[1].version,
+                inventory[1].architecture.as_deref()
+            ),
+            ("lib-part", "0:1.0~rc1-2.fc44", Some("i686"))
+        );
+        for bytes in [
+            br#"{"version":"1.0","rpms":[{"nevra":"x-1-1.noarch","action":"Install"},{"nevra":"x-1-1.noarch","action":"Install"}]}"#.as_slice(),
+            br#"{"version":"1.0","rpms":[{"nevra":"x-1-1.noarch","action":"FutureAction"}]}"#,
+            br#"{"version":"1.0","rpms":[{"nevra":"broken","action":"Install"}]}"#,
+            br#"{"version":"2.0","rpms":[]}"#,
+            br#"{"version":"1.0","groups":[{}]}"#,
+        ] { assert!(DnfPackageManager::proposed_inventory(bytes).is_err()); }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_admission_evidence_changes_with_archive_metadata_and_path() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(root.path().join("transaction.json"), b"plan")?;
+        std::fs::write(root.path().join("example.rpm"), b"archive")?;
+        let before = DnfPackageManager::stored_tree_digest(root.path())?;
+        std::fs::write(root.path().join("example.rpm"), b"changed")?;
+        assert_ne!(before, DnfPackageManager::stored_tree_digest(root.path())?);
+        std::fs::write(root.path().join("example.rpm"), b"archive")?;
+        assert_eq!(before, DnfPackageManager::stored_tree_digest(root.path())?);
+        std::fs::rename(
+            root.path().join("example.rpm"),
+            root.path().join("other.rpm"),
+        )?;
+        assert_ne!(before, DnfPackageManager::stored_tree_digest(root.path())?);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("transaction.json", root.path().join("replacement"))?;
+            assert!(DnfPackageManager::stored_tree_digest(root.path()).is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -3525,6 +4091,103 @@ mod tests {
                 .to_string()
                 .contains("DNF query failed")
         );
+    }
+
+    #[tokio::test]
+    async fn stored_query_cancellation_reaps_child_before_removing_private_namespace() -> Result<()>
+    {
+        let control = tempfile::tempdir()?;
+        let directory = tempfile::Builder::new()
+            .prefix("owned-store-")
+            .tempdir_in(control.path())?;
+        let path = directory.path().to_owned();
+        let pid_file = control.path().join("query.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 30", "--"])
+            .arg(&pid_file);
+        let task = tokio::spawn(DnfPackageManager::owned_stored_transaction(
+            command,
+            directory,
+            std::time::Duration::from_secs(60),
+        ));
+        let started = std::time::Instant::now();
+        while !pid_file.exists() {
+            anyhow::ensure!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "owned query did not start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let pid = nix::unistd::Pid::from_raw(std::fs::read_to_string(&pid_file)?.parse()?);
+        assert!(
+            path.is_dir(),
+            "query must retain its private input namespace"
+        );
+        task.abort();
+        assert!(task.await.is_err());
+        while path.exists() {
+            anyhow::ensure!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "cancelled owner failed to settle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH),
+            "namespace disappeared before its child was reaped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_query_timeout_reaps_child_before_returning() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let pid_file = directory.path().join("query.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "printf '%s' \"$$\" > \"$1\"; exec sleep 30", "--"])
+            .arg(&pid_file);
+        let error = DnfPackageManager::query_output_with_deadline(
+            command,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect_err("query must time out");
+        assert!(error.to_string().contains("DNF query timed out"));
+        let pid = nix::unistd::Pid::from_raw(std::fs::read_to_string(pid_file)?.parse()?);
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_query_returns_owned_namespace_and_exact_manifest_after_child_exit() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().to_owned();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "printf 'stored bytes' > \"$1/transaction.json\"; printf 'query output'",
+                "--",
+            ])
+            .arg(&path);
+        let (directory, bytes) = DnfPackageManager::owned_stored_transaction(
+            command,
+            directory,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(bytes, b"stored bytes");
+        assert!(path.is_dir());
+        drop(directory);
+        assert!(!path.exists());
+        Ok(())
     }
 
     #[tokio::test]

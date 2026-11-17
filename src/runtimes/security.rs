@@ -182,6 +182,18 @@ pub(crate) struct RuntimeAdmission {
 }
 
 impl RuntimeAdmission {
+    pub(crate) fn identity_context(&self) -> Result<String> {
+        self.verify_before_execution()?;
+        Ok(serde_json::to_string(&(
+            &self.record.query,
+            &self.record.destination,
+            &self.record.content_sha256,
+            &self.record.identity_sha256,
+            &self.record.policy_sha256,
+            self.record.uid,
+            self.record.euid,
+        ))?)
+    }
     pub(crate) fn verify_before_execution(&self) -> Result<()> {
         self.verify_tree(&self.tree)
     }

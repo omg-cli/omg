@@ -15,6 +15,8 @@
     "r2_buckets": [{ "binding": "RAW", "bucket_name": "omg-advisories-raw" }],
     "vars": { "CVE_BATCH_SIZE": "32" },
     "limits": { "cpu_ms": 30000 },
+    // Baseline imports make bounded R2/D1 round trips; place execution near those stores.
+    "placement": { "mode": "smart" },
     "triggers": { "crons": ["*/5 * * * *"] },
     "observability": {
         "enabled": true,

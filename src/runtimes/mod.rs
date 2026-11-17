@@ -7,22 +7,27 @@ pub(crate) mod eol;
 static DATA_DIR: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(paths::data_dir);
 
 pub(crate) mod bun;
+pub(crate) mod cargo_tool;
 pub(crate) mod common;
 pub(crate) mod deno;
 pub(crate) mod dotnet;
 pub(crate) mod erlang;
 pub(crate) mod github_tool;
 pub(crate) mod go;
+pub(crate) mod go_tool;
 pub(crate) mod java;
 pub(crate) mod node;
 pub(crate) mod npm;
+pub(crate) mod package_manager;
 pub(crate) mod php;
 pub(crate) mod pi;
+pub(crate) mod pip_tool;
 pub(crate) mod python;
 pub(crate) mod ruby;
 pub(crate) mod rust;
 pub(crate) mod security;
 pub(crate) mod swift;
+pub(crate) mod tool_artifacts;
 pub(crate) mod tool_registry;
 pub(crate) mod zig;
 

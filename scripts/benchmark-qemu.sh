@@ -1048,6 +1048,8 @@ if [[ -n "$inventory_tiers" ]]; then
   cp "$here/qemu-fingerprint-oracle.py" "$work/qemu-fingerprint-oracle.py"
   cp "$here/qemu-license-oracle.py" "$work/qemu-license-oracle.py"
   cp "$here/qemu-rust-install-oracle.py" "$work/qemu-rust-install-oracle.py"
+  cp "$here/qemu-runtime-advisory-oracle.py" "$work/qemu-runtime-advisory-oracle.py"
+  cp "$here/../tests/runtime_advisory_fixture.py" "$work/runtime_advisory_fixture.py"
   cp "$here/qemu-arch-update-fixture.sh" "$work/qemu-arch-update-fixture.sh"
   cp "$here/qemu-run-watch-check.py" "$work/qemu-run-watch-check.py"
   cp "$here/qemu-enterprise-export-oracle.py" "$work/qemu-enterprise-export-oracle.py"
@@ -1066,6 +1068,7 @@ if [[ -n "$inventory_tiers" ]]; then
       --inventory "$tsv" --network-scopes > "$work/inventory-scopes.json"
   fi
 fi
+if [[ -z "$inventory_tiers" ]]; then cp "$here/qemu-runtime-advisory-oracle.py" "$work/qemu-runtime-advisory-oracle.py"; fi
 if [[ "$benchmark" == true ]]; then
   cp "$here/../benchmark-hyperfine.sh" "$work/benchmark-hyperfine.sh"
   cp "$here/record-benchmark-run.py" "$work/record-benchmark-run.py"
@@ -1127,11 +1130,20 @@ fi
 printf '%s  release.tar.gz\n' "$digest" | sha256sum -c -
 tar -xzf release.tar.gz
 bin="$HOME/omg-${tag}-${guest_arch}-linux-${distro}/omg"
+native_release="/opt/omg-qemu/omg-${tag}-${guest_arch}-linux-${distro}"
+sudo -n install -d -o root -g root -m 0755 /opt/omg-qemu "$native_release"
+sudo -n install -o root -g root -m 0755 "$bin" "$native_release/omg"
+cmp "$bin" "$native_release/omg"
+native_bin="$native_release/omg"
 daemon="${bin%/*}/omgd"
 if [[ ! -x "$daemon" ]]; then
   printf 'Release %s for %s is missing executable omgd; publish an archive containing both omg and omgd.\n' "$tag" "$distro" >&2
   exit 1
 fi
+sudo -n install -o root -g root -m 0755 "$daemon" "$native_release/omgd"
+cmp "$daemon" "$native_release/omgd"
+stat -c '%n uid=%u gid=%g mode=%a type=%F' / /opt /opt/omg-qemu "$native_release" "$native_bin" > evidence/native-executable-trust.txt
+sha256sum "$bin" "$native_bin" > evidence/native-executable-sha256.txt
 if [[ "$distro" == debian-trixie ]]; then
   timeout --kill-after=2s 45s python3 "$HOME/qemu-apt-abi.py" \
     --distro "$distro" --arch "$guest_arch" --omg "$bin" --omgd "$daemon" \
@@ -1199,7 +1211,18 @@ if [[ "$distro" == fedora ]]; then
 else
   grep -Eqi '^[[:space:]]+tree[[:space:]]' evidence/search.txt
 fi
-sudo -n "$bin" install --yes tree
+if [[ "$distro" == fedora ]]; then
+  rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | LC_ALL=C sort > evidence/native-advisory-denial-before.tsv
+  python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --deny-only --timeout 600 -- sudo -n "$native_bin" install --yes tree > evidence/native-advisory-denial.log
+  rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | LC_ALL=C sort > evidence/native-advisory-denial-after.tsv
+  cmp evidence/native-advisory-denial-before.tsv evidence/native-advisory-denial-after.tsv
+  if installed >/dev/null 2>&1; then echo 'denied advisory risk changed tree state' >&2; exit 1; fi
+fi
+if [[ "$distro" == arch ]]; then
+  sudo -n "$bin" install --yes tree
+else
+  python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --accept-only --timeout 600 -- sudo -n "$native_bin" install --yes tree
+fi
 installed
 "$bin" info tree > evidence/omg-info.txt
 "${native[@]}" > evidence/native-info.txt
@@ -1268,7 +1291,12 @@ if [[ "$distro" == debian || "$distro" == debian-trixie || "$distro" == ubuntu ]
     echo 'local archive was accepted without consent' >&2; exit 1
   fi
   grep -Fq 'require explicit consent' evidence/local-consent.txt
-  sudo -n "$bin" install --allow-local-file --yes "${packages[0]}"
+  dpkg-query -W '-f=${binary:Package}\t${Version}\t${db:Status-Status}\n' | LC_ALL=C sort > evidence/local-advisory-denial-before.tsv
+  python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --deny-only --timeout 600 -- sudo -n "$native_bin" install --allow-local-file --yes "${packages[0]}" > evidence/local-advisory-denial.log
+  dpkg-query -W '-f=${binary:Package}\t${Version}\t${db:Status-Status}\n' | LC_ALL=C sort > evidence/local-advisory-denial-after.tsv
+  cmp evidence/local-advisory-denial-before.tsv evidence/local-advisory-denial-after.tsv
+  if installed >/dev/null 2>&1; then echo 'denied advisory risk installed local tree' >&2; exit 1; fi
+  python3 "$HOME/qemu-runtime-advisory-oracle.py" --native --accept-only --require-review --timeout 600 -- sudo -n "$native_bin" install --allow-local-file --yes "${packages[0]}"
   installed
   sudo -n "$bin" remove --yes tree
   if installed >/dev/null 2>&1; then echo 'local package remains installed' >&2; exit 1; fi
@@ -1351,6 +1379,7 @@ if [[ "$distro" == fedora ]]; then
 fi
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 "/work/release/$archive" bench@127.0.0.1:release.tar.gz
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/guest-check.sh bench@127.0.0.1:guest-check.sh
+timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-runtime-advisory-oracle.py bench@127.0.0.1:qemu-runtime-advisory-oracle.py
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 /work/qemu-daemon-check.sh bench@127.0.0.1:qemu-daemon-check.sh
 timeout 60 docker exec -w /work/guest "$controller" scp "${opts[@]}" -P 2222 \
   /work/provision-qemu-crash-channel.py /work/check-qemu-health.py bench@127.0.0.1:
@@ -1611,7 +1640,8 @@ if [[ -n "$inventory_tiers" && "$rc" == 0 ]]; then
   # TSV-driven rows run only on a healthy guest, inside the controller
   # (same netns; /work is bind-mounted). Evidence lands in $work/inventory.
   inv_args=(--work /work --distro "$distro" --tiers "$inventory_tiers" --tag "$tag"
-    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
+    --binary "/home/bench/omg-${tag}-${arch}-linux-${distro}/omg"
+    --native-binary "/opt/omg-qemu/omg-${tag}-${arch}-linux-${distro}/omg" --tsv /work/cases.tsv)
   if [[ "$source_kind" == staged ]]; then
     inv_args+=(--man-page-inventory /work/man_page_inventory.txt)
   fi

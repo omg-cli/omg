@@ -5,7 +5,7 @@ import { URL as NodeURL } from "node:url";
 import { handle } from "../src/service";
 import { Store, type Sql, type Command } from "../src/storage";
 import type { Fetcher } from "../src/ingestion";
-import { gitBlobSha1 } from "../src/baseline";
+import { baselineImportCommands, gitBlobSha1 } from "../src/baseline";
 
 const now = "2026-11-13T02:00:00.000Z";
 const ingestToken = "controlled-ingest-token-at-least-32-characters";
@@ -275,5 +275,19 @@ test("missing publisher members remain awaiting import despite operator exhausti
         const baseline = await binding(fixture.store), publisher = await publisherFetcher();
         fixture.db.query("UPDATE baseline_receipt SET exhausted=1,caught_up=1,completed_at=?").run(now);
         expect(await (await verify(fixture.store, baseline, publisher.fetcher)).json()).toMatchObject({phase:"awaiting_import",expected_count:1,verified_count:0,archive_verified:false});
+    } finally { fixture.db.close(); }
+});
+
+test("replay conflict checks probe exact member keys instead of scanning the imported corpus", async () => {
+    const fixture = setup();
+    try {
+        const plans: string[] = [];
+        const sql: Sql = { ...fixture.store.sql, first: async <T>(text: string, values: (string | number | null)[] = []) => {
+            plans.push(...fixture.db.query<{detail:string}, (string | number | null)[]>(`EXPLAIN QUERY PLAN ${text}`).all(...values).map((row) => row.detail));
+            return fixture.store.sql.first<T>(text, values);
+        } };
+        await baselineImportCommands(new Store(sql, fixture.store.raw), "controlled-session", [{id:"CVE-2026-1234",raw}]);
+        expect(plans.join("\n")).toContain("session_id=? AND cve_id=?");
+        expect(plans.some((plan) => plan.endsWith("(session_id=?)"))).toBe(false);
     } finally { fixture.db.close(); }
 });

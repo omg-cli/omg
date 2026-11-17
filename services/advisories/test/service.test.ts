@@ -1001,3 +1001,85 @@ test("official delta fetching accepts large CVE records and preserves checkpoint
         db.close();
     }
 });
+
+
+test("authenticated ingestion failures retain bounded redacted platform diagnostics", async () => {
+    const fixture = setup();
+    const logs: unknown[][] = [];
+    const original = console.error;
+    console.error = (...parts: unknown[]) => { logs.push(parts); };
+    try {
+        const failing = new Store({ ...fixture.store.sql, batch: async () => {
+            throw new Error(`D1_ERROR: platform request failed ${token} ${"x".repeat(1000)}`, {cause:new Error("database operation budget exceeded")});
+        } }, fixture.store.raw, () => now);
+        const response = await handle(new Request("https://advisories.example/internal/ingest", {method:"POST",headers:{authorization:`Bearer ${token}`,"content-type":"application/json"},body:JSON.stringify({source:"cve",records:[cve()]})}), failing, token, now);
+        expect(response.status).toBe(503);
+        expect(logs).toHaveLength(1);
+        const encoded = JSON.stringify(logs);
+        expect(encoded).toContain("D1_ERROR");
+        expect(encoded).toContain("database operation budget exceeded");
+        expect(encoded).not.toContain(token);
+        expect(encoded.length).toBeLessThan(1200);
+    } finally { console.error = original; fixture.db.close(); }
+});
+
+
+function refreshRequest(body:unknown={},credential=token) {
+    return new Request("https://advisories.example/internal/cve-refresh",{method:"POST",headers:{authorization:`Bearer ${credential}`,"content-type":"application/json"},body:JSON.stringify(body)});
+}
+test("private CVE catchup authenticates before parsing and refuses caller source or budget",async()=>{
+    const {store,db}=setup();try{
+        let fetched=0;
+        const fetcher=async()=>{fetched++;throw new Error("unexpected source");};
+        const denied=await handle(new Request("https://advisories.example/internal/cve-refresh",{method:"POST",headers:{authorization:"Bearer wrong"},body:"invalid JSON"}),store,token,now,fetcher);
+        expect(denied.status).toBe(401);
+        expect((await handle(refreshRequest({url:"https://attacker.example",batch_size:999}),store,token,now,fetcher)).status).toBe(400);
+        expect(fetched).toBe(0);
+    }finally{db.close();}
+});
+test("private CVE catchup advances fixed 32-record delta batches without fabricating bootstrap",async()=>{
+    const {store,db}=setup();try{
+        const ids=Array.from({length:33},(_,index)=>`CVE-2026-${7000+index}`);
+        const delta=JSON.stringify([{fetchTime:now,numberOfChanges:33,new:ids.map(id=>({cveId:id,githubLink:cveUrl(id),dateUpdated:now})),updated:[],error:[]}]);
+        let active=0,peak=0;
+        const fetcher=async(url:string)=>{
+            if(url===SOURCES.cve)return new Response(delta);
+            const id=ids.find(id=>cveUrl(id)===url);
+            if(!id)throw new Error("unexpected source");
+            active++;peak=Math.max(peak,active);
+            await Bun.sleep(1);active--;
+            return new Response(cve("PUBLISHED",now,"5.2",id));
+        };
+        const first=await handle(refreshRequest(),store,token,now,fetcher);
+        expect(first.status).toBe(200);
+        expect(await first.json()).toMatchObject({source:"cve",complete:false,bootstrap_complete:false,cursor:JSON.stringify({event:now,offset:32})});
+        expect(db.query("SELECT COUNT(*) count FROM source_record").get()).toEqual({count:32});
+        const second=await handle(refreshRequest(),store,token,now,fetcher);
+        expect(second.status).toBe(200);
+        expect(await second.json()).toMatchObject({complete:true,bootstrap_complete:false,cursor:JSON.stringify({event:now,offset:33})});
+        expect(db.query("SELECT COUNT(*) count FROM source_record").get()).toEqual({count:33});
+        expect(peak).toBe(4);expect(active).toBe(0);
+        expect(db.query("SELECT COUNT(*) count FROM ingestion_lease").get()).toEqual({count:0});
+    }finally{db.close();}
+});
+test("private CVE catchup respects active owners and fences expired writes",async()=>{
+    const {store,db}=setup();try{
+        let fetched=0;
+        await store.lease("cve","existing-owner",now);
+        expect((await handle(refreshRequest(),store,token,now,async()=>{fetched++;return new Response("[]");})).status).toBe(409);
+        expect(fetched).toBe(0);
+        await store.release("cve","existing-owner");
+        let clock=now;
+        const guarded=new Store(store.sql,store.raw,()=>clock);
+        const id="CVE-2026-7333",delta=JSON.stringify([{fetchTime:now,numberOfChanges:1,new:[{cveId:id,githubLink:cveUrl(id),dateUpdated:now}],updated:[],error:[]}]);
+        const response=await handle(refreshRequest(),guarded,token,now,async(url)=>{
+            if(url===SOURCES.cve)return new Response(delta);
+            expect(url).toBe(cveUrl(id));clock="2026-11-13T02:11:00.000Z";
+            return new Response(cve("PUBLISHED",now,"5.2",id));
+        });
+        expect(response.status).toBe(503);
+        expect((await store.checkpoint("cve"))?.cursor).toBe(null);
+        expect(db.query("SELECT COUNT(*) count FROM source_record").get()).toEqual({count:0});
+        expect(db.query("SELECT COUNT(*) count FROM ingestion_lease").get()).toEqual({count:0});
+    }finally{db.close();}
+});

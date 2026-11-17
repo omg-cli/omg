@@ -510,6 +510,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('for telemetry in 0 1;', script)
         self.assertIn('for count in 1 2;', script)
         self.assertIn('timeout --kill-after=5s 180 "$binary" use node 24.21.0', script)
+        self.assertIn('if [[ "$count" == 1 ]]; then', script)
+        self.assertIn('--runtime node --version 24.21.0 --timeout 180 --accept-only --', script)
         self.assertIn('timeout --kill-after=5s 10 "$OMG_DATA_DIR/versions/node/current/bin/node"', script)
         for assertion in ("usage['runtime_usage_counts']['node'] == count", "usage['commands']['runtime_switch'] == count",
                           "usage['total_commands'] == count", "process.version !== \"v24.21.0\" || 6*7 !== 42"):

@@ -99,6 +99,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Test advisory baseline publication guards
+        run: python3 -m unittest discover -s scripts -p test_advisory_baseline.py
+
       - name: Test debt baseline guards
         run: python3 -m unittest discover -s scripts -p 'test_debt*.py'
 
@@ -2124,6 +2127,8 @@ jobs:
           scripts/require-workflow-success.sh docker-e2e.yml "$GITHUB_SHA" "Docker E2E"
           # CI Success already requires this run's staged QEMU verification.
 
+          # Archive membership comes from the publisher proof, never local counts.
+          python3 scripts/advisory-baseline.py status
           git tag "$TAG" "$GITHUB_SHA"
           git push origin "refs/tags/${TAG}"
           if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null; then

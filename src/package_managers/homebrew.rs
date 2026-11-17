@@ -1018,6 +1018,38 @@ impl HomebrewPackageManager {
             .is_some_and(|argument| matches!(*argument, "install" | "upgrade" | "reinstall"))
         {
             crate::core::security::policy::require_native_plan_support("Homebrew")?;
+            let executable = self.brew_executable();
+            let arguments = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                use crate::core::security::{VulnerabilityScanner, package_review};
+                use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+                let digest = Self::executable_digest(&executable)?;
+                let context = serde_json::to_string(&(
+                    "omg-native-homebrew-v1", &executable, &digest, &arguments,
+                ))?;
+                let subjects = vec![SecurityPackage {
+                    origin: SecurityOrigin::Unknown,
+                    name: format!("Homebrew {} transaction", arguments[0]),
+                    version: "unresolved native solver transaction".into(),
+                    advisory_source: None,
+                    architecture: None,
+                    description: "Requested transaction; not an invented package version".into(),
+                    licenses: Vec::new(),
+                }];
+                let gaps = vec![
+                    "Homebrew does not expose a frozen dependency transaction to this integration. Proposed formula/cask versions, dependencies, dependent repairs and downloaded artifacts are not established. No complete CVE or disclosed-zero-day assessment is available. https://docs.brew.sh/Manpage#install-options-formulacask-".into(),
+                ];
+                let scanner = VulnerabilityScanner::new();
+                let review = package_review::review(&subjects, &context, &gaps, &scanner)?;
+                review.verify(&scanner)?;
+                anyhow::ensure!(
+                    Self::executable_digest(&executable)? == digest,
+                    "Homebrew executable changed after advisory review"
+                );
+                Ok(())
+            })
+            .await
+            .context("Homebrew advisory review worker failed")??;
         }
         let targets = args
             .iter()
@@ -1045,6 +1077,24 @@ impl HomebrewPackageManager {
         } else {
             bail!("brew command failed: {args:?}")
         }
+    }
+
+    fn executable_digest(path: &Path) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let file = std::fs::File::open(path)
+            .context("Cannot bind Homebrew executable for advisory review")?;
+        anyhow::ensure!(
+            file.metadata()?.is_file(),
+            "Homebrew executable is not a regular file"
+        );
+        let mut bytes = Vec::new();
+        file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() <= 16 * 1024 * 1024,
+            "Homebrew executable exceeds review limit"
+        );
+        Ok(hex::encode(Sha256::digest(bytes)))
     }
 }
 
@@ -1310,6 +1360,71 @@ impl PackageManager for HomebrewPackageManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upgrade_requires_advisory_admission_before_native_mutation() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        let root = tempfile::tempdir()?;
+        if std::env::var_os("OMG_BREW_ADMISSION_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "package_managers::homebrew::tests::upgrade_requires_advisory_admission_before_native_mutation",
+                    "--nocapture",
+                ])
+                .env("OMG_BREW_ADMISSION_CHILD", "1")
+                .env("OMG_CONFIG_DIR", root.path().join("config"))
+                .env("OMG_DATA_DIR", root.path().join("data"))
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env_remove("SUDO_USER")
+                .env_remove("DOAS_USER")
+                .process_group(0)
+                .stdin(std::process::Stdio::null())
+                .output()?;
+            assert!(
+                output.status.success(),
+                "isolated upgrade admission failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+        std::fs::create_dir_all(root.path().join("bin"))?;
+        let executable = root.path().join("bin/brew");
+        let marker = root.path().join("mutation-started");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let manager = HomebrewPackageManager {
+            prefix: root.path().to_owned(),
+            cellar: root.path().join(CELLAR_DIR),
+            cache: Arc::new(RwLock::new(None)),
+            client: crate::core::http::download_client().clone(),
+        };
+        let error = manager
+            .update()
+            .await
+            .expect_err("unreviewed native upgrade must be refused");
+        assert!(
+            format!("{error:#}").contains("SECURITY WARNING"),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("https://docs.brew.sh/Manpage"),
+            "{error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "native mutation ran before security consent"
+        );
+        Ok(())
+    }
 
     #[test]
     fn installed_version_selection_uses_numeric_ordering() {

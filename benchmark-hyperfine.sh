@@ -576,6 +576,11 @@ if [[ "$GUEST_MODE" == true ]]; then
         verify_tree_identity before
         if [[ "$GUEST_TOOL" == omg ]]; then
             transaction=("${privileged[@]}" "$OMG" "$GUEST_TRANSACTION" --yes tree)
+            if [[ "$GUEST_TRANSACTION" == install && "$distro" != arch ]]; then
+                consent="$REPO_ROOT/qemu-runtime-advisory-oracle.py"
+                [[ -f "$consent" && ! -L "$consent" ]] || { echo 'Missing actual native security-consent driver.' >&2; exit 120; }
+                transaction=(python3 "$consent" --native --accept-only --timeout 600 -- "${transaction[@]}")
+            fi
             transaction_label=OMG
         else
             transaction=("${privileged[@]}" "${transaction_args[@]}")

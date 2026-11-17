@@ -26,7 +26,7 @@ export async function baselineImportCommands(store: Store, session: string, reco
     const rows = await Promise.all(records.map(async ({ id, raw }) => ({ id, hash: await sha256(raw), git: await gitBlobSha1(raw) })));
     const encoded = JSON.stringify(rows);
     const conflict = await store.sql.first<{ cve_id: string }>(
-        "SELECT b.cve_id FROM baseline_member b JOIN json_each(?) j ON b.cve_id=json_extract(j.value,'$.id') WHERE b.session_id=? AND b.payload_sha256<>json_extract(j.value,'$.hash') LIMIT 1", [encoded, session]);
+        "SELECT b.cve_id FROM json_each(?) j CROSS JOIN baseline_member b ON b.session_id=? AND b.cve_id=json_extract(j.value,'$.id') WHERE b.payload_sha256<>json_extract(j.value,'$.hash') LIMIT 1", [encoded, session]);
     if (conflict) throw new Error("baseline original payload mismatch");
     return [
         { sql: "INSERT INTO baseline_member(session_id,cve_id,payload_sha256) SELECT ?,json_extract(value,'$.id'),json_extract(value,'$.hash') FROM json_each(?) WHERE 1 ON CONFLICT(session_id,cve_id) DO NOTHING", values: [session, encoded] },

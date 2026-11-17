@@ -168,8 +168,8 @@ export class Store {
         const oldRows=await this.sql.all<RecordRow>(`SELECT * FROM source_record WHERE id IN (${records.map(()=>"?").join(",")})`,records.map(record=>record.id));
         const oldById=new Map(oldRows.map(record=>[record.id,record]));
         const changed=prepared.filter(({record,hash})=>cveChanged(record,hash,oldById.get(record.id)));
-        for(let start=0;start<changed.length;start+=4) {
-            const outcomes=await Promise.allSettled(changed.slice(start,start+4).map(({key,raw})=>this.raw.put(key,raw)));
+        for(let start=0;start<changed.length;start+=6) {
+            const outcomes=await Promise.allSettled(changed.slice(start,start+6).map(({key,raw})=>this.raw.put(key,raw)));
             const failed=outcomes.find(value=>value.status==="rejected");
             if(failed)throw failed.reason;
         }

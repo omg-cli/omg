@@ -358,7 +358,7 @@ exit "$rc"
             controller = self.copy_inventory_to_controller(Path(directory))
             for name in ('qemu-inventory.sh', 'qemu-local-oracle.py', 'qemu-license-oracle.py',
                          'qemu-fingerprint-oracle.py', 'qemu-fedora-update-fixture.sh',
-                         'qemu-doctor-turbo-oracle.py',
+                         'qemu-doctor-turbo-oracle.py', 'qemu-runtime-advisory-oracle.py',
                          'workspace-overlap-fixture.sh'):
                 with self.subTest(helper=name):
                     copied = controller / name
@@ -366,6 +366,10 @@ exit "$rc"
                                     f'Controller is missing executed helper {name}')
                     self.assertEqual(copied.read_bytes(),
                                      (WORKFLOW.parents[2] / 'scripts' / name).read_bytes())
+            shared = controller / 'runtime_advisory_fixture.py'
+            self.assertTrue(shared.is_file() and not shared.is_symlink())
+            self.assertEqual(shared.read_bytes(),
+                             (WORKFLOW.parents[2] / 'tests/runtime_advisory_fixture.py').read_bytes())
 
     def run_relocated_inventory(self, root, controller):
         home, tools, guest = (root / name for name in ('home', 'bin', 'guest'))
@@ -408,6 +412,22 @@ exit "$rc"
             self.assertEqual(receipts.get('qemu-local-oracle.py'),
                              hashlib.sha256((controller / 'qemu-local-oracle.py').read_bytes()).hexdigest(),
                              'Executed local oracle bytes are absent from controller input receipts')
+            for name in ('qemu-runtime-advisory-oracle.py', 'runtime_advisory_fixture.py'):
+                self.assertEqual(receipts.get(name),
+                                 hashlib.sha256((controller / name).read_bytes()).hexdigest(),
+                                 f'Executed runtime helper {name} is absent from input receipts')
+
+    @unittest.skipIf(os.name == 'nt', 'Relocated controller needs POSIX shell descriptors')
+    def test_relocated_controller_missing_runtime_helpers_cannot_record_a_pass(self):
+        for name in ('qemu-runtime-advisory-oracle.py', 'runtime_advisory_fixture.py'):
+            with self.subTest(helper=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                controller = self.copy_inventory_to_controller(root)
+                (controller / name).unlink()
+                result, evidence = self.run_relocated_inventory(root, controller)
+                self.assertNotEqual(result.returncode, 0)
+                results = evidence / 'results.json'
+                self.assertEqual(json.loads(results.read_text()) if results.exists() else [], [])
 
     @unittest.skipIf(os.name == 'nt', 'Relocated controller needs POSIX shell descriptors')
     def test_relocated_controller_missing_local_oracle_cannot_record_a_pass(self):

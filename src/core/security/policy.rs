@@ -353,6 +353,9 @@ impl SecurityPolicy {
             SecurityOrigin::AurArchive
             | SecurityOrigin::LocalArchive
             | SecurityOrigin::NpmRegistry
+            | SecurityOrigin::CargoRegistry
+            | SecurityOrigin::PyPiRegistry
+            | SecurityOrigin::GoModule
             | SecurityOrigin::RuntimeVendor { .. }
             | SecurityOrigin::Unknown => SecurityGrade::Community,
         }

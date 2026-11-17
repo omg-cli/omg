@@ -7,7 +7,7 @@ import {
     date,
     parseCve,
 } from "./domain";
-import { ingestCveGroups, parseBatch } from "./ingestion";
+import { ingestCveGroups, parseBatch, refreshSource } from "./ingestion";
 import { Store, type Checkpoint, type RecordRow } from "./storage";
 import { recentCves } from "./recent";
 import { epss } from "./epss";
@@ -97,6 +97,18 @@ async function route(
 ): Promise<Response> {
     const url = new URL(request.url);
     try {
+        if (url.pathname === "/internal/cve-refresh") {
+            if (request.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
+            if (!await authorized(request, token)) return Response.json({ error: "unauthorized" }, { status: 401 });
+            const input = object(JSON.parse(await boundedBody(request.body, 1024)));
+            if (Object.keys(input).length) throw new Error("invalid CVE refresh fields");
+            if (!await refreshSource(store, "cve", fetcher, now, 32)) return Response.json({ error: "ingestion busy" }, { status: 409 });
+            const checkpoint = await store.checkpoint("cve");
+            if (!checkpoint) throw new Error("missing migration");
+            return Response.json({ schema_version: 1, source: "cve", complete: !!checkpoint.complete && !checkpoint.error,
+                cursor: checkpoint.cursor, checked_at: checkpoint.checked_at, bootstrap_complete: checkpoint.bootstrap_complete === 1,
+                error: checkpoint.error }, { status: checkpoint.error ? 503 : 200 });
+        }
         if (url.pathname === "/internal/baseline/verify") {
             if (request.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
             if (!await authorized(request, runtimeRefreshSecret)) return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -451,6 +463,19 @@ async function route(
             /invalid|expected|exceeds|missing publication|mismatch|catchup|baseline|completeness/.test(
                 error.message,
             );
+        if (!invalid && url.pathname.startsWith("/internal/")) {
+            const reasons: string[] = [];
+            let cause: unknown = error;
+            for (let depth = 0; depth < 3 && cause instanceof Error; depth++) {
+                let message = cause.message;
+                for (const secret of [token, runtimeRefreshSecret]) {
+                    if (secret) message = message.replaceAll(secret, "[redacted]");
+                }
+                reasons.push(message.replace(/ghs_[A-Za-z0-9]{20,255}/g, "[redacted]").slice(0, 300));
+                cause = cause.cause;
+            }
+            console.error(JSON.stringify({ event: "internal_advisory_failure", path: url.pathname, reasons }));
+        }
         return Response.json(
             {
                 error: invalid

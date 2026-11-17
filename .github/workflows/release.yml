@@ -720,6 +720,10 @@ jobs:
             exit 1
           fi
 
+      - name: Require verified advisory baseline before GitHub publication
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
+        run: python3 scripts/advisory-baseline.py status
+
       - name: Publish GitHub Release
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -834,6 +838,9 @@ jobs:
       - name: Install pinned wrangler from vendored lockfile
         run: npm ci --prefix .github/deps/release-tools
 
+      - name: Require verified advisory baseline before R2 publication
+        run: python3 scripts/advisory-baseline.py status
+
       - name: Upload release artifacts to R2
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -908,6 +915,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          python3 scripts/advisory-baseline.py status
           WRANGLER="$PWD/.github/deps/release-tools/node_modules/.bin/wrangler"
           # Keep the bucket-served installer current so a pinned release URL
           # never serves a stale bootstrap script (getomg.xyz/install.sh is

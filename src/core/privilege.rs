@@ -1119,6 +1119,7 @@ const INTERNAL_PRIVILEGED_ENTRYPOINTS: &[&str] = &[
     "turboupdate",
     "install-plan",
     "omarchy-native",
+    "dnf-native",
 ];
 
 fn snapshot_install_inputs(
@@ -1281,6 +1282,17 @@ pub async fn run_privileged_child(args: &[&str]) -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!("Elevated command failed with exit code: {status}")
+}
+
+/// Re-enter OMG so its root owner resolves, reviews and replays the DNF plan.
+/// A caller can supply package names and fixed internal modes, never a replay path.
+#[cfg(feature = "fedora")]
+pub(crate) async fn run_privileged_dnf(args: &[String]) -> anyhow::Result<()> {
+    crate::package_managers::dnf::DnfPackageManager::validate_admission_args(args)?;
+    let mut payload = vec!["dnf-native", "--"];
+    payload.extend(args.iter().map(String::as_str));
+    payload.push(FLOW_PARENT_RECORDS);
+    run_privileged_child(&payload).await
 }
 
 #[cfg(test)]

@@ -164,9 +164,12 @@ impl crate::package_managers::PackageManager for AptPackageManager {
     fn update(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             if !is_root() {
-                crate::core::privilege::run_privileged_program("apt-get", &["upgrade", "-y"])
-                    .await?;
-                return Ok(());
+                return crate::core::privilege::run_privileged_child(&[
+                    "update",
+                    "--no-sync",
+                    "-y",
+                ])
+                .await;
             }
 
             tokio::task::spawn_blocking(update_blocking)
@@ -714,8 +717,48 @@ fn install_blocking(packages: &[String]) -> Result<()> {
 
 fn install_blocking_inner(packages: &[String]) -> Result<()> {
     crate::core::security::policy::require_native_plan_support("APT")?;
+    if !packages
+        .iter()
+        .any(|target| crate::core::security::is_local_debian_package_file(target))
+    {
+        let (_apt_guard, _native_lock, cache) = open_transaction_cache()?;
+        plan_apt_install(&cache, packages)?;
+        review_apt_transaction(&cache, "install", packages)?;
+        return cache
+            .commit(&mut AcquireProgress::apt(), &mut InstallProgress::apt())
+            .map_err(|error| anyhow!("APT install error: {error:?}"));
+    }
     let staged = crate::core::security::artifact::StagedInputs::prepare(packages)?;
     let packages = staged.targets.as_slice();
+    let snapshots = packages
+        .iter()
+        .filter(|target| crate::core::security::is_local_debian_package_file(target))
+        .map(|target| {
+            crate::core::security::artifact::ArchiveSnapshot::capture(std::path::Path::new(target))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let context = serde_json::to_string(&(
+        "omg-native-apt-local-v1",
+        packages,
+        snapshots
+            .iter()
+            .map(crate::core::security::artifact::ArchiveSnapshot::handoff)
+            .collect::<Vec<_>>(),
+    ))?;
+    let subjects = vec![super::types::SecurityPackage {
+        origin: super::types::SecurityOrigin::LocalArchive,
+        name: "APT local archive transaction".into(),
+        version: "unresolved native solver transaction".into(),
+        advisory_source: None,
+        architecture: None,
+        description: String::new(),
+        licenses: Vec::new(),
+    }];
+    let scanner = crate::core::security::VulnerabilityScanner::new();
+    let gaps = vec!["Local Debian archives are sealed, but apt-get's complete proposed dependency versions and artifact identities are not established by this integration. Complete CVE/disclosed-zero-day coverage is unknown. https://manpages.debian.org/apt-get".into()];
+    let review =
+        crate::core::security::package_review::review(&subjects, &context, &gaps, &scanner)?;
+    review.verify(&scanner)?;
     let mut command = crate::core::privilege::system_command("apt-get")?;
     command.args(["install", "-y", "--"]).args(packages);
     // Keep stdout live for progress, but capture stderr: apt's own
@@ -729,6 +772,57 @@ fn install_blocking_inner(packages: &[String]) -> Result<()> {
         return Err(apt_install_error(&output));
     }
 
+    Ok(())
+}
+
+fn plan_apt_install(cache: &Cache, requests: &[String]) -> Result<()> {
+    crate::core::security::validate_debian_package_specs(requests)?;
+    // Select every explicit version before automatic dependencies are marked.
+    for request in requests {
+        let (name, pin) = request
+            .split_once('=')
+            .map_or((request.as_str(), None), |(name, version)| {
+                (name, Some(version))
+            });
+        let package = cache
+            .get(name)
+            .with_context(|| format!("Package not found: {name}"))?;
+        if let Some(pin) = pin {
+            package
+                .get_version(pin)
+                .with_context(|| format!("APT version {pin} is not available for {name}"))?
+                .set_candidate();
+        }
+        anyhow::ensure!(package.candidate().is_some(), "No APT candidate for {name}");
+    }
+    for request in requests {
+        let name = request
+            .split_once('=')
+            .map_or(request.as_str(), |(name, _)| name);
+        let package = cache
+            .get(name)
+            .with_context(|| format!("Package not found: {name}"))?;
+        anyhow::ensure!(
+            package.mark_install(true, true),
+            "APT could not mark {name} for installation"
+        );
+        package.protect();
+    }
+    cache
+        .resolve(true)
+        .map_err(|error| anyhow!("APT resolve error: {error:?}"))?;
+    for request in requests {
+        if let Some((name, pin)) = request.split_once('=') {
+            let selected = cache
+                .get(name)
+                .and_then(|package| package.install_version())
+                .context("APT pinned request lacks resolved installation version")?;
+            anyhow::ensure!(
+                selected.version() == pin,
+                "APT changed the explicitly requested version for {name}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -838,13 +932,15 @@ fn update_blocking() -> Result<()> {
 
 fn update_blocking_inner() -> Result<()> {
     crate::core::security::policy::require_native_plan_support("APT")?;
-    let (_apt_guard, cache) = open_cache(&[])?;
+    let (_apt_guard, _native_lock, cache) = open_transaction_cache()?;
     cache
         .upgrade(Upgrade::SafeUpgrade)
         .map_err(|e| anyhow!("APT upgrade error: {e:?}"))?;
     cache
         .resolve(true)
         .map_err(|e| anyhow!("APT resolve error: {e:?}"))?;
+
+    review_apt_transaction(&cache, "upgrade", &[])?;
 
     let mut acquire_progress = AcquireProgress::apt();
     let mut install_progress = InstallProgress::apt();
@@ -853,6 +949,191 @@ fn update_blocking_inner() -> Result<()> {
         .map_err(|e| anyhow!("APT commit error: {e:?}"))?;
 
     Ok(())
+}
+
+struct NativeAptLock;
+
+impl Drop for NativeAptLock {
+    fn drop(&mut self) {
+        rust_apt::util::apt_unlock();
+    }
+}
+
+fn open_transaction_cache() -> Result<(MutexGuard<'static, ()>, NativeAptLock, Cache)> {
+    let guard = APT_CACHE_LOCK
+        .lock()
+        .map_err(|_| anyhow!("APT cache lock poisoned"))?;
+    rust_apt::util::apt_lock().map_err(|error| anyhow!("APT transaction lock: {error:?}"))?;
+    let native_lock = NativeAptLock;
+    ensure_apt_fetch_dirs();
+    let cache = Cache::new::<&str>(&[]).map_err(|error| anyhow!("APT cache error: {error:?}"))?;
+    Ok((guard, native_lock, cache))
+}
+
+fn review_apt_transaction(cache: &Cache, operation: &str, requested: &[String]) -> Result<()> {
+    let (inventory, actions, gaps) = apt_transaction_evidence(cache)?;
+    if inventory.is_empty() {
+        return Ok(());
+    }
+    let context =
+        serde_json::to_string(&("omg-native-apt-resolved-v1", operation, requested, actions))?;
+    let scanner = crate::core::security::VulnerabilityScanner::new();
+    let review =
+        crate::core::security::package_review::review(&inventory, &context, &gaps, &scanner)?;
+    review.verify(&scanner)
+}
+
+type AptTransactionEvidence = (
+    Vec<super::types::SecurityPackage>,
+    Vec<serde_json::Value>,
+    Vec<String>,
+);
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AptRepositoryEvidence {
+    origin: Option<String>,
+    site: Option<String>,
+    archive: Option<String>,
+    index_path: Option<String>,
+    label: Option<String>,
+    downloadable: bool,
+    native_trusted: Option<bool>,
+    archive_uri: Option<String>,
+    sha256: Option<String>,
+}
+
+fn apt_repository_matches_vendor(expected: &str, record: &AptRepositoryEvidence) -> bool {
+    // IsTrusted also permits configured trusted=yes. The publisher transport
+    // must be established independently; other mirrors need signer evidence.
+    if !record.downloadable
+        || record.native_trusted != Some(true)
+        || record.origin.as_deref() != Some(expected)
+    {
+        return false;
+    }
+    let Some(uri) = record
+        .archive_uri
+        .as_deref()
+        .and_then(|uri| reqwest::Url::parse(uri).ok())
+    else {
+        return false;
+    };
+    if uri.scheme() != "https"
+        || !uri.username().is_empty()
+        || uri.password().is_some()
+        || uri.port_or_known_default() != Some(443)
+        || uri.query().is_some()
+        || uri.fragment().is_some()
+        || record.site.as_deref() != uri.host_str()
+    {
+        return false;
+    }
+    let path = uri.path();
+    let normalized = path.to_ascii_lowercase();
+    if normalized.contains("%2f")
+        || normalized.contains("%5c")
+        || normalized.contains("%2e")
+        || !path.ends_with(".deb")
+    {
+        return false;
+    }
+    match (expected, uri.host_str()) {
+        ("Debian", Some("deb.debian.org")) => {
+            path.starts_with("/debian/pool/") || path.starts_with("/debian-security/pool/")
+        }
+        ("Debian", Some("security.debian.org")) => path.starts_with("/debian-security/pool/"),
+        ("Ubuntu", Some("archive.ubuntu.com" | "security.ubuntu.com")) => {
+            path.starts_with("/ubuntu/pool/")
+        }
+        ("Ubuntu", Some("ports.ubuntu.com")) => path.starts_with("/ubuntu-ports/pool/"),
+        _ => false,
+    }
+}
+
+fn apt_transaction_evidence(cache: &Cache) -> Result<AptTransactionEvidence> {
+    use super::types::{SecurityOrigin, SecurityPackage};
+    let mut inventory = Vec::new();
+    let mut actions = Vec::new();
+    let mut gaps = Vec::new();
+    for package in cache.get_changes(true) {
+        if package.marked_delete() {
+            actions.push(serde_json::json!({"remove":package.fullname(true),"version":package.installed().map(|version| version.version().to_owned())}));
+            continue;
+        }
+        let version = package
+            .install_version()
+            .context("APT change lacks resolved installation version")?;
+        let origins = version
+            .version_files()
+            .map(|record| {
+                let file = record.package_file();
+                let downloadable = file.is_downloadable();
+                AptRepositoryEvidence {
+                    origin: file.origin().map(str::to_owned),
+                    site: file.site().map(str::to_owned),
+                    archive: file.archive().map(str::to_owned),
+                    index_path: file.filename().map(str::to_owned),
+                    label: file.label().map(str::to_owned),
+                    downloadable,
+                    native_trusted: downloadable.then(|| file.index_file().is_trusted()),
+                    archive_uri: downloadable
+                        .then(|| file.index_file().archive_uri(&record.lookup().filename())),
+                    sha256: record.lookup().hash_find("sha256".into()),
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected_origin = match crate::core::env::distro::detect_distro() {
+            crate::core::env::distro::Distro::Debian => Some("Debian"),
+            crate::core::env::distro::Distro::Ubuntu => Some("Ubuntu"),
+            _ => None,
+        };
+        let downloadable = origins
+            .iter()
+            .filter(|record| record.downloadable)
+            .collect::<Vec<_>>();
+        let native_origin = expected_origin.is_some_and(|expected| {
+            !downloadable.is_empty()
+                && downloadable
+                    .iter()
+                    .all(|record| apt_repository_matches_vendor(expected, record))
+        });
+        let digest = version.sha256();
+        if digest.as_ref().is_none_or(|value| {
+            value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            gaps.push(format!(
+                "APT resolved package {} has no established SHA256 archive identity",
+                package.fullname(true)
+            ));
+        }
+        if !native_origin {
+            gaps.push(format!(
+                "APT publisher identity for {} is unestablished. Release Origin and configured index trust alone are insufficient; signing-key fingerprints are not exposed by this API. Covered distribution mapping requires matching vendor HTTPS archive/site and native index trust. Other mirrors remain Unknown.",
+                package.fullname(true)
+            ));
+        }
+        let identity = SecurityPackage {
+            origin: if native_origin {
+                SecurityOrigin::DistributionPackage
+            } else {
+                SecurityOrigin::OtherRepository {
+                    repository: "APT configured repositories".into(),
+                }
+            },
+            name: package.name().to_owned(),
+            version: version.version().to_owned(),
+            advisory_source: Some((
+                version.source_name().to_owned(),
+                version.source_version().to_owned(),
+            )),
+            architecture: Some(version.arch().to_owned()),
+            description: version.summary().unwrap_or_default(),
+            licenses: Vec::new(),
+        };
+        actions.push(serde_json::json!({"install":identity.name,"version":identity.version,"source":identity.advisory_source,"architecture":identity.architecture,"sha256":digest,"uris":origins.iter().filter_map(|record| record.archive_uri.as_ref()).collect::<Vec<_>>(),"repositories":origins}));
+        inventory.push(identity);
+    }
+    Ok((inventory, actions, gaps))
 }
 
 fn sync_databases_blocking() -> Result<()> {
@@ -938,6 +1219,208 @@ fn local_to_packages(local_pkgs: Vec<LocalPackage>) -> Vec<Package> {
 #[cfg(unix)]
 mod tests {
     use super::{APT_FETCH_DIRS, apt_install_error, ensure_fetch_dirs};
+
+    #[test]
+    fn spoofed_release_origin_or_configured_trust_never_establish_vendor_mapping() {
+        let official = super::AptRepositoryEvidence {
+            origin: Some("Debian".into()),
+            site: Some("deb.debian.org".into()),
+            archive: Some("stable".into()),
+            index_path: Some("/var/lib/apt/lists/controlled_Packages".into()),
+            label: Some("Debian".into()),
+            downloadable: true,
+            native_trusted: Some(true),
+            archive_uri: Some(
+                "https://deb.debian.org/debian/pool/main/f/fixture/fixture_1-1_amd64.deb".into(),
+            ),
+            sha256: Some("0".repeat(64)),
+        };
+        assert!(super::apt_repository_matches_vendor("Debian", &official));
+        assert!(!super::apt_repository_matches_vendor("Ubuntu", &official));
+        for (site, uri, trusted) in [
+            (
+                "attacker.invalid",
+                "https://attacker.invalid/debian/pool/fixture_1.deb",
+                true,
+            ),
+            (
+                "deb.debian.org.attacker.invalid",
+                "https://deb.debian.org.attacker.invalid/debian/pool/fixture_1.deb",
+                true,
+            ),
+            (
+                "deb.debian.org",
+                "https://attacker.invalid/debian/pool/fixture_1.deb",
+                true,
+            ),
+            (
+                "deb.debian.org",
+                "http://deb.debian.org/debian/pool/fixture_1.deb",
+                true,
+            ),
+            (
+                "deb.debian.org",
+                "https://deb.debian.org/unestablished/fixture_1.deb",
+                true,
+            ),
+            (
+                "deb.debian.org",
+                "https://deb.debian.org/debian/pool/fixture_1.deb?source=other",
+                true,
+            ),
+            (
+                "deb.debian.org",
+                "https://deb.debian.org/debian/pool/fixture_1.deb",
+                false,
+            ),
+            (
+                "mirror.invalid",
+                "https://mirror.invalid/debian/pool/fixture_1.deb",
+                true,
+            ),
+        ] {
+            let record = super::AptRepositoryEvidence {
+                site: Some(site.into()),
+                archive_uri: Some(uri.into()),
+                native_trusted: Some(trusted),
+                ..official.clone()
+            };
+            assert!(
+                !super::apt_repository_matches_vendor("Debian", &record),
+                "Origin spoof mapped: {record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_pinned_install_selects_requested_version_architecture_and_dependencies()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (_guard, baseline) = super::open_cache_inner(&[], false)?;
+        let architecture = baseline
+            .get("apt")
+            .and_then(|package| package.candidate())
+            .map(|version| version.arch().to_owned())
+            .expect("native APT architecture");
+        drop(baseline);
+        let packages = directory.path().join("Packages");
+        let record = |name: &str, version: &str, dependency: &str, hash: char| {
+            format!(
+                "Package: {name}\nVersion: {version}\nArchitecture: {architecture}\n{dependency}Filename: pool/{name}_{version}.deb\nSize: 1\nSHA256: {}\nDescription: controlled pinned solver fixture\n\n",
+                hash.to_string().repeat(64)
+            )
+        };
+        std::fs::write(
+            &packages,
+            [
+                record(
+                    "omg-pin-fixture-app",
+                    "2:1.0~rc1-3",
+                    "Depends: omg-pin-fixture-dep (= 2:0.9-1)\n",
+                    '0',
+                ),
+                record(
+                    "omg-pin-fixture-app",
+                    "3:2.0-1",
+                    "Depends: omg-pin-fixture-dep (= 3:1.0-1)\n",
+                    '1',
+                ),
+                record("omg-pin-fixture-dep", "2:0.9-1", "", '2'),
+                record("omg-pin-fixture-dep", "3:1.0-1", "", '3'),
+            ]
+            .join(""),
+        )?;
+        let cache = rust_apt::Cache::new(&[packages.to_string_lossy().as_ref()])
+            .map_err(|error| anyhow::anyhow!("native pinned fixture cache: {error:?}"))?;
+        assert_eq!(
+            cache
+                .get("omg-pin-fixture-app")
+                .and_then(|package| package.candidate())
+                .unwrap()
+                .version(),
+            "3:2.0-1"
+        );
+        super::plan_apt_install(
+            &cache,
+            &[format!("omg-pin-fixture-app:{architecture}=2:1.0~rc1-3")],
+        )?;
+        let (inventory, actions, gaps) = super::apt_transaction_evidence(&cache)?;
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(
+            (
+                &*inventory[0].name,
+                &*inventory[0].version,
+                inventory[0].architecture.as_deref()
+            ),
+            (
+                "omg-pin-fixture-app",
+                "2:1.0~rc1-3",
+                Some(architecture.as_str())
+            )
+        );
+        assert_eq!(
+            (&*inventory[1].name, &*inventory[1].version),
+            ("omg-pin-fixture-dep", "2:0.9-1")
+        );
+        assert_eq!(actions[0]["sha256"], "0".repeat(64));
+        assert!(
+            actions[0]["repositories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|record| record.get("native_trusted").is_some()
+                    && record.get("archive_uri").is_some())
+        );
+        assert!(!gaps.is_empty());
+        let missing =
+            super::plan_apt_install(&cache, &["omg-pin-fixture-app=999.0-1".into()]).unwrap_err();
+        assert!(missing.to_string().contains("not available"), "{missing:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn native_solver_admission_includes_dependencies_source_versions_and_archive_hashes()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let packages = directory.path().join("Packages");
+        std::fs::write(
+            &packages,
+            format!(
+                "Package: omg-admission-fixture-app\nVersion: 2:1.0~rc1-3\nArchitecture: all\nDepends: omg-admission-fixture-dep (= 2:0.9-1)\nSource: omg-admission-fixture-source (2:0.8-1)\nFilename: pool/app.deb\nSize: 1\nSHA256: {}\nDescription: controlled solver fixture\n\nPackage: omg-admission-fixture-dep\nVersion: 2:0.9-1\nArchitecture: all\nFilename: pool/dep.deb\nSize: 1\nSHA256: {}\nDescription: controlled dependency fixture\n\n",
+                "0".repeat(64),
+                "1".repeat(64)
+            ),
+        )?;
+        let (_guard, cache) =
+            super::open_cache_inner(&[packages.to_string_lossy().into_owned()], false)?;
+        let package = cache
+            .get("omg-admission-fixture-app")
+            .expect("native local package");
+        assert!(package.mark_install(true, true));
+        package.protect();
+        cache
+            .resolve(true)
+            .map_err(|error| anyhow::anyhow!("native fixture resolve: {error:?}"))?;
+        let (inventory, actions, gaps) = super::apt_transaction_evidence(&cache)?;
+        assert_eq!(inventory.len(), 2);
+        assert_eq!(inventory[0].version, "2:1.0~rc1-3");
+        assert_eq!(
+            inventory[0].advisory_source,
+            Some(("omg-admission-fixture-source".into(), "2:0.8-1".into()))
+        );
+        assert_eq!(inventory[1].name, "omg-admission-fixture-dep");
+        assert_eq!(inventory[1].version, "2:0.9-1");
+        assert_eq!(actions[0]["sha256"], "0".repeat(64));
+        assert!(
+            !gaps.is_empty(),
+            "unsigned local Packages fixture must not become distribution coverage"
+        );
+        assert!(inventory.iter().all(|package| !matches!(
+            package.origin,
+            super::super::types::SecurityOrigin::DistributionPackage
+        )));
+        Ok(())
+    }
 
     #[test]
     #[serial_test::serial]

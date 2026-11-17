@@ -24,12 +24,27 @@ pub enum SecurityOrigin {
     DistributionPackage,
     /// Exact coordinates from a validated public npm registry lock.
     NpmRegistry,
+    CargoRegistry,
+    PyPiRegistry,
+    GoModule,
     /// Vendor runtime coordinates are independent of registry package names.
     RuntimeVendor {
         runtime: String,
         vendor: String,
     },
     Unknown,
+}
+
+impl SecurityOrigin {
+    pub(crate) const fn registry_ecosystem(&self) -> Option<&'static str> {
+        match self {
+            Self::NpmRegistry => Some("npm"),
+            Self::CargoRegistry => Some("crates.io"),
+            Self::PyPiRegistry => Some("PyPI"),
+            Self::GoModule => Some("Go"),
+            _ => None,
+        }
+    }
 }
 
 /// Installed identity for security exports. Native versions are opaque strings;

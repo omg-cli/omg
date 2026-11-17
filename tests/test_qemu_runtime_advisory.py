@@ -1,11 +1,15 @@
 """Exercise the QEMU consent driver with a real controlling terminal."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
+import shlex
+import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("qemu_runtime_consent", ROOT / "scripts/qemu-runtime-advisory-oracle.py")
@@ -14,10 +18,10 @@ spec.loader.exec_module(driver)
 
 
 class RuntimeConsentTests(unittest.TestCase):
-    def command(self, root, *, known=True, url=True, findings=1, hang=False):
+    def command(self, root, *, known=True, url=True, findings=1, hang=False, native=False):
         script = root / "fixture.py"
         details = ('SECURITY WARNING: the selected transaction has disclosed advisory findings.\n' if known else 'SECURITY WARNING: advisory coverage for the selected transaction is unknown.\n')
-        details += 'Package: ["node","24.21.0","x86_64"]\n'
+        details += ('Package: ["tree","2.2.1-1",{"kind":"unknown"},"x86_64",null,[]]\n' if native else 'Package: ["node","24.21.0","x86_64"]\n')
         details += 'CVE-2026-12345\n' if known else 'Coverage gap: controlled incomplete fixture\n'
         if url: details += 'https://www.cve.org/CVERecord?id=CVE-2026-12345\n'
         if findings > 1:
@@ -87,6 +91,123 @@ print('runtime-install-complete')
             finally: os.chdir(old)
             self.assertLess(time.monotonic() - started, 2)
             self.assertFalse((root / 'accepted.marker').exists())
+
+    def test_accounting_accept_only_runs_the_original_cli_command_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = self.command(root)
+            script = Path(command[1])
+            script.write_text("with open('attempts.log','a') as attempts: attempts.write('attempt\\n')\n" + script.read_text())
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                                     '--runtime', 'node', '--version', '24.21.0', '--timeout', '5',
+                                     '--accept-only', '--', *command], cwd=root, capture_output=True,
+                                    start_new_session=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertEqual((root / 'attempts.log').read_text().splitlines(), ['attempt'])
+            self.assertTrue((root / 'accepted.marker').exists())
+            receipt = json.loads(result.stdout.split(b'OMG_QEMU_RUNTIME_CONSENT=')[1])
+            self.assertIsNone(receipt['denied_exit_code'])
+            self.assertIsNone(receipt['denied_current_unchanged'])
+
+    def test_native_known_and_unknown_acceptance_runs_each_original_command_once(self):
+        for known in (True, False):
+            with self.subTest(known=known), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                command = self.command(root, known=known, native=True)
+                script = Path(command[1])
+                script.write_text("with open('attempts.log','a') as attempts: attempts.write('attempt\\n')\n" + script.read_text())
+                result = subprocess.run([sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                                         '--native', '--timeout', '5', '--accept-only', '--require-review',
+                                         '--', *command], cwd=root, capture_output=True,
+                                        start_new_session=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+                self.assertEqual((root / 'attempts.log').read_text().splitlines(), ['attempt'])
+                self.assertTrue((root / 'accepted.marker').exists())
+                receipt = json.loads(result.stdout.split(b'OMG_QEMU_NATIVE_CONSENT=')[1])
+                self.assertEqual(receipt['accepted_review'], 'a' * 64)
+                self.assertEqual(receipt['accepted_reviews'], ['a' * 64])
+
+    def test_native_no_terminal_refuses_and_never_mutates_the_prior_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'prior').write_bytes(b'prior native package')
+            result = subprocess.run(self.command(root, known=False, native=True), cwd=root,
+                                    stdin=subprocess.DEVNULL, capture_output=True,
+                                    start_new_session=True, timeout=5)
+            self.assertEqual(result.returncode, 7)
+            self.assertIn(b'Coverage gap:', result.stderr)
+            self.assertIn(b'https://', result.stderr)
+            self.assertFalse((root / 'accepted.marker').exists())
+            self.assertEqual((root / 'prior').read_bytes(), b'prior native package')
+
+    def test_native_denial_control_records_one_actual_refused_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = self.command(root, known=False, native=True)
+            script = Path(command[1])
+            script.write_text("with open('attempts.log','a') as attempts: attempts.write('attempt\\n')\n" + script.read_text())
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                                     '--native', '--deny-only', '--timeout', '5', '--', *command],
+                                    cwd=root, capture_output=True, start_new_session=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertEqual((root / 'attempts.log').read_text().splitlines(), ['attempt'])
+            self.assertFalse((root / 'accepted.marker').exists())
+            receipt = json.loads(result.stdout.split(b'OMG_QEMU_NATIVE_CONSENT=')[1])
+            self.assertEqual(receipt['denied_exit_code'], 7)
+            self.assertIsNone(receipt['accepted_review'])
+
+    def test_native_rejects_missing_identity_or_https_before_acceptance(self):
+        for fault in ('identity', 'url'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                command = self.command(root, native=True, url=fault != 'url')
+                if fault == 'identity':
+                    script = Path(command[1])
+                    script.write_text(script.read_text().replace('Package: [', 'Missing: ['))
+                result = subprocess.run([sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                                         '--native', '--timeout', '5', '--accept-only', '--require-review',
+                                         '--', *command], cwd=root, capture_output=True,
+                                        start_new_session=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((root / 'accepted.marker').exists())
+
+    def test_native_clean_success_can_run_without_inventing_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / 'clean.py'
+            script.write_text("open('attempts.log','a').write('attempt\\n')\nprint('native-clean-complete')\n")
+            command = [sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                       '--native', '--timeout', '5', '--accept-only', '--', sys.executable, str(script)]
+            result = subprocess.run(command, cwd=root, capture_output=True, start_new_session=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertEqual((root / 'attempts.log').read_text().splitlines(), ['attempt'])
+            receipt = json.loads(result.stdout.split(b'OMG_QEMU_NATIVE_CONSENT=')[1])
+            self.assertIsNone(receipt['accepted_review'])
+            self.assertEqual(receipt['accepted_reviews'], [])
+
+    def test_actual_transaction_recipe_keeps_one_original_install_after_exact_review(self):
+        source = (ROOT / 'benchmark-hyperfine.sh').read_text()
+        begin = source.index('        if [[ "$GUEST_TOOL" == omg ]]; then')
+        end = source.index('        command_json "$transaction_label"', begin)
+        for distro in ('debian', 'fedora'):
+            with self.subTest(distro=distro), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                command = self.command(root, native=True, known=False)
+                executable = Path(command[1])
+                executable.write_text('#!' + sys.executable + '\n' +
+                                      "with open('attempts.log','a') as attempts: attempts.write('attempt\\n')\n" +
+                                      executable.read_text())
+                executable.chmod(0o755)
+                shutil.copyfile(ROOT / 'scripts/qemu-runtime-advisory-oracle.py', root / 'qemu-runtime-advisory-oracle.py')
+                recipe = ('set -euo pipefail\nGUEST_TOOL=omg\nGUEST_TRANSACTION=install\n'
+                          + f'distro={shlex.quote(distro)}\nREPO_ROOT={shlex.quote(str(root))}\n'
+                          + f'OMG={shlex.quote(str(executable))}\nprivileged=()\n'
+                          + source[begin:end] + '\n"${transaction[@]}"\n')
+                result = subprocess.run(['bash', '-c', recipe], cwd=root, capture_output=True,
+                                        start_new_session=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+                self.assertEqual((root / 'attempts.log').read_text().splitlines(), ['attempt'])
+                self.assertTrue((root / 'accepted.marker').exists())
 
 
 if __name__ == '__main__': unittest.main()

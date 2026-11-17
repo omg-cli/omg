@@ -10,6 +10,8 @@ mode=$1; binary=$2; guest_user=$3
 for tool in rpm rpmbuild createrepo_c dnf jq sudo; do
   command -v "$tool" >/dev/null || { printf 'missing fixture tool: %s\nOMG_QEMU_FIXTURE_SETUP_FAILED\n' "$tool" >&2; exit 120; }
 done
+consent="$(dirname "${BASH_SOURCE[0]}")/qemu-runtime-advisory-oracle.py"
+[[ -f "$consent" && ! -L "$consent" ]] || { echo 'missing real security-consent fixture' >&2; exit 120; }
 package=omg-qemu-update-oracle
 repo_id=omg-qa-update
 config=/etc/dnf/dnf.conf
@@ -153,7 +155,7 @@ else
 fi
 printf 'OMG_QEMU_UPDATE_FIXTURE:before:%s:1\n' "$mode"
 phase=product
-sudo -H -u "$guest_user" -- "$binary" update "--$mode" --yes
+sudo -H -u "$guest_user" -- python3 "$consent" --native --accept-only --require-review --timeout 600 -- "$binary" update "--$mode" --yes
 phase=verification
 [[ $(rpm -q --qf '%{VERSION}\n' "$package") == 2 ]] || { echo 'OMG did not upgrade fixture to version 2' >&2; exit 1; }
 rpm -qa --qf '%{NAME}|%{EPOCHNUM}|%{VERSION}|%{RELEASE}|%{ARCH}\n' |

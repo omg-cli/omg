@@ -169,6 +169,59 @@ export async function refreshCves(
         },
     ]);
 }
+export async function refreshSource(
+    store: Store,
+    source: Feed,
+    fetcher: Fetcher,
+    now: string,
+    batchSize = LIMITS.deltaRecords,
+): Promise<boolean> {
+    const owner = crypto.randomUUID();
+    if (!(await store.lease(source, owner, now))) return false;
+    const writer = store.writer(source, owner);
+    await writer.sql.batch([
+        {
+            sql: "INSERT INTO ingestion_run(id,source,started_at) VALUES(?,?,?)",
+            values: [owner, source, now],
+        },
+    ]);
+    try {
+        if (source === "cve")
+            await refreshCves(writer, fetcher, now, batchSize);
+        else await refreshSnapshot(writer, source, fetcher, now);
+        await writer.sql.batch([
+            {
+                sql: "UPDATE ingestion_run SET finished_at=? WHERE id=?",
+                values: [now, owner],
+            },
+        ]);
+    } catch (error) {
+        const message =
+            error instanceof Error
+                ? error.message.slice(0, 200)
+                : "ingestion failed";
+        await writer.sql.batch([
+            {
+                sql: "UPDATE source_checkpoint SET error=?,complete=0 WHERE source=?",
+                values: [message, source],
+            },
+            {
+                sql: "UPDATE ingestion_run SET finished_at=?,error=? WHERE id=?",
+                values: [now, message, owner],
+            },
+        ]);
+        console.error(
+            JSON.stringify({
+                event: "ingestion_failed",
+                source,
+                error: message,
+            }),
+        );
+    } finally {
+        await store.release(source, owner);
+    }
+    return true;
+}
 export async function refresh(
     store: Store,
     fetcher: Fetcher,
@@ -176,50 +229,7 @@ export async function refresh(
     batchSize = LIMITS.deltaRecords,
 ) {
     for (const source of ["arch", "kev", "cve"] satisfies Feed[]) {
-        const owner = crypto.randomUUID();
-        if (!(await store.lease(source, owner, now))) continue;
-        const writer = store.writer(source, owner);
-        await writer.sql.batch([
-            {
-                sql: "INSERT INTO ingestion_run(id,source,started_at) VALUES(?,?,?)",
-                values: [owner, source, now],
-            },
-        ]);
-        try {
-            if (source === "cve")
-                await refreshCves(writer, fetcher, now, batchSize);
-            else await refreshSnapshot(writer, source, fetcher, now);
-            await writer.sql.batch([
-                {
-                    sql: "UPDATE ingestion_run SET finished_at=? WHERE id=?",
-                    values: [now, owner],
-                },
-            ]);
-        } catch (error) {
-            const message =
-                error instanceof Error
-                    ? error.message.slice(0, 200)
-                    : "ingestion failed";
-            await writer.sql.batch([
-                {
-                    sql: "UPDATE source_checkpoint SET error=?,complete=0 WHERE source=?",
-                    values: [message, source],
-                },
-                {
-                    sql: "UPDATE ingestion_run SET finished_at=?,error=? WHERE id=?",
-                    values: [now, message, owner],
-                },
-            ]);
-            console.error(
-                JSON.stringify({
-                    event: "ingestion_failed",
-                    source,
-                    error: message,
-                }),
-            );
-        } finally {
-            await store.release(source, owner);
-        }
+        await refreshSource(store, source, fetcher, now, batchSize);
     }
     await store.sql.batch([
         {
