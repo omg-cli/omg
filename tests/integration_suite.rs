@@ -175,6 +175,13 @@ fn detect_installed_runtime(
         )
         .unwrap();
     }
+    #[cfg(unix)]
+    common::seed_runtime_advisory_fixture(
+        project,
+        runtime,
+        installed.file_name().unwrap().to_str().unwrap(),
+    )
+    .unwrap();
     assert!(!versions.join("current").exists());
     let result = run_omg_with_options(
         &["use", runtime],
@@ -1184,6 +1191,8 @@ mod edge_cases {
         let version_dir = versions_dir.join("20.10.0");
         fs::create_dir_all(version_dir.join("bin")).unwrap();
         write_node_fixture(&version_dir.join("bin/node"), "20.10.0", "runtime fixture");
+        #[cfg(unix)]
+        common::seed_runtime_advisory_fixture(&project, "node", "20.10.0").unwrap();
         assert!(!versions_dir.join("current").exists());
 
         let deep_path = project.create_dir("a/b/c/d/e");

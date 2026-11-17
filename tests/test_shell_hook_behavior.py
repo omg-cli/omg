@@ -11,6 +11,8 @@ import time
 import unittest
 import venv
 
+from runtime_advisory_fixture import fixture_cli_environment, seed_runtime_advisory_fixture
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -77,15 +79,21 @@ fi
             (project / ".python-version").write_text(version)
             runtime = root / f"data/versions/python/{version}/bin"
             runtime.mkdir(parents=True)
+            payload = runtime / "python3"
+            payload.write_text(f"#!/bin/sh\nprintf '%s\\n' 'Python {version}'\n")
+            payload.chmod(0o755)
         (root / "neutral").mkdir()
         binary = os.environ.get("OMG_HOOK_TEST_BINARY")
         captured = os.environ.get("OMG_HOOK_TEST_ENV_OUTPUTS")
         if binary:
+            environment = fixture_cli_environment(root)
+            for version in ("3.12.0", "3.13.0"):
+                seed_runtime_advisory_fixture(root / f"data/versions/python/{version}",
+                                              "python", version, environment["OMG_CONFIG_DIR"])
             for name in ("A", "B"):
                 result = subprocess.run([binary, "hook-env", "-s", shell],
                                         cwd=root / f"project-{name}", text=True, capture_output=True, timeout=15,
-                                        env={**os.environ, "OMG_NATIVE_TEST_DATA_DIR": "1",
-                                             "OMG_DATA_DIR": str(root / "data")})
+                                        env=environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stderr, "", result.stderr)
                 outputs[name] = result.stdout
@@ -283,6 +291,24 @@ omg-explicit-count
             self.assertEqual(self.run_shell("zsh", script, root).splitlines(),
                              ["45", "123", "6", "7", "1", "0", "0", "0", "0", "73"])
             self.assertEqual((root / "events").read_text(), "cli-fallback\n")
+
+    def test_actual_cli_refuses_unreviewed_runtime_path(self):
+        binary = os.environ.get("OMG_HOOK_TEST_BINARY")
+        if not binary:
+            self.skipTest("requires actual CLI hook-env binary")
+        with tempfile.TemporaryDirectory(prefix="omg-hook-unreviewed-") as directory:
+            root = Path(directory)
+            environment = fixture_cli_environment(root)
+            runtime = root / "data/versions/python/3.12.0/bin"
+            runtime.mkdir(parents=True)
+            project = root / "project"
+            project.mkdir()
+            (project / ".python-version").write_text("3.12.0")
+            result = subprocess.run([binary, "hook-env", "-s", "bash"], cwd=project,
+                                    env=environment, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("advisory review required", result.stderr)
+            self.assertNotIn(str(runtime), result.stdout)
 
     def test_bash_switches_only_owned_runtime_paths(self):
         self.switches_only_owned_paths("bash")

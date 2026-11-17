@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, ensure};
 
 use super::common::{self, print_already_installed, print_installed, print_using};
-use super::npm::{install_reviewed_npm, review_installed_npm};
+use super::npm::{cached_installed_npm, install_reviewed_npm, review_installed_npm};
 use super::security::{ReviewMode, RuntimeSecurity};
 use crate::core::security::vulnerability::{VulnerabilityScanner, VulnerabilitySource};
 
@@ -109,28 +109,55 @@ impl PiManager {
     fn select_owned(&self, version: &str, lease: &common::RuntimeLease) -> Result<()> {
         let prefix = self.versions_dir.join(version);
         let entrypoint = validate_pi_install(&prefix, version)?;
+        if let Ok((admission, reviewed)) = (|| {
+            let admission = self
+                .security
+                .installed("pi", &prefix, ReviewMode::CachedOnly)?;
+            let reviewed = cached_installed_npm(
+                &format!("{PI_PACKAGE}@{version}"),
+                &prefix,
+                &self.tools_dir()?,
+                &self.security,
+                &admission,
+            )?;
+            let expected = launcher_bytes(&prefix, &entrypoint, reviewed.node_path())?;
+            ensure!(
+                crate::core::security::npm::read_metadata(&prefix.join("bin/pi"), expected.len())?
+                    == expected,
+                "Cached Pi launcher changed"
+            );
+            Ok::<_, anyhow::Error>((admission, reviewed))
+        })() {
+            reviewed.verify(&prefix)?;
+            admission.verify(&prefix)?;
+            common::set_current_version_with_lease(&self.versions_dir, version, lease)?;
+            print_using("Pi", version, &self.versions_dir.join("current/bin"));
+            return Ok(());
+        }
         let receipt_path = prefix.join(".omg-npm-advisory-review.json");
         let previous_receipt =
             crate::core::security::npm::read_metadata(&receipt_path, 16 * 1024 * 1024)?;
-        let reviewed = review_installed_npm(
-            &format!("{PI_PACKAGE}@{version}"),
-            &prefix,
-            &self.tools_dir()?,
-            self.advisories.as_ref(),
-            &self.security,
-        )?;
         let next_admission = (|| {
+            let reviewed = review_installed_npm(
+                &format!("{PI_PACKAGE}@{version}"),
+                &prefix,
+                &self.tools_dir()?,
+                self.advisories.as_ref(),
+                &self.security,
+            )?;
             let expected = launcher_bytes(&prefix, &entrypoint, reviewed.node_path())?;
             ensure!(
                 crate::core::security::npm::read_metadata(&prefix.join("bin/pi"), expected.len())?
                     == expected,
                 "Pi launcher does not match its reviewed managed Node; reinstall this Pi release"
             );
-            self.security
-                .installed("pi", &prefix, ReviewMode::FreshAttended)
+            let admission = self
+                .security
+                .installed("pi", &prefix, ReviewMode::FreshAttended)?;
+            Ok::<_, anyhow::Error>((reviewed, admission))
         })();
-        let admission = match next_admission {
-            Ok(admission) => admission,
+        let (reviewed, admission) = match next_admission {
+            Ok(selection) => selection,
             Err(error) => {
                 crate::core::safe_ops::atomic_write_file_sync(&receipt_path, previous_receipt)
                     .context("Failed to restore the previous Pi dependency review after admission failed")?;
@@ -396,7 +423,7 @@ esac
         assert!(arguments.contains("--ignore-scripts"));
         assert!(
             fs::read_to_string(manager.versions_dir.join("current/bin/pi"))?
-                .contains(&shell_path(&node)?)
+                .contains(&shell_path(&node.canonicalize()?)?)
         );
         manager.use_version("0.83.0")?;
         Ok(())
@@ -501,6 +528,11 @@ esac
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_same_version_admission_restores_previous_dependency_review() -> Result<()> {
+        if crate::core::testing::run_isolated_test(
+            "runtimes::pi::tests::failed_same_version_admission_restores_previous_dependency_review",
+        ) {
+            return Ok(());
+        }
         use crate::core::security::vulnerability::{
             AssessmentUse, PackageAssessment, PackageCoverage, VulnerabilityError,
         };
@@ -585,7 +617,12 @@ esac
         let previous_reads = source.pi_reads.load(Ordering::SeqCst);
         npm_source.revision.store(2, Ordering::SeqCst);
         source.refuse_pi.store(true, Ordering::SeqCst);
-        assert!(manager.use_version("0.83.0").is_err());
+        let result = temp_env::with_var(
+            crate::cli::tool::ALLOW_NPM_SCRIPTS_ENV,
+            Some("@earendil-works/pi-coding-agent@0.83.0"),
+            || manager.use_version("0.83.0"),
+        );
+        assert!(result.is_err());
         assert!(
             source.pi_reads.load(Ordering::SeqCst) > previous_reads,
             "changed dependency evidence must force the actual fresh Pi admission path"
@@ -599,6 +636,69 @@ esac
             .security
             .installed("pi", &prefix, ReviewMode::CachedOnly)?
             .verify(&prefix)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn intact_cached_pi_selection_does_not_call_sources_or_run_npm() -> Result<()> {
+        use crate::core::security::vulnerability::{
+            AssessmentUse, PackageAssessment, VulnerabilityError,
+        };
+        use crate::package_managers::types::SecurityPackage;
+        struct OfflineSource;
+        impl VulnerabilitySource for OfflineSource {
+            fn assess_packages<'a>(
+                &'a self,
+                _packages: &'a [SecurityPackage],
+                _use_case: AssessmentUse,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = std::result::Result<
+                                Vec<PackageAssessment>,
+                                VulnerabilityError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                panic!("an intact cached Pi inventory must not query the package source")
+            }
+        }
+        impl super::super::security::RuntimeEvidenceSource for OfflineSource {
+            fn read(&self, _query: &super::super::security::RuntimeQuery) -> Result<Vec<u8>> {
+                panic!("an intact cached Pi or Node admission must not query the runtime source")
+            }
+        }
+        let temp = tempfile::tempdir()?;
+        let npm = fake_npm(temp.path(), "0.83.0", true)?;
+        managed_node(temp.path(), &npm)?;
+        let mut manager = PiManager::with_paths(temp.path().join("versions/pi"), npm);
+        manager.install("0.83.0").await?;
+        let receipt_path = manager
+            .versions_dir
+            .join("0.83.0/.omg-npm-advisory-review.json");
+        let receipt = fs::read(&receipt_path)?;
+        let phases = fs::read(temp.path().join("phases"))?;
+        fs::write(
+            temp.path().join("signature-reject"),
+            "cached selection cannot run a new audit",
+        )?;
+        manager.advisories = Arc::new(OfflineSource);
+        manager.security = RuntimeSecurity::with_source(Arc::new(OfflineSource));
+        manager.use_version("0.83.0")?;
+        assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
+        assert_eq!(
+            fs::read(receipt_path)?,
+            receipt,
+            "cache reuse must preserve the original reviewed bytes and timestamp"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("phases"))?,
+            phases,
+            "cache reuse cannot materialize, audit or run scripts again"
+        );
         Ok(())
     }
 

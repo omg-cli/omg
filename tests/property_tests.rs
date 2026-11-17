@@ -82,6 +82,7 @@ fn installed_node(project: &TestProject, version: &str) -> std::path::PathBuf {
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        common::seed_runtime_advisory_fixture(project, "node", version).unwrap();
     }
     directory
 }

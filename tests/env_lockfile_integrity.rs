@@ -528,6 +528,7 @@ fn snapshot_restores_installed_php_offline_without_replacing_its_payload() {
         )
         .unwrap();
         std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        common::seed_runtime_advisory_fixture(&project, "php", version).unwrap();
     }
     symlink(versions.join("8.4"), versions.join("current")).unwrap();
     project.run(&["env", "capture"]).assert_success();
@@ -669,16 +670,16 @@ fn snapshot_restores_all_registered_installed_runtimes_and_executes_selected_pay
             };
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            if name == "pi" {
-                let manifest = versions
-                    .join(version)
-                    .join("lib/node_modules/@earendil-works/pi-coding-agent/package.json");
-                std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-                std::fs::write(manifest, format!("{{\"version\":\"{version}\"}}")).unwrap();
-            }
         }
         symlink(versions.join(&target), versions.join("current")).unwrap();
         fixtures.push((name, target, changed, binary));
+    }
+    common::seed_pi_runtime_fixture(&project, "1.2.3", "1.2.3").unwrap();
+    common::seed_pi_runtime_fixture(&project, "2.3.4", "2.3.4").unwrap();
+    for (name, target, changed, _) in &fixtures {
+        for version in [target, changed] {
+            common::seed_runtime_advisory_fixture(&project, name, version).unwrap();
+        }
     }
     project.run(&["env", "capture"]).assert_success();
     project.run(&["snapshot", "create"]).assert_success();

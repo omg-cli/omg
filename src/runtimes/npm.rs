@@ -390,6 +390,7 @@ fn write_receipt(
         "node_root":runtime.version_dir,"reviewed_at":jiff::Timestamp::now().to_string(),
         "review_id":review.review.as_ref().map(AdvisoryRiskReview::id),
         "risk_accepted":review.acceptance.is_some(),"coverage":"assessed",
+        "security_overrides":active_security_overrides("npm", package),
         "lifecycle_scripts_ran":scripts_ran,"npm_signatures_verified":signatures_verified,
         "assessments":review.assessments.iter().map(|item|serde_json::json!({"name":item.package.name,"version":item.package.version,"source":item.coverage.provenance(),"findings":item.findings})).collect::<Vec<_>>(),
     });
@@ -467,5 +468,139 @@ pub(crate) fn review_installed_npm(
         previous["lifecycle_scripts_ran"].as_bool().unwrap_or(false),
         require_signatures,
     )?;
+    Ok(binding)
+}
+
+/// Reuse an intact complete review only while its Pi and Node authorities,
+/// exact inventory, signatures and separately chosen overrides still match.
+pub(crate) fn cached_installed_npm(
+    package: &str,
+    prefix: &Path,
+    tools_dir: &Path,
+    security: &crate::runtimes::security::RuntimeSecurity,
+    pi_admission: &crate::runtimes::security::RuntimeAdmission,
+) -> Result<ReviewedNpm> {
+    use crate::core::security::advisory_review::AdvisoryRiskReview;
+    use crate::core::security::npm::{NpmLock, NpmSpec};
+    use crate::core::security::vulnerability::{PackageAssessment, PackageCoverage};
+    use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+    use sha2::{Digest as _, Sha256};
+    pi_admission.verify(prefix)?;
+    anyhow::ensure!(
+        !host_environment_is_allowed("npm", package),
+        "Cached npm selection requires the pinned public registry"
+    );
+    let spec = NpmSpec::parse(package)?;
+    let lock = NpmLock::parse(
+        &read_npm_metadata(&prefix.join("package-lock.json"), 16 * 1024 * 1024)?,
+        &spec,
+    )?;
+    let receipt: serde_json::Value = serde_json::from_slice(&read_npm_metadata(
+        &prefix.join(".omg-npm-advisory-review.json"),
+        16 * 1024 * 1024,
+    )?)?;
+    let runtime = ManagedNpm::open(tools_dir)?;
+    let node_admission = security.installed(
+        "node",
+        &runtime.version_dir,
+        crate::runtimes::security::ReviewMode::CachedOnly,
+    )?;
+    let overrides = active_security_overrides("npm", package);
+    let signatures = !package_is_allowed(ALLOW_UNVERIFIED_ENV, &format!("npm:{package}"));
+    let manager_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&runtime.identity)?));
+    anyhow::ensure!(
+        receipt["schema_version"] == 2
+            && receipt["package"].as_str() == Some(package)
+            && receipt["coverage"] == "assessed"
+            && receipt["lock_sha256"].as_str() == Some(lock.sha256.as_str())
+            && receipt["node_version"].as_str() == Some(runtime.version.as_str())
+            && receipt["node_root"] == serde_json::to_value(&runtime.version_dir)?
+            && receipt["node_path"] == serde_json::to_value(&runtime.node)?
+            && receipt["runtime_content_sha256"].as_str() == Some(manager_sha256.as_str())
+            && receipt["security_overrides"] == serde_json::to_value(&overrides)?
+            && receipt["npm_signatures_verified"].as_bool() == Some(signatures)
+            && receipt["lifecycle_scripts_ran"].is_boolean(),
+        "Cached npm review identity or security choices changed"
+    );
+    let reviewed_at: jiff::Timestamp = receipt["reviewed_at"]
+        .as_str()
+        .context("Cached npm review has no timestamp")?
+        .parse()?;
+    let now = jiff::Timestamp::now();
+    anyhow::ensure!(
+        reviewed_at <= now && now.as_second() - reviewed_at.as_second() <= 1800,
+        "Cached npm review expired"
+    );
+    let coordinates = lock
+        .packages
+        .values()
+        .map(|item| (item.name.clone(), item.version.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let rows = receipt["assessments"]
+        .as_array()
+        .context("Cached npm review has no complete inventory")?;
+    anyhow::ensure!(
+        rows.len() == coordinates.len(),
+        "Cached npm review omitted dependencies"
+    );
+    let mut assessed = BTreeMap::new();
+    for row in rows {
+        let name = row["name"]
+            .as_str()
+            .context("Cached npm assessment has no name")?
+            .to_owned();
+        let version = row["version"]
+            .as_str()
+            .context("Cached npm assessment has no version")?
+            .to_owned();
+        let package = SecurityPackage {
+            origin: SecurityOrigin::NpmRegistry,
+            name: name.clone(),
+            version: version.clone(),
+            advisory_source: None,
+            architecture: None,
+            description: String::new(),
+            licenses: vec![],
+        };
+        let assessment = PackageAssessment {
+            package,
+            coverage: PackageCoverage::Assessed {
+                provenance: serde_json::from_value(row["source"].clone())?,
+            },
+            findings: serde_json::from_value(row["findings"].clone())?,
+        };
+        anyhow::ensure!(
+            coordinates.contains(&(name.clone(), version.clone()))
+                && assessed.insert((name, version), assessment).is_none(),
+            "Cached npm review inventory changed"
+        );
+    }
+    let assessments = assessed.into_values().collect::<Vec<_>>();
+    let transaction = serde_json::to_string(&(
+        package,
+        prefix,
+        &lock.sha256,
+        &runtime.version,
+        &runtime.identity,
+        &overrides,
+        nix::unistd::getuid().as_raw(),
+        nix::unistd::geteuid().as_raw(),
+    ))?;
+    let review = AdvisoryRiskReview::new(&assessments, &transaction)?;
+    anyhow::ensure!(
+        receipt["review_id"] == serde_json::to_value(review.as_ref().map(AdvisoryRiskReview::id))?
+            && receipt["risk_accepted"].as_bool() == Some(review.is_some()),
+        "Cached npm risk decision does not match its complete evidence"
+    );
+    let binding = ReviewedNpm {
+        runtime,
+        node_admission,
+        spec,
+        lock,
+        package: package.to_owned(),
+        overrides,
+    };
+    binding.verify(prefix)?;
+    pi_admission.verify(prefix)?;
     Ok(binding)
 }

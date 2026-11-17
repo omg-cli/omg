@@ -47,6 +47,25 @@ fn path_env(dir: &Path) -> (&'static str, &str) {
 // Fixtures
 // ═══════════════════════════════════════════════════════════════════════════════
 
+fn seed_owned_node(project: &TestProject, version: &str) -> std::path::PathBuf {
+    let bin = project
+        .data_dir
+        .path()
+        .join("versions/node")
+        .join(version)
+        .join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_shim(
+        &bin,
+        "node",
+        &format!("#!/bin/sh\nprintf 'v{version}\\n'\n"),
+    );
+    project.create_file(".nvmrc", version);
+    seed_runtime_advisory_fixture(project, "node", version)
+        .expect("review controlled Node fixture");
+    bin
+}
+
 fn write_npm_project(project: &TestProject, scripts: &[(&str, &str)]) {
     let scripts_json: Vec<String> = scripts
         .iter()
@@ -118,6 +137,8 @@ fn npm_extra_args_get_double_dash_separator_before_user_flags() {
     write_shim(shims.path(), "npm", &echo_shim_body("ARGS"));
     write_shim(shims.path(), "node", "#!/bin/sh\nexit 0\n");
 
+    seed_owned_node(&project, "20.11.1");
+
     let result = project.run_with_env(
         &["run", "build", "--", "--minify"],
         &[path_env(shims.path())],
@@ -184,6 +205,8 @@ fn unlisted_task_falls_back_to_npm_run_prefix_from_marker_file() {
     write_shim(shims.path(), "npm", &echo_shim_body("ARGS"));
     write_shim(shims.path(), "node", "#!/bin/sh\nexit 0\n");
 
+    seed_owned_node(&project, "20.11.1");
+
     let result = project.run_with_env(&["run", "lint"], &[path_env(shims.path())]);
 
     result.assert_success();
@@ -204,6 +227,8 @@ fn unlisted_js_task_uses_the_detected_package_manager() {
     let shims = tempfile::tempdir().expect("shim dir");
     write_shim(shims.path(), "pnpm", &echo_shim_body("ARGS"));
     write_shim(shims.path(), "node", "#!/bin/sh\necho v20.11.1\n");
+
+    seed_owned_node(&project, "20.11.1");
 
     let result = project.run_with_env(&["run", "lint"], &[path_env(shims.path())]);
 
@@ -261,6 +286,8 @@ fn child_nonzero_exit_code_propagates_as_task_failure() {
     );
     write_shim(shims.path(), "node", "#!/bin/sh\nexit 0\n");
 
+    seed_owned_node(&project, "20.11.1");
+
     let result = project.run_with_env(&["run", "build"], &[path_env(shims.path())]);
 
     result.assert_failure();
@@ -312,8 +339,8 @@ fn missing_node_runtime_fails_closed_when_install_prompt_unavailable() {
 }
 
 #[test]
-fn nvm_alias_task_executes_the_selected_node_binary() {
-    let project = tempfile::tempdir().unwrap();
+fn nvm_alias_task_refuses_unreviewed_node_and_reviewed_managed_node_runs() {
+    let project = TestProject::new();
     let shims = tempfile::tempdir().unwrap();
     let nvm = tempfile::tempdir().unwrap();
     fs::write(
@@ -336,25 +363,37 @@ fn nvm_alias_task_executes_the_selected_node_binary() {
     );
     for alias in ["default", "lts"] {
         fs::write(project.path().join(".nvmrc"), alias).unwrap();
-        let result = run_omg_with_options(
+        let result = project.run_with_env(
             &["run", "build", "--", "--verify"],
-            Some(project.path()),
             &[
                 path_env(shims.path()),
                 ("NVM_DIR", nvm.path().to_str().unwrap()),
             ],
         );
-        result.assert_success();
-        let expected = format!("NODE: {}", node_bin.join("node").display());
-        assert!(result.stdout.lines().any(|line| line == expected));
-        assert!(result.stdout.lines().any(|line| line == "v22.14.0"));
+        result.assert_failure();
         assert!(
-            result
-                .stdout
-                .lines()
-                .any(|line| line == "ARGS: run build -- --verify")
+            !result.stdout.contains("NODE:"),
+            "task ran an unreviewed external NVM Node"
         );
     }
+    let managed_bin = seed_owned_node(&project, "22.14.0");
+    let result = project.run_with_env(
+        &["run", "build", "--", "--verify"],
+        &[
+            path_env(shims.path()),
+            ("NVM_DIR", nvm.path().to_str().unwrap()),
+        ],
+    );
+    result.assert_success();
+    let expected = format!("NODE: {}", managed_bin.join("node").display());
+    assert!(result.stdout.lines().any(|line| line == expected));
+    assert!(result.stdout.lines().any(|line| line == "v22.14.0"));
+    assert!(
+        result
+            .stdout
+            .lines()
+            .any(|line| line == "ARGS: run build -- --verify")
+    );
     assert_eq!(
         fs::read_to_string(nvm.path().join("alias/default")).unwrap(),
         "lts/jod\n"
@@ -363,7 +402,6 @@ fn nvm_alias_task_executes_the_selected_node_binary() {
         fs::read_to_string(nvm.path().join("alias/lts/jod")).unwrap(),
         "v22.14.0\n"
     );
-    project.close().unwrap();
     shims.close().unwrap();
     nvm.close().unwrap();
 }

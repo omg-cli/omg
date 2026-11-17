@@ -189,6 +189,62 @@ impl AdvisoryRiskReview {
                 }
             }
         }
+        if details.len() > 60 * 1024 {
+            details = String::from(
+                "\nSECURITY WARNING: the selected transaction has disclosed advisory findings.\nAccepting the risk does not mark these versions safe or establish missing coverage.\nCondensed review: every advisory is listed below. Open its link for the full description.\n",
+            );
+            for assessment in assessments.iter().filter(|item| !item.findings.is_empty()) {
+                writeln!(
+                    details,
+                    "Package: {}",
+                    serde_json::to_string(&(
+                        &assessment.package.name,
+                        &assessment.package.version,
+                        &assessment.package.architecture,
+                    ))?
+                )?;
+                writeln!(
+                    details,
+                    "Coverage: {}",
+                    if assessment.coverage.is_assessed() {
+                        "assessed"
+                    } else {
+                        "unknown"
+                    }
+                )?;
+                writeln!(
+                    details,
+                    "Source: {}",
+                    serde_json::to_string(&assessment.coverage.provenance())?
+                )?;
+                for finding in &assessment.findings {
+                    let confidence = match finding.applicability {
+                        FindingApplicability::Applicable => "affected version",
+                        FindingApplicability::Possible => {
+                            "possible match; applicability unconfirmed"
+                        }
+                    };
+                    writeln!(
+                        details,
+                        "  {} ({confidence})",
+                        serde_json::to_string(&finding.id)?
+                    )?;
+                    let url = advisory_link(&finding.id).or_else(|| {
+                        finding
+                            .native_advisory
+                            .as_ref()?
+                            .references
+                            .iter()
+                            .find_map(|reference| safe_reference(&reference.url))
+                    });
+                    if let Some(url) = url {
+                        writeln!(details, "  {url}")?;
+                    } else {
+                        writeln!(details, "  {}", serde_json::to_string(&finding.summary)?)?;
+                    }
+                }
+            }
+        }
         let details = details
             .lines()
             .map(crate::cli::style::sanitize_terminal_text)
@@ -335,6 +391,48 @@ mod tests {
                 "https://www.cve.org/CVERecord?id=CVE-2026-{number}"
             )));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn long_distinct_advisories_keep_every_link_and_bind_full_descriptions() -> anyhow::Result<()> {
+        let mut assessment = package("python");
+        for number in 10000..10197 {
+            let mut item = finding(
+                &format!("CVE-2026-{number}"),
+                FindingApplicability::Applicable,
+            );
+            item.summary = format!(
+                "CVE-2026-{number}: {}",
+                "Detailed publisher explanation. ".repeat(30)
+            );
+            assessment.findings.push(item);
+        }
+        let mut unlinked = finding("vendor:python:issue", FindingApplicability::Possible);
+        unlinked.summary = "Publisher identified a possible interpreter memory error".into();
+        assessment.findings.push(unlinked);
+        let review =
+            AdvisoryRiskReview::new_with_unknown(&[assessment.clone()], "python-install")?.unwrap();
+        assert!(review.details().len() <= 60 * 1024);
+        assert!(review.details().contains("Condensed review"));
+        assert!(review.details().contains("Coverage: unknown"));
+        assert!(
+            review
+                .details()
+                .contains("Publisher identified a possible interpreter memory error")
+        );
+        for number in 10000..10197 {
+            assert!(review.details().contains(&format!(
+                "https://www.cve.org/CVERecord?id=CVE-2026-{number}"
+            )));
+        }
+        let accepted = review.accept(&format!("accept {}", review.id()))?;
+        assessment.findings[0]
+            .summary
+            .push_str(" Changed publisher evidence.");
+        let changed =
+            AdvisoryRiskReview::new_with_unknown(&[assessment], "python-install")?.unwrap();
+        assert!(!accepted.matches(&changed));
         Ok(())
     }
 

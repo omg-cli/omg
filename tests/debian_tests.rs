@@ -2080,6 +2080,7 @@ mod runtime_management {
         assert_eq!(fixture_program_hash(&binary), expected);
         assert_eq!(fixture_program_hash(&fixture), expected);
         std::fs::write(version_dir.join(".omg-install-complete"), "20.10.0\n").unwrap();
+        super::common::seed_runtime_advisory_fixture(&project, "node", "20.10.0").unwrap();
         let before_pin = std::fs::read(project.path().join(".nvmrc")).unwrap();
         let before_package = std::fs::read(project.path().join("package.json")).unwrap();
 

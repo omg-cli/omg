@@ -2190,6 +2190,16 @@ fn prepare_owned_contract(project: &TestProject, raw: &str, environment: &[(&str
             "{raw} fixture failed: {}",
             String::from_utf8_lossy(&result.stderr)
         );
+        if case == "hook-env" {
+            for (runtime, version) in [
+                ("node", "24.21.0"),
+                ("node", "22.16.0"),
+                ("python", "3.12.14"),
+            ] {
+                common::seed_runtime_advisory_fixture(project, runtime, version)
+                    .expect("seed controlled hook runtime advisory authority");
+            }
+        }
     } else if matches!(
         raw,
         "missing-lock-ci-refusal"
@@ -2581,6 +2591,18 @@ fn behavior_inventory_runs_in_hermetic_state() {
                 std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o700))
                     .expect("make task-runner stub executable");
             }
+            project.create_file(".node-version", "24.0.0\n");
+            let managed_bin = project.data_dir.path().join("versions/node/24.0.0/bin");
+            std::fs::create_dir_all(&managed_bin).expect("create managed task runtime fixture");
+            for executable in ["node", "npm"] {
+                std::fs::copy(
+                    project.path().join("bin").join(executable),
+                    managed_bin.join(executable),
+                )
+                .expect("copy owned task runtime executable");
+            }
+            common::seed_runtime_advisory_fixture(project, "node", "24.0.0")
+                .expect("seed reviewed managed task runtime");
         }
         let privacy_case = matches!(
             case.id.as_str(),

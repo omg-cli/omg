@@ -162,11 +162,16 @@ fn read_security_review(
     use std::io::{Read, Write};
     fn ready(
         tty: &std::fs::File,
-        events: rustix::event::PollFlags,
+        writing: bool,
         deadline: std::time::Instant,
         check_cancelled: &dyn Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        use rustix::event::{FdSetElement, Timespec, fd_set_insert, fd_set_num_elements, select};
+        use std::os::fd::AsRawFd;
+        let descriptor = tty.as_raw_fd();
+        let bound = descriptor
+            .checked_add(1)
+            .context("Invalid terminal descriptor")?;
         loop {
             check_cancelled()?;
             anyhow::ensure!(
@@ -178,9 +183,22 @@ fn read_security_review(
                 .context("Security acknowledgement timed out")?;
             let timeout = Timespec::try_from(remaining.min(std::time::Duration::from_millis(100)))
                 .context("Invalid acknowledgement timeout")?;
-            let mut items = [PollFd::new(tty, events)];
-            let result =
-                poll(&mut items, Some(&timeout)).context("Security acknowledgement interrupted")?;
+            // Darwin cannot poll /dev/tty; select supports the controlling-terminal alias.
+            let mut descriptors = vec![FdSetElement::default(); fd_set_num_elements(1, bound)];
+            fd_set_insert(&mut descriptors, descriptor);
+            // SAFETY: the only selected descriptor belongs to tty, borrowed for this entire call.
+            #[expect(
+                unsafe_code,
+                reason = "select requires proof that every selected descriptor remains open"
+            )]
+            let result = unsafe {
+                if writing {
+                    select(bound, None, Some(&mut descriptors), None, Some(&timeout))
+                } else {
+                    select(bound, Some(&mut descriptors), None, None, Some(&timeout))
+                }
+            }
+            .context("Security acknowledgement interrupted")?;
             check_cancelled()?;
             anyhow::ensure!(
                 nix::unistd::tcgetpgrp(tty)? == nix::unistd::getpgrp(),
@@ -189,16 +207,6 @@ fn read_security_review(
             if result == 0 {
                 continue;
             }
-            anyhow::ensure!(
-                !items[0]
-                    .revents()
-                    .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL),
-                "Security acknowledgement terminal disconnected"
-            );
-            anyhow::ensure!(
-                items[0].revents().contains(events),
-                "Security acknowledgement terminal is not ready"
-            );
             return Ok(());
         }
     }
@@ -225,12 +233,7 @@ fn read_security_review(
     }
     let mut remaining = prompt.as_bytes();
     while !remaining.is_empty() {
-        ready(
-            tty,
-            rustix::event::PollFlags::OUT,
-            deadline,
-            check_cancelled,
-        )?;
+        ready(tty, true, deadline, check_cancelled)?;
         match foreground_io(tty, |mut tty| tty.write(remaining))? {
             Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),
             Ok(count) => remaining = &remaining[count..],
@@ -240,7 +243,7 @@ fn read_security_review(
     }
     let mut answer = Vec::new();
     loop {
-        ready(tty, rustix::event::PollFlags::IN, deadline, check_cancelled)?;
+        ready(tty, false, deadline, check_cancelled)?;
         let mut buffer = [0_u8; 128];
         let count = match foreground_io(tty, |mut tty| tty.read(&mut buffer))? {
             Ok(0) => anyhow::bail!("Security acknowledgement terminal closed"),

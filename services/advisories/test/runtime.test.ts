@@ -341,8 +341,10 @@ test("runtime refresh uses its separate secret and sends ephemeral job credentia
 });
 test("runtime refresh refuses arbitrary URLs, personal tokens and unsupported runtime selectors", async () => {
     const { store, db } = setup(); let calls = 0;
+    const personalTokenFixture = "ghp_" + "fixturefake" + "0".repeat(25);
+    expect(personalTokenFixture).toMatch(/^ghp_[A-Za-z0-9]{36}$/);
     try {
-        for (const body of [{ runtime: "bun", github_token: jobToken, url: "https://example.com" }, { runtime: "bun", github_token: "ghp_personalTokenMustNotBeAccepted0123456789012345" }, { runtime: "../node", github_token: jobToken }]) {
+        for (const body of [{ runtime: "bun", github_token: jobToken, url: "https://example.com" }, { runtime: "bun", github_token: personalTokenFixture }, { runtime: "../node", github_token: jobToken }]) {
             const response = await handle(refreshRequest(body), store, undefined, now, async () => { calls++; return Response.json([]); }, refreshSecret);
             expect(response.status).toBe(400);
         }

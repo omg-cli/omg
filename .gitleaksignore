@@ -4,3 +4,6 @@ e9a2f51a054035318e907496baa05d13c8d39416:src/core/security/secrets.rs:private-ke
 
 # Verified source SHA-256 provenance for CodeLoud f4371c4 test/api.test.ts; not a credential.
 bfff4883f4fa39c54bbb98473535e642c9cb128d:services/ci-coder/port-origin.json:generic-api-key:21
+
+# Synthetic PAT-rejection fixture in history; current test builds a fixturefake value.
+b59af76393babd0df77f858f1c877cfbcdc798a2:services/advisories/test/runtime.test.ts:github-pat:345
