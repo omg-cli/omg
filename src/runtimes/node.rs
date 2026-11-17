@@ -258,8 +258,14 @@ impl NodeManager {
     }
 
     #[cfg(not(feature = "pgp"))]
-    async fn fetch_checksum(&self, _version: &str, _filename: &str) -> Result<String> {
-        anyhow::bail!("Authenticated Node installation requires an OMG build with PGP support")
+    fn fetch_checksum(
+        &self,
+        _version: &str,
+        _filename: &str,
+    ) -> std::future::Ready<Result<String>> {
+        std::future::ready(Err(anyhow::anyhow!(
+            "Authenticated Node installation requires an OMG build with PGP support"
+        )))
     }
 
     /// Switch to a specific version
