@@ -36,6 +36,8 @@ async function measureImport(count: number) {
         await db.batch(unstable_splitSqlQuery(initial).map((statement) => db.prepare(statement)));
         const counter = await readFile(new NodeURL("../migrations/0002_baseline_member_counter.sql", import.meta.url), "utf8");
         await db.batch(unstable_splitSqlQuery(counter).map((statement) => db.prepare(statement)));
+        const proof = await readFile(new NodeURL("../migrations/0006_baseline_publisher_proof.sql", import.meta.url), "utf8");
+        await db.batch(unstable_splitSqlQuery(proof).map((statement) => db.prepare(statement)));
         let rowsRead = 0;
         const measured = {
             prepare: db.prepare.bind(db),
@@ -155,7 +157,7 @@ test("real workerd route roundtrips a structured 2.4 MB CVE through private R2 a
         bindings: {INGEST_TOKEN: token, CVE_BATCH_SIZE: "32"}, resourcePersistencePath: scratch}));
     try {
         const db = await runtime.getD1Database("DB");
-        for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql"]) {
+        for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql", "0006_baseline_publisher_proof.sql"]) {
             const source = await readFile(new NodeURL(`../migrations/${name}`, import.meta.url), "utf8");
             await db.batch(unstable_splitSqlQuery(source).map((statement) => db.prepare(statement)));
         }

@@ -37,7 +37,7 @@ test("real Worker parses vendor ZIP/YAML, persists D1/R2 evidence and never HTTP
     }));
     try {
         const db = await runtime.getD1Database("DB");
-        for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql", "0003_recent_cves.sql", "0004_epss_cache.sql", "0005_runtime_sources.sql"]) {
+        for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql", "0003_recent_cves.sql", "0004_epss_cache.sql", "0005_runtime_sources.sql", "0006_baseline_publisher_proof.sql"]) {
             const source = await readFile(new NodeURL(`../migrations/${name}`, import.meta.url), "utf8");
             await db.batch(unstable_splitSqlQuery(source).map((query) => db.prepare(query)));
         }

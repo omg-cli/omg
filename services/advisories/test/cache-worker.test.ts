@@ -21,7 +21,7 @@ test("real Worker caches public reads, isolates private reads and uses indexed r
     }));
     try {
         const db = await runtime.getD1Database("DB");
-        for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql", "0004_epss_cache.sql"]) {
+        for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql", "0004_epss_cache.sql", "0006_baseline_publisher_proof.sql"]) {
             const source = await readFile(new NodeURL(`../migrations/${name}`, import.meta.url), "utf8");
             await db.batch(unstable_splitSqlQuery(source).map((query) => db.prepare(query)));
         }

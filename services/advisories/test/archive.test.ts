@@ -5,6 +5,20 @@ import { parseBatch } from "../src/ingestion";
 import { scanArchive, fileHash, type ArchiveState } from "../scripts/archive";
 const encodeBatch = (records: string[]) => JSON.stringify({source: "cve", records});
 const path = fileURLToPath(new NodeURL("./fixtures/tiny.zip", import.meta.url));
+
+test("baseline scans honor the bounded batch size and reject invalid budgets", async () => {
+    const digest = await fileHash(path);
+    const sizes: number[] = [];
+    const options = {
+        path, digest, state: { digest, next_entry: 0, accepted: 0, exhausted: false, finished_at: null } as ArchiveState,
+        maxRecords: 100, batchSize: 2, encodeBatch,
+        send: async (body: string) => { sizes.push(JSON.parse(body).records.length); },
+        save: async () => {},
+    };
+    await scanArchive(options);
+    expect(sizes).toEqual([2, 1]);
+    await expect(scanArchive({ ...options, batchSize: 65 })).rejects.toThrow("batch size");
+});
 test("tiny ZIP scans lazily, stops at record budget and resumes without extracting files", async () => {
     const digest = await fileHash(path);
     const state: ArchiveState = {

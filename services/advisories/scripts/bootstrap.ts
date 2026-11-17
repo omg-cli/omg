@@ -1,8 +1,10 @@
-import { readFile, writeFile, rename, stat } from "node:fs/promises";
+import { readFile, rename, stat, lstat, open, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { scanArchive, fileHash, type ArchiveState } from "./archive";
 import { boundedBody, object, string, date } from "../src/domain";
+import { baselineBinding, operatorPost, readCheckpoint, recoverCheckpoint, verifyIngestReply, type BaselineBinding } from "./operator";
 const { values } = parseArgs({
     options: {
         archive: { type: "string" },
@@ -12,7 +14,9 @@ const { values } = parseArgs({
         asset: { type: "string" },
         "token-file": { type: "string" },
         "max-records": { type: "string", default: "1000" },
-        "delay-ms": { type: "string", default: "1000" },
+        "delay-ms": { type: "string", default: "0" },
+        "resume-instance": { type: "string" },
+        "resume-session": { type: "string" },
         "dry-run": { type: "boolean", default: false },
         finalize: { type: "boolean", default: false },
         help: { type: "boolean", default: false },
@@ -21,7 +25,7 @@ const { values } = parseArgs({
 });
 if (values.help) {
     process.stdout.write(
-        "bun run bootstrap --archive PATH --state PATH --release-tag TAG --asset NAME [--endpoint HTTPS_URL] [--token-file MODE_600_FILE] [--max-records 1000] [--delay-ms 1000] [--dry-run] [--finalize]\nINGEST_TOKEN environment variable is supported. No Cloudflare account credential is needed. Dry run never writes HTTP.\n",
+        "bun run bootstrap --archive PATH --state PATH --release-tag TAG --asset NAME [--endpoint HTTPS_URL] [--token-file MODE_600_FILE] [--max-records 1000] [--delay-ms 0] [--resume-instance ID --resume-session UUID] [--dry-run] [--finalize]\nINGEST_TOKEN environment variable is supported. No Cloudflare account credential is needed. Dry run never writes HTTP. Recovery requires a missing state file and replays the exact bound archive/session from zero. Batches remain serial and bounded by service limits.\n",
     );
     process.exit(0);
 }
@@ -106,30 +110,9 @@ async function run() {
         if (values["dry-run"]) return {};
         if (!endpoint || !token)
             throw new Error("missing writer configuration");
-        for (let attempt = 0; attempt < 5; attempt++) {
-            const reply = await fetch(new URL(path, endpoint), {
-                method: "POST",
-                redirect: "error",
-                signal: AbortSignal.timeout(60_000),
-                headers: {
-                    authorization: `Bearer ${token}`,
-                    "content-type": "application/json",
-                },
-                body,
-            });
-            if (reply.ok) return object(await reply.json());
-            await reply.body?.cancel();
-            if (
-                ![409, 429, 500, 502, 503, 504].includes(reply.status) ||
-                attempt === 4
-            )
-                throw new Error(
-                    `ingest HTTP ${reply.status}; progress retained`,
-                );
-            await Bun.sleep(Math.min(30_000, 1000 * 2 ** attempt));
-        }
+        return operatorPost({endpoint,token,path,body});
     }
-    let binding: Record<string, unknown> | null = null;
+    let binding: BaselineBinding | null = null;
     let state: ArchiveState = {
         digest,
         next_entry: 0,
@@ -137,34 +120,15 @@ async function run() {
         exhausted: false,
         finished_at: null,
     };
+    let resumed=false;
     try {
+        const info=await lstat(values.state);
+        if(!info.isFile() || info.isSymbolicLink() || info.size>16*1024) throw new Error("resume state must be a bounded regular file");
         const saved = object(JSON.parse(await readFile(values.state, "utf8")));
-        if (
-            saved.digest !== digest ||
-            !Number.isSafeInteger(saved.next_entry) ||
-            !Number.isSafeInteger(saved.accepted) ||
-            Number(saved.next_entry) < 0 || Number(saved.next_entry) > 1_000_000 ||
-            Number(saved.accepted) < 0 || Number(saved.accepted) > 1_000_000 ||
-            typeof saved.exhausted !== "boolean" ||
-            (saved.exhausted && saved.accepted === 0) ||
-            !(
-                saved.finished_at === null ||
-                typeof saved.finished_at === "string"
-            )
-        )
-            throw new Error("invalid resume state");
-        if (!values["dry-run"]) {
-            binding = object(saved.baseline);
-            if (binding.digest !== digest || binding.endpoint !== endpoint?.origin || typeof binding.instance_id !== "string" || typeof binding.session_id !== "string")
-                throw new Error("invalid resume instance or endpoint binding");
-        }
-        state = {
-            digest,
-            next_entry: Number(saved.next_entry),
-            accepted: Number(saved.accepted),
-            exhausted: saved.exhausted,
-            finished_at: saved.finished_at,
-        };
+        const savedBinding=object(saved.baseline);
+        binding=baselineBinding(savedBinding,digest,endpoint?.origin??string(savedBinding.endpoint));
+        state=readCheckpoint(saved,binding);
+        resumed=true;
     } catch (error) {
         if (
             !(
@@ -175,14 +139,30 @@ async function run() {
         )
             throw error;
     }
+    if(values["resume-instance"] || values["resume-session"]) {
+        if(resumed || !endpoint || !values["resume-instance"] || !values["resume-session"]) throw new Error("recovery requires both instance/session, endpoint and a missing state file");
+        binding=baselineBinding({digest,endpoint:endpoint.origin,instance_id:values["resume-instance"],session_id:values["resume-session"]},digest,endpoint.origin);
+        state=recoverCheckpoint(binding);
+    }
+    const startAccepted=state.accepted;
+    const startedAt=performance.now();
+    let lastProgress=startedAt;
     async function save(next: ArchiveState) {
         if (values["dry-run"]) return;
         const path = values.state;
         if (!path) throw new Error("missing state path");
-        await writeFile(`${path}.tmp`, JSON.stringify({...next, baseline: binding}) + "\n", {
-            mode: 0o600,
-        });
-        await rename(`${path}.tmp`, path);
+        const temporary=`${path}.tmp-${randomUUID()}`;
+        try {
+            const file=await open(temporary,"wx",0o600);
+            try { await file.writeFile(JSON.stringify({...next,baseline:binding})+"\n"); await file.sync(); }
+            finally { await file.close(); }
+            await rename(temporary,path);
+        } finally { await rm(temporary,{force:true}); }
+        const now=performance.now();
+        if(now-lastProgress>=5000 || next.exhausted) {
+            process.stderr.write(JSON.stringify({event:"bootstrap_progress",wave_records:next.accepted-startAccepted,accepted:next.accepted,next_entry:next.next_entry,exhausted:next.exhausted,elapsed_seconds:Math.round((now-startedAt)/1000)})+"\n");
+            lastProgress=now;
+        }
     }
     if (!values["dry-run"]) {
         const started = await post("/internal/baseline/start", JSON.stringify({
@@ -190,9 +170,9 @@ async function run() {
             baseline_at: baseline,
             ...binding,
         }));
-        if (!started || started.digest !== digest || started.endpoint !== endpoint?.origin || typeof started.instance_id !== "string" || typeof started.session_id !== "string")
-            throw new Error("invalid baseline session response");
-        binding = {digest, endpoint:started.endpoint, instance_id:started.instance_id, session_id:started.session_id};
+        const actual=baselineBinding(started,digest,endpoint?.origin??"");
+        if(binding && (actual.instance_id!==binding.instance_id || actual.session_id!==binding.session_id)) throw new Error("baseline response changed the requested session binding");
+        binding=actual;
         await save(state);
     }
     if (!state.exhausted)
@@ -201,10 +181,16 @@ async function run() {
             digest,
             state,
             maxRecords: max,
+            batchSize: 64,
             encodeBatch: (records) => JSON.stringify({source: "cve", records, baseline: binding}),
             send: async (body) => {
-                await post("/internal/ingest", body);
-                if (!values["dry-run"]) await Bun.sleep(delay);
+                const reply=await post("/internal/ingest", body);
+                if(!values["dry-run"]) {
+                    const sent=object(JSON.parse(body)).records;
+                    if(!Array.isArray(sent)) throw new Error("invalid encoded ingest records");
+                    verifyIngestReply(reply,sent.length);
+                    if(delay>0) await Bun.sleep(delay);
+                }
             },
             save,
         });
@@ -229,6 +215,8 @@ async function run() {
             archive_verified: finalized?.archive_verified === true,
             caught_up: finalized?.caught_up === true,
             next_entry: state.next_entry,
+            wave_records:state.accepted-startAccepted,
+            elapsed_seconds:Math.round((performance.now()-startedAt)/1000),
         }) + "\n",
     );
 }

@@ -11,7 +11,7 @@ const id = "CVE-2021-23337";
 const now = "2026-11-17T02:00:00.000Z";
 function setup() {
     const db = new Database(":memory:");
-    for (const name of ["0001_advisories.sql", "0004_epss_cache.sql"])
+    for (const name of ["0001_advisories.sql", "0004_epss_cache.sql", "0006_baseline_publisher_proof.sql"])
         db.exec(readFileSync(new NodeURL(`../migrations/${name}`, import.meta.url), "utf8"));
     const sql: Sql = {
         first: async <T>(text: string, values: (string | number | null)[] = []) => db.query<T, (string | number | null)[]>(text).get(...values),

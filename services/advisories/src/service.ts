@@ -5,7 +5,6 @@ import {
     cveId,
     object,
     date,
-    sha256,
     parseCve,
 } from "./domain";
 import { ingestCveGroups, parseBatch } from "./ingestion";
@@ -15,6 +14,7 @@ import { epss } from "./epss";
 import { runtimeReport, refreshRuntime } from "./runtime";
 import { type Fetcher } from "./ingestion";
 import { publicResponse } from "./cache";
+import { baselineImportCommands, verifyBaseline } from "./baseline";
 async function authorized(
     request: Request,
     token: string | undefined,
@@ -97,6 +97,12 @@ async function route(
 ): Promise<Response> {
     const url = new URL(request.url);
     try {
+        if (url.pathname === "/internal/baseline/verify") {
+            if (request.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
+            if (!await authorized(request, runtimeRefreshSecret)) return Response.json({ error: "unauthorized" }, { status: 401 });
+            const input: unknown = JSON.parse(await boundedBody(request.body, 4096));
+            return Response.json(await verifyBaseline(input, store, url.origin, now, fetcher));
+        }
         if (url.pathname === "/internal/runtime-refresh") {
             if (request.method !== "POST") return Response.json({ error: "method not allowed" }, { status: 405 });
             if (!await authorized(request, runtimeRefreshSecret)) return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -117,7 +123,7 @@ async function route(
             const input = object(
                 JSON.parse(await boundedBody(request.body, LIMITS.batch)),
             );
-            const records = parseBatch(input);
+            const records = parseBatch(input, input.baseline === undefined ? LIMITS.records : 64);
             const binding =
                 input.baseline === undefined ? null : object(input.baseline);
             const owner = crypto.randomUUID();
@@ -131,23 +137,24 @@ async function route(
                 const baseline = binding
                     ? await baselineSession(writer, binding, url.origin)
                     : null;
-                await ingestCveGroups(
-                    records.map((raw) => ({ id: parseCve(raw).id, raw })),
-                    async ({ id, raw }) => {
-                        await writer.cve(raw, now);
-                        if (baseline)
-                            await writer.sql.batch([
-                                {
-                                    sql: "INSERT INTO baseline_member(session_id,cve_id,payload_sha256) VALUES(?,?,?) ON CONFLICT(session_id,cve_id) DO NOTHING",
-                                    values: [baseline.session_id, id, await sha256(raw)],
-                                },
-                                {
-                                    sql: "UPDATE baseline_receipt SET caught_up=0,completed_at=NULL WHERE session_id=?",
-                                    values: [baseline.session_id],
-                                },
-                            ]);
-                    },
-                );
+                const parsed = records.map((raw) => {
+                    const record = parseCve(raw);
+                    return { id: record.id, supported: record.supported, raw };
+                });
+                if (baseline && new Set(parsed.map((record) => record.id)).size === parsed.length && parsed.every((record) => record.supported)) {
+                    const after = await baselineImportCommands(writer, baseline.session_id, parsed);
+                    await writer.cveBatch(parsed, now, after);
+                } else {
+                    if (records.length > LIMITS.records) throw new Error("invalid duplicate or unsupported large ingest batch");
+                    await ingestCveGroups(
+                        parsed,
+                        async ({ id, raw }) => {
+                            const after = baseline ? await baselineImportCommands(writer, baseline.session_id, [{ id, raw }]) : [];
+                            await writer.cve(raw, now);
+                            if (after.length) await writer.sql.batch(after);
+                        },
+                    );
+                }
             } finally {
                 await store.release("cve", owner);
             }
@@ -264,6 +271,7 @@ async function route(
                     { status: 409 },
                 );
             try {
+                await baselineSession(store, receipt, url.origin);
                 const checkpoint = await store.checkpoint("cve");
                 if (
                     !checkpoint?.complete ||
@@ -296,19 +304,21 @@ async function route(
                     imported.count !== imported.accepted
                 )
                     throw new Error("invalid baseline member count");
+                const proof = await store.sql.first<{ phase: string }>("SELECT phase FROM baseline_publisher_proof WHERE session_id=?", [started.session_id]);
+                const verified = proof?.phase === "verified";
                 await store.writer("cve", owner).sql.batch([
                     {
                         sql: "UPDATE baseline_receipt SET accepted=?,exhausted=1,caught_up=1,completed_at=? WHERE session_id=?",
                         values: [imported.count, now, started.session_id],
                     },
                     {
-                        sql: "UPDATE source_checkpoint SET bootstrap_complete=0 WHERE source=?",
-                        values: ["cve"],
+                        sql: "UPDATE source_checkpoint SET bootstrap_complete=? WHERE source=?",
+                        values: [Number(verified), "cve"],
                     },
                 ]);
                 return Response.json({
-                    bootstrap_complete: false,
-                    archive_verified: false,
+                    bootstrap_complete: verified,
+                    archive_verified: verified,
                     imported: imported.count,
                     caught_up: true,
                 });
@@ -328,15 +338,16 @@ async function route(
             const baseline = await store.sql.first<{
                 imported: number;
                 caught_up: number;
+                archive_verified: number;
             }>(
-                "SELECT r.accepted AS imported,r.caught_up FROM baseline_receipt r JOIN source_checkpoint c ON c.baseline_digest=r.digest WHERE c.source='cve'",
+                "SELECT r.accepted AS imported,r.caught_up,CASE WHEN p.phase='verified' AND p.verified_at IS NOT NULL THEN 1 ELSE 0 END AS archive_verified FROM baseline_receipt r JOIN source_checkpoint c ON c.baseline_digest=r.digest LEFT JOIN baseline_publisher_proof p ON p.session_id=r.session_id WHERE c.source='cve'",
             );
             return Response.json({
                 schema_version: 1,
                 baseline: {
                     imported: baseline?.imported ?? 0,
                     caught_up: baseline?.caught_up === 1,
-                    archive_verified: false,
+                    archive_verified: baseline?.archive_verified === 1,
                 },
                 bootstrap_complete:
                     checkpoints.find((c) => c.source === "cve")

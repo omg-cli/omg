@@ -230,13 +230,13 @@ export async function refresh(
         },
     ]);
 }
-export function parseBatch(value: unknown): string[] {
+export function parseBatch(value: unknown, maximum = LIMITS.records): string[] {
     const batch = object(value);
     if (
         batch.source !== "cve" ||
         !Array.isArray(batch.records) ||
         batch.records.length === 0 ||
-        batch.records.length > LIMITS.records
+        batch.records.length > maximum
     )
         throw new Error("invalid ingest batch");
     return batch.records.map((item) => string(item));

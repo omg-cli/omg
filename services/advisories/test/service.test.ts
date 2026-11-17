@@ -29,6 +29,7 @@ function setup(counterMigration = true) {
                 "utf8",
             ),
         );
+    db.exec(require("fs").readFileSync(new URL("../migrations/0006_baseline_publisher_proof.sql", import.meta.url), "utf8"));
     const sql: Sql = {
         first: async <T>(
             text: string,

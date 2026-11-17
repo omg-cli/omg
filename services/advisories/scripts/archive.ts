@@ -69,10 +69,14 @@ export async function scanArchive(options: {
     digest: string;
     state: ArchiveState;
     maxRecords: number;
+    batchSize?: number;
     encodeBatch: (records: string[]) => string;
     send: (body: string) => Promise<void>;
     save: (state: ArchiveState) => Promise<void>;
 }) {
+    const batchSize = options.batchSize ?? LIMITS.records;
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 64)
+        throw new Error("invalid archive batch size");
     if (options.state.digest !== options.digest)
         throw new Error("archive digest mismatch");
     const emptyBody = options.encodeBatch([]);
@@ -190,7 +194,7 @@ export async function scanArchive(options: {
                 pending.push(raw);
                 pendingBody = body;
                 pendingNext = index;
-                if (pending.length === LIMITS.records) await flush();
+                if (pending.length === batchSize) await flush();
             }
             await flush();
             if (!stop) {

@@ -10,7 +10,7 @@ import { cachedRead } from "../src/cache";
 const now = "2026-11-16T12:00:00.000Z";
 function setup() {
     const db = new Database(":memory:");
-    for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql", "0003_recent_cves.sql"])
+    for (const name of ["0001_advisories.sql", "0002_baseline_member_counter.sql", "0003_recent_cves.sql", "0006_baseline_publisher_proof.sql"])
         db.exec(readFileSync(new NodeURL(`../migrations/${name}`, import.meta.url), "utf8"));
     const sql: Sql = {
         first: async <T>(query: string, values: (string | number | null)[] = []) =>
