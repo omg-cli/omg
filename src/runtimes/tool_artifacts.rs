@@ -31,12 +31,12 @@ enum ChildObservation {
 }
 
 #[cfg(unix)]
-fn classify_child_wait<T>(result: rustix::io::Result<Option<T>>) -> Result<ChildObservation> {
+fn classify_child_wait<T>(result: &rustix::io::Result<Option<T>>) -> Result<ChildObservation> {
     match result {
         Ok(Some(_)) => Ok(ChildObservation::Exited),
         Ok(None) => Ok(ChildObservation::Pending),
-        Err(error) if error == rustix::io::Errno::INTR => Ok(ChildObservation::Interrupted),
-        Err(error) => Err(error.into()),
+        Err(error) if *error == rustix::io::Errno::INTR => Ok(ChildObservation::Interrupted),
+        Err(error) => Err((*error).into()),
     }
 }
 
@@ -46,7 +46,7 @@ fn observe_child_exit(process: u32) -> Result<ChildObservation> {
         use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
         let process =
             Pid::from_raw(i32::try_from(process)?).context("Invalid manager process ID")?;
-        classify_child_wait(waitid(
+        classify_child_wait(&waitid(
             WaitId::Pid(process),
             WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
         ))
@@ -949,7 +949,7 @@ esac
         );
         let output = Command::new(destination.join("bin/fixture-tool")).output()?;
         let stderr = String::from_utf8_lossy(&output.stderr);
-        ensure!(output.status.success(), "Published tool failed: {}", stderr);
+        ensure!(output.status.success(), "Published tool failed: {stderr}");
         assert_eq!(output.stdout, b"reviewed-tool-success\n");
         let receipt = read(
             &destination.join(".omg-package-advisory-review.json"),
@@ -1276,18 +1276,18 @@ esac
     #[test]
     fn process_wait_error_and_timeout_stop_and_reap_the_owned_real_child() -> Result<()> {
         assert_eq!(
-            classify_child_wait::<()>(Ok(Some(())))?,
+            classify_child_wait::<()>(&Ok(Some(())))?,
             ChildObservation::Exited
         );
         assert_eq!(
-            classify_child_wait::<()>(Ok(None))?,
+            classify_child_wait::<()>(&Ok(None))?,
             ChildObservation::Pending
         );
         assert_eq!(
-            classify_child_wait::<()>(Err(rustix::io::Errno::INTR))?,
+            classify_child_wait::<()>(&Err(rustix::io::Errno::INTR))?,
             ChildObservation::Interrupted
         );
-        assert!(classify_child_wait::<()>(Err(rustix::io::Errno::IO)).is_err());
+        assert!(classify_child_wait::<()>(&Err(rustix::io::Errno::IO)).is_err());
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 30"]);
         let mut owned_pid = None;
@@ -1331,11 +1331,11 @@ esac
                 "controlled retry",
                 Instant::now() + Duration::from_secs(2),
                 |pid| {
-                    if !interrupted {
+                    if interrupted {
+                        observe_child_exit(pid)
+                    } else {
                         interrupted = true;
                         Ok(ChildObservation::Interrupted)
-                    } else {
-                        observe_child_exit(pid)
                     }
                 }
             )
@@ -1347,8 +1347,7 @@ esac
     }
 
     #[test]
-    fn real_manager_output_overflow_fails_closed_and_failure_diagnostics_are_sanitized()
-    -> Result<()> {
+    fn real_manager_output_overflow_fails_closed_and_failure_diagnostics_are_sanitized() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "head -c 2097152 /dev/zero >&2; sleep 30"]);
         let started = Instant::now();
@@ -1371,7 +1370,6 @@ esac
             )
             .is_err()
         );
-        Ok(())
     }
 
     #[test]
@@ -1406,10 +1404,10 @@ esac
             scoped_future(async { Err::<(), _>(anyhow::anyhow!("controlled metadata failure")) })
                 .unwrap_err();
         assert!(error.to_string().contains("controlled metadata failure"));
-        async fn panicking_worker() -> Result<()> {
+        let panicking_worker = std::future::poll_fn(|_| -> std::task::Poll<Result<()>> {
             panic!("controlled metadata panic")
-        }
-        let error = scoped_future(panicking_worker()).unwrap_err();
+        });
+        let error = scoped_future(panicking_worker).unwrap_err();
         assert!(error.to_string().contains("metadata worker failed"));
         Ok(())
     }

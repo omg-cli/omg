@@ -5,6 +5,7 @@ on:
     paths:
       - ".github/workflows/release-smoke.yml"
       - "scripts/release-smoke.sh"
+      - "scripts/qemu-runtime-advisory-oracle.py"
       - "scripts/test-release-smoke.sh"
       - "scripts/test-release-provenance.sh"
       - "scripts/report-smoke-sentry.sh"
@@ -207,7 +208,9 @@ jobs:
         run: python3 scripts/ci-smoke-report.py configure
 
       - name: Install GNU timeout
-        run: brew install coreutils
+        run: |
+          brew install coreutils python@3.13
+          echo "$(brew --prefix python@3.13)/libexec/bin" >> "$GITHUB_PATH"
 
       - name: Pin server-computed release digests
         # Native execution runs the extracted release binary directly on this

@@ -973,11 +973,19 @@ esac
     fn malformed_advisory_receipt_cannot_establish_cached_authority() {
         let fixture = Fixture::new();
         drop(fixture.install().expect("controlled signed installation"));
-        fs::write(
-            fixture.prefix.join(".omg-npm-advisory-review.json"),
-            b"invalid published advisory receipt",
-        )
-        .expect("write malformed advisory receipt fixture");
+        let receipt = fixture.prefix.join(".omg-npm-advisory-review.json");
+        fs::remove_file(&receipt).expect("remove the controlled advisory receipt");
+        let missing = read_advisory_receipt(&fixture.prefix)
+            .expect_err("missing advisory receipt must not establish cached authority");
+        assert_eq!(
+            missing
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound),
+            "receipt IO failures must remain observable"
+        );
+        fs::write(receipt, b"invalid published advisory receipt")
+            .expect("write malformed advisory receipt fixture");
         let error = read_advisory_receipt(&fixture.prefix)
             .expect_err("malformed cached advisory receipt must refuse parsing");
         assert!(format!("{error:#}").contains("expected value"));

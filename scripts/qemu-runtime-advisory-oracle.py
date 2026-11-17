@@ -9,6 +9,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -145,7 +146,11 @@ def main():
     require(command and 1 <= args.timeout <= 1500, 'invalid bounded runtime command')
     require(args.native or args.version, 'runtime mode requires its exact version')
     require(not args.native or args.accept_only or args.deny_only, 'native commands need --accept-only or a separate --deny-only control')
-    command[0] = str(Path(command[0]).resolve(strict=True))
+    executable = command[0]
+    if os.sep not in executable:
+        executable = shutil.which(executable)
+        require(executable is not None, f'command executable was not found in PATH: {command[0]}')
+    command[0] = str(Path(executable).resolve(strict=True))
     def interrupted(signum, _frame): raise RuntimeError(f'runtime consent interrupted by signal {signum}')
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP): signal.signal(signum, interrupted)
     if args.deny_only:

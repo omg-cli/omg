@@ -569,7 +569,9 @@ jobs:
           name: macos-build
           path: staged-release
       - name: Install GNU timeout
-        run: brew install coreutils
+        run: |
+          brew install coreutils python@3.13
+          echo "$(brew --prefix python@3.13)/libexec/bin" >> "$GITHUB_PATH"
       - name: Pin staged macOS archive to builder digest
         env:
           ARCHIVE_SHA256: ${{ needs.build-macos.outputs.archive_sha256 }}

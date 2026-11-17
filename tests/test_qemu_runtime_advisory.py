@@ -195,6 +195,70 @@ print('runtime-install-complete')
             self.assertIsNone(receipt['accepted_review'])
             self.assertEqual(receipt['accepted_reviews'], [])
 
+    def test_named_privilege_launcher_uses_path_and_not_a_same_named_working_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = self.command(root, native=True, known=False)
+            search = root / 'commands'
+            search.mkdir()
+            launcher = search / 'sudo'
+            launcher.write_text('#!' + sys.executable + '\n' +
+                                "import os,sys\nassert sys.argv[1] == '-n'\n" +
+                                "open('launcher.log','a').write('path-launcher\\n')\n" +
+                                'os.execv(sys.argv[2], sys.argv[2:])\n')
+            launcher.chmod(0o755)
+            shadow = root / 'sudo'
+            shadow.write_text('#!/bin/sh\nprintf wrong-working-directory-launcher\\n\nexit 42\n')
+            shadow.chmod(0o755)
+            environment = os.environ | {'PATH': str(search) + os.pathsep + os.environ.get('PATH', '')}
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                                     '--native', '--accept-only', '--require-review', '--timeout', '5',
+                                     '--', 'sudo', '-n', *command], cwd=root, env=environment,
+                                    capture_output=True, start_new_session=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertEqual((root / 'launcher.log').read_text().splitlines(), ['path-launcher'])
+            self.assertTrue((root / 'accepted.marker').exists())
+            self.assertNotIn(b'wrong-working-directory-launcher', result.stdout)
+
+    def test_missing_path_command_refuses_before_any_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                                     '--native', '--accept-only', '--timeout', '5', '--',
+                                     'omg-missing-launcher-fixture'], cwd=root,
+                                    capture_output=True, start_new_session=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'command executable was not found in PATH', result.stderr)
+            self.assertFalse((root / 'accepted.marker').exists())
+
+    def test_explicit_relative_launcher_keeps_its_path_without_a_path_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / 'owned-command'
+            launcher.write_text('#!' + sys.executable + '\n' +
+                                "open('attempts.log','a').write('relative-launcher\\n')\n")
+            launcher.chmod(0o755)
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                                     '--native', '--accept-only', '--timeout', '5', '--',
+                                     './owned-command'], cwd=root, env=os.environ | {'PATH': ''},
+                                    capture_output=True, start_new_session=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertEqual((root / 'attempts.log').read_text().splitlines(), ['relative-launcher'])
+
+    def test_nonexecutable_path_entry_never_becomes_a_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / 'omg-inert-launcher-fixture'
+            launcher.write_text('#!/bin/sh\ntouch should-not-run\n')
+            launcher.chmod(0o644)
+            result = subprocess.run([sys.executable, str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'),
+                                     '--native', '--accept-only', '--timeout', '5', '--', launcher.name],
+                                    cwd=root, env=os.environ | {'PATH': str(root)}, capture_output=True,
+                                    start_new_session=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'command executable was not found in PATH', result.stderr)
+            self.assertFalse((root / 'should-not-run').exists())
+
     def test_actual_transaction_recipe_keeps_one_original_install_after_exact_review(self):
         source = (ROOT / 'benchmark-hyperfine.sh').read_text()
         begin = source.index('        if [[ "$GUEST_TOOL" == omg ]]; then')

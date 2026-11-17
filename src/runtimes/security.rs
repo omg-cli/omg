@@ -1533,6 +1533,50 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    #[ignore = "requires the fixed public advisory provider; selected explicitly by genuine Node coverage"]
+    fn public_http_source_provides_complete_node_evidence() {
+        assert!(
+            std::env::var("OMG_RUN_NETWORK_TESTS").as_deref() == Ok("1"),
+            "Public runtime source probe requires explicit network-test selection"
+        );
+        let query = RuntimeQuery {
+            runtime: "node".into(),
+            vendor: "nodejs".into(),
+            version: "26.13.1".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let bytes = HttpSource
+            .read(&query)
+            .expect("read the fixed public runtime advisory source");
+        let report: Envelope = serde_json::from_slice(&bytes)
+            .expect("decode the actual public runtime source response");
+        validate_envelope(&report, &query, jiff::Timestamp::now())
+            .expect("validate exact public Node identity, freshness and source evidence");
+        assert_eq!(
+            report.coverage,
+            Coverage::Assessed,
+            "Public Node advisory source must provide complete assessed evidence"
+        );
+        assert!(
+            report.sources.iter().any(|source| {
+                source.complete && source.url == "https://raw.githubusercontent.com/nodejs/security-wg/main/vuln/core/index.json"
+            }),
+            "Public runtime report must retain its complete official Node source receipt"
+        );
+        println!(
+            "OMG_RUNTIME_PUBLIC_SOURCE_PROBE={}",
+            serde_json::json!({
+                "schema_version": 1,
+                "identity": report.identity,
+                "checked_at": report.checked_at,
+                "sources": report.sources,
+                "findings_count": report.findings.len(),
+            })
+        );
+    }
+
     struct CountingSource {
         calls: AtomicUsize,
     }
@@ -1719,9 +1763,7 @@ mod tests {
             let stderr = String::from_utf8_lossy(&output.stderr);
             ensure!(
                 output.status.success(),
-                "Identity-change security regression failed: {}\n{}",
-                stdout,
-                stderr
+                "Identity-change security regression failed: {stdout}\n{stderr}"
             );
             return Ok(());
         }
@@ -1906,7 +1948,7 @@ mod tests {
         let mut identity = InstallIdentity {
             schema_version: 1,
             runtime: "rust".into(),
-            requested: requested.clone(),
+            requested,
             version: "1.93.1".into(),
             vendor: "rust-lang".into(),
             build: "controlled foreign host compiler".into(),
@@ -2577,19 +2619,19 @@ mod tests {
             return Ok(());
         }
         use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
         struct Restore {
-            limit: nix::libc::rlimit,
+            limit: Rlimit,
             signal: SigAction,
         }
         impl Drop for Restore {
             fn drop(&mut self) {
-                // SAFETY: this isolated process restores its own saved resource and signal state.
-                assert_eq!(
-                    unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_FSIZE, &self.limit) },
-                    0,
-                    "restore fixture file limit failed"
-                );
+                setrlimit(Resource::Fsize, self.limit).expect("restore fixture file limit failed");
                 // SAFETY: the saved handler belongs only to this isolated fixture process.
+                #[expect(
+                    unsafe_code,
+                    reason = "restore the saved SIGXFSZ disposition in an isolated exact-test child"
+                )]
                 unsafe { sigaction(Signal::SIGXFSZ, &self.signal) }
                     .expect("restore fixture signal failed");
             }
@@ -2601,28 +2643,23 @@ mod tests {
         let previous = fs::read(&identity)?;
         let archive = owner.path().join("controlled-archive");
         fs::write(&archive, b"authenticated fixture archive")?;
-        let mut limit = nix::libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: the kernel writes a valid rlimit into this process-local object.
-        ensure!(
-            unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_FSIZE, &mut limit) } == 0,
-            "read fixture resource limit"
-        );
+        let limit = getrlimit(Resource::Fsize);
         let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
         // SAFETY: only this disposable child changes SIGXFSZ; Restore reinstates it before profile flush.
+        #[expect(
+            unsafe_code,
+            reason = "isolated exact-test child needs EFBIG instead of process termination for real write failures"
+        )]
         let signal = unsafe { sigaction(Signal::SIGXFSZ, &ignore) }?;
         let restore = Restore { limit, signal };
-        let restricted = nix::libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: restore.limit.rlim_max,
-        };
-        // SAFETY: lowering this child's soft file-size limit does not affect any other process.
-        ensure!(
-            unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_FSIZE, &restricted) } == 0,
-            "set fixture resource limit"
-        );
+        setrlimit(
+            Resource::Fsize,
+            Rlimit {
+                current: Some(0),
+                maximum: restore.limit.maximum,
+            },
+        )
+        .context("set fixture resource limit")?;
         let download = record_download(
             "node",
             "24.22.3",

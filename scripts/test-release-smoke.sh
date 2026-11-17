@@ -210,6 +210,33 @@ grep -q '"result":"HARNESS_ERROR"' "$(results_file "$scratch/missing-evidence")"
 
 make_stage "$scratch/valid"
 export FAKE_CONTAINER_STATE="$scratch/container-state"
+mkdir -p "$scratch/copy-failure-bin"
+real_cp="$(command -v cp)"
+cat > "$scratch/copy-failure-bin/cp" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+destination="${!#}"
+if [[ "$destination" == "$FAKE_CP_EVIDENCE_ROOT/"* ]]; then
+  if [[ "$FAKE_CP_KIND" == probe && "$destination" == */probe.sh ]] ||
+      [[ "$FAKE_CP_KIND" == helper && "$destination" == */qemu-runtime-advisory-oracle.py ]]; then
+    printf 'controlled evidence copy failure\n' >&2
+    exit 73
+  fi
+fi
+exec "$REAL_CP" "$@"
+EOF
+chmod 700 "$scratch/copy-failure-bin/cp"
+for carrier in probe helper; do
+  evidence="$scratch/copy-failed-$carrier"
+  engine_calls="$scratch/copy-failed-$carrier-engine"
+  FAKE_CP_KIND="$carrier" FAKE_CP_EVIDENCE_ROOT="$evidence" REAL_CP="$real_cp" \
+    FAKE_ENGINE_ARGS="$engine_calls" PATH="$scratch/copy-failure-bin:$PATH" \
+    assert_rc 3 "$runner" "${base_args[@]}" --staged-dir "$scratch/valid" --evidence-dir "$evidence"
+  grep -q '"result":"HARNESS_ERROR"' "$(results_file "$evidence")" || fail 'failed evidence carrier was not a harness error'
+  if grep -q '"result":"PASS"' "$(results_file "$evidence")" || grep -qx run "$engine_calls"; then
+    fail 'failed evidence carrier executed the product or recorded PASS'
+  fi
+done
 assert_rc 2 "$runner" --apt-abi 8 --distro debian
 assert_rc 2 "$runner" --apt-abi 7 --distro arch
 make_stage "$scratch/apt7" debian-trixie
@@ -323,7 +350,7 @@ grep -q '"artifact_source":"published"' "$(results_file "$scratch/published-evid
 family_args=(--release v9.9.9 --distro arch --family package --container-engine fake-engine)
 export FAKE_ENGINE_ARGS="$scratch/engine-args"
 assert_rc 0 "$runner" "${family_args[@]}" --staged-dir "$scratch/valid" --evidence-dir "$scratch/family-evidence"
-grep -Fxq 'OMG_PROBE_INDEX_CMD=pacman-key --init && pacman-key --populate archlinux && pacman -Syu --noconfirm' "$FAKE_ENGINE_ARGS" || fail "Arch setup must initialize trust and perform a full upgrade"
+grep -Fxq 'OMG_PROBE_INDEX_CMD=pacman-key --init && pacman-key --populate archlinux && pacman -Syu --noconfirm && pacman -S --noconfirm python' "$FAKE_ENGINE_ARGS" || fail "Arch setup must initialize trust, perform a full upgrade and provide Python consent support"
 unset FAKE_ENGINE_ARGS
 [[ "$(grep -c '"case_id"' "$(results_file "$scratch/family-evidence")")" -eq 3 ]] || fail "package family did not select three contracts"
 assert_rc 2 "$runner" "${family_args[@]}" --case release-package-rollback-tree \
@@ -352,6 +379,7 @@ grep -q '"exit_code":0' "$result" || fail "result omits exit code"
 grep -Eq '"elapsed_seconds":[0-9]+' "$result" || fail "result omits elapsed seconds"
 probe="$(find "$scratch/pass-evidence" -name probe.sh -type f -print -quit)"
 [[ -n "$probe" ]] || fail "release probe was not preserved"
+cmp "$repo_root/scripts/qemu-runtime-advisory-oracle.py" "$(dirname "$probe")/qemu-runtime-advisory-oracle.py" || fail 'release evidence did not carry exact native consent owner bytes'
 probe_root="$scratch/probe-root"
 probe_package="$probe_root/omg-v9.9.9-x86_64-linux-arch"
 mkdir -p "$probe_package"
@@ -388,6 +416,61 @@ done
 export FAKE_SEARCH_OUTPUT='  tree.x86_64 2.2.1-4.fc44  Official' FAKE_SEARCH_EXIT=1
 assert_rc 1 env "${fedora_probe_env[@]}" bash "$probe"
 unset FAKE_SEARCH_OUTPUT FAKE_SEARCH_EXIT
+cp "$probe_package/omg" "$scratch/search-fixture-omg"
+cp "$repo_root/scripts/qemu-runtime-advisory-oracle.py" "$probe_root/qemu-runtime-advisory-oracle.py"
+cat > "$probe_package/omg" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  --version) printf 'omg 9.9.9\n' ;;
+  install)
+    printf 'SECURITY WARNING:\nPackage: ["tree","1.0"]\n'
+    if [[ "${FAKE_WARNING_KIND:-unknown}" == known ]]; then
+      printf 'disclosed advisory findings\nCVE-2026-6161 https://www.cve.org/CVERecord?id=CVE-2026-6161\n'
+    else
+      printf 'Coverage: unknown\nCoverage gap: controlled native solver coverage\n'
+      [[ "${FAKE_WARNING_KIND:-unknown}" == missing-url ]] || printf 'https://www.cve.org/\n'
+    fi
+    if ! { exec 9<>/dev/tty; } 2>/dev/null; then
+      printf 'Security review requires an attended controlling terminal\n' >&2
+      exit 1
+    fi
+    digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    printf 'Type accept %s within 60 seconds to continue (default: cancel): ' "$digest"
+    IFS= read -r answer <&9
+    [[ "$answer" == "accept $digest" ]] || exit 1
+    touch "$FAKE_INSTALL_MARKER"
+    ;;
+  remove) rm -f "$FAKE_INSTALL_MARKER" ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 700 "$probe_package/omg"
+export FAKE_INSTALL_MARKER="$scratch/consent-installed"
+install_probe_env=("${probe_env[@]}" OMG_SMOKE_PROBE_KIND=install-tree
+  'OMG_PROBE_INSTALLED_ASSERT=test -f "$FAKE_INSTALL_MARKER"'
+  'OMG_PROBE_REMOVED_ASSERT=test ! -f "$FAKE_INSTALL_MARKER"')
+run_no_tty() {
+  python3 -c 'import subprocess,sys; raise SystemExit(subprocess.call(sys.argv[1:],start_new_session=True))' "$@"
+}
+# A real nonterminal denial is independent of the measured install attempt.
+assert_rc 0 python3 "$repo_root/scripts/qemu-runtime-advisory-oracle.py" --native --deny-only --timeout 10 -- "$probe_package/omg" install --yes tree
+[[ ! -e "$FAKE_INSTALL_MARKER" ]] || fail 'unattended denial mutated native fixture state'
+for warning in unknown known; do
+  export FAKE_WARNING_KIND="$warning"
+  assert_rc 0 run_no_tty env "${install_probe_env[@]}" bash "$probe"
+  [[ -e "$FAKE_INSTALL_MARKER" ]] || fail 'exact attended acceptance did not execute native install'
+  grep -Fq 'OMG_QEMU_NATIVE_CONSENT=' "$scratch/command.out" || fail 'install probe omitted actual consent receipt'
+  rm "$FAKE_INSTALL_MARKER"
+done
+export FAKE_WARNING_KIND=missing-url
+assert_rc 1 run_no_tty env "${install_probe_env[@]}" bash "$probe"
+[[ ! -e "$FAKE_INSTALL_MARKER" ]] || fail 'warning without a source URL was accepted'
+export FAKE_WARNING_KIND=unknown
+assert_rc 0 run_no_tty env "${install_probe_env[@]}" OMG_SMOKE_PROBE_KIND=remove-tree bash "$probe"
+[[ ! -e "$FAKE_INSTALL_MARKER" ]] || fail 'remove probe lost native absent-state assertion'
+unset FAKE_INSTALL_MARKER FAKE_WARNING_KIND
+cp "$scratch/search-fixture-omg" "$probe_package/omg"
 printf '#!/usr/bin/env bash\nprintf "omgd 9.9.8\\n"\n' > "$probe_package/omgd"
 assert_rc 1 env "${probe_env[@]}" bash "$probe"
 rm "$probe_package/omgd"
@@ -1060,7 +1143,7 @@ assert_rc 1 "$runner" --release v9.9.9 --distro macos --executor native --case r
 grep -q '"result":"PRODUCT_FAIL"' "$(results_file "$scratch/native-daemon-version-fail")" || fail "packaged daemon version mismatch was not blamed on the product"
 
 mkdir -p "$scratch/macbin"
-for tool in awk basename bash cat chmod cp date dirname env find grep gzip head mktemp mkdir mv rm tail tar tee tr wc; do
+for tool in awk basename bash cat chmod cp date dirname env find grep gzip head mktemp mkdir mv python3 rm tail tar tee tr wc; do
   ln -sf "$(command -v "$tool")" "$scratch/macbin/$tool"
 done
 if command -v shasum >/dev/null 2>&1; then
