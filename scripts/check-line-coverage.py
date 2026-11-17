@@ -2250,6 +2250,133 @@ def eager_call_prefix_obligations(name, sources, counts, descriptors, inventorie
     return dict(mapped), receipt
 
 
+def test_declaration_header_obligations(name, sources, counts, descriptors, inventories, grouped, work):
+    """Bind unchanged test declaration lines to the same closed entry projection."""
+    left, right = descriptors
+    guard = ('#', '[', 'cfg', '(', 'test', ')', ']')
+    if (left['context'] != right['context'] or left['attributes'] != right['attributes']
+            or not any(tuple(header[:len(guard)]) == guard for header in left['context'][0])):
+        return None
+    parents = [{nominal_method_parent(owner['name'], descriptor['declaration'])
+                for owner in descriptor['group'][2]} for descriptor in descriptors]
+    if None in parents[0] or len(parents[0]) != 1 or parents[0] != parents[1]:
+        return None
+    lines = []; geometry = []; states = []; witnesses = []; headers = []; entry_geometry = []
+    for source, mapped, descriptor, inventory, compiled in zip(sources, counts, descriptors, inventories, grouped):
+        first, last, members = descriptor['group']
+        header = descriptor['row']['header']
+        _construct_charge(work, len(header) + len(members) + 1)
+        opening = next((index for index, token in enumerate(header) if token == '('), None)
+        if opening is None:
+            return None
+        receiver = []
+        for token in header[opening + 1:]:
+            receiver.append(token)
+            if token == ',':
+                break
+        if re.fullmatch(r"&(?:'[A-Za-z_]\w*)?(?:mut)?self,", ''.join(receiver)) is None:
+            return None
+        code = inventory[0]
+        tokens = code.words[descriptor['row']['first']:descriptor['row']['opening']]
+        punctuation = {'<', '>', '(', ')', '[', ']', '&', '*', ',', ':', '::', '+', '=', '->'}
+        forbidden = {'const', 'where', 'unsafe', 'extern', 'impl', 'for'}
+        if (tokens.count('fn') != 1 or tokens.count('(') != 1 or tokens.count(')') != 1
+                or any(token in forbidden or token not in punctuation
+                       and re.fullmatch(r"(?:'[A-Za-z_]\w*|[A-Za-z_]\w*)", token) is None for token in tokens)):
+            return None
+        opening_line = code.position(code.starts[descriptor['row']['opening']])[0]
+        levels = {}; depth = 0
+        for index in range(descriptor['row']['first'], descriptor['row']['opening']):
+            number = code.position(code.starts[index])[0]
+            levels.setdefault(number, [depth, depth])
+            depth += int(code.words[index] == '<') - int(code.words[index] == '>')
+            if depth < 0:
+                return None
+            levels[number][1] = depth
+        if depth:
+            return None
+        start = descriptor['row']['first'] + opening + 1
+        end = start + len(receiver) - 1
+        line = code.position(code.starts[start])[0]
+        if (code.position(code.ends[end])[0] != line or not first < line < last
+                or re.fullmatch(r"\s*&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?self\s*,\s*", source[line - 1]) is None):
+            return None
+        if line not in mapped or mapped[line] <= 0:
+            return None
+        text = source[line - 1]
+        low = (line, len(text[:len(text) - len(text.lstrip())].encode()) + 1)
+        high = (line, len(text.rstrip().encode()) + 1)
+        allowed = {id(owner) for owner in members}
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in compiled[0]))
+        if any(tuple(region[:2]) < high and low < tuple(region[2:4])
+               for owner in compiled[0] if id(owner) not in allowed for region in owner['regions']):
+            return None
+        shapes = []; vectors = []; evidence = []; entries = []
+        for owner in members:
+            regions = [region for region in owner['regions']
+                       if tuple(region[:2]) < high and low < tuple(region[2:4])]
+            # The containing region must start at this method's declaration,
+            # rather than a nested callback or a coincidentally painted line.
+            if (len(regions) != 1 or regions[0][0] != first
+                    or not tuple(regions[0][:2]) <= low or not high <= tuple(regions[0][2:4])
+                    or type(owner.get('count')) is not int or not 0 < owner['count'] < COUNTER_LIMIT
+                    or not 0 < regions[0][4] < COUNTER_LIMIT):
+                return None
+            region, = regions
+            shapes.append((low[1], high[1], *region[5:]))
+            vectors.append((int(region[4] > 0),))
+            evidence.append(dict(name=owner['name'], count=owner['count'], region=region))
+            entries.append((region[0] - first, region[1], region[2] - first, region[3], *region[5:]))
+        lines.append(line); geometry.append(shapes); states.append(vectors); witnesses.append(evidence)
+        headers.append((first, opening_line, levels)); entry_geometry.append(entries)
+    if (sources[0][lines[0] - 1] != sources[1][lines[1] - 1] or not states[0]
+            or len(states[0]) != len(states[1]) or geometry[0] != geometry[1]):
+        return None
+    _construct_charge(work, len(states[0]) * len(states[1]) + sum(len(repr(d['context'])) for d in descriptors))
+    matching = compiled_hit_state_matching(*states)
+    if matching is None:
+        return None
+    pairs = {lines[0]: lines[1]}
+    header_compatible = (entry_geometry[0] == entry_geometry[1]
+        and headers[0][1] - headers[0][0] == headers[1][1] - headers[1][0])
+    _construct_charge(work, headers[0][1] - headers[0][0])
+    for offset in range(headers[0][1] - headers[0][0] if header_compatible else 0):
+        pair = [header[0] + offset for header in headers]
+        if (sources[0][pair[0] - 1] != sources[1][pair[1] - 1]
+                or not sources[0][pair[0] - 1].strip()
+                or headers[0][2].get(pair[0]) != headers[1][2].get(pair[1])
+                or any(mapped.get(line, 0) <= 0 for mapped, line in zip(counts, pair))):
+            continue
+        valid = True
+        for side, (source, descriptor, compiled, number) in enumerate(zip(sources, descriptors, grouped, pair)):
+            text = source[number - 1]
+            low = (number, len(text[:len(text) - len(text.lstrip())].encode()) + 1)
+            high = (number, len(text.rstrip().encode()) + 1)
+            members = descriptor['group'][2]; allowed = {id(owner) for owner in members}
+            _construct_charge(work, len(text) + sum(len(owner['regions']) + 1 for owner in compiled[0]))
+            if any(tuple(region[:2]) < high and low < tuple(region[2:4])
+                   for owner in compiled[0] if id(owner) not in allowed for region in owner['regions']):
+                valid = False; break
+            for owner, witness in zip(members, witnesses[side]):
+                overlaps = [region for region in owner['regions']
+                            if tuple(region[:2]) < high and low < tuple(region[2:4])]
+                if (overlaps != [witness['region']] or not tuple(overlaps[0][:2]) <= low
+                        or not high <= tuple(overlaps[0][2:4])):
+                    valid = False; break
+            if not valid:
+                break
+        if valid:
+            pairs[pair[0]] = pair[1]
+    if pairs.get(lines[0]) != lines[1]:
+        return None
+    return pairs, dict(file=name, pairs=[list(pair) for pair in sorted(pairs.items())],
+        test_declaration_header=dict(context_sha256=hashlib.sha256(repr(left['context']).encode()).hexdigest(),
+            owners=witnesses, geometry=geometry[0], base_instance_states=states[0], head_instance_states=states[1],
+            instance_matching=matching, entry_geometry=entry_geometry[0],
+            header_ranges=[list(header[:2]) for header in headers]), summary_credit=[0, 0], mapped_credit=[0, 0],
+        claim='Byte-identical test declaration lines at unique relative token-depth coordinates only; no changed type, body, callback or deletion credit')
+
+
 def retained_replacement_obligations(name, old, new, before, after, inventories, grouped,
                                      replacements, work, head_counts=None, parent_files=None):
     if not replacements or any(value is None for value in tuple(inventories) + tuple(grouped)):
@@ -2550,7 +2677,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     _construct_charge(work, sum(len(inventory[1]) for inventory in inventories))
     file_counts = [Counter(row['digest'] for row in inventory[1] if row['kind'] == 'statement')
                    for inventory in inventories]
-    candidates = []
+    candidates = []; receiver_candidates = []
     for left_prefix, left in descriptors[0].items():
         for right_prefix, right in descriptors[1].items():
             _construct_charge(work, 1)
@@ -2601,6 +2728,8 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 if (not seeds and not method_migration
                         or parent_files is not None and parent_files(parent) != {name}):
                     continue
+                if method_migration:
+                    receiver_candidates.append((left_prefix, right_prefix, left, right))
                 if not seeds:
                     _construct_charge(work, sum(descriptor['row']['end'] - descriptor['row']['opening']
                         for descriptor in (left, right)))
@@ -2611,6 +2740,18 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
             candidates.append((left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite, prefix_only))
     left_counts = Counter(row[0] for row in candidates); right_counts = Counter(row[1] for row in candidates)
     pairs = {}; receipts = []; proved_functions = set(); excerpts = []
+    receiver_left = Counter(row[0] for row in receiver_candidates)
+    receiver_right = Counter(row[1] for row in receiver_candidates)
+    for lp, rp, left, right in receiver_candidates:
+        if receiver_left[lp] != 1 or receiver_right[rp] != 1:
+            continue
+        proof = test_declaration_header_obligations(name, (old, new), (before, after),
+            (left, right), inventories, grouped, work)
+        if proof is not None:
+            mapped, receipt = proof
+            pairs.update(mapped); receipts.append(receipt)
+            excerpts.extend(('\n'.join(source[descriptor['group'][0] - 1:descriptor['group'][1]]) + '\n').encode()
+                            for source, descriptor in zip((old, new), (left, right)))
     _construct_charge(work, 3 * (len(old) + len(new)))
     equal_rows = [(line + 1, c + line - a + 1)
                   for tag, a, b, c, d in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()

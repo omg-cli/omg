@@ -367,7 +367,8 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertNotEqual(coverage.nominal_method_path(child.replace('Ms0_', 'Ms1_')).copy_identity,
                             decoded.copy_identity)
 
-    def migrated_trait_compare(self, mutation=None, callback=False, method_kind='X'):
+    def migrated_trait_compare(self, mutation=None, callback=False, method_kind='X', receiver_only=False,
+                               multiline_header=False):
         old = b"impl Source for FixtureSource {\n    fn scan_package<'a>(\n        &'a self,\n        name: &'a str,\n    ) -> Result<Value> {\n        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n        old_step();\n    }\n}\n"
         if method_kind == 'M':
             old = old.replace(b'impl Source for FixtureSource {', b'impl FixtureSource {')
@@ -375,8 +376,14 @@ class SourceAwareCoverageTests(unittest.TestCase):
             old = old.replace(b'impl Source for FixtureSource {', b'trait Source {')
         if callback:
             old = old.replace(b'        old_step();', b'        Box::pin(async move {\n            old_step();\n        })')
+        if multiline_header:
+            old = old.replace(b') -> Result<Value> {',
+                b') -> Pin<\n        Box<\n            Result<Value>,\n        >,\n    > {')
         new = old.replace(b'scan_package', b'assess_packages').replace(
             b"name: &'a str", b"packages: &'a [Package]").replace(b'Result<Value>', b'Result<Assessment>').replace(b'old_step()', b'new_step()')
+        if receiver_only:
+            old = old.replace(b'impl Source', b'#[cfg(test)] impl Source')
+            new = new.replace(b'impl Source', b'#[cfg(test)] impl Source').replace(b'fetch_add', b'fetch_sub')
         original = '_RNvXNtNtNtNtNtCs40j12eeWnis_7omg_lib3cli8packages7install4arch5testsNtB2_13FixtureSourceNtNtNtNtBc_4core8security13vulnerability19VulnerabilitySource12scan_package'
         crate = 'Cs40j12eeWnis_7omg_lib'
         if method_kind == 'M':
@@ -388,11 +395,13 @@ class SourceAwareCoverageTests(unittest.TestCase):
             for document, source, symbol in ((base, old, original), (head, new, current)):
                 lines = source.decode().splitlines()
                 end = len(lines) - 1
+                header_end = 9 if multiline_header else 5
+                body = header_end + 1
                 document['data'][0]['functions'] = [dict(name=symbol, count=1,
                     filenames=['/src/example.rs'], regions=[
-                        [2, 5, 5, len(lines[4]), 1, 0, 0, 0],
+                        [2, 5, header_end, len(lines[header_end - 1]), 1, 0, 0, 0],
                         *[[line, 9 if line < end else 5, line, len(lines[line - 1]) + 1, 1, 0, 0, 0]
-                          for line in ([6, 7, end] if callback else range(6, end + 1))]])]
+                          for line in ([body, body + 1, end] if callback else range(body, end + 1))]])]
                 if callback:
                     rebased = symbol[2:].replace('B2_', 'B4_').replace('Bc_', 'Be_')
                     child = '_RNC' + rebased + '0Be_'
@@ -403,8 +412,8 @@ class SourceAwareCoverageTests(unittest.TestCase):
                         child = '_RNC' + symbol[2:-len(root)] + '0' + root
                     document['data'][0]['functions'].append(dict(name=child,
                         count=1, filenames=['/src/example.rs'], regions=[
-                            [7, lines[6].index('{') + 1, 9, 10, 1, 0, 0, 0],
-                            [8, 13, 8, len(lines[7]) + 1, 1, 0, 0, 0]]))
+                            [body + 1, lines[body].index('{') + 1, body + 3, 10, 1, 0, 0, 0],
+                            [body + 2, 13, body + 2, len(lines[body + 1]) + 1, 1, 0, 0, 0]]))
             if mutation:
                 mutation(base, head)
         return self.compare(before=[(line, 1) for line in range(2, len(old.splitlines()))],
@@ -416,6 +425,141 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertEqual([receipt[key] for key in ('deleted_summary_found', 'deleted_summary_hit',
                                                  'deleted_mapped', 'deleted_mapped_hit')], [0, 0, 0, 0])
         self.assertTrue(receipt['retained_replacement_obligations'])
+
+    def test_test_only_migrated_receiver_has_declaration_only_proof_without_body_seed(self):
+        observed = []
+        original = coverage.test_declaration_header_obligations
+        def inspect(*arguments):
+            result = original(*arguments)
+            observed.append(result)
+            return result
+        with patch.object(coverage, 'test_declaration_header_obligations', side_effect=inspect):
+            with self.assertRaisesRegex(ValueError, r'example.rs:7 -> 7'):
+                self.migrated_trait_compare(receiver_only=True, callback=True)
+        proof, = [row[1] for row in observed if row is not None]
+        self.assertEqual(proof['pairs'], [[3, 3]])
+        self.assertEqual(proof['summary_credit'], [0, 0])
+        self.assertEqual(proof['mapped_credit'], [0, 0])
+
+    def declaration_receiver_fixture(self, multiline_header=False):
+        observed = []
+        original = coverage.test_declaration_header_obligations
+        def inspect(*arguments):
+            observed.append(arguments)
+            return original(*arguments)
+        with patch.object(coverage, 'test_declaration_header_obligations', side_effect=inspect):
+            line = 11 if multiline_header else 7
+            with self.assertRaisesRegex(ValueError, f'example.rs:{line} -> {line}'):
+                self.migrated_trait_compare(receiver_only=True, callback=True, multiline_header=multiline_header)
+        arguments, = observed
+        return arguments
+
+    def test_test_declaration_header_proves_only_exact_entry_painted_type_lines(self):
+        observed = []
+        original = coverage.test_declaration_header_obligations
+        def inspect(*arguments):
+            result = original(*arguments)
+            observed.append(result)
+            return result
+        with patch.object(coverage, 'test_declaration_header_obligations', side_effect=inspect):
+            with self.assertRaisesRegex(ValueError, r'example.rs:11 -> 11'):
+                self.migrated_trait_compare(receiver_only=True, callback=True, multiline_header=True)
+        proof, = [row[1] for row in observed if row is not None]
+        self.assertEqual(proof['pairs'], [[3, 3], [5, 5], [6, 6], [8, 8]])
+        self.assertEqual(proof['summary_credit'], [0, 0])
+        self.assertEqual(proof['mapped_credit'], [0, 0])
+
+    def test_test_receiver_proof_rejects_wrong_context_or_incomplete_compiler_copy(self):
+        original = self.declaration_receiver_fixture()
+        for mode in ('non-test', 'context', 'attributes', 'self-type', 'trait', 'impl',
+                     'cold-entry', 'cold-region', 'overlapping-cold-region', 'callback-only',
+                     'unrelated-paint', 'missing-copy', 'additional-copy', 'typed-receiver',
+                     'mixed-line', 'changed-receiver', 'missing-mapping'):
+            with self.subTest(mode=mode):
+                arguments = copy.deepcopy(list(original))
+                arguments[-1] = [20_000_000]
+                sources, counts, descriptors, inventories, grouped = arguments[1:6]
+                left, right = descriptors
+                owner = right['group'][2][0]
+                if mode == 'non-test':
+                    for descriptor in descriptors:
+                        descriptor['context'] = ((), descriptor['context'][1])
+                elif mode == 'context':
+                    right['context'] = (right['context'][0], ('changed_import',))
+                elif mode == 'attributes':
+                    right['attributes'] = ['unsafe']
+                elif mode in ('self-type', 'trait', 'impl'):
+                    old, new = {'self-type': ('13FixtureSource', '13AnotherSource'),
+                                'trait': ('19VulnerabilitySource', '19VulnerabilityOther'),
+                                'impl': ('_RNvX', '_RNvXs_')}[mode]
+                    owner['name'] = owner['name'].replace(old, new)
+                elif mode == 'cold-entry':
+                    owner['count'] = 0
+                elif mode == 'cold-region':
+                    owner['regions'][0][4] = 0
+                elif mode == 'overlapping-cold-region':
+                    owner['regions'].append([3, 9, 3, 17, 0, 0, 0, 0])
+                elif mode == 'callback-only':
+                    owner['name'] = grouped[1][0][1]['name']
+                elif mode == 'unrelated-paint':
+                    grouped[1][0].append(dict(name='unrelated', count=1,
+                        filenames=['/src/example.rs'], regions=[[3, 9, 3, 17, 1, 0, 0, 0]]))
+                elif mode == 'missing-copy':
+                    right['group'][2].clear()
+                elif mode == 'additional-copy':
+                    right['group'][2].append(copy.deepcopy(owner))
+                elif mode == 'typed-receiver':
+                    right['row']['header'] = tuple('fn changed ( self : Box < Self > , )'.split())
+                elif mode in ('mixed-line', 'changed-receiver'):
+                    sources[1][2] = ("        &'a self, other: usize," if mode == 'mixed-line'
+                                     else "        &'a mut self,")
+                elif mode == 'missing-mapping':
+                    counts[1].pop(3)
+                self.assertIsNone(coverage.test_declaration_header_obligations(*arguments))
+
+    def test_test_receiver_proof_keeps_all_copies_and_refuses_a_cold_second_copy(self):
+        arguments = copy.deepcopy(list(self.declaration_receiver_fixture()))
+        arguments[-1] = [20_000_000]
+        for side, descriptor in enumerate(arguments[3]):
+            owner = copy.deepcopy(descriptor['group'][2][0])
+            owner['name'] = owner['name'].replace('Cs40j12eeWnis_', 'Cs99_').replace('CsjVdvAHsNP8N_', 'Cs99_')
+            descriptor['group'][2].append(owner)
+            arguments[5][side][0].append(owner)
+        proof = coverage.test_declaration_header_obligations(*arguments)
+        self.assertIsNotNone(proof)
+        self.assertEqual([len(side) for side in proof[1]['test_declaration_header']['owners']], [2, 2])
+        arguments[3][1]['group'][2][1]['regions'][0][4] = 0
+        self.assertIsNone(coverage.test_declaration_header_obligations(*arguments))
+
+    def test_test_declaration_header_refuses_expression_grammar_and_changed_type_credit(self):
+        original = self.declaration_receiver_fixture(multiline_header=True)
+        for replacement in ('TypeMacro!()', 'Array<7>', 'fn()', 'Wrapper<{ cold() }>',
+                            'Result<Value> where Self: Trait', 'extern "C" fn()'):
+            with self.subTest(replacement=replacement):
+                arguments = copy.deepcopy(list(original))
+                arguments[-1] = [20_000_000]
+                for side in (0, 1):
+                    source = arguments[1][side]
+                    source[6] = '            ' + replacement + ','
+                    inventory = coverage._construct_inventory(source, [20_000_000])
+                    arguments[4] = tuple(inventory if index == side else value
+                                         for index, value in enumerate(arguments[4]))
+                    rows = [row for row in inventory[1] if row['kind'] == 'fn']
+                    if len(rows) == 1:
+                        arguments[3][side]['row'] = rows[0]
+                self.assertIsNone(coverage.test_declaration_header_obligations(*arguments))
+        arguments = copy.deepcopy(list(original))
+        arguments[-1] = [20_000_000]
+        arguments[1][1][5] = '        Arc<'
+        inventory = coverage._construct_inventory(arguments[1][1], [20_000_000])
+        arguments[4] = (arguments[4][0], inventory)
+        arguments[3][1]['row'] = next(row for row in inventory[1] if row['kind'] == 'fn')
+        pairs, proof = coverage.test_declaration_header_obligations(*arguments)
+        self.assertNotIn(6, pairs, 'Changed type tokens cannot receive retained credit')
+        self.assertNotIn(7, pairs, 'Changed result type cannot receive retained credit')
+        self.assertNotIn(9, pairs, 'A body-opening line is outside the complete declaration slice')
+        self.assertNotIn(11, pairs, 'An async body is outside the declaration slice')
+        self.assertEqual(proof['summary_credit'], [0, 0])
 
     def test_fully_covered_trait_migration_keeps_complete_async_owner_inventory(self):
         receipt = self.migrated_trait_compare(callback=True)
