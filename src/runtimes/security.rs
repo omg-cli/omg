@@ -470,13 +470,19 @@ fn admit_tree(
         policy.check_source(&assessment.package.name, &assessment.package.origin, None)?;
     }
     let context = context(&record)?;
-    if let Some(review) = AdvisoryRiskReview::new_with_unknown(&evaluated, &context)? {
-        let reusable = prior.as_ref().is_some_and(|previous| {
-            previous.accepted_review.as_deref() == Some(review.id())
-                && validate_acceptance(previous).is_ok()
-        });
+    let mut pending = AdvisoryRiskReview::new_with_unknown(&evaluated, &context)?;
+    for attempt in 0..3 {
+        let Some(review) = pending.take() else { break };
+        let reusable = attempt == 0
+            && prior.as_ref().is_some_and(|previous| {
+                previous.accepted_review.as_deref() == Some(review.id())
+                    && validate_acceptance(previous).is_ok()
+            });
         if !reusable {
             let mut details = review.details().to_owned();
+            if attempt > 0 {
+                details.push_str("\nRuntime advisory evidence changed since the previous review.");
+            }
             for gap in &record.report.gaps {
                 let _ = write!(details, "\nCoverage gap: {}", serde_json::to_string(gap)?);
             }
@@ -499,24 +505,26 @@ fn admit_tree(
                 &|| Ok(()),
             )?;
         }
-        let fresh = read_report(source, &record.query, Some(&record.report));
-        let mut current = fresh;
+        let mut current = read_report(source, &record.query, Some(&record.report));
         if !local_gaps.is_empty() {
             current.coverage = Coverage::Unknown;
             current.gaps.extend(local_gaps.iter().cloned());
         }
-        let current_review =
-            AdvisoryRiskReview::new_with_unknown(&assessments(&current)?, &context)?;
+        pending = AdvisoryRiskReview::new_with_unknown(&assessments(&current)?, &context)?;
         let acceptance = review.accept(&format!("accept {}", review.id()))?;
-        ensure!(
-            current_review
-                .as_ref()
-                .is_some_and(|review| acceptance.matches(review)),
-            "Runtime advisory evidence changed after acceptance; review again"
-        );
         record.report = current;
-        record.accepted_review = Some(review.id().to_owned());
+        if pending
+            .as_ref()
+            .is_some_and(|current| acceptance.matches(current))
+        {
+            record.accepted_review = Some(review.id().to_owned());
+            break;
+        }
     }
+    ensure!(
+        pending.is_none() || record.accepted_review.is_some(),
+        "Runtime advisory evidence kept changing during review; try again"
+    );
     let admission = RuntimeAdmission {
         record,
         tree: canonical_destination(tree)?,
@@ -1997,46 +2005,71 @@ mod tests {
     #[test]
     fn attended_provider_unknown_keeps_exact_acceptance_without_local_integrity_gaps() {
         const NAME: &str = "runtimes::security::tests::attended_provider_unknown_keeps_exact_acceptance_without_local_integrity_gaps";
-        if std::env::var_os("OMG_RUNTIME_PROVIDER_UNKNOWN_FIXTURE").is_none() {
+        let Ok(mode) = std::env::var("OMG_RUNTIME_PROVIDER_UNKNOWN_FIXTURE") else {
             const DRIVER: &str = r"
-import importlib.util, os, sys
+import importlib.util, sys, time
 from pathlib import Path
 spec = importlib.util.spec_from_file_location('runtime_review_terminal', sys.argv[2])
 terminal = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(terminal)
-terminal.NAME = sys.argv[3]
-code, transcript = terminal.terminal_case(Path(sys.argv[1]), 'accept', dict(os.environ), expected=(b'Coverage: unknown', b'node', b'Controlled vendor feed coverage unavailable'))
+command = [str(Path(sys.argv[1]).resolve()), '--exact', sys.argv[3], '--nocapture', '--test-threads=1']
+code, transcript, receipt = terminal.run_terminal(command, 'node', '24.22.3', time.monotonic() + 30)
 assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(errors='replace')
+assert b'Controlled vendor feed coverage unavailable' in transcript, transcript.decode(errors='replace')
+reviews = receipt['accepted_reviews']
+assert len(reviews) == len(set(reviews)) == int(sys.argv[4]), transcript.decode(errors='replace')
 ";
-            let output = std::process::Command::new(
-                crate::core::privilege::root_controlled_program_path("python3")
-                    .expect("existing terminal fixture Python"),
-            )
-            .arg("-c")
-            .arg(DRIVER)
-            .arg(std::env::current_exe().expect("current runtime fixture executable"))
-            .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/test-arch-advisory-consent.py"),
-            )
-            .arg(NAME)
-            .env("OMG_RUNTIME_PROVIDER_UNKNOWN_FIXTURE", "1")
-            .output()
-            .expect("run real controlling-PTY runtime review");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(output.status.success(), "{stdout}\n{stderr}");
+            for (mode, expected) in [
+                ("stable", "1"),
+                ("changed", "2"),
+                ("cleared", "1"),
+                ("unstable", "3"),
+            ] {
+                let output = std::process::Command::new(
+                    crate::core::privilege::root_controlled_program_path("python3")
+                        .expect("existing terminal fixture Python"),
+                )
+                .arg("-c")
+                .arg(DRIVER)
+                .arg(std::env::current_exe().expect("current runtime fixture executable"))
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("scripts/qemu-runtime-advisory-oracle.py"),
+                )
+                .args([NAME, expected])
+                .env("OMG_RUNTIME_PROVIDER_UNKNOWN_FIXTURE", mode)
+                .output()
+                .expect("run real controlling-PTY runtime review");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");
+            }
             return;
+        };
+        struct UnknownSource {
+            calls: AtomicUsize,
+            mode: String,
         }
-        struct UnknownSource(AtomicUsize);
         impl RuntimeEvidenceSource for UnknownSource {
             fn read(&self, query: &RuntimeQuery) -> Result<Vec<u8>> {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                let round = self.calls.fetch_add(1, Ordering::SeqCst);
                 let mut report: Envelope = serde_json::from_slice(
                     &fixture_runtime_report(query).expect("controlled exact runtime report"),
                 )
                 .expect("controlled runtime report schema");
-                report.coverage = Coverage::Unknown;
-                report.gaps = vec!["Controlled vendor feed coverage unavailable".into()];
+                if self.mode != "cleared" || round == 0 {
+                    report.coverage = Coverage::Unknown;
+                    report.gaps = vec!["Controlled vendor feed coverage unavailable".into()];
+                }
+                if self.mode == "changed" && round > 0 {
+                    report
+                        .gaps
+                        .push("A required source changed during review".into());
+                } else if self.mode == "unstable" {
+                    report
+                        .gaps
+                        .push(format!("Coverage changed again at refresh {round}"));
+                }
                 Ok(serde_json::to_vec(&report).expect("controlled provider Unknown report"))
             }
         }
@@ -2048,23 +2081,41 @@ assert code == 0 and b'1 passed; 0 failed' in transcript, transcript.decode(erro
             gap.is_none(),
             "fixture must not introduce a local identity gap"
         );
-        let source = Arc::new(UnknownSource(AtomicUsize::new(0)));
+        let source = Arc::new(UnknownSource {
+            calls: AtomicUsize::new(0),
+            mode: mode.clone(),
+        });
         let security = RuntimeSecurity::with_source(source.clone());
-        let admission = security
-            .installed("node", &root, ReviewMode::FreshAttended)
-            .expect("explicitly accepted unchanged provider Unknown evidence");
-        assert_eq!(source.0.load(Ordering::SeqCst), 2);
-        assert_eq!(admission.record.report.coverage, Coverage::Unknown);
+        let result = security.installed("node", &root, ReviewMode::FreshAttended);
+        if mode == "unstable" {
+            let error = result.expect_err("a changing report must exhaust the review bound");
+            assert!(error.to_string().contains("kept changing"), "{error:#}");
+            assert_eq!(source.calls.load(Ordering::SeqCst), 4);
+            assert!(load_cache(&root).expect("read fixture cache").is_none());
+            return;
+        }
+        let admission = result.expect("explicitly accepted current provider Unknown evidence");
+        let expected_reads = if mode == "changed" { 3 } else { 2 };
+        let expected_coverage = if mode == "cleared" {
+            Coverage::Assessed
+        } else {
+            Coverage::Unknown
+        };
+        assert_eq!(source.calls.load(Ordering::SeqCst), expected_reads);
+        assert_eq!(admission.record.report.coverage, expected_coverage);
         assert!(admission.record.local_gaps.is_empty());
-        assert!(admission.record.accepted_review.is_some());
+        assert_eq!(
+            admission.record.accepted_review.is_some(),
+            mode != "cleared"
+        );
         admission
             .verify(&root)
             .expect("verify exact accepted authority");
         let cached = security
             .installed("node", &root, ReviewMode::CachedOnly)
             .expect("reuse exact accepted Unknown authority without another prompt");
-        assert_eq!(source.0.load(Ordering::SeqCst), 2);
-        assert_eq!(cached.record.report.coverage, Coverage::Unknown);
+        assert_eq!(source.calls.load(Ordering::SeqCst), expected_reads);
+        assert_eq!(cached.record.report.coverage, expected_coverage);
         assert!(cached.record.local_gaps.is_empty());
         assert_eq!(
             cached.record.accepted_review,

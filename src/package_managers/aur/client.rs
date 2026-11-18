@@ -8082,8 +8082,7 @@ mod tests {
         std::fs::write(pkg_dir.join("PKGBUILD"), "pkgname=mypkg\n").expect("pkgbuild");
 
         let error = ReviewedSource::capture(&pkg_dir)
-            .err()
-            .expect("missing .SRCINFO must not produce a source cache identity");
+            .expect_err("missing .SRCINFO must not produce a source cache identity");
         assert_eq!(
             error.to_string(),
             "AUR review requires PKGBUILD and .SRCINFO"
@@ -8127,7 +8126,7 @@ mod tests {
 
         std::fs::set_permissions(&srcinfo, original).expect("restore chmod");
 
-        let error = result.err().expect("unreadable .SRCINFO must fail closed");
+        let error = result.expect_err("unreadable .SRCINFO must fail closed");
         assert!(
             error.chain().any(|cause| cause
                 .downcast_ref::<std::io::Error>()
