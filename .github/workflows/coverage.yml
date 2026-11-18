@@ -590,6 +590,14 @@ jobs:
             -name 'omg-scaffold-git-*.profraw' -print0)
           test "${#scaffold_profiles[@]}" -eq 1
           test -s "${scaffold_profiles[0]}"
+          runuser -u omg-coverage -- env \
+            LLVM_PROFILE_FILE="$profile_dir/omg-scaffold-collision-%p-%m.profraw" \
+            python3 scripts/test-scaffold-existing-git.py "$cli" --manifest-collision \
+            | tee "$evidence_dir/scaffold-collision.json"
+          mapfile -d '' collision_profiles < <(find "$profile_dir" -maxdepth 1 -type f \
+            -name 'omg-scaffold-collision-*.profraw' -print0)
+          test "${#collision_profiles[@]}" -eq 1
+          test -s "${collision_profiles[0]}"
           (
             profiles=$(mktemp -d)
             chmod 1777 "$profiles"

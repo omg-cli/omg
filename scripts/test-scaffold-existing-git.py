@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify a new scaffold leaves a concurrently initialized Git repository alone."""
+"""Verify that a new scaffold preserves files created by a concurrent process."""
 
 import ctypes
 import json
@@ -24,7 +24,7 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def preserve_repository(binary, owner):
+def verify_scaffold(binary, owner, collision=False):
     command = ctypes.CDLL(None, use_errno=True).ptrace
     command.argtypes = (ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
     command.restype = ctypes.c_long
@@ -36,7 +36,8 @@ def preserve_repository(binary, owner):
 
     target = owner / 'project'
     git = owner / 'git'
-    git.write_text('#!/bin/sh\nprintf "Unexpected git invocation\\n" >&2\nexit 73\n')
+    git_marker = owner / 'git-invoked'
+    git.write_text('#!/bin/sh\nprintf invoked > "$HOME/git-invoked"\nprintf "Unexpected git invocation\\n" >&2\nexit 73\n')
     git.chmod(0o700)
     # The fixture owns every path and supplies a Git command that must stay unused.
     env = dict(PATH=str(owner), HOME=str(owner), XDG_CONFIG_HOME=str(owner / 'config'),
@@ -70,31 +71,50 @@ def preserve_repository(binary, owner):
                     require(os.WIFSTOPPED(status) and os.WSTOPSIG(status) == syscall_stop,
                             'scaffolder did not stop at successful directory creation')
 
-                # The child has created the directory and will only continue after Git initializes it.
-                subprocess.run(['/usr/bin/git', 'init', '--quiet', '--initial-branch=existing'],
-                               cwd=target, env={**env, 'PATH': '/usr/bin:/bin'}, check=True, timeout=5)
-                head = target / '.git/HEAD'
-                config = target / '.git/config'
-                lock = target / '.tool-versions'
-                lock.write_bytes(b'rust 1.78.0\n')
-                before = head.read_bytes(), config.read_bytes(), lock.read_bytes()
+                if collision:
+                    manifest = target / 'Cargo.toml'
+                    before = b'[package]\nname = "owned-before-scaffold"\nversion = "9.9.9"\n'
+                    manifest.write_bytes(before)
+                else:
+                    # The child has created the directory and will only continue after Git initializes it.
+                    subprocess.run(['/usr/bin/git', 'init', '--quiet', '--initial-branch=existing'],
+                                   cwd=target, env={**env, 'PATH': '/usr/bin:/bin'}, check=True, timeout=5)
+                    head = target / '.git/HEAD'
+                    config = target / '.git/config'
+                    lock = target / '.tool-versions'
+                    lock.write_bytes(b'rust 1.78.0\n')
+                    before = head.read_bytes(), config.read_bytes(), lock.read_bytes()
                 trace(PTRACE_DETACH, pid)
                 exit_code = cli.wait(timeout=10)
                 output.seek(0)
                 transcript = output.read(64 * 1024).decode(errors='replace')
-                require(exit_code == 0, f'scaffold exited {exit_code}: {transcript}')
-                require((target / 'Cargo.toml').is_file(), 'Rust scaffold did not create its manifest')
-                require('Unexpected git invocation' not in transcript, 'scaffold reran git init')
-                require((head.read_bytes(), config.read_bytes(), lock.read_bytes()) == before,
-                        'scaffold changed existing Git or runtime metadata')
+                require(not git_marker.exists(), 'scaffold invoked the forbidden Git fixture')
+                if collision:
+                    expected = 'Error: Failed to write the Rust Cargo.toml: File exists (os error 17)'
+                    require(exit_code == 1, f'collision exited {exit_code}: {transcript}')
+                    diagnostics = [line for line in transcript.splitlines() if line.startswith('Error: ')]
+                    require(diagnostics == [expected], f'wrong collision diagnostic: {transcript}')
+                    require(manifest.read_bytes() == before, 'scaffold changed the owned manifest')
+                    require({entry.name for entry in target.iterdir()} == {'Cargo.toml'},
+                            'scaffold continued after the manifest collision')
+                else:
+                    require(exit_code == 0, f'scaffold exited {exit_code}: {transcript}')
+                    require((target / 'Cargo.toml').is_file(), 'Rust scaffold did not create its manifest')
+                    require('Unexpected git invocation' not in transcript, 'scaffold reran git init')
+                    require((head.read_bytes(), config.read_bytes(), lock.read_bytes()) == before,
+                            'scaffold changed existing Git or runtime metadata')
             finally:
                 if cli.returncode is None:
                     cli.kill()
 
+    if collision:
+        return {'scaffold': 'rust', 'case': 'manifest-collision', 'exit': exit_code,
+                'diagnostic': expected, 'manifest_preserved': True, 'git_invocations': 0,
+                'entries': ['Cargo.toml']}
     return {'scaffold': 'rust', 'git_head': before[0].decode().strip(), 'exit': exit_code}
 
 
-def main(binary):
+def main(binary, collision=False):
     require(os.getuid() != 0, 'scaffold fixture requires an ordinary user')
 
     def deadline(_signum, _frame):
@@ -104,10 +124,12 @@ def main(binary):
     signal.alarm(20)
     try:
         with tempfile.TemporaryDirectory(prefix='omg-scaffold-') as work:
-            print(json.dumps(preserve_repository(Path(binary).resolve(strict=True), Path(work))))
+            print(json.dumps(verify_scaffold(Path(binary).resolve(strict=True), Path(work), collision)))
     finally:
         signal.alarm(0)
 
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    require(len(sys.argv) in (2, 3), 'expected CLI path and optional --manifest-collision')
+    require(len(sys.argv) == 2 or sys.argv[2] == '--manifest-collision', 'unknown fixture mode')
+    main(sys.argv[1], collision=len(sys.argv) == 3)
