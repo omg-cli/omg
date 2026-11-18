@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import uuid
 from typing import NamedTuple
 import xml.etree.ElementTree as ET
@@ -157,8 +158,9 @@ def fixture_member(archive, name, value):
     archive.addfile(info, io.BytesIO(data))
 
 
-def fixture_package(directory, name, version, payload_path, payload, depends=()):
-    path = directory / f'{name}-{version}-any.pkg.tar.gz'
+def fixture_package(directory, name, version, payload_path, payload, depends=(), compression='gz'):
+    require(compression in ('gz', 'zst'), 'Unsupported inert package compression')
+    path = directory / f'{name}-{version}-any.pkg.tar.{compression}'
     info = (f'pkgname = {name}\npkgbase = {name}\npkgver = {version}\n'
             'pkgdesc = inert coverage fixture\nbuilddate = 1\npackager = Native Fixture <coverage@example.invalid>\n'
             f'size = {len(payload)}\narch = any\nlicense = MIT\n'
@@ -169,12 +171,37 @@ def fixture_package(directory, name, version, payload_path, payload, depends=())
     mtree = '#mtree\n/set uid=0 gid=0 type=file\n' + ''.join(
         f'./{p} mode=644 size={len(b)} time=1.0 sha256digest={hashlib.sha256(b).hexdigest()}\n'
         for p, b in contents)
-    with tarfile.open(path, 'w:gz', format=tarfile.GNU_FORMAT) as archive:
-        fixture_member(archive, '.PKGINFO', info)
-        fixture_member(archive, '.BUILDINFO', build)
-        fixture_member(archive, '.MTREE', gzip.compress(mtree.encode(), mtime=0))
-        fixture_member(archive, payload_path, payload)
+    def write_archive(destination, mode):
+        with tarfile.open(destination, mode, format=tarfile.GNU_FORMAT) as archive:
+            fixture_member(archive, '.PKGINFO', info)
+            fixture_member(archive, '.BUILDINFO', build)
+            fixture_member(archive, '.MTREE', gzip.compress(mtree.encode(), mtime=0))
+            fixture_member(archive, payload_path, payload)
+
+    if compression == 'gz':
+        write_archive(path, 'w:gz')
+    else:
+        with tempfile.TemporaryDirectory(prefix='.inert-package-', dir=directory) as temporary:
+            raw = Path(temporary) / 'package.tar'
+            write_archive(raw, 'w:')
+            fixture_command(['zstd', '--quiet', '--no-progress', '-T1', '--format=zstd',
+                             '-o', str(path), str(raw)])
+        with path.open('rb') as stream:
+            require(stream.read(4) == b'\x28\xb5\x2f\xfd', 'Inert package lacks zstd frame magic')
     return path
+
+
+def fixture_repository_database(database, records, compression='gz'):
+    require(compression in ('gz', 'bz2'), 'Unsupported signed repository compression')
+    with tarfile.open(database, 'w:' + compression) as archive:
+        for name, file, payload_path, payload, depends in records:
+            fields = {'NAME': name, 'BASE': name, 'VERSION': '3-1', 'FILENAME': file.name,
+                      'DESC': 'inert signed coverage fixture', 'ARCH': 'any', 'PACKAGER': 'Native Fixture <coverage@example.invalid>',
+                      'CSIZE': str(file.stat().st_size), 'ISIZE': str(len(payload)),
+                      'SHA256SUM': sha(file), 'PGPSIG': base64.b64encode(Path(str(file) + '.sig').read_bytes()).decode(), 'LICENSE': 'MIT'}
+            if depends:
+                fields['DEPENDS'] = '\n'.join(depends)
+            fixture_member(archive, name + '-3-1/desc', ''.join(f'%{k}%\n{v}\n\n' for k, v in fields.items()))
 
 
 def fixture_local_package(root, database, name, version, payload_path, payload, reason, depends=()):
@@ -192,7 +219,9 @@ def fixture_local_package(root, database, name, version, payload_path, payload, 
     target.write_bytes(payload)
 
 
-def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_audio=False):
+def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_audio=False,
+                          repository_compression="gz"):
+    require(repository_compression in ("gz", "bz2"), "Unsupported signed repository compression")
     if os.geteuid() != 0:
         raise RuntimeError('Guest root setup required')
     for kind in ('mnt', 'net'):
@@ -270,15 +299,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         fixture_local_package(owner / 'root', owner / 'db', name, '1-1', 'usr/share/omg-coverage/' + name + '.txt', b'retain unless actual orphan\n', reason)
     for repository, records in repositories.items():
         database = owner / 'repos' / repository / (repository + '.db')
-        with tarfile.open(database, 'w:gz') as archive:
-            for name, file, payload_path, payload, depends in records:
-                fields = {'NAME': name, 'BASE': name, 'VERSION': '3-1', 'FILENAME': file.name,
-                          'DESC': 'inert signed coverage fixture', 'ARCH': 'any', 'PACKAGER': 'Native Fixture <coverage@example.invalid>',
-                          'CSIZE': str(file.stat().st_size), 'ISIZE': str(len(payload)),
-                          'SHA256SUM': sha(file), 'PGPSIG': base64.b64encode(Path(str(file) + '.sig').read_bytes()).decode(), 'LICENSE': 'MIT'}
-                if depends:
-                    fields['DEPENDS'] = '\n'.join(depends)
-                fixture_member(archive, name + '-3-1/desc', ''.join(f'%{k}%\n{v}\n\n' for k, v in fields.items()))
+        fixture_repository_database(database, records, repository_compression)
         fixture_command(signing + ['--local-user', fingerprint, '--detach-sign', '--output', str(database) + '.sig', str(database)])
     for version in ('0-1', '1-1', '2-1'):
         file = fixture_package(owner / 'cache', 'omg-coverage-app', version, 'usr/share/omg-coverage/omg-coverage-app.txt', b'cached fixture\n', ('omg-coverage-dep>=1-1',))
@@ -348,6 +369,68 @@ FRESH_ADMISSION_CASES = (
     FreshAdmissionCase('repository-accept', 'none', '', True, ''),
     FreshAdmissionCase('repository-stale-evidence', 'none', 'stale', False, 'stale Arch snapshot'),
 )
+
+
+# Additional decoder evidence never replaces the original admission matrix.
+SIGNED_DECODER_CASES = (
+    FreshAdmissionCase('archive-zstd-accept', 'accept', '', True, ''),
+    FreshAdmissionCase('repository-bzip2-info', 'none', '', False, ''),
+)
+SIGNED_DECODER_MARKERS = {
+    'archive-zstd-accept': 'PASS_SIGNED_ZSTD_LOCAL_ARCHIVE_DECODER',
+    'repository-bzip2-info': 'PASS_SIGNED_BZIP2_REPOSITORY_INFO_DECODER',
+}
+
+
+def fresh_case_exit(case):
+    return 0 if case.commits or case.name == 'repository-bzip2-info' else 1
+
+
+def validate_bzip2_info(output):
+    value = json.loads(output)
+    require(type(value) is dict and set(value) == {'name', 'version', 'description', 'url',
+            'size', 'install_size', 'download_size', 'repo', 'depends', 'licenses', 'installed'},
+            'Bzip2 repository info did not return the exact native JSON schema')
+    expected = dict(name='xorg-xrandr', version='3-1', description='inert signed coverage fixture',
+        url=None, size=len(b'xorg-xrandr: upgraded3\n'), install_size=len(b'xorg-xrandr: upgraded3\n'),
+        repo='core', depends=[], licenses=['MIT'], installed=False)
+    require(all(type(value[key]) is type(item) and value[key] == item for key, item in expected.items())
+            and type(value['download_size']) is int and value['download_size'] > 0,
+            'Bzip2 repository info lost the signed repository identity or metadata')
+    return value
+
+
+def signed_decoder_input(case, fixture, archive, signer):
+    source = fixture / 'db/sync/core.db' if case.name == 'repository-bzip2-info' else archive
+    with source.open('rb') as stream:
+        magic = stream.read(4)
+    expected = b'BZh' if case.name == 'repository-bzip2-info' else b'\x28\xb5\x2f\xfd'
+    require(magic.startswith(expected), 'Signed decoder input has the wrong compression')
+    return dict(source_path=str(source), source_sha256=sha(source),
+        signature_sha256=sha(Path(str(source) + '.sig')), magic_hex=magic.hex(),
+        fixture_signer_fingerprint=signer)
+
+
+def validate_signed_decoder_input(case, row):
+    value = row.get('decoder_input')
+    require(type(value) is dict and set(value) == {'source_path', 'source_sha256',
+            'signature_sha256', 'magic_hex', 'fixture_signer_fingerprint'}
+            and row.get('decoder_marker') == SIGNED_DECODER_MARKERS[case.name],
+            'Signed decoder evidence or exact marker is missing')
+    suffix = '/db/sync/core.db' if case.name == 'repository-bzip2-info' else '/inputs/omg-fresh-archive-1-1-any.pkg.tar.zst'
+    require(type(value['source_path']) is str and value['source_path'].startswith('/opt/omg-coverage-fresh-')
+            and value['source_path'].endswith(suffix)
+            and all(type(value[key]) is str and re.fullmatch('[0-9a-f]{64}', value[key])
+                    for key in ('source_sha256', 'signature_sha256'))
+            and type(value['fixture_signer_fingerprint']) is str
+            and re.fullmatch('[0-9A-F]{40}', value['fixture_signer_fingerprint']),
+            'Signed decoder source or signature identity is invalid')
+    magic = value['magic_hex']
+    require(type(magic) is str and (re.fullmatch('425a683[1-9]', magic) is not None
+            if case.name == 'repository-bzip2-info' else magic == '28b52ffd'),
+            'Signed decoder compression marker differs')
+    if case.name == 'repository-bzip2-info':
+        validate_bzip2_info(row['output'])
 
 
 def fresh_admission_snapshot(mode, now=None):
@@ -514,7 +597,7 @@ def fresh_admission_terminal(cli, arguments, environment, case, directory, state
             os.close(terminal)
 
 
-def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
+def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_cases=False):
     import pwd
     import signal
     import ssl
@@ -538,7 +621,8 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
         require(profiles == Path('/profiles') and stat.S_ISDIR(metadata.st_mode)
                 and metadata.st_uid == 0 and stat.S_IMODE(metadata.st_mode) == 0o1777,
                 'Private guest coverage return directory required')
-    selected = [case for case in FRESH_ADMISSION_CASES if names is None or case.name in names]
+    cases = SIGNED_DECODER_CASES if decoder_cases else FRESH_ADMISSION_CASES
+    selected = [case for case in cases if names is None or case.name in names]
     require(selected and (names is None or set(names) == {case.name for case in selected}), 'Unknown fresh admission case')
     owner.mkdir(mode=0o700)
     user = pwd.getpwnam('bench')
@@ -640,14 +724,17 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
             directory = owner / case.name
             directory.mkdir()
             fixture = owner.parent / (owner.name + '-' + case.name)
-            prepared = create_signed_fixture(fixture)
+            read_only = case.name == 'repository-bzip2-info'
+            prepared = create_signed_fixture(fixture, native_migrations=read_only,
+                repository_compression='bz2' if read_only else 'gz')
             for repository in ('core', 'omarchy'):
                 for suffix in ('.db', '.db.sig'):
                     name = repository + suffix
                     (fixture / 'db/sync' / name).write_bytes((fixture / 'repos' / repository / name).read_bytes())
             (fixture / 'inputs').mkdir()
             archive = fixture_package(fixture / 'inputs', 'omg-fresh-archive', '1-1',
-                                      'usr/share/omg-fresh-archive.txt', b'approved inert archive\n')
+                                      'usr/share/omg-fresh-archive.txt', b'approved inert archive\n',
+                                      compression='zst' if case.name == 'archive-zstd-accept' else 'gz')
             fixture_command(['gpg', '--batch', '--homedir', str(fixture / 'signing'), '--pinentry-mode',
                              'loopback', '--passphrase', '', '--local-user', prepared['fixture_signer_fingerprint'],
                              '--detach-sign', '--output', str(archive) + '.sig', str(archive)])
@@ -661,6 +748,10 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
             arguments = ['install', str(archive), '--allow-local-file', '--yes']
             if case.name.startswith('repository-'):
                 arguments = ['install', 'omg-coverage-app', '--yes']
+            if read_only:
+                require(not (fixture / 'db/local/xorg-xrandr-3-1').exists(),
+                        'Bzip2 info must query a repository-only package')
+                arguments = ['--json', 'info', 'xorg-xrandr']
             if case.name == 'archive-batch-limit':
                 targets = [archive]
                 for index in range(64):
@@ -681,6 +772,9 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
             if profiles is not None:
                 environment['LLVM_PROFILE_FILE'] = str(profiles / ('omg-extra-fresh-' + case.name + '-%p-%m.profraw'))
             row = dict(name=case.name, expected_commit=case.commits, status='FAIL')
+            if decoder_cases:
+                row['decoder_input'] = signed_decoder_input(
+                    case, fixture, archive, prepared['fixture_signer_fingerprint'])
             try:
                 if case.interaction == 'noninteractive':
                     child = subprocess.Popen([str(cli), *arguments], env=environment,
@@ -698,7 +792,7 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
                     result = fresh_admission_terminal(cli, arguments, environment, case, directory,
                                                       current, user.pw_uid, user.pw_gid)
                 row.update(result)
-                require(result['exit_code'] == (0 if case.commits else 1),
+                require(result['exit_code'] == fresh_case_exit(case),
                         'Native fresh admission returned an unexpected status')
                 require(not result.get('stopped_signal'), 'Native foreground loss stopped the transaction')
                 require(not current['server_errors'], 'Controlled advisory fixture failed')
@@ -719,6 +813,13 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
                 require(not (fixture / 'db/db.lck').exists(), 'Native admission left its transaction lock')
                 if case.interaction == 'timeout':
                     require(result['elapsed_seconds'] >= 59, 'Native acknowledgement timed out prematurely')
+                if decoder_cases:
+                    require(row['decoder_input'] == signed_decoder_input(
+                        case, fixture, archive, prepared['fixture_signer_fingerprint']),
+                        'Signed decoder input or signature changed during the CLI run')
+                    if read_only:
+                        validate_bzip2_info(result['output'])
+                    row['decoder_marker'] = SIGNED_DECODER_MARKERS[case.name]
                 row.update(status='PASS', database_before=before, database_after=after,
                            payload_before=payload_before, payload_after=payload_after)
             except Exception as error:
@@ -740,17 +841,18 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None):
         cli_sha256=sha(cli), selected=[case.name for case in selected], cases=results,
         profile_stages=['fresh-' + case.name for case in selected] if profiles is not None else [],
         real_guest_database_unchanged=unchanged,
-        complete_matrix=len(selected) == len(FRESH_ADMISSION_CASES), coverage_acceptance=False)
+        complete_matrix=len(selected) == len(cases), coverage_acceptance=False)
     (owner / 'receipt.json').write_text(json.dumps(result, indent=2) + '\n')
     require(result['status'] == 'PASS', 'Native fresh admission matrix failed; inspect per-case receipts')
     return result
 
 
-def validate_fresh_admission(value, cli_sha256):
+def validate_fresh_admission(value, cli_sha256, decoder_cases=False):
     require(type(value) is dict and set(value) == {'status', 'cli_sha256', 'selected', 'cases',
             'profile_stages', 'real_guest_database_unchanged', 'complete_matrix', 'coverage_acceptance'},
             'Unexpected native admission receipt schema')
-    names = [case.name for case in FRESH_ADMISSION_CASES]
+    cases = SIGNED_DECODER_CASES if decoder_cases else FRESH_ADMISSION_CASES
+    names = [case.name for case in cases]
     require(value['status'] == 'PASS' and value['cli_sha256'] == cli_sha256
             and value['selected'] == names and value['complete_matrix'] is True
             and value['real_guest_database_unchanged'] is True and value['coverage_acceptance'] is False,
@@ -759,10 +861,10 @@ def validate_fresh_admission(value, cli_sha256):
             'Native admission profile inventory differs')
     rows = value['cases']
     require(type(rows) is list and len(rows) == len(names), 'Native admission cases are incomplete')
-    for case, row in zip(FRESH_ADMISSION_CASES, rows, strict=True):
+    for case, row in zip(cases, rows, strict=True):
         require(type(row) is dict and row.get('name') == case.name and row.get('status') == 'PASS'
                 and row.get('expected_commit') is case.commits
-                and type(row.get('exit_code')) is int and row['exit_code'] == (0 if case.commits else 1)
+                and type(row.get('exit_code')) is int and row['exit_code'] == fresh_case_exit(case)
                 and row.get('stopped_signal') is None and row.get('transaction_lock_remains') is False
                 and row.get('server_errors') == [], 'Native admission failed or left a stopped transaction: ' + case.name)
         prompt = case.interaction not in ('none', 'noninteractive')
@@ -771,7 +873,8 @@ def validate_fresh_admission(value, cli_sha256):
         require(type(output) is str and len(output.encode()) <= 1024 * 1024
                 and case.diagnostic in output and (not prompt or 'applicability is UNKNOWN' in output),
                 'Native admission diagnostic differs: ' + case.name)
-        fetched = case.interaction == 'accept' or case.name.startswith('repository-')
+        fetched = case.interaction == 'accept' or (case.name.startswith('repository-')
+                                                   and case.name != 'repository-bzip2-info')
         requests = [dict(path='/v1/arch/advisories', prompt_seen=prompt)] if fetched else []
         require(row.get('requests') == requests, 'Native admission fetch crossed the acknowledgement boundary: ' + case.name)
         for key in ('database_before', 'database_after', 'payload_before', 'payload_after'):
@@ -791,6 +894,8 @@ def validate_fresh_admission(value, cli_sha256):
             require(package + '/desc' in row['database_after'] and row['database_before'] != row['database_after']
                     and row['payload_after'].get(path) == hashlib.sha256(payload).hexdigest(),
                     'Native admission did not commit the approved package bytes: ' + case.name)
+        if decoder_cases:
+            validate_signed_decoder_input(case, row)
         if case.interaction == 'foreground-loss':
             require(row.get('foreground_moved') is True, 'Native foreground-loss control was not exercised')
         if case.interaction == 'timeout':
@@ -1085,8 +1190,9 @@ OMARCHY_CASES = {
 ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
 NATIVE_PREFLIGHT_TEST = 'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy'
 FRESH_ADMISSION_STAGES = tuple('fresh-' + case.name for case in FRESH_ADMISSION_CASES)
+SIGNED_DECODER_STAGES = tuple('fresh-' + case.name for case in SIGNED_DECODER_CASES)
 PROCESS_STAGES = ('cli-q', 'cli-v', 'cli-vv', 'cli-vvv', 'cli-fresh-mock-refused', 'cli-elevation-denied', 'cli-authorization-denied',
-                  'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES, *FRESH_ADMISSION_STAGES, 'native-preflight-isolation')
+                  'daemon', *OMARCHY_CASES, *ARCH_READONLY_STAGES, *FRESH_ADMISSION_STAGES, *SIGNED_DECODER_STAGES, 'native-preflight-isolation')
 STAGES = tuple('registry-' + role for role in HARNESSES) + tuple(row[0] for row in CASES) + PROCESS_STAGES
 PROFILE = re.compile(r'omg-extra-(' + '|'.join(map(re.escape, STAGES)) + r')-([0-9]+)-([0-9]+_[0-9]+)\.profraw')
 
@@ -1997,13 +2103,16 @@ printf 'daemon\t0\n' >> /evidence/cli/process-checks.tsv
 @@OMARCHY_CASE_BODY@@
 python3 /native-cli-coverage.py fresh-admission-fixture --owner /opt/omg-coverage-fresh-ci \
   --cli /omg-extra-bin/cli --profiles /profiles > /evidence/cli/fresh-admission.json
+unshare --mount -- python3 /native-cli-coverage.py fresh-admission-fixture --owner /opt/omg-coverage-fresh-decoders \
+  --cli /omg-extra-bin/cli --profiles /profiles --decoder-cases > /evidence/cli/signed-decoders.json
 python3 - <<'OMG_FRESH_STAGE_RECEIPTS'
 import json
 from pathlib import Path
-value = json.loads(Path('/evidence/cli/fresh-admission.json').read_text())
 with Path('/evidence/cli/process-checks.tsv').open('a') as stream:
-    for stage in value['profile_stages']:
-        stream.write(stage + '\t0\n')
+    for receipt in ('fresh-admission.json', 'signed-decoders.json'):
+        value = json.loads((Path('/evidence/cli/') / receipt).read_text())
+        for stage in value['profile_stages']:
+            stream.write(stage + '\t0\n')
 OMG_FRESH_STAGE_RECEIPTS
 stage=native-preflight-isolation
 ordinary env LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
@@ -2324,7 +2433,11 @@ def validate_evidence(evidence, profiles, artifacts, commit):
     fresh_receipt = evidence / 'fresh-admission.json'
     require(fresh_receipt.is_file(), 'Native admission receipt is missing')
     fresh = validate_fresh_admission(json.loads(fresh_receipt.read_text()), artifacts['cli']['sha256'])
-    for stage in FRESH_ADMISSION_STAGES:
+    decoder_receipt = evidence / 'signed-decoders.json'
+    require(decoder_receipt.is_file(), 'Signed decoder receipt is missing')
+    decoders = validate_fresh_admission(
+        json.loads(decoder_receipt.read_text()), artifacts['cli']['sha256'], decoder_cases=True)
+    for stage in (*FRESH_ADMISSION_STAGES, *SIGNED_DECODER_STAGES):
         require({PROFILE.fullmatch(path.name)[3] for path in grouped[stage]} == cli_modules,
                 'Native admission profiles do not match the actual CLI: ' + stage)
     native_stage = next(stage for stage, role, name in CASES if role == 'lib-unit' and name == NATIVE_PREFLIGHT_TEST)
@@ -2340,7 +2453,7 @@ def validate_evidence(evidence, profiles, artifacts, commit):
     ET.ElementTree(suite).write(evidence / 'tests.xml', encoding='unicode', xml_declaration=True)
     selected = sorted(path for paths in grouped.values() for path in paths)
     (evidence / 'verification.json').write_text(json.dumps(dict(source_commit=commit, tests=tests,
-        process_checks=list(PROCESS_STAGES), artifacts=artifacts, fresh_admission=fresh,
+        process_checks=list(PROCESS_STAGES), artifacts=artifacts, fresh_admission=fresh, signed_decoders=decoders,
         profiles=[dict(name=p.name, bytes=p.stat().st_size, sha256=sha(p)) for p in selected]), indent=2) + '\n')
     return selected
 
@@ -2459,7 +2572,9 @@ def main():
     fresh.add_argument('--owner', required=True, type=Path)
     fresh.add_argument('--cli', required=True, type=Path)
     fresh.add_argument('--profiles', type=Path)
-    fresh.add_argument('--case', action='append', choices=tuple(case.name for case in FRESH_ADMISSION_CASES))
+    fresh.add_argument('--case', action='append',
+                       choices=tuple(case.name for case in (*FRESH_ADMISSION_CASES, *SIGNED_DECODER_CASES)))
+    fresh.add_argument('--decoder-cases', action='store_true')
     signed_check = commands.add_parser('verify-signed-fixture')
     signed_check.add_argument('--owner', required=True, type=Path)
     signed_check.add_argument('--phase', choices=tuple(NATIVE_PHASES), default='complete')
@@ -2491,7 +2606,7 @@ def main():
     elif args.operation == 'signed-fixture':
         create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_audio)
     elif args.operation == 'fresh-admission-fixture':
-        print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles)))
+        print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)))
     elif args.operation == 'verify-signed-fixture':
         print(json.dumps(verify_signed_fixture(args.owner, args.phase)))
     elif args.operation == 'verify-machine-identity-fixture':

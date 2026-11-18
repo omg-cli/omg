@@ -295,11 +295,14 @@ class HostedProducer(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'fresh-admission.json').write_text(json.dumps({'profile_stages': ['fresh-one', 'fresh-two']}))
+            (root / 'signed-decoders.json').write_text(json.dumps({'profile_stages': list(PRODUCER.SIGNED_DECODER_STAGES)}))
             block = block.replace('/evidence/cli/', str(root) + '/')
             result = subprocess.run([BASH, '-euo', 'pipefail', '-c', block],
                                     capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual((root / 'process-checks.tsv').read_text(), 'fresh-one\t0\nfresh-two\t0\n')
+            self.assertEqual((root / 'process-checks.tsv').read_text(),
+                             'fresh-one\t0\nfresh-two\t0\n' + ''.join(
+                                 stage + '\t0\n' for stage in PRODUCER.SIGNED_DECODER_STAGES))
             self.assertEqual(result.stderr, '')
 
     def test_generated_cli_identity_preserves_literal_template_words(self):
@@ -1022,11 +1025,113 @@ with socket.socket(socket.AF_UNIX) as server:
         self.assertNotIn('systemd-detect-virt', script)
 
 
-def fresh_admission_receipt():
+class SignedDecoderFixtures(unittest.TestCase):
+    def test_bzip2_database_preserves_exact_signed_package_metadata(self):
+        import bz2
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            package = PRODUCER.fixture_package(owner, 'xorg-xrandr', '3-1',
+                'usr/share/fixture', b'inert')
+            # Encoding unit control only; real signatures remain the guest producer's responsibility.
+            Path(str(package) + '.sig').write_bytes(b'encoding-only-signature-input')
+            records = [('xorg-xrandr', package, 'usr/share/fixture', b'inert', ('dep>=1',))]
+            gz, bz = owner / 'gzip.db', owner / 'bzip2.db'
+            PRODUCER.fixture_repository_database(gz, records)
+            PRODUCER.fixture_repository_database(bz, records, 'bz2')
+            self.assertEqual(bz.read_bytes()[:4], b'BZh9')
+            self.assertEqual(bz2.decompress(bz.read_bytes()), __import__('gzip').decompress(gz.read_bytes()))
+            with tarfile.open(bz, 'r:bz2') as archive:
+                self.assertEqual(archive.getnames(), ['xorg-xrandr-3-1/desc'])
+                desc = archive.extractfile(archive.getmembers()[0]).read().decode()
+            self.assertIn('%SHA256SUM%\n' + PRODUCER.sha(package) + '\n', desc)
+            self.assertIn('%PGPSIG%\n', desc)
+            self.assertIn('%DEPENDS%\ndep>=1\n', desc)
+            with self.assertRaisesRegex(ValueError, 'compression'):
+                PRODUCER.fixture_repository_database(owner / 'invalid.db', records, 'xz')
+            self.assertFalse((owner / 'invalid.db').exists())
+
+    def test_zstd_package_encoding_preserves_tar_and_retires_only_owned_raw_stage(self):
+        captured = []
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            def encode(argv):
+                self.assertEqual(argv[:6], ['zstd', '--quiet', '--no-progress', '-T1', '--format=zstd', '-o'])
+                output, raw = Path(argv[6]), Path(argv[7])
+                self.assertTrue(raw.is_file())
+                self.assertEqual(raw.parent.parent, owner)
+                with tarfile.open(raw, 'r:') as archive:
+                    captured.append(dict(members=archive.getnames(),
+                        payload=archive.extractfile('usr/share/fixture').read(), raw=raw))
+                # This tests routing/ownership only, not a functioning zstd encoder.
+                output.write_bytes(b'\x28\xb5\x2f\xfdencoding-only')
+            with patch.object(PRODUCER, 'fixture_command', side_effect=encode):
+                package = PRODUCER.fixture_package(owner, 'inert', '1-1',
+                    'usr/share/fixture', b'approved inert bytes', compression='zst')
+            self.assertEqual(package.name, 'inert-1-1-any.pkg.tar.zst')
+            self.assertEqual(captured[0]['members'], ['.PKGINFO', '.BUILDINFO', '.MTREE', 'usr/share/fixture'])
+            self.assertEqual(captured[0]['payload'], b'approved inert bytes')
+            self.assertFalse(captured[0]['raw'].parent.exists())
+            self.assertEqual(set(owner.iterdir()), {package})
+
+    def test_failed_zstd_encoder_retires_owned_raw_stage_and_refuses_bad_magic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            with patch.object(PRODUCER, 'fixture_command', side_effect=RuntimeError('encoder failed')):
+                with self.assertRaisesRegex(RuntimeError, 'encoder failed'):
+                    PRODUCER.fixture_package(owner, 'inert', '1-1', 'usr/share/fixture', b'data', compression='zst')
+            self.assertEqual(list(owner.iterdir()), [])
+            def wrong_magic(argv):
+                Path(argv[6]).write_bytes(b'not-zstd')
+            with patch.object(PRODUCER, 'fixture_command', side_effect=wrong_magic):
+                with self.assertRaisesRegex(ValueError, 'zstd frame magic'):
+                    PRODUCER.fixture_package(owner, 'inert', '1-1', 'usr/share/fixture', b'data', compression='zst')
+            with self.assertRaisesRegex(ValueError, 'compression'):
+                PRODUCER.fixture_package(owner, 'invalid', '1-1', 'usr/share/fixture', b'data', compression='zip')
+            self.assertFalse((owner / 'invalid-1-1-any.pkg.tar.zip').exists())
+
+    def test_signed_decoder_receipts_require_both_exact_cli_cases_and_identity(self):
+        value = fresh_admission_receipt(decoder_cases=True)
+        rows = PRODUCER.validate_fresh_admission(value, 'a' * 64, decoder_cases=True)
+        self.assertEqual([row['name'] for row in rows], ['archive-zstd-accept', 'repository-bzip2-info'])
+        self.assertEqual(rows[1]['database_before'], rows[1]['database_after'])
+        mutations = (
+            lambda r: r['cases'].pop(),
+            lambda r: r['cases'][0].pop('decoder_marker'),
+            lambda r: r['cases'][0]['decoder_input'].update(magic_hex='1f8b0800'),
+            lambda r: r['cases'][0]['decoder_input'].update(signature_sha256=''),
+            lambda r: r['cases'][1]['decoder_input'].update(fixture_signer_fingerprint=''),
+            lambda r: r['cases'][1].update(output=r['cases'][1]['output'].replace('3-1', '1-1')),
+            lambda r: r['cases'][1].update(output=r['cases'][1]['output'].replace('false', 'true')),
+            lambda r: r['cases'][1]['payload_after'].update({'unexpected': 'c' * 64}),
+            lambda r: r['cases'][1].update(requests=[dict(path='/v1/arch/advisories', prompt_seen=False)]),
+        )
+        for mutate in mutations:
+            value = fresh_admission_receipt(decoder_cases=True)
+            mutate(value)
+            with self.assertRaises((ValueError, KeyError)):
+                PRODUCER.validate_fresh_admission(value, 'a' * 64, decoder_cases=True)
+
+    def test_decoder_cases_are_additive_and_have_distinct_mandatory_cli_profiles(self):
+        self.assertEqual(len(PRODUCER.FRESH_ADMISSION_CASES), 20)
+        self.assertEqual({case.name for case in PRODUCER.FRESH_ADMISSION_CASES if case.commits},
+                         {'archive-accept', 'archive-source-replaced', 'repository-accept'})
+        for case in PRODUCER.SIGNED_DECODER_CASES:
+            self.assertNotIn(case.name, {row.name for row in PRODUCER.FRESH_ADMISSION_CASES})
+            self.assertIn('fresh-' + case.name, PRODUCER.PROCESS_STAGES)
+        script = PRODUCER.guest_script({role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}, '/build/omg')
+        self.assertIn('--decoder-cases > /evidence/cli/signed-decoders.json', script)
+        self.assertIn('/opt/omg-coverage-fresh-decoders', script)
+        syntax = subprocess.run([BASH, '-n'], input=script, text=True, capture_output=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+
+
+def fresh_admission_receipt(decoder_cases=False):
     rows = []
-    for case in PRODUCER.FRESH_ADMISSION_CASES:
+    cases = PRODUCER.SIGNED_DECODER_CASES if decoder_cases else PRODUCER.FRESH_ADMISSION_CASES
+    for case in cases:
         prompt = case.interaction not in ('none', 'noninteractive')
-        fetched = case.interaction == 'accept' or case.name.startswith('repository-')
+        fetched = case.interaction == 'accept' or (case.name.startswith('repository-')
+                                                   and case.name != 'repository-bzip2-info')
         before = {'installed-1-1/desc': 'd' * 64}
         after = dict(before)
         payload = {'usr/share/installed.txt': 'e' * 64}
@@ -1040,13 +1145,25 @@ def fresh_admission_receipt():
                 after['omg-fresh-archive-1-1/desc'] = 'f' * 64
                 changed['usr/share/omg-fresh-archive.txt'] = hashlib.sha256(b'approved inert archive\n').hexdigest()
         rows.append(dict(name=case.name, expected_commit=case.commits, status='PASS',
-            exit_code=0 if case.commits else 1, stopped_signal=None, transaction_lock_remains=False,
+            exit_code=PRODUCER.fresh_case_exit(case), stopped_signal=None, transaction_lock_remains=False,
             prompt_seen=prompt, foreground_moved=case.interaction == 'foreground-loss',
             elapsed_seconds=60 if case.interaction == 'timeout' else 1,
             output=('Arch advisory applicability is UNKNOWN\n' if prompt else '') + case.diagnostic,
             requests=[dict(path='/v1/arch/advisories', prompt_seen=prompt)] if fetched else [],
             server_errors=[], database_before=before, database_after=after,
             payload_before=payload, payload_after=changed))
+        if decoder_cases:
+            bzip2 = case.name == 'repository-bzip2-info'
+            rows[-1].update(decoder_marker=PRODUCER.SIGNED_DECODER_MARKERS[case.name],
+                decoder_input=dict(source_path='/opt/omg-coverage-fresh-decoders-' + case.name +
+                    ('/db/sync/core.db' if bzip2 else '/inputs/omg-fresh-archive-1-1-any.pkg.tar.zst'),
+                    source_sha256='a' * 64, signature_sha256='b' * 64,
+                    fixture_signer_fingerprint='A' * 40, magic_hex='425a6839' if bzip2 else '28b52ffd'))
+            if bzip2:
+                rows[-1]['output'] = json.dumps(dict(name='xorg-xrandr', version='3-1',
+                    description='inert signed coverage fixture', url=None,
+                    size=len(b'xorg-xrandr: upgraded3\n'), install_size=len(b'xorg-xrandr: upgraded3\n'),
+                    download_size=512, repo='core', depends=[], licenses=['MIT'], installed=False))
     return dict(status='PASS', cli_sha256='a' * 64, cases=rows,
         selected=[row['name'] for row in rows], complete_matrix=True,
         profile_stages=['fresh-' + row['name'] for row in rows],
@@ -1061,6 +1178,7 @@ def evidence_fixture(root):
                  for role in PRODUCER.ROLES}
     (evidence / 'all-stages-pass.txt').write_text('PASS\n')
     (evidence / 'fresh-admission.json').write_text(json.dumps(fresh_admission_receipt()))
+    (evidence / 'signed-decoders.json').write_text(json.dumps(fresh_admission_receipt(decoder_cases=True)))
     rows = ['\t'.join(row) for row in PRODUCER.CASES]
     (evidence / 'expected-tests.tsv').write_text('\n'.join(rows) + '\n')
     (evidence / 'passed.tsv').write_text('\n'.join(row + '\tPASS' for row in rows) + '\n')
@@ -1477,8 +1595,9 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 22)
-            self.assertEqual(len(receipt['process_checks']), 72)
+            self.assertEqual(len(receipt['process_checks']), 74)
             self.assertEqual(len(receipt['fresh_admission']), 20)
+            self.assertEqual(len(receipt['signed_decoders']), 2)
             self.assertEqual(len(files), len(receipt['profiles']))
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
@@ -1501,6 +1620,10 @@ class SupplementalEvidence(unittest.TestCase):
             'no-daemon-cleanup': lambda e, p: (e / 'daemon.log').write_text('[extra-daemon] startup_socket=ready uid=65534'),
             'duplicate-result': lambda e, p: (e / 'passed.tsv').write_text((e / 'passed.tsv').read_text() * 2),
             'missing-process': lambda e, p: (e / 'process-checks.tsv').write_text('cli-q\t0\n'),
+            'decoder-missing-receipt': lambda e, p: (e / 'signed-decoders.json').unlink(),
+            'decoder-incomplete-receipt': lambda e, p: (e / 'signed-decoders.json').write_text('{}'),
+            'decoder-wrong-cli-profile': lambda e, p: (p / 'omg-extra-fresh-archive-zstd-accept-123-100_0.profraw').rename(
+                p / 'omg-extra-fresh-archive-zstd-accept-123-200_0.profraw'),
             'fresh-missing-receipt': lambda e, p: (e / 'fresh-admission.json').unlink(),
             'fresh-incomplete-receipt': lambda e, p: (e / 'fresh-admission.json').write_text('{}'),
             'native-preflight-not-executed': lambda e, p: (e / 'native-preflight-isolation.log').write_text(
