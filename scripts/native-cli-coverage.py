@@ -219,8 +219,18 @@ def fixture_local_package(root, database, name, version, payload_path, payload, 
     target.write_bytes(payload)
 
 
+def fixture_signing_key(signing, identity):
+    fixture_command(signing + ['--quick-generate-key', identity, 'ed25519', 'cert,sign', '1d'])
+    listing = fixture_command(signing + ['--with-colons', '--fingerprint', '--list-keys', identity],
+                              text=True).stdout
+    fingerprints = [line.split(':')[9] for line in listing.splitlines() if line.startswith('fpr:')]
+    require(len(fingerprints) == 1 and re.fullmatch('[0-9A-F]{40}', fingerprints[0]),
+            'One exact private fixture signing fingerprint required')
+    return fingerprints[0]
+
+
 def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_audio=False,
-                          repository_compression="gz"):
+                          repository_compression="gz", unknown_app_signer=False):
     require(repository_compression in ("gz", "bz2"), "Unsupported signed repository compression")
     if os.geteuid() != 0:
         raise RuntimeError('Guest root setup required')
@@ -238,12 +248,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         (owner / path).chmod(0o700)
     (owner / 'db/local/ALPM_DB_VERSION').write_text('9\n')
     signing = ['gpg', '--batch', '--homedir', str(owner / 'signing'), '--pinentry-mode', 'loopback', '--passphrase', '']
-    fixture_command(signing + ['--quick-generate-key', 'OMG coverage fixture <coverage@example.invalid>', 'ed25519', 'cert,sign', '1d'])
-    listing = fixture_command(signing + ['--with-colons', '--fingerprint', '--list-keys'], text=True).stdout
-    fingerprints = [line.split(':')[9] for line in listing.splitlines() if line.startswith('fpr:')]
-    if len(fingerprints) != 1 or len(fingerprints[0]) != 40:
-        raise RuntimeError('One exact private fixture signing fingerprint required')
-    fingerprint = fingerprints[0]
+    fingerprint = fixture_signing_key(signing, 'OMG coverage fixture <coverage@example.invalid>')
     before_public = fixture_command(signing + ['--export', fingerprint]).stdout
     public_path = owner / 'fixture-public.gpg'
     public_path.write_bytes(before_public)
@@ -257,6 +262,8 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
     updated_public = fixture_command(signing + ['--export', fingerprint]).stdout
     if before_public == updated_public:
         raise RuntimeError('Updated public bundle must differ from initial bundle')
+    unknown_signer = (fixture_signing_key(signing, 'OMG unknown fixture <unknown@example.invalid>')
+                      if unknown_app_signer else fingerprint)
     initial = {}
     repositories = {'core': [], 'omarchy': []}
     packages = [
@@ -286,7 +293,8 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         if not migration_only or installed_audio and name == 'hp-omnibook-3-audio':
             fixture_local_package(owner / 'root', owner / 'db', name, '1-1', payload_path, old_payload, reason, depends)
         archive = fixture_package(owner / 'repos' / repository, name, '3-1', payload_path, new_payload, depends)
-        fixture_command(signing + ['--local-user', fingerprint, '--detach-sign', '--output', str(archive) + '.sig', str(archive)])
+        package_signer = unknown_signer if name == 'omg-coverage-app' else fingerprint
+        fixture_command(signing + ['--local-user', package_signer, '--detach-sign', '--output', str(archive) + '.sig', str(archive)])
         repositories[repository].append((name, archive, payload_path, new_payload, depends))
         inventory = migration_packages if migration_only else initial
         inventory[name] = {'version': '3-1' if migration_only else '1-1', 'reason': reason,
@@ -368,6 +376,7 @@ FRESH_ADMISSION_CASES = (
     FreshAdmissionCase('archive-batch-limit', 'none', '', False, 'at most 64 archives'),
     FreshAdmissionCase('repository-accept', 'none', '', True, ''),
     FreshAdmissionCase('repository-stale-evidence', 'none', 'stale', False, 'stale Arch snapshot'),
+    FreshAdmissionCase('repository-unknown-signing-key', 'none', '', False, 'Unknown signing key refused'),
 )
 
 
@@ -725,8 +734,9 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             directory.mkdir()
             fixture = owner.parent / (owner.name + '-' + case.name)
             read_only = case.name == 'repository-bzip2-info'
+            unknown_key = case.name == 'repository-unknown-signing-key'
             prepared = create_signed_fixture(fixture, native_migrations=read_only,
-                repository_compression='bz2' if read_only else 'gz')
+                repository_compression='bz2' if read_only else 'gz', unknown_app_signer=unknown_key)
             for repository in ('core', 'omarchy'):
                 for suffix in ('.db', '.db.sig'):
                     name = repository + suffix
@@ -745,6 +755,8 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             fixture_command(['mount', '--bind', str(fixture / 'pacman.conf'), '/etc/pacman.conf'])
             before = fixture_tree_hashes(fixture / 'db/local')
             payload_before = fixture_tree_hashes(fixture / 'root')
+            keyring = fixture / 'gnupg/pubring.gpg'
+            keyring_before = sha(keyring) if unknown_key else None
             arguments = ['install', str(archive), '--allow-local-file', '--yes']
             if case.name.startswith('repository-'):
                 arguments = ['install', 'omg-coverage-app', '--yes']
@@ -810,6 +822,10 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
                         require('applicability is UNKNOWN' in result['output'], 'Archive acknowledgement lost Unknown coverage')
                 else:
                     require(after == before and payload_after == payload_before, 'Refused admission changed its private package state')
+                if unknown_key:
+                    keyring_after = sha(keyring)
+                    require(keyring_after == keyring_before, 'Refused package changed the verification keyring')
+                    row['keyring_sha256'] = [keyring_before, keyring_after]
                 require(not (fixture / 'db/db.lck').exists(), 'Native admission left its transaction lock')
                 if case.interaction == 'timeout':
                     require(result['elapsed_seconds'] >= 59, 'Native acknowledgement timed out prematurely')
@@ -894,6 +910,11 @@ def validate_fresh_admission(value, cli_sha256, decoder_cases=False):
             require(package + '/desc' in row['database_after'] and row['database_before'] != row['database_after']
                     and row['payload_after'].get(path) == hashlib.sha256(payload).hexdigest(),
                     'Native admission did not commit the approved package bytes: ' + case.name)
+        if case.name == 'repository-unknown-signing-key':
+            keyring = row.get('keyring_sha256')
+            require(type(keyring) is list and len(keyring) == 2 and keyring[0] == keyring[1]
+                    and type(keyring[0]) is str and re.fullmatch('[0-9a-f]{64}', keyring[0]),
+                    'Unknown signing key refusal lacks an unchanged verification keyring')
         if decoder_cases:
             validate_signed_decoder_input(case, row)
         if case.interaction == 'foreground-loss':

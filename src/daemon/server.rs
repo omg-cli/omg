@@ -867,6 +867,7 @@ mod tests {
     struct PausedAdvisorySource {
         started: tokio::sync::Notify,
         resume: tokio::sync::Notify,
+        fail_scan: std::sync::atomic::AtomicBool,
     }
 
     impl crate::core::security::vulnerability::VulnerabilitySource for PausedAdvisorySource {
@@ -888,6 +889,13 @@ mod tests {
             Box::pin(async move {
                 self.started.notify_one();
                 self.resume.notified().await;
+                if self.fail_scan.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(
+                        crate::core::security::vulnerability::VulnerabilityError::Unavailable {
+                            reason: "fixture advisory provider failed".into(),
+                        },
+                    );
+                }
                 Ok(packages
                     .iter()
                     .cloned()
@@ -925,6 +933,7 @@ mod tests {
         let source = Arc::new(PausedAdvisorySource {
             started: tokio::sync::Notify::new(),
             resume: tokio::sync::Notify::new(),
+            fail_scan: std::sync::atomic::AtomicBool::new(false),
         });
         let mut state = DaemonState::new_isolated_with_scanner(
             directory.path(),
@@ -932,6 +941,9 @@ mod tests {
             backend,
             source.clone(),
         )?;
+        let previous =
+            crate::daemon::status_policy::status_snapshot(1, 1, 0, 0, vec![], Some((3, 1))).0;
+        state.cache.update_status(Arc::new(previous));
         state.background_security_scans = true;
         let state = Arc::new(state);
         let socket = directory.path().join("held.sock");
@@ -991,6 +1003,35 @@ mod tests {
                 .is_none(),
             "old inventory must not survive refresh on disk"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_scan_error_marks_previous_vulnerabilities_stale() -> Result<()> {
+        let (_directory, state, source, _socket, server) = daemon_with_paused_scan().await?;
+        source
+            .fail_scan
+            .store(true, std::sync::atomic::Ordering::Release);
+        source.resume.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = state
+                    .cache
+                    .get_status()
+                    .filter(|status| !status.vulnerabilities_scanned)
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        server.abort();
+        let status = result.expect("failed refresh must publish the previous count as stale");
+        assert_eq!(status.security_vulnerabilities, 3);
+        assert_eq!(status.scanned_vulnerability_summary(), None);
+        assert_eq!(status.security_unknown_packages, None);
         Ok(())
     }
 

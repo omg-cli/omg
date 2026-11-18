@@ -801,6 +801,67 @@ class RetainedAlpmRegistrationTests(unittest.TestCase):
                 self.assertIsNone(self.compare(fault))
 
 
+class ColdArchSnapshotReaderTests(unittest.TestCase):
+    def observe(self, fault=None):
+        filename = 'src/core/security/vulnerability.rs'
+        files = {'/artifact/' + filename: filename}
+        declaration = '    pub async fn fetch_alsa_issues(&self) -> Result<Vec<AlsaIssue>, VulnerabilityError> {'
+        sources = [
+            ['        let response = self.client.get(ARCH_UPSTREAM_URL).send().await?;',
+             '        Ok(response.json().await?)'],
+            ['        let snapshot = self.arch_snapshot(AssessmentUse::Admission).await?;',
+             '        Ok(snapshot.issues.clone())'],
+        ]
+        if fault == 'changed-wrapper':
+            sources[1][0] = sources[1][0].replace('Admission', 'Review')
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        sides = []
+        indexes = []
+        for side, body in enumerate(sources):
+            source = ['impl VulnerabilityScanner {', declaration, *body, '    }', '}']
+            owners = []
+            futures = []
+            def add(symbol, hits, geometry):
+                owner = dict(name=symbol, count=hits, filenames=list(files),
+                             regions=[[*position,hits,0,0,0] for position in geometry])
+                owners.append(owner)
+                return owner
+            for crate, hits in (('saJq9CMLDmry_',0),('s40j12eeWnis_',int(
+                    fault=='hot-baseline' if not side else fault!='cold-replacement'))):
+                scope = 's2_' if side else 's_'
+                namespace = f'M{scope}NtNtNtC{crate}7omg_lib4core8security13vulnerability'
+                method = '_20VulnerabilityScanner17fetch_alsa_issues'
+                add(f'_RNv{namespace}NtB{5 if side else 4}{method}',hits,
+                    [(2,5,2,len(declaration)+1)])
+                future_name = f'_RNCNv{namespace}NtB{7 if side else 6}{method}0'
+                futures.append(add(future_name+('Bd_' if side else 'Bc_'),hits,[(2,5,5,6)]))
+                if side and not hits and crate=='saJq9CMLDmry_':
+                    futures.append(add(future_name+'CsiKC45NoN8w3_22real_world_integration',0,[(2,5,5,6)]))
+                if not side:
+                    nested = f'_RNCNCNv{namespace}NtB8{method}0'
+                    suffixes = ('0Be_','s0_0Be_','s1_0Be_','s_0Be_')
+                    if fault=='missing-cold-child':
+                        suffixes=suffixes[:-1]
+                    for suffix in suffixes:
+                        add(nested+suffix,0,[(3,9,3,18)])
+            observer = coverage._ObserverWork()
+            raw = [region for owner in owners for region in owner['regions']]
+            counts = dict(coverage._llvm22_rows(coverage._llvm22_segments(raw,observer),observer))
+            spans = {id(owner):coverage.source_owner_span(owner,filename,files,source) for owner in futures}
+            sides.append((source,spans,counts,futures))
+            indexes.append(coverage.index_compiled_owner_sources(owners,files,work,{filename}))
+        return coverage.replaced_cold_arch_snapshot_reader(filename,declaration,sides,indexes,work)
+
+    def test_changed_arch_reader_admits_only_a_complete_cold_baseline(self):
+        proof = self.observe()
+        self.assertEqual(proof['summary_credit'], [0,0])
+        self.assertEqual(proof['mapped_credit'], [0,0])
+        self.assertEqual(proof['preserved_base_mapped'], [2,3,4,5])
+        for fault in ('hot-baseline','missing-cold-child','cold-replacement','changed-wrapper'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(self.observe(fault))
+
+
 class RetainedSourceEntryTests(unittest.TestCase):
     def observe(self, name, variants, source_observer, *, fault=None):
         sides=[]; indexes=[]
@@ -811,7 +872,8 @@ class RetainedSourceEntryTests(unittest.TestCase):
             for copy,(hits,count) in enumerate(zip(hit_counts,root_counts)):
                 if side and fault=='missing-copy' and not copy:
                     continue
-                prefix=f'_RNvNt{"Nt" if name.endswith("alpm_ops.rs") else ""}Cs{side+1}{copy+1}_7omg_lib'
+                depth = name.removeprefix('src/').count('/') + 1
+                prefix = f'_RNv{"Nt" * depth}Cs{side+1}{copy+1}_7omg_lib'
                 symbol=prefix+scope
                 def region(number,text,value,end_number=None,end_text=None):
                     col=source[number-1].rindex(text)+1
@@ -964,6 +1026,30 @@ class RetainedSourceEntryTests(unittest.TestCase):
                 proof=self.leading_ensure(fault)
                 self.assertEqual(proof['pairs'],[[2,2]])
                 self.assertEqual(proof['condition_pairs'],[])
+
+    def test_super_visible_duplicate_identity_guard_preserves_its_entry(self):
+        variants = []
+        for key in ('key', 'key.clone()'):
+            condition = f'identities.insert({key}, reference.clone()).is_none()'
+            source = [
+                'pub(super) fn compose(installed: &[Package]) -> anyhow::Result<()> {',
+                '    for package in installed {',
+                '        anyhow::ensure!(',
+                f'            {condition},',
+                '            "Duplicate installed SBOM identity"',
+                '        );',
+                '    }',
+                '    Ok(())',
+                '}',
+            ]
+            variants.append((source,3,[(3,'anyhow::ensure!'),(4,condition)],
+                             (0,2),(0,1),'4core8security11sbom_shared7compose'))
+        def observe(fault=None):
+            return self.observe('src/core/security/sbom_shared.rs',variants,
+                                coverage.ensure_entry_source,fault=fault)
+        self.assertEqual(observe()['pairs'], [[3, 3]])
+        self.assertIsNone(observe('missing-copy'))
+        self.assertIsNone(observe('foreign'))
 
 
     def test_map_initializer_tracks_both_copies_when_a_cold_copy_executes(self):
@@ -4838,19 +4924,24 @@ class SourceAwareCoverageTests(unittest.TestCase):
         beginning = ['fn compose(audit: &Audit) {',
                      '    for (name, findings) in &audit.vulnerabilities {',
                      '        for finding in findings {']
+        lookup = [
+            '            let reference = identities.get(&key).ok_or_else(|| {',
+            '                anyhow::anyhow!("missing fixture component")',
+            '            })?;',
+        ]
         advisories = [
             '                advisories: finding.native_advisory.as_ref().map(|native| {',
             '                    describe(native);',
             '                }),',
         ]
         sources = [
-            [*beginning, '            vulnerabilities.push(SbomVulnerability {',
+            [*beginning, *lookup, '            vulnerabilities.push(SbomVulnerability {',
              '                properties: finding.native_advisory.as_ref().map(|native| {',
              '                    vec![', *['                        ' + line for line in entries],
              '                    ]',
              '                    .into_iter().filter(|property| !property.value.is_empty()).collect()',
              '                }).unwrap_or_default(),', *advisories, '            });', '        }', '    }', '}'],
-            [*beginning, '            if let Some(native) = &finding.native_advisory {',
+            [*beginning, *lookup, '            if let Some(native) = &finding.native_advisory {',
              '                properties.extend(', '                    [',
              *['                    ' + line for line in entries],
              '                    ]',
@@ -4863,6 +4954,8 @@ class SourceAwareCoverageTests(unittest.TestCase):
         docs = []
         counts = []
         for side, lines in enumerate(sources):
+            array = lines.index('                    [' if side else '                    vec![') + 1
+            lookup_line = lines.index(lookup[0]) + 1
             copies = []
             for copy_number in (0, 1):
                 state = int(copy_number == 1)
@@ -4874,12 +4967,23 @@ class SourceAwareCoverageTests(unittest.TestCase):
                     return [number, column, number, column + len(value), quantity, 0, 0, 0]
                 root = dict(name=symbol, count=1, filenames=['/src/' + file],
                             regions=[span(1, 'fn compose(audit: &Audit)', 1), span(len(lines), '}', 1)])
-                raw = [[6, 21, 19, 22, state, 0, 0, 0]] if side else [span(6, 'vec!', state)]
-                for record in (7, 11, 15):
+                root['regions'].extend([
+                    span(lookup_line, 'reference', state),
+                    span(lookup_line, 'identities', state),
+                    span(lookup_line, 'ok_or_else', state),
+                    span(lookup_line+2, '?', state),
+                ])
+                if side and fault == 'missing-lookup-continuation' and copy_number == 0:
+                    root['regions'].pop()
+                copies.append(dict(name='_RNC'+symbol[2:]+'s2_0B9_', count=state,
+                    filenames=['/src/' + file], regions=[span(lookup_line, '{',state),
+                    span(lookup_line+1,'anyhow::anyhow!',state), span(lookup_line+2,'}',state)]))
+                raw = [[array, 21, array+13, 22, state, 0, 0, 0]] if side else [span(array, 'vec!', state)]
+                for record in (array+1, array+5, array+9):
                     first = lines[record - 1].index('SbomProperty') + 1
-                    if not side or record != 15:
+                    if not side or record != array+9:
                         raw.append([record, first, record + 3, first + 1, state, 0, 0, 0])
-                    literal = entries[record - 6].split('"')[1]
+                    literal = entries[record - array].split('"')[1]
                     raw.extend([span(record + 1, '"' + literal + '"', state),
                                 span(record + 1, 'into', state)])
                 if side:
@@ -4895,7 +4999,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
                     span(callback+1,'describe',1),span(callback+2,'}',1)]))
                 copies.append(root)
             if side and fault == 'source-value':
-                lines[8] = lines[8].replace('finding.summary', 'finding.id')
+                lines[array+2] = lines[array+2].replace('finding.summary', 'finding.id')
             work = coverage._ObserverWork()
             counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
                 [row for owner in copies for row in owner['regions']], work), work)))
@@ -4911,7 +5015,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
         result = self.sbom_advisory_property_array_compare()
         proof, = [row for row in result['retained_replacement_obligations']
                   if row.get('kind') == 'retained-sbom-advisory-properties']
-        self.assertIn([12, 12], proof['pairs'])
+        self.assertIn([15, 15], proof['pairs'])
         self.assertEqual(result['deleted_mapped'], 0)
         for fault in ('redistributed-count', 'foreign-record-owner', 'source-value'):
             with self.subTest(fault=fault):
@@ -4921,6 +5025,18 @@ class SourceAwareCoverageTests(unittest.TestCase):
                     continue
                 self.assertFalse(any(row.get('kind') == 'retained-sbom-advisory-properties'
                                      for row in rejected['retained_replacement_obligations']))
+
+    def test_sbom_identity_lookup_retains_the_call_and_error_propagation(self):
+        def lookup_pairs(result):
+            return [row['pairs'] for row in result.get('retained_replacement_obligations', [])
+                    if row.get('kind') == 'closed-retained-callback-island' and [4,4] in row['pairs']]
+        result = self.sbom_advisory_property_array_compare()
+        self.assertEqual(lookup_pairs(result), [[[4,4],[5,5],[6,6]]])
+        try:
+            missing = self.sbom_advisory_property_array_compare('missing-lookup-continuation')
+        except ValueError:
+            return
+        self.assertFalse(lookup_pairs(missing))
 
     def test_block_mapper_preserves_complete_cold_descendant_and_context(self):
         receipt=self.closed_retained_callback_island_fixture()

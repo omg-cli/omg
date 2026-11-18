@@ -64,8 +64,7 @@ pub fn status_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{reported_vulnerability_counts, status_snapshot, vulnerability_count_from_scan};
-    use crate::core::security::scan::{AuditCoverage, SecurityAuditResult};
+    use super::{status_snapshot, vulnerability_count_from_scan};
 
     #[test]
     fn successful_scan_replaces_the_previous_count() {
@@ -93,6 +92,9 @@ mod tests {
 
     #[test]
     fn unreported_package_coverage_does_not_replace_the_last_scan() {
+        use super::reported_vulnerability_counts;
+        use crate::core::security::scan::{AuditCoverage, SecurityAuditResult};
+
         let scan = SecurityAuditResult {
             coverage: AuditCoverage::Unreported,
             total_vulnerabilities: 0,

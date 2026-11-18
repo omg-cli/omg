@@ -3091,7 +3091,7 @@ def ensure_entry_source(name, source, inventory, line, work):
         if not row['supported'] or row['kind']!='fn' or header.count('fn')!=1:
             return None
         index=header.index('fn')
-        if header[:index] not in ((),('pub','(','crate',')')):
+        if header[:index] not in ((), ('pub','(','crate',')'), ('pub','(','super',')')):
             return None
         first=code.position(code.starts[row['first']+index])[0]
         last=code.position(code.ends[row['end']])[0]
@@ -5696,6 +5696,7 @@ def _construct_inventory(source, work):
         rows = boundaries.get(parent, [])
         at = bisect.bisect_left(rows, index)
         return rows[at - 1] + 1 if at else (parent + 1 if parent is not None else 0)
+
     def digest(first, last):
         _construct_charge(work, last - first + 1)
         return hashlib.sha256(repr(tuple(code.words[first:last + 1])).encode()).hexdigest()
@@ -7630,12 +7631,15 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
             candidate_sets.append(candidates);continue
         for row in rows:
             header=row.get('header',());opening=row['opening']
+            identity_check=(name=='src/core/security/sbom_shared.rs' and header==('||',))
+            unary=(len(header)>=3 and header[0]=='|' and header[2]=='|'
+                   and re.fullmatch(r'[A-Za-z_]\w*',header[1],re.ASCII) is not None)
             if (row['kind']!='expression' or not row['supported'] or opening is None
-                    or len(header)<3 or header[0]!='|' or header[2]!='|'
-                    or re.fullmatch(r'[A-Za-z_]\w*',header[1],re.ASCII) is None):
+                    or not (unary or identity_check)):
                 continue
             parent=code.parents[row['first']]
-            if (parent is None or parent<2 or code.words[parent-2:parent]!=['.','map']
+            method='ok_or_else' if identity_check else 'map'
+            if (parent is None or parent<2 or code.words[parent-2:parent]!=['.',method]
                     or code.words[parent]!='(' or code.pairs[parent]!=row['end']+1):
                 continue
             parents=[d for d in selected if d['row']['opening']<row['first']<row['end']<d['row']['end']]
@@ -7650,6 +7654,14 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                 if code.parents[at]==scope and code.words[at] in (';',','):
                     start=at+1
             prefix=list(code.words[start:parent-2]);filters=[];normalized=[];at=0
+            identity_paint=None
+            if identity_check:
+                continuation=code.pairs[parent]+1
+                if (prefix!='let reference = identities . get ( & key )'.split()
+                        or code.words[continuation:continuation+2]!=['?',';']):
+                    continue
+                identity_paint=(code.region(start,parent-1),code.region(continuation,continuation),
+                                code.region(parent-1,parent-1))
             while at<len(prefix):
                 _construct_charge(work,1)
                 if prefix[at:at+3]==['.','filter','(']:
@@ -7676,7 +7688,7 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
             if any(not line.isascii() for line in body):continue
             key=(descriptor['declaration'],descriptor['signature'],tuple(descriptor['attributes']),tuple(ancestors),
                  tuple(normalized),tuple(header),body)
-            candidates.setdefault(key,[]).append((descriptor,row,filters))
+            candidates.setdefault(key,[]).append((descriptor,row,filters,identity_paint))
         candidate_sets.append(candidates)
     common=candidate_sets[0].keys()&candidate_sets[1].keys()
     pairs={};targets={};receipts=[];indexes=None
@@ -7690,7 +7702,8 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                 word for word in inventories[0][0].words[selected[0][1]['first']:selected[0][1]['end']+1]),blobs,work):continue
         if indexes is None:indexes=indexes_factory()
         sides=[];valid=True
-        for side,((descriptor,callback,filters),inventory,index) in enumerate(zip(selected,inventories,indexes)):
+        for side,((descriptor,callback,filters,identity_paint),inventory,index) in enumerate(
+                zip(selected,inventories,indexes,strict=True)):
             code=inventory[0];opening,closing=code.region(callback['opening'],callback['end'])[:2],code.region(callback['opening'],callback['end'])[2:]
             available=index.inventories.get(name,());_construct_charge(work,sum(len(o['regions'])+1 for o in available))
             forest=[o for o in available if any(tuple(r[:2])<closing and opening<tuple(r[2:4]) for r in o['regions'])]
@@ -7711,20 +7724,28 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                 at=end+1
             if not valid or len(slots)>8:valid=False;break
             prefix_rows={}
-            if any(fields is not None for _,_,fields in slots):
+            include_roots=identity_paint is not None or any(fields is not None for _,_,fields in slots)
+            if include_roots:
                 call=code.parents[callback['first']]
-                if call is None or code.words[call-1]!='map':valid=False;break
-                prefix=code.region(call-1,call-1);lo,hi=prefix[:2],prefix[2:]
+                if call is None:valid=False;break
+                prefix=tuple(code.region(call-1,call-1))
+                windows=tuple(map(tuple,identity_paint[:2])) if identity_paint else (prefix,)
+                required={prefix,tuple(identity_paint[1])} if identity_paint else {prefix}
                 roots={o['name'] for o in descriptor['group'][2]}
-                _construct_charge(work,sum(len(o['regions'])+1 for o in available))
+                _construct_charge(work,sum((len(o['regions'])+1)*len(windows) for o in available))
                 for owner in available:
-                    touches=[r for r in owner['regions'] if tuple(r[:2])<tuple(hi) and tuple(lo)<tuple(r[2:4])]
+                    touches=[r for r in owner['regions'] if any(tuple(r[:2])<window[2:] and window[:2]<tuple(r[2:4])
+                                                                for window in windows)]
                     if not touches:continue
-                    if (owner['name'] not in roots or len(touches)!=1 or tuple(touches[0][:4])!=tuple(prefix)
-                            or touches[0][5:]!=[0,0,0] or type(touches[0][4]) is not int
-                            or not 0<=touches[0][4]<COUNTER_LIMIT):valid=False;break
-                    prefix_rows[owner['name']]=touches
-                if not valid or prefix_rows and set(prefix_rows)!=roots:valid=False;break
+                    spans={tuple(r[:4]) for r in touches}
+                    if (owner['name'] not in roots or len(touches)!=len(spans) or not required<=spans
+                            or any(r[5:]!=[0,0,0] or type(r[4]) is not int or not 0<=r[4]<COUNTER_LIMIT
+                                   or not any(window[:2]<=tuple(r[:2])<tuple(r[2:4])<=window[2:]
+                                              for window in windows) for r in touches)):
+                        valid=False;break
+                    prefix_rows[owner['name']]=sorted(touches,key=lambda r:tuple(r[:4]))
+                if not valid or (identity_paint or prefix_rows) and set(prefix_rows)!=roots:
+                    valid=False;break
             roles=[];owned=set();filter_owned=set();filter_evidence=[]
             filter_touching=[]
             if filters:
@@ -7812,12 +7833,14 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                     geometry.append(tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in ordered))
                     states.extend([int(entry>0),*[int(r[4]>0) for r in ordered]])
                 if not valid:break
-                prefix=prefix_rows.get(root['name'],[])
-                if prefix and (mapper['count']>prefix[0][4] or prefix[0][4]>0 and root['count']==0):
+                outer=prefix_rows.get(root['name'],[])
+                method_count=next((r[4] for r in outer if tuple(r[:4])==prefix),None)
+                if outer and (method_count is None or mapper['count']>method_count
+                              or root['count']==0 and any(r[4]>0 for r in outer)):
                     valid=False;break
-                if any(fields is not None for _,_,fields in slots):
-                    geometry.append(tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in prefix))
-                    states.extend(int(r[4]>0) for r in prefix)
+                if include_roots:
+                    geometry.append(tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in outer))
+                    states.extend(int(r[4]>0) for r in outer)
                 roles.append(dict(role=shape.identity,identity=root['name'],geometry=tuple(geometry),states=tuple(states),
                     nested_ordinals=tuple(nested_ordinals),names=names))
             if (not valid or owned!={id(o) for o in forest}
@@ -10213,9 +10236,15 @@ def retained_construct_anchors(name, old, new, before, after, base, head, base_f
             if word == 'fn' and code.parents[index] is None:
                 rows.setdefault(code.position(code.starts[index])[0], []).append(index)
         declarations[id(code)] = rows
-        _construct_charge(work, len(inventory[1]) * (len(inventory[1]).bit_length() + 2))
-        ordered = sorted(inventory[1], key=lambda row: row['first'])
-        construct_rows[id(code)] = ordered, [code.position(code.starts[row['first']])[0] for row in ordered]
+    def control_rows(inventory):
+        code, rows = inventory[:2]
+        if id(code) not in construct_rows:
+            _construct_charge(work, len(rows))
+            controls = [row for row in rows if row['supported'] and row['kind'] in ('if', 'for', 'while', 'loop', 'match')]
+            _construct_charge(work, len(controls) * (len(controls).bit_length() + 2))
+            controls.sort(key=lambda row: row['first'])
+            construct_rows[id(code)] = controls, [code.position(code.starts[row['first']])[0] for row in controls]
+        return construct_rows[id(code)]
     def line_counts(side, owner):
         key = side, id(owner)
         if key not in projections:
@@ -10253,14 +10282,13 @@ def retained_construct_anchors(name, old, new, before, after, base, head, base_f
         for inventory, group in zip(inventories, groups):
             by_digest = {}
             code = inventory[0]
-            rows, positions = construct_rows[id(code)]
+            rows, positions = control_rows(inventory)
             first = bisect.bisect_right(positions, group[0])
             last = bisect.bisect_left(positions, group[1])
             _construct_charge(work, last - first)
             for index in range(first, last):
                 row = rows[index]
-                if (row['kind'] in ('if', 'for', 'while', 'loop', 'match') and row['supported']
-                        and group[0] < code.position(code.starts[row['first']])[0]
+                if (group[0] < code.position(code.starts[row['first']])[0]
                         <= code.position(code.starts[row['end']])[0] < group[1]):
                     by_digest.setdefault(row['digest'], []).append(row)
             selected.append(by_digest)
@@ -11699,6 +11727,70 @@ def retained_boolean_argument_paint(name, old, new, before, after, base, head, b
     return results
 
 
+def replaced_cold_arch_snapshot_reader(name, declaration, sides, indexes, work):
+    """Prove that a replaced feed reader contributes no previously covered execution."""
+    if (name != 'src/core/security/vulnerability.rs'
+            or declaration.strip() != 'pub async fn fetch_alsa_issues(&self) -> Result<Vec<AlsaIssue>, VulnerabilityError> {'):
+        return None
+    namespace = ('crate','omg_lib')
+    for component in ('core','security','vulnerability'):
+        namespace = ('type',namespace,(component,''))
+    self_type = ('type',namespace,('VulnerabilityScanner',''))
+    evidence = []
+    for side, ((source, spans, counts, futures), index) in enumerate(zip(sides, indexes, strict=True)):
+        boundaries = {spans.get(id(owner)) for owner in futures}
+        if len(boundaries) != 1 or None in boundaries:
+            return None
+        (first,last,header,_), = boundaries
+        if header != declaration or not 1 <= last-first <= 128:
+            return None
+        if side and source[first:last] != [
+                '        let snapshot = self.arch_snapshot(AssessmentUse::Admission).await?;',
+                '        Ok(snapshot.issues.clone())',
+                '    }']:
+            return None
+        members = []
+        regions = []
+        depths = Counter()
+        seen_futures = set()
+        for owner in index.inventories.get(name, ()):
+            raw = owner['regions']
+            _construct_charge(work, len(raw)+1)
+            if not any(row[0]<=last and first<=row[2] for row in raw):
+                continue
+            symbol = owner['name']
+            _construct_charge(work, len(symbol)+len(raw))
+            shape = nominal_method_path(symbol,inventory=True)
+            if (shape is None or shape.kind!='M' or shape.namespace!=namespace or shape.self_type!=self_type
+                    or shape.method!=('fetch_alsa_issues','') or index.name_counts[symbol]!=1
+                    or len(owner['filenames'])!=1 or index.files.get(owner['filenames'][0])!=name
+                    or owner.get('branches') or owner.get('mcdc_records')
+                    or not 0<=owner['count']<COUNTER_LIMIT or not side and owner['count']!=0
+                    or any(not first<=row[0]<=row[2]<=last or row[5:]!=[0,0,0]
+                           or not 0<=row[4]<COUNTER_LIMIT or not side and row[4]!=0 for row in raw)):
+                return None
+            depth = len(shape.callbacks)
+            depths[depth] += 1
+            if depth==1:
+                seen_futures.add(id(owner))
+            members.append(dict(name=symbol,count=owner['count'],regions_sha256=hashlib.sha256(repr(raw).encode()).hexdigest()))
+            regions.extend(raw)
+        expected = {0:2,1:3} if side else {0:2,1:2,2:8}
+        if depths!=expected or seen_futures!={id(owner) for owner in futures}:
+            return None
+        observer = _ObserverWork(work)
+        observed = dict(_llvm22_rows(_llvm22_segments(regions,observer),observer))
+        _construct_charge(work,last-first+1)
+        if (not observed or observed!={line:counts[line] for line in range(first,last+1) if line in counts}
+                or any(bool(hits)!=bool(side) for hits in observed.values())):
+            return None
+        evidence.append(([first,last],members,list(observed)))
+    return dict(kind='replaced-cold-arch-snapshot-reader',file=name,
+        base_range=evidence[0][0],head_range=evidence[1][0],compiled_owners=[side[1] for side in evidence],
+        preserved_base_mapped=evidence[0][2],pairs=[],summary_credit=[0,0],mapped_credit=[0,0],
+        claim='The complete baseline reader was cold and the replacement reader executes on every mapped line')
+
+
 def retained_specialization_additions(name, sides, indexes, inventory_for_side, work, *, path_reference=False):
     """Match every original specialization and observe additional consumers in full."""
     layouts = []; roles = []; spans = []; containers = []; summaries = []; source_bytes = []; compiled_methods = set()
@@ -12018,6 +12110,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             for groups in (base_groups, head_groups) for group in groups.values()))
         closed = [{frozenset(id(owner) for owner in group[2]) for group in groups.values()}
                   for groups in (base_groups, head_groups)]
+        cold_replacements = []
         for declaration in base_declarations.keys() & head_declarations.keys():
             previous, current = base_declarations[declaration], head_declarations[declaration]
             _construct_charge(construct_work, len(previous) + len(current) + 1)
@@ -12039,6 +12132,14 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         key = 'additive_path_reference_copies' if path_reference else 'additive_trait_copies'
                         specialization_receipts.setdefault(key, []).append(proof)
                         continue
+                    if name=='src/core/security/vulnerability.rs' and 'fetch_alsa_issues(' in declaration:
+                        proof = replaced_cold_arch_snapshot_reader(name,declaration,
+                            ((old,base_spans,before,previous),(new,head_spans,after,current)),
+                            source_owner_indexes(),construct_work)
+                        if proof is not None:
+                            cold_replacements.append(proof)
+                            obligation_receipts.append(proof)
+                            continue
                 raise ValueError(f'Ambiguous unchanged source correspondence: {name}; '
                                  'Retained covered line requires a complete compiled-copy inventory')
             if frozenset(map(id, current)) not in closed[1]:
@@ -12318,7 +12419,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for start, end in replaced_functions:
             _construct_charge(construct_work, end - start + 1)
             gone.difference_update(range(start, end + 1))
-        for receipt in residual_receipts:
+        for receipt in (*residual_receipts,*cold_replacements):
             protected=receipt.get('preserved_base_mapped',())
             _construct_charge(construct_work,len(protected))
             gone.difference_update(protected)

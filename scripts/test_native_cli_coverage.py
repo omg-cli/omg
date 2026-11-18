@@ -1112,7 +1112,7 @@ class SignedDecoderFixtures(unittest.TestCase):
                 PRODUCER.validate_fresh_admission(value, 'a' * 64, decoder_cases=True)
 
     def test_decoder_cases_are_additive_and_have_distinct_mandatory_cli_profiles(self):
-        self.assertEqual(len(PRODUCER.FRESH_ADMISSION_CASES), 20)
+        self.assertEqual(len(PRODUCER.FRESH_ADMISSION_CASES), 21)
         self.assertEqual({case.name for case in PRODUCER.FRESH_ADMISSION_CASES if case.commits},
                          {'archive-accept', 'archive-source-replaced', 'repository-accept'})
         for case in PRODUCER.SIGNED_DECODER_CASES:
@@ -1164,6 +1164,8 @@ def fresh_admission_receipt(decoder_cases=False):
                     description='inert signed coverage fixture', url=None,
                     size=len(b'xorg-xrandr: upgraded3\n'), install_size=len(b'xorg-xrandr: upgraded3\n'),
                     download_size=512, repo='core', depends=[], licenses=['MIT'], installed=False))
+        if case.name == 'repository-unknown-signing-key':
+            rows[-1]['keyring_sha256'] = ['c' * 64, 'c' * 64]
     return dict(status='PASS', cli_sha256='a' * 64, cases=rows,
         selected=[row['name'] for row in rows], complete_matrix=True,
         profile_stages=['fresh-' + row['name'] for row in rows],
@@ -1595,8 +1597,8 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 22)
-            self.assertEqual(len(receipt['process_checks']), 74)
-            self.assertEqual(len(receipt['fresh_admission']), 20)
+            self.assertEqual(len(receipt['process_checks']), 75)
+            self.assertEqual(len(receipt['fresh_admission']), 21)
             self.assertEqual(len(receipt['signed_decoders']), 2)
             self.assertEqual(len(files), len(receipt['profiles']))
 
@@ -1902,7 +1904,7 @@ class FreshAdmissionFixture(unittest.TestCase):
                          'archive-profile-changed', 'archive-staged-bytes-changed',
                          'archive-source-replaced', 'archive-identity-changed',
                          'archive-stale-evidence', 'archive-minimum-verified',
-                         'repository-accept', 'repository-stale-evidence',
+                         'repository-accept', 'repository-stale-evidence', 'repository-unknown-signing-key',
                          'archive-long-input', 'archive-timeout', 'archive-batch-limit'} <= by_name.keys())
         self.assertEqual({case.name for case in cases if case.commits},
                          {'archive-accept', 'archive-source-replaced', 'repository-accept'})
@@ -1922,6 +1924,17 @@ class FreshAdmissionFixture(unittest.TestCase):
         self.assertEqual(stale['payload_sha256'], fresh['payload_sha256'])
         with self.assertRaisesRegex(ValueError, 'snapshot mode'):
             PRODUCER.fresh_admission_snapshot('unrecognized', 1_800_000_000)
+
+    def test_unknown_signing_key_refusal_requires_the_original_keyring_digest(self):
+        receipt = fresh_admission_receipt()
+        row, = [item for item in receipt['cases'] if item['name'] == 'repository-unknown-signing-key']
+        self.assertEqual(row['exit_code'], 1)
+        self.assertEqual(row['database_before'], row['database_after'])
+        PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
+        for keyring in (None, ['c' * 64, 'd' * 64], ['c' * 63, 'c' * 63]):
+            with self.subTest(keyring=keyring), self.assertRaisesRegex(ValueError, 'keyring'):
+                row['keyring_sha256'] = keyring
+                PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
 
     def test_native_matrix_refuses_an_ordinary_process_before_creating_fixtures(self):
         with patch.object(PRODUCER.os, 'geteuid', return_value=1000), \
