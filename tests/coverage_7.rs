@@ -261,6 +261,30 @@ fn run_with_fixture_env<T>(
     )
 }
 
+fn catalog(name: &str) -> Vec<u8> {
+    let description = format!(
+        "%NAME%\n{name}\n\n%VERSION%\n1-1\n\n%FILENAME%\n{name}-1-1-any.pkg.tar.zst\n\n%ARCH%\nany\n\n%CSIZE%\n1\n\n%ISIZE%\n1\n\n"
+    );
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut archive = tar::Builder::new(gzip);
+    let mut header = tar::Header::new_gnu();
+    header.set_size(description.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(
+            &mut header,
+            format!("{name}-1-1/desc"),
+            description.as_bytes(),
+        )
+        .expect("add package description");
+    archive
+        .into_inner()
+        .expect("finish tar")
+        .finish()
+        .expect("finish gzip")
+}
+
 const fn arch() -> &'static str {
     std::env::consts::ARCH
 }
@@ -278,9 +302,11 @@ fn successful_sync_downloads_exact_db_bytes_into_sync_dir() {
     let core_path = format!("/core/os/{}/core.db", arch());
     let extra_path = format!("/extra/os/{}/extra.db", arch());
 
+    let core_bytes = catalog("fixture-core");
+    let extra_bytes = catalog("fixture-extra");
     let mut routes = HashMap::new();
-    routes.insert(core_path.clone(), (200u16, b"CORE-DB-BYTES-v7".to_vec()));
-    routes.insert(extra_path.clone(), (200u16, b"EXTRA-DB-BYTES-v7".to_vec()));
+    routes.insert(core_path.clone(), (200u16, core_bytes.clone()));
+    routes.insert(extra_path.clone(), (200u16, extra_bytes.clone()));
     let server = MockMirror::start(routes);
 
     let outcome = run_with_fixture_env(&fixture, &server.base_url, || {
@@ -299,15 +325,9 @@ fn successful_sync_downloads_exact_db_bytes_into_sync_dir() {
 
     // Byte-exact persisted artifacts at OMG_PACMAN_SYNC_DIR.
     let core_db = std::fs::read(fixture.sync_dir.join("core.db")).expect("core.db must exist");
-    assert_eq!(
-        core_db, b"CORE-DB-BYTES-v7",
-        "core.db content must be exact"
-    );
+    assert_eq!(core_db, core_bytes, "core.db content must be exact");
     let extra_db = std::fs::read(fixture.sync_dir.join("extra.db")).expect("extra.db must exist");
-    assert_eq!(
-        extra_db, b"EXTRA-DB-BYTES-v7",
-        "extra.db content must be exact"
-    );
+    assert_eq!(extra_db, extra_bytes, "extra.db content must be exact");
 
     // The downloader must have requested exactly the URL built from the
     // mirrorlist template ($repo/$arch substitution + <repo>.db suffix).
@@ -378,8 +398,8 @@ fn existing_db_sends_if_modified_since_and_304_preserves_cached_file() {
     init_test_env();
 
     let fixture = make_fixture(&["core"]);
-    let cached_bytes = b"STALE-LOCAL-CORE-DB";
-    std::fs::write(fixture.sync_dir.join("core.db"), cached_bytes).expect("seed cached core.db");
+    let cached_bytes = catalog("fixture-cached");
+    std::fs::write(fixture.sync_dir.join("core.db"), &cached_bytes).expect("seed cached core.db");
 
     let core_path = format!("/core/os/{}/core.db", arch());
 

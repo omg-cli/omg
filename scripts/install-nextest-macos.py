@@ -11,12 +11,14 @@ Curl transfer codes: https://curl.se/libcurl/c/libcurl-errors.html
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
 import re
+import select
 import signal
 import stat
 import subprocess
@@ -65,37 +67,69 @@ def admit(path, expected, maximum):
             f'installer artifact checksum or size mismatch: {path}')
 
 
-def group_exists(group):
+@contextmanager
+def observe_leader(pid):
+    # Keep the child unreaped while inspecting or signaling its process group.
+    # Once reaped, a recycled PID can name an unrelated group.
+    if hasattr(select, 'kqueue'):
+        with select.kqueue() as queue:
+            try:
+                queue.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                             flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                             fflags=select.KQ_NOTE_EXIT)], 0, 0)
+                exited = False
+            except ProcessLookupError:
+                exited = True
+
+            def observe():
+                nonlocal exited
+                exited = exited or bool(queue.control(None, 1, 0))
+                return exited
+
+            yield observe
+    else:
+        def observe():
+            return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+        yield observe
+
+
+def group_has_descendants(leader):
     try:
-        os.killpg(group, 0)
-        return True
-    except ProcessLookupError:
-        return False
+        inventory = subprocess.run(['/bin/ps', '-axo', 'pid=,pgid='],
+                                   stdout=subprocess.PIPE, text=True, check=True, timeout=2)
+        groups = [tuple(map(int, row.split())) for row in inventory.stdout.splitlines()]
+        require(groups and all(len(row) == 2 for row in groups)
+                and (leader, leader) in groups, 'owned process group missing from inventory')
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise AdmissionError('could not inspect the owned process group') from error
+    return any(pid != leader and group == leader for pid, group in groups)
 
 
-def finish_group(process, row):
-    """Reap the leader and terminate all remaining members of its own session."""
-    process.poll()
-    remaining = group_exists(process.pid)
-    row['group_remaining_at_cleanup'] = remaining
+def finish_group(process, row, observe):
+    """Terminate remaining members before releasing the leader's PID."""
+    def remaining():
+        return not observe() or group_has_descendants(process.pid)
+
+    unfinished = remaining()
+    row['group_remaining_at_cleanup'] = unfinished
     for label, action in [('term', signal.SIGTERM), ('kill', signal.SIGKILL)]:
-        if not group_exists(process.pid):
+        if not remaining():
             break
         try:
             os.killpg(process.pid, action)
             row['group_' + label + '_sent'] = True
         except ProcessLookupError:
             row['group_exited_before_' + label] = True
+        except PermissionError as error:
+            raise AdmissionError('could not signal the owned process group') from error
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            process.poll()
-            if not group_exists(process.pid):
-                break
+        while time.monotonic() < deadline and remaining():
             time.sleep(0.05)
-    process.poll()
-    row['group_gone_after_cleanup'] = not group_exists(process.pid)
+    row['group_gone_after_cleanup'] = not remaining()
     require(row['group_gone_after_cleanup'], 'owned command group did not terminate')
-    return remaining
+    process.wait()
+    return unfinished
 
 
 class Commands:
@@ -118,24 +152,23 @@ class Commands:
             process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stdout,
                                        stderr=stderr, start_new_session=True)
             row['leader_pid'] = row['process_group'] = process.pid
-            while process.poll() is None:
-                if time.monotonic() - started >= seconds:
-                    failure = 'command exceeded its elapsed deadline'
-                if bounded_file and bounded_file[0].exists():
-                    if bounded_file[0].stat().st_size > bounded_file[1]:
-                        failure = 'command output exceeded its byte bound'
-                if failure:
-                    break
-                time.sleep(0.05)
-            try:
-                remaining = finish_group(process, row)
-                if remaining and failure is None:
-                    failure = 'command leader finished with unfinished descendants'
-            except AdmissionError as cleanup_error:
-                failure = str(cleanup_error) if failure is None else failure + '; ' + str(cleanup_error)
-            if process.poll() is None:
-                failure = 'owned command leader did not terminate after group cleanup; ' + str(failure)
-            row.update(exit=process.poll(), seconds=time.monotonic() - started,
+            with observe_leader(process.pid) as observe:
+                while not observe():
+                    if time.monotonic() - started >= seconds:
+                        failure = 'command exceeded its elapsed deadline'
+                    if bounded_file and bounded_file[0].exists():
+                        if bounded_file[0].stat().st_size > bounded_file[1]:
+                            failure = 'command output exceeded its byte bound'
+                    if failure:
+                        break
+                    time.sleep(0.05)
+                try:
+                    remaining = finish_group(process, row, observe)
+                    if remaining and failure is None:
+                        failure = 'command leader finished with unfinished descendants'
+                except AdmissionError as cleanup_error:
+                    failure = str(cleanup_error) if failure is None else failure + '; ' + str(cleanup_error)
+            row.update(exit=process.returncode, seconds=time.monotonic() - started,
                        controller_failure=failure)
         self.rows.append(row)
         (self.receipts / 'commands.json').write_text(json.dumps(self.rows, indent=2) + '\n')

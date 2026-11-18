@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import subprocess
@@ -53,7 +54,13 @@ def main():
     absent = subprocess.run(['pacman', '-Qq', package], capture_output=True, timeout=10)
     require(absent.returncode == 1, 'Install fixture package must initially be absent')
     before = native_state()
-    cli = ['sudo', '-n', '/usr/local/bin/omg']
+    download_user = subprocess.check_output(['pacman-conf', 'DownloadUser'],
+                                            text=True, timeout=10).strip()
+    require(download_user and pwd.getpwnam(download_user).pw_uid != 0,
+            'Docker install fixture requires a non-root pacman DownloadUser')
+    # Docker root lacks CAP_SYS_ADMIN. libalpm applies Landlock before setting
+    # no_new_privs, so set it after sudo and before launching the real CLI.
+    cli = ['sudo', '-n', '/usr/bin/setpriv', '--no-new-privs', '/usr/local/bin/omg']
     deny_unattended(cli + ['install', package], before)
     deny_unattended(cli + ['install', '-y', package], before)
     helper = types.ModuleType('attend_unknown_fixture')
