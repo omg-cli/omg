@@ -11,7 +11,7 @@ Curl transfer codes: https://curl.se/libcurl/c/libcurl-errors.html
 """
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import os
@@ -72,7 +72,7 @@ def observe_leader(pid):
     # Keep the child unreaped while inspecting or signaling its process group.
     # Once reaped, a recycled PID can name an unrelated group.
     if hasattr(select, 'kqueue'):
-        with select.kqueue() as queue:
+        with closing(select.kqueue()) as queue:
             try:
                 queue.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
                                              flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
@@ -96,7 +96,7 @@ def observe_leader(pid):
 
 def group_has_descendants(leader):
     try:
-        inventory = subprocess.run(['/bin/ps', '-axo', 'pid=,pgid='],
+        inventory = subprocess.run(['/bin/ps', '-ax', '-o', 'pid=', '-o', 'pgid='],
                                    stdout=subprocess.PIPE, text=True, check=True, timeout=2)
         groups = [tuple(map(int, row.split())) for row in inventory.stdout.splitlines()]
         require(groups and all(len(row) == 2 for row in groups)

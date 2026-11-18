@@ -14,6 +14,19 @@ SPEC.loader.exec_module(INSTALLER)
 
 @unittest.skipUnless(os.name == 'posix', 'Requires POSIX process groups')
 class InstallerProcessTests(unittest.TestCase):
+    def test_kqueue_without_context_manager_is_closed_and_latches_exit(self):
+        queue = Mock()
+        queue.control.side_effect = [[], [], [object()]]
+        with patch.multiple(INSTALLER.select, create=True, kqueue=Mock(return_value=queue),
+                            kevent=Mock(), KQ_FILTER_PROC=1, KQ_EV_ADD=2, KQ_EV_ONESHOT=4,
+                            KQ_NOTE_EXIT=8):
+            with INSTALLER.observe_leader(123) as observe:
+                self.assertFalse(observe())
+                self.assertTrue(observe())
+                self.assertTrue(observe())
+        self.assertEqual(queue.control.call_count, 3)
+        queue.close.assert_called_once_with()
+
     def test_finished_leader_is_reaped_after_group_check(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
