@@ -142,8 +142,35 @@ pub struct SecurityPolicy {
     pub banned_packages: Vec<String>,
     #[serde(default)]
     pub advisory_requirement: AdvisoryRequirement,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_advisory_repositories")]
     pub arch_advisory_repositories: BTreeSet<String>,
+}
+
+fn deserialize_advisory_repositories<'de, D>(deserializer: D) -> Result<BTreeSet<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let repositories = BTreeSet::deserialize(deserializer)?;
+    validate_advisory_repositories(&repositories).map_err(serde::de::Error::custom)?;
+    Ok(repositories)
+}
+
+fn validate_advisory_repositories(repositories: &BTreeSet<String>) -> Result<(), PolicyError> {
+    if repositories.len() > 64
+        || repositories.iter().any(|name| {
+            name.is_empty()
+                || name.len() > 128
+                || !name.as_bytes()[0].is_ascii_alphanumeric()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
+        })
+    {
+        return Err(PolicyError::AdvisoryScope {
+            reason: "use at most 64 repository names of at most 128 ASCII letters, digits, '.', '_', '+' or '-'".into(),
+        });
+    }
+    Ok(())
 }
 
 const fn default_minimum_grade() -> SecurityGrade {
@@ -242,12 +269,10 @@ impl SecurityPolicy {
             path: path.display().to_string(),
             source,
         })?;
-        let policy: Self = toml::from_str(&content).map_err(|source| PolicyError::Parse {
+        toml::from_str(&content).map_err(|source| PolicyError::Parse {
             path: path.display().to_string(),
             source,
-        })?;
-        policy.validate_advisory_scope()?;
-        Ok(policy)
+        })
     }
 
     /// Load a policy file, using the built-in default only when the file is absent.
@@ -296,19 +321,7 @@ impl SecurityPolicy {
     }
 
     pub(crate) fn validate_advisory_scope(&self) -> Result<(), PolicyError> {
-        if self.arch_advisory_repositories.len() > 64
-            || self.arch_advisory_repositories.iter().any(|name| {
-                name.is_empty()
-                    || name.len() > 128
-                    || !name.as_bytes()[0].is_ascii_alphanumeric()
-                    || !name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte))
-            })
-        {
-            return Err(PolicyError::AdvisoryScope { reason: "use at most 64 repository names of at most 128 ASCII letters, digits, '.', '_', '+' or '-'".into() });
-        }
-        Ok(())
+        validate_advisory_repositories(&self.arch_advisory_repositories)
     }
 
     pub fn check_assessments(
@@ -992,6 +1005,12 @@ mod tests {
         );
         let inherited: SecurityPolicy = serde_json::from_slice(&serde_json::to_vec(&policy)?)?;
         assert_eq!(inherited, policy);
+        assert!(
+            serde_json::from_str::<SecurityPolicy>(
+                r#"{"arch_advisory_repositories":["core/foreign"]}"#
+            )
+            .is_err()
+        );
         for invalid in [
             "advisory_requirement = [",
             "advisory_requirement = 'unsupported'",
@@ -1004,6 +1023,14 @@ mod tests {
         }
         fs::write(&path, "arch_advisory_repositories = ['core\nspoof']\n")?;
         assert!(SecurityPolicy::load(&path).is_err());
+        fs::write(&path, "arch_advisory_repositories = ['core/foreign']\n")?;
+        let invalid_scope = SecurityPolicy::load(&path).expect_err("invalid repository name");
+        assert!(matches!(
+            invalid_scope,
+            PolicyError::Parse { path: reported, source }
+                if reported == path.display().to_string()
+                    && source.to_string().contains("Invalid Arch advisory repository scope")
+        ));
         let oversized = SecurityPolicy {
             arch_advisory_repositories: (0..65).map(|index| format!("repo{index}")).collect(),
             ..SecurityPolicy::default()
