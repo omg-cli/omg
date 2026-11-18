@@ -178,6 +178,23 @@ def install_bundle(directory, output, policy, arch, revision, install):
     print('Installed native Fedora SQLite baseline admitted')
 
 
+def prepare_spec(text, policy, jobs):
+    test_recipe = 'make test\n'
+    if jobs > 2:
+        # Build the tools concurrently before running Fedora's test recipe in order.
+        test_recipe = 'make %{?_smp_mflags} testprogs\n'+test_recipe
+    replacements = [('Release: 2%{?dist}', 'Release: '+policy['release'].removesuffix('.fc44')+'%{?dist}'),
+        ('Patch3: sqlite-3.51.2-CVE-2026-11822-CVE-2026-11824.patch',
+         'Patch3: sqlite-3.51.2-CVE-2026-11822-CVE-2026-11824.patch\nPatch4: '+policy['patch']),
+        ('%patch -P 3 -p1', '%patch -P 3 -p1\n%patch -P 4 -p1'),
+        ('make test\n', test_recipe+'cp test-out.txt %{_topdir}/test-details.txt\n')]
+    for old, new in replacements:
+        if text.count(old) != 1:
+            raise ValueError('official Fedora spec differs from reviewed source')
+        text = text.replace(old, new)
+    return text
+
+
 def build_bundle(destination, policy_path, policy, revision):
     if platform.system() != 'Linux' or os.geteuid() != 0 or platform.machine() not in policy['test_files']:
         raise ValueError('source build requires a native supported Fedora builder')
@@ -241,22 +258,14 @@ def build_bundle(destination, policy_path, policy, revision):
         shutil.copyfile(material/policy['patch'], top/'SOURCES'/policy['patch'])
         spec = top/'SPECS/sqlite.spec'
         text = spec.read_text()
-        replacements = [('Release: 2%{?dist}', 'Release: '+policy['release'].removesuffix('.fc44')+'%{?dist}'),
-            ('Patch3: sqlite-3.51.2-CVE-2026-11822-CVE-2026-11824.patch',
-             'Patch3: sqlite-3.51.2-CVE-2026-11822-CVE-2026-11824.patch\nPatch4: '+policy['patch']),
-            ('%patch -P 3 -p1', '%patch -P 3 -p1\n%patch -P 4 -p1'),
-            ('make test\n', 'make test\ncp test-out.txt %{_topdir}/test-details.txt\n')]
-        for old, new in replacements:
-            if text.count(old) != 1:
-                raise ValueError('official Fedora spec differs from reviewed source')
-            text = text.replace(old, new)
-        spec.write_text(text)
+        jobs = min(len(os.sched_getaffinity(0)), 4 if arch == 'x86_64' else 2)
+        spec.write_text(prepare_spec(text, policy, jobs))
         run(['chown', '-R', 'sqlitebuilder:sqlitebuilder', top])
         command = ['runuser', '-u', 'sqlitebuilder', '--', 'env', '-i', 'HOME=/home/sqlitebuilder',
                    'PATH=/usr/bin:/usr/sbin:/bin:/sbin', 'LANG=C.UTF-8', 'bash', '-c',
                    'set -euo pipefail; ulimit -Sn "$1"; shift; printf "SQLITE_NOFILE_SOFT=%s\n" "$(ulimit -Sn)"; exec "$@"',
                    '_', str(policy['nofile_soft']), 'rpmbuild', '-ba',
-                   '--define', '_topdir '+str(top), '--define', '_smp_mflags -j2', spec]
+                   '--define', '_topdir '+str(top), '--define', f'_smp_mflags -j{jobs}', spec]
         with (destination/'rpmbuild.log').open('wb') as stream:
             run(['timeout', '--kill-after=10s', '1800s', *command],
                 stdout=stream, stderr=subprocess.STDOUT, timeout=1820)
