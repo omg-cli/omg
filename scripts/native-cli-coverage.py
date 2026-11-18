@@ -341,6 +341,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
 NATIVE_PHASES = {
     'initial': 'PASS_NATIVE_INITIAL_STATE',
     'cache-pruned': 'PASS_NATIVE_CACHE_PRUNED_STATE',
+    'keyrings-refreshed': 'PASS_NATIVE_KEYRINGS_REFRESHED_STATE',
     'complete': 'PASS_SIGNED_NATIVE_STATE',
     'migrated': 'PASS_SIGNED_NATIVE_MIGRATIONS_STATE',
     'migrated-unmatched': 'PASS_SIGNED_NATIVE_MIGRATIONS_UNMATCHED_STATE',
@@ -961,6 +962,8 @@ def verify_signed_fixture(owner, phase='complete'):
     receipt = json.loads((owner / 'data-receipt.json').read_text())
     completed = phase in ('complete', 'migrated', 'migrated-unmatched', 'repository-upgraded')
     packages = dict(receipt['initial_packages'])
+    refreshed = {'archlinux-keyring', 'omarchy-keyring'} if phase == 'keyrings-refreshed' else set()
+    require(refreshed <= packages.keys(), 'Expected native keyring packages are missing')
     if phase in ('migrated', 'migrated-unmatched'):
         require(set(receipt.get('migration_packages', {})) == {'xorg-xrandr', 'hp-omnibook-3-audio'},
                 'Native migration package fixtures are missing')
@@ -970,20 +973,29 @@ def verify_signed_fixture(owner, phase='complete'):
             if name not in packages:
                 require(not (owner / 'root' / value['payload_path']).exists(),
                         'Non-matching hardware received an unrelated package payload')
-    version = '3-1' if completed else '1-1'
-    obsolete = '1-1' if completed else '3-1'
-    payload_hash = 'after_sha256' if completed else 'before_sha256'
-    expected_records = {name + '-' + version for name in packages}
+    versions = {name: '3-1' if completed or name in refreshed else '1-1' for name in packages}
+    expected_records = {name + '-' + version for name, version in versions.items()}
     if not completed or phase == 'repository-upgraded':
         expected_records.add('omg-coverage-dead-dep-1-1')
     actual_records = {path.name for path in (owner / 'db/local').iterdir() if path.is_dir()}
-    require(actual_records == expected_records, 'Native package inventory differs from expected phase')
+    require(actual_records == expected_records,
+            f'Native package inventory differs for {phase}: missing={sorted(expected_records - actual_records)}, '
+            f'extra={sorted(actual_records - expected_records)}')
     if not completed:
-        require(fixture_tree_hashes(owner / 'db/local') == receipt['initial_database_sha256'],
+        keyring_records = {f'{name}-{version}' for name in refreshed for version in ('1-1', '3-1')}
+        keyring_payloads = {packages[name]['payload_path'] for name in refreshed}
+        database = fixture_tree_hashes(owner / 'db/local')
+        payloads = fixture_tree_hashes(owner / 'root')
+        require({p:h for p,h in database.items() if p.split('/',1)[0] not in keyring_records}
+                == {p:h for p,h in receipt['initial_database_sha256'].items() if p.split('/',1)[0] not in keyring_records},
                 'Native package database differs from initial state')
-        require(fixture_tree_hashes(owner / 'root') == receipt['initial_payload_sha256'],
+        require({p:h for p,h in payloads.items() if p not in keyring_payloads}
+                == {p:h for p,h in receipt['initial_payload_sha256'].items() if p not in keyring_payloads},
                 'Native transaction payload differs from initial state')
     for name, expected in packages.items():
+        version = versions[name]
+        obsolete = '1-1' if version == '3-1' else '3-1'
+        payload_hash = 'after_sha256' if version == '3-1' else 'before_sha256'
         installed = owner / 'db/local' / (name + '-' + version)
         require(installed.is_dir() and not (owner / 'db/local' / (name + '-' + obsolete)).exists(),
                 'Native transaction has an unexpected version for ' + name)
@@ -1193,7 +1205,7 @@ OMARCHY_CASES = {
     'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-runtime-unset': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
-    'omarchy-unknown-signing-key': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
+    'omarchy-unknown-signing-key': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='keyrings-refreshed'),
     'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
     'omarchy-optional-failures': OmarchyCase(0, tuple(
         item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
@@ -1754,8 +1766,8 @@ OMARCHY_CASE_SETUP
   if test -n "$control"; then
     launch=(python3 "$fixture/control.py" "$control")
   fi
-  if { test "$native_phase" != initial && test "$native_phase" != cache-pruned \
-       || test "$stage" = omarchy-unknown-signing-key; } && test -z "$reboot_answer" && test -z "$control"; then
+  if test "$native_phase" != initial && test "$native_phase" != cache-pruned \
+       && test -z "$reboot_answer" && test -z "$control"; then
     launch=(python3 /attend-unknown-fixture.py --timeout "$((stage_timeout-2))" \
       --receipt "$case_dir/unknown.json" -- "${launch[@]}")
   fi

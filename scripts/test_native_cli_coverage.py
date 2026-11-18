@@ -523,6 +523,47 @@ with socket.socket(socket.AF_UNIX) as server:
             self.assertEqual(case.native_phase, 'cache-pruned')
             self.assertEqual(case.exit_status, 1)
 
+    def test_unknown_signer_refusal_preserves_packages_after_keyrings_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            owner = Path(directory)
+            database = owner / 'db'
+            (database / 'local').mkdir(parents=True)
+            (owner / 'cache').mkdir()
+            packages = {}
+            for name in ('omg-coverage-app','archlinux-keyring','omarchy-keyring','omg-coverage-dead-dep'):
+                relative = 'usr/share/fixture/' + name
+                old = f'{name} before'.encode()
+                new = f'{name} after'.encode()
+                reason = int(name=='omg-coverage-dead-dep')
+                PRODUCER.fixture_local_package(owner / 'root',database,name,'1-1',relative,old,reason)
+                if name != 'omg-coverage-dead-dep':
+                    packages[name] = dict(reason=reason,payload_path=relative,
+                                          before_sha256=hashlib.sha256(old).hexdigest(),
+                                          after_sha256=hashlib.sha256(new).hexdigest())
+            (owner / 'data-receipt.json').write_text(json.dumps(dict(initial_packages=packages,
+                initial_database_sha256=PRODUCER.fixture_tree_hashes(database / 'local'),
+                initial_payload_sha256=PRODUCER.fixture_tree_hashes(owner / 'root'))))
+            (owner / 'cache/unrelated.txt').write_text('must survive pruning\n')
+            (owner / 'outside-cache.txt').write_text('must survive symlink escape\n')
+            (owner / 'cache/escape.pkg.tar.gz').symlink_to(owner / 'outside-cache.txt')
+            for version in ('1-1','2-1'):
+                for suffix in ('','.sig'):
+                    (owner / f'cache/omg-coverage-app-{version}-any.pkg.tar.gz{suffix}').write_bytes(b'cache')
+            for name in ('archlinux-keyring','omarchy-keyring'):
+                old_record = database / 'local' / (name+'-1-1')
+                for file in old_record.iterdir():
+                    file.unlink()
+                old_record.rmdir()
+                PRODUCER.fixture_local_package(owner / 'root',database,name,'3-1',packages[name]['payload_path'],
+                                               f'{name} after'.encode(),0)
+            phase = PRODUCER.OMARCHY_CASES['omarchy-unknown-signing-key'].native_phase
+            self.assertEqual(phase,'keyrings-refreshed')
+            self.assertEqual(PRODUCER.verify_signed_fixture(owner,phase)['status'],
+                             'PASS_NATIVE_KEYRINGS_REFRESHED_STATE')
+            (owner / 'root/usr/share/fixture/omg-coverage-app').write_bytes(b'unreviewed package contents')
+            with self.assertRaisesRegex(ValueError,'payload differs'):
+                PRODUCER.verify_signed_fixture(owner,phase)
+
     def test_normal_arch_readonly_updates_are_required_after_vendor_scenarios(self):
         for stage in ('arch-dry-run', 'arch-check'):
             self.assertIn(stage, PRODUCER.PROCESS_STAGES)
@@ -1944,14 +1985,16 @@ class FreshAdmissionFixture(unittest.TestCase):
                 row['keyring_sha256'] = keyring
                 PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
 
-    def test_omarchy_signer_refusal_exercises_native_review_after_cache_pruning(self):
+    def test_omarchy_signer_refusal_exercises_native_review_after_keyring_refresh(self):
         stage = 'omarchy-unknown-signing-key'
         case = PRODUCER.OMARCHY_CASES[stage]
-        self.assertEqual((case.exit_status, case.native_phase), (1, 'cache-pruned'))
+        self.assertEqual((case.exit_status, case.native_phase), (1, 'keyrings-refreshed'))
         self.assertEqual(case.helpers, PRODUCER.OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',))
         script = PRODUCER.guest_script({role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}, '/build/omg')
         self.assertIn(f'{stage}; then signed_options+=(--unknown-app-signer); fi', script)
-        self.assertIn(f'|| test "$stage" = {stage}', script)
+        self.assertRegex(script, rf'{stage}\).*native_phase=keyrings-refreshed;')
+        self.assertIn('&& test -z "$reboot_answer" && test -z "$control"; then\n'
+                      '    launch=(python3 /attend-unknown-fixture.py', script)
 
     def test_attended_signer_refusal_requires_the_fixture_key_and_decline(self):
         receipt = fresh_admission_receipt()

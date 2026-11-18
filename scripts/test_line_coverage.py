@@ -1356,6 +1356,41 @@ class RetainedPolicyDefaultRecordTests(unittest.TestCase):
 
 
 class OsvRequestMigrationTests(unittest.TestCase):
+    def test_complete_osv_fixture_keeps_the_nested_future_and_every_counter(self):
+        name = 'src/core/security/vulnerability.rs'
+        test = 'incomplete_osv_pages_fail_without_caching_partial_findings'
+        symbol = f'_RNvNtNtNtNtCs1_7omg_lib4core8security13vulnerability5tests{len(test)}{test}'
+
+        def side(method, missing_future=False, cold=False, endpoint='"Debian:12"'):
+            source = ['#[cfg(test)]','mod tests {','    #[tokio::test]',
+                      f'    async fn {test}() -> anyhow::Result<()> {{',
+                      f'        let scanner = VulnerabilityScanner::with_osv_endpoint(endpoint, {endpoint}.into());',
+                      '        let fixture = tokio::spawn(async move {', '            Ok(())', '        });',
+                      f'        scanner.{method}(&name, &version).await?;', '        Ok(())','    }','}']
+            path = '/artifact/'+name
+            root = dict(name=symbol,filenames=[path],count=1,regions=[[4,11,4,len(source[3])-1,1,0,0,0],
+                                                                    [5,9,10,15,1,0,0,0]])
+            body_name = '_RNC'+symbol[2:]+'0Bb_'
+            method_first = source[8].index(method)+1
+            body = dict(name=body_name,filenames=[path],count=1,regions=[
+                [4,len(source[3]),4,len(source[3])+1,1,0,0,0], [9,method_first,9,method_first+len(method),1,0,0,0],
+                [9,len(source[8])-1,9,len(source[8]),int(cold),0,0,0], [11,5,11,6,1,0,0,0]])
+            nested = dict(name='_RNCNC'+symbol[2:]+'00Bd_',filenames=[path],count=1,
+                          regions=[[6,len(source[5]),8,10,1,0,0,0]])
+            owners = [root, body] + ([] if missing_future else [nested])
+            work = [100_000]
+            counts = coverage._owner_line_counts({'regions':[r for o in owners for r in o['regions']]},
+                                                 coverage._ObserverWork(work))
+            return source, counts, (4,11,[root]), owners, Counter(o['name'] for o in owners), coverage._construct_inventory(source,work)
+
+        old = side('scan_package')
+        proof = coverage.retained_osv_fixture_migration((old,side('scan_osv_package')),[100_000])
+        self.assertIsNotNone(proof)
+        self.assertIn([9,9],proof['pairs'])
+        for mismatch in ({'missing_future':True},{'cold':True},{'endpoint':'"Alpine:v3"'}):
+            with self.subTest(mismatch=mismatch):
+                self.assertIsNone(coverage.retained_osv_fixture_migration((old,side('scan_osv_package',**mismatch)),[100_000]))
+
     def test_report_fixture_binds_renamed_osv_call_and_its_wait_phases(self):
         name = 'src/core/security/vulnerability.rs'
         test = 'test_vulnerability_report_creation'

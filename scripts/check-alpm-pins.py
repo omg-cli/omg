@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 import re
 import subprocess
-import tarfile
 import tempfile
 import tomllib
 
@@ -47,18 +46,15 @@ def prepare_cargo_source(destination, revision, locked_versions, *, source=MIRRO
     with tempfile.TemporaryDirectory(prefix="fetch-", dir=destination) as temporary:
         repo = Path(temporary) / "repo"
         subprocess.run(["git", "init", "--quiet", "--bare", str(repo)], check=True, timeout=15)
-        git = ["git", "-C", str(repo), "-c", "core.autocrlf=false"]
+        git = ["git", "-C", str(repo), "--work-tree", str(snapshot), "-c", "core.autocrlf=false"]
         subprocess.run([*git, "fetch", "--depth=1", "--no-tags", "--no-recurse-submodules",
                         source, revision], check=True, timeout=120)
         fetched = subprocess.check_output([*git, "rev-parse", "FETCH_HEAD"], text=True, timeout=15)
         if fetched.strip() != revision:
             raise ValueError("ALPM mirror returned a different commit")
-        # The pinned tree contains the entire Rust workspace without the website's theme gitlink.
-        with tempfile.TemporaryFile() as archive:
-            subprocess.run([*git, "archive", revision], stdout=archive, check=True, timeout=30)
-            archive.seek(0)
-            with tarfile.open(fileobj=archive) as tree:
-                tree.extractall(snapshot, filter="data")
+        # Git materializes the pinned files without populating the website theme gitlink.
+        subprocess.run([*git, "read-tree", revision], check=True, timeout=15)
+        subprocess.run([*git, "checkout-index", "--all"], check=True, timeout=30)
 
     prepared = {}
     for manifest in sorted(snapshot.glob("*/Cargo.toml")):

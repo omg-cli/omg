@@ -4309,6 +4309,101 @@ def async_osv_report_call(name, source, counts, group, owners, names, inventory,
     return identity,dict(witness,method=call[1],record_span=[first,end])
 
 
+_OSV_PAGINATION_FIXTURE = 'incomplete_osv_pages_fail_without_caching_partial_findings'
+
+
+def retained_osv_fixture_migration(sides, work):
+    """Compare complete fixtures whose explicit OSV scanner calls were renamed."""
+    observations = []
+    for source, counts, group, owners, names, inventory in sides:
+        first,last,roots = group
+        if len(roots)!=1:
+            return None
+        root, = roots
+        symbol = root['name']
+        shape = plain_rust_function_symbol(symbol)
+        if (shape is None or shape.identifiers[:-1]!=('omg_lib','core','security','vulnerability','tests')
+                or shape.identifiers[-1]!=_OSV_PAGINATION_FIXTURE or names[symbol]!=1 or not root['count']):
+            return None
+        code, constructs = inventory[:2]
+        _construct_charge(work,len(constructs)+last-first+1)
+        functions = [fn for fn in constructs if fn['kind']=='fn' and 'async' in fn['header']
+                     and fn['header'][fn['header'].index('async')+2]==shape.identifiers[-1]
+                     and code.position(code.starts[fn['first']+fn['header'].index('async')])[0]==first
+                     and code.position(code.ends[fn['end']])[0]==last]
+        if len(functions)!=1:
+            return None
+        fn, = functions
+        scope = range(fn['opening']+1,fn['end'])
+        _construct_charge(work,len(scope)+sum(len(line)+1 for line in source[first-1:last]))
+        methods = ('scan_package','scan_osv_package')
+        replacements = {}
+        projection = source[first-1:last]
+        bound = Counter(code.words[i+1] for i in scope if code.words[i]=='let' and
+                        code.words[i+2:i+7]==['=','VulnerabilityScanner','::','with_osv_endpoint','('])
+        for index in scope:
+            method = code.words[index]
+            if method not in methods:
+                continue
+            line,start = code.position(code.starts[index])
+            receiver = code.words[index-2]
+            if (bound[receiver]!=1 or code.words[index-1]!='.' or code.words[index+1]!='('
+                    or line in replacements or not source[line-1].isascii()):
+                return None
+            replacements[line] = start,len(method)
+            text = source[line-1]
+            projection[line-first] = text[:start-1]+methods[0]+text[start+len(method)-1:]
+        if not replacements or {width for _,width in replacements.values()} not in ({len(methods[0])},{len(methods[1])}):
+            return None
+        widths = {width for _,width in replacements.values()}
+        def column(line, position):
+            if line not in replacements:
+                return position
+            start,width = replacements[line]
+            if start<position<start+width:
+                return None
+            return position-(width-len(methods[0]))*int(position>=start+width)
+        records = {}; all_rows = []
+        for owner in owners:
+            child = owner['name']
+            _construct_charge(work,4*len(owner['regions'])+len(child)+1)
+            touching = [r for r in owner['regions'] if r[0]<=last and r[2]>=first]
+            if not touching:
+                continue
+            depth = re.match(r'_R((?:NC){1,8})',child) if child!=symbol else None
+            if owner is root:
+                role = ''
+            elif depth and direct_rust_callback_symbol(child,symbol,shape.modules,len(depth[1])//2):
+                role = depth[1]+child[len('_R'+depth[1]+symbol[2:]):]
+            else:
+                return None
+            if (role in records or names[child]!=1 or owner['filenames']!=root['filenames']
+                    or len(root['filenames'])!=1 or owner.get('branches') or owner.get('mcdc_records')
+                    or type(owner.get('count')) is not int or not 0<=owner['count']<COUNTER_LIMIT):
+                return None
+            rows = []
+            for a,b,c,d,hit,*channels in touching:
+                begin,end = column(a,b),column(c,d)
+                if (channels!=[0,0,0] or begin is None or end is None or not first<=a<=c<=last
+                        or not 0<=hit<COUNTER_LIMIT):
+                    return None
+                rows.append((a-first,begin,c-first,end,hit))
+            records[role] = (owner['count'],tuple(rows))
+            all_rows.extend(touching)
+        compared = {i:counts[i] for i in range(first,last+1) if i in counts}
+        if ('' not in records or len(records)<2 or
+                _owner_line_counts({'regions':all_rows},_ObserverWork(work))!=compared):
+            return None
+        observations.append((shape.identity,tuple(projection),records,list(compared),first,widths))
+    before, after = observations
+    if before[:3]!=after[:3] or before[5]!={len('scan_package')} or after[5]!={len('scan_osv_package')}:
+        return None
+    pairs = [[line,line+after[4]-before[4]] for line in before[3]]
+    if [target for _,target in pairs]!=after[3]:
+        return None
+    return dict(kind='retained-osv-fixture-migration',pairs=pairs,counter_roles=list(before[2]))
+
+
 def async_runtime_inventory_assertion(name, source, counts, group, owners, names, inventory, first, last, work):
     """Keep one closed published-artifact assertion while separately observing its new security terms."""
     if name!='src/runtimes/rust.rs' or inventory is None or first!=last or first<1 or first+2>len(source):
@@ -5610,6 +5705,22 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
                       and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
+        if (name=='src/core/security/vulnerability.rs' and len(candidates)==1
+                and construct_inventories is not None and macro_expansions==([],[])):
+            _, bg, hg = candidates[0]
+            roots = [group[2][0]['name'] for group in (bg,hg) if len(group[2])==1]
+            if len(roots)==2 and all(symbol.endswith(_OSV_PAGINATION_FIXTURE) for symbol in roots):
+                sides = [(source,counts,group,inventories[side],inventory_names[side],construct_inventories[side])
+                         for side,(source,counts,group) in enumerate(((old,before,bg),(new,after,hg)))]
+                entry = retained_osv_fixture_migration(sides,work)
+                if entry is not None:
+                    matched = entry['pairs']
+                    if any(line in pairs and pairs[line]!=target for line,target in matched):
+                        refuse()
+                    pairs.update(matched)
+                    preproved_callback_pairs.update(matched)
+                    receipts.append(dict(file=name,**entry,callback_fragments=[dict(pairs=matched)]))
+                    continue
         if (len(candidates)==1 and a+1==b and c+1==d and tuple(pending)==(b,)
                 and before.get(b)==0 and after.get(d,0)>0
                 and b in inherent_async_lines[0] and d in inherent_async_lines[1]):

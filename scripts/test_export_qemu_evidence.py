@@ -544,15 +544,16 @@ class DescriptorTests(unittest.TestCase):
 
     def test_native_guest_failure_exports_case_evidence_but_excludes_private_neighbors(self):
         prefix = 'run-test/native-evidence/cli/'
-        for name in ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
-                     'test-01.log', 'verification.json'):
+        included = ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
+                    'omarchy-unknown-signing-key.log', 'omarchy-unknown-signing-key-native-state.json',
+                    'omarchy-unknown-signing-key-unknown.json', 'test-01.log', 'verification.json')
+        for name in included:
             self.fixture(prefix + name, b'actual captured case evidence')
         for name in ('credentials.json', 'private/verification.json', 'config/config.toml'):
             self.fixture(prefix + name, b'private neighbor')
         status, report = self.run_export()
         self.assertEqual(status, 0, report)
-        expected = {prefix + name for name in ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
-                                              'test-01.log', 'verification.json')}
+        expected = {prefix + name for name in included}
         self.assertEqual(set(report['copied']), expected)
         self.assertFalse((self.destination / prefix / 'credentials.json').exists())
 
