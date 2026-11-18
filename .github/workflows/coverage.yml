@@ -310,33 +310,6 @@ jobs:
           DOCKERFILE
           python3 scripts/native-cli-coverage.py prepare --target "$profile_dir" \
             --source-commit "$(git rev-parse HEAD)" --output "$evidence_dir/cli-manifest.json"
-          cli=$(jq -er '.artifacts.cli.path' "$evidence_dir/cli-manifest.json")
-          runuser -u omg-coverage -- env \
-            LLVM_PROFILE_FILE="$profile_dir/omg-scaffold-git-%p-%m.profraw" \
-            python3 scripts/test-scaffold-existing-git.py "$cli" | tee "$evidence_dir/scaffold-git.json"
-          mapfile -d '' scaffold_profiles < <(find "$profile_dir" -maxdepth 1 -type f \
-            -name 'omg-scaffold-git-*.profraw' -print0)
-          test "${#scaffold_profiles[@]}" -eq 1
-          test -s "${scaffold_profiles[0]}"
-          (
-            profiles=$(mktemp -d)
-            chmod 1777 "$profiles"
-            case_name=core::container::tests::generated_recipe_terminal_binds_recipe_ignore_builder_and_policy
-            LLVM_PROFILE_FILE="$profiles/omg-container-root-%p-%m.profraw" \
-              timeout --kill-after=2s 60s "$binary" --exact "$case_name" --nocapture --test-threads=1 \
-              2>&1 | tee "$evidence_dir/container-terminal-root.log"
-            grep -F '[omg-unprivileged-fixture]' "$evidence_dir/container-terminal-root.log" | grep -F 'parent_uid=0 '
-            grep -F '[omg-unprivileged-fixture-child]' "$evidence_dir/container-terminal-root.log" | grep -F 'uid=65534 '
-            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$evidence_dir/container-terminal-root.log"
-            if grep -Eq '\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)' "$evidence_dir/container-terminal-root.log"; then
-              exit 1
-            fi
-            for profile in "$profiles"/omg-container-root-*.profraw; do
-              test -s "$profile"
-              mv -- "$profile" "$profile_dir/"
-            done
-            rmdir "$profiles"
-          )
           curl -fsS https://raw.githubusercontent.com/moby/profiles/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json -o /tmp/coverage-seccomp.json
           echo '536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74  /tmp/coverage-seccomp.json' | sha256sum --check
           jq '(.syscalls[] | select(.includes.caps == ["CAP_SYS_ADMIN"]) | .names) += ["pivot_root"]' \
@@ -600,6 +573,42 @@ jobs:
           receipt = {'source_commit': sys.argv[4], 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'tests': tests}
           (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
           PY
+
+      - name: Cover existing scaffold Git and container privilege drop
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          profile_dir="$GITHUB_WORKSPACE/target/llvm-cov-target"
+          evidence_dir="$RUNNER_TEMP/native-coverage-evidence"
+          binary=$(jq -er '.artifacts["lib-unit"].path' "$evidence_dir/cli-manifest.json")
+          cli=$(jq -er '.artifacts.cli.path' "$evidence_dir/cli-manifest.json")
+          runuser -u omg-coverage -- env \
+            LLVM_PROFILE_FILE="$profile_dir/omg-scaffold-git-%p-%m.profraw" \
+            python3 scripts/test-scaffold-existing-git.py "$cli" | tee "$evidence_dir/scaffold-git.json"
+          mapfile -d '' scaffold_profiles < <(find "$profile_dir" -maxdepth 1 -type f \
+            -name 'omg-scaffold-git-*.profraw' -print0)
+          test "${#scaffold_profiles[@]}" -eq 1
+          test -s "${scaffold_profiles[0]}"
+          (
+            profiles=$(mktemp -d)
+            chmod 1777 "$profiles"
+            case_name=core::container::tests::generated_recipe_terminal_binds_recipe_ignore_builder_and_policy
+            LLVM_PROFILE_FILE="$profiles/omg-container-root-%p-%m.profraw" \
+              timeout --kill-after=2s 60s "$binary" --exact "$case_name" --nocapture --test-threads=1 \
+              2>&1 | tee "$evidence_dir/container-terminal-root.log"
+            grep -F '[omg-unprivileged-fixture]' "$evidence_dir/container-terminal-root.log" | grep -F 'parent_uid=0 '
+            grep -F '[omg-unprivileged-fixture-child]' "$evidence_dir/container-terminal-root.log" | grep -F 'uid=65534 '
+            grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$evidence_dir/container-terminal-root.log"
+            if grep -Eq '\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)' "$evidence_dir/container-terminal-root.log"; then
+              exit 1
+            fi
+            for profile in "$profiles"/omg-container-root-*.profraw; do
+              test -s "$profile"
+              mv -- "$profile" "$profile_dir/"
+            done
+            rmdir "$profiles"
+          )
 
       - name: Export bounded native VM diagnostics
         if: ${{ !cancelled() && (steps.native_fixture_tests.outcome == 'success' || steps.native_fixture_tests.outcome == 'failure') }}
