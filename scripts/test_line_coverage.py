@@ -6239,6 +6239,75 @@ class SourceAwareCoverageTests(unittest.TestCase):
             with self.subTest(fault=fault):
                 self.assertIsNone(observe(True,fault))
 
+    def test_osv_cache_record_retains_coverage_across_added_arch_endpoint(self):
+        def observe(insert=False, fault=None):
+            source = [
+                '#[cfg(test)]', 'mod tests {', '    #[tokio::test]',
+                '    async fn cache_key_includes_the_ecosystem() -> anyhow::Result<()> {',
+                '        for (expected_requests, ecosystem) in [(1, "Debian:12"), (2, "Debian:13")] {',
+                '            let scanner = VulnerabilityScanner {',
+                '                client: shared_client().clone(),',
+                '                osv_api_url: endpoint.clone(),',
+                '                osv_ecosystem_override: Some(ecosystem.to_string()),',
+                '            };', '        }', '        Ok(())', '    }', '}',
+            ]
+            initializer = 'ARCH_ADVISORY_ENDPOINT.to_owned()'
+            if insert:
+                source.insert(9, f'                arch_endpoint: {initializer},')
+            if fault == 'different-ecosystem':
+                source[4] = source[4].replace('Debian:13', 'Debian:14')
+            if fault == 'dynamic':
+                source[4] = source[4].replace('"Debian:13"', 'discover()')
+            shift = int(insert)
+            filename = '/src/src/core/security/vulnerability.rs'
+            symbol = ('_RNvNtNtNtNtCs1_7omg_lib4core8security13vulnerability5tests'
+                      's_32cache_key_includes_the_ecosystem')
+
+            def slot(line, value, count):
+                column = source[line - 1].index(value) + 1
+                return [line, column, line, column + len(value), count, 0, 0, 0]
+
+            entry = source[3].index('{') + 1
+            root = dict(name=symbol, count=1, filenames=[filename],
+                        regions=[[4, 11, 4, entry - 1, 1, 0, 0, 0]])
+            loop = [slot(5, 'expected_requests', 2), slot(5, 'ecosystem', 2),
+                    slot(5, source[4].split(' in ')[1].removesuffix(' {'), 1)]
+            if fault == 'cold-binding':
+                loop[1][4] = 0
+            record = [slot(6, 'scanner', 2), [6, 27, 10 + shift, 14, 2, 0, 0, 0],
+                      slot(7, 'shared_client()', 2), slot(7, 'clone', 2),
+                      slot(8, 'endpoint', 2), slot(8, 'clone', 2)]
+            if insert:
+                if fault in ('record-envelope', 'cold-retained-field'):
+                    record.append(slot(9, 'Some(ecosystem.to_string())',
+                                       0 if fault == 'cold-retained-field' else 2))
+                else:
+                    record.append(slot(10, initializer, 0 if fault == 'cold-field' else 2))
+            body = dict(root, name='_RNC' + symbol[2:] + '0Bb_',
+                        regions=[[4, entry, 4, entry + 1, 1, 0, 0, 0], *loop, *record])
+            owners = [root, body]
+            if fault == 'foreign-owner':
+                owners.append(dict(body, name='foreign', regions=[record[0]]))
+            work = [2_000_000]
+            counts = coverage._owner_line_counts({'regions': record}, coverage._ObserverWork(work))
+            return coverage.async_runtime_fixture_record(
+                'src/core/security/vulnerability.rs', source, counts, (4, 13 + shift, [root]),
+                owners, Counter(owner['name'] for owner in owners),
+                coverage._construct_inventory(source, work), 6, 6, work)
+
+        before, after = observe(), observe(True)
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        self.assertEqual(before[0], after[0])
+        self.assertEqual(after[1]['security_initializer'][0][4], 2)
+        self.assertEqual(observe(True, 'record-envelope')[0], before[0])
+        cold = observe(True, 'cold-retained-field')
+        self.assertTrue(cold is None or cold[0] != before[0])
+        self.assertNotEqual(observe(True, 'different-ecosystem')[0], before[0])
+        for fault in ('dynamic', 'cold-binding', 'cold-field', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(observe(True, fault))
+
     def parameterized_rust_helper_record(self, insertion=False, fault=None, body_group=True, enum_role=False):
         source = ['#[cfg(test)]', '#[expect(clippy::unwrap_used)]', 'mod tests {',
             '    async fn install_fixture(corrupt: bool, missing_launcher: Option<&str>) -> Result<()> {',

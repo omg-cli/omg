@@ -4089,9 +4089,21 @@ def sync_runtime_fragment_owners(name, group, owners, names, inventory, first, l
     return fn,(shape.identity,words),dict(root=root['name'],regions=affected[0][1],entry=entry,synchronous=True),hits
 
 
-def incremental_rust_fixture_loop(inventory, function, record, owners, witness, entries, work):
+def literal_fixture_loop(inventory, function, record, owners, witness, entries, work):
+    """Bind record execution to a fixed table exercised by the async body."""
     code, rows=inventory[:2]
-    if function['header'][:3]!=('async','fn','incremental_updates_fixture'):
+    function_header = function['header']
+    declaration = function_header.index('fn')
+    ecosystem_cache = function_header[declaration+1] == 'cache_key_includes_the_ecosystem'
+    if function_header[:3] == ('async','fn','incremental_updates_fixture'):
+        header = ('for','(','installed',',','candidate',',','compatible',')','in','[')
+        setup = ['let','versions','=','TempDir','::','new','(',')','?',';']
+        binding_offsets = (2,4,6)
+    elif ecosystem_cache:
+        header = ('for','(','expected_requests',',','ecosystem',')','in','[')
+        setup = []
+        binding_offsets = (2,4)
+    else:
         return None
     opening=code.parents[record['first']]
     _construct_charge(work,len(rows))
@@ -4099,10 +4111,8 @@ def incremental_rust_fixture_loop(inventory, function, record, owners, witness, 
     if len(matches)!=1:
         return None
     loop,=matches
-    header=('for','(','installed',',','candidate',',','compatible',')','in','[')
     if (loop['header'][:len(header)]!=header or code.parents[loop['first']]!=function['opening']
-            or code.words[opening+1:record['first']]!=
-                ['let','versions','=','TempDir','::','new','(',')','?',';']):
+            or code.words[opening+1:record['first']]!=setup):
         return None
     array=loop['first']+len(header)-1
     if code.pairs.get(array)!=opening-1 or opening-array>512:
@@ -4116,6 +4126,14 @@ def incremental_rust_fixture_loop(inventory, function, record, owners, witness, 
         if code.words[begin]!='(' or code.pairs.get(begin)!=end-1:
             return None
         parts=_boolean_arguments(code,begin)
+        if ecosystem_cache:
+            if parts is None or len(parts)!=2:
+                return None
+            requests, ecosystem = (code.words[a:b] for a,b in parts)
+            if (len(requests)!=1 or re.fullmatch(r'[1-9][0-9]?', requests[0]) is None
+                    or len(ecosystem)!=1 or literals.fullmatch(ecosystem[0]) is None):
+                return None
+            continue
         if parts is None or len(parts)!=3:
             return None
         installed,candidate,compatible=(code.words[a:b] for a,b in parts)
@@ -4124,9 +4142,12 @@ def incremental_rust_fixture_loop(inventory, function, record, owners, witness, 
                 or len(candidate)!=1 or literals.fullmatch(candidate[0]) is None
                 or compatible not in (['true'],['false'])):
             return None
-    bindings=[code.region(loop['first']+offset,loop['first']+offset) for offset in (2,4,6)]
+    bindings=[code.region(loop['first']+offset,loop['first']+offset) for offset in binding_offsets]
     envelope=code.region(array,opening-1)
-    case_spans=[code.region(begin,end-1) for begin,end in cases[:-1]]
+    # LLVM emits one array region for the inline OSV table.
+    if ecosystem_cache and envelope[0] != envelope[2]:
+        return None
+    case_spans = [] if ecosystem_cache else [code.region(begin,end-1) for begin,end in cases[:-1]]
     expected={*bindings,envelope,*case_spans}
     low,high=code.region(loop['first'],opening-1)[:2],envelope[2:]
     rows_seen={}
@@ -4183,6 +4204,10 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
         return None
     record, = candidates
     closing = code.position(code.ends[record['end']])[0]
+    cache_record = scanner and closing-first in (4,5)
+    if cache_record:
+        original_size = 4
+        fields = [(4,f'arch_endpoint: {initializer},',initializer)]
     if closing-first not in (original_size,original_size+len(fields)) or source[closing-1].strip()!='};':
         return None
     synchronous=source[group[0]-1].lstrip().startswith('fn ')
@@ -4190,12 +4215,15 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
         bound=sync_runtime_fragment_owners(name,group,owners,names,inventory,first,closing,work)
     else:
         bound = async_test_fragment_owners(name,group,owners,names,inventory,first,closing,work,
-                                           result_alias=True,runtime_helper=True)
+                                           result_alias=not cache_record,runtime_helper=True)
     if bound is None:
         return None
     function, identity, witness, entry_hits = bound
+    if cache_record and ('cache_key_includes_the_ecosystem' not in function['header']
+                         or code.parents[record['first']]==function['opening']):
+        return None
     if code.parents[record['first']]!=function['opening']:
-        loop=incremental_rust_fixture_loop(inventory,function,record,owners,witness,entry_hits,work)
+        loop=literal_fixture_loop(inventory,function,record,owners,witness,entry_hits,work)
         if loop is None:
             return None
         entry_hits, header=loop
@@ -4248,7 +4276,8 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
             return None
         if scanner and witness.get('initializer_uses_record_envelope'):
             preceding = source[added-2]
-            value = 'Some("Debian:12".to_string())'
+            value = ('Some(ecosystem.to_string())' if cache_record
+                     else 'Some("Debian:12".to_string())')
             if preceding.strip()==f'osv_ecosystem_override: {value},':
                 start = preceding.index(value)+1
                 field = (added-1,start,added-1,start+len(value))
