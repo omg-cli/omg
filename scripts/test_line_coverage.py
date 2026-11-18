@@ -157,12 +157,25 @@ class CompiledMethodParentFilesTests(unittest.TestCase):
         self.assertEqual(index, {})
         self.assertEqual(unknown, {'opaque.rs', '<unattributed source>'})
 
+    def test_bounded_prefix_scan_still_accounts_for_long_opaque_owners(self):
+        owners = [
+            dict(name='_RNvNtC' + 'x' * 512, filenames=['/src/free.rs']),
+            dict(name='opaque-' + 'x' * 512, filenames=['/unknown.rs']),
+            dict(name=self.symbol, filenames=['/src/method.rs']),
+        ]
+        files = {'/src/free.rs': 'free.rs', '/src/method.rs': 'method.rs'}
+        index, unknown = coverage.compiled_method_parent_files(owners, files, [len(self.symbol) + 96])
+        key = coverage.nominal_method_parent(self.symbol, inventory=True)[1]
+        self.assertEqual(index, {key: {'method.rs'}})
+        self.assertEqual(unknown, {'<unattributed source>'})
+
     def test_index_refuses_exhaustion_before_symbol_decoding(self):
         owners = [dict(name=self.symbol, filenames=['/src/example.rs'])]
         with patch.object(coverage, 'nominal_method_parent',
                           side_effect=AssertionError('decode before admission')):
-            with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
-                coverage.compiled_method_parent_files(owners, {}, [len(owners)])
+            for budget in (len(owners), len(owners) + coverage._NOMINAL_METHOD_PREFIX_WORK):
+                with self.subTest(budget=budget), self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                    coverage.compiled_method_parent_files(owners, {}, [budget])
 
 
 class CompiledPlainParentFilesTests(unittest.TestCase):

@@ -2025,6 +2025,10 @@ class RustNominalMethodPath:
         return self.parent_scope, self.method, self.crate_graph, self.instantiating_crate
 
 
+_NOMINAL_METHOD_PREFIX = re.compile(r'_R((?:NC){0,8})Nv([MXY])')
+_NOMINAL_METHOD_PREFIX_WORK = len('_R' + 'NC' * 8 + 'NvX') + 1
+
+
 @lru_cache(maxsize=4096)
 def nominal_method_path(symbol, *, inventory=False):
     """Decode bounded nominal v0 inherent, trait-impl and default-trait methods.
@@ -2035,7 +2039,7 @@ def nominal_method_path(symbol, *, inventory=False):
     """
     if type(symbol) is not str or len(symbol) > 4096:
         return None
-    prefix = re.match(r'_R((?:NC){0,8})Nv([MXY])', symbol)
+    prefix = _NOMINAL_METHOD_PREFIX.match(symbol)
     if prefix is None:
         return None
     depth = len(prefix[1]) // 2
@@ -2143,9 +2147,13 @@ def compiled_method_parent_files(owners, files, work):
     _construct_charge(work, len(owners))
     scopes = {}; unknown = set()
     for owner in owners:
-        _construct_charge(work, len(owner['name']) + 1)
-        parent = nominal_method_parent(owner['name'], inventory=True)
-        if parent is None and owner['name'].startswith(('_R', '_ZN')):
+        name = owner['name']
+        _construct_charge(work, min(len(name) + 1, _NOMINAL_METHOD_PREFIX_WORK))
+        parent = None
+        if _NOMINAL_METHOD_PREFIX.match(name) is not None:
+            _construct_charge(work, len(name) + 1)
+            parent = nominal_method_parent(name, inventory=True)
+        if parent is None and name.startswith(('_R', '_ZN')):
             continue
         _construct_charge(work, len(owner['filenames']))
         locations = unknown if parent is None else scopes.setdefault(parent[1], set())
