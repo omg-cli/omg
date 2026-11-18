@@ -4562,6 +4562,93 @@ mod tests {
     }
 
     #[test]
+    fn omarchy_cache_pruning_refuses_the_transaction_path() -> anyhow::Result<()> {
+        const NAME: &str =
+            "package_managers::alpm_ops::tests::omarchy_cache_pruning_refuses_the_transaction_path";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        let fixture = tempfile::tempdir()?;
+        let pacman_conf = fixture.path().join("absent-pacman.conf");
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(fixture.path().as_os_str())),
+                ("OMG_PACMAN_CONF", Some(pacman_conf.as_os_str())),
+            ],
+            || {
+                assert_eq!(crate::core::paths::pacman_conf_path(), pacman_conf);
+                let error = super::execute_omarchy_transaction(
+                    super::super::arch::NativeOmarchyOperation::PruneCache,
+                    Vec::new(),
+                )
+                .expect_err("cache cleaning cannot enter an ALPM transaction");
+                assert_eq!(error.to_string(), "Cache pruning is not a transaction");
+                assert_eq!(std::fs::read_dir(fixture.path())?.count(), 0);
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn omarchy_install_refuses_a_package_from_a_search_only_repository() -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::omarchy_install_refuses_a_package_from_a_search_only_repository";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        let fixture = RepositoryFixture::new()?;
+        let package = "omg-fixture-search-only";
+        fixture.write_sync("lookup", &[(package, "1-1", "")])?;
+        let root = fixture.directory.path().join("root");
+        let keyring = fixture.directory.path().join("keyring");
+        std::fs::create_dir(&keyring)?;
+        let pacman_conf = fixture.directory.path().join("pacman.conf");
+        std::fs::write(
+            &pacman_conf,
+            format!(
+                "[options]\nRootDir = {}\nGPGDir = {}\nSigLevel = Required DatabaseOptional\n\
+                 [lookup]\nUsage = Search\nServer = file://{}\n",
+                root.display(),
+                keyring.display(),
+                fixture.directory.path().display()
+            ),
+        )?;
+        let mut alpm = fixture.open();
+        temp_env::with_vars(
+            [
+                ("OMG_CONFIG_DIR", Some(fixture.directory.path().as_os_str())),
+                ("OMG_PACMAN_CONF", Some(pacman_conf.as_os_str())),
+            ],
+            || {
+                assert_eq!(crate::core::paths::pacman_conf_path(), pacman_conf);
+                assert_eq!(crate::core::paths::pacman_root_result()?, root);
+                let config = crate::core::pacman_conf::PacmanConfig::parse(&pacman_conf)?;
+                super::register_configured_syncdbs(&alpm, &config)?;
+                let lookup = alpm.syncdbs().first().expect("fixture repository");
+                assert_eq!(lookup.usage()?, alpm::Usage::SEARCH);
+                assert_eq!(lookup.pkg(package)?.name(), package);
+
+                let error = super::execute_transaction_in(
+                    vec![package.to_owned()],
+                    super::TransactionKind::Install,
+                    Some(&mut alpm),
+                    None,
+                    &[],
+                    super::TransactionPolicy::Omarchy,
+                )
+                .expect_err("search visibility cannot authorize a package transaction");
+                assert_eq!(error.to_string(), "Omarchy package is unavailable");
+                assert!(alpm.localdb().pkg(package).is_err());
+                assert!(!fixture.database().join("db.lck").exists());
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
     #[serial_test::serial]
     fn omarchy_replacements_keep_vendor_defaults_but_unattended_conflicts_refuse() {
         for (policy, yes, relationship, accepted) in [

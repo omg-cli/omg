@@ -206,6 +206,36 @@ mod tests {
     }
 
     #[test]
+    fn official_arch_package_without_snapshot_provenance_is_unassessed() -> anyhow::Result<()> {
+        let package = SecurityPackage {
+            origin: SecurityOrigin::ArchRepository {
+                repository: "core".into(),
+            },
+            name: "omg-official-audit-fixture".into(),
+            version: "1.0-1".into(),
+            advisory_source: None,
+            architecture: Some("any".into()),
+            description: String::new(),
+            licenses: vec![],
+        };
+        let advisory: AlsaIssue = serde_json::from_str(
+            r#"{"name":"AVG-fixture","packages":["other-package"],"status":"Not affected","severity":"Low","affected":"1.0-1","fixed":null,"issues":["CVE-fixture"]}"#,
+        )?;
+        let results = assess_packages(std::slice::from_ref(&package), &[advisory], None)?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].package, package);
+        assert!(matches!(
+            results[0].coverage,
+            PackageCoverage::Unknown {
+                reason: UnknownCoverage::EvidenceUnavailable,
+                provenance: None
+            }
+        ));
+        assert!(results[0].findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn another_distribution_cannot_supply_arch_applicability_provenance() {
         let advisory: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-fixture","packages":["fixture"],"status":"Vulnerable","severity":"High","affected":"1-1","fixed":null,"issues":["CVE-fixture"]}"#).expect("complete advisory");
         for source in [
