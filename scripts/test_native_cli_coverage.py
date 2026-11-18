@@ -1258,6 +1258,9 @@ def evidence_fixture(root):
                 'released private lock; owned transcript mode=600\n')
             (evidence / f'{stage}-transcript.log').write_text('OMG Omarchy update started\nOMG Omarchy update finished: exit status: 0\n')
         (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status=PRODUCER.NATIVE_PHASES[case.native_phase])))
+        if stage == 'omarchy-unknown-signing-key':
+            (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(
+                status=PRODUCER.NATIVE_PHASES[case.native_phase], refused_signer='A' * 40)))
         if case.scene in ('migration-inventory-error', 'migration-directory-untrusted'):
             (evidence / f'{stage}-migrations.txt').write_text(f'boundary_control={case.scene} completion_markers=0\n')
         elif stage == 'omarchy-native-migrations-script-failure':
@@ -1335,6 +1338,7 @@ def evidence_fixture(root):
             'omarchy-required-helper-missing': 'Omarchy update did not complete: omarchy-update-dev',
             'omarchy-optional-failures': '| System is up to date\n! Continuing without a snapshot\n! Some mise tools could not be updated',
             'omarchy-vendor-failure': 'Omarchy update did not complete',
+            'omarchy-unknown-signing-key': 'Native Omarchy updates require existing trusted signing keys',
             'omarchy-declined': 'declined',
             'omarchy-migration-refusal': 'external package helper',
             'omarchy-migration-helper-tabs': 'external package helper',
@@ -1600,7 +1604,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 22)
-            self.assertEqual(len(receipt['process_checks']), 76)
+            self.assertEqual(len(receipt['process_checks']), 77)
             self.assertEqual(len(receipt['fresh_admission']), 22)
             self.assertEqual(len(receipt['signed_decoders']), 2)
             self.assertEqual(len(files), len(receipt['profiles']))
@@ -1939,6 +1943,15 @@ class FreshAdmissionFixture(unittest.TestCase):
             with self.subTest(keyring=keyring), self.assertRaisesRegex(ValueError, 'keyring'):
                 row['keyring_sha256'] = keyring
                 PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
+
+    def test_omarchy_signer_refusal_exercises_native_review_after_cache_pruning(self):
+        stage = 'omarchy-unknown-signing-key'
+        case = PRODUCER.OMARCHY_CASES[stage]
+        self.assertEqual((case.exit_status, case.native_phase), (1, 'cache-pruned'))
+        self.assertEqual(case.helpers, PRODUCER.OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',))
+        script = PRODUCER.guest_script({role: {'sha256': 'a' * 64} for role in PRODUCER.ROLES}, '/build/omg')
+        self.assertIn(f'{stage}; then signed_options+=(--unknown-app-signer); fi', script)
+        self.assertIn(f'|| test "$stage" = {stage}', script)
 
     def test_attended_signer_refusal_requires_the_fixture_key_and_decline(self):
         receipt = fresh_admission_receipt()

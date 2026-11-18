@@ -1004,6 +1004,18 @@ def verify_signed_fixture(owner, phase='complete'):
                     'Native cache pruning removed a retained version')
     require(not (owner / 'db/db.lck').exists(), 'Native transaction leaked its database lock')
     result = dict(status=NATIVE_PHASES[phase], packages=packages)
+    signer = receipt.get('fixture_app_signer_fingerprint')
+    trusted = receipt.get('fixture_signer_fingerprint')
+    if signer is not None and signer != trusted:
+        require(type(trusted) is str and re.fullmatch('[0-9A-F]{40}', trusted)
+                and type(signer) is str and re.fullmatch('[0-9A-F]{40}', signer),
+                'Native signer fingerprints are invalid')
+        listing = fixture_command(['gpg', '--batch', '--homedir', str(owner / 'gnupg'), '--no-default-keyring',
+            '--keyring', str(owner / 'gnupg/pubring.gpg'), '--with-colons', '--fingerprint', '--list-keys']).stdout
+        keys = {record.split(b':')[9] for record in listing.splitlines() if record.startswith(b'fpr:')}
+        require(trusted.encode() in keys and signer.encode() not in keys,
+                'Rejected fixture signer must stay outside the verification keyring')
+        result['refused_signer'] = signer
     kernel = receipt.get('running_kernel_modules')
     if kernel is not None:
         require(sha(Path('/') / kernel['path']) == kernel['sha256'], 'Real guest kernel inventory was changed')
@@ -1181,6 +1193,7 @@ OMARCHY_CASES = {
     'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-runtime-unset': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
+    'omarchy-unknown-signing-key': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
     'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
     'omarchy-optional-failures': OmarchyCase(0, tuple(
         item for item in OMARCHY_PREFIX + OMARCHY_SUFFIX
@@ -1606,6 +1619,7 @@ for stage in OMARCHY_STAGE_NAMES; do
   if test "$stage" = omarchy-current-kernel; then signed_options=(--current-kernel); fi
   if [[ $stage == omarchy-native-migrations* ]]; then signed_options=(--native-migrations); fi
   if test "$stage" = omarchy-native-migrations-installed-audio; then signed_options+=(--installed-audio); fi
+  if test "$stage" = omarchy-unknown-signing-key; then signed_options+=(--unknown-app-signer); fi
   python3 /native-cli-coverage.py signed-fixture --owner "$signed_owner" "${signed_options[@]}"
   sed -i "s|file://$signed_owner/repos/|http://127.0.0.1:18080/${signed_owner##*/}/repos/|g" "$signed_owner/pacman.conf"
   cp "$signed_owner/pacman.conf" "$case_dir/pacman.conf"
@@ -1740,7 +1754,8 @@ OMARCHY_CASE_SETUP
   if test -n "$control"; then
     launch=(python3 "$fixture/control.py" "$control")
   fi
-  if test "$native_phase" != initial && test "$native_phase" != cache-pruned && test -z "$reboot_answer" && test -z "$control"; then
+  if { test "$native_phase" != initial && test "$native_phase" != cache-pruned \
+       || test "$stage" = omarchy-unknown-signing-key; } && test -z "$reboot_answer" && test -z "$control"; then
     launch=(python3 /attend-unknown-fixture.py --timeout "$((stage_timeout-2))" \
       --receipt "$case_dir/unknown.json" -- "${launch[@]}")
   fi
@@ -2461,6 +2476,12 @@ def validate_evidence(evidence, profiles, artifacts, commit):
                     'Optional Omarchy update failures were not visible: ' + stage)
         elif stage == 'omarchy-vendor-failure':
             require('Omarchy update did not complete' in log, 'Missing vendor failure diagnostic')
+        elif stage == 'omarchy-unknown-signing-key':
+            state = json.loads((evidence / f'{stage}-native-state.json').read_text())
+            signer = state.get('refused_signer')
+            require(type(signer) is str and re.fullmatch('[0-9A-F]{40}', signer)
+                    and 'Native Omarchy updates require existing trusted signing keys' in log,
+                    'Missing native signing-key refusal or unchanged verification keyring')
         elif stage == 'omarchy-migration-refusal' or stage.startswith('omarchy-migration-helper-'):
             require('external package helper' in log, 'Missing native package migration refusal')
         elif stage in ('omarchy-unsupported-mode', 'omarchy-unsupported-turbo-mode'):
@@ -2619,6 +2640,7 @@ def main():
     signed.add_argument('--current-kernel', action='store_true')
     signed.add_argument('--native-migrations', action='store_true')
     signed.add_argument('--installed-audio', action='store_true')
+    signed.add_argument('--unknown-app-signer', action='store_true')
     fresh = commands.add_parser('fresh-admission-fixture')
     fresh.add_argument('--owner', required=True, type=Path)
     fresh.add_argument('--cli', required=True, type=Path)
@@ -2655,7 +2677,8 @@ def main():
             json.dump(value, stream, indent=2)
             stream.write('\n')
     elif args.operation == 'signed-fixture':
-        create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_audio)
+        create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_audio,
+                              unknown_app_signer=args.unknown_app_signer)
     elif args.operation == 'fresh-admission-fixture':
         print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)))
     elif args.operation == 'verify-signed-fixture':

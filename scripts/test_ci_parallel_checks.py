@@ -6,6 +6,21 @@ import test_ci_required_results
 
 
 class ParallelChecksTests(unittest.TestCase):
+    def test_standalone_suites_share_the_required_mac_runtime_runner(self):
+        source = CI_YML.read_text(encoding='utf-8')
+        linux = job_block(source, 'standalone-suites')
+        mac = job_block(source, 'macos')
+        self.assertIn('runs-on: ubuntu-24.04', linux)
+        self.assertNotIn('macos-15', linux)
+        self.assertIn('runs-on: macos-15', mac)
+        for manifest in ('tests/mise-compat/Cargo.toml', 'tests/env-portable/Cargo.toml'):
+            command = f'run: cargo test --manifest-path {manifest} --locked'
+            for job in (linux, mac):
+                self.assertEqual(job.count(command), 1)
+        final = job_block(source, 'ci-success')
+        self.assertIn('STANDALONE_SUITES: ${{ needs.standalone-suites.result }}', final)
+        self.assertIn('MACOS: ${{ needs.macos.result }}', final)
+
     def test_platform_prerequisite_only_classifies_changes(self):
         source = CI_YML.read_text(encoding='utf-8')
         gate = job_block(source, 'quick-gate')

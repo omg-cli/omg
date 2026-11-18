@@ -4037,7 +4037,8 @@ def async_test_expected_error(name, source, counts, group, owners, names, invent
 
 def sync_runtime_fragment_owners(name, group, owners, names, inventory, first, last, work):
     """Observe one exact synchronous Result test owner without inventing a future."""
-    if inventory is None or len(group[2])!=1 or name not in ('src/runtimes/java.rs','src/runtimes/rust.rs'):
+    if inventory is None or len(group[2])!=1 or name not in (
+            'src/runtimes/java.rs','src/runtimes/rust.rs','src/core/security/sbom_shared.rs'):
         return None
     code,rows=inventory[:2]
     _construct_charge(work,len(rows)+1)
@@ -4149,19 +4150,28 @@ def incremental_rust_fixture_loop(inventory, function, record, owners, witness, 
 def async_runtime_fixture_record(name, source, counts, group, owners, names, inventory, first, last, work):
     """Project a fixture record through the addition of its eager security field."""
     managers = {'src/runtimes/java.rs':'JavaManager', 'src/runtimes/rust.rs':'RustManager'}
-    manager = managers.get(name)
-    if (manager is None or inventory is None or first!=last
-            or source[first-1].strip()!=f'let manager = {manager} {{'):
+    if name == 'src/core/security/sbom_shared.rs':
+        bindings, record_type, original_size = ('package','old'), 'SecurityPackage', 7
+        initializer = 'crate::package_managers::types::SecurityOrigin::Unknown'
+        added_field = f'origin: {initializer},'
+    elif name in managers:
+        bindings, record_type, original_size = ('manager',), managers[name], 3
+        initializer = 'crate::runtimes::security::RuntimeSecurity::fixture'
+        added_field = f'security: {initializer}(),'
+    else:
+        return None
+    if (inventory is None or first!=last or source[first-1].strip() not in
+            {f'let {binding} = {record_type} {{' for binding in bindings}):
         return None
     code, rows = inventory[:2]
     _construct_charge(work,len(rows))
-    candidates = [row for row in rows if row.get('header')==('let','manager','=',manager)
+    candidates = [row for row in rows if row.get('header') in {('let',binding,'=',record_type) for binding in bindings}
                   and code.position(code.starts[row['first']])[0]==first]
     if len(candidates)!=1:
         return None
     record, = candidates
     closing = code.position(code.ends[record['end']])[0]
-    if closing-first not in (3,4) or source[closing-1].strip()!='};':
+    if closing-first not in (original_size,original_size+1) or source[closing-1].strip()!='};':
         return None
     synchronous=source[group[0]-1].lstrip().startswith('fn ')
     if synchronous:
@@ -4186,10 +4196,9 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
         return None
     if counts.get(first,0)<=0:
         return None
-    initializer = 'crate::runtimes::security::RuntimeSecurity::fixture'
-    insertion = closing-first==4
+    insertion = closing-first==original_size+1
     added = first+1
-    if insertion and source[added-1].strip()!=f'security: {initializer}(),':
+    if insertion and source[added-1].strip()!=added_field:
         return None
     source_rows = source[first-1:closing]
     _construct_charge(work,sum(len(text)+1 for text in source_rows)+len(witness['regions']))
@@ -4435,6 +4444,72 @@ def async_test_expected_variant(name, source, counts, group, owners, names, inve
     return (*identity,code.words[value],message,tuple(named)), dict(witness,wrapped=wrapped)
 
 
+def retained_arch_audit_entry(sides, work):
+    """Observe the Arch audit wrapper and its two future entries in every copy."""
+    crate = ('crate', 'omg_lib')
+    managers = ('type', crate, ('package_managers', ''))
+    namespace = ('type', managers, ('arch', ''))
+    parent = ('type', namespace, ('ArchPackageManager', ''))
+    trait = ('type', ('type', managers, ('traits', '')), ('PackageManager', ''))
+    evidence = []
+    for source, counts, group, owners, names, inventory, line in sides:
+        code, rows = inventory[:2]
+        start = bisect.bisect_left(code.starts,code.offsets[line-1])
+        opening = code.parents[start]
+        _construct_charge(work,len(rows)*2+len(code.starts).bit_length())
+        functions = [row for row in rows if row['kind']=='fn' and row['opening']==opening and
+                     row['header'][:2]==('fn','security_audit')]
+        if (len(functions)!=1 or start!=opening+1 or code.words[start:start+16] !=
+                ['Some','(','Box','::','pin','(','async','move','{','use','anyhow','::','Context',';','async','{']):
+            return None
+        if not any(row['kind']=='impl' and row['opening']==code.parents[opening] and
+                row['header']==('impl','PackageManager','for','ArchPackageManager') for row in rows):
+            return None
+        slots = (code.region(start+2,start+4),code.region(start+8,start+8),code.region(start+15,start+15))
+        selected_lines = (line,slots[-1][0])
+        roots = {id(owner) for owner in group[2]}
+        seen_roots = set(); copies = {}; raw = []
+        if not 1<=len(roots)<=16:
+            return None
+        for owner in owners:
+            symbol = owner['name']
+            _construct_charge(work,2*len(owner['regions'])+1)
+            touching = [r for r in owner['regions'] if any(r[0]<=number<=r[2] for number in selected_lines)]
+            if not touching:
+                continue
+            _construct_charge(work,len(symbol)+len(touching)+1)
+            shape = nominal_method_path(symbol)
+            if (shape is None or shape.kind!='X' or shape.namespace!=namespace or shape.self_type!=parent
+                    or shape.trait!=trait or shape.method!=('security_audit','') or shape.callbacks not in ((), ('',), ('',''))
+                    or names[symbol]!=1 or owner.get('branches') or owner.get('mcdc_records')):
+                return None
+            depth = len(shape.callbacks)
+            count = owner['count']
+            if (not 0<=count<COUNTER_LIMIT or touching != [[*slots[depth],count,0,0,0]]
+                    or (depth==0) != (id(owner) in roots)):
+                return None
+            roles = copies.setdefault(shape.copy_identity,{})
+            if depth in roles:
+                return None
+            roles[depth] = (symbol,count,owner['filenames'])
+            if depth==0:
+                seen_roots.add(id(owner))
+            raw.extend(touching)
+        if seen_roots!=roots or len(copies)!=len(roots) or any(
+                roles.keys()!={0,1,2} or roles[0][1:]!=roles[1][1:]
+                or roles[1][1]<roles[2][1] or roles[1][2]!=roles[2][2] for roles in copies.values()):
+            return None
+        if _owner_line_counts({'regions':raw},_ObserverWork(work))!={number:counts.get(number) for number in selected_lines}:
+            return None
+        evidence.append((functions[0]['header'],selected_lines,
+                         [tuple(roles[depth][:2] for depth in (0,1,2)) for roles in copies.values()]))
+    base, head = evidence
+    if (base[0]!=head[0] or len(base[2])!=len(head[2]) or any(hits<=0 for copy in head[2] for _,hits in copy)):
+        return None
+    return dict(kind='retained-arch-audit-entry',pairs=[list(pair) for pair in zip(base[1],head[1],strict=True)],
+                compiled_entries=[base[2],head[2]],summary_credit=[0,0],mapped_credit=[0,0])
+
+
 def retained_osv_request(sides, work):
     """Observe the same request fields before and after extracting the OSV scan."""
     observations = []
@@ -4563,7 +4638,7 @@ def osv_request_obligations(sources, counts, inventories, grouped, work):
 
 
 def retained_sbom_metadata(sides, work):
-    """Observe the unchanged leading fields of the system component record."""
+    """Observe the same record fields around the changed advisory properties."""
     evidence = []
     for source, counts, group, owners, names, inventory, line in sides:
         code = inventory[0]
@@ -4582,18 +4657,21 @@ def retained_sbom_metadata(sides, work):
         record = component[0] + 1
         if code.words[record] != '{':
             return None
-        properties = [i for i in range(record+1,code.pairs[record]) if code.parents[i]==record
+        component_end = code.pairs[record]
+        properties = [i for i in range(record+1,component_end) if code.parents[i]==record
                       and code.words[i:i+2]==['properties',':']]
-        if len(properties) != 1:
+        if len(properties) != 1 or code.words[component_end:component_end+5] != ['}',')',',','manufacture',':']:
             return None
         last = code.position(code.starts[properties[0]])[0] - 1
-        if last <= line:
+        suffix = code.position(code.starts[component_end+3])[0]
+        if not line < last < suffix < group[1]:
             return None
+        ranges = ((line,last), (suffix,group[1]))
         assigned = {}; raw = []
         roots = {id(root) for root in group[2]}
         for owner in owners:
-            _construct_charge(work,len(owner['regions'])+1)
-            regions = [r for r in owner['regions'] if r[0]<=last and line<=r[2]]
+            _construct_charge(work,2*len(owner['regions'])+1)
+            regions = [r for r in owner['regions'] if any(r[0]<=end and start<=r[2] for start,end in ranges)]
             if not regions:
                 continue
             symbol = owner['name']; shape = plain_rust_function_symbol(symbol)
@@ -4601,10 +4679,12 @@ def retained_sbom_metadata(sides, work):
             if (id(owner) not in roots or symbol in assigned or names[symbol]!=1
                     or shape is None or shape.identifiers!=('omg_lib','core','security','sbom_shared','compose')
                     or owner.get('branches') or owner.get('mcdc_records')
-                    or any(not line<=r[0]<=r[2]<=last or r[5:]!=[0,0,0] or not 0<=r[4]<COUNTER_LIMIT
+                    or any(not any(start<=r[0]<=r[2]<=end for start,end in ranges)
+                           or r[5:]!=[0,0,0] or not 0<=r[4]<COUNTER_LIMIT
                            or r[4] and not owner['count'] for r in regions)):
                 return None
-            slots=sorted(((a-line,b,c-line,d), int(hits>0)) for a,b,c,d,hits,*_ in regions)
+            slots=sorted(((segment,a-start,b,c-start,d), int(hits>0))
+                         for segment,(start,end) in enumerate(ranges) for a,b,c,d,hits,*_ in regions if start<=a<=end)
             geometry, states = zip(*slots,strict=True)
             if len(set(geometry)) != len(geometry):
                 return None
@@ -4613,10 +4693,12 @@ def retained_sbom_metadata(sides, work):
         if not roots or len(assigned) != len(roots):
             return None
         projection = _owner_line_counts({'regions':raw},_ObserverWork(work))
-        _construct_charge(work,last-line+1)
-        if projection != {i:counts[i] for i in range(line,last+1) if i in counts} or not counts.get(line,0):
+        _construct_charge(work,sum(end-start+1 for start,end in ranges))
+        if projection != {i:counts[i] for start,end in ranges for i in range(start,end+1) if i in counts} or not counts.get(line,0):
             return None
-        evidence.append((source[line-1:last], {i-line for i in projection}, assigned,line))
+        observed = [(segment,i-start) for segment,(start,end) in enumerate(ranges)
+                    for i in range(start,end+1) if i in projection]
+        evidence.append(([source[first-1:end] for first,end in ranges], observed, assigned, ranges))
     old,new = evidence
     if old[:2]!=new[:2]:
         return None
@@ -4627,7 +4709,8 @@ def retained_sbom_metadata(sides, work):
                                            [list(side[2]) for side in evidence])
     if matching is None:
         return None
-    return dict(kind='retained-sbom-metadata', pairs=[[old[3]+i,new[3]+i] for i in sorted(old[1])],
+    return dict(kind='retained-sbom-metadata', pairs=[[old[3][segment][0]+i,new[3][segment][0]+i]
+                                                      for segment,i in old[1]],
                 geometry=list(geometries)[0], owners=[list(side[2]) for side in evidence], role_matching=matching)
 
 
@@ -5599,7 +5682,9 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         elif (name=='src/core/security/policy.rs' and b-a==1 and tuple(pending)==(b,)
               and b<len(old) and old[a].strip()=='assert!(' and '&FailingVulns)' in old[b]):
             async_fragment = async_policy_unavailable_assertion
-        elif b-a==1 and old[a].strip() in ('let manager = JavaManager {','let manager = RustManager {'):
+        elif b-a==1 and (old[a].strip() in ('let manager = JavaManager {','let manager = RustManager {')
+                or name=='src/core/security/sbom_shared.rs' and old[a].strip() in
+                    ('let package = SecurityPackage {','let old = SecurityPackage {')):
             async_fragment = async_runtime_fixture_record
         elif name=='src/runtimes/rust.rs' and b-a==1 and tuple(pending)==(b,) and old[a].strip()=='assert_eq!(':
             async_fragment = async_runtime_inventory_assertion
@@ -5646,7 +5731,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                         async_runtime_fixture_record:'async-runtime-fixture-record',
                         async_runtime_inventory_assertion:'async-runtime-inventory-assertion'}[async_fragment]
                 if synchronous_record:
-                    kind='sync-runtime-fixture-record'
+                    kind='sync-sbom-fixture-record' if name=='src/core/security/sbom_shared.rs' else 'sync-runtime-fixture-record'
                 evidence = [observation[1] for observation in observations]
                 receipt = dict(kind=kind,file=name,pairs=matched,owners=evidence)
                 if synchronous_record:
@@ -5684,22 +5769,24 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
                 continue
-        if (name=='src/core/security/sbom_shared.rs' and construct_inventories is not None
-                and macro_expansions==([],[]) and a+1==b and c+1==d and tuple(pending)==(b,)
-                and old[a].strip() == new[c].strip()
-                and old[a].strip() in ('components.push(SbomComponent {', 'vulnerabilities.push(SbomVulnerability {',
-                                       'bom_format: "CycloneDX".into(),')):
+        arch_entry = name=='src/package_managers/arch.rs' and old[a].strip()=='Some(Box::pin(async move {'
+        sbom_entry = name=='src/core/security/sbom_shared.rs' and old[a].strip() in (
+            'components.push(SbomComponent {', 'vulnerabilities.push(SbomVulnerability {', 'bom_format: "CycloneDX".into(),')
+        if ((arch_entry or sbom_entry) and construct_inventories is not None and macro_expansions==([],[])
+                and a+1==b and c+1==d and tuple(pending)==(b,) and old[a]==new[c]):
             sides = [
                 (source, counts, group, inventories[side], inventory_names[side],
                  construct_inventories[side], line)
                 for side, (source, counts, group, line) in enumerate(((old,before,bg,b),(new,after,hg,d)))
             ]
-            if old[a].lstrip().startswith('bom_format:'):
-                component = retained_sbom_metadata(sides,work)
+            if arch_entry:
+                entry = retained_arch_audit_entry(sides,work)
+            elif old[a].lstrip().startswith('bom_format:'):
+                entry = retained_sbom_metadata(sides,work)
             else:
-                component = retained_sbom_push(sides,work,vulnerability=old[a].lstrip().startswith('vulnerabilities.'))
-            if component is not None:
-                matched = component['pairs']
+                entry = retained_sbom_push(sides,work,vulnerability=old[a].lstrip().startswith('vulnerabilities.'))
+            if entry is not None:
+                matched = entry['pairs']
                 if any(line in pairs and pairs[line] != target for line, target in matched):
                     refuse()
                 pairs.update(matched)
@@ -5708,7 +5795,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     first,last = group[:2]
                     _construct_charge(work, sum(len(text)+1 for text in source[first-1:last]))
                     excerpts[side,first,last] = ('\n'.join(source[first-1:last])+'\n').encode()
-                receipts.append(dict(file=name, **component, callback_fragments=[dict(pairs=matched)]))
+                receipts.append(dict(file=name, **entry, callback_fragments=[dict(pairs=matched)]))
                 continue
         if (construct_inventories is not None and macro_expansions==([],[])
                 and a+1==b and c+1==d and tuple(pending)==(b,)
@@ -10415,7 +10502,9 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
         if qualifiers and re.fullmatch(r"< '[A-Za-z_]\w*(?: , '[A-Za-z_]\w*)* >",qualifiers,re.ASCII) is None:
             return None
         begin = code.position(code.starts[definition['first']]); brace = code.position(code.starts[definition['opening']])
-        end = code.position(code.ends[definition['end']]); entry = (*begin,brace[0],brace[1]-1)
+        end = code.position(code.ends[definition['end']])
+        last_header_token = code.position(code.ends[definition['opening']-1])
+        entry = (*begin, *(last_header_token if last_header_token[0] < brace[0] else (brace[0],brace[1]-1)))
         if not begin[0] < number < brace[0]:
             return None
         holding = code.parents[definition['opening']]
@@ -10428,7 +10517,7 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
                 return None
             implementation, = implementations
             nominal_impl = ' '.join(implementation['header'])
-            match = re.fullmatch(r'impl (super(?: :: super)* :: (?:[A-Za-z_]\w* :: )*[A-Za-z_]\w*) for ([A-Za-z_]\w*)',
+            match = re.fullmatch(r'impl ((?:super(?: :: super)* :: (?:[A-Za-z_]\w* :: )*)?[A-Za-z_]\w*) for ([A-Za-z_]\w*)',
                                  nominal_impl,re.ASCII)
             context = _boolean_module(code, {'start':implementation['first']})
             if match is None or context is None:
@@ -10439,7 +10528,17 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
             crate += tuple(context[0])
             if supers >= len(crate):
                 return None
-            trait = nominal((*crate[:-supers], *path[supers:])); owner_type = nominal((*crate,match[2]))
+            if supers:
+                trait = nominal((*crate[:-supers], *path[supers:]))
+            else:
+                module = code.parents[holding]
+                local_traits = [row for row in rows if row['kind']=='trait' and code.parents[row['opening']]==module
+                                and 'trait' in row['header'] and row['header'][row['header'].index('trait')+1]==path[0]]
+                _construct_charge(work,len(rows))
+                if len(path) != 1 or len(local_traits) != 1:
+                    return None
+                trait = nominal((*crate,*path))
+            owner_type = nominal((*crate,match[2]))
         low = code.position(code.starts[first]); high = code.position(code.ends[last-1]); roots = {}
         roles = declaration_signature_roles(code,args,definition['opening'],source,work)
         signature_low = (min(roles.values(),default=number),1)

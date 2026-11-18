@@ -1398,27 +1398,61 @@ class OsvRequestMigrationTests(unittest.TestCase):
 
 
 class SbomComponentPushTests(unittest.TestCase):
+    def test_package_identity_fixture_adds_an_observed_unknown_origin(self):
+        name = 'src/core/security/sbom_shared.rs'
+        symbol = '_RNvNtNtNtNtCs1_7omg_lib4core8security11sbom_shared5tests7fixture'
+        origin = 'crate::package_managers::types::SecurityOrigin::Unknown'
+
+        def observe(addition=None, count=1):
+            source = ['#[cfg(test)]', 'mod tests {', '    #[test]', '    fn fixture() {',
+                      '        let package = SecurityPackage {']
+            if addition is not None:
+                source.append(f'            origin: {addition},')
+            source.extend(['            name: "fixture".into(),', '            version: "1".into(),',
+                           '            advisory_source: None,', '            architecture: None,',
+                           '            description: String::new(),', '            licenses: vec![],',
+                           '        };', '    }', '}'])
+            end = len(source)-2
+            raw = [[4,5,4,17,1,0,0,0],[5,13,5,20,1,0,0,0],[5,23,end,10,1,0,0,0],
+                   [end+1,5,end+1,6,1,0,0,0]]
+            if addition is not None:
+                raw.append([6,21,6,21+len(addition),count,0,0,0])
+            root = dict(name=symbol, filenames=['/artifact/'+name], regions=raw, count=1)
+            work = [100_000]
+            counts = coverage._owner_line_counts({'regions':raw},coverage._ObserverWork(work))
+            return coverage.async_runtime_fixture_record(name,source,counts,(4,end+1,[root]),[root],
+                        Counter({symbol:1}),coverage._construct_inventory(source,work),5,5,work)
+
+        old = observe()
+        current = observe(origin)
+        self.assertIsNotNone(old)
+        self.assertEqual(old[0],current[0])
+        self.assertIsNone(observe(origin,count=0))
+        self.assertIsNone(observe('SecurityOrigin::DistributionPackage'))
+
     def test_system_component_metadata_requires_its_original_fields_and_regions(self):
         name = '_RNvNtNtNtCs1_7omg_lib4core8security11sbom_shared7compose'
 
-        def scenario(properties, name_field='os_name', hits=1):
+        def scenario(properties, name_field='os_name', hits=1, vendor='None'):
             source = ['fn compose() {', '    Ok(Sbom {', '        bom_format: "CycloneDX".into(),',
                       '        metadata: SbomMetadata {', '            component: Some(SbomComponent {',
                       f'                name: {name_field}.into(),', f'                properties: {properties},',
-                      '            }),', '        },', '    })', '}']
-            raw = [[3,21,3,32,1,0,0,0], [6,23,6,30,hits,0,0,0]]
+                      '            }),', f'            manufacture: {vendor},', '        },', '    })', '}']
+            raw = [[3,21,3,32,1,0,0,0], [6,23,6,30,hits,0,0,0], [9,26,9,30,1,0,0,0]]
             root = dict(name=name, regions=raw, count=1)
             work = [100_000]
-            return (source, {3:1,6:hits}, (1,len(source),[root]), [root], Counter({name:1}),
+            return (source, {3:1,6:hits,9:1}, (1,len(source),[root]), [root], Counter({name:1}),
                     coverage._construct_inventory(source,work), 3)
 
         base = scenario('None')
         proof = coverage.retained_sbom_metadata((base,scenario('Some(properties)')), [100_000])
-        self.assertEqual(proof['pairs'], [[3,3], [6,6]])
+        self.assertEqual(proof['pairs'], [[3,3], [6,6], [9,9]])
         self.assertIsNone(coverage.retained_sbom_metadata(
             (base,scenario('Some(properties)', name_field='new_name')), [100_000]))
         self.assertIsNone(coverage.retained_sbom_metadata(
             (base,scenario('Some(properties)', hits=0)), [100_000]))
+        self.assertIsNone(coverage.retained_sbom_metadata(
+            (base,scenario('Some(properties)', vendor='Some(vendor)')), [100_000]))
 
     def test_component_properties_cannot_replace_coverage_of_the_record_or_its_mapper(self):
         name = 'src/core/security/sbom_shared.rs'
@@ -10542,6 +10576,41 @@ impl SecurityPolicy {
 
 
 class RetiredDeclarationParameterTests(unittest.TestCase):
+    def test_same_module_trait_and_next_line_brace_preserve_syntax_only(self):
+        name = 'src/core/security/vulnerability.rs'
+        filename = '/artifact/' + name
+        files = {filename:name}
+        work = [500_000]
+
+        def fixture(method, crate, split_brace=False, trait='VulnerabilitySource'):
+            lines = [f'pub trait {trait} {{}}', 'impl VulnerabilitySource for VulnerabilityScanner {',
+                     f"    fn {method}<'a>(", "        &'a self,", '    ) -> usize']
+            end = len(lines[-1])+1
+            if split_brace:
+                lines.append('    {')
+            else:
+                lines[-1] += ' {'
+            lines.extend(['        1', '    }', '}'])
+            terminal = len(lines)-1
+            raw = [[3,5,5,end,1,0,0,0], [terminal-1,9,terminal-1,10,1,0,0,0],
+                   [terminal,5,terminal,6,1,0,0,0]]
+            symbol = (f'_RNvXs0_NtNtNtCs{crate}_7omg_lib4core8security13vulnerability'
+                      f'NtB5_20VulnerabilityScannerNtB5_19VulnerabilitySource{len(method)}{method}')
+            roots = [dict(name=symbol,count=1,filenames=[filename],regions=raw)]
+            spans = {id(owner):coverage.source_owner_span(owner,name,files,lines) for owner in roots}
+            index = coverage.index_compiled_owner_sources(roots,files,work,{name},index_declaration_ends=True)
+            return (lines,coverage._construct_inventory(lines,work),spans,{4:1}), index
+
+        base = fixture('scan_package','aJq9CMLDmry')
+        head = fixture('assess_packages','40j12eeWnis',split_brace=True)
+        proof, peers = coverage.retired_declaration_parameter(name,4,4,
+            (base[0],head[0]),(base[1],head[1]),{'assess_packages'},work)
+        self.assertEqual((proof['declaration'],proof['pairs'],proof['mapped_credit']), ('scan_package',[],[0,0]))
+        self.assertEqual(peers,{})
+        foreign = fixture('assess_packages','40j12eeWnis',split_brace=True,trait='DifferentTrait')
+        self.assertIsNone(coverage.retired_declaration_parameter(name,4,4,
+            (base[0],foreign[0]),(base[1],foreign[1]),{'assess_packages'},work))
+
     def compare_signature(self, foreign_return_paint=False):
         old = ['pub(crate) fn previous(', '    ttl: Duration,', ') -> Result<',
                '    OldValue,', '    Error,', '> {', '    check_old(ttl)', '}']
@@ -10628,6 +10697,42 @@ class RetiredDeclarationParameterTests(unittest.TestCase):
 
 
 class InherentAsyncLeafTests(unittest.TestCase):
+    def test_arch_audit_entry_observes_both_box_and_future_in_each_compiled_copy(self):
+        source = ['impl PackageManager for ArchPackageManager {', '    fn security_audit(&self) {',
+                  '        Some(Box::pin(async move {', '            use anyhow::Context;',
+                  '            async {', '                audit().await', '            }.await',
+                  '        }))', '    }', '}']
+        namespace = '7omg_lib16package_managers4arch'
+        work = [200_000]
+
+        def scenario(hits, fault=None):
+            owners = []
+            roots = []
+            for crate in ('aJq9CMLDmry','40j12eeWnis'):
+                base = f'NvXs0_NtNtCs{crate}_{namespace}'
+                root = dict(name=f'_R{base}NtB5_18ArchPackageManagerNtNtB7_6traits14PackageManager14security_audit',
+                            filenames=['/src/package_managers/arch.rs'],count=hits,regions=[[3,14,3,22,hits,0,0,0]])
+                roots.append(root)
+                owners.append(root)
+                if fault != 'missing-future' or len(roots)==1:
+                    child_hits = 0 if fault=='cold-future' and len(roots)==2 else hits
+                    owners.append(dict(root,name=f'_RNC{base}NtB7_18ArchPackageManagerNtNtB9_6traits14PackageManager14security_audit0Bb_',
+                                       count=child_hits,regions=[[3,34,3,35,child_hits,0,0,0]]))
+                if fault != 'missing-inner' or len(roots)==1:
+                    owners.append(dict(root,name=f'_RNCNC{base}NtB9_18ArchPackageManagerNtNtBb_6traits14PackageManager14security_audit00Bd_',
+                                       regions=[[5,19,5,20,hits,0,0,0]]))
+            projection = coverage._owner_line_counts({'regions':[r for o in owners for r in o['regions']]},
+                                                     coverage._ObserverWork(work))
+            return (source,projection,(2,9,roots),owners,Counter(o['name'] for o in owners),
+                    coverage._construct_inventory(source,work),3)
+
+        base = scenario(0)
+        proof = coverage.retained_arch_audit_entry((base,scenario(1)),work)
+        self.assertEqual(proof['pairs'],[[3,3],[5,5]])
+        for fault in ('missing-future','cold-future','missing-inner'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(coverage.retained_arch_audit_entry((base,scenario(1,fault)),work))
+
     def compare(self, kind, mutation=None):
         if kind == 'assigned':
             old = ['impl Manager {', '    async fn checked() {', '        let refreshed = async {',
