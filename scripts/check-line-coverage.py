@@ -2147,8 +2147,9 @@ def _construct_inventory(source, work):
         prefix = code.words[first:i]
         kind = next((word for word in ('fn', 'struct', 'enum', 'impl', 'trait', 'mod', 'if', 'for', 'while', 'loop', 'match')
                      if word in prefix), 'expression')
+        complete = digest(first, end)
         row = dict(first=first, opening=i, end=end, kind=kind, header=tuple(prefix),
-                   digest=digest(first, end), body=digest(i, end), supported='#' not in prefix)
+                   digest=complete, body=complete if first == i else digest(i, end), supported='#' not in prefix)
         bodies.add(row['body']); constructs.append(row)
         line = code.position(code.starts[end])[0]
         endings.setdefault(line, []).append(row)
