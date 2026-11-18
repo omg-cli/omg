@@ -1362,8 +1362,10 @@ class DeferredSourceFragment:
 
 
 def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, inventory, work,
-                               *, caller_entry=False):
+                               *, caller_entry=False, single_binding=False, phase_cache=None):
     """Prove fragment execution through a uniquely source-bound direct callback."""
+    if single_binding and caller_entry:
+        return None
     if inventory is None:
         return None
     code = inventory[0]
@@ -1397,7 +1399,10 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         return None
     candidates = [row for row in inventory[1] if row['opening'] is not None
                   and function['opening'] < row['opening'] < row['end'] < function['end']
-                  and code.words[row['opening'] - 1] == '||'
+                  and (code.words[row['opening'] - 1] == '||' if not single_binding else
+                       row['opening'] >= 3
+                       and code.words[row['opening']-3] == code.words[row['opening']-1] == '|'
+                       and re.fullmatch(r'[A-Za-z_]\w*', code.words[row['opening']-2]) is not None)
                   and code.parents[row['opening']] is not None
                   and code.words[code.parents[row['opening']]] == '('
                   and code.position(code.starts[row['opening']])[0] <= first <= last
@@ -1409,10 +1414,36 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         call_parent = code.parents[callback['opening']]
         if code.parents[call_parent] != function['opening']:
             return None
-    argument = callback['opening'] - 1
+    argument = callback['opening'] - (3 if single_binding else 1)
+    if single_binding:
+        if code.parents[code.parents[callback['opening']]] != function['opening']:
+            return None
+        entry_only = first == last == code.position(code.starts[callback['opening']])[0]
+        control = []; fragment_tokens = ()
+        if not entry_only:
+            _construct_charge(work,len(inventory[1]))
+            fragment_rows = [row for row in inventory[1] if row['kind']=='statement'
+                and code.position(code.starts[row['first']])[0] == first
+                and code.position(code.starts[row['end']])[0] == last
+                and callback['opening'] < row['first'] <= row['end'] < callback['end']]
+            if len(fragment_rows) != 1:
+                return None
+            _construct_charge(work,len(inventory[1]))
+            by_opening = {row['opening']:row for row in inventory[1] if row['opening'] is not None}
+            for opening_token in _construct_ancestors(code, fragment_rows[0]['first'], work):
+                if opening_token == callback['opening']:
+                    break
+                construct = by_opening.get(opening_token)
+                if construct is None:
+                    return None
+                control.append(tuple(construct['header']))
+            else:
+                return None
+            fragment_tokens = tuple(code.words[fragment_rows[0]['first']:fragment_rows[0]['end']+1])
+        _construct_charge(work, len(fragment_tokens)+sum(len(value) for value in control))
     if argument > 0 and code.words[argument - 1] == 'move':
         argument -= 1
-    # A zero-argument closure starts an argument; boolean OR does not.
+    # A closure starts an argument; boolean OR does not.
     if argument == 0 or code.words[argument - 1] not in ('(', ','):
         return None
     if code.parents[argument] != code.parents[callback['opening']]:
@@ -1446,13 +1477,34 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         if (type(parent.get('count')) is not int or not 0 <= parent['count'] < COUNTER_LIMIT
                 or len(parent_entries) != 1 or parent_entries[0][4] != parent['count']):
             return None
-        children = []
-        for owner in owners:
-            _construct_charge(work, len(owner['name']) + len(owner['regions']))
-            if (direct_rust_callback_symbol(owner['name'], parent['name'], shape.modules)
-                    and min(tuple(row[:2]) for row in owner['regions']) == opening
-                    and max(tuple(row[2:4]) for row in owner['regions']) == closing):
-                children.append(owner)
+        candidate_key = (id(code), id(owners), parent['name'], shape.modules, opening, closing)
+        cache = phase_cache if single_binding else None
+        if cache is None or candidate_key not in cache:
+            children = []
+            candidates = owners
+            if cache is not None:
+                boundary_key = ('owner-boundaries',id(owners))
+                if boundary_key not in cache:
+                    boundaries = {}
+                    _construct_charge(work,len(owners))
+                    for owner in owners:
+                        _construct_charge(work,2*len(owner['regions'])+1)
+                        span=(min(tuple(row[:2]) for row in owner['regions']),
+                              max(tuple(row[2:4]) for row in owner['regions']))
+                        boundaries.setdefault(span,[]).append(owner)
+                    cache[boundary_key] = boundaries
+                candidates = cache[boundary_key].get((opening,closing),())
+            for owner in candidates:
+                _construct_charge(work, len(owner['name']) + len(owner['regions']))
+                if (direct_rust_callback_symbol(owner['name'], parent['name'], shape.modules)
+                        and min(tuple(row[:2]) for row in owner['regions']) == opening
+                        and max(tuple(row[2:4]) for row in owner['regions']) == closing):
+                    children.append(owner)
+            if cache is not None:
+                cache[candidate_key] = tuple(children)
+        else:
+            _construct_charge(work,len(parent['name'])+1)
+            children = cache[candidate_key]
         if len(children) != 1:
             return None
         child = children[0]
@@ -1490,17 +1542,38 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
                               parent_entry=int(parent['count'] > 0), child_entry=int(child['count'] > 0)))
     if len(set(identities)) != 1 or len(set(geometries)) != 1:
         return None
-    _construct_charge(work, sum(len(owner['regions']) for owner in owners) * (last - first + 1))
-    if any(id(owner) not in bound and any(owner_covers_lines([row], line, line)
-           for row in owner['regions'] for line in range(first, last + 1)) for owner in owners):
-        return None
+    if single_binding and phase_cache is not None:
+        footprint_key = ('owner-line-footprints', id(owners))
+        if footprint_key not in phase_cache:
+            footprint = {}
+            _construct_charge(work,len(owners))
+            for owner in owners:
+                for row in owner['regions']:
+                    _construct_charge(work,row[2]-row[0]+2)
+                    for line in range(row[0],row[2]+1):
+                        if owner_covers_lines([row],line,line):
+                            footprint.setdefault(line,set()).add(id(owner))
+            phase_cache[footprint_key] = footprint
+        footprint = phase_cache[footprint_key]
+        _construct_charge(work,last-first+1+sum(len(footprint.get(line,())) for line in range(first,last+1)))
+        if any(footprint.get(line,set()) - bound for line in range(first,last+1)):
+            return None
+    else:
+        _construct_charge(work, sum(len(owner['regions']) for owner in owners) * (last - first + 1))
+        if any(id(owner) not in bound and any(owner_covers_lines([row], line, line)
+               for row in owner['regions'] for line in range(first, last + 1)) for owner in owners):
+            return None
     kind = 'zero-arg-callback-call-entry' if caller_entry else 'zero-arg-callback-fragment'
+    if single_binding:
+        kind = 'single-bound-callback-entry' if entry_only else 'single-bound-callback-fragment'
     signature = (kind, identities[0], tuple(header), prefix, geometries[0])
+    if single_binding:
+        signature += (tuple(control), fragment_tokens)
     if caller_entry:
         signature += (caller_scope,)
     witness = dict(kind=kind, owners=witnesses,
         callback_span=[list(opening), list(closing)],
-        context_sha256=hashlib.sha256(repr(signature if caller_entry else signature[:-1]).encode()).hexdigest(),
+        context_sha256=hashlib.sha256(repr(signature if caller_entry or single_binding else signature[:-1]).encode()).hexdigest(),
         parent_geometry=[list(row) for row in geometries[0][0]],
         child_geometry=[list(row) for row in geometries[0][1]],
         parent_context_geometry=[list(row) for row in geometries[0][2]],
@@ -3347,6 +3420,144 @@ def test_declaration_header_obligations(name, sources, counts, descriptors, inve
         claim='Byte-identical test declaration lines at unique relative token-depth coordinates only; no changed type, body, callback or deletion credit')
 
 
+def one_bound_phase_obligations(name, sources, counts, descriptors, inventories, grouped, replacements, work):
+    pairs = {}; receipts = []; proved = set(); phase_cache = {}; all_targets = {}
+    direct_phases = []
+    for inventory in inventories:
+        code = inventory[0]; roots = set()
+        _construct_charge(work,3*len(inventory[1]))
+        for row in inventory[1]:
+            opening = row['opening']
+            if opening is None or len(row['header']) != 3 or row['header'][::2] != ('|','|'):
+                continue
+            parent = code.parents[opening]
+            if parent is not None and code.words[parent] == '(':
+                roots.add(code.parents[parent])
+        direct_phases.append(roots)
+    for prefix, left in descriptors[0].items():
+        _construct_charge(work,1)
+        right = descriptors[1].get(prefix)
+        if (right is None or left['row']['opening'] not in direct_phases[0]
+                or right['row']['opening'] not in direct_phases[1]
+                or any(left[key] != right[key] for key in ('signature','context','attributes'))):
+            continue
+        groups = left['group'], right['group']
+        if len(groups[0][2]) != len(groups[1][2]):
+            continue
+        _construct_charge(work,len(replacements))
+        # A whole old-function proof may not silently omit an overlapping
+        # retained obligation whose target escaped the paired head function.
+        selected = [r for r in replacements.values() if r.get('retained_statements')
+            and r['base_range'][0] <= groups[0][1] and groups[0][0] <= r['base_range'][1]]
+        if any(not (groups[0][0] <= r['base_range'][0] <= r['base_line'] <= r['base_range'][1] <= groups[0][1]
+                    and groups[1][0] <= r['head_range'][0] <= r['head_line'] <= r['head_range'][1] <= groups[1][1])
+               for r in selected):
+            continue
+        _construct_charge(work,sum(len(r.get('retained_statements',()))+1 for r in selected))
+        needed = set().union(*(set(r.get('retained_statements',())) for r in selected)) if selected else set()
+        if not needed:
+            continue
+        required = set(); mapped = {}; targets_owned = {}; all_proofs = []; failed = False
+        _construct_charge(work,len(needed))
+        if any(not left['statements'].get(digest) for digest in needed):
+            continue
+        for digest in needed:
+            _construct_charge(work,len(left['statements'].get(digest,())))
+            for row in left['statements'].get(digest,()):
+                code=inventories[0][0]
+                low=code.position(code.starts[row['first']])[0]
+                high=code.position(code.starts[row['end']])[0]
+                _construct_charge(work,high-low+1)
+                required.update(range(low,high+1))
+        _construct_charge(work,len(left['statements'])+sum(len(rows) for rows in left['statements'].values()))
+        for digest,rows in left['statements'].items():
+            for row in rows:
+                code=inventories[0][0]
+                low=code.position(code.starts[row['first']])[0]
+                high=code.position(code.starts[row['end']])[0]
+                _construct_charge(work,high-low+1)
+                if not required.intersection(range(low,high+1)) or set(range(low,high+1)) <= set(mapped):
+                    continue
+                a=zero_arg_callback_fragment(sources[0],groups[0],grouped[0][0],grouped[0][2],low,high,inventories[0],work,single_binding=True,phase_cache=phase_cache)
+                if a is None:
+                    continue
+                targets=[]
+                _construct_charge(work,len(right['statements'].get(digest,())))
+                for target in right['statements'].get(digest,()):
+                    other=inventories[1][0]
+                    lo=other.position(other.starts[target['first']])[0]
+                    hi=other.position(other.starts[target['end']])[0]
+                    _construct_charge(work,sum(len(line)+1 for source,first,last in ((sources[0],low,high),(sources[1],lo,hi)) for line in source[first-1:last]))
+                    if high-low != hi-lo or sources[0][low-1:high] != sources[1][lo-1:hi]:
+                        continue
+                    b=zero_arg_callback_fragment(sources[1],groups[1],grouped[1][0],grouped[1][2],lo,hi,inventories[1],work,single_binding=True,phase_cache=phase_cache)
+                    if b is not None and a.signature==b.signature:
+                        targets.append((lo,hi,b))
+                if len(targets)!=1:
+                    continue
+                lo,hi,b=targets[0]
+                _construct_charge(work,high-low+1)
+                for number in range(low,high+1):
+                    target=number+lo-low
+                    if (number in mapped and mapped[number]!=target
+                            or target in targets_owned and targets_owned[target]!=number):
+                        failed=True;break
+                    mapped[number]=target;targets_owned[target]=number
+                if failed:break
+                all_proofs.append((low,high,a,lo,hi,b))
+            if failed:break
+        if failed or not all_proofs or not required <= set(mapped):
+            continue
+        # Bind the unchanged phase construction header separately. This proves
+        # only construction/entry; it does not paint the changed callback body.
+        first_proof = all_proofs[0]
+        old_entry = first_proof[2].witness['callback_span'][0][0]
+        new_entry = first_proof[5].witness['callback_span'][0][0]
+        a=zero_arg_callback_fragment(sources[0],groups[0],grouped[0][0],grouped[0][2],old_entry,old_entry,inventories[0],work,single_binding=True,phase_cache=phase_cache)
+        b=zero_arg_callback_fragment(sources[1],groups[1],grouped[1][0],grouped[1][2],new_entry,new_entry,inventories[1],work,single_binding=True,phase_cache=phase_cache)
+        if a is None or b is None or a.signature!=b.signature or sources[0][old_entry-1]!=sources[1][new_entry-1]:
+            continue
+        all_proofs.append((old_entry,old_entry,a,new_entry,new_entry,b))
+        if (old_entry in mapped and mapped[old_entry]!=new_entry
+                or new_entry in targets_owned and targets_owned[new_entry]!=old_entry):
+            continue
+        mapped[old_entry]=new_entry;targets_owned[new_entry]=old_entry
+        _construct_charge(work,len(mapped))
+        if any(line in counts[0] and target not in counts[1] for line,target in mapped.items()):
+            continue
+        _construct_charge(work,len(all_proofs)*(len(all_proofs).bit_length()+1))
+        all_proofs.sort(key=lambda row:(row[0],row[1]))
+        states=[[],[]]
+        for side in (0,1):
+            for index in range(len(groups[side][2])):
+                vector=[]
+                for proof in all_proofs:
+                    _construct_charge(work,len(proof[2 if side==0 else 5].states[index]))
+                    vector.extend(proof[2 if side==0 else 5].states[index])
+                states[side].append(tuple(vector))
+        _construct_charge(work,(len(states[0])*len(states[1])+1)*len(states[0][0]))
+        matching=compiled_hit_state_matching(*states)
+        if matching is None:
+            raise ValueError('Single-bound callback phase lost compiled-copy coverage')
+        _construct_charge(work,len(mapped))
+        executable={line:target for line,target in mapped.items() if line in counts[0] and target in counts[1]}
+        if any(line in pairs and pairs[line]!=target for line,target in executable.items()):
+            raise ValueError('Ambiguous single-bound callback phase correspondence')
+        if any(target in all_targets and all_targets[target]!=line for line,target in executable.items()):
+            raise ValueError('Non-injective single-bound callback phase correspondence')
+        all_targets.update((target,line) for line,target in executable.items())
+        pairs.update(executable);proved.add(groups[0][:2])
+        receipts.append(dict(file=name,kind='single-bound-callback-retained-statements',
+            base_range=list(groups[0][:2]),head_range=list(groups[1][:2]),
+            pairs=[list(row) for row in sorted(executable.items())],
+            statement_witnesses=[dict(base=[r[0],r[1]],head=[r[3],r[4]],
+                signature_sha256=hashlib.sha256(repr(r[2].signature).encode()).hexdigest(),
+                base_phase=r[2].witness,head_phase=r[5].witness) for r in all_proofs],
+            base_instance_states=states[0],head_instance_states=states[1],instance_matching=matching,
+            claim='Exact local retained statements only, all root and phase copies; no changed sibling or callee equivalence'))
+    return pairs,receipts,proved
+
+
 def retained_replacement_obligations(name, old, new, before, after, inventories, grouped,
                                      replacements, work, head_counts=None, parent_files=None):
     if not replacements or any(value is None for value in tuple(inventories) + tuple(grouped)):
@@ -3431,7 +3642,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 parameter_signature=parameter_signature,
                 statements=by_digest, constructs=by_opening)
         descriptors.append(functions)
-    statement_contexts = {}; capsule_indexes = {}
+    statement_contexts = {}; capsule_indexes = {}; callback_indexes = {}
     def statement_context(descriptor, code, row):
         key = id(code), row['first'], descriptor['row']['opening']
         if key not in statement_contexts:
@@ -3472,17 +3683,29 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 index[opening] = (closing, value); counts[value] += 1
             capsule_indexes[key] = index, counts
         return capsule_indexes[key]
+    def indexed_callback_candidates(compiled, side, prefix):
+        if side not in callback_indexes:
+            _construct_charge(work, 4 * len(compiled[0]))
+            owners = [owner for owner in compiled[0] if owner['name'].startswith('_RNC')]
+            _construct_charge(work, (len(owners).bit_length() + 2)
+                              * sum(len(owner['name']) + 1 for owner in owners))
+            owners.sort(key=lambda owner: owner['name'])
+            callback_indexes[side] = [owner['name'] for owner in owners], owners
+        names, owners = callback_indexes[side]
+        _construct_charge(work, (len(prefix) + 1) * (len(names).bit_length() + 1))
+        for slot in range(bisect.bisect_left(names, prefix), len(names)):
+            _construct_charge(work, len(prefix) + 1)
+            if not names[slot].startswith(prefix):
+                break
+            yield owners[slot]
     def attached_callbacks(descriptor, code, compiled, ordered, side, source):
         index = counts = None
         result = []; all_children = set()
         for parent in descriptor['group'][2]:
             shape = plain_rust_function_symbol(parent['name']); children = {}
             prefix = '_RNC' + parent['name'][2:]
-            _construct_charge(work, len(prefix) + len(compiled[0]))
-            for child in compiled[0]:
-                _construct_charge(work, len(child['name']))
-                if shape is None or not child['name'].startswith(prefix):
-                    continue
+            candidates = () if shape is None else indexed_callback_candidates(compiled, side, prefix)
+            for child in candidates:
                 _construct_charge(work, len(prefix))
                 if not direct_rust_callback_symbol(child['name'], parent['name'], shape.modules):
                     continue
@@ -3652,8 +3875,12 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     _construct_charge(work, sum(len(inventory[1]) for inventory in inventories))
     file_counts = [Counter(row['digest'] for row in inventory[1] if row['kind'] == 'statement')
                    for inventory in inventories]
+    extra_pairs, extra_receipts, extra_proved = one_bound_phase_obligations(
+        name, (old,new), (before,after), descriptors, inventories, grouped, replacements, work)
     candidates = []; receiver_candidates = []
     for left_prefix, left in descriptors[0].items():
+        if left['group'][:2] in extra_proved:
+            continue
         for right_prefix, right in descriptors[1].items():
             _construct_charge(work, 1)
             method_migration = (left_prefix != right_prefix
@@ -3722,7 +3949,10 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
             candidates.append((left_prefix, right_prefix, left, right, seeds, parent, complete_test_rewrite,
                                prefix_only, qualified_seeds))
     left_counts = Counter(row[0] for row in candidates); right_counts = Counter(row[1] for row in candidates)
-    pairs = {}; receipts = []; proved_functions = set(); excerpts = []
+    pairs = dict(extra_pairs); receipts = list(extra_receipts); proved_functions = set(extra_proved); excerpts = []
+    for receipt in extra_receipts:
+        excerpts.extend(('\n'.join(source[receipt[side+'_range'][0]-1:receipt[side+'_range'][1]])+'\n').encode()
+            for side,source in zip(('base','head'),(old,new)))
     receiver_left = Counter(row[0] for row in receiver_candidates)
     receiver_right = Counter(row[1] for row in receiver_candidates)
     for lp, rp, left, right in receiver_candidates:
@@ -4236,6 +4466,44 @@ _DECLARATION_PARAMETER = re.compile(r"\s*(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?
                                     r"[A-Za-z_]\w*\s*:\s*[A-Za-z_]\w*)\s*,\s*", re.ASCII)
 
 
+def declaration_signature_roles(code, args, opening, source, work):
+    """Locate declaration-only lines by argument or return-type position."""
+    close = code.pairs[args]
+    args_line = code.position(code.starts[args])[0]
+    return_line = code.position(code.starts[close])[0]
+    body_line = code.position(code.starts[opening])[0]
+    roles = {}
+    _construct_charge(work, opening-args+body_line-args_line)
+    for number in range(args_line+1, return_line):
+        if _DECLARATION_PARAMETER.fullmatch(source[number-1]) is None:
+            continue
+        a = bisect.bisect_left(code.starts,code.offsets[number-1])
+        b = bisect.bisect_left(code.starts,code.offsets[number])
+        _construct_charge(work,b-a)
+        if a < b and all(code.parents[token] == args for token in range(a,b)):
+            roles['parameter',number-args_line,0,0] = number
+    if code.words[close+1:close+2] != ['->']:
+        return roles
+    levels = {}; depth = 0
+    for token in range(close+2,opening):
+        word = code.words[token]
+        if (word not in ('::','<','>',',','+','=')
+                and (word in ('const','where','for','impl','extern','unsafe','async')
+                     or re.fullmatch(r"'?[A-Za-z_]\w*",word,re.ASCII) is None)):
+            return roles
+        number = code.position(code.starts[token])[0]
+        levels.setdefault(number,[depth,depth])
+        depth += (word == '<') - (word == '>')
+        if depth < 0:
+            return roles
+        levels[number][1] = depth
+    if not depth:
+        for number, (before,after) in levels.items():
+            if number < body_line:
+                roles['return-type',number-return_line,before,after] = number
+    return roles
+
+
 def retired_declaration_parameter(name, line, target, sides, indexes, head_names, work):
     """Discard a spurious parameter-line match while retaining all execution obligations."""
     file_scope = re.fullmatch(r'src/([A-Za-z_]\w*(?:/[A-Za-z_]\w*)*)\.rs', name, re.ASCII)
@@ -4300,11 +4568,17 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
                 return None
             trait = nominal((*crate[:-supers], *path[supers:])); owner_type = nominal((*crate,match[2]))
         low = code.position(code.starts[first]); high = code.position(code.ends[last-1]); roots = {}
+        roles = declaration_signature_roles(code,args,definition['opening'],source,work)
+        signature_low = (min(roles.values(),default=number),1)
+        signature_high = (max(roles.values(),default=number)+1,1)
+        exclusive = len(roles) > 1
         for owner in index.inventories.get(name, ()):
             symbol = owner['name']; regions = owner['regions']
-            _construct_charge(work, len(regions)+len(method)+1)
+            _construct_charge(work, (1+int(exclusive))*len(regions)+len(method)+1)
             touching = [r for r in regions if tuple(r[:2]) < high and low < tuple(r[2:4])]
             if not touching and not symbol.endswith(method):
+                exclusive = exclusive and not any(tuple(r[:2]) < signature_high and signature_low < tuple(r[2:4])
+                                                  for r in regions)
                 continue
             _construct_charge(work, len(symbol))
             if trait is None:
@@ -4318,6 +4592,8 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
                            and shape.trait == trait and shape.self_type == owner_type)
                 identity = shape.copy_identity if matched else None
             if not matched and not touching:
+                exclusive = exclusive and not any(tuple(r[:2]) < signature_high and signature_low < tuple(r[2:4])
+                                                  for r in regions)
                 continue
             count = owner.get('count'); span = spans.get(id(owner))
             if (not matched or identity in roots or index.name_counts[symbol] != 1 or span is None
@@ -4326,19 +4602,28 @@ def retired_declaration_parameter(name, line, target, sides, indexes, head_names
                     or touching != [[*entry,count,0,0,0]] or not begin <= low < high <= entry[2:4]):
                 return None
             roots[identity] = symbol,count
-        if not roots or sum(count for _,count in roots.values()) != mapped[number]:
+            exclusive = exclusive and [r for r in regions if tuple(r[:2]) < signature_high
+                                      and signature_low < tuple(r[2:4])] == [[*entry,count,0,0,0]]
+        total = sum(count for _,count in roots.values())
+        if not roots or total != mapped[number]:
             return None
-        bindings.append((method,(begin[0],end[0]),roots))
-    (method, old_range, old_roots), (new_method, _, _) = bindings
+        covered_roles = ({role: slot for role,slot in roles.items() if mapped.get(slot) == total}
+                         if exclusive else {})
+        bindings.append((method,(begin[0],end[0]),roots,covered_roles))
+    (method, old_range, old_roots, old_roles), (new_method, _, _, new_roles) = bindings
     if method == new_method or method in head_names or any(symbol in indexes[1].name_counts for symbol,_ in old_roots.values()):
         return None
     alternatives = indexes[1].declaration_ends.get(method[-2:],())
     _construct_charge(work, len(alternatives)*(len(method)+1))
     if any(symbol.endswith(method) for symbol in alternatives):
         return None
-    return dict(file=name, kind='retired-declaration-parameter', line=line, head_candidate=target,
+    candidates = {(old_roles[role],new_roles[role]):role[0] for role in old_roles.keys() & new_roles.keys()
+                  if (old_roles[role],new_roles[role]) != (line,target)
+                  and sides[0][0][old_roles[role]-1] == sides[1][0][new_roles[role]-1]}
+    proof = dict(file=name, kind='retired-declaration-parameter', line=line, head_candidate=target,
                 base_range=list(old_range), declaration=method, owners=sorted(old_roots.values()), pairs=[],
                 summary_credit=[0,0], mapped_credit=[0,0])
+    return proof,candidates
 
 
 def retired_async_methods(name, probes, source, inventory, before, base_index, head_index,
@@ -6217,6 +6502,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
         retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}; neutral_declarations = {}
+        declaration_roles = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
         _construct_charge(construct_work, len(base_groups) + len(head_groups))
         missing_prefixes = base_groups.keys() - head_groups.keys()
@@ -6298,16 +6584,27 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         retained_statement_rows = {}
         def retire_declaration(line,target):
             if (line in anchored or line in deferred_fragments or inventories is None
-                    or old[line-1] != new[target-1] or before.get(line,0) <= 0
-                    or _DECLARATION_PARAMETER.fullmatch(old[line-1]) is None or head_construct_inventory() is None):
+                    or old[line-1] != new[target-1] or before.get(line,0) <= 0):
                 return False
             if line in neutral_declarations:
-                return target == neutral_declarations[line]['head_candidate']
-            sides = ((old,inventories[0],base_spans,before),(new,inventories[1],head_spans,after))
-            proof = retired_declaration_parameter(name,line,target,sides,source_owner_indexes(),head_fn_names,construct_work)
-            if proof is None:
+                return target == neutral_declarations[line][0]
+            candidate = declaration_roles.get((line,target))
+            if candidate is not None:
+                proof, role = candidate
+                proof.setdefault('other_signature_lines', []).append(dict(line=line,head_candidate=target,role=role))
+                neutral_declarations[line] = target,proof
+                return True
+            if _DECLARATION_PARAMETER.fullmatch(old[line-1]) is None or head_construct_inventory() is None:
                 return False
-            neutral_declarations[line] = proof
+            sides = ((old,inventories[0],base_spans,before),(new,inventories[1],head_spans,after))
+            observed = retired_declaration_parameter(name,line,target,sides,source_owner_indexes(),head_fn_names,construct_work)
+            if observed is None:
+                return False
+            proof, candidates = observed
+            neutral_declarations[line] = target,proof
+            _construct_charge(construct_work,len(candidates))
+            for coordinates, role in candidates.items():
+                declaration_roles[coordinates] = proof,role
             retired_declaration_receipts.append(proof)
             return True
         def retained_statement_lines(block):
@@ -6478,10 +6775,25 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             for line,target in sorted(probes):
                 if checked[line] == 1:
                     retire_declaration(line,target)
+            if declaration_roles:
+                targets = {}
+                for a, _, c, _, pending in unresolved_fragments:
+                    _construct_charge(construct_work,len(pending))
+                    for line in pending:
+                        targets.setdefault(line,set()).add(c+line-a)
+                for line, choices in targets.items():
+                    if (len(choices) != 1 or line in anchored or line in deferred_fragments
+                            or line in neutral_declarations):
+                        continue
+                    target, = choices
+                    if (line,target) in declaration_roles:
+                        retire_declaration(line,target)
         if neutral_declarations:
-            for line,proof in neutral_declarations.items():
-                first,last = proof['base_range']; _construct_charge(construct_work,last-first+1)
+            _construct_charge(construct_work,len(neutral_declarations))
+            for first,last in {tuple(proof['base_range']) for _,proof in neutral_declarations.values()}:
+                _construct_charge(construct_work,last-first+1)
                 gone.difference_update(range(first,last+1))
+            for line in neutral_declarations:
                 retained.pop(line,None)
             unresolved_fragments = [(*bounds, active) for *bounds, pending in unresolved_fragments
                 if (active := [line for line in pending if line not in neutral_declarations])]

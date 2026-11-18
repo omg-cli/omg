@@ -173,7 +173,7 @@ impl PublicationFixture {
         }
     }
 
-    pub(super) fn corrupt_identity(&self, version: &str) {
+    pub(super) fn identity_path(&self, version: &str) -> std::path::PathBuf {
         use sha2::{Digest as _, Sha256};
         let root = self
             .versions
@@ -183,13 +183,14 @@ impl PublicationFixture {
         let key = hex::encode(Sha256::digest(
             serde_json::to_vec(&root).expect("exact fixture destination"),
         ));
-        std::fs::write(
-            self.versions
-                .join(".security")
-                .join(format!("{key}.identity.json")),
-            b"invalid publisher identity",
-        )
-        .expect("controlled publisher corruption");
+        self.versions
+            .join(".security")
+            .join(format!("{key}.identity.json"))
+    }
+
+    pub(super) fn corrupt_identity(&self, version: &str) {
+        std::fs::write(self.identity_path(version), b"invalid publisher identity")
+            .expect("controlled publisher corruption");
     }
 }
 

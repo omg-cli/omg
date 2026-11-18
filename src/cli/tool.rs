@@ -1617,6 +1617,7 @@ pub fn registry() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use self::install_managed_fixture as install_managed;
     use super::*;
 
     #[cfg(target_os = "linux")]
@@ -1811,7 +1812,8 @@ with zipfile.ZipFile(sys.argv[1], 'w') as archive:
             .expect("real offline venv");
         assert!(
             created.status.success(),
-            "{}",
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&created.stdout),
             String::from_utf8_lossy(&created.stderr)
         );
         let installed_wheel = Command::new(staging.join("bin/python"))
@@ -2108,7 +2110,7 @@ with zipfile.ZipFile(sys.argv[1], 'w') as archive:
                     .unwrap();
                 assert!(
                     runtime
-                        .block_on(install_managed_fixture(
+                        .block_on(install_managed(
                             manager,
                             package,
                             "fixture-tool",
@@ -2238,7 +2240,7 @@ esac
                 .build()
                 .unwrap();
             let error = runtime
-                .block_on(install_managed_fixture(
+                .block_on(install_managed(
                     "npm",
                     "fixture-tool",
                     "fixture-tool",
@@ -2256,7 +2258,7 @@ esac
             )
             .unwrap();
             let error = runtime
-                .block_on(install_managed_fixture(
+                .block_on(install_managed(
                     "npm",
                     "fixture-tool",
                     "fixture-tool",
@@ -2419,8 +2421,6 @@ esac
     #[cfg(unix)]
     #[test]
     fn dropping_successful_managed_install_still_verifies_and_activates() {
-        use self::install_managed_fixture as install_managed;
-
         if crate::core::testing::run_isolated_test(
             "cli::tool::tests::dropping_successful_managed_install_still_verifies_and_activates",
         ) {
@@ -2524,8 +2524,6 @@ esac
     #[cfg(unix)]
     #[test]
     fn dropping_managed_install_keeps_child_and_cleanup_owned() {
-        use self::install_managed_fixture as install_managed;
-
         if crate::core::testing::run_isolated_test(
             "cli::tool::tests::dropping_managed_install_keeps_child_and_cleanup_owned",
         ) {
@@ -2703,7 +2701,7 @@ exit 1
                     };
                     let (outcome, tick_elapsed) = tokio::join!(
                         biased;
-                        install_managed_fixture(manager, request, "fixture-tool", &tools, &bin),
+                        install_managed(manager, request, "fixture-tool", &tools, &bin),
                         async {
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             started.elapsed()
@@ -3123,7 +3121,7 @@ exit 1
             );
         }
 
-        let error = install_managed_fixture(
+        let error = install_managed(
             "cargo",
             "omg-definitely-not-a-real-crate-000",
             "fake-tool",

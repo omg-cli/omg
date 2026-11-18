@@ -253,9 +253,13 @@ impl DotnetManager {
                             })
                     })
                 {
-                    for component in ["runtime", "aspnetcore-runtime", "windowsdesktop"] {
+                    for (key, component) in [
+                        ("runtime", "runtime"),
+                        ("aspnetcore", "aspnetcore-runtime"),
+                        ("windowsdesktop", "windowsdesktop"),
+                    ] {
                         if let Some(value) = release
-                            .get(component)
+                            .get(key)
                             .and_then(|value| value.get("version"))
                             .and_then(serde_json::Value::as_str)
                         {
@@ -397,6 +401,147 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the isolated fixed-public TLS native fixture"]
+    async fn native_public_install_preserves_authenticated_download_boundary() -> Result<()> {
+        use super::super::security::{
+            ReviewMode, RuntimeEvidenceSource, RuntimeQuery, RuntimeSecurity, admit_installed,
+            fixture_runtime_report,
+        };
+        use super::super::test_archive::{PublicationFixture, tar_gz_entries};
+        use sha2::{Digest as _, Sha512};
+
+        const HOST: &str = "builds.dotnet.microsoft.com";
+        const INDEX: &str = "/dotnet/release-metadata/releases-index.json";
+        const CHANNEL: &str = "/dotnet/release-metadata/9.0/releases.json";
+        const AFFECTED_SDK: &str = "9.0.315";
+        const CVE: &str = "CVE-2099-9000";
+        const ADVISORY: &str = "https://www.cve.org/CVERecord?id=CVE-2099-9000";
+        struct Advisories;
+        impl RuntimeEvidenceSource for Advisories {
+            fn read(&self, query: &RuntimeQuery) -> Result<Vec<u8>> {
+                let mut report: serde_json::Value =
+                    serde_json::from_slice(&fixture_runtime_report(query)?)?;
+                if query.version == AFFECTED_SDK {
+                    report["findings"] = json!([{
+                        "id": CVE, "summary": "Controlled .NET advisory",
+                        "applicability": "applicable", "severity": "high", "urls": [ADVISORY]
+                    }]);
+                }
+                Ok(serde_json::to_vec(&report)?)
+            }
+        }
+        let archive = tar_gz_entries(
+            ".",
+            &[
+                ("dotnet", b"fixture .NET launcher"),
+                ("sdk/payload", b"fixture SDK"),
+            ],
+        )?;
+        let artifact_path = |version| format!("/dotnet/Sdk/{version}/dotnet-sdk.tar.gz");
+        let rid = dotnet_rid()?;
+        let sdk = |version, digest| {
+            json!({
+                "version": version,
+                "files": [{
+                    "name": format!("dotnet-sdk-{rid}.tar.gz"),
+                    "rid": rid,
+                    "url": format!("https://{HOST}{}", artifact_path(version)),
+                    "hash": digest,
+                }]
+            })
+        };
+        let index = serde_json::to_vec(&json!({
+            "releases-index": [{
+                "support-phase": "active",
+                "releases.json": format!("https://{HOST}{CHANNEL}"),
+            }]
+        }))?;
+        let installed_sdk = "9.0.317";
+        let rejected_sdk = "9.0.316";
+        let channel = serde_json::to_vec(&json!({
+            "channel-version": "9.0",
+            "releases": [
+                {
+                    "sdk": {"version": "9.0.318"},
+                    "sdks": [sdk(installed_sdk, hex::encode(Sha512::digest(&archive)))],
+                    "runtime": {"version": "9.0.19"},
+                    "aspnetcore": {"version": "9.0.18"},
+                },
+                {
+                    "sdk": sdk(rejected_sdk, hex::encode(Sha512::digest(b"different bytes"))),
+                    "runtime": {"version": "9.0.17"},
+                },
+                {
+                    "sdk": sdk(AFFECTED_SDK, hex::encode(Sha512::digest(&archive))),
+                    "runtime": {"version": "9.0.16"},
+                },
+            ]
+        }))?;
+        super::super::test_https::fixed_public_routes(&[
+            (HOST, INDEX, &index),
+            (HOST, CHANNEL, &channel),
+            (HOST, &artifact_path(installed_sdk), &archive),
+            (HOST, INDEX, &index),
+            (HOST, CHANNEL, &channel),
+            (HOST, &artifact_path(rejected_sdk), &archive),
+            (HOST, INDEX, &index),
+            (HOST, CHANNEL, &channel),
+            (HOST, &artifact_path(AFFECTED_SDK), &archive),
+        ]);
+
+        let fixture = PublicationFixture::new("dotnet", "dotnet");
+        let manager = DotnetManager {
+            security: RuntimeSecurity::with_source(std::sync::Arc::new(Advisories)),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager.install(installed_sdk).await?;
+        let installed = fixture.versions.join(installed_sdk);
+        assert_eq!(
+            fs::read(fixture.versions.join("current/dotnet"))?,
+            b"fixture .NET launcher"
+        );
+        assert_eq!(fs::read(installed.join("sdk/payload"))?, b"fixture SDK");
+
+        let error = manager
+            .install(rejected_sdk)
+            .await
+            .expect_err("a checksum mismatch must refuse publication");
+        assert!(
+            format!("{error:#}").contains("Checksum mismatch"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join(rejected_sdk).exists());
+        let error = manager
+            .install(AFFECTED_SDK)
+            .await
+            .expect_err("unattended install must refuse the reported CVE");
+        let warning = format!("{error:#}");
+        assert!(
+            warning.contains(CVE) && warning.contains(ADVISORY),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("requires an attended controlling terminal"),
+            "{warning}"
+        );
+        assert!(!fixture.versions.join(AFFECTED_SDK).exists());
+        assert_eq!(fs::read_link(fixture.versions.join("current"))?, installed);
+        let admission = admit_installed("dotnet", &installed, ReviewMode::CachedOnly)?;
+        admission.verify(&installed)?;
+        let identity: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.identity_path(installed_sdk))?)?;
+        assert_eq!(
+            identity["components"],
+            json!({
+                "sdk": installed_sdk, "runtime": "9.0.19", "aspnetcore-runtime": "9.0.18"
+            })
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn release_metadata_refuses_private_target_before_connecting() {

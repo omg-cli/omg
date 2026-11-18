@@ -3172,6 +3172,84 @@ class SourceAwareCoverageTests(unittest.TestCase):
             {2: 1}, {2: 1}, UnreadOwners(), UnreadOwners(), {}, {}, work, inventories, grouped)
         self.assertEqual((pairs, receipts), ({}, []))
 
+    def single_bound_phase_fixture(self, *, repeated=False, mutate=None):
+        sources = [
+            ['fn retained() {', '    dispatch(|handle| {', '        verify(handle);',
+             *(['        verify(handle);'] if repeated else []), '        old_step();', '    });', '}'],
+            ['fn retained() {', '    dispatch(|handle| {', '        verify(handle);',
+             '        new_step();', '    });', '}']]
+        documents = []; inventories = []; grouped = []; descriptors = []
+        work = [2_000_000]
+        for source in sources:
+            opening = source[1].index('{') + 1; closing = len(source) - 1
+            members = []
+            for index, state in enumerate((1, 0)):
+                parent = f'_RNvCs{index + 1}_7example8retained'
+                members.extend([
+                    dict(name=parent, count=state, filenames=['/src/example.rs'], regions=[
+                        [1, 1, 1, source[0].index('{') + 1, state, 0, 0, 0],
+                        [2, 5, 2, 13, state, 0, 0, 0],
+                        [len(source), 1, len(source), 2, state, 0, 0, 0]]),
+                    dict(name='_RNC' + parent[2:] + '0B3_', count=state,
+                         filenames=['/src/example.rs'], regions=[
+                             [2, opening, 2, opening + 1, state, 0, 0, 0],
+                             *[[line, 9, line, len(source[line - 1]) + 1, state, 0, 0, 0]
+                               for line in range(3, closing)],
+                             [closing, 5, closing, 6, state, 0, 0, 0]])])
+            documents.append(members)
+            inventory = coverage._construct_inventory(source, work); inventories.append(inventory)
+            compiled = coverage._compiled_function_groups('example.rs', members,
+                {'/src/example.rs': 'example.rs'}, source, work); grouped.append(compiled)
+            code = inventory[0]; function = next(row for row in inventory[1] if row['kind'] == 'fn')
+            statements = {}
+            for row in inventory[1]:
+                if row['kind'] == 'statement' and function['opening'] < row['first'] <= row['end'] < function['end']:
+                    statements.setdefault(row['digest'], []).append(row)
+            descriptors.append({'fn retained()': dict(group=compiled[1]['fn retained()'],
+                row=function, declaration='retained', signature=function['header'],
+                attributes=(), context=((), ()), statements=statements)})
+        code = inventories[0][0]
+        retained = next(row['digest'] for row in inventories[0][1]
+            if row['kind'] == 'statement' and code.position(code.starts[row['first']])[0] == 3)
+        replacements = {0: dict(base_line=len(sources[0])-1, head_line=len(sources[1])-1,
+            base_range=[2, len(sources[0])-1], head_range=[2, len(sources[1])-1],
+            retained_statements={retained})}
+        counts = [{line: 1 for line in range(1, len(source)+1)} for source in sources]
+        if mutate:
+            mutate(replacements, counts)
+        return coverage.one_bound_phase_obligations('example.rs', sources, counts, descriptors,
+            inventories, grouped, replacements, work)
+
+    def test_single_bound_phase_retains_complete_hot_and_cold_copies(self):
+        pairs, receipts, proved = self.single_bound_phase_fixture()
+        self.assertEqual(pairs, {2: 2, 3: 3})
+        self.assertEqual(proved, {(1, 6)})
+        self.assertEqual(len(receipts), 1)
+        self.assertTrue(any(not any(row) for row in receipts[0]['base_instance_states']))
+        self.assertTrue(any(any(row) for row in receipts[0]['base_instance_states']))
+
+    def test_single_bound_phase_refuses_cross_scope_and_overlapping_obligations(self):
+        def outside_head(replacements, counts):
+            record = copy.deepcopy(replacements[0]); record['head_line'] += 10
+            record['head_range'] = [line + 10 for line in record['head_range']]
+            replacements[1] = record
+        def overlapping_old(replacements, counts):
+            record = copy.deepcopy(replacements[0]); record['base_line'] = 8
+            record['base_range'] = [5, 8]; replacements[1] = record
+        for mutate in (outside_head, overlapping_old):
+            with self.subTest(mutate=mutate.__name__):
+                self.assertEqual(self.single_bound_phase_fixture(mutate=mutate), ({}, [], set()))
+
+    def test_single_bound_phase_refuses_missing_statement_or_construction_da(self):
+        for line in (2, 3):
+            with self.subTest(line=line):
+                def missing(replacements, counts):
+                    counts[1].pop(line)
+                self.assertEqual(self.single_bound_phase_fixture(mutate=missing), ({}, [], set()))
+
+    def test_single_bound_phase_cannot_credit_repeated_old_calls_to_one_head_call(self):
+        self.assertEqual(self.single_bound_phase_fixture(repeated=True), ({}, [], set()))
+
     def attribution_obligations(self, old, new, *, excluded=(), painted=(), callbacks=False,
                                 parent_states=((1, 1), (1, 1)), child_states=None, mutation=None):
         sources = [source.splitlines() for source in (old, new)]
@@ -7115,6 +7193,39 @@ impl SecurityPolicy {
 
 
 class RetiredDeclarationParameterTests(unittest.TestCase):
+    def compare_signature(self, foreign_return_paint=False):
+        old = ['pub(crate) fn previous(', '    ttl: Duration,', ') -> Result<',
+               '    OldValue,', '    Error,', '> {', '    check_old(ttl)', '}']
+        replacement = ['fn replacement(', '    ttl: Duration,', ') -> Result<',
+                       '    NewValue,', '    Error,', '>  {', '    check_new(ttl)', '}']
+        new = replacement + [line.replace('replacement','another').replace('check_new','check_another')
+                             for line in replacement]
+        file = '/src/example.rs'
+        def owner(name, source, first, crate, entry_end):
+            return dict(name=f'_RNvNtCs{crate}_7omg_lib7example{len(name)}{name}', count=1, filenames=[file],
+                regions=[[first,1,first+5,entry_end,1,0,0,0],
+                         [first+6,5,first+6,len(source[first+5])+1,1,0,0,0],
+                         [first+7,1,first+7,2,1,0,0,0]])
+        def mutate(base, head):
+            base['data'][0]['functions'] = [owner('previous',old,1,1,2)]
+            if foreign_return_paint:
+                base['data'][0]['functions'].append(dict(name='opaque', count=1, filenames=[file],
+                    regions=[[5,5,5,10,1,0,0,0]]))
+            head['data'][0]['functions'] = [owner(name,new,first,2,3)
+                                         for name, first in (('replacement',1),('another',9))]
+        sources = tuple({'src/example.rs': ('\n'.join(source)+'\n').encode()} for source in (old,new))
+        return SourceAwareCoverageTests().compare([(line,1) for line in range(1,len(old)+1)],
+            [(line,1) for line in range(1,len(new)+1)], mutate, sources)
+
+    def test_only_closed_signature_rows_share_the_retired_parameter_proof(self):
+        proof, = self.compare_signature()['retired_declarations']
+        self.assertEqual(proof['pairs'], [])
+        self.assertEqual(proof['mapped_credit'], [0,0])
+        self.assertEqual([(row['line'],row['head_candidate'],row['role']) for row in proof['other_signature_lines']],
+                         [(3,3,'return-type'),(5,5,'return-type')])
+        with self.assertRaisesRegex(ValueError, 'Unproved retained execution|Ambiguous unchanged source correspondence'):
+            self.compare_signature(foreign_return_paint=True)
+
     def compare(self, cold_head_line=None, mutate_old=None, mutate_head=None, head_sources=None):
         old = ['pub(crate) fn previous(', '    ttl: Duration,', ') -> u8 {',
                '    check_old(ttl)', '}']

@@ -1243,6 +1243,10 @@ mod tests {
             lock_metadata(&location, MetadataAccess::Shared).is_err(),
             "a metadata lock must not follow a symlink to an unrelated inode"
         );
+        assert!(
+            open_fresh_metadata_index_at(&location, Duration::from_mins(1)).is_err(),
+            "the metadata reader must propagate an unsafe lock failure"
+        );
         std::fs::remove_file(&lock_path)?;
         std::fs::hard_link(&target, &lock_path)?;
         assert!(

@@ -1770,7 +1770,7 @@ async fn security_audit_fetches_all_osv_pages_and_refuses_partial_results_over_r
         } => {
             assert_eq!(result.total, 1);
             assert_eq!(result.packages[0].name, package);
-            assert_eq!(result.packages[0].version.to_string(), "1.0.0");
+            assert_eq!(result.packages[0].version, "1.0.0");
         }
         other => panic!("catalog lookup returned {other:?}"),
     }
