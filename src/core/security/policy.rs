@@ -2339,12 +2339,13 @@ mod tests {
             !crate::core::privilege::is_root(),
             "fixture must be unprivileged"
         );
-        let policy = SecurityPolicy::default();
+        let policy: SecurityPolicy = toml::from_str("advisory_requirement = 'optional'")?;
         assert_eq!(
-            policy.advisory_requirement,
-            AdvisoryRequirement::Optional,
-            "the built-in policy allows optional advisory coverage"
+            policy,
+            SecurityPolicy::default(),
+            "omitted fields retain defaults"
         );
+        assert_eq!(policy.advisory_requirement, AdvisoryRequirement::Optional);
         assert!(policy.allow_aur, "the default allows AUR");
         let argument = format!(
             "{POLICY_MARKER}{}",

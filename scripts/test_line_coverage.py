@@ -29,6 +29,30 @@ def report(hit=1, found=2, counts=(1, 0)):
 
 
 class LineCoverageTests(unittest.TestCase):
+    def test_single_validated_owner_reuses_its_raw_span_without_sorting_one_shape(self):
+        name = 'src/example.rs'
+        filename = '/artifact/src/example.rs'
+        source = ['fn retained() {', '    sample();', '}']
+        fields = [filename]
+        regions = [[1, 1, 1, 14, 1, 0, 0, 0],
+                   *([[2, 5, 2, 11, 1, 0, 0, 0]] * 80),
+                   [3, 1, 3, 2, 1, 0, 0, 0]]
+        owner = dict(name='compiled', filenames=fields, regions=regions)
+        files = {filename: name}
+        spans = {id(owner): coverage.source_owner_span(owner, name, files, source)}
+        structure = coverage._source_structural_map(source)
+        prefixes = coverage.source_function_prefixes(source, [(1, 3)], structure=structure)
+        _, groups, _ = coverage._compiled_function_groups(name, [owner], files, source, [12],
+            source_structure=structure, validated_spans=spans, shared_prefixes=prefixes)
+        self.assertEqual(list(groups.values()), [(1, 3, [owner])])
+
+        owner['regions'] = [regions[-1], *regions[:-1]]
+        self.assertEqual(coverage.source_owner_span(owner, name, files, source), spans[id(owner)])
+        _, reversed_groups, _ = coverage._compiled_function_groups(
+            name, [owner], files, source, [200], source_structure=structure,
+            validated_spans=spans, shared_prefixes=prefixes)
+        self.assertEqual(reversed_groups, groups)
+
     def test_replacement_and_retained_rows_share_the_same_full_source_diff(self):
         old = ['fn retained() {', '    before();', '    keep();', '}']
         new = ['fn retained() {', '    after();', '    keep();', '}']
@@ -5148,7 +5172,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
         extra = dict(child, regions=child['regions']+[[6,13,6,14,1,0,0,0]])
         self.assertIsNone(observe(owner=extra))
 
-    def parameterized_rust_helper_record(self, insertion=False, fault=None, body_group=True):
+    def parameterized_rust_helper_record(self, insertion=False, fault=None, body_group=True, enum_role=False):
         source = ['#[cfg(test)]', '#[expect(clippy::unwrap_used)]', 'mod tests {',
             '    async fn install_fixture(corrupt: bool, missing_launcher: Option<&str>) -> Result<()> {',
             '        let ready = read_fixture().await?;',
@@ -5159,6 +5183,19 @@ class SourceAwareCoverageTests(unittest.TestCase):
         field = 'crate::runtimes::security::RuntimeSecurity::fixture'
         shift = int(insertion)
         if insertion: source.insert(6, f'            security: {field}(),')
+        if enum_role:
+            source[3]='    async fn rust_src_install_fixture(incremental: bool, selection: SourceSelection) -> Result<()> {'
+            source[-1:-1]=['    #[derive(Clone, Copy, Debug)]',
+                           '    enum SourceSelection { Wildcard, HostPreferred, Unavailable, Missing, }']
+            if fault=='enum-payload': source[-2]=source[-2].replace('Wildcard,','Wildcard(u8),')
+            elif fault=='enum-no-copy': source[-3]=source[-3].replace('Copy, ','')
+            elif fault=='enum-variant': source[-2]=source[-2].replace('Missing','Other')
+            elif fault=='enum-public': source[-2]=source[-2].replace('enum ','pub enum ')
+            elif fault=='enum-alias': source[-2]='    type SourceSelection = Other;'
+            elif fault=='enum-duplicate': source[-1:-1]=source[-3:-1]
+            elif fault=='enum-foreign-module': source[-3:-1]=['    mod other {',*source[-3:-1],'    }']
+            elif fault=='enum-reference': source[3]=source[3].replace('selection: SourceSelection','selection: &SourceSelection')
+
         if fault == 'parameter-type': source[3] = source[3].replace('corrupt: bool', 'corrupt: usize')
         elif fault == 'parameter-name': source[3] = source[3].replace('missing_launcher:', 'other:')
         elif fault == 'return-type': source[3] = source[3].replace('Result<()>', 'Option<()>')
@@ -5169,6 +5206,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
         end = 11 + shift
         root = dict(name='_RNvNtNtNtCs1_7omg_lib8runtimes4rust5tests15install_fixture', count=4,
                     filenames=['/src/runtimes/rust.rs'], regions=[[4,5,4,opening-1,4,0,0,0]])
+        if enum_role: root['name']=root['name'].replace('15install_fixture','24rust_src_install_fixture')
         question = source[7+shift].index('?') + 1
         fields = [[6,13,6,20,4,0,0,0],
             [7+shift,source[6+shift].index('fixture')+1,7+shift,len(source[6+shift]),4,0,0,0],
@@ -5285,6 +5323,30 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 except ValueError: continue
                 self.assertFalse(any(row['kind']=='async-runtime-inventory-assertion'
                     for row in receipt.get('positive_source_fragments',[])))
+
+    def test_owned_source_enum_parameter_reuses_exact_record_and_cold_slot_proof(self):
+        old=self.parameterized_rust_helper_record(enum_role=True)
+        new=self.parameterized_rust_helper_record(insertion=True,enum_role=True)
+        self.assertIsNotNone(old)
+        self.assertIsNotNone(new)
+        self.assertEqual(old[0],new[0])
+        self.assertNotEqual(old[0],self.parameterized_rust_helper_record()[0])
+        self.assertFalse(old[1]['security_initializer'])
+        self.assertEqual(len(new[1]['security_initializer']),1)
+        self.assertIn(False,[row[-1] for row in old[0][2]])
+
+    def test_owned_source_enum_parameter_refuses_unbound_layout_scope_and_cold_state(self):
+        for fault in ('enum-payload','enum-no-copy','enum-variant','enum-public','enum-alias',
+                      'enum-duplicate','enum-foreign-module','enum-reference','production-module',
+                      'wrong-factory','foreign-constructor','missing-constructor','duplicate-body',
+                      'foreign-overlap','channel','cold-entry','missing-da'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(self.parameterized_rust_helper_record(insertion=True,enum_role=True,fault=fault))
+        old=self.parameterized_rust_helper_record(enum_role=True)
+        for fault in ('lost-field','lost-cold'):
+            with self.subTest(fault=fault):
+                new=self.parameterized_rust_helper_record(insertion=True,enum_role=True,fault=fault)
+                self.assertTrue(new is None or new[0]!=old[0])
 
     def test_parameterized_runtime_helper_record_retains_cold_field_and_exact_role(self):
         old = self.parameterized_rust_helper_record()

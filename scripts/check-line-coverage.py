@@ -1233,13 +1233,14 @@ def _compiled_function_groups(name, owners, files, source, work=None, source_str
         _construct_charge(work, len(source) + len(owners))
         if source_structure is None:
             _construct_charge(work, sum(len(line) + 1 for line in source))
-        scans = 2 if validated_spans is None else 1
-        _construct_charge(work, sum(len(owner['filenames']) + scans * len(owner['regions']) for owner in owners))
+        _construct_charge(work, sum(len(owner['filenames']) for owner in owners))
     names = Counter(owner['name'] for owner in owners)
     inventory = [owner for owner in owners if any(
         files.get(path) == name or path.endswith('/' + name) for path in owner['filenames'])]
     by_span = {}
     for owner in inventory:
+        if work is not None and validated_spans is None:
+            _construct_charge(work, len(owner['regions']))
         span = (source_owner_span(owner, name, files, source) if validated_spans is None
                 else validated_spans.get(id(owner)))
         if span is None:
@@ -1256,15 +1257,33 @@ def _compiled_function_groups(name, owners, files, source, work=None, source_str
         if work is not None:
             _construct_charge(work,len(by_span))
         prefixes = {span:shared_prefixes[span] for span in by_span if span in shared_prefixes}
+
+    def reaches_end(owner, end, column):
+        for region in reversed(owner['regions']):
+            if work is not None:
+                _construct_charge(work, 1)
+            if region[2] == end and region[3] > column:
+                return True
+        return False
+
     valid = {}
     for span, prefix in prefixes.items():
         members = by_span[span]
-        shapes = {tuple(sorted(tuple(row[:4] + row[5:]) for row in owner['regions']))
-                  for owner in members}
-        if (len(shapes) == 1 and all(names[owner['name']] == 1 for owner in members)
-                and all(any(row[2] == span[1]
-                            and row[3] > len(source[span[1] - 1].rstrip().encode())
-                            for row in owner['regions']) for owner in members)):
+        end = span[1]
+        closing = source[end - 1].rstrip()
+        if work is not None:
+            _construct_charge(work, len(members) + len(source[end - 1]) + 1)
+        if not all(names[owner['name']] == 1 for owner in members):
+            continue
+        if len(members) > 1:
+            if work is not None:
+                _construct_charge(work, sum(len(owner['regions']) for owner in members))
+            shapes = {tuple(sorted(tuple(row[:4] + row[5:]) for row in owner['regions']))
+                      for owner in members}
+            if len(shapes) != 1:
+                continue
+        column = len(closing.encode())
+        if all(reaches_end(owner, end, column) for owner in members):
             valid[prefix] = (*span, members)
     return inventory, valid, names
 
@@ -3870,10 +3889,25 @@ def async_test_fragment_owners(name, group, owners, names, inventory, first, las
     tokio_test = ('#','[','tokio','::','test',']','async','fn')
     headers = (tokio_test, ('#','[','cfg','(','unix',')',']')+tokio_test) if result_alias else (tokio_test,)
     result = ('(',')','->','Result','<','(',')','>') if result_alias else _RESULT_TEST_SIGNATURE[6:]
-    helper = (runtime_helper and result_alias and name=='src/runtimes/rust.rs'
-              and words[:declaration+1]==('async','fn')
-              and words[declaration+2:]==('(','corrupt',':','bool',',','missing_launcher',':',
+    runtime_header=(runtime_helper and result_alias and name=='src/runtimes/rust.rs'
+                    and words[:declaration+1]==('async','fn'))
+    helper = (runtime_header and words[declaration+2:]==('(','corrupt',':','bool',',','missing_launcher',':',
                   'Option','<','&','str','>',')','->','Result','<','(',')','>'))
+    enum_binding=None
+    if (runtime_header and scope is not None and words[declaration+2:]==(
+            '(','incremental',':','bool',',','selection',':','SourceSelection',')','->','Result','<','(',')','>')):
+        module=code.parents[fn['first']]
+        header=('#','[','derive','(','Clone',',','Copy',',','Debug',')',']','enum','SourceSelection')
+        variants=('Wildcard',',','HostPreferred',',','Unavailable',',','Missing',',')
+        _construct_charge(work,len(rows)+len(code.words)+1)
+        enums=[row for row in rows if row['kind']=='enum' and row.get('header')==header
+               and code.parents[row['first']]==module]
+        bindings=[i for i,word in enumerate(code.words) if i and word=='SourceSelection'
+                  and code.parents[i]==module and code.words[i-1] in ('enum','struct','type','trait','union','mod','fn')]
+        if (len(enums)==len(bindings)==1
+                and tuple(code.words[enums[0]['opening']+1:enums[0]['end']])==variants):
+            enum_binding=(tuple(scope[0]),header,variants)
+            helper=True
     if ((not helper and (words[:declaration+1] not in headers or words[declaration+2:]!=result))
             or scope is None or scope[:2]!=(['tests'],['tests'])):
         return None
@@ -3913,7 +3947,12 @@ def async_test_fragment_owners(name, group, owners, names, inventory, first, las
             or [r[4] for r in child['regions'] if tuple(r[:4])==body_entry and r[5:]==[0,0,0]]!=[child['count']]
             or any(not open_at<=tuple(r[:2])<tuple(r[2:4])<=close_at for r in child['regions'])):
         return None
-    return fn, (shape.identity,words), dict(root=root['name'],body=child['name'],regions=raw,entry=body_entry), child['count']
+    identity=(shape.identity,words)
+    witness=dict(root=root['name'],body=child['name'],regions=raw,entry=body_entry)
+    if enum_binding is not None:
+        identity=(*identity,enum_binding)
+        witness['enum_parameter_source']=enum_binding
+    return fn, identity, witness, child['count']
 
 
 def initial_async_test_record(name, source, counts, group, owners, names, inventory, first, last, work):
