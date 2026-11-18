@@ -684,7 +684,7 @@ jobs:
     steps:
       - name: Configure signed Ubuntu archive before checkout
         if: matrix.platform == 'ubuntu-2604'
-        uses: omg-cli/omg/.github/actions/ubuntu-apt@572076847a70f932757630c0f7d487ca6e8de64f
+        uses: omg-cli/omg/.github/actions/ubuntu-apt@84de6d880056ad0fd4eb539dbca1b45759f35c32
 
       - name: Setup environment
         run: ${{ matrix.setup }}
