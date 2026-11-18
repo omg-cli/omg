@@ -410,7 +410,9 @@ git() { printf '%040d\\n' 1; }
             self.assertIn(name, selected)
             self.assertIn('"$test_name" == ' + name, script)
         self.assertIn('runner=(env OMG_ISOLATED_FIXTURE_TEST="$test_name")', script)
-        self.assertEqual(len(selected), 29)
+        self.assertEqual(len(selected), 31)
+        self.assertIn('package_managers::aur::client::tests::sandbox_launcher_isolates_host_ipc_namespace', selected)
+        self.assertIn('package_managers::arch::tests::platform_keyring_list_requires_a_bounded_root_owned_file', selected)
         for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
             name = 'package_managers::arch_install::native_tests::' + test
             self.assertIn(name, selected)

@@ -124,52 +124,6 @@ fn append_platform_keyrings(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::append_platform_keyrings;
-    use std::os::unix::fs::symlink;
-
-    #[test]
-    #[ignore = "requires root-owned fixture files"]
-    fn platform_keyring_list_requires_a_bounded_root_owned_file() -> anyhow::Result<()> {
-        let directory = tempfile::tempdir()?;
-        let list = directory.path().join("keyrings");
-        let mut names = vec!["archlinux-keyring".to_owned()];
-
-        append_platform_keyrings(&list, &mut names, |_| Ok(false))?;
-        assert_eq!(names, ["archlinux-keyring"]);
-
-        let contents = "\n# platform keys\narchlinux-keyring\ninvalid\n/invalid-keyring\ninstalled-keyring\nmissing-keyring\n";
-        std::fs::write(&list, contents)?;
-        append_platform_keyrings(&list, &mut names, |name| match name {
-            "installed-keyring" => Ok(true),
-            "missing-keyring" => Ok(false),
-            other => panic!("unexpected keyring lookup: {other}"),
-        })?;
-        assert_eq!(names, ["archlinux-keyring", "installed-keyring"]);
-
-        let link = directory.path().join("link");
-        symlink(&list, &link)?;
-        let error = append_platform_keyrings(&link, &mut names, |_| Ok(false))
-            .expect_err("root process must not follow a keyring-list symlink");
-        assert!(
-            error
-                .to_string()
-                .contains("Cannot read platform keyring packages")
-        );
-
-        let error = append_platform_keyrings(directory.path(), &mut names, |_| Ok(false))
-            .expect_err("the keyring list must be a regular file");
-        assert!(error.to_string().contains("root-controlled regular file"));
-
-        std::fs::write(&list, vec![b'x'; 65537])?;
-        let error = append_platform_keyrings(&list, &mut names, |_| Ok(false))
-            .expect_err("oversized keyring lists must be refused");
-        assert!(error.to_string().contains("exceeds its limit"));
-        Ok(())
-    }
-}
-
 /// Execute one fixed, already elevated Omarchy package operation.
 ///
 /// # Errors
@@ -180,7 +134,6 @@ pub fn execute_native_omarchy_operation(
     interaction: NativeOmarchyInteraction,
 ) -> AnyhowResult<()> {
     use crate::core::history::{HistoryManager, PackageChange, TransactionType};
-    use anyhow::Context;
     anyhow::ensure!(
         crate::core::is_root(),
         "Native Omarchy package operations require elevation"
@@ -819,6 +772,46 @@ pub async fn is_installed(package: &str) -> AnyhowResult<bool> {
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    #[ignore = "requires root-owned fixture files"]
+    fn platform_keyring_list_requires_a_bounded_root_owned_file() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let list = directory.path().join("keyrings");
+        let mut names = vec!["archlinux-keyring".to_owned()];
+
+        super::append_platform_keyrings(&list, &mut names, |_| Ok(false))?;
+        assert_eq!(names, ["archlinux-keyring"]);
+
+        let contents = "\n# platform keys\narchlinux-keyring\ninvalid\n/invalid-keyring\ninstalled-keyring\nmissing-keyring\n";
+        std::fs::write(&list, contents)?;
+        super::append_platform_keyrings(&list, &mut names, |name| match name {
+            "installed-keyring" => Ok(true),
+            "missing-keyring" => Ok(false),
+            other => panic!("unexpected keyring lookup: {other}"),
+        })?;
+        assert_eq!(names, ["archlinux-keyring", "installed-keyring"]);
+
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&list, &link)?;
+        let error = super::append_platform_keyrings(&link, &mut names, |_| Ok(false))
+            .expect_err("root process must not follow a keyring-list symlink");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot read platform keyring packages")
+        );
+
+        let error = super::append_platform_keyrings(directory.path(), &mut names, |_| Ok(false))
+            .expect_err("the keyring list must be a regular file");
+        assert!(error.to_string().contains("root-controlled regular file"));
+
+        std::fs::write(&list, vec![b'x'; 65537])?;
+        let error = super::append_platform_keyrings(&list, &mut names, |_| Ok(false))
+            .expect_err("oversized keyring lists must be refused");
+        assert!(error.to_string().contains("exceeds its limit"));
+        Ok(())
+    }
+
     use super::*;
 
     pub(crate) fn native_audit_verifies_existing_advisory_fixture(

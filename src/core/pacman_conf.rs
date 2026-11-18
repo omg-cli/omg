@@ -448,7 +448,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn directives_before_a_section_do_not_configure_a_later_repository() {
+    fn directives_before_a_section_do_not_expand_search_only_usage() {
         let config = PacmanConfig::parse_str(
             "Server = https://ignored.invalid\nUsage = Unknown\n[core]\nUsage = Search\n",
         )
