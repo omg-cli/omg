@@ -2518,6 +2518,40 @@ esac
                 assert!(managers.join("verified").exists(), "signatures checked before publication");
                 assert_eq!(fs::read_link(bin.join("fixture-tool")).expect("new link"), install_dir.join("node_modules/.bin/fixture-tool"));
             });
+
+            let fresh_tools = temp.path().join("fresh-tools");
+            let fresh_bin = temp.path().join("fresh-bin");
+            let fresh_install = fresh_tools.join("npm/fixture-tool");
+            fs::create_dir(&fresh_bin).expect("fresh shared bin directory");
+            assert!(
+                !fresh_install.exists(),
+                "fixture has no previous installation"
+            );
+            runtime
+                .block_on(install_managed_fixture(
+                    "npm",
+                    "fixture-tool",
+                    "fixture-tool",
+                    &fresh_tools,
+                    &fresh_bin,
+                ))
+                .expect("publish and activate a first installation");
+            let installed_command = fresh_bin.join("fixture-tool");
+            assert_eq!(
+                fs::read_link(&installed_command).expect("fresh tool activation"),
+                fresh_install.join("node_modules/.bin/fixture-tool")
+            );
+            assert_eq!(
+                fs::read(&installed_command).expect("published fresh tool"),
+                b"#!/bin/sh\necho new-version\n"
+            );
+            assert_eq!(
+                fs::read_dir(fresh_tools.join("npm"))
+                    .expect("fresh manager directory")
+                    .count(),
+                1,
+                "successful first installation leaves only the published tool"
+            );
         });
     }
 
@@ -2784,6 +2818,8 @@ exit 1
             ("npm", "@scope/name/extra"),
             ("pip", "relative/package"),
             ("cargo", "relative/crate"),
+            ("pacman", "core/fixture-tool"),
+            ("pacman", "fixture-tool@stable"),
             ("unknown-manager", "eslint"),
         ] {
             assert!(
@@ -2796,6 +2832,7 @@ exit 1
             ("npm", "@angular/cli"),
             ("pip", "yt-dlp"),
             ("cargo", "cargo-audit"),
+            ("pacman", "fixture-tool++"),
             ("go", "github.com/rakyll/hey"),
             ("go", "github.com/rakyll/hey@v0.1.4"),
         ] {
@@ -2952,6 +2989,50 @@ exit 1
             assert_eq!(entries.first().map(PathBuf::as_path), executable.parent());
             assert!(entries.contains(&PathBuf::from("/usr/bin")));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secured_commands_resolve_owned_path_and_report_missing_manager() {
+        if crate::core::testing::run_isolated_test(
+            "cli::tool::tests::secured_commands_resolve_owned_path_and_report_missing_manager",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("manager fixture directory");
+        let executable = fixture.path().join("omg-managed-fixture");
+        fs::write(&executable, b"fixture").expect("create owned manager");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("make the owned fixture executable");
+        let staging = tempfile::tempdir().expect("staging directory");
+        with_managed_fixture_environment(fixture.path().as_os_str(), || {
+            let command = secured_manager_command(
+                "omg-managed-fixture",
+                staging.path(),
+                "npm",
+                "lookup-fixture",
+            )
+            .expect("resolve the owned manager");
+            #[cfg(target_os = "linux")]
+            assert_eq!(command.get_args().last(), Some(executable.as_os_str()));
+            #[cfg(not(target_os = "linux"))]
+            assert_eq!(command.get_program(), executable.as_os_str());
+
+            let error = secured_manager_command(
+                "omg-missing-manager",
+                staging.path(),
+                "npm",
+                "lookup-fixture",
+            )
+            .expect_err("unavailable manager must be rejected");
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains("Failed to resolve npm executable 'omg-missing-manager'"),
+                "{diagnostic}"
+            );
+        });
     }
 
     #[cfg(target_os = "linux")]
