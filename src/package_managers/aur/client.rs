@@ -534,10 +534,6 @@ fn encode_symlink_manifest(target: &Path) -> Vec<u8> {
 fn contained_aur_symlink_target(root: &Path, link_path: &Path, target: &Path) -> Result<()> {
     let link_display = review_path(link_path);
     let target_display = review_path(target);
-    anyhow::ensure!(
-        target.is_relative(),
-        "AUR source symlink must be relative: {link_display} -> {target_display}"
-    );
     let mut resolved = link_path
         .parent()
         .map_or_else(|| root.to_path_buf(), Path::to_path_buf);

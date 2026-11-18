@@ -3902,6 +3902,8 @@ def async_test_fragment_owners(name, group, owners, names, inventory, first, las
                     and words[:declaration+1]==('async','fn'))
     helper = (runtime_header and words[declaration+2:]==('(','corrupt',':','bool',',','missing_launcher',':',
                   'Option','<','&','str','>',')','->','Result','<','(',')','>'))
+    if runtime_header and words[declaration+1:]==('incremental_updates_fixture',*result):
+        helper=True
     enum_binding=None
     if (runtime_header and scope is not None and words[declaration+2:]==(
             '(','incremental',':','bool',',','selection',':','SourceSelection',')','->','Result','<','(',')','>')):
@@ -4084,6 +4086,66 @@ def sync_runtime_fragment_owners(name, group, owners, names, inventory, first, l
     return fn,(shape.identity,words),dict(root=root['name'],regions=affected[0][1],entry=entry,synchronous=True),hits
 
 
+def incremental_rust_fixture_loop(inventory, function, record, owners, witness, entries, work):
+    code, rows=inventory[:2]
+    if function['header'][:3]!=('async','fn','incremental_updates_fixture'):
+        return None
+    opening=code.parents[record['first']]
+    _construct_charge(work,len(rows))
+    matches=[row for row in rows if row['kind']=='for' and row['opening']==opening]
+    if len(matches)!=1:
+        return None
+    loop,=matches
+    header=('for','(','installed',',','candidate',',','compatible',')','in','[')
+    if (loop['header'][:len(header)]!=header or code.parents[loop['first']]!=function['opening']
+            or code.words[opening+1:record['first']]!=
+                ['let','versions','=','TempDir','::','new','(',')','?',';']):
+        return None
+    array=loop['first']+len(header)-1
+    if code.pairs.get(array)!=opening-1 or opening-array>512:
+        return None
+    cases=_boolean_arguments(code,array)
+    if cases is None or not 1<=len(cases)<=16:
+        return None
+    _construct_charge(work,opening-array)
+    literals=re.compile(r'"[^"\\\r\n]{0,256}"',re.ASCII)
+    for begin,end in cases:
+        if code.words[begin]!='(' or code.pairs.get(begin)!=end-1:
+            return None
+        parts=_boolean_arguments(code,begin)
+        if parts is None or len(parts)!=3:
+            return None
+        installed,candidate,compatible=(code.words[a:b] for a,b in parts)
+        if ((installed!=['None'] and (len(installed)!=4 or installed[:2]!=['Some','(']
+                or installed[3]!=')' or literals.fullmatch(installed[2]) is None))
+                or len(candidate)!=1 or literals.fullmatch(candidate[0]) is None
+                or compatible not in (['true'],['false'])):
+            return None
+    bindings=[code.region(loop['first']+offset,loop['first']+offset) for offset in (2,4,6)]
+    envelope=code.region(array,opening-1)
+    case_spans=[code.region(begin,end-1) for begin,end in cases[:-1]]
+    expected={*bindings,envelope,*case_spans}
+    low,high=code.region(loop['first'],opening-1)[:2],envelope[2:]
+    rows_seen={}
+    for owner in owners:
+        _construct_charge(work,len(owner['regions']))
+        for row in owner['regions']:
+            if not (tuple(row[:2])<high and low<tuple(row[2:4])):
+                continue
+            span=tuple(row[:4])
+            if (owner['name']!=witness['body'] or span not in expected or span in rows_seen
+                    or row[5:]!=[0,0,0] or not 0<row[4]<COUNTER_LIMIT):
+                return None
+            rows_seen[span]=row[4]
+    if rows_seen.keys()!=expected or rows_seen[envelope]>entries:
+        return None
+    iterations=rows_seen[envelope]*len(cases)
+    if (any(rows_seen[span]!=iterations for span in bindings)
+            or any(rows_seen[span]!=rows_seen[envelope] for span in case_spans)):
+        return None
+    return iterations,tuple(loop['header'])
+
+
 def async_runtime_fixture_record(name, source, counts, group, owners, names, inventory, first, last, work):
     """Project a fixture record through the addition of its eager security field."""
     managers = {'src/runtimes/java.rs':'JavaManager', 'src/runtimes/rust.rs':'RustManager'}
@@ -4110,9 +4172,19 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
     if bound is None:
         return None
     function, identity, witness, entry_hits = bound
+    if code.parents[record['first']]!=function['opening']:
+        loop=incremental_rust_fixture_loop(inventory,function,record,owners,witness,entry_hits,work)
+        if loop is None:
+            return None
+        entry_hits, header=loop
+        binder=code.region(record['first']+1,record['first']+1)
+        if [row[4] for row in witness['regions'] if tuple(row[:4])==binder]!=[entry_hits]:
+            return None
+        identity=(*identity,header)
+        witness['loop_iterations']=entry_hits
     if (synchronous or identity[1][:2]==('async','fn')) and any(row[4]>entry_hits for row in witness['regions']):
         return None
-    if code.parents[record['first']]!=function['opening'] or counts.get(first,0)<=0:
+    if counts.get(first,0)<=0:
         return None
     initializer = 'crate::runtimes::security::RuntimeSecurity::fixture'
     insertion = closing-first==4
@@ -4832,8 +4904,11 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
         if arguments is None or len(arguments)!=3:
             return None
         _construct_charge(work,start-body)
-        values={code.words[begin+1]:tuple(code.words[begin:end])
-                for begin,end in arguments if code.words[begin]=='(' and code.pairs[begin]==end-1}
+        positions={code.words[begin+1]:(begin,end) for begin,end in arguments
+                   if code.words[begin]=='(' and code.pairs[begin]==end-1}
+        if len(positions)!=3:
+            return None
+        values={key:tuple(code.words[begin:end]) for key,(begin,end) in positions.items()}
         config=('(','"OMG_CONFIG_DIR"',',','Some','(','directory','.','path','(',')','.','as_os_str','(',')',')',')')
         test_mode=('(','"OMG_TEST_MODE"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"1"',')',')',')')
         data=('(','"OMG_DATA_DIR"',',','Some','(','data_dir','.','as_os_str','(',')',')',')')
@@ -4934,9 +5009,24 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
         return (*identity,call_slot[1::2],argument_slot[1::2]),dict(
             parent=symbol,child=child_key,span=[*low,*high],entry=list(opener),
             nested=[],modern=None,file_steps=None,observed_lines=entry)
+    environment_entries={'call':call_slot}
+    for key,role in (('"OMG_CONFIG_DIR"','config-directory'),('"OMG_TEST_MODE"','test-mode')):
+        begin,end=positions[key]
+        whole=code.region(begin,end-1)
+        marker=whole if role=='config-directory' else code.region(begin+1,begin+1)
+        if whole[0]!=whole[2]:
+            continue
+        regions=[r for r in root_raw if tuple(r[:2])<whole[2:] and whole[:2]<tuple(r[2:4])
+                 and tuple(r[:4])!=argument_slot]
+        _construct_charge(work,len(root_raw)+len(regions))
+        geometries={tuple(r[:4]) for r in regions}
+        if (marker in geometries and geometries<={marker,whole} and len(geometries)==len(regions)
+                and all(r[4]==hits for r in regions)):
+            environment_entries[role]=marker
     steps=prepared_policy_file_steps(code,rows,opening,closing,raw,hits,modern,work)
     return identity,dict(parent=symbol,child=child_key,span=[*low,*high],entry=list(opener),
-                         nested=[nested_key] if factories else [],modern=modern,file_steps=steps)
+                         nested=[nested_key] if factories else [],modern=modern,file_steps=steps,
+                         environment_entries=environment_entries)
 
 
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
@@ -5092,6 +5182,13 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     if (not all([line,line+c-a] in matched for line in pending)
                             or any(old[line-1]!=new[target-1] for line,target in matched)):
                         refuse()
+                else:
+                    previous,current=(item['environment_entries'] for item in witnesses)
+                    for role in sorted(previous.keys() & current.keys()):
+                        source_span,target_span=previous[role],current[role]
+                        line,target=source_span[0],target_span[0]
+                        if source_span[1::2]==target_span[1::2] and old[line-1]==new[target-1]:
+                            matched.append([line,target])
                 steps=[entry[1]['file_steps'] for entry in observations]
                 if all(steps):
                     matched.extend([previous['line'],current['line']]
@@ -9387,6 +9484,88 @@ def retired_assertion_delimiter(name, line, target, sides, indexes, head_invento
                 summary_credit=[0,0],mapped_credit=[0,0])
 
 
+def retired_policy_grade_metadata(name, lines, sides, indexes, work):
+    """Prove that removed Tokio wrapper paint covered static assertion arguments."""
+    if name!='src/core/security/policy.rs':
+        return None
+    declaration='official_packages_are_verified_not_locked_by_name'
+    scope=('omg_lib','core','security','policy','tests',declaration)
+    expected=['SecurityGrade','::','Verified']
+    diagnostic='"package names must not mint a Locked SLSA grade"'
+    observations=[]; retired=[]
+    for side,((source,inventory,counts),line,index) in enumerate(zip(sides,lines,indexes,strict=True)):
+        code,rows=inventory[:2]
+        _construct_charge(work,len(rows)+len(code.starts).bit_length())
+        first=bisect.bisect_left(code.starts,code.offsets[line-1])
+        paren=code.parents[first]
+        if paren is None or code.words[paren-2:paren+1]!=['assert_eq','!','(']:
+            return None
+        macro=paren-2;end=code.pairs[paren]
+        if code.words[end+1:end+2]!=[';']:
+            return None
+        args=_boolean_arguments(code,paren)
+        if args is None or len(args)!=3:
+            return None
+        (left,left_end),(right,right_end),(note,note_end)=args
+        grade_call=['SecurityPolicy','::','source_grade','(','&','package','.','package','.','origin',')']
+        if (code.words[left:left_end]!=(grade_call if side else ['grade'])
+                or code.words[right:right_end]!=expected or code.words[note:note_end]!=[diagnostic]
+                or first not in (right,note)):
+            return None
+        metadata=[code.region(a,b-1) for a,b in ((right,right_end),(note,note_end))]
+        metadata.append(code.region(end,end+1))
+        if (any(span[0]!=span[2] for span in metadata)
+                or any((span[0] in counts if side else counts.get(span[0])!=1) for span in metadata)):
+            return None
+        block=code.parents[macro]
+        attrs=('#','[','test',']') if side else ('#','[','tokio','::','test',']','async')
+        funcs=[row for row in rows if row['kind']=='fn' and row['opening']==block and
+               row['header']==(*attrs,'fn',declaration,'(',')')]
+        if len(funcs)!=1:
+            return None
+        function,=funcs
+        context=_boolean_module(code,{'start':function['first']})
+        if context is None or context[:2]!=(['tests'],['tests']):
+            return None
+        invocation=code.region(macro,end+1);entry=code.region(macro,macro+1)
+        declared=code.region(function['first']+len(attrs),block-1)
+        low,high=invocation[:2],invocation[2:]
+        forest=[]
+        for owner in index.inventories.get(name,()):
+            _construct_charge(work,len(owner['regions'])+1)
+            touching=[r for r in owner['regions'] if tuple(r[:2])<high and low<tuple(r[2:4])]
+            if touching:
+                if (owner['count']!=1 or owner.get('branches') or owner.get('mcdc_records')
+                        or index.name_counts[owner['name']]!=1 or len(owner['filenames'])!=1
+                        or index.files.get(owner['filenames'][0])!=name):
+                    return None
+                forest.append((owner,touching))
+        roots=[(owner,raw,shape) for owner,raw in forest if
+               (shape:=plain_rust_function_symbol(owner['name'])) is not None and shape.identifiers==scope]
+        if len(roots)!=1:
+            return None
+        root,raw,shape=roots[0]
+        if [*declared,1,0,0,0] not in root['regions'] or counts.get(entry[0])!=1:
+            return None
+        if side:
+            slots=[entry,code.region(left,left+2),code.region(left+4,left_end-2)]
+            if len(forest)!=1 or sorted(raw)!=sorted([*slot,1,0,0,0] for slot in slots):
+                return None
+        else:
+            children=[rows for owner,rows in forest if direct_rust_callback_symbol(
+                owner['name'],root['name'],shape.modules)]
+            if len(forest)!=2 or raw!=[[*invocation,1,0,0,0]] or children!=[[[*entry,1,0,0,0]]]:
+                return None
+        retired.append([span[0] for span in metadata])
+        observations.append(dict(owners=[o['name'] for o,_ in forest],
+                                 assertion_regions=[r for _,raw in forest for r in raw]))
+    pairs=[list(pair) for pair in zip(*retired,strict=True)]
+    if any(sides[0][0][line-1]!=sides[1][0][target-1] for line,target in pairs):
+        return None
+    return dict(file=name,kind='retired-policy-grade-metadata',retired_lines=pairs,
+                observations=observations,summary_credit=[0,0],mapped_credit=[0,0])
+
+
 _DECLARATION_PARAMETER = re.compile(r"\s*(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?self|"
                                     r"[A-Za-z_]\w*\s*:\s*[A-Za-z_]\w*)\s*,\s*", re.ASCII)
 
@@ -11319,7 +11498,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
     head_fn_names = set(); retirement_receipts = []; retired_declaration_receipts = []
     specialization_receipts = {}
-    retired_assertion_receipts = []; retired_constructor_receipts = []
+    retired_assertion_receipts = []; retired_constructor_receipts = []; retired_policy_metadata = []
     parent_file_cache = {}; method_parent_files = None; plain_parent_files = None; owner_indexes = None
     def source_owner_indexes():
         nonlocal owner_indexes
@@ -11947,6 +12126,21 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                  f'at {name}:{line} -> {fragment.target} ({fragment.kind})')
         retained.update(positive)
         positive_receipts.extend(receipts)
+        if (name=='src/core/security/policy.rs' and inventories is not None
+                and (bs[name]['expansions'],hs[name]['expansions'])==([],[])):
+            _construct_charge(construct_work,len(retained))
+            for line,target in list(retained.items()):
+                if (target in after or line in anchored or old[line-1]!=new[target-1]
+                        or old[line-1].strip()!='SecurityGrade::Verified,'):
+                    continue
+                proof=retired_policy_grade_metadata(name,(line,target),
+                    ((old,inventories[0],before),(new,inventories[1],after)),source_owner_indexes(),construct_work)
+                if proof is not None and all(previous not in anchored and retained.get(previous,current)==current
+                                             for previous,current in proof['retired_lines']):
+                    for previous,_ in proof['retired_lines']:
+                        retained.pop(previous,None)
+                        gone.discard(previous)
+                    retired_policy_metadata.append(proof)
         gone.difference_update(anchored)
         anchored_new = set(anchored.values())
         paint = []
@@ -12037,6 +12231,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         paint_receipt['retired_async_test_constructor_delimiters']=retired_constructor_receipts
     if retired_assertion_receipts:
         paint_receipt['retired_assertion_delimiters'] = retired_assertion_receipts
+    if retired_policy_metadata:
+        paint_receipt['retired_policy_grade_metadata'] = retired_policy_metadata
     paint_receipt.update(specialization_receipts)
     if construct_receipts:
         paint_receipt['retained_constructs'] = construct_receipts

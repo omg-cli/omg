@@ -1100,6 +1100,10 @@ class PreparedPolicyEnvironmentEntryTests(unittest.TestCase):
         root=dict(name=symbol,filenames=['/artifact/src/example.rs'],count=2,
                   regions=[row(5,'fn checked()',2),row(6,'directory'),row(call,'temp_env::with_vars'),
                            [call+1,13,opening-1,14,1,0,0,0],row(len(lines)-1,'}',2)])
+        if fault!='missing-config-region':
+            root['regions'].append(row(call+2,lines[call+1].strip().removesuffix(',')))
+        if fault!='missing-test-mode-region':
+            root['regions'].append(row(call+3,'"OMG_TEST_MODE"',int(fault!='cold-test-mode')))
         child=dict(root,name='_RNC'+symbol[2:]+'0B7_',count=1,
                    regions=[row(opening,'{',0 if fault=='cold-opener' else 1),row(closing,'}')])
         if file_checks:
@@ -1181,6 +1185,15 @@ class PreparedPolicyEnvironmentEntryTests(unittest.TestCase):
                              (True,'cold-opener'),(True,'foreign'),(False,'missing-factory')):
             with self.subTest(fault=fault):
                 self.assertIsNone(self.observe(modern,fault))
+
+    def test_multi_config_callback_preserves_executed_shared_inputs(self):
+        old,new=[self.observe(modern)[1]['environment_entries'] for modern in (False,True)]
+        self.assertEqual(set(old),{'call','config-directory','test-mode'})
+        self.assertEqual(set(new),set(old))
+        for fault,role in (('missing-config-region','config-directory'),('missing-test-mode-region','test-mode'),
+                           ('cold-test-mode','test-mode')):
+            with self.subTest(fault=fault):
+                self.assertNotIn(role,self.observe(True,fault)[1]['environment_entries'])
 
     def test_file_checks_preserve_typed_assertion_and_cold_file_error_slots(self):
         for modern in (False,True):
@@ -5275,6 +5288,58 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertEqual(receipt['kind'],'async-test-expected-error-call')
         self.assertEqual(receipt['async_copies']['base'][0]['body'],child['name'])
         self.assertEqual(receipt['async_fragment_regions'][0]['base_range'],[6,6])
+
+    def test_runtime_record_counts_are_bound_to_the_literal_install_loop(self):
+        def observe(insert=False, fault=None):
+            source=['#[cfg(test)]','mod tests {','    async fn incremental_updates_fixture() -> Result<()> {',
+                    '        for (installed, candidate, compatible) in [',
+                    '            (Some("1.0"), "2.0", false),',
+                    '            (None, "1.0", true),','        ] {',
+                    '            let versions = TempDir::new()?;',
+                    '            let manager = RustManager {',
+                    '                versions_dir: versions.path().to_path_buf(),',
+                    '                client: download_client(),','            };','        }','        Ok(())','    }','}']
+            factory='crate::runtimes::security::RuntimeSecurity::fixture'
+            if insert:
+                source.insert(9,f'                security: {factory}(),')
+            shift=int(insert)
+            if fault=='different-literal':
+                source[4]=source[4].replace('"2.0"','"3.0"')
+            if fault=='dynamic':
+                source[5]=source[5].replace('None','discover()')
+            filename='/src/src/runtimes/rust.rs'
+            symbol='_RNvNtNtNtCs1_7omg_lib8runtimes4rust5tests27incremental_updates_fixture'
+            def slot(line,value,count):
+                start=source[line-1].index(value)+1
+                return [line,start,line,start+len(value),count,0,0,0]
+            start=source[2].index('{')+1
+            root=dict(name=symbol,count=1,filenames=[filename],regions=[[3,5,3,start-1,1,0,0,0]])
+            case=source[4].strip().removesuffix(',')
+            loop=[slot(4,'installed',2),slot(4,'candidate',1 if fault=='binding-count' else 2),
+                  slot(4,'compatible',2),[4,source[3].index('[')+1,7,10,1,0,0,0],slot(5,case,1)]
+            record=[slot(9,'manager',2),[9,27,12+shift,14,2,0,0,0],
+                    slot(10+shift,'versions.path()',2),slot(11+shift,'download_client',2)]
+            if insert:
+                record.append(slot(10,factory,int(fault!='cold-field')*2))
+            child=dict(root,name='_RNC'+symbol[2:]+'0B9_',regions=[[3,start,3,start+1,1,0,0,0],*loop,*record])
+            owners=[root,child]
+            if fault=='foreign-overlap':
+                owners.append(dict(root,name='unbound',regions=[slot(4,'compatible',0)]))
+            work=[2_000_000]
+            counts=coverage._owner_line_counts({'regions':record},coverage._ObserverWork(work))
+            return coverage.async_runtime_fixture_record(
+                'src/runtimes/rust.rs',source,counts,(3,15+shift,[child]),owners,
+                Counter(owner['name'] for owner in owners),coverage._construct_inventory(source,work),9,9,work)
+
+        before,after=observe(),observe(True)
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(after)
+        self.assertEqual(before[0],after[0])
+        self.assertEqual(after[1]['security_initializer'][0][4],2)
+        self.assertNotEqual(observe(True,'different-literal')[0],before[0])
+        for fault in ('dynamic','binding-count','foreign-overlap','cold-field'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(observe(True,fault))
 
     def parameterized_rust_helper_record(self, insertion=False, fault=None, body_group=True, enum_role=False):
         source = ['#[cfg(test)]', '#[expect(clippy::unwrap_used)]', 'mod tests {',
@@ -9971,6 +10036,59 @@ class InherentAsyncLeafTests(unittest.TestCase):
 
 
 class RetiredAssertionDelimiterTests(unittest.TestCase):
+    def test_policy_grade_metadata_requires_the_executed_assertions_on_both_sides(self):
+        name='src/core/security/policy.rs'
+        filename='/src/'+name
+        expected='SecurityGrade::Verified'
+        diagnostic='"package names must not mint a Locked SLSA grade"'
+        declaration='official_packages_are_verified_not_locked_by_name'
+        def fixture(head,fault):
+            expression='SecurityPolicy::source_grade(&package.package.origin)' if head else 'grade'
+            lines=['#[cfg(test)]','mod tests {',
+                   '    #[test]' if head else '    #[tokio::test]',
+                   f'    {"async " if not head else ""}fn {declaration}() {{',
+                   '        assert_eq!(',f'            {expression},',
+                   f'            {expected},',f'            {diagnostic}','        );','    }','}']
+            if head and fault=='different-expectation':
+                lines[6]=lines[6].replace('Verified','Community')
+            def slot(line,value,count=1):
+                start=lines[line-1].index(value)+1
+                return [line,start,line,start+len(value),count,0,0,0]
+            symbol='_RNvNtNtNtNtCs1_7omg_lib4core8security6policy5tests'
+            symbol+=f'{len(declaration)}{declaration}'
+            raw=[slot(4,f'fn {declaration}()'),slot(10,'}')]
+            regions=[slot(5,'assert_eq!')]
+            if head:
+                regions.extend([slot(6,'SecurityPolicy::source_grade',int(fault!='cold-comparison')),
+                                slot(6,'&package.package.origin')])
+                raw.extend(regions)
+            else:
+                raw.append([5,9,9,11,1,0,0,0])
+            root=dict(name=symbol,filenames=[filename],count=1,regions=raw)
+            owners=[root]
+            if not head:
+                owners.append(dict(root,name='_RNC'+symbol[2:]+'0Bb_',regions=regions))
+            if fault=='foreign-region':
+                owners.append(dict(root,name='foreign',regions=[slot(7,expected)],count=1))
+            work=[2_000_000]
+            counts=coverage._owner_line_counts({'regions':[r for owner in owners for r in owner['regions']]},
+                                              coverage._ObserverWork(work))
+            inventory=coverage._construct_inventory(lines,work)
+            index=coverage.index_compiled_owner_sources(owners,{filename:name},work,{name})
+            return (lines,inventory,counts),index
+
+        def observe(fault=None):
+            old,base=fixture(False,fault if fault=='foreign-region' else None)
+            current,head=fixture(True,fault if fault!='foreign-region' else None)
+            return coverage.retired_policy_grade_metadata(name,(7,7),(old,current),(base,head),[2_000_000])
+
+        proof=observe()
+        self.assertEqual(proof['retired_lines'],[[7,7],[8,8],[9,9]])
+        self.assertEqual(proof['mapped_credit'],[0,0])
+        for fault in ('different-expectation','cold-comparison','foreign-region'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(observe(fault))
+
     def proof(self, mutation=None):
         name = 'src/example.rs'; path = '/src/example.rs'
         old = ['fn trial() {', '    for value in input {', '        assert_eq!(',

@@ -2298,9 +2298,42 @@ mod tests {
                         .to_string()
                         .contains("Security policy exceeds elevation handoff limit")
                 );
+                assert_current_policy_rejects_changed_handoff(&file, decoded);
                 Ok(())
             },
         )
+    }
+
+    fn assert_current_policy_rejects_changed_handoff(
+        file: &std::path::Path,
+        inherited: SecurityPolicy,
+    ) {
+        let original = toml::to_string(&inherited).expect("serialize inherited policy");
+        fs::write(file, &original).expect("write the trusted policy");
+        validate_inherited_policy(&inherited).expect("accept the matching policy");
+        INHERITED_POLICY
+            .set(inherited.clone())
+            .expect("isolated handoff fixture");
+        assert_eq!(
+            SecurityPolicy::load_current().expect("unchanged trusted policy"),
+            inherited
+        );
+
+        let updated = SecurityPolicy {
+            allow_aur: true,
+            ..inherited
+        };
+        let changed = toml::to_string(&updated).expect("serialize changed policy");
+        fs::write(file, &changed).expect("replace the trusted policy");
+        let error = SecurityPolicy::load_current().expect_err("changed policy must refuse");
+        assert_eq!(
+            error.to_string(),
+            "Security policy changed after elevation; retry the operation"
+        );
+        assert_eq!(
+            fs::read_to_string(file).expect("read changed policy"),
+            changed
+        );
     }
 
     #[test]
