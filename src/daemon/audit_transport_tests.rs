@@ -106,7 +106,7 @@ async fn cancelled_active_and_waiting_scans_release_the_lock_without_caching() -
     let package = format!("cancel-scan-{}", uuid::Uuid::new_v4());
     let state_path = temp.path().join("mock_state_pacman.json");
     let inventory = serde_json::to_vec(&serde_json::json!({
-        "installed": {package.clone(): "1.0.0"}, "available": {}
+        "installed": {package.clone(): "1.0.0"}, "available": {package.clone(): "1.0.0"}
     }))?;
     std::fs::write(&state_path, &inventory)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -153,6 +153,10 @@ async fn cancelled_active_and_waiting_scans_release_the_lock_without_caching() -
         "arch",
         temp.path(),
     )));
+    let catalog = manager.package_index().await?;
+    assert!(catalog.iter().any(|entry| {
+        entry.name == package && entry.installed && entry.version.to_string() == "1.0.0"
+    }));
     let mut state = DaemonState::new_isolated(temp.path(), PackageIndex::empty(), manager)?;
     state.vulnerability_scanner = Arc::new(VulnerabilityScanner::with_osv_endpoint(
         endpoint,

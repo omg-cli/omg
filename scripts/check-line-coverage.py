@@ -472,24 +472,26 @@ def project_observer_groups(observed, removed_groups, *, _work=None):
 
 def source_owner_span(owner, name, files, source):
     if (len(owner["filenames"]) != 1 or files.get(owner["filenames"][0]) != name
-            or not owner["regions"]
-            or any(len(region) != 8 or any(type(value) is not int for value in region)
-                   or min(region[:4]) < 1 or region[0] > region[2]
-                   or region[2] > len(source)
-                   or region[1] > len(source[region[0] - 1].encode("utf-8")) + 1
-                   or region[3] > len(source[region[2] - 1].encode("utf-8")) + 1
-                   or (region[0] == region[2] and region[1] >= region[3])
-                   or region[4] < 0 or region[5:] != [0, 0, 0]
-                   for region in owner["regions"])):
+            or not owner["regions"]):
         return None
-    start, end = min(r[0] for r in owner["regions"]), max(r[2] for r in owner["regions"])
+    start = len(source) + 1; endpoint = (0, 0)
+    for region in owner['regions']:
+        if (len(region) != 8 or any(type(value) is not int for value in region)
+                or min(region[:4]) < 1 or region[0] > region[2] or region[2] > len(source)
+                or region[1] > len(source[region[0] - 1].encode('utf-8')) + 1
+                or region[3] > len(source[region[2] - 1].encode('utf-8')) + 1
+                or (region[0] == region[2] and region[1] >= region[3])
+                or region[4] < 0 or region[5:] != [0, 0, 0]):
+            return None
+        start = min(start, region[0]); endpoint = max(endpoint, (region[2], region[3]))
+    end, end_column = endpoint
     declaration = source[start - 1]
     function = re.fullmatch(
         r"([ \t]*)(?:(?:pub(?:\([^()]*\))?|async|unsafe|const)\s+)*fn\s+[A-Za-z_]\w*[^{}]*\{\s*",
         declaration)
     header = declaration if function else None
     if not (function and source[end - 1].rstrip() == function[1] + "}"
-            and any(r[2] == end and r[3] > len(function[1]) + 1 for r in owner["regions"])):
+            and end_column > len(function[1]) + 1):
         declaration = None
     return start, end, declaration, header
 
@@ -1084,18 +1086,21 @@ def nested_map_err_states(source, group, inventory, name_counts, first, last, co
     return states, (tuple(body), bindings[0], geometry[0], parents[0].disambiguators), proof
 
 
-def _compiled_function_groups(name, owners, files, source, work=None, source_structure=None):
+def _compiled_function_groups(name, owners, files, source, work=None, source_structure=None,
+                              validated_spans=None):
     if work is not None:
         _construct_charge(work, len(source) + len(owners))
         if source_structure is None:
             _construct_charge(work, sum(len(line) + 1 for line in source))
-        _construct_charge(work, sum(len(owner['filenames']) + 3 * len(owner['regions']) for owner in owners))
+        scans = 2 if validated_spans is None else 1
+        _construct_charge(work, sum(len(owner['filenames']) + scans * len(owner['regions']) for owner in owners))
     names = Counter(owner['name'] for owner in owners)
     inventory = [owner for owner in owners if any(
         files.get(path) == name or path.endswith('/' + name) for path in owner['filenames'])]
     by_span = {}
     for owner in inventory:
-        span = source_owner_span(owner, name, files, source)
+        span = (source_owner_span(owner, name, files, source) if validated_spans is None
+                else validated_spans.get(id(owner)))
         if span is None:
             return None
         by_span.setdefault(span[:2], []).append(owner)
@@ -1227,7 +1232,7 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
     constructors = {}; bodies = {}
     for owner in owners:
         regions = owner['regions']
-        _construct_charge(work, len(owner['name']) + len(owner['filenames']) + 3 * len(regions))
+        _construct_charge(work, len(owner['filenames']) + 3 * len(regions))
         if source_owner_span(owner, name, files, source) is None:
             continue
         if len(regions) == 1:
@@ -1780,6 +1785,250 @@ def literal_pair_loop_authority(source, group, owners, name_counts, inventory, l
     return tuple(states), signature, witness
 
 
+
+def biased_join_result_fragment(source, group, owners, name_counts, first, last, inventory, work,
+                                *, expansions=None, loop_cache=None, cache=None):
+    """Bind completed results or exact timer states, never expanded join internals."""
+    if (inventory is None or not 1<=first<=last<=len(source) or last-first>7
+            or type(expansions) is not list or expansions):
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(source[first-1])+len(group[2])+1)
+    pattern = re.compile(r'[ \t]*let[ \t]+\((?P<left>[A-Za-z_][A-Za-z0-9_]*),[ \t]*'
+        r'(?P<right>[A-Za-z_][A-Za-z0-9_]*)\)[ \t]*=[ \t]*(?P<macro>tokio::join!)\([ \t]*')
+    cache = {} if cache is None else cache
+    identity=(id(code),id(owners),id(name_counts),group[:2],tuple(id(owner) for owner in group[2]))
+    _construct_charge(work,len(cache)*(len(group[2])+5))
+    ready=[value for key,value in cache.items() if key[:-1]==identity and value is not None
+           and value.witness['timer_source_range'][0]<=first<=last<=value.witness['timer_source_range'][1]]
+    if len(ready)>1:
+        return None
+    if ready:
+        prepared=ready[0]; macro_first=prepared.witness['header_source_line']
+    else:
+        if first == last and source[first-1].lstrip().startswith('if '):
+            return joined_async_condition(source, owners, first, inventory, work,
+                [value for key,value in cache.items() if key[:-1]==identity and value is not None])
+        header=pattern.fullmatch(source[first-1]);macro_first=first
+        if header is None:
+            _construct_charge(work,len(rows))
+            candidates=[row for row in rows if row['kind']=='statement'
+                and code.position(code.starts[row['first']])[0]<=first<=last<=code.position(code.ends[row['end']])[0]
+                and pattern.fullmatch(source[code.position(code.starts[row['first']])[0]-1])]
+            if len(candidates)!=1:
+                return None
+            macro_first=code.position(code.starts[candidates[0]['first']])[0]
+            header=pattern.fullmatch(source[macro_first-1])
+        if header['left']==header['right']:
+            return None
+        key=(*identity,macro_first)
+        if key not in cache:
+            # Inputs are immutable and authenticated for this comparison; no global cache.
+            cache[key]=biased_join_result_authority(source,group,owners,name_counts,macro_first,inventory,
+                                                    work,header,loop_cache)
+        prepared=cache[key]
+    if prepared is None:
+        return None
+    if first==last==macro_first:
+        return prepared
+    timer_first,timer_last=prepared.witness['timer_source_range']
+    if not timer_first<=first<=last<=timer_last:
+        return None
+    timer_rows=[copy['timer_regions'] for copy in prepared.witness['owners']]
+    _construct_charge(work,(last-first+1)*sum(len(rows) for rows in timer_rows))
+    line_states=tuple(tuple(int(any(row[4]>0 and owner_covers_lines([row],line,line)
+        for row in rows)) for line in range(first,last+1)) for rows in timer_rows)
+    signature=(*prepared.signature,'unchanged-owned-timer',(first-timer_first,last-timer_first))
+    witness=dict(prepared.witness,kind='biased-join-owned-timer-fragment',fragment_range=[first,last],
+        context_sha256=hashlib.sha256(repr(signature).encode()).hexdigest())
+    return CallbackFragmentEvidence(prepared.states,line_states,signature,witness)
+
+
+def joined_async_condition(source, owners, line, inventory, work, authorities):
+    """Carry a complete direct conditional under an already bound async owner."""
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows) + len(authorities))
+    guards = [row for row in rows if row['kind'] == 'if' and row['supported']
+              and row['header'][:1] == ('if',) and row['opening'] > row['first'] + 1
+              and code.position(code.starts[row['first']])[0] == line
+              and code.position(code.starts[row['opening']])[0] == line]
+    if len(guards) != 1:
+        return None
+    guard = guards[0]
+    opening, closing = guard['opening'], guard['end']
+    parent = code.parents[opening]
+    if parent is None or code.words[parent] != '{' or code.words[closing+1:closing+2] == ['else']:
+        return None
+    parent_span = [list(code.position(code.starts[parent])), list(code.position(code.ends[code.pairs[parent]]))]
+    matches = [proof for proof in authorities if proof.witness['phase_entry']['async_span'] == parent_span
+               and proof.witness['timer_source_range'][1] < line]
+    if len(matches) != 1:
+        return None
+    prepared = matches[0]
+    _construct_charge(work, closing - guard['first'] + 1)
+    if any(word in ('!', '#', 'unsafe', 'async', '||', 'else') for word in code.words[guard['first']:closing+1]):
+        return None
+    expression = code.region(guard['first']+1, opening-1)
+    body = code.region(opening, closing)
+    endpoint = code.region(closing, closing)
+    last = body[2]
+    _construct_charge(work, sum(len(owner['regions'])+1 for owner in owners))
+    by_name = {owner['name']: owner for owner in owners}
+    phase_names = {copy['phase'] for copy in prepared.witness['owners']}
+    def touches(region):
+        return region[0] <= last and region[2] >= line
+    if any(owner['name'] not in phase_names and any(touches(region) for region in owner['regions'])
+           for owner in owners):
+        return None
+    states = []; witnesses = []; geometries = set()
+    for copy, state in zip(prepared.witness['owners'], prepared.states, strict=True):
+        owner = by_name[copy['phase']]
+        _construct_charge(work, len(owner['regions']) + len(owner.get('branches', ())))
+        selected = [region for region in owner['regions'] if touches(region)]
+        roles = {tuple(region[:4]): region[4] for region in selected}
+        if (len(roles) != len(selected) or not {expression,body,endpoint} <= roles.keys()
+                or any(region[5:] != [0,0,0] for region in selected)
+                or any(touches(branch) for branch in owner.get('branches', ()))
+                or owner.get('mcdc_records') or not 0 <= roles[body] <= roles[expression] == owner['count']
+                or roles[endpoint] != roles[expression]
+                or any(not (body[:2] <= region[:2] < region[2:] <= body[2:] and 0 <= count <= roles[body])
+                       for region,count in roles.items() if region not in (expression,body,endpoint))):
+            return None
+        geometry, bits = fragment_region_states(dict(regions=selected), line, last, source, work)
+        geometries.add(geometry)
+        states.append((*state,*bits))
+        witnesses.append(dict(owner=owner['name'],condition=roles[expression],body=roles[body],regions=selected))
+    if len(geometries) != 1:
+        return None
+    signature = ('joined-async-condition',prepared.signature,guard['digest'],next(iter(geometries)))
+    witness = dict(kind='joined-async-condition',condition_span=[line,last],owners=witnesses,
+                   context_sha256=hashlib.sha256(repr(signature).encode()).hexdigest())
+    return CallbackFragmentEvidence(tuple(states),tuple((int(row['condition']>0),) for row in witnesses),
+                                    signature,witness)
+
+
+def biased_join_result_authority(source, group, owners, name_counts, first, inventory, work, header, loop_cache):
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows))
+    statements = [row for row in rows if row['kind'] == 'statement'
+                  and code.position(code.starts[row['first']])[0] == first]
+    if len(statements) != 1:
+        return None
+    statement = statements[0]; start = statement['first']; words = code.words
+    if tuple(words[start:start+12]) != ('let','(',header['left'],',',header['right'],')','=',
+                                      'tokio','::','join','!','('):
+        return None
+    macro_open = start+11; macro_end = code.pairs[macro_open]
+    if (macro_end+1 != statement['end'] or words[statement['end']] != ';'
+            or tuple(words[macro_open+1:macro_open+3]) != ('biased',';')):
+        return None
+    callee = macro_open+3; call_open = callee+1
+    if (not _boolean_leaf([words[callee]]) or re.fullmatch('[A-Za-z_][A-Za-z0-9_]*',words[callee]) is None
+            or words[call_open] != '(' or code.parents[call_open] != macro_open):
+        return None
+    call_end = code.pairs[call_open]; args = _boolean_arguments(code,call_open)
+    if args is None or len(args) != 5:
+        return None
+    values = [tuple(words[a:b]) for a,b in args]
+    if any(not (_boolean_leaf(list(value)) or len(value)==2 and value[0]=='&'
+            and re.fullmatch('[A-Za-z_][A-Za-z0-9_]*',value[1])) for value in values):
+        return None
+    if words[call_end+1] != ',' or tuple(words[call_end+2:call_end+4]) != ('async','{'):
+        return None
+    timer_open = call_end+3; timer_end = code.pairs[timer_open]
+    if code.parents[timer_open] != macro_open or tuple(words[timer_end+1:macro_end]) != (',',):
+        return None
+    timer_words = tuple(words[timer_open+1:timer_end])
+    timer_prefix = ('tokio','::','time','::','sleep','(','Duration','::','from_millis','(','50',')',')','.','await',';')
+    if (len(timer_words) != 21 or timer_words[:16] != timer_prefix
+            or not _boolean_leaf([timer_words[16]]) or timer_words[17:] != ('.','elapsed','(',')')):
+        return None
+    phases = [row for row in rows if row['opening'] is not None
+              and words[row['opening']-1] == 'async' and row['opening'] < start < statement['end'] < row['end']
+              and code.parents[start] == row['opening']]
+    if len(phases) != 1:
+        return None
+    phase = phases[0]; phase_line = code.position(code.starts[phase['opening']])[0]
+    loops = [row for row in rows if row['kind']=='for' and row['opening'] is not None
+             and row['opening'] < phase['opening'] < phase['end'] < row['end']]
+    if len(loops) != 1 or values[0] != (loops[0]['header'][2],):
+        return None
+    authority = nested_async_call_entry_fragment(source,group,owners,name_counts,phase_line,phase_line,
+        inventory,work,loop_cache=loop_cache)
+    if authority is None or authority.witness['kind'] != 'literal-pair-loop-async-call-entry':
+        return None
+    token_span = lambda a,b: (*code.position(code.starts[a]),*code.position(code.ends[b]))
+    expected_header = tuple((first,header.start(name)+1,first,header.end(name)+1)
+                            for name in ('left','right','macro'))
+    if (token_span(start+2,start+2) != expected_header[0]
+            or token_span(start+4,start+4) != expected_header[1]
+            or token_span(start+7,start+10) != expected_header[2]):
+        return None
+    first_call_roles = (token_span(callee,callee),*(token_span(a,b-1) for a,b in args))
+    opening = code.position(code.starts[timer_open]); closing = code.position(code.ends[timer_end])
+    if (opening[0] != first+3 or closing[0] != first+6
+            or code.position(code.starts[callee])[0] != first+2
+            or code.position(code.ends[macro_end])[0] != first+7):
+        return None
+    expected_timer = ((*opening,opening[0],opening[1]+1),
+        token_span(timer_open+1,timer_open+5),token_span(timer_open+1,timer_open+15),
+        token_span(timer_open+17,timer_open+17),token_span(timer_open+19,timer_open+19),
+        (*code.position(code.starts[timer_end]),*closing))
+    _construct_charge(work, statement['end']-start+sum(len(source[i])+1 for i in range(first-1,first+7)))
+    low = code.position(code.starts[start]); high = code.position(code.ends[statement['end']])
+    def overlaps(row):
+        return tuple(row[:2]) < high and low < tuple(row[2:4])
+    by_name = {owner['name']:owner for owner in owners}
+    states=[]; line_states=[]; geometries=[]; copies=[]; allowed=set()
+    for index, parent_proof in enumerate(authority.witness['owners']):
+        root=by_name[parent_proof['parent']]; current=by_name[parent_proof['child']]
+        shape=plain_rust_function_symbol(root['name'])
+        _construct_charge(work,sum(len(owner['name'])+len(owner['regions']) for owner in owners))
+        children=[owner for owner in owners if direct_rust_callback_symbol(owner['name'],root['name'],shape.modules,3)
+            and min(tuple(row[:2]) for row in owner['regions'])==opening
+            and max(tuple(row[2:4]) for row in owner['regions'])==closing]
+        if len(children)!=1:
+            return None
+        child=children[0]
+        if (child['filenames']!=current['filenames'] or name_counts[child['name']]!=1
+                or child['count']!=current['count'] or id(child) in allowed):
+            return None
+        expected_parent=(*expected_header,*first_call_roles)
+        prepared=[]
+        for owner,expected in ((current,expected_parent),(child,expected_timer)):
+            _construct_charge(work,len(owner['regions']))
+            selected=[row for row in owner['regions'] if overlaps(row)]
+            if (len(selected)!=len(expected) or {tuple(row[:4]) for row in selected}!=set(expected)
+                    or any(len(row)!=8 or row[5:]!=[0,0,0] or type(row[4]) is not int
+                        or not 0<=row[4]<COUNTER_LIMIT or row[4]!=current['count'] for row in selected)):
+                return None
+            prepared.append([next(row for row in selected if tuple(row[:4])==span) for span in expected])
+            allowed.add(id(owner))
+        parent_rows,timer_rows=prepared
+        if len(child['regions'])!=len(expected_timer):
+            return None
+        geometry=(tuple((r[0]-first,r[1],r[2]-first,r[3],*r[5:]) for r in parent_rows[:3]),
+                  tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in timer_rows))
+        geometries.append(geometry)
+        bits=tuple(int(row[4]>0) for row in (*parent_rows,*timer_rows))
+        states.append((*authority.states[index],*bits));line_states.append((int(any(row[4]>0 for row in parent_rows[:3])),))
+        copies.append(dict(parent=root['name'],phase=current['name'],timer=child['name'],
+                           result_roles=parent_rows[:3],unclaimed_first_call_roles=parent_rows[3:],timer_regions=timer_rows))
+    _construct_charge(work,sum(len(owner['regions']) for owner in owners))
+    if (not geometries or len(set(geometries))!=1 or any(id(owner) not in allowed
+            and any(overlaps(row) for row in owner['regions']) for owner in owners)):
+        return None
+    signature=('biased-join-result-binding',authority.signature,header['left'],header['right'],
+               tuple(values[i] for i in (0,2,3,4)),timer_words,geometries[0])
+    witness=dict(kind='biased-join-result-binding',owners=copies,phase_entry=authority.witness,
+        empty_expansion_metadata=True,header_source_line=first,timer_source_range=[opening[0],closing[0]],
+        first_callee_unclaimed=words[callee],first_argument_value_unclaimed=values[1],
+        header_geometry=geometries[0][0],timer_geometry=geometries[0][1],
+        context_sha256=hashlib.sha256(repr(signature).encode()).hexdigest(),
+        limitation='Completed tuple bindings and unchanged owned timer states only; changed first callee/value and expanded join internals are unclaimed')
+    return CallbackFragmentEvidence(tuple(states),tuple(line_states),signature,witness)
+
+
 def nominal_phase_fragment(source, group, owners, name_counts, first, last, inventory, work, cache):
     """Bind a nongeneric impl method's complete lexical phase tree to compiled copies."""
     if inventory is None:
@@ -1969,9 +2218,10 @@ class CompiledOwnerSourceIndex:
     inventories: dict
     name_counts: Counter
     source_names: frozenset | None
+    declaration_ends: dict | None = None
 
 
-def index_compiled_owner_sources(owners, files, work, source_names=None):
+def index_compiled_owner_sources(owners, files, work, source_names=None, *, index_declaration_ends=False):
     """Index the exact canonical-or-literal-suffix predicate once per owner set."""
     _construct_charge(work, len(owners))
     if source_names is not None:
@@ -1979,8 +2229,14 @@ def index_compiled_owner_sources(owners, files, work, source_names=None):
         _construct_charge(work, sum(len(name) for name in source_names))
         source_names = frozenset(source_names)
     aliases = {}; inventories = {}; names = Counter()
+    declaration_ends = {} if index_declaration_ends else None
     for owner in owners:
-        names[owner['name']] += 1
+        symbol = owner['name']; names[symbol] += 1
+        if declaration_ends is not None:
+            _construct_charge(work, 1)
+            if symbol[3:4] == 'v':
+                _construct_charge(work, 3)
+                declaration_ends.setdefault(symbol[-2:], []).append(symbol)
         targets = set()
         _construct_charge(work, len(owner['filenames']))
         for path in owner['filenames']:
@@ -2003,7 +2259,7 @@ def index_compiled_owner_sources(owners, files, work, source_names=None):
     _construct_charge(work, len(inventories))
     _construct_charge(work, sum(len(rows) for rows in inventories.values()))
     return CompiledOwnerSourceIndex(owners, files, len(owners), len(files),
-        {name: tuple(rows) for name, rows in inventories.items()}, names, source_names)
+        {name: tuple(rows) for name, rows in inventories.items()}, names, source_names, declaration_ends)
 
 
 def qualified_function_completion(sides, work):
@@ -2070,7 +2326,7 @@ def qualified_function_completion(sides, work):
 
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
                               fragments, work=None, construct_inventories=None, compiled_groups=None,
-                              callback_functions=(), owner_indexes=None, inherent_async_lines=((), ())):
+                              callback_functions=(), owner_indexes=None, inherent_async_lines=((), ()), macro_expansions=(None, None)):
     """Prove positive head pairs, retaining every base state, copy and candidate."""
     if not fragments:
         return {}, []
@@ -2121,7 +2377,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         groups[1][prefix] = group
     claimed = {}; pairs = {}; excerpts = {}; callback_sources = {}; callback_inventories = {}; callback_work = 20_000_000
     receipts = []
-    nominal_phase_cache = {}; literal_loop_cache = {}
+    nominal_phase_cache = {}; literal_loop_cache = {}; join_cache = {}
     for a, b, c, d, pending in fragments:
         current_fragment = (a, b, c, d, pending)
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
@@ -2305,6 +2561,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                             callback = literal_pair_loop_fragment(source, group, inventories[side],
                                 inventory_names[side], offset + 1, offset + b - a,
                                 callback_inventories[side], work, normalize_second=True, cache=literal_loop_cache)
+                        if (callback is None and type(macro_expansions) in (tuple,list)
+                                and len(macro_expansions)==2):
+                            callback = biased_join_result_fragment(source,group,inventories[side],
+                                inventory_names[side],offset+1,offset+b-a,callback_inventories[side],work,
+                                expansions=macro_expansions[side],loop_cache=literal_loop_cache,cache=join_cache)
                         if callback is None:
                             callback = nominal_fragments.get((side, offset))
                             if callback is None:
@@ -3971,6 +4232,115 @@ def _owner_line_counts(owner, work):
     return {line + first - 1: count for line, count in projected}
 
 
+_DECLARATION_PARAMETER = re.compile(r"\s*(?:&\s*(?:'[A-Za-z_]\w*\s+)?(?:mut\s+)?self|"
+                                    r"[A-Za-z_]\w*\s*:\s*[A-Za-z_]\w*)\s*,\s*", re.ASCII)
+
+
+def retired_declaration_parameter(name, line, target, sides, indexes, head_names, work):
+    """Discard a spurious parameter-line match while retaining all execution obligations."""
+    file_scope = re.fullmatch(r'src/([A-Za-z_]\w*(?:/[A-Za-z_]\w*)*)\.rs', name, re.ASCII)
+    if file_scope is None or indexes[1].declaration_ends is None:
+        return None
+    def nominal(parts):
+        path = ('crate', parts[0])
+        for part in parts[1:]:
+            path = ('type', path, (part, ''))
+        return path
+    bindings = []
+    for number, (source, inventory, spans, mapped), index in zip((line,target),sides,indexes,strict=True):
+        if not 1 <= number < len(source):
+            return None
+        text = source[number-1]
+        if (text != sides[0][0][line-1] or _DECLARATION_PARAMETER.fullmatch(text) is None
+                or mapped.get(number, 0) <= 0 or inventory is None):
+            return None
+        code, rows = inventory[:2]
+        first = bisect.bisect_left(code.starts,code.offsets[number-1])
+        last = bisect.bisect_left(code.starts,code.offsets[number])
+        _construct_charge(work, len(rows)+last-first+1)
+        if first == last:
+            return None
+        args = code.parents[first]
+        if (args is None or code.words[args] != '(' or code.words[last-1] != ','
+                or any(code.parents[pos] != args for pos in range(first,last))):
+            return None
+        definitions = [row for row in rows if row['kind'] == 'fn' and row['supported']
+                       and row['first'] < args < row['opening']]
+        if len(definitions) != 1:
+            return None
+        definition, = definitions
+        header = definition['header']; fn = header.index('fn'); method = header[fn+1]
+        qualifiers = ' '.join(header[fn+2:args-definition['first']])
+        if qualifiers and re.fullmatch(r"< '[A-Za-z_]\w*(?: , '[A-Za-z_]\w*)* >",qualifiers,re.ASCII) is None:
+            return None
+        begin = code.position(code.starts[definition['first']]); brace = code.position(code.starts[definition['opening']])
+        end = code.position(code.ends[definition['end']]); entry = (*begin,brace[0],brace[1]-1)
+        if not begin[0] < number < brace[0]:
+            return None
+        holding = code.parents[definition['opening']]
+        crate = ('omg_lib', *file_scope[1].split('/'))
+        trait = None; owner_type = None
+        if holding is not None:
+            _construct_charge(work, len(rows))
+            implementations = [row for row in rows if row['opening'] == holding and row['kind'] == 'impl']
+            if len(implementations) != 1:
+                return None
+            implementation, = implementations
+            nominal_impl = ' '.join(implementation['header'])
+            match = re.fullmatch(r'impl (super(?: :: super)* :: (?:[A-Za-z_]\w* :: )*[A-Za-z_]\w*) for ([A-Za-z_]\w*)',
+                                 nominal_impl,re.ASCII)
+            context = _boolean_module(code, {'start':implementation['first']})
+            if match is None or context is None:
+                return None
+            path = tuple(match[1].split(' :: ')); supers = 0
+            while supers < len(path) and path[supers] == 'super':
+                supers += 1
+            crate += tuple(context[0])
+            if supers >= len(crate):
+                return None
+            trait = nominal((*crate[:-supers], *path[supers:])); owner_type = nominal((*crate,match[2]))
+        low = code.position(code.starts[first]); high = code.position(code.ends[last-1]); roots = {}
+        for owner in index.inventories.get(name, ()):
+            symbol = owner['name']; regions = owner['regions']
+            _construct_charge(work, len(regions)+len(method)+1)
+            touching = [r for r in regions if tuple(r[:2]) < high and low < tuple(r[2:4])]
+            if not touching and not symbol.endswith(method):
+                continue
+            _construct_charge(work, len(symbol))
+            if trait is None:
+                shape = plain_rust_function_symbol(symbol)
+                matched = shape is not None and shape.identifiers == (*crate,method)
+                identity = (shape.identity, re.match(r'_RNv(?:Nt)*C(s[0-9A-Za-z]{0,32}_)?',symbol)[1]) if matched else None
+            else:
+                shape = nominal_method_path(symbol)
+                matched = (shape is not None and shape.kind == 'X' and not shape.callbacks
+                           and shape.method == (method,'') and shape.namespace == nominal(crate)
+                           and shape.trait == trait and shape.self_type == owner_type)
+                identity = shape.copy_identity if matched else None
+            if not matched and not touching:
+                continue
+            count = owner.get('count'); span = spans.get(id(owner))
+            if (not matched or identity in roots or index.name_counts[symbol] != 1 or span is None
+                    or span[:2] != (begin[0],end[0]) or type(count) is not int or not 0 <= count < COUNTER_LIMIT
+                    or any(owner.get(field) for field in ('branches','mcdc_records'))
+                    or touching != [[*entry,count,0,0,0]] or not begin <= low < high <= entry[2:4]):
+                return None
+            roots[identity] = symbol,count
+        if not roots or sum(count for _,count in roots.values()) != mapped[number]:
+            return None
+        bindings.append((method,(begin[0],end[0]),roots))
+    (method, old_range, old_roots), (new_method, _, _) = bindings
+    if method == new_method or method in head_names or any(symbol in indexes[1].name_counts for symbol,_ in old_roots.values()):
+        return None
+    alternatives = indexes[1].declaration_ends.get(method[-2:],())
+    _construct_charge(work, len(alternatives)*(len(method)+1))
+    if any(symbol.endswith(method) for symbol in alternatives):
+        return None
+    return dict(file=name, kind='retired-declaration-parameter', line=line, head_candidate=target,
+                base_range=list(old_range), declaration=method, owners=sorted(old_roots.values()), pairs=[],
+                summary_credit=[0,0], mapped_credit=[0,0])
+
+
 def retired_async_methods(name, probes, source, inventory, before, base_index, head_index,
                           head_inventory, head_declarations, work):
     """Prove the complete disappearance of a closed async owner with zero ratio credit."""
@@ -5527,6 +5897,87 @@ def retained_boolean_argument_paint(name, old, new, before, after, base, head, b
     return results
 
 
+def retained_default_trait_additions(name, sides, indexes, work):
+    """Match every original default-trait specialization and observe extra types in full."""
+    layouts = []; roles = []; spans = []; traits = []; summaries = []; source_bytes = []; compiled_traits = set()
+    for (source, counts, candidates), index in zip(sides, indexes, strict=True):
+        _construct_charge(work, sum(3*len(owner['regions'])+1 for owner in candidates))
+        bounds = {source_owner_span(owner, name, index.files, source) for owner in candidates}
+        if len(bounds) != 1 or None in bounds:
+            return None
+        (first, last, declaration, _), = bounds
+        if declaration is None:
+            return None
+        spans.append((first, last)); source_bytes.append(source[first-1:last])
+        _construct_charge(work, sum(len(line)+1 for line in source))
+        inventory = _construct_inventory(source, work)
+        if inventory is None:
+            return None
+        code, rows = inventory[:2]
+        _construct_charge(work, 2*len(rows))
+        methods = [row for row in rows if row['kind'] == 'fn' and row['supported']
+                   and row['header'][:1] == ('fn',) and row['header'][2:6] == ('(', '&', 'self', ')')
+                   and code.position(code.starts[row['first']])[0] == first
+                   and code.position(code.ends[row['end']])[0] == last]
+        if len(methods) != 1:
+            return None
+        method = methods[0]; holding = code.parents[method['opening']]
+        containers = [row for row in rows if row['opening'] == holding and row['kind'] == 'trait'
+                      and row['header'][:2] == ('pub', 'trait') and code.parents[holding] is None]
+        if len(containers) != 1:
+            return None
+        trait = containers[0]['header']; owner_roles = {}; projections = Counter(); geometries = set()
+        traits.append(trait)
+        entire_file = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['regions'])+1 for owner in entire_file))
+        touching = {id(owner) for owner in entire_file if any(
+            region[0] <= last and region[2] >= first for region in owner['regions'])}
+        if touching != {id(owner) for owner in candidates}:
+            return None
+        observer = _ObserverWork(work)
+        for owner in candidates:
+            symbol = owner['name']; regions = owner['regions']; count = owner.get('count')
+            _construct_charge(work, len(symbol)+3*len(regions)+1)
+            shape = nominal_method_path(symbol)
+            if (shape is None or shape.kind != 'Y' or shape.callbacks or shape.trait[0] != 'type'
+                    or shape.trait[-1][0] != trait[2] or shape.method[0] != method['header'][1]
+                    or index.name_counts[symbol] != 1 or type(count) is not int or not 0 <= count < COUNTER_LIMIT
+                    or owner.get('branches') or owner.get('mcdc_records')):
+                return None
+            geometry, states = fragment_region_states(owner, first, last, source, work)
+            geometries.add(geometry)
+            compiled_traits.add((shape.trait, shape.method))
+            signature = (shape.parent_scope, shape.method, shape.instantiating_crate[0])
+            owner_roles.setdefault(signature, []).append((shape.copy_identity, (int(count > 0), *states)))
+            projections.update(_owner_line_counts(owner, observer))
+        summary = {line: counts[line] for line in range(first,last+1) if line in counts}
+        if len(geometries) != 1 or not summary or projections != summary:
+            return None
+        if any(len({identity for identity, _ in entries}) != len(entries) for entries in owner_roles.values()):
+            return None
+        summaries.append(summary); layouts.append(next(iter(geometries))); roles.append(owner_roles)
+    if (source_bytes[0] != source_bytes[1] or traits[0] != traits[1]
+            or layouts[0] != layouts[1] or len(compiled_traits) != 1):
+        return None
+    base, head = roles
+    added = head.keys() - base.keys()
+    if not added or base.keys() - head.keys() or any(not all(states) for role in added for _, states in head[role]):
+        return None
+    for role, previous in base.items():
+        current = head[role]
+        before_ids, before_states = zip(*previous, strict=True)
+        after_ids, after_states = zip(*current, strict=True)
+        _construct_charge(work, len(before_states)*len(after_states)*len(before_states[0]))
+        if compiled_hit_state_matching(before_states, after_states, (before_ids, after_ids)) is None:
+            return None
+    offset = spans[1][0] - spans[0][0]
+    if summaries[1].keys() != {line+offset for line in summaries[0]}:
+        return None
+    return dict(file=name, base_range=spans[0], head_range=spans[1],
+                pairs=[[line,line+offset] for line in summaries[0]],
+                base_types=len(base), head_types=len(head), added_types=sorted(map(repr, added)))
+
+
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
     bf, bs = region_evidence(base_regions, base, base_sources, "base")
     hf, hs = region_evidence(head_regions, head, head_sources, "head")
@@ -5573,8 +6024,15 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
-    head_fn_names = set(); retirement_receipts = []
+    head_fn_names = set(); retirement_receipts = []; additive_trait_receipts = []; retired_declaration_receipts = []
     parent_file_cache = {}; method_parent_files = None; plain_parent_files = None; owner_indexes = None
+    def source_owner_indexes():
+        nonlocal owner_indexes
+        if owner_indexes is None:
+            owner_indexes = (index_compiled_owner_sources(bf, base_files, construct_work, bs.keys()),
+                             index_compiled_owner_sources(hf, head_files, construct_work, bs.keys(),
+                                                          index_declaration_ends=True))
+        return owner_indexes
     def parent_files(parent):
         nonlocal method_parent_files, plain_parent_files
         method_scope = parent[0].startswith('method:')
@@ -5632,13 +6090,16 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for functions, files, source in [(owners_by_file.get(name, []), base_files, old),
                                          (head_owners_by_file.get(name, []), head_files, new)]:
             spans = {}; declarations = {}; headers = {}
+            _construct_charge(construct_work, len(source) + sum(len(owner['regions']) + len(owner['filenames'])
+                                                              for owner in functions))
+            occurrences = Counter(source)
             for function in functions:
                 span = source_owner_span(function, name, files, source)
                 if span is not None:
                     spans[id(function)] = span
-                    if span[2] is not None and source.count(span[2]) == 1:
+                    if span[2] is not None and occurrences[span[2]] == 1:
                         declarations.setdefault(span[2], []).append(function)
-                    if span[3] is not None and source.count(span[3]) == 1:
+                    if span[3] is not None and occurrences[span[3]] == 1:
                         headers.setdefault(span[3], []).append(function)
             source_owners.append((spans, declarations, headers))
         (base_spans, base_declarations, base_headers), (head_spans, head_declarations, head_headers) = source_owners
@@ -5695,8 +6156,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         if base_sources[name] == head_sources[name]:
             _construct_charge(construct_work, sum(len(line) + 1 for line in old))
             source_structure = _source_structural_map(old)
-        grouped = [_compiled_function_groups(name, owners, files, source, construct_work, source_structure) for owners, files, source in (
-            (owners_by_file.get(name, []), base_files, old), (head_owners_by_file.get(name, []), head_files, new))]
+        grouped = [_compiled_function_groups(name, owners, files, source, construct_work, source_structure, spans)
+                   for owners, files, source, spans in ((owners_by_file.get(name, []), base_files, old, base_spans),
+                                                       (head_owners_by_file.get(name, []), head_files, new, head_spans))]
         base_groups, head_groups = (value[1] if value is not None else {} for value in grouped)
         _construct_charge(construct_work, sum(len(group[2]) + 1
             for groups in (base_groups, head_groups) for group in groups.values()))
@@ -5708,6 +6170,17 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             if frozenset(map(id, previous)) not in closed[0]:
                 continue
             if len(previous) != len(current):
+                if (len(current) > len(previous) and frozenset(map(id, current)) in closed[1]
+                        and all(owner['name'].startswith('_RNvY') for owner in (*previous, *current))):
+                    proof = retained_default_trait_additions(name, ((old, before, previous), (new, after, current)),
+                                                              source_owner_indexes(), construct_work)
+                    if proof is not None:
+                        for line, target in proof['pairs']:
+                            if line in anchored and anchored[line] != target:
+                                raise ValueError('Ambiguous retained default trait owner')
+                            anchored[line] = target
+                        additive_trait_receipts.append(proof)
+                        continue
                 raise ValueError(f'Ambiguous unchanged source correspondence: {name}; '
                                  'Retained covered line requires a complete compiled-copy inventory')
             if frozenset(map(id, current)) not in closed[1]:
@@ -5743,7 +6216,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         construct_pairs, witnesses = retained_construct_anchors(name, old, new, before, after,
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
-        retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}
+        retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}; neutral_declarations = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
         _construct_charge(construct_work, len(base_groups) + len(head_groups))
         missing_prefixes = base_groups.keys() - head_groups.keys()
@@ -5823,6 +6296,20 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             construct_work, head_capsule_counts, parent_files) if inventories is not None else ({}, [], set())
         anchored.update(obligation_pairs); obligation_receipts.extend(residual_receipts)
         retained_statement_rows = {}
+        def retire_declaration(line,target):
+            if (line in anchored or line in deferred_fragments or inventories is None
+                    or old[line-1] != new[target-1] or before.get(line,0) <= 0
+                    or _DECLARATION_PARAMETER.fullmatch(old[line-1]) is None or head_construct_inventory() is None):
+                return False
+            if line in neutral_declarations:
+                return target == neutral_declarations[line]['head_candidate']
+            sides = ((old,inventories[0],base_spans,before),(new,inventories[1],head_spans,after))
+            proof = retired_declaration_parameter(name,line,target,sides,source_owner_indexes(),head_fn_names,construct_work)
+            if proof is None:
+                return False
+            neutral_declarations[line] = proof
+            retired_declaration_receipts.append(proof)
+            return True
         def retained_statement_lines(block):
             key = tuple(block['base_range']), tuple(block.get('retained_statements', ()))
             if key not in retained_statement_rows:
@@ -5881,7 +6368,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         kind = 'async' if re.search(r'\basync\s+fn\b', scopes[0]) else 'callback'
                         deferred_fragments[line] = DeferredSourceFragment(target, kind, scopes[0])
                         unresolved_fragments.append((line - 1, line, target - 1, target, [line]))
-                    else:
+                    elif not retire_declaration(line,target):
                         raise ValueError(f'Unproved retained execution in replaced construct: '
                             f'{name}:{line} -> {target}; '
                             f'base_count={before.get(line)} head_count={after.get(target)}')
@@ -5957,9 +6444,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     proposals.append((line - 1, line, target - 1, target, [line]))
                     seen_pairs.add((line, target))
             unresolved_fragments = proposals
-        if unresolved_fragments and owner_indexes is None:
-            owner_indexes = (index_compiled_owner_sources(bf, base_files, construct_work, bs.keys()),
-                             index_compiled_owner_sources(hf, head_files, construct_work, bs.keys()))
+        if unresolved_fragments:
+            source_owner_indexes()
         if unresolved_fragments and inventories is not None:
             _construct_charge(construct_work, sum(len(pending) for *_, pending in unresolved_fragments))
             probes = {line for *_, pending in unresolved_fragments for line in pending
@@ -5982,13 +6468,31 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         retained.pop(line, None)
                     unresolved_fragments = [(*bounds, active) for *bounds, pending in unresolved_fragments
                         if (active := [line for line in pending if line not in retired])]
+        if unresolved_fragments and inventories is not None:
+            probes = set()
+            for a, _, c, _, pending in unresolved_fragments:
+                _construct_charge(construct_work,len(pending))
+                probes.update((line,c+line-a) for line in pending if line not in deferred_fragments
+                              and _DECLARATION_PARAMETER.fullmatch(old[line-1]) is not None)
+            checked = Counter(line for line,_ in probes)
+            for line,target in sorted(probes):
+                if checked[line] == 1:
+                    retire_declaration(line,target)
+        if neutral_declarations:
+            for line,proof in neutral_declarations.items():
+                first,last = proof['base_range']; _construct_charge(construct_work,last-first+1)
+                gone.difference_update(range(first,last+1))
+                retained.pop(line,None)
+            unresolved_fragments = [(*bounds, active) for *bounds, pending in unresolved_fragments
+                if (active := [line for line in pending if line not in neutral_declarations])]
         async_obligations = [(line, fragment.target) for line, fragment in deferred_fragments.items()
                              if fragment.kind == 'async']
         _construct_charge(construct_work, len(deferred_fragments))
         positive, receipts = positive_source_fragments(
             name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments,
             construct_work, inventories, grouped, callback_functions, owner_indexes,
-            tuple(zip(*async_obligations)) if async_obligations else ((), ()))
+            tuple(zip(*async_obligations)) if async_obligations else ((), ()),
+            macro_expansions=(bs[name]['expansions'],hs[name]['expansions']))
         proof_pairs = {
             'async': {tuple(pair) for receipt in receipts
                       if 'async_copies' in receipt and 'async_fragment_regions' in receipt
@@ -6086,6 +6590,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         paint_receipt['source_replacements'] = replacement_receipts
     if retirement_receipts:
         paint_receipt['retired_async_methods'] = retirement_receipts
+    if retired_declaration_receipts:
+        paint_receipt['retired_declarations'] = retired_declaration_receipts
+    if additive_trait_receipts:
+        paint_receipt['additive_trait_copies'] = additive_trait_receipts
     if construct_receipts:
         paint_receipt['retained_constructs'] = construct_receipts
     if obligation_receipts:

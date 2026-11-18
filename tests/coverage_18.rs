@@ -1749,17 +1749,37 @@ async fn security_audit_fetches_all_osv_pages_and_refuses_partial_results_over_r
 
     let fixture = RealServerFixture::with_catalog_and_scanner(
         &[(package.as_str(), "1.0.0")],
-        &[],
-        false,
+        &[(package.as_str(), "1.0.0")],
+        true,
         Some(scanner),
     )
     .await?;
+    match request_on_wire(
+        &fixture,
+        Request::Search {
+            id: 9299,
+            query: package.clone(),
+            limit: Some(2),
+        },
+    )
+    .await?
+    {
+        Response::Success {
+            id: 9299,
+            result: ResponseResult::Search(result),
+        } => {
+            assert_eq!(result.total, 1);
+            assert_eq!(result.packages[0].name, package);
+            assert_eq!(result.packages[0].version.to_string(), "1.0.0");
+        }
+        other => panic!("catalog lookup returned {other:?}"),
+    }
     let state_path = fixture
         .temp_dir
         .as_ref()
         .context("fixture directory")?
         .path()
-        .join("data/mock_state_pacman.json");
+        .join("data/mock_state_dnf.json");
     let original = std::fs::read(&state_path)?;
     let baseline = metrics_probe(&fixture).await?;
     match request_on_wire(&fixture, Request::SecurityAudit { id: 9300 }).await? {

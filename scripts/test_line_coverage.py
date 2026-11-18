@@ -1553,6 +1553,210 @@ class SourceAwareCoverageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.literal_loop_async_compare(body=True)
 
+
+    def join_result_compare(self, mutation=None, expansions=([], []), body=False, fragment=None,
+                            with_guard=False):
+        captured = {}
+        def nest(old, new, base, head):
+            for source, members, callee, request in ((old, base, 'before', '"fixture-tool"'),
+                                                    (new, head, 'after', 'request')):
+                source[10:11] = [
+                    '                let (outcome, tick_elapsed) = tokio::join!(',
+                    '                    biased;',
+                    '                    ' + callee + '(manager, ' + request + ', "fixture-tool", &tools, &bin),',
+                    '                    async {',
+                    '                        tokio::time::sleep(Duration::from_millis(50)).await;',
+                    '                        started.elapsed()',
+                    '                    },',
+                    '                );',
+                ]
+                for owner in members:
+                    for row in owner['regions']:
+                        for column in (0, 2):
+                            if row[column] >= 12:
+                                row[column] += 7
+                for root, phase in ((members[0], members[8]), (members[2], members[9])):
+                    phase['regions'] = [row for row in phase['regions'] if row[0] != 11]
+                    line = source[10]
+                    for name in ('outcome', 'tick_elapsed', 'tokio::join!'):
+                        start = line.index(name)+1
+                        phase['regions'].append([11, start, 11, start+len(name), 2, 0, 0, 0])
+                    line = source[12]
+                    matched = re.fullmatch(r'\s*(?P<callee>\w+)\((?P<a>manager), (?P<b>"fixture-tool"|request), '
+                        r'(?P<c>"fixture-tool"), (?P<d>&tools), (?P<e>&bin)\),', line)
+                    for name in ('callee', 'a', 'b', 'c', 'd', 'e'):
+                        phase['regions'].append([13, matched.start(name)+1, 13, matched.end(name)+1, 2, 0, 0, 0])
+                    brace = source[13].index('{')+1; sleep = source[14].index('tokio')+1
+                    started = source[15].index('started')+1; elapsed = source[15].index('elapsed')+1
+                    end = source[16].index('}')+1
+                    members.append(dict(name='_RNCNCNC'+root['name'][2:]+'000B7_', count=2,
+                        filenames=['/src/example.rs'], regions=[
+                            [14, brace, 14, brace+1, 2, 0, 0, 0],
+                            [15, sleep, 15, sleep+len('tokio::time::sleep'), 2, 0, 0, 0],
+                            [15, sleep, 15, source[14].index(';')+1, 2, 0, 0, 0],
+                            [16, started, 16, started+len('started'), 2, 0, 0, 0],
+                            [16, elapsed, 16, elapsed+len('elapsed'), 2, 0, 0, 0],
+                            [17, end, 17, end+1, 2, 0, 0, 0],
+                        ]))
+                if with_guard:
+                    source[18:18] = ['                if tick_elapsed >= Duration::from_millis(500) {',
+                                     '                    starved.push(manager);',
+                                     '                }']
+                    for owner in members:
+                        for row in owner['regions']:
+                            for column in (0, 2):
+                                if row[column] >= 19:
+                                    row[column] += 3
+                    for phase in (members[8], members[9]):
+                        guard = source[18]; expression = guard.index('tick_elapsed') + 1
+                        brace = guard.index('{') + 1; end = source[20].index('}') + 1
+                        phase['regions'].extend([
+                            [19, expression, 19, brace - 1, 2, 0, 0, 0],
+                            [19, brace, 21, end + 1, 0, 0, 0, 0],
+                            [20, 21, 20, 33, 0, 0, 0, 0],
+                            [21, end, 21, end + 1, 2, 0, 0, 0],
+                        ])
+            if mutation:
+                mutation(old, new, base, head)
+            captured.update(old=old, new=new, base=base, head=head)
+        self.literal_loop_async_compare(nest)
+        first, last = fragment or ((11, 15) if body else (11, 11))
+        requested = [(first-1, last, first-1, last, list(range(first,last+1)))]
+        if with_guard:
+            requested.append((18, 19, 18, 19, [19]))
+        return coverage.positive_source_fragments('example.rs', captured['old'], captured['new'],
+            {n: 1 for n in range(1, 32)}, {n: 1 for n in range(1, 32)},
+            captured['base'], captured['head'], {'/src/example.rs': 'example.rs'},
+            {'/src/example.rs': 'example.rs'}, requested,
+            callback_functions=('fn checked()',), macro_expansions=expansions)
+
+    def test_join_result_binds_exact_result_roles_and_unchanged_owned_timer(self):
+        pairs, receipts = self.join_result_compare()
+        self.assertEqual(pairs, {11: 11})
+        proofs = [proof for receipt in receipts for proof in receipt.get('callback_owners', [])
+                  if proof['kind'] == 'biased-join-result-binding']
+        self.assertEqual(len(proofs), 2)
+        self.assertEqual([proof['first_callee_unclaimed'] for proof in proofs], ['before', 'after'])
+        self.assertTrue(all(proof['empty_expansion_metadata'] for proof in proofs))
+
+    def test_join_result_projects_only_the_exact_closed_timer_owner(self):
+        for first,last in ((14,14),(15,15),(16,16),(17,17),(14,17)):
+            with self.subTest(fragment=(first,last)):
+                pairs,receipts=self.join_result_compare(fragment=(first,last))
+                self.assertEqual(pairs, {line:line for line in range(first,last+1)})
+                self.assertTrue(any(proof['kind']=='biased-join-owned-timer-fragment'
+                    for receipt in receipts for proof in receipt.get('callback_owners',[])))
+        for fragment in ((12,12),(13,13),(11,15),(13,17)):
+            with self.subTest(unclaimed=fragment),self.assertRaises(ValueError):
+                self.join_result_compare(fragment=fragment)
+
+    def test_join_scope_proves_the_unchanged_direct_conditional_and_preserves_cold_regions(self):
+        pairs, receipts = self.join_result_compare(with_guard=True)
+        self.assertEqual(pairs, {11:11,19:19})
+        proofs = [proof for receipt in receipts for proof in receipt.get('callback_owners', [])
+                  if proof['kind']=='joined-async-condition']
+        self.assertEqual(len(proofs), 2)
+        self.assertTrue(all(proof['condition_span'] == [19,21] for proof in proofs))
+
+    def test_join_scope_refuses_changed_conditional_body_and_lost_copy_state(self):
+        def change(old, new, base, head, mode):
+            if mode == 'different-body':
+                new[19] = new[19].replace('push', 'drop')
+            elif mode == 'foreign-region':
+                head.append(dict(name='foreign', filenames=['/src/example.rs'], count=2,
+                    regions=[[19,20,19,24,2,0,0,0]]))
+            else:
+                next(row for row in head[8]['regions'] if row[0]==19 and row[2]==19)[4] = 0
+        for mode in ('different-body','foreign-region','lost-copy'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.join_result_compare(lambda *args: change(*args, mode), with_guard=True)
+
+    def test_join_prepared_cache_is_scoped_to_exact_immutable_inputs_and_metadata(self):
+        original=coverage.biased_join_result_fragment
+        captured=[]
+        def record(*args,**kwargs):
+            value=original(*args,**kwargs)
+            if value is not None and first_not_captured(args,captured):
+                captured.append((args,kwargs))
+            return value
+        def first_not_captured(args,captured):
+            return all(old[0][0] is not args[0] for old in captured)
+        with patch.object(coverage,'biased_join_result_fragment',side_effect=record):
+            self.join_result_compare()
+        self.assertEqual(len(captured),2)
+        cache={}
+        for (args,kwargs),callee in zip(captured,('before','after')):
+            value=original(*args,**(kwargs|{'cache':cache}))
+            self.assertEqual(value.witness['first_callee_unclaimed'],callee)
+            for missing in (None,[{}]):
+                self.assertIsNone(original(*args,**(kwargs|{'cache':cache,'expansions':missing})))
+        args,kwargs=captured[1];changed=list(args);changed[2]=list(args[2]);changed[2].pop()
+        self.assertIsNone(original(*changed,**(kwargs|{'cache':cache})))
+        exhausted=list(args);exhausted[7]=[0]
+        with self.assertRaisesRegex(ValueError,'work bound exceeded'):
+            original(*exhausted,**(kwargs|{'cache':cache}))
+
+    def test_join_result_refuses_unavailable_or_nonempty_expansion_metadata(self):
+        for expansions in ((None,None), ([],None), (None,[]), ([{}],[]), ([],[{}])):
+            with self.subTest(expansions=expansions), self.assertRaises(ValueError):
+                self.join_result_compare(expansions=expansions)
+
+    def test_join_result_refuses_cold_foreign_missing_or_changed_macro_control(self):
+        def mutate(old,new,base,head,mode):
+            if mode == 'missing-timer':
+                del head[10]
+            elif mode == 'duplicate-timer':
+                head.append(copy.deepcopy(head[10]))
+            elif mode == 'foreign-overlap':
+                head.append(dict(name='foreign',count=1,filenames=['/src/example.rs'],
+                    regions=[copy.deepcopy(head[10]['regions'][0])]))
+            elif mode == 'wrong-timer-depth':
+                head[10]['name'] = head[10]['name'].replace('_RNCNCNC','_RNCNC')
+            elif mode == 'timer-foreign-file':
+                head[10]['filenames'] = ['/src/foreign.rs']
+            elif mode == 'cold-timer':
+                head[10]['count'] = head[10]['regions'][0][4] = 0
+            elif mode == 'cold-timer-subregion':
+                head[10]['regions'][2][4] = 0
+            elif mode == 'disagreed-timer-entry':
+                head[10]['count'] += 1
+            elif mode == 'cold-result':
+                head[8]['regions'][2][4] = 0
+            elif mode == 'cold-first-call':
+                head[8]['regions'][-1][4] = 0
+            elif mode == 'changed-timer':
+                new[14] = new[14].replace('(50)','(60)')
+            elif mode == 'changed-manager':
+                new[12] = new[12].replace('(manager,','(another,')
+            elif mode == 'no-biased-control':
+                for source in (old,new):
+                    source[11] = '                    unbiased;'
+            elif mode == 'third-branch':
+                for source in (old,new):
+                    source[16] += ' another(),'
+            elif mode == 'expression-escape':
+                for source in (old,new):
+                    source[12] = source[12].replace('before(','return before(').replace('after(','return after(')
+            elif mode == 'wrong-macro':
+                for source in (old,new):
+                    source[10] = source[10].replace('tokio::join!', 'other::join!')
+            elif mode in ('stable-bad-slot','stable-bad-tail'):
+                for members in (base,head):
+                    for phase in (members[8],members[9]):
+                        phase['regions'][2][1 if mode=='stable-bad-slot' else 7] += 1
+            elif mode == 'wrong-timer-end':
+                head[10]['regions'][-1][3] += 1
+        for mode in ('missing-timer','duplicate-timer','foreign-overlap','wrong-timer-depth',
+                'timer-foreign-file','cold-timer','cold-timer-subregion','disagreed-timer-entry',
+                'cold-result','cold-first-call','changed-timer','changed-manager','no-biased-control',
+                'third-branch','expression-escape','wrong-macro','stable-bad-slot','stable-bad-tail','wrong-timer-end'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.join_result_compare(lambda old,new,base,head:mutate(old,new,base,head,mode))
+
+    def test_join_result_never_credits_macro_body_or_first_callee_semantics(self):
+        with self.assertRaises(ValueError):
+            self.join_result_compare(body=True)
+
     def nested_async_entry_compare(self, mutation=None, body=False):
         captured = {}
         def nest(old, new, base, head):
@@ -3563,6 +3767,44 @@ class SourceAwareCoverageTests(unittest.TestCase):
             "files": [{"filename": "/src/example.rs", "summary": {"lines": {
                 "count": len(rows), "covered": sum(count > 0 for _, count in rows)}}}],
             "functions": functions}]}
+
+    def default_trait_additions_compare(self, change=None):
+        old = b'pub trait Backend {\n    fn index(&self) -> usize {\n        self.fetch()\n    }\n}\n'
+        new = b'// Additional consumers of the same default.\n' + old
+        def owner(role, crate, shift, count):
+            name = f'_RNvYNtCs{crate}_3pkg{len(role)}{role}NtB4_7Backend5index'
+            return dict(name=name, filenames=['/src/example.rs'], count=count,
+                        regions=[[2+shift, 5, 2+shift, 30, count, 0, 0, 0],
+                                 [3+shift, 9, 3+shift, 21, count, 0, 0, 0],
+                                 [4+shift, 5, 4+shift, 6, count, 0, 0, 0]])
+        def bind(base, head):
+            base['data'][0]['functions'] = [owner('Alpha', '1', 0, 1), owner('Beta', '1', 0, 0)]
+            candidates = [owner('Alpha', '2', 1, 1), owner('Beta', '2', 1, 0), owner('Gamma', '2', 1, 1)]
+            if change == 'cold-new':
+                candidates[1:] = [owner('Beta', '2', 1, 1), owner('Gamma', '2', 1, 0)]
+            elif change == 'cold-retained':
+                candidates[:2] = [owner('Alpha', '2', 1, 0), owner('Beta', '2', 1, 1)]
+            elif change == 'lost-type':
+                candidates[0] = owner('Delta', '2', 1, 1)
+            elif change == 'unmapped-new':
+                candidates[2]['regions'][1][4] = 0
+            elif change == 'unknown-symbol':
+                candidates[2]['name'] = 'foreign'
+            head['data'][0]['functions'] = candidates
+        if change == 'changed-body':
+            new = new.replace(b'self.fetch()', b'self.query()')
+        return self.compare(before=[(2,1),(3,1),(4,1)], after=[(3,2),(4,2),(5,2)],
+                            mutate=bind, sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_retained_default_trait_method_can_gain_a_fully_observed_type(self):
+        receipt = self.default_trait_additions_compare()
+        self.assertEqual(receipt['deleted_mapped'], 0)
+        self.assertEqual(receipt['additive_trait_copies'][0]['pairs'], [[2,3],[3,4],[4,5]])
+
+    def test_default_trait_additions_require_all_original_types_and_live_new_copies(self):
+        for change in ('cold-new', 'cold-retained', 'lost-type', 'unmapped-new', 'unknown-symbol', 'changed-body'):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'complete compiled-copy'):
+                self.default_trait_additions_compare(change)
 
     def compare(self, before=None, after=None, mutate=None, sources=None):
         default_before, default_after = self.fixture()
@@ -6870,6 +7112,59 @@ impl SecurityPolicy {
                        stale_head, stale_body, opaque_head, keeps_declaration, relocated_statement):
             with self.subTest(mutate=mutate.__name__):
                 self.assertEqual(self.witness(mutate), [])
+
+
+class RetiredDeclarationParameterTests(unittest.TestCase):
+    def compare(self, cold_head_line=None, mutate_old=None, mutate_head=None, head_sources=None):
+        old = ['pub(crate) fn previous(', '    ttl: Duration,', ') -> u8 {',
+               '    check_old(ttl)', '}']
+        new = ['fn replacement(', '    ttl: Duration,', ') -> bool {', '    check_new(ttl)', '}',
+               'fn another(', '    ttl: Duration,', ') -> bool {', '    another_check(ttl)', '}']
+        file = '/src/example.rs'
+        old_rows = [dict(name='_RNvNtCs1_7omg_lib7example8previous', count=1, filenames=[file], regions=[
+            [1,1,3,8,1,0,0,0],[4,5,4,19,1,0,0,0],[5,1,5,2,1,0,0,0]])]
+        if mutate_old:
+            mutate_old(old_rows)
+        before = [(line,1) for line in range(1,6)]
+        after = [(line,int(line != cold_head_line)) for line in range(1,11)]
+        def mutate(base, head):
+            base['data'][0]['functions'] = old_rows
+            head['data'][0]['functions'] = [dict(name=f'_RNvNtCs2_7omg_lib7example{len(name)}{name}',
+                count=1, filenames=[file], regions=[[first,1,first+2,10,1,0,0,0],
+                [first+3,5,first+3,len(new[first+2])+1,int(first+3 != cold_head_line),0,0,0],
+                [first+4,1,first+4,2,1,0,0,0]])
+                for first,name in ((1,'replacement'),(6,'another'))]
+            if mutate_head:
+                mutate_head(head['data'][0]['functions'])
+        sources = tuple({'src/example.rs': ('\n'.join(source)+'\n').encode()} for source in (old,new))
+        sources[1].update(head_sources or {})
+        return SourceAwareCoverageTests().compare(before, after, mutate, sources)
+
+    def test_retires_only_the_old_header_projection(self):
+        receipt = self.compare()
+        proof, = receipt['retired_declarations']
+        self.assertEqual((proof['line'], proof['head_candidate']), (2,2))
+        self.assertEqual(proof['pairs'], [])
+        self.assertEqual({key: value for key,value in receipt.items() if key.startswith('deleted_')},
+            dict(deleted_summary_found=0, deleted_summary_hit=0, deleted_mapped=0, deleted_mapped_hit=0))
+
+    def test_cold_new_executable_line_and_opaque_old_header_are_still_refused(self):
+        with self.assertRaisesRegex(ValueError, 'New uncovered instrumented line: src/example.rs:4'):
+            self.compare(cold_head_line=4)
+        def opaque(owners):
+            owners.append(dict(name='opaque', count=1, filenames=['/src/example.rs'],
+                               regions=[[2,5,2,18,1,0,0,0]]))
+        with self.assertRaises(ValueError):
+            self.compare(mutate_old=opaque)
+
+    def test_persisting_head_declaration_or_raw_root_blocks_neutrality(self):
+        with self.assertRaisesRegex(ValueError, 'Unproved retained execution in replaced construct'):
+            self.compare(head_sources={'src/different.rs': b'fn previous() {}\n'})
+        def displaced_owner(owners):
+            owners.append(dict(name='_RNvNtCs3_7omg_lib7example8previous', count=1,
+                filenames=['/unselected/different.rs'], regions=[[1,1,1,5,1,0,0,0]]))
+        with self.assertRaisesRegex(ValueError, 'Unproved retained execution in replaced construct'):
+            self.compare(mutate_head=displaced_owner)
 
 
 if __name__ == "__main__":
