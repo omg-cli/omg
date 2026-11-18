@@ -603,7 +603,7 @@ class AsyncTestExpectedVariantTests(unittest.TestCase):
 
 
 class RetainedEnsureEntryTests(unittest.TestCase):
-    def compare(self, *, local=False, fault=None, same_condition=False):
+    def compare(self, *, local=False, fault=None, same_condition=False, terminal=False):
         name='src/package_managers/aur/client.rs' if local else 'src/example.rs'
         filename=f'/artifact/{name}'
         files={filename:name}
@@ -620,7 +620,15 @@ class RetainedEnsureEntryTests(unittest.TestCase):
             condition='!valid' if side and not same_condition else 'valid'
             message='wrong fixture assertion' if side and fault=='changed-label' else 'owned fixture assertion'
             opener=len(source)+1
-            source.extend([f'{indentation}anyhow::ensure!(',f'{indentation}    {condition},',
+            conditions=[f'{condition},']
+            slots=[condition]
+            if terminal:
+                bound='super::source_file::MAX_SOURCE_FILE_BYTES' if side else '16 * 1024 * 1024'
+                limit='20_000' if side and fault=='changed-tail' else '10_000'
+                operator='||' if side and fault=='different-guard' else '&&'
+                slots=['metadata.is_file()',f'metadata.len() <= {bound}',f'files.len() < {limit}']
+                conditions=[slots[0],f'    && {slots[1]}',f'    {operator} {slots[2]},']
+            source.extend([f'{indentation}anyhow::ensure!(',*[f'{indentation}    {value}' for value in conditions],
                            f'{indentation}    "{message}: {{}}",',f'{indentation}    '+('new_display()' if side else 'old_display()'),
                            f'{indentation});'])
             if side and fault=='duplicate-label':
@@ -653,9 +661,11 @@ class RetainedEnsureEntryTests(unittest.TestCase):
                 if side and fault=='trailing-symbol' and copy:
                     symbol+='x'
                 regions=[row(first,'fn',counter),row(last,'}',counter),
-                         row(opener,'anyhow::ensure!',counter),
-                         row(opener+1,condition,0 if side and fault=='condition-cold' else counter),
-                         row(opener+3,'new_display' if side else 'old_display',counter)]
+                         row(opener,'anyhow::ensure!',counter)]
+                regions.extend(row(opener+offset,slot,0 if side and
+                    (fault=='condition-cold' or fault=='terminal-cold' and offset==3) else counter)
+                    for offset,slot in enumerate(slots,1))
+                regions.append(row(opener+2+len(slots),'new_display' if side else 'old_display',counter))
                 if side and fault=='missing-slot' and not copy:
                     del regions[2]
                 owners.append(dict(name=symbol,filenames=[filename],count=counter,regions=regions))
@@ -689,6 +699,14 @@ class RetainedEnsureEntryTests(unittest.TestCase):
                 separate=self.compare(local=True,same_condition=mode!='changed-source',fault=mode)
                 self.assertEqual(separate['pairs'],[[6,6]])
                 self.assertEqual(separate['condition_pairs'],[])
+
+    def test_terminal_guard_keeps_its_complete_copy_and_counter_obligations(self):
+        witness=self.compare(local=True,terminal=True)
+        self.assertEqual(witness['condition_pairs'],[[7,7],[9,9]])
+        for fault in ('terminal-cold','changed-tail','different-guard'):
+            with self.subTest(fault=fault):
+                separate=self.compare(local=True,terminal=True,fault=fault)
+                self.assertNotIn([9,9],separate['condition_pairs'])
 
     def test_rejects_foreign_or_incomplete_copy_and_source_evidence(self):
         for local in (False,True):
@@ -1112,6 +1130,47 @@ class PreparedPolicyEnvironmentEntryTests(unittest.TestCase):
         inventory=coverage._construct_inventory(lines,work)
         return coverage.prepared_policy_environment_entry('src/example.rs',lines,counts,(5,len(lines)-1,[root]),
             owners,Counter(item['name'] for item in owners),inventory,opening,work)
+
+    def test_single_config_entry_binds_the_call_argument_and_callback(self):
+        def observe(operation, fault=None):
+            key = 'OMG_CACHE_DIR' if fault == 'wrong-key' else 'OMG_CONFIG_DIR'
+            capture = 'other' if fault == 'wrong-capture' else 'directory'
+            lines = ['#[cfg(test)]', 'mod tests {', '    #[test]',
+                     '    fn checked() -> anyhow::Result<()> {',
+                     '        let directory = tempfile::tempdir()?;',
+                     '        temp_env::with_var(', f'            "{key}",',
+                     f'            Some({capture}.path()),',
+                     '            || -> anyhow::Result<()> {', f'                {operation}()?;',
+                     '                Ok(())', '            },', '        )', '    }', '}']
+            def slot(line, value, count=1):
+                start = lines[line-1].index(value)+1
+                return [line,start,line,start+len(value),count,0,0,0]
+            symbol = '_RNvNtNtCs1_7omg_lib7example5tests7checked'
+            argument = slot(8, f'Some({capture}.path())', int(fault != 'cold-argument'))
+            root = dict(name=symbol, count=2, filenames=['/artifact/src/example.rs'], regions=[
+                slot(4, 'fn checked() -> anyhow::Result<()>', 2), slot(5, 'directory'),
+                slot(6, 'temp_env::with_var'), argument, slot(14, '}', 2)])
+            child = dict(root, name='_RNC'+symbol[2:]+'0B7_', count=1, regions=[
+                slot(9, '{', int(fault != 'cold-opener')), slot(10, operation), slot(12, '}')])
+            owners = [root, child]
+            if fault == 'foreign':
+                owners.append(dict(root, name='opaque', regions=[slot(8, 'Some', 0)]))
+            if fault == 'literal-paint':
+                root['regions'].append(slot(7, f'"{key}"'))
+            work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+            counts = coverage._owner_line_counts({'regions': [r for owner in owners for r in owner['regions']]},
+                                                  coverage._ObserverWork(work))
+            return coverage.prepared_policy_environment_entry('src/example.rs', lines, counts, (4,14,[root]),
+                owners, Counter(owner['name'] for owner in owners), coverage._construct_inventory(lines, work),
+                6, work)
+
+        before, after = observe('old_policy_check'), observe('new_policy_check')
+        self.assertIsNotNone(before)
+        self.assertEqual(before[0], after[0])
+        self.assertEqual(after[1]['observed_lines'], [6,8,9,12])
+        for fault in ('wrong-key', 'wrong-capture', 'cold-argument', 'cold-opener', 'foreign', 'literal-paint'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(observe('new_policy_check', fault))
 
     def test_distinct_environment_arguments_preserve_only_the_direct_closure_entry(self):
         old,head=[self.observe(modern) for modern in (False,True)]
@@ -4725,12 +4784,20 @@ class SourceAwareCoverageTests(unittest.TestCase):
        except ValueError:continue
        self.assertFalse(any(r.get('kind')=='projected-iterator-input' for r in result.get('retained_replacement_obligations',[])))
 
-    def closed_sync_fixture(self,callbacks=True,fault=None):
+    def closed_sync_fixture(self,callbacks=True,fault=None,factory=False,array=False):
      old=['#[cfg(test)]','mod tests {','    #[test]','    fn routine() {',
           '        let finding = Row {','            id: "fixture",','        };']
      if callbacks:old+=['        let values = items().map(|item| item.name()).collect::<Vec<_>>();',
                        '        assert!(items().any(|item| item.name() == "fixture"));']
      old+=['        assert!(finding.id == "fixture");','    }','}']
+     if factory:
+      old[4]='        let finding = |id: &str| Row {'
+      old[6:6]=['            name: id.into(),']
+      old[-3]='        assert!(finding("sample").id == "fixture");'
+     if array:
+      old[4]='        let finding = [Row {'
+      old[6]='        }];'
+      old[-3]='        assert!(finding[0].id == "fixture");'
      new=old[:5]+['            status: Status::Applicable,']+old[5:]
      if callbacks:
       old=[line.replace('Row {','serde_json::json!({').replace('id: "fixture",','"id": "fixture"').replace('        };','        });') for line in old]
@@ -4744,6 +4811,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
      elif fault=='missing-test-gate':new[0]='#[cfg(feature = "other")]'
      elif fault=='unknown-callback':new=[line.replace('.find(','.inspect(') for line in new]
      elif fault=='block-callback':new=[line.replace('| item.name() == "fixture"','| { item.name() == "fixture" }') for line in new]
+     elif fault=='factory-parameter':new[4]=new[4].replace('&str','&Path')
      sources=[old,new];documents=[]
      for side,source in enumerate(sources):
       root=f'_RNvNtCs{side+1}_7example5tests7routine'
@@ -4758,6 +4826,12 @@ class SourceAwareCoverageTests(unittest.TestCase):
         ordinal=('0','s_0')[number if side==0 else 1-number]
         quantity=number+2
         members.append(owner('_RNC'+root[2:]+ordinal+'B5_',quantity,[row(line,first,first+len('item.name'),quantity),row(line,first+len('item.name()'),lastcol,quantity)] if number else [row(line,first,first+len('item'),quantity),row(line,first+len('item.'),lastcol-2,quantity)]))
+      if factory:
+       record=[row(n,source[n-1].index(': ')+3,len(source[n-1]),3) for n in range(6,8+side)]
+       record.append(row(8+side,9,10,3))
+       members.append(owner('_RNC'+root[2:]+'0B5_',3,record))
+      if array:
+       members[0]['regions'].extend(row(n,source[n-1].index(': ')+3,len(source[n-1])) for n in range(6,7+side))
       documents.append(members)
      if fault=='cold-root':documents[1][0]['count']=0;documents[1][0]['regions'][0][4]=0
      elif fault=='cold-child':documents[1][1]['count']=0;documents[1][1]['regions'][0][4]=0
@@ -4797,6 +4871,24 @@ class SourceAwareCoverageTests(unittest.TestCase):
        try:result=self.closed_sync_fixture(True,fault)
        except ValueError:continue
        self.assertFalse(any(r.get('kind')=='same-qualified-positive-test' for r in result.get('retained_replacement_obligations',[])))
+
+    def test_closed_sync_record_factory_retains_its_compiled_child(self):
+     result=self.closed_sync_fixture(False,factory=True)
+     proof,=[r for r in result.get('retained_replacement_obligations',[]) if r.get('kind')=='same-qualified-positive-test']
+     self.assertEqual([len(s[0]) for s in proof['phase_forests']],[2,2])
+     self.assertEqual(proof['mapped_credit'],[0,0])
+     for fault in ('factory-parameter','impure-record-field','cold-child','hidden-child-region',
+                   'missing-child','foreign-child','wrong-child-slot','raw-channel'):
+      with self.subTest(fault=fault):
+       try:result=self.closed_sync_fixture(False,fault,factory=True)
+       except ValueError:continue
+       self.assertFalse(any(r.get('kind')=='same-qualified-positive-test' for r in result.get('retained_replacement_obligations',[])))
+
+    def test_closed_sync_record_retains_a_single_element_array_fixture(self):
+     result=self.closed_sync_fixture(False,array=True)
+     proof,=[r for r in result.get('retained_replacement_obligations',[]) if r.get('kind')=='same-qualified-positive-test']
+     self.assertEqual([len(s[0]) for s in proof['phase_forests']],[1,1])
+     self.assertEqual(proof['summary_credit'],[0,0])
 
     def closed_record_field_forest_compare(self, kind='free', mutation=None):
         if kind == 'free':
@@ -5171,6 +5263,18 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertIsNone(observe(lines=source[:4]+['        fixture().await']+source[5:]))
         extra = dict(child, regions=child['regions']+[[6,13,6,14,1,0,0,0]])
         self.assertIsNone(observe(owner=extra))
+        owners=[root,child]
+        files={'/src/example.rs':'src/example.rs'}
+        work=[1_000_000]
+        inventories=tuple(coverage._construct_inventory(lines,work) for lines in (source,call_changed))
+        pairs,receipts=coverage.positive_source_fragments(
+            'src/example.rs',source,call_changed,{6:1},{6:1},owners,owners,files,files,
+            [(5,6,5,6,[6])],work,construct_inventories=inventories,macro_expansions=([],[]))
+        self.assertEqual(pairs,{6:6})
+        receipt,=receipts
+        self.assertEqual(receipt['kind'],'async-test-expected-error-call')
+        self.assertEqual(receipt['async_copies']['base'][0]['body'],child['name'])
+        self.assertEqual(receipt['async_fragment_regions'][0]['base_range'],[6,6])
 
     def parameterized_rust_helper_record(self, insertion=False, fault=None, body_group=True, enum_role=False):
         source = ['#[cfg(test)]', '#[expect(clippy::unwrap_used)]', 'mod tests {',
@@ -5323,6 +5427,116 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 except ValueError: continue
                 self.assertFalse(any(row['kind']=='async-runtime-inventory-assertion'
                     for row in receipt.get('positive_source_fragments',[])))
+
+    def sync_runtime_record_fixture(self, runtime='java', fault=None, observe=False, unit=False):
+        manager={'java':'JavaManager','rust':'RustManager'}[runtime]
+        declaration={'java':'publication_refuses_a_home_without_java_before_creating_a_version',
+                     'rust':'mutation_lock_rejects_symlinks_without_changing_the_target'}[runtime]
+        prefix=['#[cfg(test)]']+(['#[expect(clippy::unwrap_used)]'] if runtime=='rust' else [])
+        prefix+=['mod tests {','    #[test]']+(['    #[cfg(unix)]'] if runtime=='rust' else [])
+        old=prefix+[f'    fn {declaration}() -> Result<()> {{','        let versions = tempfile::tempdir()?;',
+            f'        let manager = {manager} {{','            versions_dir: versions.path().to_path_buf(),',
+            '            client: download_client(),','        };',
+            '        let staging = begin_staged_install(versions.path())?;',
+            '        assert!(manager.publish_install(&staging, "21").is_err());',
+            '        assert!(!versions.path().join("21").exists());','        Ok(())','    }','}']
+        if unit:
+            old=[line.replace(' -> Result<()>', '').replace('tempfile::tempdir()?;',
+                 'tempfile::tempdir().expect("temp dir");').replace('begin_staged_install(versions.path())?;',
+                 'begin_staged_install(versions.path()).expect("staging");').replace('Ok(())','()') for line in old]
+        function=next(i+1 for i,line in enumerate(old) if f'fn {declaration}' in line)
+        first=function+2
+        field='crate::runtimes::security::RuntimeSecurity::fixture'
+        new=old[:first]+[f'            security: {field}(),']+old[first:]
+        sources=[old,new];documents=[]
+        for side,source in enumerate(sources):
+            shift=side;opening=source[function-1].index('{')+1;closing=len(source)-1
+            def row(line,start,end,hits=1):return [line,start,line,end,hits,0,0,0]
+            def token(line,text,hits=1):
+                at=source[line-1].index(text)+1
+                return row(line,at,at+len(text),hits)
+            regions=[row(function,5,opening-1,1),token(function+1,'tempfile::tempdir'),token(function+1,'expect' if unit else '?',1 if unit else 0),
+                row(first,13,20),[first,23,first+3+shift,10,1,0,0,0],
+                token(first+1+shift,'versions.path()'),token(first+4+shift,'begin_staged_install'),
+                token(first+4+shift,'expect' if unit else '?',1 if unit else 0),token(first+5+shift,'assert!'),token(first+6+shift,'assert!'),
+                token(first+7+shift,'(' if unit else 'Ok'),row(closing,5,6)]
+            if side:
+                at=source[first].index(field)+1
+                regions.append(row(first+1,at,at+len(field)))
+            root=f'_RNvNtNtNtCs1_7omg_lib8runtimes{len(runtime)}{runtime}5testss_{len(declaration)}{declaration}'
+            documents.append([dict(name=root,count=1,filenames=[f'/src/src/runtimes/{runtime}.rs'],
+                                  regions=regions,branches=[],mcdc_records=[])])
+        head=documents[1][0]
+        if fault=='parameter':sources[1][function-1]=sources[1][function-1].replace(f'{declaration}()',f'{declaration}(value: bool)')
+        elif fault=='return-type':sources[1][function-1]=(sources[1][function-1].replace(f'{declaration}()',f'{declaration}() -> Option<()>') if unit
+            else sources[1][function-1].replace('Result<()>','Option<()>'))
+        elif fault=='public':sources[1][function-1]=sources[1][function-1].replace(f'fn {declaration}',f'pub fn {declaration}')
+        elif fault=='module':sources[1][0]='#[cfg(feature = "production")]'
+        elif fault=='factory':sources[1][first]=sources[1][first].replace('::fixture()', '::default()')
+        elif fault=='cold-field':next(r for r in head['regions'] if r[0]==first+2)[4]=0
+        elif fault=='cold-entry':head['regions'][0][4]=0
+        elif fault=='channel':next(r for r in head['regions'] if r[0]==first+2)[7]=1
+        elif fault=='foreign-owner':head['name']=head['name'].replace('Cs1_', 'Cs9_').replace(f'{len(declaration)}{declaration}','7another')
+        elif fault=='duplicate-owner':documents[1].append(copy.deepcopy(head))
+        elif fault=='foreign-overlap':documents[1].append(dict(head,name='foreign',regions=[next(r for r in head['regions'] if r[0]==first+2)]))
+        counts=[]
+        for document in documents:
+            work=coverage._ObserverWork()
+            counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [r for owner in document for r in owner['regions']],work),work)))
+        if fault=='missing-da':counts[1]=[(n,c) for n,c in counts[1] if n!=first+2]
+        def bind(base,head):
+            for document,owners in zip((base,head),documents):
+                document['data'][0]['functions']=owners
+                document['data'][0]['files'][0].update(expansions=[],branches=[],mcdc_records=[])
+        filename=f'src/runtimes/{runtime}.rs'
+        if observe:
+            observations=[]
+            for side,(source,document) in enumerate(zip(sources,documents)):
+                mapped=dict(counts[side]);group=(function,len(source)-1,[document[0]])
+                observations.append(coverage.async_runtime_fixture_record(filename,source,mapped,
+                    group,document,Counter(o['name'] for o in document),
+                    coverage._construct_inventory(source,[1_000_000]),first,first,[1_000_000]))
+            return observations
+        return self.compare(before=counts[0],after=counts[1],mutate=bind,filename=filename,
+            sources=({filename:('\n'.join(old)+'\n').encode()},{filename:('\n'.join(new)+'\n').encode()}))
+
+    def test_sync_runtime_result_record_preserves_failure_control_and_field_regions(self):
+        for runtime in ('java','rust'):
+            with self.subTest(runtime=runtime):
+                before,after=self.sync_runtime_record_fixture(runtime,observe=True)
+                self.assertIsNotNone(before)
+                self.assertIsNotNone(after)
+                self.assertEqual(before[0],after[0])
+                self.assertTrue(before[1]['synchronous'])
+                self.assertNotIn('body',after[1])
+                self.assertEqual(len(after[1]['security_initializer']),1)
+                receipt=self.sync_runtime_record_fixture(runtime)
+                self.assertEqual(receipt['deleted_mapped'],0)
+
+    def test_sync_runtime_result_record_refuses_unbound_source_and_compiled_roles(self):
+        for runtime in ('java','rust'):
+            for fault in ('parameter','return-type','public','module','factory','cold-field','cold-entry',
+                          'channel','foreign-owner','duplicate-owner','foreign-overlap','missing-da'):
+                with self.subTest(runtime=runtime,fault=fault):
+                    before,after=self.sync_runtime_record_fixture(runtime,fault,observe=True)
+                    self.assertTrue(before is None or after is None or before[0]!=after[0])
+
+    def test_unit_runtime_record_retains_qualified_owner_without_claiming_result_rewrite(self):
+        for runtime in ('java','rust'):
+            with self.subTest(runtime=runtime):
+                before,after=self.sync_runtime_record_fixture(runtime,observe=True,unit=True)
+                self.assertIsNotNone(before)
+                self.assertIsNotNone(after)
+                self.assertEqual(before[0],after[0])
+                self.assertNotEqual(before[0],self.sync_runtime_record_fixture(runtime,observe=True)[0][0])
+                self.assertNotIn('body',after[1])
+                self.assertEqual(len(after[1]['security_initializer']),1)
+                for fault in ('parameter','return-type','public','module','factory','cold-field','cold-entry',
+                              'channel','foreign-owner','duplicate-owner','foreign-overlap','missing-da'):
+                    with self.subTest(fault=fault):
+                        old,new=self.sync_runtime_record_fixture(runtime,fault,observe=True,unit=True)
+                        self.assertTrue(old is None or new is None or old[0]!=new[0])
 
     def test_owned_source_enum_parameter_reuses_exact_record_and_cold_slot_proof(self):
         old=self.parameterized_rust_helper_record(enum_role=True)

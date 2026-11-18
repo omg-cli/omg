@@ -9,6 +9,147 @@ pub mod alpm_harness;
 
 use alpm_harness::{AlpmHarness, HarnessPkg};
 use anyhow::Result;
+use omg_lib::core::{paths, privilege, security::PolicyError};
+use omg_lib::package_managers::{TransactionKind, execute_transaction};
+use std::fmt::Write as _;
+use std::fs;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+use std::process::Command;
+use std::time::Duration;
+
+#[test]
+fn install_conflict_requires_consent_before_security_policy() -> Result<()> {
+    const CHILD: &str = "OMG_TEST_ALPM_CONFLICT_ROOT";
+    const CASE: &str = "install_conflict_requires_consent_before_security_policy";
+    const INSTALLED: &str = "omg-fixture-installed";
+    const INCOMING: &str = "omg-fixture-incoming";
+    const DEPENDENCY: &str = "omg-fixture-dependency";
+    let executable = std::env::current_exe()?;
+    if privilege::is_root() {
+        let directory = tempfile::tempdir()?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))?;
+        let binary = directory.path().join("alpm-conflict-test");
+        fs::copy(executable, &binary)?;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+        let mut child = Command::new(binary);
+        child.uid(65534).gid(65534).env_remove(CHILD);
+        assert_cmd::Command::from_std(child)
+            .args(["--exact", CASE, "--nocapture"])
+            .timeout(Duration::from_secs(45))
+            .assert()
+            .success();
+        return Ok(());
+    }
+    if let Some(root) = std::env::var_os(CHILD) {
+        let root = std::path::PathBuf::from(root);
+        let (db, conf) = (root.join("var/lib/pacman"), root.join("pacman.conf"));
+        assert!(!console::user_attended());
+        assert_eq!(paths::pacman_root_result()?, root);
+        assert_eq!(paths::pacman_conf_path(), conf);
+        assert_eq!(paths::config_dir(), root.join("config"));
+        assert_eq!(
+            paths::pacman_cache_dirs_result()?,
+            [root.join("var/cache/pacman/pkg")]
+        );
+        let yes = std::env::var("OMG_TEST_ALPM_CONFLICT_YES")? == "yes";
+        privilege::set_yes_flag(yes);
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_writer(std::io::stderr)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let mut alpm = alpm::Alpm::new(
+            root.to_str().expect("test root"),
+            db.to_str().expect("test database"),
+        )?;
+        alpm.register_syncdb(
+            "core",
+            alpm::SigLevel::PACKAGE | alpm::SigLevel::DATABASE_OPTIONAL,
+        )?;
+        let error = execute_transaction(
+            vec![INCOMING.into()],
+            TransactionKind::Install,
+            Some(&mut alpm),
+        )
+        .expect_err("the fixture must stop before committing");
+        if yes {
+            assert!(
+                matches!(error.downcast_ref::<PolicyError>(), Some(PolicyError::Banned { name }) if name==DEPENDENCY),
+                "{error:#}"
+            );
+        } else {
+            assert!(
+                format!("{error:#}").contains("Transaction preparation failed"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(alpm.localdb().pkg(INSTALLED)?.version().as_str(), "1-1");
+        assert!(alpm.localdb().pkg(INCOMING).is_err());
+        assert!(alpm.localdb().pkg(DEPENDENCY).is_err());
+        assert!(!db.join("db.lck").try_exists()?);
+        return Ok(());
+    }
+
+    let harness = AlpmHarness::new()?;
+    let root = harness.root();
+    let local = harness.db_path().join(format!("local/{INSTALLED}-1-1"));
+    fs::create_dir(&local)?;
+    let installed = HarnessPkg::new(INSTALLED, "1-1").desc;
+    fs::write(local.join("desc"), &installed)?;
+    fs::write(local.join("files"), "%FILES%\nusr/bin/owned-fixture\n\n")?;
+    let mut candidate = HarnessPkg::new(INCOMING, "1-1");
+    write!(
+        candidate.desc,
+        "%CONFLICTS%\n{INSTALLED}\n\n%DEPENDS%\n{DEPENDENCY}\n\n"
+    )?;
+    harness.add_sync_pkgs("core", &[candidate, HarnessPkg::new(DEPENDENCY, "1-1")])?;
+    fs::create_dir(root.join("config"))?;
+    fs::write(root.join("config/config.toml"), "")?;
+    fs::write(
+        root.join("config/policy.toml"),
+        format!("banned_packages = ['{DEPENDENCY}']\n"),
+    )?;
+    fs::write(
+        root.join("pacman.conf"),
+        format!(
+            "[options]\nArchitecture = auto\nSigLevel = Required DatabaseOptional\n[core]\nServer = file://{}\n",
+            root.display()
+        ),
+    )?;
+    let manifest = fs::read(harness.db_path().join("sync/core.db"))?;
+    for (yes, decision) in [
+        (
+            "no",
+            format!("Refusing implicit removal of conflicting package {INSTALLED}"),
+        ),
+        ("yes", format!("Removing conflicting package {INSTALLED}")),
+    ] {
+        let mut child = Command::new(&executable);
+        child
+            .env_clear()
+            .env(CHILD, root)
+            .env("OMG_TEST_ALPM_CONFLICT_YES", yes)
+            .env("OMG_PACMAN_ROOT", root)
+            .env("OMG_PACMAN_CONF", root.join("pacman.conf"))
+            .env("OMG_CONFIG_DIR", root.join("config"));
+        for key in ["LD_LIBRARY_PATH", "LLVM_PROFILE_FILE"] {
+            if let Some(value) = std::env::var_os(key) {
+                child.env(key, value);
+            }
+        }
+        let assertion = assert_cmd::Command::from_std(child)
+            .args(["--exact", CASE, "--nocapture"])
+            .timeout(Duration::from_secs(15))
+            .assert()
+            .success();
+        let output = assertion.get_output();
+        let observed = String::from_utf8_lossy(&output.stderr);
+        assert!(observed.contains(&decision), "{observed}");
+        assert_eq!(fs::read_to_string(local.join("desc"))?, installed);
+        assert_eq!(fs::read(harness.db_path().join("sync/core.db"))?, manifest);
+    }
+    Ok(())
+}
 
 #[test]
 fn test_harness_package_search() -> Result<()> {

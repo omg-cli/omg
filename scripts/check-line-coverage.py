@@ -3161,9 +3161,17 @@ def ensure_entry_source(name, source, inventory, line, work):
                 and not any(code.words[token]=='||' and code.parents[token]==opening
                             for token in range(conjunct+1,condition_end))):
             leading=prefix,(source[first-1],)
+    trailing=None
+    tail=['files','.','len','(',')','<','10_000']
+    tail_start=condition_end-len(tail)
+    if (name=='src/package_managers/aur/client.rs' and leading is not None
+            and tail_start>conjunct and code.words[tail_start-1:condition_end]==['&&',*tail]
+            and code.parents[tail_start-1]==opening and last>first
+            and source[last-1].strip()=='&& files.len() < 10_000,'):
+        trailing=code.region(tail_start,condition_end-1),(source[last-1],)
     repeatable=any(row['kind'] in ('for','while','loop') for row in parents[:function_at])
     return (syntax,span,code.region(start,stop),(code.region(start,start+3),),
-            modules,function_name,method,(condition,leading),repeatable)
+            modules,function_name,method,(condition,leading,trailing),repeatable)
 
 
 def ensure_condition_observation(source_condition, roots, counts, work):
@@ -3409,7 +3417,7 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
         return dict(file=name, kind='retained-alpm-update-record-entry', pairs=pairs,
                     instance_states=states, observations=receipts)
     condition_pairs=[]
-    for candidate in (0,1):
+    for candidate in range(len(conditions[0][0])):
         old_source,new_source=(item[0][candidate] for item in conditions)
         if old_source is None or new_source is None or old_source[1]!=new_source[1]:
             continue
@@ -3417,9 +3425,10 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                      for item in conditions]
         if all(item is not None for item in projections) and projections[0][1:]==projections[1][1:]:
             old,new=[item[0] for item in projections]
-            condition_pairs=[[old+offset,new+offset] for offset in projections[0][2]]
-            pairs.extend(condition_pairs)
-            break
+            condition_pairs.extend([old+offset,new+offset] for offset in projections[0][2])
+            if candidate==0:
+                break
+    pairs.extend(condition_pairs)
     kind = 'retained-map-capacity-entry' if map_initializer else 'retained-ensure-entry'
     return dict(file=name,kind=kind,pairs=pairs,condition_pairs=condition_pairs,
                 instance_states=states,observations=receipts)
@@ -4024,6 +4033,57 @@ def async_test_expected_error(name, source, counts, group, owners, names, invent
     return (*identity,tuple(binder),slot),witness
 
 
+def sync_runtime_fragment_owners(name, group, owners, names, inventory, first, last, work):
+    """Observe one exact synchronous Result test owner without inventing a future."""
+    if inventory is None or len(group[2])!=1 or name not in ('src/runtimes/java.rs','src/runtimes/rust.rs'):
+        return None
+    code,rows=inventory[:2]
+    _construct_charge(work,len(rows)+1)
+    functions=[row for row in rows if row['kind']=='fn' and 'fn' in row['header'] and 'async' not in row['header']
+               and code.position(code.starts[row['first']+row['header'].index('fn')])[0]==group[0]
+               and code.position(code.ends[row['end']])[0]==group[1]]
+    if len(functions)!=1:
+        return None
+    fn,=functions;words=fn['header'];at=words.index('fn')
+    test=('#','[','test',']');unix=('#','[','cfg','(','unix',')',']')
+    if (words[:at] not in (test,test+unix,unix+test)
+            or words[at+2:] not in (('(',')'),('(',')','->','Result','<','(',')','>'))):
+        return None
+    scope=_boolean_module(code,{'start':fn['first']})
+    if scope is None and name=='src/runtimes/rust.rs':
+        enclosing=code.ancestors(fn['first'])
+        if len(enclosing)==1:
+            module,=enclosing
+            if (code.words[module-2:module]==['mod','tests'] and _boolean_attributes(code,module-2)==[
+                    ['expect','(','clippy','::','unwrap_used',')'],['cfg','(','test',')']]):
+                scope=['tests'],['tests'],[module]
+    if scope is None or scope[:2]!=(['tests'],['tests']):
+        return None
+    root,=group[2];shape=plain_rust_function_symbol(root['name']);hits=root.get('count')
+    path=('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests',words[at+1])
+    entry=code.region(fn['first']+at,fn['opening']-1);terminal=code.region(fn['end'],fn['end'])
+    if (shape is None or shape.identifiers!=path or names[root['name']]!=1
+            or type(hits) is not int or not 0<hits<COUNTER_LIMIT or len(root['filenames'])!=1
+            or not root['filenames'][0].endswith('/'+name) or root.get('branches') or root.get('mcdc_records')
+            or [r[4] for r in root['regions'] if tuple(r[:4])==entry and r[5:]==[0,0,0]]!=[hits]
+            or [r[4] for r in root['regions'] if tuple(r[:4])==terminal and r[5:]==[0,0,0]]!=[hits]):
+        return None
+    records=[row for row in rows if row['opening'] is not None
+             and code.position(code.starts[row['first']])[0]==first
+             and code.position(code.ends[row['end']])[0]==last]
+    if len(records)!=1:
+        return None
+    lo,hi=code.region(records[0]['first'],records[0]['end'])[:2],code.region(records[0]['first'],records[0]['end'])[2:]
+    _construct_charge(work,sum(len(owner['regions'])+1 for owner in owners))
+    touching=[(owner,[r for r in owner['regions'] if tuple(r[:2])<hi and lo<tuple(r[2:4])]) for owner in owners]
+    affected=[(owner,raw) for owner,raw in touching if raw]
+    if (len(affected)!=1 or affected[0][0] is not root
+            or any(r[5:]!=[0,0,0] or type(r[4]) is not int or not 0<=r[4]<=hits
+                   or not lo<=tuple(r[:2])<tuple(r[2:4])<=hi for r in affected[0][1])):
+        return None
+    return fn,(shape.identity,words),dict(root=root['name'],regions=affected[0][1],entry=entry,synchronous=True),hits
+
+
 def async_runtime_fixture_record(name, source, counts, group, owners, names, inventory, first, last, work):
     """Project a fixture record through the addition of its eager security field."""
     managers = {'src/runtimes/java.rs':'JavaManager', 'src/runtimes/rust.rs':'RustManager'}
@@ -4041,12 +4101,16 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
     closing = code.position(code.ends[record['end']])[0]
     if closing-first not in (3,4) or source[closing-1].strip()!='};':
         return None
-    bound = async_test_fragment_owners(name,group,owners,names,inventory,first,closing,work,
-                                       result_alias=True,runtime_helper=True)
+    synchronous=source[group[0]-1].lstrip().startswith('fn ')
+    if synchronous:
+        bound=sync_runtime_fragment_owners(name,group,owners,names,inventory,first,closing,work)
+    else:
+        bound = async_test_fragment_owners(name,group,owners,names,inventory,first,closing,work,
+                                           result_alias=True,runtime_helper=True)
     if bound is None:
         return None
     function, identity, witness, entry_hits = bound
-    if identity[1][:2]==('async','fn') and any(row[4]>entry_hits for row in witness['regions']):
+    if (synchronous or identity[1][:2]==('async','fn')) and any(row[4]>entry_hits for row in witness['regions']):
         return None
     if code.parents[record['first']]!=function['opening'] or counts.get(first,0)<=0:
         return None
@@ -4728,43 +4792,60 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
     code,rows=inventory[:2]
     _construct_charge(work,len(rows)+len(code.starts).bit_length())
     start=bisect.bisect_left(code.starts,code.offsets[line-1])
+    single=code.words[start:start+4]==['temp_env','::','with_var','(']
+    if single:
+        argument=start+3
+        key=argument+1
+        value=key+2
+        start=value+9
+        if code.words[key:start]!=['"OMG_CONFIG_DIR"',',','Some','(','directory','.','path','(',')',')',',']:
+            return None
+        argument_slot=code.region(value,start-2)
     opening=start+len(_RESULT_CLOSURE)
     if tuple(code.words[start:opening])!=_RESULT_CLOSURE or code.words[opening:opening+1]!=['{']:
         return None
-    closing=code.pairs[opening]; argument=code.parents[opening]
-    if argument is None or code.words[argument-3:argument+1]!=['temp_env','::','with_vars','(']:
+    closing=code.pairs[opening];argument=code.parents[opening]
+    if argument is None or code.words[argument-3:argument+1]!=[
+            'temp_env','::','with_var' if single else 'with_vars','(']:
         return None
     body=code.parents[argument]
     functions=[row for row in rows if row['kind']=='fn' and row['opening']==body]
     if len(functions)!=1 or len(group[2])!=1:
         return None
     fn,=functions
-    header=fn['header']
-    if ((*header[:12],'<declaration>',*header[13:])!=
-            ('#','[','cfg','(','debug_assertions',')',']')+_RESULT_TEST_SIGNATURE
+    header=fn['header'];fn_at=header.index('fn')
+    expected=_RESULT_TEST_SIGNATURE if single else ('#','[','cfg','(','debug_assertions',')',']')+_RESULT_TEST_SIGNATURE
+    if ((*header[:fn_at+1],'<declaration>',*header[fn_at+2:])!=expected
             or code.words[closing+1:fn['end']]!=[',',')']
             or (context:=_boolean_module(code,{'start':fn['first']})) is None
             or context[:2]!=(['tests'],['tests'])):
         return None
-    array=argument+1
-    if code.words[array:array+1]!=['['] or code.pairs[array]+2!=start:
-        return None
-    arguments=_boolean_arguments(code,array)
-    if arguments is None or len(arguments)!=3:
-        return None
-    _construct_charge(work,start-body)
-    values={code.words[begin+1]:tuple(code.words[begin:end])
-            for begin,end in arguments if code.words[begin]=='(' and code.pairs[begin]==end-1}
-    config=('(','"OMG_CONFIG_DIR"',',','Some','(','directory','.','path','(',')','.','as_os_str','(',')',')',')')
-    test_mode=('(','"OMG_TEST_MODE"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"1"',')',')',')')
-    data=('(','"OMG_DATA_DIR"',',','Some','(','data_dir','.','as_os_str','(',')',')',')')
-    distro=('(','"OMG_TEST_DISTRO"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"fedora"',')',')',')')
-    if values.get('"OMG_CONFIG_DIR"')!=config or values.get('"OMG_TEST_MODE"')!=test_mode:
-        return None
-    modern=values.get('"OMG_DATA_DIR"')==data
-    if not modern and values.get('"OMG_TEST_DISTRO"')!=distro:
-        return None
+    if single:
+        if not environment_result_callback(code,fn,dict(opening=opening,end=closing)):
+            return None
+        modern=None
+    else:
+        array=argument+1
+        if code.words[array:array+1]!=['['] or code.pairs[array]+2!=start:
+            return None
+        arguments=_boolean_arguments(code,array)
+        if arguments is None or len(arguments)!=3:
+            return None
+        _construct_charge(work,start-body)
+        values={code.words[begin+1]:tuple(code.words[begin:end])
+                for begin,end in arguments if code.words[begin]=='(' and code.pairs[begin]==end-1}
+        config=('(','"OMG_CONFIG_DIR"',',','Some','(','directory','.','path','(',')','.','as_os_str','(',')',')',')')
+        test_mode=('(','"OMG_TEST_MODE"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"1"',')',')',')')
+        data=('(','"OMG_DATA_DIR"',',','Some','(','data_dir','.','as_os_str','(',')',')',')')
+        distro=('(','"OMG_TEST_DISTRO"',',','Some','(','std','::','ffi','::','OsStr','::','new','(','"fedora"',')',')',')')
+        if values.get('"OMG_CONFIG_DIR"')!=config or values.get('"OMG_TEST_MODE"')!=test_mode:
+            return None
+        modern=values.get('"OMG_DATA_DIR"')==data
+        if not modern and values.get('"OMG_TEST_DISTRO"')!=distro:
+            return None
+        argument_slot=code.region(array,code.pairs[array])
     call=argument-3
+    _construct_charge(work,call-body)
     prefix=code.words[body+1:call]
     added=['let','data_dir','=','directory','.','path','(',')','.','join','(','"data"',')',';']
     tempdir=['let','directory','=','tempfile','::','tempdir','(',')','?',';']
@@ -4777,13 +4858,14 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
     last_setup=code.position(code.ends[body+len(prefix)])[0]
     tail=('assert_eq','!','(','fs','::','read_to_string','(','&','path',')','?',',','bytes',')',';',
           'Ok','(','(',')',')')
+    tail=tail[-5:] if single else tail
     if tuple(code.words[closing-len(tail):closing])!=tail:
         return None
     tokens=code.words[opening+1:closing]
     _construct_charge(work,3*len(tokens))
     nested_pattern=['let','package','=','||','{']
     factories=[opening+1+i+4 for i in range(len(tokens)) if tokens[i:i+5]==nested_pattern]
-    if len(factories)!=int(not modern):
+    if len(factories)!=int(modern is False):
         return None
     if modern:
         for requirement in (['.','remove','(','"advisory_requirement"',')'],
@@ -4792,7 +4874,7 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
                 return None
     root,=group[2]; symbol=root['name']; shape=plain_rust_function_symbol(symbol)
     modules=('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests')
-    if (shape is None or shape.identifiers!=(*modules,header[12])
+    if (shape is None or len(root['filenames'])!=1 or shape.identifiers!=(*modules,header[fn_at+1])
             or not 0<root['count']<COUNTER_LIMIT):
         return None
     child_key='_RNC'+symbol[2:]+'0'+rust_same_crate_backref(shape.modules,1)
@@ -4818,14 +4900,18 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
         return None
     child,raw=observed[child_key]; hits=child['count']
     opener=code.region(opening,opening); closer=code.region(closing,closing)
+    opener_line=opener[0]
     if (not 0<hits<=root['count'] or len(raw)!=len(child['regions'])
             or not direct_rust_callback_symbol(child_key,symbol,shape.modules)
             or any(not opener[:2]<=tuple(r[:2])<tuple(r[2:4])<=closer[2:] for r in raw)
-            or [r for r in raw if r[0]<=line<=r[2]]!=[[*opener,hits,0,0,0]]
+            or [r for r in raw if r[0]<=opener_line<=r[2]]!=[[*opener,hits,0,0,0]]
             or [r for r in raw if tuple(r[:4])==closer]!=[[*closer,hits,0,0,0]]):
         return None
     root_raw=observed[symbol][1]
-    for slot in (code.region(call,call+2),code.region(array,code.pairs[array])):
+    call_slot=code.region(call,call+2)
+    if single and len(root_raw)!=2:
+        return None
+    for slot in (call_slot,argument_slot):
         if [r[4] for r in root_raw if tuple(r[:4])==slot]!=[hits]:
             return None
     if any(tuple(row[2:4])>opener[:2] for row in root_raw):
@@ -4843,6 +4929,11 @@ def prepared_policy_environment_entry(name, source, counts, group, owners, names
         return None
     setup=fragment_region_states(root,group[0],last_setup,source,work)
     identity=(shape.identity,header,tuple(prefix),setup,root['count'],hits,opener[1::2])
+    if single:
+        entry=[line,argument_slot[0],opener_line,closer[0]]
+        return (*identity,call_slot[1::2],argument_slot[1::2]),dict(
+            parent=symbol,child=child_key,span=[*low,*high],entry=list(opener),
+            nested=[],modern=None,file_steps=None,observed_lines=entry)
     steps=prepared_policy_file_steps(code,rows,opening,closing,raw,hits,modern,work)
     return identity,dict(parent=symbol,child=child_key,span=[*low,*high],entry=list(opener),
                          nested=[nested_key] if factories else [],modern=modern,file_steps=steps)
@@ -4980,16 +5071,27 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     instance_states=states,owners=owners,
                     callback_fragments=[dict(pairs=matched,base_range=[a+1,b],head_range=[c+1,d])]))
                 continue
+        environment=(name=='src/core/security/policy.rs' and a+1==b and c+1==d
+                     and tuple(pending)==(b,) and old[a]==new[c]
+                     and old[a].strip()=='temp_env::with_var(')
         if (name=='src/core/security/policy.rs' and construct_inventories is not None
-                and macro_expansions==([],[]) and len(candidates)==1 and b-a==d-c==1
-                and tuple(pending)==(b,) and old[a]==new[c] and old[a].strip()=='|| -> anyhow::Result<()> {'):
+                and macro_expansions==([],[]) and len(candidates)==1
+                and (environment or (b-a==d-c==1 and tuple(pending)==(b,)
+                    and old[a]==new[c] and old[a].strip()=='|| -> anyhow::Result<()> {'))):
+            single=environment
             _,bg,hg=candidates[0]
             observations=[prepared_policy_environment_entry(name,source,counts,group,inventories[side],
                             inventory_names[side],construct_inventories[side],line,work)
                           for side,(source,counts,group,line) in enumerate(((old,before,bg,b),(new,after,hg,d)))]
             if (all(observations) and observations[0][0]==observations[1][0]
-                    and [entry[1]['modern'] for entry in observations]==[False,True]):
+                    and [entry[1]['modern'] for entry in observations]==([None,None] if single else [False,True])):
+                witnesses=[entry[1] for entry in observations]
                 matched=[[b,d]]
+                if single:
+                    matched=[list(pair) for pair in zip(*(item['observed_lines'] for item in witnesses),strict=True)]
+                    if (not all([line,line+c-a] in matched for line in pending)
+                            or any(old[line-1]!=new[target-1] for line,target in matched)):
+                        refuse()
                 steps=[entry[1]['file_steps'] for entry in observations]
                 if all(steps):
                     matched.extend([previous['line'],current['line']]
@@ -5003,7 +5105,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
                 receipts.append(dict(file=name,kind='prepared-policy-environment-entry',pairs=matched,
-                    owners=[entry[1] for entry in observations],
+                    owners=witnesses,
                     callback_fragments=[dict(pairs=[[line,target]],base_range=[line,line],head_range=[target,target])
                                         for line,target in matched]))
                 continue
@@ -5084,19 +5186,33 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     first,last=group[:2]
                     _construct_charge(work,sum(len(line)+1 for line in source[first-1:last]))
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
+                synchronous_record=(async_fragment is async_runtime_fixture_record
+                                    and any(owner['synchronous'] for _,owner in observations if 'synchronous' in owner))
+                if synchronous_record and not all(owner.get('synchronous') for _,owner in observations):
+                    refuse()
                 kind = {initial_async_test_record:'initial-async-test-record',
                         async_test_expected_error:'async-test-expected-error-call',
                         async_test_expected_variant:'async-test-expected-variant-entry',
                         async_policy_unavailable_assertion:'async-policy-unavailable-assertion-entry',
                         async_runtime_fixture_record:'async-runtime-fixture-record',
                         async_runtime_inventory_assertion:'async-runtime-inventory-assertion'}[async_fragment]
+                if synchronous_record:
+                    kind='sync-runtime-fixture-record'
                 evidence = [observation[1] for observation in observations]
                 receipt = dict(kind=kind,file=name,pairs=matched,owners=evidence)
-                if async_fragment in (async_runtime_fixture_record,async_runtime_inventory_assertion):
+                if synchronous_record:
+                    receipt['callback_fragments'] = [dict(pairs=matched,
+                        base_range=evidence[0]['record_span'],head_range=evidence[1]['record_span'])]
+                else:
                     receipt['async_copies'] = {side:[dict(constructor=owner['root'],body=owner['body'],
                         constructor_state=1,body_state=1)] for side,owner in zip(('base','head'),evidence)}
-                    receipt['async_fragment_regions'] = [dict(base_range=evidence[0]['record_span'],
-                        head_range=evidence[1]['record_span'],geometry=observations[0][0][2])]
+                    if async_fragment in (async_runtime_fixture_record,async_runtime_inventory_assertion):
+                        fragment = dict(base_range=evidence[0]['record_span'],head_range=evidence[1]['record_span'],
+                                        geometry=observations[0][0][2])
+                    else:
+                        fragment = dict(base_range=[a+1,b],head_range=[c+1,d],
+                                        regions=[owner['regions'] for owner in evidence])
+                    receipt['async_fragment_regions'] = [fragment]
                 receipts.append(receipt)
                 continue
         if (construct_inventories is not None and macro_expansions==([],[]) and prefix in callback_functions
@@ -7740,6 +7856,17 @@ def retained_projected_iterator_obligations(name,sources,counts,descriptors,inve
     return pairs,receipts,proved
 
 
+def sync_record_factory_header(code, opening):
+    if opening < 10:
+        return None
+    let, binding, equals, bar, parameter, colon, borrow, kind, closing, record = code.words[opening-10:opening]
+    if ((let,equals,bar,colon,borrow,kind,closing)!=('let','=','|',':','&','str','|')
+            or any(re.fullmatch(r'[A-Za-z_]\w*',name,re.ASCII) is None for name in (binding,parameter,record))
+            or code.words[opening]!='{' or code.words[code.pairs[opening]+1:code.pairs[opening]+2]!=[';']):
+        return None
+    return binding,parameter,record
+
+
 def positive_sync_fixture_change(descriptors,inventories,work):
     """Admit only one pure local fixture field addition before owner indexing."""
     codes=[i[0] for i in inventories];functions=[d['row'] for d in descriptors]
@@ -7753,10 +7880,22 @@ def positive_sync_fixture_change(descriptors,inventories,work):
             if (added[1::2]==[':','::',','] and all(re.fullmatch(r'[A-Za-z_]\w*',added[n],re.ASCII) for n in (0,2,4))
                     and words[0]==words[1][:at]+words[1][at+6:]):
                 parents=[c.parents[r['first']+at] for c,r in zip(codes,functions)]
-                if all(parent is not None and c.words[parent]=='{' and c.words[parent-2]=='='
-                        and re.fullmatch(r'[A-Za-z_]\w*',c.words[parent-1],re.ASCII)
-                        and (c.words[parent-4]=='let' or c.words[parent-5:parent-3]==['let','mut'])
-                        for c,parent in zip(codes,parents)):
+                if all(parent is not None and c.parents[parent]==fn['opening']
+                       and sync_record_factory_header(c,parent)
+                       for c,parent,fn in zip(codes,parents,functions)):
+                    return 'scalar-record-factory-field'
+                def record_let(code,opening):
+                    if opening is None or code.words[opening]!='{' or opening<5:
+                        return False
+                    record=opening-1
+                    enclosing=code.parents[opening]
+                    if (enclosing==record-1 and code.words[enclosing]=='['
+                            and code.pairs[enclosing]==code.pairs[opening]+1):
+                        record=enclosing
+                    return (code.words[record-1]=='='
+                            and re.fullmatch(r'[A-Za-z_]\w*',code.words[opening-1],re.ASCII)
+                            and (code.words[record-3]=='let' or code.words[record-4:record-2]==['let','mut']))
+                if all(record_let(code,opening) for code,opening in zip(codes,parents)):
                     return 'scalar-record-field'
     values=[];bindings=[]
     def unique_fields(pairs):
@@ -7800,7 +7939,7 @@ def positive_sync_fixture_change(descriptors,inventories,work):
 
 
 def positive_sync_test_slots(descriptor,inventory,source,work):
-    """Recognize a small sync unit routine with only direct expression callbacks."""
+    """Recognize a small sync unit routine with direct expression callbacks or a record factory."""
     code=inventory[0];fn=descriptor['row'];first,last=fn['opening']+1,fn['end']
     if last-first>2048:return None
     _construct_charge(work,last-first+1)
@@ -7814,6 +7953,19 @@ def positive_sync_test_slots(descriptor,inventory,source,work):
         _construct_charge(work,1)
         if code.words[at]!='|':at+=1;continue
         call=code.parents[at]
+        opening=at+7
+        if (call==fn['opening'] and opening<last and code.words[opening]=='{'
+                and (header:=sync_record_factory_header(code,opening)) is not None
+                and re.fullmatch(r'[A-Za-z_]\w*',code.words[opening+1],re.ASCII)
+                and code.words[opening+2]==':'):
+            end=code.pairs[opening]
+            _construct_charge(work,end-opening+1)
+            if any(word in ('|','||','async','move') for word in code.words[opening+1:end]):
+                return None
+            begin=code.position(code.starts[opening+3]);finish=code.position(code.ends[end])
+            slots.append((begin,finish,'record-factory',header))
+            if len(slots)>2:return None
+            at=end+1;continue
         if (call is None or code.words[call]!='(' or code.words[call-2]!='.'
                 or code.words[call-1] not in ('map','any','find') or call+1!=at):return None
         if code.words[at+2:at+3]==['|']:
@@ -7849,6 +8001,7 @@ def positive_sync_callback_members(root,forest,slots,work):
         if (any(owner is other for other in selected)
                 or type(quantity) is not int or not 0<quantity<COUNTER_LIMIT
                 or min(tuple(r[:2]) for r in owner['regions'])!=first
+                or method=='record-factory' and max(tuple(r[2:4]) for r in owner['regions'])!=last
                 or any(r[4]!=quantity for r in owner['regions'])):return None
         selected.append(owner);roles.append((method,header,first,last,owner['name']))
     return selected,tuple(roles)
@@ -7944,7 +8097,9 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
                 _construct_charge(work,sum(d['group'][1]-d['group'][0]+1 for d in chosen))
                 if any(any(da.get(n,1)<=0 for n in range(d['group'][0],d['group'][1]+1)) for da,d in zip(counts,chosen)):continue
                 slots=tuple(positive_sync_test_slots(d,i,s,work) for d,i,s in zip(chosen,inventories,sources))
-                if any(s is None for s in slots) or any(len(s)!=(0 if fixture=='scalar-record-field' else 2) for s in slots):continue
+                expected={'scalar-record-field':0,'scalar-record-factory-field':1,'literal-json-field':2}[fixture]
+                if any(s is None or len(s)!=expected for s in slots):continue
+                if any(sum(slot[2]=='record-factory' for slot in s)!=int(expected==1) for s in slots):continue
                 sync_shapes[declaration]=slots;sync_potential.append((declaration,chosen))
             else:potential.append((declaration,chosen))
     if len(sync_potential)<=16:potential.extend(sync_potential)
@@ -11539,18 +11694,23 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             obligation_receipts.append(proof)
                             continue
                     entry_source = None
+                    entry_lines = (line,target)
                     if inventories is not None and old[line-1]==new[target-1]:
                         if old[line-1].strip()=='anyhow::ensure!(':
                             entry_source=ensure_entry_source
+                        elif (name=='src/package_managers/aur/client.rs' and min(line,target)>3
+                              and old[line-1].strip()=='&& files.len() < 10_000,'):
+                            entry_source=ensure_entry_source
+                            entry_lines=(line-3,target-3)
                         elif name=='src/package_managers/alpm_ops.rs' and old[line-1].strip()==_MAP_CAPACITY_LINE:
                             entry_source=map_capacity_entry_source
                         elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == _ALPM_UPDATE_RECORD_LINE:
                             entry_source = alpm_update_record_entry_source
                     if entry_source is not None and (bs[name]['expansions'],hs[name]['expansions'])==([],[]):
-                        sides=((old,inventories[0],base_spans,before,line),
-                               (new,inventories[1],head_spans,after,target))
+                        sides=((old,inventories[0],base_spans,before,entry_lines[0]),
+                               (new,inventories[1],head_spans,after,entry_lines[1]))
                         proof=retained_observed_entry(name,sides,source_owner_indexes(),construct_work,entry_source)
-                        if proof is not None:
+                        if proof is not None and [line,target] in proof['pairs']:
                             if any(previous in anchored and anchored[previous] != current
                                    for previous, current in proof['pairs']):
                                 raise ValueError('Ambiguous retained entry correspondence')

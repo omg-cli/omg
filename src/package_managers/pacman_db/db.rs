@@ -883,6 +883,7 @@ mod native_health_tests {
     async fn native_health_accepts_shared_directories_without_writes_or_repository_access() {
         let owner = tempfile::tempdir().unwrap();
         let database = owner.path();
+        let local = database.join("local");
         package(
             database,
             "app",
@@ -895,15 +896,13 @@ mod native_health_tests {
             "%PROVIDES%\nvirtual=2\n\n",
             "usr/\nusr/lib/provider",
         );
-        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n").unwrap();
-        let before = super::LocalHealthSnapshot::capture(&database.join("local")).unwrap();
-        let report = check_native_local_db_health(&database.join("local"))
-            .await
-            .unwrap();
+        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+        let before = super::LocalHealthSnapshot::capture(&local).unwrap();
+        let report = check_native_local_db_health(&local).await.unwrap();
         assert_eq!(report.packages, 2);
         assert!(report.missing.is_empty());
         report.native.unwrap();
-        before.revalidate(&database.join("local")).unwrap();
+        before.revalidate(&local).unwrap();
         assert!(!database.join("db.lck").exists());
         assert!(!database.join("sync").exists());
     }
@@ -924,19 +923,18 @@ mod native_health_tests {
             ("", "usr/bin/shared", "Duplicate installed file ownership"),
         ] {
             let owner = tempfile::tempdir().unwrap();
+            let local = owner.path().join("local");
             package(owner.path(), "app", extra, files);
             package(owner.path(), "other", "", "usr/bin/shared");
-            std::fs::write(owner.path().join("local/ALPM_DB_VERSION"), "9\n").unwrap();
-            let before = super::LocalHealthSnapshot::capture(&owner.path().join("local")).unwrap();
-            let report = check_native_local_db_health(&owner.path().join("local"))
-                .await
-                .unwrap();
+            std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+            let before = super::LocalHealthSnapshot::capture(&local).unwrap();
+            let report = check_native_local_db_health(&local).await.unwrap();
             let error = report.native.expect_err("unhealthy native database");
             assert!(
                 error.to_string().contains(expected),
                 "{expected}: {error:#}"
             );
-            before.revalidate(&owner.path().join("local")).unwrap();
+            before.revalidate(&local).unwrap();
             assert!(!owner.path().join("db.lck").exists());
         }
     }
