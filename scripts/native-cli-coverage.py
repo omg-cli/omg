@@ -2492,7 +2492,8 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             state = json.loads((evidence / f'{stage}-native-state.json').read_text())
             signer = state.get('refused_signer')
             require(type(signer) is str and re.fullmatch('[0-9A-F]{40}', signer)
-                    and 'Native Omarchy updates require existing trusted signing keys' in log,
+                    and ('ALPM transaction aborted: it requires an unconfirmed package mutation '
+                         'or signing-key import (import an untrusted signing key)') in log,
                     'Missing native signing-key refusal or unchanged verification keyring')
         elif stage == 'omarchy-migration-refusal' or stage.startswith('omarchy-migration-helper-'):
             require('external package helper' in log, 'Missing native package migration refusal')

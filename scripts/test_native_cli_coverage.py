@@ -1379,7 +1379,9 @@ def evidence_fixture(root):
             'omarchy-required-helper-missing': 'Omarchy update did not complete: omarchy-update-dev',
             'omarchy-optional-failures': '| System is up to date\n! Continuing without a snapshot\n! Some mise tools could not be updated',
             'omarchy-vendor-failure': 'Omarchy update did not complete',
-            'omarchy-unknown-signing-key': 'Native Omarchy updates require existing trusted signing keys',
+            'omarchy-unknown-signing-key': 'Error: ALPM transaction aborted: it requires an unconfirmed package '
+                                          'mutation or signing-key import (import an untrusted signing key) '
+                                          'the required consent was not granted; resolve the conflict explicitly and retry',
             'omarchy-declined': 'declined',
             'omarchy-migration-refusal': 'external package helper',
             'omarchy-migration-helper-tabs': 'external package helper',
@@ -1649,6 +1651,20 @@ class SupplementalEvidence(unittest.TestCase):
             self.assertEqual(len(receipt['fresh_admission']), 22)
             self.assertEqual(len(receipt['signed_decoders']), 2)
             self.assertEqual(len(files), len(receipt['profiles']))
+
+    def test_omarchy_signing_key_refusal_requires_the_transaction_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            log = evidence / 'omarchy-unknown-signing-key.log'
+            original = log.read_text()
+            for mismatch in ('Native Omarchy updates require existing trusted signing keys',
+                             'ALPM transaction aborted: insufficient disk space'):
+                with self.subTest(mismatch=mismatch):
+                    log.write_text(original.replace(
+                        'ALPM transaction aborted: it requires an unconfirmed package mutation '
+                        'or signing-key import (import an untrusted signing key)', mismatch))
+                    with self.assertRaisesRegex(ValueError, 'Missing native signing-key refusal'):
+                        PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
     def test_forged_omarchy_helper_evidence_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
