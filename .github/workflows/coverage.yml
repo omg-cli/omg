@@ -583,21 +583,16 @@ jobs:
           evidence_dir="$RUNNER_TEMP/native-coverage-evidence"
           binary=$(jq -er '.artifacts["lib-unit"].path' "$evidence_dir/cli-manifest.json")
           cli=$(jq -er '.artifacts.cli.path' "$evidence_dir/cli-manifest.json")
-          runuser -u omg-coverage -- env \
-            LLVM_PROFILE_FILE="$profile_dir/omg-scaffold-git-%p-%m.profraw" \
-            python3 scripts/test-scaffold-existing-git.py "$cli" | tee "$evidence_dir/scaffold-git.json"
-          mapfile -d '' scaffold_profiles < <(find "$profile_dir" -maxdepth 1 -type f \
-            -name 'omg-scaffold-git-*.profraw' -print0)
-          test "${#scaffold_profiles[@]}" -eq 1
-          test -s "${scaffold_profiles[0]}"
-          runuser -u omg-coverage -- env \
-            LLVM_PROFILE_FILE="$profile_dir/omg-scaffold-collision-%p-%m.profraw" \
-            python3 scripts/test-scaffold-existing-git.py "$cli" --manifest-collision \
-            | tee "$evidence_dir/scaffold-collision.json"
-          mapfile -d '' collision_profiles < <(find "$profile_dir" -maxdepth 1 -type f \
-            -name 'omg-scaffold-collision-*.profraw' -print0)
-          test "${#collision_profiles[@]}" -eq 1
-          test -s "${collision_profiles[0]}"
+          for mode in git manifest-collision lock-collision; do
+            runuser -u omg-coverage -- env \
+              LLVM_PROFILE_FILE="$profile_dir/omg-scaffold-$mode-%p-%m.profraw" \
+              python3 scripts/test-scaffold-existing-git.py "$cli" "--$mode" \
+              | tee "$evidence_dir/scaffold-$mode.json"
+            mapfile -d '' profiles < <(find "$profile_dir" -maxdepth 1 -type f \
+              -name "omg-scaffold-$mode-*.profraw" -print0)
+            test "${#profiles[@]}" -eq 1
+            test -s "${profiles[0]}"
+          done
           (
             profiles=$(mktemp -d)
             chmod 1777 "$profiles"

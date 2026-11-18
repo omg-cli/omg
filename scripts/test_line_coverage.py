@@ -212,11 +212,16 @@ class CompiledPlainParentFilesTests(unittest.TestCase):
 
 class QualifiedFunctionCompletionTests(unittest.TestCase):
     def compare(self, fault=None):
+        misleading = fault is not None and fault.startswith('misleading-')
+        if misleading:
+            fault = fault[len('misleading-'):]
         before = ['fn scaffold(name: &str) -> Result<()> {', '    write(name)', '}']
         after = ['fn scaffold(root: &Path, name: &str) -> Result<()> {',
                  '    write_at(root, name)', '}']
         if fault == 'different-result':
             after[0] = after[0].replace('Result<()>', 'Result<bool>')
+        elif fault == 'same-parameters':
+            after[0] = before[0]
         files = {'/src/example.rs': 'example.rs'}
         base, head = [[dict(name=f'_RNvNtCs{crate}_7omg_lib3cli8scaffold', count=1,
                             filenames=['/src/example.rs'], regions=[
@@ -235,11 +240,32 @@ class QualifiedFunctionCompletionTests(unittest.TestCase):
         elif fault == 'foreign-region':
             head.append(dict(name='foreign', count=1, filenames=['/src/example.rs'],
                              regions=[[3, 1, 3, 2, 1, 0, 0, 0]]))
+        target = 3
+        if misleading:
+            after[:0] = ['enum Entry {', '    Variant,', '}', '']
+            for owner in head:
+                for row in owner['regions']:
+                    row[0] += 4; row[2] += 4
+            target = 7
+            if fault == 'ambiguous-logical-function':
+                after.extend(['', 'fn scaffold(other: &str) -> Result<()> {', '    other()', '}'])
+                head.append(dict(name='_RNvNtCse_7omg_lib3cli8scaffold', count=1,
+                    filenames=['/src/example.rs'], regions=[
+                        [9, 1, 9, len(after[8])+1, 1, 0, 0, 0], [11, 1, 11, 2, 1, 0, 0, 0]]))
+            elif fault == 'foreign-proposed-function':
+                after[0] = 'fn foreign() {'
+                after[1] = '    foreign_work();'
+                head.append(dict(name='_RNvNtCse_7omg_lib3cli7foreign', count=1,
+                    filenames=['/src/example.rs'], regions=[
+                        [1, 1, 1, len(after[0])+1, 1, 0, 0, 0], [3, 1, 3, 2, 1, 0, 0, 0]]))
+            elif fault == 'nonbare-proposal':
+                after[2] = '    }'
         line = 2 if fault == 'body-line' else 3
         if line == 2:
             after[1] = before[1]
+        mapped = {line: 2} if fault == 'missing-target-mapping' else {target: 2}
         return coverage.positive_source_fragments('example.rs', before, after,
-            {line: 2}, {line: 2}, base, head, files, files,
+            {line: 2}, mapped, base, head, files, files,
             [(line - 1, line, line - 1, line, [line])])
 
     def test_retains_only_the_exact_closing_regions_under_a_new_parameter_list(self):
@@ -249,6 +275,22 @@ class QualifiedFunctionCompletionTests(unittest.TestCase):
         self.assertEqual(receipt['kind'], 'qualified-function-completion')
         self.assertEqual(receipt['pairs'], [[3, 3]])
         self.assertEqual([len(side) for side in receipt['owners']], [2, 2])
+
+    def test_misleading_enum_brace_resolves_the_unique_function_completion(self):
+        pairs, receipts = self.compare('misleading-enum-brace')
+        self.assertEqual(pairs, {3: 7})
+        receipt, = receipts
+        self.assertEqual(receipt['pairs'], [[3, 7]])
+        self.assertEqual(receipt['head_range'], [5, 7])
+
+    def test_completion_cannot_borrow_the_misleading_proposals_evidence(self):
+        for fault in ('cold-copy', 'missing-copy', 'wrong-owner', 'duplicate-name',
+                      'foreign-region', 'different-result', 'same-parameters',
+                      'ambiguous-logical-function', 'missing-target-mapping', 'nonbare-proposal'):
+            with self.subTest(fault=fault), self.assertRaisesRegex(ValueError, 'Ambiguous'):
+                self.compare('misleading-' + fault)
+        pairs, _ = self.compare('misleading-foreign-proposed-function')
+        self.assertEqual(pairs, {3: 7})
 
     def test_incomplete_or_different_owner_evidence_is_refused(self):
         for fault in ('cold-copy', 'missing-copy', 'wrong-owner', 'duplicate-name',

@@ -1749,14 +1749,27 @@ def index_compiled_owner_sources(owners, files, work, source_names=None):
 def qualified_function_completion(sides, work):
     """Bind only the closing brace of a free function after its parameters change."""
     witnesses = []
-    for source, groups, inventory, line in sides:
+    for side, (source, groups, inventory, line) in enumerate(sides):
         if source[line - 1] != '}':
             return None
         _construct_charge(work, len(groups))
-        choices = [group for group in groups.values() if group[1] == line]
+        if side == 0:
+            choices = [group for group in groups.values() if group[1] == line]
+        else:
+            _construct_charge(work, len(inventory))
+            _construct_charge(work, sum(len(owner['name']) + 1 for owner in inventory))
+            logical_owners = {id(owner) for owner in inventory
+                              if (path := plain_rust_function_symbol(owner['name'])) is not None
+                              and path.identity == witnesses[0][0]}
+            _construct_charge(work, sum(len(group[2]) + 1 for group in groups.values()))
+            choices = [group for group in groups.values()
+                       if logical_owners and {id(owner) for owner in group[2]} == logical_owners]
         if len(choices) != 1:
             return None
         start, end, owners = choices[0]
+        line = end
+        if source[line - 1] != '}':
+            return None
         header = source[start - 1]
         _construct_charge(work, len(header) + sum(len(owner['name']) + 1 for owner in owners))
         declaration = re.fullmatch(r'fn ([A-Za-z_]\w*)\(([^(){}]*)\)([^{}]*)\{\s*', header)
@@ -1854,14 +1867,15 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
                       and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
         if (not candidates and b == a + 1 and d == c + 1 and pending == [b]
-                and before.get(b, 0) > 0 and after.get(d, 0) > 0):
+                and before.get(b, 0) > 0):
             witness = qualified_function_completion(
                 zip((old, new), groups, inventories, (b, d)), work)
             if witness is not None:
-                if b in pairs and pairs[b] != d:
+                target = witness['head_range'][1]
+                if after.get(target, 0) <= 0 or b in pairs and pairs[b] != target:
                     refuse()
-                pairs[b] = d
-                receipts.append(dict(file=name, pairs=[[b, d]], **witness))
+                pairs[b] = target
+                receipts.append(dict(file=name, pairs=[[b, target]], **witness))
                 for side, (source, span) in enumerate(zip((old, new),
                         (witness['base_range'], witness['head_range']))):
                     start, end = span
