@@ -41,7 +41,11 @@ def preserve_repository(binary, owner):
     # The fixture owns every path and supplies a Git command that must stay unused.
     env = dict(PATH=str(owner), HOME=str(owner), XDG_CONFIG_HOME=str(owner / 'config'),
                XDG_DATA_HOME=str(owner / 'data'), XDG_CACHE_HOME=str(owner / 'cache'),
+               OMG_DATA_DIR=str(owner / 'data'),
                OMG_DISABLE_DAEMON='1', OMG_DISABLE_TELEMETRY='1')
+    rust = owner / 'data/versions/rust'
+    (rust / '1.95.0').mkdir(parents=True)
+    (rust / 'current').symlink_to('1.95.0', target_is_directory=True)
     for name in ('LD_LIBRARY_PATH', 'LLVM_PROFILE_FILE'):
         if name in os.environ:
             env[name] = os.environ[name]
@@ -71,7 +75,9 @@ def preserve_repository(binary, owner):
                                cwd=target, env={**env, 'PATH': '/usr/bin:/bin'}, check=True, timeout=5)
                 head = target / '.git/HEAD'
                 config = target / '.git/config'
-                before = head.read_bytes(), config.read_bytes()
+                lock = target / '.tool-versions'
+                lock.write_bytes(b'rust 1.78.0\n')
+                before = head.read_bytes(), config.read_bytes(), lock.read_bytes()
                 trace(PTRACE_DETACH, pid)
                 exit_code = cli.wait(timeout=10)
                 output.seek(0)
@@ -79,8 +85,8 @@ def preserve_repository(binary, owner):
                 require(exit_code == 0, f'scaffold exited {exit_code}: {transcript}')
                 require((target / 'Cargo.toml').is_file(), 'Rust scaffold did not create its manifest')
                 require('Unexpected git invocation' not in transcript, 'scaffold reran git init')
-                require((head.read_bytes(), config.read_bytes()) == before,
-                        'scaffold changed the existing Git repository')
+                require((head.read_bytes(), config.read_bytes(), lock.read_bytes()) == before,
+                        'scaffold changed existing Git or runtime metadata')
             finally:
                 if cli.returncode is None:
                     cli.kill()

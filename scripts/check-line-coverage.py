@@ -1267,7 +1267,8 @@ class DeferredSourceFragment:
     function_prefix: str
 
 
-def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, inventory, work):
+def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, inventory, work,
+                               *, caller_entry=False):
     """Prove fragment execution through a uniquely source-bound direct callback."""
     if inventory is None:
         return None
@@ -1279,7 +1280,26 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     if len(functions) != 1:
         return None
     function = functions[0]; header = function['header']; fn = header.index('fn')
-    if list(header[:fn]) not in ([], ['pub'], ['pub', '(', 'crate', ')'], ['#', '[', 'test', ']']):
+    caller_scope = None
+    if caller_entry:
+        if first != last or list(header[fn:]) != ['fn', header[fn + 1], '(', ')']:
+            return None
+        attributes = _boolean_attributes(code, function['first'] + fn)
+        scope = _boolean_module(code, {'start': function['first'] + fn})
+        if (attributes is None or ['test'] not in attributes or scope is None
+                or any(attribute not in (['test'], ['cfg', '(', 'unix', ')']) for attribute in attributes)):
+            return None
+        line = source[first - 1]
+        _construct_charge(work, group[1] - group[0] + 1)
+        _construct_charge(work, len(line) + sum(len(value) + 1 for value in source[group[0]-1:group[1]]))
+        call = re.fullmatch(r'[ \t]*(?P<callee>[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)'
+                           r'\([ \t]*(?P<argument>&[A-Za-z_][A-Za-z0-9_]*)[ \t]*,[ \t]*\|\|[ \t]*\{[ \t]*', line)
+        if call is None or sum(value == line for value in source[group[0]-1:group[1]]) != 1:
+            return None
+        entry_slots = tuple((first, call.start(part) + 1, first, call.end(part) + 1)
+                            for part in ('callee', 'argument'))
+        caller_scope = (tuple(scope[0]), tuple(scope[1]), tuple(tuple(value) for value in attributes))
+    elif list(header[:fn]) not in ([], ['pub'], ['pub', '(', 'crate', ')'], ['#', '[', 'test', ']']):
         return None
     candidates = [row for row in inventory[1] if row['opening'] is not None
                   and function['opening'] < row['opening'] < row['end'] < function['end']
@@ -1291,6 +1311,10 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     if len(candidates) != 1:
         return None
     callback = candidates[0]
+    if caller_entry:
+        call_parent = code.parents[callback['opening']]
+        if code.parents[call_parent] != function['opening']:
+            return None
     argument = callback['opening'] - 1
     if argument > 0 and code.words[argument - 1] == 'move':
         argument -= 1
@@ -1299,9 +1323,14 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         return None
     if code.parents[argument] != code.parents[callback['opening']]:
         return None
-    prefix = tuple(code.words[function['opening'] + 1:callback['opening']])
+    if caller_entry:
+        _construct_charge(work, 2 * (len(code.starts).bit_length() + 1))
+        start = bisect.bisect_left(code.starts, code.offsets[first - 1])
+        prefix = tuple(code.words[start:callback['opening'] + 1])
+    else:
+        prefix = tuple(code.words[function['opening'] + 1:callback['opening']])
     _construct_charge(work, len(prefix) + len(header))
-    if any(word in ('!', '#') for word in prefix):
+    if not caller_entry and any(word in ('!', '#') for word in prefix):
         return None
     opening = code.position(code.starts[callback['opening']])
     closing = code.position(code.ends[callback['end']])
@@ -1314,6 +1343,8 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     for parent in group[2]:
         shape = plain_rust_function_symbol(parent['name'])
         if shape is None or shape.identifiers[-1] != header[fn + 1] or name_counts[parent['name']] != 1:
+            return None
+        if caller_entry and tuple(shape.identifiers[-len(caller_scope[0])-1:]) != (*caller_scope[0], header[fn+1]):
             return None
         parent_entries = [row for row in parent['regions']
                           if tuple(row[:2]) == function_start
@@ -1341,7 +1372,18 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         children_bound.add(id(child)); bound.add(id(child)); identities.append(shape.identity)
         parent_geometry, parent_states = fragment_region_states(parent, first, last, source, work)
         child_geometry, child_states = fragment_region_states(child, first, last, source, work)
-        context_geometry, context_states = fragment_region_states(parent, group[0], opening[0], source, work)
+        if caller_entry:
+            context_geometry, context_states = (), ()
+            _construct_charge(work, len(parent['regions']) + len(child['regions']))
+            overlaps = [row for row in parent['regions'] if owner_covers_lines([row], first, first)]
+            if (len(overlaps) != 2 or {tuple(row[:4]) for row in overlaps} != set(entry_slots)
+                    or any(len(row) != 8 or list(row[5:]) != [0, 0, 0] for row in overlaps)
+                    or len(entries[0]) != 8 or list(entries[0][5:]) != [0, 0, 0]
+                    or any(owner_covers_lines([row], first, first) and row is not entries[0]
+                           for row in child['regions'])):
+                return None
+        else:
+            context_geometry, context_states = fragment_region_states(parent, group[0], opening[0], source, work)
         if not child_geometry:
             return None
         geometries.append((parent_geometry, child_geometry, context_geometry))
@@ -1358,14 +1400,20 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     if any(id(owner) not in bound and any(owner_covers_lines([row], line, line)
            for row in owner['regions'] for line in range(first, last + 1)) for owner in owners):
         return None
-    signature = ('zero-arg-callback-fragment', identities[0], tuple(header), prefix, geometries[0])
-    witness = dict(kind='zero-arg-callback-fragment', owners=witnesses,
+    kind = 'zero-arg-callback-call-entry' if caller_entry else 'zero-arg-callback-fragment'
+    signature = (kind, identities[0], tuple(header), prefix, geometries[0])
+    if caller_entry:
+        signature += (caller_scope,)
+    witness = dict(kind=kind, owners=witnesses,
         callback_span=[list(opening), list(closing)],
-        context_sha256=hashlib.sha256(repr(signature[:-1]).encode()).hexdigest(),
+        context_sha256=hashlib.sha256(repr(signature if caller_entry else signature[:-1]).encode()).hexdigest(),
         parent_geometry=[list(row) for row in geometries[0][0]],
         child_geometry=[list(row) for row in geometries[0][1]],
         parent_context_geometry=[list(row) for row in geometries[0][2]],
         limitation='Fragment execution only; no argument-value or callee-semantic equivalence')
+    if caller_entry:
+        witness['caller_scope'] = caller_scope
+        witness['parent_entry_slots'] = entry_slots
     return CallbackFragmentEvidence(tuple(states), tuple(line_states), signature, witness)
 
 
@@ -1849,6 +1897,10 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                                 if construct_inventories is None else construct_inventories[side])
                         callback = zero_arg_callback_fragment(source, group, inventories[side],
                             inventory_names[side], offset + 1, offset + b - a, callback_inventories[side], work)
+                        if callback is None:
+                            callback = zero_arg_callback_fragment(source, group, inventories[side],
+                                inventory_names[side], offset + 1, offset + b - a,
+                                callback_inventories[side], work, caller_entry=True)
                         if callback is None:
                             callback = nominal_fragments.get((side, offset))
                             if callback is None:

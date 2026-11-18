@@ -327,6 +327,7 @@ mod runtime_matrix {
     #[serial]
     fn new_scaffolds_without_ambient_package_managers_or_runtimes() {
         use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::symlink;
 
         let project = TestProject::new();
         let fake_bin = project.path().join("fake-bin");
@@ -342,9 +343,15 @@ mod runtime_matrix {
         }
         let marker = project.path().join("ambient-executed");
         let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+        let data = project.path().join("runtime-state");
+        let node = data.join("versions/node");
+        std::fs::create_dir_all(node.join("26.13.1")).unwrap();
+        symlink("26.13.1", node.join("current")).unwrap();
         let env = [
             ("PATH", path.as_str()),
             ("OMG_SCAFFOLD_MARKER", marker.to_str().unwrap()),
+            ("OMG_DATA_DIR", data.to_str().unwrap()),
+            ("OMG_NATIVE_TEST_DATA_DIR", "1"),
         ];
         for (stack, manifest) in [
             ("rust", "Cargo.toml"),
@@ -362,6 +369,12 @@ mod runtime_matrix {
             assert!(target.join(".git").is_dir(), "{stack}");
             assert!(!target.join("node_modules").exists(), "{stack}");
             assert!(!target.join(".venv").exists(), "{stack}");
+            let lock = target.join(".tool-versions");
+            if matches!(stack, "react" | "node") {
+                assert_eq!(std::fs::read_to_string(lock).unwrap(), "node 26.13.1\n");
+            } else {
+                assert!(!lock.exists(), "{stack} locked an unselected runtime");
+            }
         }
         assert!(
             !marker.exists(),
@@ -379,6 +392,10 @@ mod runtime_matrix {
         .unwrap();
         assert_eq!(package["name"], "react-starter");
         assert_eq!(package["scripts"]["dev"], "vite");
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("samples/go-starter/go.mod")).unwrap(),
+            "module samples/go-starter\n\ngo 1.21.0\n"
+        );
         for (stack, name) in [
             ("rust", "invalid/with.dot"),
             ("react", "invalid/Uppercase"),
@@ -405,6 +422,17 @@ mod runtime_matrix {
             std::fs::read_to_string(project.path().join("blocked-parent")).unwrap(),
             "existing file\n"
         );
+        std::fs::remove_file(node.join("current")).unwrap();
+        std::fs::create_dir(node.join("1~2")).unwrap();
+        symlink("1~2", node.join("current")).unwrap();
+        let invalid_lock = project.run_with_env(&["new", "node", "unsafe-lock"], &env);
+        invalid_lock.assert_failure();
+        assert!(
+            invalid_lock
+                .combined_output()
+                .contains("unsafe for filesystem paths")
+        );
+        assert!(!project.path().join("unsafe-lock/.tool-versions").exists());
         assert!(
             !marker.exists(),
             "rejected scaffold executed an ambient command"

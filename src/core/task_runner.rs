@@ -2175,7 +2175,7 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     "python", &version, &runtime, &runtime,
                 )
                 .unwrap();
-                let executed = execute_process_in(
+                execute_process_in(
                     "python3",
                     &["-B".into(), "-c".into(), program.clone()],
                     &[],
@@ -2183,12 +2183,8 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     owner.path(),
                     owner.path(),
                     owner.path(),
-                );
-                assert!(
-                    executed.is_ok(),
-                    "real venv task failed: expected_base={} config={original_config:?}: {executed:#?}",
-                    bin.display()
-                );
+                )
+                .expect("virtualenv task must run with its reviewed Python");
                 assert_eq!(
                     fs::read_to_string(&observed).unwrap(),
                     format!("{}|local-package", venv.display())

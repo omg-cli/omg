@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 
 use crate::cli::{args::ProjectStack, style};
+use ScaffoldEntry::{Directory, File};
 
 fn require_command_success(status: std::process::ExitStatus, operation: &str) -> Result<()> {
     anyhow::ensure!(status.success(), "{operation} failed with {status}");
@@ -142,17 +144,40 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+enum ScaffoldEntry<'a> {
+    Directory(&'static str),
+    File(&'static str, &'a [u8]),
+}
+
+fn write_scaffold(root: &Path, stack: &str, entries: &[ScaffoldEntry<'_>]) -> Result<()> {
+    for entry in entries {
+        match entry {
+            Directory(path) => fs::create_dir(root.join(path))
+                .with_context(|| format!("Failed to create the {stack} directory {path}"))?,
+            File(path, contents) => fs::File::create_new(root.join(path))
+                .and_then(|mut file| file.write_all(contents))
+                .with_context(|| format!("Failed to write the {stack} {path}"))?,
+        }
+    }
+    Ok(())
+}
+
 fn scaffold_rust(root: &Path, name: &str) -> Result<()> {
-    fs::write(
-        root.join("Cargo.toml"),
-        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
-    )?;
-    fs::create_dir(root.join("src"))?;
-    fs::write(
-        root.join("src/main.rs"),
-        "fn main() {\n    println!(\"Hello from OMG!\");\n}\n",
-    )?;
-    fs::write(root.join(".gitignore"), "/target\n").context("Failed to write the Rust .gitignore")
+    let manifest =
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_scaffold(
+        root,
+        "Rust",
+        &[
+            File("Cargo.toml", manifest.as_bytes()),
+            Directory("src"),
+            File(
+                "src/main.rs",
+                b"fn main() {\n    println!(\"Hello from OMG!\");\n}\n",
+            ),
+            File(".gitignore", b"/target\n"),
+        ],
+    )
 }
 
 fn scaffold_react(root: &Path, name: &str) -> Result<()> {
@@ -174,13 +199,14 @@ fn scaffold_react(root: &Path, name: &str) -> Result<()> {
             "vite": "^8.3.8"
         }
     });
-    fs::write(
-        root.join("package.json"),
-        serde_json::to_vec_pretty(&package)?,
-    )?;
-    fs::write(
-        root.join("tsconfig.json"),
-        r#"{
+    write_scaffold(
+        root,
+        "React",
+        &[
+            File("package.json", format!("{package:#}").as_bytes()),
+            File(
+                "tsconfig.json",
+                br#"{
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
@@ -193,10 +219,10 @@ fn scaffold_react(root: &Path, name: &str) -> Result<()> {
   "include": ["src"]
 }
 "#,
-    )?;
-    fs::write(
-        root.join("index.html"),
-        r#"<!doctype html>
+            ),
+            File(
+                "index.html",
+                br#"<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8">
@@ -209,20 +235,21 @@ fn scaffold_react(root: &Path, name: &str) -> Result<()> {
   </body>
 </html>
 "#,
-    )?;
-    fs::create_dir(root.join("src"))?;
-    fs::write(
-        root.join("src/main.tsx"),
-        r#"import { createRoot } from "react-dom/client";
+            ),
+            Directory("src"),
+            File(
+                "src/main.tsx",
+                br#"import { createRoot } from "react-dom/client";
 
 const root = document.getElementById("root");
 if (root) {
   createRoot(root).render(<h1>Hello from OMG!</h1>);
 }
 "#,
-    )?;
-    fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")
-        .context("Failed to write the React .gitignore")
+            ),
+            File(".gitignore", b"node_modules\ndist\n.env\n"),
+        ],
+    )
 }
 
 fn scaffold_node(root: &Path, name: &str) -> Result<()> {
@@ -242,13 +269,14 @@ fn scaffold_node(root: &Path, name: &str) -> Result<()> {
             "@types/node": "^22.0.0"
         }
     });
-    fs::write(
-        root.join("package.json"),
-        serde_json::to_vec_pretty(&package)?,
-    )?;
-    fs::write(
-        root.join("tsconfig.json"),
-        r#"{
+    write_scaffold(
+        root,
+        "Node",
+        &[
+            File("package.json", format!("{package:#}").as_bytes()),
+            File(
+                "tsconfig.json",
+                br#"{
   "compilerOptions": {
     "target": "ES2022",
     "module": "NodeNext",
@@ -259,32 +287,39 @@ fn scaffold_node(root: &Path, name: &str) -> Result<()> {
   "include": ["src"]
 }
 "#,
-    )?;
-    fs::create_dir(root.join("src"))?;
-    fs::write(
-        root.join("src/index.ts"),
-        "console.log(\"Hello from OMG!\");\n",
-    )?;
-    fs::write(root.join(".gitignore"), "node_modules\ndist\n.env\n")
-        .context("Failed to write the Node .gitignore")
+            ),
+            Directory("src"),
+            File("src/index.ts", b"console.log(\"Hello from OMG!\");\n"),
+            File(".gitignore", b"node_modules\ndist\n.env\n"),
+        ],
+    )
 }
 
 fn scaffold_python(root: &Path, name: &str) -> Result<()> {
-    fs::write(
-        root.join("pyproject.toml"),
-        format!("[project]\nname = \"{name}\"\nversion = \"0.1.0\"\ndependencies = []\n"),
-    )?;
-    fs::write(root.join("requirements.txt"), "")?;
-    fs::write(root.join("main.py"), "print('Hello from OMG!')\n")?;
-    fs::write(root.join(".gitignore"), ".venv/\n__pycache__/\n.env\n")
-        .context("Failed to write the Python .gitignore")
+    let manifest =
+        format!("[project]\nname = \"{name}\"\nversion = \"0.1.0\"\ndependencies = []\n");
+    write_scaffold(
+        root,
+        "Python",
+        &[
+            File("pyproject.toml", manifest.as_bytes()),
+            File("requirements.txt", b""),
+            File("main.py", b"print('Hello from OMG!')\n"),
+            File(".gitignore", b".venv/\n__pycache__/\n.env\n"),
+        ],
+    )
 }
 
 fn scaffold_go(root: &Path, name: &str) -> Result<()> {
-    fs::write(root.join("go.mod"), format!("module {name}\n\ngo 1.21.0\n"))?;
-    fs::write(
-        root.join("main.go"),
-        r#"package main
+    let manifest = format!("module {name}\n\ngo 1.21.0\n");
+    write_scaffold(
+        root,
+        "Go",
+        &[
+            File("go.mod", manifest.as_bytes()),
+            File(
+                "main.go",
+                br#"package main
 
 import "fmt"
 
@@ -292,10 +327,10 @@ func main() {
 	fmt.Println("Hello from OMG!")
 }
 "#,
-    )?;
-    fs::write(
-        root.join("Taskfile.yml"),
-        r"version: '3'
+            ),
+            File(
+                "Taskfile.yml",
+                br"version: '3'
 
 tasks:
   build:
@@ -305,8 +340,9 @@ tasks:
     cmds:
       - go run main.go
 ",
+            ),
+        ],
     )
-    .context("Failed to write the Go Taskfile.yml")
 }
 
 fn lock_runtimes(target_dir: &Path, stack: &str) -> Result<()> {
@@ -316,9 +352,11 @@ fn lock_runtimes(target_dir: &Path, stack: &str) -> Result<()> {
         .join(runtime);
     if let Some(version) = crate::runtimes::common::get_current_version(&versions) {
         crate::core::security::validate_runtime_version(&version)?;
-        fs::write(
-            target_dir.join(".tool-versions"),
-            format!("{runtime} {version}\n"),
+        let lock = format!("{runtime} {version}\n");
+        write_scaffold(
+            target_dir,
+            "runtime",
+            &[File(".tool-versions", lock.as_bytes())],
         )?;
         println!("  {} Locked {runtime} to {version}", style::success("✓"));
     }
@@ -343,25 +381,53 @@ mod tests {
     #[test]
     fn scaffold_diagnostics_name_the_file_that_cannot_be_written() -> Result<()> {
         type Scaffold = fn(&Path, &str) -> Result<()>;
-        let cases: [(&str, &str, Scaffold); 5] = [
-            ("Rust", ".gitignore", scaffold_rust),
-            ("React", ".gitignore", scaffold_react),
-            ("Node", ".gitignore", scaffold_node),
-            ("Python", ".gitignore", scaffold_python),
-            ("Go", "Taskfile.yml", scaffold_go),
+        let cases: [(&str, [&str; 2], Scaffold); 5] = [
+            ("Rust", ["Cargo.toml", ".gitignore"], scaffold_rust),
+            ("React", ["package.json", ".gitignore"], scaffold_react),
+            ("Node", ["package.json", ".gitignore"], scaffold_node),
+            ("Python", ["pyproject.toml", ".gitignore"], scaffold_python),
+            ("Go", ["go.mod", "Taskfile.yml"], scaffold_go),
         ];
-        for (stack, file, scaffold) in cases {
-            let owner = tempfile::tempdir()?;
-            let existing = owner.path().join(file);
-            fs::create_dir(&existing)?;
-            let error = scaffold(owner.path(), "scaffold-fixture")
-                .expect_err("an existing directory cannot be replaced by a scaffold file");
-            assert_eq!(
-                error.to_string(),
-                format!("Failed to write the {stack} {file}")
-            );
-            assert!(existing.is_dir());
+        for (stack, [first, last], scaffold) in cases {
+            for (file, contents) in [(first, Some("previous project file\n")), (last, None)] {
+                let owner = tempfile::tempdir()?;
+                let existing = owner.path().join(file);
+                if let Some(contents) = contents {
+                    fs::write(&existing, contents)?;
+                } else {
+                    fs::create_dir(&existing)?;
+                }
+                let error = scaffold(owner.path(), "scaffold-fixture")
+                    .expect_err("scaffolding must leave existing entries intact");
+                assert_eq!(
+                    error.to_string(),
+                    format!("Failed to write the {stack} {file}")
+                );
+                if let Some(contents) = contents {
+                    assert_eq!(fs::read_to_string(&existing)?, contents);
+                    assert!(!owner.path().join(last).exists());
+                } else {
+                    assert!(existing.is_dir());
+                    assert!(owner.path().join(first).is_file());
+                }
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn scaffold_source_directory_collision_preserves_existing_contents() -> Result<()> {
+        let owner = tempfile::tempdir()?;
+        let source = owner.path().join("src");
+        fs::create_dir(&source)?;
+        let previous = source.join("main.rs");
+        fs::write(&previous, "original source\n")?;
+        let error = scaffold_rust(owner.path(), "scaffold-fixture")
+            .expect_err("scaffolding must leave an existing source directory alone");
+        assert_eq!(error.to_string(), "Failed to create the Rust directory src");
+        assert_eq!(fs::read_to_string(previous)?, "original source\n");
+        assert!(owner.path().join("Cargo.toml").is_file());
+        assert!(!owner.path().join(".gitignore").exists());
         Ok(())
     }
 

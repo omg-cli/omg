@@ -1103,6 +1103,152 @@ class SourceAwareCoverageTests(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 self.migrated_trait_compare(lambda base, head: mutate(base, head, mode))
 
+    def caller_entry_compare(self, mutation=None, body=False):
+        def fixture(operation):
+            return (f'#[cfg(unix)]\n#[test]\nfn checked() {{\n'
+                    f'    let path = vec![1];\n    caller(&path, || {{\n'
+                    f'        {operation}();\n    }});\n}}\n')
+        old = (fixture('before') + fixture('unchanged').replace('checked', 'sibling')).splitlines()
+        new = (fixture('after') + fixture('unchanged').replace('checked', 'sibling')).splitlines()
+        def owners(source):
+            result = []
+            for name, start in [('checked', 3), ('sibling', 11)]:
+                line = start + 2
+                call = source[line - 1]
+                brace = call.index('{') + 1
+                for copy in range(2):
+                    parent = f'_RNvCs{copy + 1}_7example{len(name)}{name}'
+                    result.extend([
+                        dict(name=parent, count=2, filenames=['/src/example.rs'], regions=[
+                            [start, 1, start, source[start-1].index('{')+1, 2, 0, 0, 0],
+                            [line, 5, line, 11, 1, 0, 0, 0],
+                            [line, 12, line, 17, 1, 0, 0, 0],
+                            [start+5, 1, start+5, 2, 1, 0, 0, 0]]),
+                        dict(name='_RNC'+parent[2:]+'0B3_', count=1,
+                             filenames=['/src/example.rs'], regions=[
+                                 [line, brace, line, brace+1, 1, 0, 0, 0],
+                                 [line+1, 9, line+1, len(source[line])+1, 1, 0, 0, 0],
+                                 [line+2, 5, line+2, 6, 1, 0, 0, 0]])])
+            return result
+        base, head = owners(old), owners(new)
+        if mutation:
+            mutation(old, new, base, head)
+        span = (5, 6) if body else (5, 5)
+        prefix = 'fn checked()'
+        return coverage.positive_source_fragments(
+            'example.rs', old, new, {n: 1 for n in range(1, 17)},
+            {n: 1 for n in range(1, 17)}, base, head,
+            {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'},
+            [(span[0]-1, span[1], span[0]-1, span[1], list(range(span[0], span[1]+1)))],
+            callback_functions=(prefix,))
+
+    def test_closed_test_caller_entry_retains_every_parent_and_child_copy(self):
+        pairs, receipts = self.caller_entry_compare()
+        self.assertEqual(pairs, {5: 5})
+        self.assertTrue(any(witness['kind'] == 'zero-arg-callback-call-entry'
+                            for receipt in receipts for witness in receipt.get('callback_owners', [])))
+
+    def test_caller_entry_refuses_missing_cold_foreign_or_ambiguous_authority(self):
+        def mutate(old, new, base, head, mode):
+            if mode == 'cold-child':
+                head[1]['count'] = head[1]['regions'][0][4] = 0
+            elif mode == 'cold-callee':
+                head[0]['regions'][1][4] = 0
+            elif mode == 'cold-argument':
+                head[0]['regions'][2][4] = 0
+            elif mode == 'disagreed-parent-entry':
+                head[0]['count'] += 1
+            elif mode == 'disagreed-child-entry':
+                head[1]['count'] += 1
+            elif mode == 'missing-copy':
+                del head[2:4]
+            elif mode == 'missing-child':
+                del head[1]
+            elif mode == 'duplicate-symbol':
+                head.append(copy.deepcopy(head[1]))
+            elif mode == 'foreign-overlap':
+                head.append(dict(name='foreign', count=1, filenames=['/src/example.rs'],
+                                 regions=[copy.deepcopy(head[1]['regions'][0])]))
+            elif mode == 'wrong-parent':
+                head[1]['name'] = head[1]['name'].replace('7checked', '7another')
+            elif mode == 'foreign-child-file':
+                head[1]['filenames'] = ['/src/foreign.rs']
+            elif mode == 'wrong-child-end':
+                head[1]['regions'][-1][3] += 1
+            elif mode == 'broad-parent-row':
+                head[0]['regions'][1][2] += 1
+            elif mode == 'extra-child-entry-region':
+                head[1]['regions'].append([5, 18, 5, 19, 1, 0, 0, 0])
+            elif mode in ('stable-wrong-slot', 'stable-wrong-tail', 'stable-child-tail'):
+                for members in (base, head):
+                    for parent, child in zip(members[::2], members[1::2]):
+                        if mode == 'stable-wrong-slot':
+                            parent['regions'][1][1] += 1
+                        elif mode == 'stable-wrong-tail':
+                            parent['regions'][1][5] = 1
+                        else:
+                            child['regions'][0][7] = 1
+            elif mode == 'nested-placement':
+                for source in (old, new):
+                    source[3] = '    if ready {'
+                    source[6] += ' }'
+            elif mode == 'duplicate-caller-in-parent':
+                for source, members in ((old, base), (new, head)):
+                    source[7:7] = ['    caller(&path, || {', '    });']
+                    for owner in members:
+                        for row in owner['regions']:
+                            for column in (0, 2):
+                                if row[column] >= 8:
+                                    row[column] += 2
+            elif mode == 'different-cfg':
+                new[0] = '#[cfg(windows)]'
+            elif mode == 'not-test':
+                new[1] = '#[inline]'
+            elif mode == 'changed-callee':
+                new[4] = new[4].replace('caller', 'otherf')
+            elif mode == 'changed-argument':
+                new[4] = new[4].replace('&path', '&else')
+            elif mode == 'macro-caller':
+                for source in (old, new):
+                    source[4] = source[4].replace('caller(', 'caller!(')
+            elif mode == 'body-as-caller':
+                for source in (old, new):
+                    source[4] += ' inline();'
+        for mode in ('cold-child', 'cold-callee', 'cold-argument', 'disagreed-parent-entry',
+                     'disagreed-child-entry', 'missing-copy', 'missing-child', 'duplicate-symbol',
+                     'foreign-overlap', 'wrong-parent', 'foreign-child-file', 'wrong-child-end',
+                     'broad-parent-row', 'extra-child-entry-region', 'different-cfg', 'not-test',
+                     'changed-callee', 'changed-argument', 'macro-caller', 'body-as-caller',
+                     'stable-wrong-slot', 'stable-wrong-tail', 'stable-child-tail',
+                     'nested-placement', 'duplicate-caller-in-parent'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.caller_entry_compare(lambda old, new, base, head: mutate(old, new, base, head, mode))
+
+    def test_caller_entry_never_credits_changed_callback_body(self):
+        with self.assertRaises(ValueError):
+            self.caller_entry_compare(body=True)
+
+    def test_caller_entry_preserves_default_callback_proof_and_shared_work_bound(self):
+        original = coverage.zero_arg_callback_fragment
+        captured = []
+        def record(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if kwargs.get('caller_entry'):
+                captured.append(args)
+            else:
+                self.assertIsNone(result)
+            return result
+        with patch.object(coverage, 'zero_arg_callback_fragment', side_effect=record):
+            self.caller_entry_compare()
+        self.assertTrue(captured)
+        args = list(captured[0])
+        args[-1] = [0]
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            original(*args, caller_entry=True)
+        args = list(captured[0])
+        args[5] = 6
+        self.assertIsNone(original(*args, caller_entry=True))
+
     def changed_callback_compare(self, mutation=None, context_change=False, joint=False, callback_form='||',
                                  header_end='brace'):
         def function(name, operation, setup='setup'):
