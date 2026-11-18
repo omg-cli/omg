@@ -104,6 +104,21 @@ class FedoraSQLiteTests(unittest.TestCase):
         self.assertEqual(json.loads(refusal.read_text())['error'], 'ReadError')
         self.assertFalse((destination/'manifest.json').exists())
 
+    def test_parallel_build_preserves_the_full_fedora_check(self):
+        official_spec = (
+            'Release: 2%{?dist}\n'
+            'Patch3: sqlite-3.51.2-CVE-2026-11822-CVE-2026-11824.patch\n'
+            '%patch -P 3 -p1\n%check\nmake test\n'
+        )
+        for jobs, extra in ((2, ''), (4, 'make %{?_smp_mflags} testprogs\n')):
+            with self.subTest(jobs=jobs):
+                spec = sqlite.prepare_spec(official_spec, self.policy, jobs)
+                self.assertIn('%patch -P 4 -p1\n', spec)
+                self.assertEqual(spec.split('%check\n', 1)[1],
+                                 extra+'make test\ncp test-out.txt %{_topdir}/test-details.txt\n')
+        with self.assertRaisesRegex(ValueError, 'spec differs'):
+            sqlite.prepare_spec(official_spec+'make test\n', self.policy, 4)
+
     def test_failed_dependency_download_preserves_diagnostics_without_admitting_a_bundle(self):
         destination = self.bundle/'failed'/'fedora-sqlite-x86_64-1'
         observed = []

@@ -272,7 +272,12 @@ def execute_module(root, relative, output, only=None):
             rows[test.id()]['elapsed_seconds'] = time.monotonic() - started[test.id()]
             save(); super().stopTest(test)
     # Own timing works on Python 3.11 as well as hosted 3.12; no new durations kwarg.
-    result = unittest.TextTestRunner(verbosity=2, resultclass=Recorded).run(suite)
+    old_path = sys.path[:]
+    try:
+        sys.path[:0] = [str((root / relative).parent), str(root)]
+        result = unittest.TextTestRunner(verbosity=2, resultclass=Recorded).run(suite)
+    finally:
+        sys.path[:] = old_path
     return 0 if result.wasSuccessful() and all(row['status'] in ('passed', 'skipped') for row in rows.values()) else 1
 
 
