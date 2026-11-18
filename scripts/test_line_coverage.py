@@ -1356,6 +1356,105 @@ class RetainedPolicyDefaultRecordTests(unittest.TestCase):
 
 
 class OsvRequestMigrationTests(unittest.TestCase):
+    def test_report_fixture_binds_renamed_osv_call_and_its_wait_phases(self):
+        name = 'src/core/security/vulnerability.rs'
+        test = 'test_vulnerability_report_creation'
+        symbol = f'_RNvNtNtNtNtCs1_7omg_lib4core8security13vulnerability5tests{len(test)}{test}'
+
+        def observe(method, args='&package, &version', resume=1):
+            source = ['#[cfg(test)]','mod tests {','    #[tokio::test]',f'    async fn {test}() {{',
+                      '        let scanner = VulnerabilityScanner {',
+                      '            osv_ecosystem_override: Some("Debian:12".to_string()),',
+                      '        };','        let reports = scanner',f'            .{method}({args})',
+                      '            .await','            .expect("actual report");','    }','}']
+            brace = len(source[3])
+            root = dict(name=symbol,filenames=['/artifact/'+name],count=1,regions=[[4,11,4,brace-1,1,0,0,0]])
+            start, end = 14, 14+len(method)
+            child = dict(root,name='_RNC'+symbol[2:]+'0Bb_',regions=[
+                [4,brace,4,brace+1,1,0,0,0], [8,13,8,20,1,0,0,0], [8,23,8,30,1,0,0,0],
+                [8,23,10,19,1,0,0,0], [9,start,9,end,1,0,0,0], [9,end+1,9,end+9,1,0,0,0],
+                [11,14,11,20,resume,0,0,0], [11,21,11,36,resume,0,0,0], [12,5,12,6,1,0,0,0]])
+            owners = (root,child)
+            work = [100_000]
+            counts = coverage._owner_line_counts({'regions':child['regions']},coverage._ObserverWork(work))
+            return coverage.async_osv_report_call(name,source,counts,(4,12,[root]),owners,
+                Counter(o['name'] for o in owners),coverage._construct_inventory(source,work),8,8,work)
+
+        baseline = observe('scan_package')
+        head = observe('scan_osv_package')
+        self.assertIsNotNone(baseline)
+        self.assertEqual(baseline[0],head[0])
+        self.assertIsNone(observe('scan_osv_package',args='&other, &version'))
+        self.assertIsNone(observe('scan_osv_package',resume=0))
+
+    def test_vector_score_fixture_preserves_the_unexecuted_try_return(self):
+        name = 'src/core/security/vulnerability.rs'
+        test = 'osv_ingestion_retains_the_highest_numeric_or_vector_score'
+        symbol = f'_RNvNtNtNtNtCs1_7omg_lib4core8security13vulnerability5tests{len(test)}{test}'
+
+        def observe(method, try_hits=0):
+            source = ['#[cfg(test)]','mod tests {','    #[tokio::test]',
+                      f'    async fn {test}() -> anyhow::Result<()> {{',
+                      '        let scanner = VulnerabilityScanner::with_osv_endpoint(endpoint, "Debian:12".into());',
+                      '        let reports = scanner',f'            .{method}(',
+                      '                &format!("vector-test-{}", uuid::Uuid::new_v4()),',
+                      '                &crate::package_managers::parse_version_or_zero("1.0"),',
+                      '            )','            .await?;','    }','}']
+            brace = len(source[3])
+            root = dict(name=symbol,filenames=['/artifact/'+name],count=1,regions=[[4,11,4,brace-1,1,0,0,0]])
+            child = dict(root,name='_RNC'+symbol[2:]+'0Bb_',regions=[
+                [4,brace,4,brace+1,1,0,0,0], [6,13,6,20,1,0,0,0], [6,23,6,30,1,0,0,0],
+                [6,23,11,19,1,0,0,0], [7,14,7,14+len(method),1,0,0,0], [8,17,8,65,1,0,0,0],
+                [11,19,11,20,try_hits,0,0,0], [12,5,12,6,1,0,0,0]])
+            owners = (root,child)
+            work = [100_000]
+            counts = coverage._owner_line_counts({'regions':child['regions']},coverage._ObserverWork(work))
+            return coverage.async_osv_report_call(name,source,counts,(4,12,[root]),owners,
+                Counter(o['name'] for o in owners),coverage._construct_inventory(source,work),6,6,work)
+
+        baseline, head = observe('scan_package'), observe('scan_osv_package')
+        self.assertIsNotNone(baseline)
+        self.assertEqual(baseline[0],head[0])
+        self.assertIsNone(observe('scan_osv_package',try_hits=1))
+
+    def test_scanner_fixture_observes_the_expanded_eager_record(self):
+        name = 'src/core/security/vulnerability.rs'
+        test = 'test_vulnerability_report_creation'
+        symbol = f'_RNvNtNtNtNtCs1_7omg_lib4core8security13vulnerability5tests{len(test)}{test}'
+        field = 'arch_endpoint: ARCH_ADVISORY_ENDPOINT.to_owned(),'
+
+        def observe(addition=None, shortened=False, extra_region_delta=0):
+            source = ['#[cfg(test)]','mod tests {','    #[tokio::test]',f'    async fn {test}() {{',
+                      '        let scanner = VulnerabilityScanner {', '            client: Client::builder()',
+                      '                .no_proxy()', '                .build()', '                .expect("fixture"),',
+                      '            osv_api_url: endpoint,',
+                      '            osv_ecosystem_override: Some("Debian:12".to_string()),']
+            if addition:
+                source.append('            '+addition)
+            source.extend(['        };','    }','}'])
+            end = len(source)-2
+            brace = len(source[3])
+            root = dict(name=symbol,filenames=['/artifact/'+name],count=1,regions=[[4,11,4,brace-1,1,0,0,0]])
+            child = dict(root,name='_RNC'+symbol[2:]+'0Bb_',regions=[
+                [4,brace,4,brace+1,1,0,0,0], [5,13,5,20,1,0,0,0],
+                [5,23,end-int(shortened),10,1,0,0,0], [end+1,5,end+1,6,1,0,0,0]])
+            if addition:
+                start = source[10].index('Some(')+1
+                child['regions'].insert(3,[11,start,11,len(source[10])+extra_region_delta,1,0,0,0])
+            owners = (root,child)
+            work = [500_000]
+            counts = coverage._owner_line_counts({'regions':child['regions']},coverage._ObserverWork(work))
+            return coverage.async_runtime_fixture_record(name,source,counts,(4,end+1,[root]),owners,
+                Counter(o['name'] for o in owners),coverage._construct_inventory(source,work),5,5,work)
+
+        old = observe()
+        head = observe(field)
+        self.assertIsNotNone(old)
+        self.assertEqual(old[0],head[0])
+        self.assertNotEqual(old[0],observe(field,extra_region_delta=-1)[0])
+        self.assertIsNone(observe(field,shortened=True))
+        self.assertIsNone(observe('arch_endpoint: endpoint.clone(),'))
+
     def test_request_observation_requires_exact_coordinates_and_all_compiled_copies(self):
         def scenario(modern, fault=None):
             name = 'scan_osv_coordinates' if modern else 'scan_package'
@@ -1398,6 +1497,42 @@ class OsvRequestMigrationTests(unittest.TestCase):
 
 
 class SbomComponentPushTests(unittest.TestCase):
+    def test_audit_fixture_observes_coverage_and_applicability_separately(self):
+        name = 'src/core/security/sbom_shared.rs'
+        symbol = '_RNvNtNtNtNtCs1_7omg_lib4core8security11sbom_shared5tests7fixture'
+        fields = ('coverage: crate::core::security::scan::AuditCoverage::Unreported,',
+                  'applicability: crate::core::security::scan::FindingApplicability::Possible,')
+
+        def observe(modern=False, applicability_hits=1):
+            source = ['#[cfg(test)]','mod tests {','    #[test]','    fn fixture() {',
+                      '        let audit = SecurityAuditResult {','            total_vulnerabilities: 1,',
+                      '            high_severity: 0,','            vulnerabilities: vec![(',
+                      '                old.name.clone(),','                vec![Vulnerability {',
+                      '                    id: "fixture-advisory".into(),',
+                      '                    summary: "fixture".into(),','                    score: None,',
+                      '                    advisory_severity: None,','                    native_advisory: None,',
+                      '                    affected_installed: vec![InstalledIdentity::from(&old)],',
+                      '                }],','            )],','        };','    }','}']
+            raw = [[4,5,4,17,1,0,0,0],[5,13,5,18,1,0,0,0]]
+            if modern:
+                for offset, indent, field, count in ((1,12,fields[0],1),(7,20,fields[1],applicability_hits)):
+                    text = ' '*indent + field
+                    source.insert(4+offset,text)
+                    col = text.index(': ')+3
+                    raw.append([5+offset,col,5+offset,len(text),count,0,0,0])
+            end = len(source)-2
+            raw.extend([[5,21,end,10,1,0,0,0],[end+1,5,end+1,6,1,0,0,0]])
+            root = dict(name=symbol,filenames=['/artifact/'+name],regions=raw,count=1)
+            work = [100_000]
+            counts = coverage._owner_line_counts({'regions':raw},coverage._ObserverWork(work))
+            return coverage.async_runtime_fixture_record(name,source,counts,(4,end+1,[root]),[root],
+                        Counter({symbol:1}),coverage._construct_inventory(source,work),5,5,work)
+
+        old, head = observe(), observe(True)
+        self.assertIsNotNone(old)
+        self.assertEqual(old[0],head[0])
+        self.assertIsNone(observe(True,applicability_hits=0))
+
     def test_package_identity_fixture_adds_an_observed_unknown_origin(self):
         name = 'src/core/security/sbom_shared.rs'
         symbol = '_RNvNtNtNtNtCs1_7omg_lib4core8security11sbom_shared5tests7fixture'

@@ -3898,6 +3898,8 @@ def async_test_fragment_owners(name, group, owners, names, inventory, first, las
     tokio_test = ('#','[','tokio','::','test',']','async','fn')
     headers = (tokio_test, ('#','[','cfg','(','unix',')',']')+tokio_test) if result_alias else (tokio_test,)
     result = ('(',')','->','Result','<','(',')','>') if result_alias else _RESULT_TEST_SIGNATURE[6:]
+    if name=='src/core/security/vulnerability.rs' and words[declaration+1]=='test_vulnerability_report_creation':
+        result = ('(',')')
     runtime_header=(runtime_helper and result_alias and name=='src/runtimes/rust.rs'
                     and words[:declaration+1]==('async','fn'))
     helper = (runtime_header and words[declaration+2:]==('(','corrupt',':','bool',',','missing_launcher',':',
@@ -4148,16 +4150,26 @@ def incremental_rust_fixture_loop(inventory, function, record, owners, witness, 
 
 
 def async_runtime_fixture_record(name, source, counts, group, owners, names, inventory, first, last, work):
-    """Project a fixture record through the addition of its eager security field."""
+    """Project a fixture record through separately observed eager security fields."""
     managers = {'src/runtimes/java.rs':'JavaManager', 'src/runtimes/rust.rs':'RustManager'}
-    if name == 'src/core/security/sbom_shared.rs':
+    scanner = name == 'src/core/security/vulnerability.rs'
+    if scanner:
+        bindings, record_type, original_size = ('scanner',), 'VulnerabilityScanner', 7
+        initializer = 'ARCH_ADVISORY_ENDPOINT.to_owned()'
+        fields = [(7,f'arch_endpoint: {initializer},',initializer)]
+    elif name=='src/core/security/sbom_shared.rs' and source[first-1].strip()=='let audit = SecurityAuditResult {':
+        bindings, record_type, original_size = ('audit',), 'SecurityAuditResult', 14
+        coverage = 'crate::core::security::scan::AuditCoverage::Unreported'
+        applicability = 'crate::core::security::scan::FindingApplicability::Possible'
+        fields = [(1,f'coverage: {coverage},',coverage), (7,f'applicability: {applicability},',applicability)]
+    elif name == 'src/core/security/sbom_shared.rs':
         bindings, record_type, original_size = ('package','old'), 'SecurityPackage', 7
         initializer = 'crate::package_managers::types::SecurityOrigin::Unknown'
-        added_field = f'origin: {initializer},'
+        fields = [(1,f'origin: {initializer},',initializer)]
     elif name in managers:
         bindings, record_type, original_size = ('manager',), managers[name], 3
         initializer = 'crate::runtimes::security::RuntimeSecurity::fixture'
-        added_field = f'security: {initializer}(),'
+        fields = [(1,f'security: {initializer}(),',initializer)]
     else:
         return None
     if (inventory is None or first!=last or source[first-1].strip() not in
@@ -4171,7 +4183,7 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
         return None
     record, = candidates
     closing = code.position(code.ends[record['end']])[0]
-    if closing-first not in (original_size,original_size+1) or source[closing-1].strip()!='};':
+    if closing-first not in (original_size,original_size+len(fields)) or source[closing-1].strip()!='};':
         return None
     synchronous=source[group[0]-1].lstrip().startswith('fn ')
     if synchronous:
@@ -4196,35 +4208,105 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
         return None
     if counts.get(first,0)<=0:
         return None
-    insertion = closing-first==original_size+1
-    added = first+1
-    if insertion and source[added-1].strip()!=added_field:
+    insertion = closing-first!=original_size
+    inserted = {}
+    if insertion:
+        for offset, field, initializer in fields:
+            added = first+offset
+            text = source[added-1]
+            if text.strip()!=field:
+                return None
+            start = text.index(initializer)+1
+            inserted[added] = (added,start,added,start+len(initializer))
+    if record_type=='SecurityAuditResult' and source[first+4+int(insertion)].strip()!='vec![Vulnerability {':
         return None
     source_rows = source[first-1:closing]
     _construct_charge(work,sum(len(text)+1 for text in source_rows)+len(witness['regions']))
-    if insertion:
-        extra = source_rows.pop(1)
-        start = extra.index(initializer)+1
-        slot = (added,start,added,start+len(initializer))
+    for added in reversed(inserted):
+        source_rows.pop(added-first)
     def relative(line):
-        return line-first-int(insertion and line>added)
+        return line-first-sum(number<line for number in inserted)
     region_states = []; additions = []
     for row in witness['regions']:
         if row[5:]!=[0,0,0]:
             return None
-        if insertion and tuple(row[:4])==slot:
+        if row[0] in inserted and tuple(row[:4])==inserted[row[0]]:
             additions.append(row)
             continue
-        if insertion and added in (row[0],row[2]):
+        if row[0] in inserted or row[2] in inserted:
             return None
         region_states.append((relative(row[0]),row[1],relative(row[2]),row[3],row[4]>0))
-    if insertion and (len(additions)!=1 or additions[0][4]!=entry_hits or counts.get(added,0)<=0):
-        return None
+    if insertion:
+        if scanner and not additions:
+            added, = inserted
+            envelope = code.region(record['first']+3,record['end'])
+            additions = [row for row in witness['regions'] if tuple(row[:4])==envelope and row[0]<added<row[2]]
+            witness['initializer_uses_record_envelope'] = True
+        if sorted(row[0] for row in additions)!=list(inserted) and not witness.get('initializer_uses_record_envelope'):
+            return None
+        if len(additions)!=len(inserted) or any(row[4]!=entry_hits for row in additions) or any(counts.get(line,0)<=0 for line in inserted):
+            return None
+        if scanner and witness.get('initializer_uses_record_envelope'):
+            preceding = source[added-2]
+            value = 'Some("Debian:12".to_string())'
+            if preceding.strip()==f'osv_ecosystem_override: {value},':
+                start = preceding.index(value)+1
+                field = (added-1,start,added-1,start+len(value))
+                redundant = [row for row in witness['regions'] if tuple(row[:4])==field and row[4]==entry_hits]
+                if len(redundant)==1:
+                    region_states.remove((relative(field[0]),field[1],relative(field[2]),field[3],True))
+                    witness['retained_field_region'] = redundant[0]
     observed = _owner_line_counts({'regions':witness['regions']},_ObserverWork(work))
     if observed!={line:counts[line] for line in range(first,closing+1) if line in counts}:
         return None
-    witness.update(record_span=[first,closing],security_initializer=additions)
+    witness.update(record_span=[first,closing],security_initializer=additions,
+                   shifts=[first+offset-index-1 for index,(offset,_,_) in enumerate(fields)])
     return (identity,tuple(source_rows),tuple(sorted(region_states))),witness
+
+
+def async_osv_report_call(name, source, counts, group, owners, names, inventory, first, last, work):
+    if (name!='src/core/security/vulnerability.rs' or first!=last or first+3>len(source)
+            or source[first-1]!='        let reports = scanner'):
+        return None
+    call = re.fullmatch(r'            \.(scan_package|scan_osv_package)\((|&package, &version\))',source[first])
+    if call is None:
+        return None
+    short = bool(call[2])
+    if short:
+        tail = ['            .await','            .expect("actual report");']
+        test = 'test_vulnerability_report_creation'
+        setup_line = '            osv_ecosystem_override: Some("Debian:12".to_string()),'
+    else:
+        tail = ['                &format!("vector-test-{}", uuid::Uuid::new_v4()),',
+                '                &crate::package_managers::parse_version_or_zero("1.0"),',
+                '            )','            .await?;']
+        test = 'osv_ingestion_retains_the_highest_numeric_or_vector_score'
+        setup_line = '        let scanner = VulnerabilityScanner::with_osv_endpoint(endpoint, "Debian:12".into());'
+    end = first+len(tail)+1
+    if source[first+1:end]!=tail:
+        return None
+    scope = async_test_fragment_owners(name,group,owners,names,inventory,first,end,work,result_alias=short)
+    if scope is None:
+        return None
+    function, identity, witness, hits = scope
+    if test not in function['header']:
+        return None
+    setup = source[group[0]-1:first-1]
+    _construct_charge(work,sum(len(line)+1 for line in setup))
+    if setup.count(setup_line)!=1:
+        return None
+    expanded = len(call[1])-len('scan_package')
+    slots = [(0,13,0,20),(0,23,0,30),(0,23,2 if short else 5,19),(1,14,1,26+expanded)]
+    if short:
+        slots.extend([(1,27+expanded,1,35+expanded),(3,14,3,20),(3,21,3,36)])
+    else:
+        slots.append((2,17,2,65))
+    expected = [[first+a,b,first+c,d,hits,0,0,0] for a,b,c,d in slots]
+    if not short:
+        expected.append([end,19,end,20,0,0,0,0])
+    if witness['regions']!=expected or any(counts.get(line)!=hits for line in range(first,end+1)):
+        return None
+    return identity,dict(witness,method=call[1],record_span=[first,end])
 
 
 def async_runtime_inventory_assertion(name, source, counts, group, owners, names, inventory, first, last, work):
@@ -5683,11 +5765,14 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
               and b<len(old) and old[a].strip()=='assert!(' and '&FailingVulns)' in old[b]):
             async_fragment = async_policy_unavailable_assertion
         elif b-a==1 and (old[a].strip() in ('let manager = JavaManager {','let manager = RustManager {')
+                or name=='src/core/security/vulnerability.rs' and old[a].strip()=='let scanner = VulnerabilityScanner {'
                 or name=='src/core/security/sbom_shared.rs' and old[a].strip() in
-                    ('let package = SecurityPackage {','let old = SecurityPackage {')):
+                    ('let package = SecurityPackage {','let old = SecurityPackage {','let audit = SecurityAuditResult {')):
             async_fragment = async_runtime_fixture_record
         elif name=='src/runtimes/rust.rs' and b-a==1 and tuple(pending)==(b,) and old[a].strip()=='assert_eq!(':
             async_fragment = async_runtime_inventory_assertion
+        elif name=='src/core/security/vulnerability.rs' and b-a==1 and old[a].strip()=='let reports = scanner':
+            async_fragment = async_osv_report_call
         if async_fragment is not None and macro_expansions==([],[]) and construct_inventories is not None:
             observations = [async_fragment(name,source,counts,group,inventories[side],
                 inventory_names[side],construct_inventories[side],first,last,work)
@@ -5699,19 +5784,26 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                          [entry[1]['typed'] for entry in observations]==[False,True])
                 and (async_fragment is not async_runtime_fixture_record or
                          [bool(entry[1]['security_initializer']) for entry in observations]==[False,True])
+                and (async_fragment is not async_osv_report_call or
+                         [entry[1]['method'] for entry in observations]==['scan_package','scan_osv_package'])
                     and (async_fragment is not async_runtime_inventory_assertion or
                          [bool(entry[1]['security_terms']) for entry in observations]==[False,True])):
                 matched = [(line,line+c-a) for line in pending]
                 if async_fragment in (async_runtime_fixture_record,async_runtime_inventory_assertion):
                     old_first,old_last = observations[0][1]['record_span']
                     new_first = observations[1][1]['record_span'][0]
-                    shift_after=observations[0][1].get('shift_after',old_first)
-                    shift_count=2 if async_fragment is async_runtime_inventory_assertion else 1
-                    matched = [(line,line+new_first-old_first+shift_count*int(line>shift_after))
+                    shifts=observations[0][1].get('shifts')
+                    if shifts is None:
+                        shifts=(observations[0][1]['shift_after'],)*2
+                    matched = [(line,line+new_first-old_first+sum(point<line for point in shifts))
                                for line in range(old_first,old_last+1) if line in before]
                     _construct_charge(work,len(matched))
                     if any(target not in after for _,target in matched):
                         refuse()
+                    preproved_callback_pairs.update(matched)
+                if async_fragment is async_osv_report_call:
+                    old_start,old_end = observations[0][1]['record_span']
+                    matched = [(line,line+d-b) for line in range(old_start,old_end+1)]
                     preproved_callback_pairs.update(matched)
                 if any(line in pairs and pairs[line]!=target for line,target in matched):
                     refuse()
@@ -5729,9 +5821,12 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                         async_test_expected_variant:'async-test-expected-variant-entry',
                         async_policy_unavailable_assertion:'async-policy-unavailable-assertion-entry',
                         async_runtime_fixture_record:'async-runtime-fixture-record',
+                        async_osv_report_call:'async-osv-fixture-call',
                         async_runtime_inventory_assertion:'async-runtime-inventory-assertion'}[async_fragment]
                 if synchronous_record:
                     kind='sync-sbom-fixture-record' if name=='src/core/security/sbom_shared.rs' else 'sync-runtime-fixture-record'
+                elif async_fragment is async_runtime_fixture_record and name=='src/core/security/vulnerability.rs':
+                    kind='async-osv-fixture-record'
                 evidence = [observation[1] for observation in observations]
                 receipt = dict(kind=kind,file=name,pairs=matched,owners=evidence)
                 if synchronous_record:

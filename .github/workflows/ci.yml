@@ -1142,8 +1142,16 @@ jobs:
 
       - name: Platform clippy
         if: matrix.phase == 'clippy'
+        shell: bash
         run: |
-          cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
+          set -euo pipefail
+          cargo_source=()
+          if [ '${{ matrix.platform }}' = debian ]; then
+            # Cargo otherwise fetches an unrelated website submodule while resolving the lockfile.
+            python3 scripts/check-alpm-pins.py --prepare-cargo-source "$RUNNER_TEMP/omg-alpm-source"
+            cargo_source=(--config "$RUNNER_TEMP/omg-alpm-source/cargo-config.toml")
+          fi
+          cargo clippy "${cargo_source[@]}" --all-targets --no-default-features --features ${{ matrix.features }} \
             --locked -- -D warnings
 
       - name: Test emitted shell hooks

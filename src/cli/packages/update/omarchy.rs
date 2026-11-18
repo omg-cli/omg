@@ -3464,11 +3464,18 @@ omarchy-state set reboot-required
             Err(nix::errno::Errno::ECHILD),
             "kernel auto-reaping left no waitable stage"
         );
-        assert_eq!(
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
-            Err(nix::errno::Errno::ESRCH),
-            "the inert stage no longer exists"
-        );
+        // waitpid can report ECHILD before the kernel detaches an auto-reaped PID.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
+            let mut pid_visible = true;
+            while pid_visible {
+                poll.tick().await;
+                pid_visible = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None)
+                    != Err(nix::errno::Errno::ESRCH);
+            }
+        })
+        .await
+        .expect("the inert stage no longer exists");
         assert!(
             commands.active.is_none(),
             "cleanup released child ownership"
