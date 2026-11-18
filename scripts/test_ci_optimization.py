@@ -86,7 +86,8 @@ class OptimizationContracts(unittest.TestCase):
         self.assertIsNotNone(cases, 'coverage must select its required fixture cases explicitly')
         selected = [line.strip() for line in cases.group(1).splitlines() if line.strip()]
         self.assertEqual(len(selected), len(set(selected)))
-        self.assertEqual(len(selected), 14)
+        self.assertEqual(len(selected), 15)
+        self.assertIn('package_managers::aur::client::tests::sandbox_launcher_isolates_host_ipc_namespace', selected)
         self.assertEqual(selected[0], 'package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman')
         self.assertEqual(selected[-1], 'core::usage::tests::elevated_state_roundtrip_preserves_caller_files')
         self.assertIn('mkdir -m 1777 /profiles', script)
