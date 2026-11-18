@@ -2433,10 +2433,12 @@ def fully_covered_replacement(name, old, new, before, after, descriptors, groupe
         async_bodies = {parent: [] for parent in parent_names}
         owners = []; regions = []
         for owner in compiled[0]:
-            _construct_charge(work, len(owner['name']) * (1 + 8 * len(parent_names)) + len(owner['regions']))
+            name_length = len(owner['name'])
+            _construct_charge(work, 2 * len(owner['regions']) + 1)
             span = min(row[0] for row in owner['regions']), max(row[2] for row in owner['regions'])
             if span[1] < first or span[0] > last:
                 continue
+            _construct_charge(work, name_length * (1 + 8 * len(parent_names)))
             shape = nominal_method_path(owner['name'])
             child = (shape is not None and shape.callbacks and shape.copy_identity in parent_paths
                      or any(plain is not None and any(direct_rust_callback_symbol(
