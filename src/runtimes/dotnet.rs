@@ -490,6 +490,9 @@ mod tests {
             (HOST, INDEX, &index),
             (HOST, CHANNEL, &channel),
             (HOST, &artifact_path(AFFECTED_SDK), &archive),
+            (HOST, INDEX, &index),
+            (HOST, CHANNEL, &channel),
+            (HOST, &artifact_path(AFFECTED_SDK), &archive),
         ]);
 
         let fixture = PublicationFixture::new("dotnet", "dotnet");
@@ -515,6 +518,31 @@ mod tests {
             "{error:#}"
         );
         assert!(!fixture.versions.join(rejected_sdk).exists());
+        let publisher_state = || -> std::io::Result<BTreeMap<_, _>> {
+            fs::read_dir(fixture.versions.join(".security"))?
+                .map(|entry| {
+                    let entry = entry?;
+                    Ok((entry.file_name(), fs::read(entry.path())?))
+                })
+                .collect()
+        };
+        let previous_state = publisher_state()?;
+        let lease = super::super::common::try_lock_runtime_file(
+            &fixture.versions,
+            &format!(".admission-{AFFECTED_SDK}.lock"),
+        )?;
+        let error = manager
+            .install(AFFECTED_SDK)
+            .await
+            .expect_err("a competing publication must refuse the authenticated download");
+        assert!(
+            format!("{error:#}").contains("Another runtime mutation or active use conflicts"),
+            "{error:#}"
+        );
+        assert!(!fixture.versions.join(AFFECTED_SDK).exists());
+        assert_eq!(publisher_state()?, previous_state);
+        assert_eq!(fs::read_link(fixture.versions.join("current"))?, installed);
+        drop(lease);
         let error = manager
             .install(AFFECTED_SDK)
             .await
@@ -529,6 +557,7 @@ mod tests {
             "{warning}"
         );
         assert!(!fixture.versions.join(AFFECTED_SDK).exists());
+        assert_eq!(publisher_state()?, previous_state);
         assert_eq!(fs::read_link(fixture.versions.join("current"))?, installed);
         let admission = admit_installed("dotnet", &installed, ReviewMode::CachedOnly)?;
         admission.verify(&installed)?;

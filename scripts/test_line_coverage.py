@@ -3356,6 +3356,161 @@ class SourceAwareCoverageTests(unittest.TestCase):
             sources=({'example.rs': ('\n'.join(sources[0])+'\n').encode()},
                      {'example.rs': ('\n'.join(sources[1])+'\n').encode()}))
 
+    def synchronous_tail_record_compare(self, direct_first=False, fault=None, shorthand=False):
+        old = ['impl Widget {', '    pub fn create() -> Self {', '        Self {',
+               '            directory: super::DATA_DIR.join("widget"),',
+               '            client: download_client(),', '        }', '    }', '}',
+               'use support::{Auxiliary};']
+        if shorthand:
+            old[1:4] = ['    #[cfg(test)]',
+                        '    fn create(directory: PathBuf, keyring: PathBuf) -> Self {',
+                        '        Self {', '            directory,', '            keyring,']
+            if fault == 'wrong-shorthand':
+                old[4] = '            elsewhere,'
+            elif fault == 'reordered-shorthand':
+                old[4:6] = list(reversed(old[4:6]))
+            elif fault == 'wrong-guard':
+                old[1] = '    #[cfg(unix)]'
+            elif fault == 'pattern-parameter':
+                old[2] = old[2].replace('directory:', 'mut directory:')
+        entry = 3 if shorthand else 2
+        first = entry+2
+        close = len(old)-2
+        new = old[:first-1] + ['            security: super::audit::Witness::default(),'] + old[first-1:]
+        new[-1] = 'use support::{Auxiliary, Monument};'
+        if fault == 'changed-parameter':
+            new[entry-1] = new[entry-1].replace('directory: PathBuf', 'directory: PathBox')
+        documents = []
+        for side, source in enumerate((old, new)):
+            members = []
+            for copy_number, hits in enumerate((3+side, int(not direct_first)), 1):
+                rows = []
+                def raw(first, column, last, endpoint):
+                    return [first, column, last, endpoint, hits, 0, 0, 0]
+                def value(line):
+                    text = source[line-1]
+                    start = text.index(': ')+3 if ': ' in text else len(text)-len(text.lstrip())+1
+                    return raw(line, start, line, text.rfind(',')+1-2*text.endswith('(),'))
+                rows.extend([raw(entry, 5, entry, source[entry-1].index('{')+1),
+                             raw(entry+1, 9, close-1+side, 10),
+                             raw(close+side, 5, close+side, 6)])
+                if direct_first:
+                    rows.append(value(first+side))
+                if side:
+                    rows.append(value(first))
+                owner = f'_RNvMNtCs{copy_number}_7example7exampleNtB2_6Widget6create'
+                self.assertIsNotNone(coverage.nominal_method_path(owner))
+                members.append(dict(name=owner, count=hits, filenames=['/src/example.rs'],
+                                    regions=rows, branches=[], mcdc_records=[]))
+            documents.append(members)
+
+        head = documents[1]
+        addition = head[0]['regions'][-1]
+        if fault == 'missing-added':
+            head[0]['regions'].pop()
+        elif fault == 'zero-added':
+            addition[4] = 0
+        elif fault == 'misplaced-added':
+            addition[1] += 1
+        elif fault == 'mismapped-retained':
+            head[0]['regions'][-2][1] += 1
+        elif fault == 'changed-retained':
+            new[4] = new[4].replace('"widget"', '"gadget"')
+        elif fault == 'changed-tail':
+            new[7] = '    };'
+        elif fault == 'new-argument':
+            new[3] = new[3].replace('default()', 'default(1)')
+            for owner in head:
+                owner['regions'][-1][3] += 1
+        elif fault == 'foreign-owner':
+            head.append(dict(name='foreign', count=1, filenames=['/src/example.rs'],
+                             regions=[copy.deepcopy(addition)]))
+        elif fault == 'missing-cold-copy':
+            head.pop()
+        elif fault == 'lost-copy-hit':
+            self.assertFalse(direct_first)
+            head[1]['count'] = 0
+            for row in head[1]['regions']:
+                row[4] = 0
+        elif fault == 'lost-retained-hit':
+            head[0]['regions'][-2][4] = 0
+        elif fault == 'foreign-type':
+            head[0]['name'] = head[0]['name'].replace('6Widget', '6Gadget')
+        elif fault == 'wrong-new-field-count':
+            addition[4] += 1
+        elif fault == 'missing-direct-slot':
+            for side in documents:
+                for owner in side:
+                    owner['regions'].pop(3)
+        elif fault == 'changed-binding':
+            new[-1] = 'use support::{Auxiliary, download_client};'
+        elif fault == 'new-glob':
+            new[-1] = 'use support::*;'
+        elif fault == 'new-alias':
+            new[-1] = 'use support::Another as download_client;'
+        counts = []
+        for members in documents:
+            work = coverage._ObserverWork()
+            counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [row for owner in members for row in owner['regions']], work), work)))
+
+        def owners(base, head):
+            for document, members in zip((base, head), documents):
+                document['data'][0]['functions'] = members
+                document['data'][0]['files'][0].update(expansions=[], branches=[], mcdc_records=[])
+        return self.compare(before=counts[0], after=counts[1], mutate=owners,
+            sources=({'example.rs': ('\n'.join(old)+'\n').encode()},
+                     {'example.rs': ('\n'.join(new)+'\n').encode()}))
+
+    def test_tail_record_insertion_retains_inherited_and_direct_field_regions(self):
+        for direct_first in (False, True):
+            with self.subTest(direct_first=direct_first):
+                report = self.synchronous_tail_record_compare(direct_first)
+                proof, = [row for row in report['retained_replacement_obligations']
+                          if row.get('kind') == 'retained-record-field-forest']
+                self.assertEqual(proof['pairs'], [[2,2], [3,3], [4,5], [5,6], [6,7], [7,8]])
+                self.assertEqual(proof['added_line'], 4)
+                self.assertEqual(report['deleted_mapped'], 0)
+                self.assertEqual([r['extra_field'][4] for r in proof['forests'][1]],
+                                 [4, int(not direct_first)])
+
+    def test_cfg_tail_record_insertion_binds_ordered_typed_shorthand_slots(self):
+        report = self.synchronous_tail_record_compare(True, shorthand=True)
+        proof, = [row for row in report['retained_replacement_obligations']
+                  if row.get('kind') == 'retained-record-field-forest']
+        self.assertEqual(proof['pairs'], [[3,3], [4,4], [5,6], [6,7], [7,8], [8,9], [9,10]])
+        self.assertEqual([copy['extra_field'][4] for copy in proof['forests'][1]], [4, 0])
+        self.assertEqual(proof['added_line'], 5)
+        self.assertEqual(proof['typed_parameter_slots'],
+                         (('directory', 'PathBuf'), ('keyring', 'PathBuf')))
+        self.assertEqual(proof['first_shorthand_spans'], [(5,13,5,22), (6,13,6,22)])
+        self.assertEqual(report['deleted_mapped'], 0)
+
+    def test_cfg_tail_record_insertion_refuses_unbound_shorthand_and_incomplete_regions(self):
+        for fault in ('wrong-shorthand', 'reordered-shorthand', 'wrong-guard',
+                      'pattern-parameter', 'changed-parameter', 'missing-added', 'missing-cold-copy',
+                      'mismapped-retained', 'lost-retained-hit', 'missing-direct-slot', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                try:
+                    report = self.synchronous_tail_record_compare(True, fault, shorthand=True)
+                except ValueError:
+                    continue
+                self.assertFalse(any(row.get('kind') == 'retained-record-field-forest'
+                    for row in report.get('retained_replacement_obligations', [])))
+
+    def test_tail_record_insertion_refuses_unproved_forests(self):
+        for fault in ('missing-added', 'zero-added', 'misplaced-added', 'mismapped-retained',
+                      'foreign-owner', 'missing-cold-copy', 'lost-copy-hit', 'lost-retained-hit',
+                      'foreign-type', 'wrong-new-field-count', 'changed-retained', 'changed-tail',
+                      'new-argument', 'changed-binding', 'new-glob', 'new-alias'):
+            with self.subTest(fault=fault):
+                try:
+                    report = self.synchronous_tail_record_compare(fault != 'lost-copy-hit', fault)
+                except ValueError:
+                    continue
+                self.assertFalse(any(row.get('kind') == 'retained-record-field-forest'
+                    for row in report.get('retained_replacement_obligations', [])))
+
     def test_retained_record_field_preserves_nested_block_forest_and_cold_copy(self):
         receipt = self.closed_record_field_forest_compare()
         self.assertTrue(any(row.get('kind') == 'retained-record-field-forest'
@@ -4081,6 +4236,56 @@ class SourceAwareCoverageTests(unittest.TestCase):
         for change in ('cold-new', 'cold-retained', 'lost-type', 'unmapped-new', 'unknown-symbol', 'changed-body'):
             with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'complete compiled-copy'):
                 self.default_trait_additions_compare(change)
+
+    def path_reference_additions_compare(self, change=None):
+        old = (b'impl Fixture {\n    pub fn new_in(distro: &str, dir: impl AsRef<Path>) -> Self {\n'
+               b'        Self::build(distro, dir.as_ref().to_path_buf())\n    }\n}\n')
+        new = b'// Another integration test uses this constructor.\n' + old
+        def owner(crate, instance, shift, count, argument='RNtNtCs7_3std4path4Path'):
+            return dict(name=f'_RINvMs_NtCs{crate}_3pkg7exampleNtB5_7Fixture6new_in{argument}E{instance}',
+                        filenames=['/src/example.rs'], count=count,
+                        regions=[[2+shift, 5, 2+shift, 65, count, 0, 0, 0],
+                                 [3+shift, 9, 3+shift, 56, count, 0, 0, 0],
+                                 [4+shift, 5, 4+shift, 6, count, 0, 0, 0]])
+        def bind(base, head):
+            base['data'][0]['functions'] = [owner('1', 'Cs8_5alpha', 0, 1), owner('1', 'B7_', 0, 0, 'p')]
+            candidates = [owner('2', 'Cs9_5alpha', 1, 1), owner('2', 'B7_', 1, 0, 'p'),
+                          owner('2', 'Csa_4beta', 1, 1)]
+            if change == 'lost-consumer':
+                candidates[0]['name'] = candidates[0]['name'].replace('5alpha', '5gamma')
+            elif change == 'lost-cold-root':
+                candidates[1]['name'] = candidates[1]['name'].removesuffix('B7_') + 'Csb_5gamma'
+            elif change == 'cold-added':
+                candidates[2] = owner('2', 'Csa_4beta', 1, 0)
+            elif change == 'changed-type':
+                candidates[0]['name'] = candidates[0]['name'].replace('4PathE', '7PathBufE')
+            elif change == 'foreign-type':
+                candidates[2]['name'] = candidates[2]['name'].replace('3std4path4Path', '3abc4path4Path')
+            elif change == 'foreign-impl':
+                candidates[2]['name'] = candidates[2]['name'].replace('7Fixture', '7Foreign')
+            elif change == 'foreign-std-copy':
+                candidates[2]['name'] = candidates[2]['name'].replace('Cs7_3std', 'Cs8_3std')
+            elif change == 'unknown-suffix':
+                candidates[2]['name'] += '.llvm.1'
+            elif change == 'duplicate-copy':
+                candidates[2] = candidates[0]
+            head['data'][0]['functions'] = candidates
+        if change == 'changed-body':
+            new = new.replace(b'Self::build', b'Self::apply')
+        after = [(3, 2), (4, 2), (5, 2)] if change != 'cold-added' else [(3, 1), (4, 1), (5, 1)]
+        return self.compare(before=[(2, 1), (3, 1), (4, 1)], after=after,
+                            mutate=bind, sources=({'example.rs': old}, {'example.rs': new}))
+
+    def test_retained_path_constructor_can_gain_a_fully_observed_consumer(self):
+        receipt = self.path_reference_additions_compare()
+        self.assertEqual(receipt['deleted_mapped'], 0)
+        self.assertEqual(receipt['additive_path_reference_copies'][0]['pairs'], [[2, 3], [3, 4], [4, 5]])
+
+    def test_path_constructor_addition_requires_every_original_copy_and_known_new_consumer(self):
+        for change in ('lost-consumer', 'lost-cold-root', 'cold-added', 'changed-type', 'foreign-type',
+                       'foreign-impl', 'foreign-std-copy', 'unknown-suffix', 'duplicate-copy', 'changed-body'):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'complete compiled-copy'):
+                self.path_reference_additions_compare(change)
 
     def compare(self, before=None, after=None, mutate=None, sources=None):
         default_before, default_after = self.fixture()
@@ -7596,6 +7801,85 @@ class RetiredAssertionDelimiterTests(unittest.TestCase):
 
 
 class IntactFixtureCallbackForestTests(unittest.TestCase):
+    def binding_compare(self, fault=None, repeated=False):
+        old = ['#[cfg(test)]','mod tests {','    #[test]','    fn trial() {',
+               '        let path = std::env::join_paths(paths).expect("fixture PATH");',
+               '        with_managed_fixture_environment(&path, || {',
+               '            let runtime = fixture_runtime();',
+               '            runtime.block_on(async {','                run_fixture();',
+               '            });','        });','    }','}']
+        if repeated:
+            old[6:7] = ['            for (kind, diagnostic) in [("npm", "before")] {',
+                        '                let runtime = fixture_runtime(kind);',
+                        '            }']
+        new = old[:4]+['        prepare_fixture();']+old[4:]
+        extra = 2*int(repeated)
+        new[9+extra] = '                run_changed();'
+        if repeated:
+            new[7] = new[7].replace('"before"','"update"')
+            if fault == 'different-kind':
+                new[7] = new[7].replace('"npm"','"pip"')
+            if fault == 'reads-diagnostic':
+                for source, position in ((old,7),(new,8)):
+                    source[position] = source[position].replace('kind','diagnostic')
+        if fault == 'binding':
+            new[7+int(repeated)] = new[7+int(repeated)].replace('fixture_runtime', 'prepare_runtime')
+        file = '/src/cli/tool.rs'; name = 'src/cli/tool.rs'; files = {file:name}
+        reports = []; mapped = []
+        for shift, source in enumerate((old, new)):
+            root = f'_RNvNtNtNtCs{1+shift}_7omg_lib3cli4tool5testss_5trial'
+            outer = source[5+shift].index('{')+1
+            inner = source[7+shift+extra].index('{')+1
+            bind_line = 7+shift+int(repeated)
+            indent = 4*int(repeated)
+            binding = [bind_line, 17+indent, bind_line, 24+indent, 1, 0, 0, 0]
+            value = [bind_line, 27+indent, bind_line, len(source[bind_line-1]), 1, 0, 0, 0]
+            if shift and fault == 'geometry':
+                binding[1] += 1
+            if shift and fault == 'cold':
+                binding[4] = 0
+            outer_regions = [[6+shift,outer,6+shift,outer+1,1,0,0,0]]
+            if repeated:
+                for token in ('kind','diagnostic','[("'):
+                    line = source[6+shift]
+                    start = line.index(token)+1
+                    end = start+len(token) if token != '[("' else line.index(']')+2
+                    outer_regions.append([7+shift,start,7+shift,end,1,0,0,0])
+            outer_regions.extend([binding,value,[11+shift+extra,9,11+shift+extra,10,1,0,0,0]])
+            inner_regions = [[8+shift+extra,inner,8+shift+extra,inner+1,1,0,0,0],
+                             [9+shift+extra,17,9+shift+extra,30,1,0,0,0],
+                             [10+shift+extra,13,10+shift+extra,14,1,0,0,0]]
+            call_regions = [[6+shift,9,6+shift,41,1,0,0,0],[6+shift,42,6+shift,47,1,0,0,0]]
+            reports.append([dict(name=symbol, count=count, filenames=[file], regions=regions) for symbol,count,regions in (
+                (root,2,[[4,5,4,17,2,0,0,0],*call_regions,[12+shift+extra,5,12+shift+extra,6,2,0,0,0]]),
+                ('_RNC'+root[2:]+'0B9_',1,outer_regions),('_RNCNC'+root[2:]+'00Bb_',1,inner_regions))])
+            mapped.append(coverage._owner_line_counts({'regions':call_regions+outer_regions+inner_regions},
+                                                       coverage._ObserverWork([10_000])))
+        if fault == 'missing-child':
+            reports[1].pop()
+        line = 7+int(repeated)
+        return coverage.positive_source_fragments(name, old, new, *mapped, *reports, files, files,
+            [(line-1,line,line,line+1,[line])], callback_functions={'    fn trial()'}, macro_expansions=([],[]))
+
+    def test_retained_binding_before_changed_fixture_work(self):
+        pairs, receipts = self.binding_compare()
+        self.assertEqual(pairs, {7:8})
+        proof, = receipts
+        self.assertEqual(proof['kind'], 'retained-fixture-bindings')
+        self.assertEqual(proof['pairs'], [[7,8]])
+
+    def test_retained_binding_requires_source_and_every_raw_owner(self):
+        for fault in ('binding', 'geometry', 'cold', 'missing-child'):
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                self.binding_compare(fault)
+
+    def test_retained_loop_prefix_uses_unchanged_input_slots(self):
+        pairs, _ = self.binding_compare(repeated=True)
+        self.assertEqual(pairs, {8:9})
+        for fault in ('different-kind', 'reads-diagnostic', 'geometry', 'cold', 'missing-child'):
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                self.binding_compare(fault, repeated=True)
+
     def compare(self, mutation=None, expansions=([],[])):
         old = ['#[cfg(test)]','mod tests {','    #[test]','    fn trial() {',
                '        let path = std::env::join_paths(paths).expect("fixture PATH");',

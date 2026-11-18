@@ -1461,9 +1461,77 @@ def fixture_callback_forest(source, group, owners, names, counts, inventory, wor
         layout.append((role,tuple((r[0]-low[0],r[1],r[2]-low[0],r[3],*r[5:]) for r in regions)))
         states.extend((int(count>0),*(int(r[4]>0) for r in regions)))
         evidence.append(dict(path=role,name=symbol,count=count,regions=len(regions)))
+    bindings = []; mapped_bindings = {}; binding_states = []
+    outer_role = lexical_roles[brace]
+    statements = {row['first']:row for row in rows if row['kind']=='statement'}
+    _construct_charge(work,len(rows))
+    owner_regions = valid[outer_role][3]
+    outer_regions = {id(r) for r in owner_regions}
+    _construct_charge(work,len(outer_regions))
+    ident = re.compile(r'[A-Za-z_]\w*',re.ASCII)
+    def retain_statements(parent, *, ignored=None, iterations=None):
+        binding = parent+1
+        while binding in statements and code.parents[binding]==parent:
+            row = statements[binding]; last = row['end']
+            _construct_charge(work,last-binding+1+len(observed))
+            words = code.words[binding:last]
+            slot = 1+int(words[1:2]==['mut'])
+            local = (len(words)>slot+2 and words[0]=='let' and ident.fullmatch(words[slot])
+                     and words[slot+1]=='=')
+            direct = (ignored is not None and len(words)>4 and words[1]=='::' and words[3]=='('
+                      and ident.fullmatch(words[0]) and ident.fullmatch(words[2]))
+            if (not row['supported'] or code.words[last]!=';' or not (local or direct)
+                    or {'{','?','!',ignored}.intersection(words)):
+                break
+            start, column, end_line, end_column = code.region(binding,last)
+            raw = [r for r in observed if tuple(r[:2])<(end_line,end_column) and (start,column)<tuple(r[2:4])]
+            _construct_charge(work,len(raw)+end_line-start+1)
+            if (not raw or any(id(r) not in outer_regions or tuple(r[:2])<(start,column)
+                               or tuple(r[2:4])>(end_line,end_column) or iterations is not None and r[4]!=iterations
+                               for r in raw)
+                    or source[start-1][:column-1].strip() or source[end_line-1][end_column-1:].strip()):
+                break
+            line_counts = {line:measured[line] for line in range(start,end_line+1) if line in measured}
+            if _owner_line_counts({'regions':raw},_ObserverWork(work))!=line_counts:
+                break
+            bindings.append((row['digest'],tuple(source[start-1:end_line]),
+                tuple((r[0]-low[0],r[1],r[2]-low[0],r[3],*r[5:]) for r in raw)))
+            mapped_bindings.update((line-low[0],int(value>0)) for line,value in line_counts.items())
+            binding_states.extend(int(r[4]>0) for r in raw)
+            binding = last+1
+        return binding
+    next_statement = retain_statements(brace)
+    iteration_shape = None
+    _construct_charge(work,len(rows))
+    loop = next((row for row in rows if row['first']==next_statement and row['kind']=='for'
+                 and code.parents[row['opening']]==brace),None)
+    if loop is not None:
+        parts = loop['header']; _construct_charge(work,len(parts)+len(owner_regions))
+        if (len(parts)>13 and parts[:2]==('for','(') and parts[3]==',' and parts[5:8]==(')','in','[')
+                and parts[-1]==']' and parts[2]!=parts[4] and all(ident.fullmatch(parts[i]) for i in (2,4))):
+            items = parts[8:-1]
+            if items[-1]!=',':
+                items += (',',)
+            entries = [items[i:i+6] for i in range(0,len(items),6)]
+            if all(len(entry)==6 and entry[::2]==('(',',',')') and entry[-1]==','
+                   and all(re.fullmatch(r'"[A-Za-z0-9_ .-]+"',entry[i]) for i in (1,3)) for entry in entries):
+                count = valid[outer_role][2]
+                iterations = count*len(entries)
+                slots = {code.region(next_statement+i,next_statement+i):iterations for i in (2,4)}
+                slots[code.region(next_statement+7,loop['opening']-1)] = count
+                if iterations<COUNTER_LIMIT and all(
+                        [r[4] for r in owner_regions if tuple(r[:4])==at]==[hits] for at,hits in slots.items()):
+                    size = len(bindings)
+                    retain_statements(loop['opening'],ignored=parts[4],iterations=iterations)
+                    if len(bindings)>size:
+                        iteration_shape = parts[2],parts[4],tuple(entry[1] for entry in entries),size
+    entry_signature = (shape.identity,header,previous[0]['digest'],source[low[0]-1],tuple(sorted(valid)),
+                       outer_role,iteration_shape)
+    entry_states = tuple(int(valid[role][2]>0) for role in sorted(valid))
+    prelude = (entry_signature,tuple(bindings)), (*entry_states,*binding_states), mapped_bindings
     signature = (shape.identity,header,previous[0]['digest'],call['digest'],
                  tuple(source[low[0]-1:high[0]]),tuple(layout))
-    return signature,(low[0],high[0]),tuple(states),{n-low[0]:int(v>0) for n,v in measured.items()},evidence
+    return signature,(low[0],high[0]),tuple(states),{n-low[0]:int(v>0) for n,v in measured.items()},evidence,prelude
 
 
 _INHERENT_LEAF = re.compile(r'\s*(?:let [A-Za-z_]\w* = async \{|\.with_context\(\|\| format!\(.+\)\)\?)', re.ASCII)
@@ -2724,22 +2792,28 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     scopes.append(fixture_callback_forest(source,group,inventories[side],inventory_names[side],
                                                           mapped,inventory,work))
                 first,second = scopes
-                if first is not None and second is not None and first[0]==second[0]:
-                    _construct_charge(work,len(first[2])+len(first[3]))
-                    if (len(first[2])==len(second[2]) and all(x<=y for x,y in zip(first[2],second[2]))
-                            and first[3].keys()==second[3].keys() and all(first[3][n]<=second[3][n] for n in first[3])):
-                        fixture_forests[prefix] = first,second
+                if first is not None and second is not None:
+                    variants = (('intact-fixture-callback-forest', [scope[:1]+scope[2:4] for scope in scopes]),
+                                ('retained-fixture-bindings', [scope[5] for scope in scopes]))
+                    for mode, (previous, current) in variants:
+                        _construct_charge(work,len(previous[1])+len(previous[2]))
+                        if (previous[0]==current[0] and previous[2] and len(previous[1])==len(current[1])
+                                and all(x<=y for x,y in zip(previous[1],current[1]))
+                                and previous[2].keys()==current[2].keys()
+                                and all(previous[2][n]<=current[2][n] for n in previous[2])):
+                            fixture_forests[prefix] = first,second,mode,previous,current
+                            break
                 fixture_forests.setdefault(prefix,None)
             if fixture_forests[prefix] is not None:
-                first,second = fixture_forests[prefix]
+                first,second,mode,previous,current = fixture_forests[prefix]
                 left,right = first[1],second[1]
                 if (left[0]<=a+1<=b<=left[1] and right[0]<=c+1<=d<=right[1]
-                        and c-a==right[0]-left[0] and all(line-left[0] in first[3] for line in pending)):
+                        and c-a==right[0]-left[0] and all(line-left[0] in previous[2] for line in pending)):
                     if prefix not in fixture_receipts:
-                        receipt = dict(file=name,kind='intact-fixture-callback-forest',pairs=[],
+                        receipt = dict(file=name,kind=mode,pairs=[],
                             base_range=list(left),head_range=list(right),
                             callback_fragments=[],owners=dict(base=first[4],head=second[4]),
-                            instance_states=[first[2]],head_instance_states=[second[2]])
+                            instance_states=[previous[1]],head_instance_states=[current[1]])
                         fixture_receipts[prefix] = receipt
                         receipts.append(receipt)
                         for side,(source,group) in enumerate(((old,bg),(new,hg))):
@@ -3089,6 +3163,7 @@ class RustNominalMethodPath:
     kind: str
     crate_graph: tuple[tuple[str, str], ...]
     instantiating_crate: tuple[str, str]
+    type_argument: tuple | None = None
 
     @property
     def parent_scope(self):
@@ -3096,15 +3171,16 @@ class RustNominalMethodPath:
 
     @property
     def copy_identity(self):
-        return self.parent_scope, self.method, self.crate_graph, self.instantiating_crate
+        return self.parent_scope, self.method, self.crate_graph, self.instantiating_crate, self.type_argument
 
 
 _NOMINAL_METHOD_PREFIX = re.compile(r'_R((?:NC){0,8})Nv([MXY])')
+_PATH_REFERENCE_METHOD_PREFIX = re.compile(r'_RI()Nv(M)')
 _NOMINAL_METHOD_PREFIX_WORK = len('_R' + 'NC' * 8 + 'NvX') + 1
 
 
 @lru_cache(maxsize=4096)
-def nominal_method_path(symbol, *, inventory=False):
+def nominal_method_path(symbol, *, inventory=False, path_reference=False):
     """Decode bounded nominal v0 inherent, trait-impl and default-trait methods.
 
     Replacement identity omits crate disambiguators; callback ownership retains
@@ -3113,7 +3189,7 @@ def nominal_method_path(symbol, *, inventory=False):
     """
     if type(symbol) is not str or len(symbol) > 4096:
         return None
-    prefix = _NOMINAL_METHOD_PREFIX.match(symbol)
+    prefix = (_PATH_REFERENCE_METHOD_PREFIX if path_reference else _NOMINAL_METHOD_PREFIX).match(symbol)
     if prefix is None:
         return None
     depth = len(prefix[1]) // 2
@@ -3140,7 +3216,7 @@ def nominal_method_path(symbol, *, inventory=False):
         if len(value) != size or re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value) is None:
             raise ValueError('unsupported identifier')
         return value, scope
-    def path(depth=0):
+    def path(depth=0, *, external=False):
         nonlocal at, work, crate
         work -= 1
         if depth > 16 or work < 0 or at >= len(symbol):
@@ -3150,7 +3226,7 @@ def nominal_method_path(symbol, *, inventory=False):
             value, scope = identifier()
             if crate is None:
                 crate = value, scope
-            elif kind != 'Y' and crate != (value, scope):
+            elif kind != 'Y' and not external and crate != (value, scope):
                 raise ValueError('external crate identity is unsupported')
             if value in crates and crates[value] != scope:
                 raise ValueError('ambiguous nominal crate copy')
@@ -3158,7 +3234,7 @@ def nominal_method_path(symbol, *, inventory=False):
             result = ('crate', value)
         elif tag == 'N' and symbol[at:at + 1] == 't':
             at += 1
-            parent = path(depth + 1)
+            parent = path(depth + 1, external=external)
             result = ('type', parent, identifier())
         elif tag == 'B':
             encoded = re.match(r'([0-9A-Za-z]{0,4})_', symbol[at:])
@@ -3191,20 +3267,39 @@ def nominal_method_path(symbol, *, inventory=False):
             if symbol[at:at + 1] != '0':
                 return None
             at += 1
+        argument = None
+        if path_reference:
+            tag = symbol[at:at + 1]
+            at += 1
+            if tag == 'R':
+                reference = path(external=True)
+                if reference not in (('type', ('type', ('crate', 'std'), ('path', '')), (item, ''))
+                                     for item in ('Path', 'PathBuf')):
+                    return None
+                argument = ('reference', reference[-1][0], crates['std'])
+            elif tag == 'p':
+                argument = ('placeholder',)
+            else:
+                return None
+            if symbol[at:at + 1] != 'E':
+                return None
+            at += 1
         instance = None
-        if (depth and symbol[at:at + 1] == 'B'
+        if (path_reference or depth and symbol[at:at + 1] == 'B'
                 or kind == 'Y' and symbol[at:at + 1] in ('B', 'C')):
-            root = path()
+            root = path(external=path_reference)
             if root[0] != 'crate':
                 return None
             instance = root[1], crates[root[1]]
+        if path_reference and (argument == ('placeholder',) and instance != crate or instance[0] == 'std'):
+            return None
         if kind == 'Y' and len(crates) > 1 and instance is None and not inventory:
             return None
         if not inventory and at != len(symbol):
             return None
         return RustNominalMethodPath(impl_scope, namespace, self_type, trait,
             (method, item_scope), tuple(callbacks), kind,
-            tuple(sorted(crates.items())), instance or crate)
+            tuple(sorted(crates.items())), instance or crate, argument)
     except ValueError:
         return None
 
@@ -3838,9 +3933,89 @@ def one_bound_phase_obligations(name, sources, counts, descriptors, inventories,
     return pairs,receipts,proved
 
 
+_TEST_TAIL_RECORD_HEADER = ('#', '[', 'cfg', '(', 'test', ')', ']', 'fn')
+
+
+def tail_record_parameters(signature, work):
+    """Recognize nullary public or explicitly test-only typed constructors."""
+    if signature == ('pub', 'fn', '<declaration>', '(', ')', '->', 'Self'):
+        return ()
+    if (signature[:8] != _TEST_TAIL_RECORD_HEADER or signature[9:10] != ('(',)
+            or signature[-3:] != (')', '->', 'Self')):
+        return None
+    tokens = signature[10:-3]
+    _construct_charge(work, sum(len(token)+1 for token in tokens)+1)
+    if not tokens or len(tokens) % 4 != 3:
+        return None
+    parameters = []
+    for offset in range(0, len(tokens), 4):
+        name, colon, type_name = tokens[offset:offset+3]
+        if (colon != ':' or tokens[offset+3:offset+4] not in ((), (',',))
+                or any(re.fullmatch(r'[A-Za-z_]\w*', word, re.ASCII) is None for word in (name, type_name))):
+            return None
+        parameters.append((name,type_name))
+    return tuple(parameters)
+
+
+def tail_record_value_spans(code, function, record, source, parameters, work):
+    """Bind a single tail record with one direct initializer per source line."""
+    if (record['header'] != ('Self',)
+            or record['first'] != function['opening'] + 1 or record['end'] + 1 != function['end']):
+        return None
+    first = code.position(code.starts[record['opening']])[0]
+    last = code.position(code.starts[record['end']])[0]
+    _construct_charge(work,len(source[first-1])+len(source[last-1])+2)
+    if source[first-1].strip() != 'Self {' or source[last-1].strip() != '}':
+        return None
+    identifier = r'[A-Za-z_][A-Za-z0-9_]*'
+    path = r'(?:'+identifier+r'::)*'+identifier
+    pattern = re.compile(r'[ \t]*('+identifier+r'): (?P<value>'+path+r'\(\)|'
+        +path+r'\.'+identifier+r'\("[A-Za-z0-9_./-]+"\)),[ \t]*', re.ASCII)
+    shorthand = re.compile(r'[ \t]*('+identifier+r'),[ \t]*', re.ASCII)
+    values = set(); fields = set(); roots = {type_name for _,type_name in parameters}
+    bound = []; first_slot = None
+    for number in range(first+1,last):
+        line = source[number-1]; _construct_charge(work, len(line)+1)
+        slot = shorthand.fullmatch(line) if parameters else None
+        if slot is not None:
+            field = slot[1]
+            if field in fields:
+                return None
+            span = (number,slot.start(1)+1,number,slot.end(1)+1)
+            if not bound:
+                first_slot = span
+            bound.append(field);fields.add(field)
+            values.add(span)
+            continue
+        parsed = pattern.fullmatch(line)
+        if parsed is None or parsed[1] in fields:
+            return None
+        fields.add(parsed[1])
+        start = parsed.start('value')+1
+        # LLVM paints the callee path for a direct nullary call.
+        values.add((number,start,number,start+len(parsed['value'].removesuffix('()'))))
+        roots.add(re.match(identifier,parsed['value'])[0])
+    return (values,roots,first_slot) if values and bound == [name for name,_ in parameters] else None
+
+
+def tail_record_import_context(before, after, referenced, work):
+    """Ensure changed ordinary imports cannot replace a directly referenced binding."""
+    if before == after:
+        return True
+    _construct_charge(work,2*sum(len(clause)+1 for clauses in (before,after) for clause in clauses))
+    old, new = Counter(before), Counter(after)
+    for clause in (old-new).keys() | (new-old).keys():
+        if (clause[:1] != ('use',) or clause[-1:] != (';',)
+                or any(word in ('as','self') or word in referenced or (
+                    word not in ('::','{','}',',') and re.fullmatch(r'[A-Za-z_]\w*',word,re.ASCII) is None)
+                    for word in clause[1:-1])):
+            return False
+    return True
+
+
 def retained_record_field_obligations(name, sources, counts, descriptors, inventories, grouped,
                                       replacements, work, indexes_factory, expansions):
-    """Retain a closed forest across one observed first scalar record field.
+    """Retain a closed forest across one observed first record field.
 
     This proves execution of old source only. The extra field's raw counter is
     retained separately and must match the same record-construction channel.
@@ -3850,12 +4025,19 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
     pairs = {}; target_owners = {}; receipts = []; proved = set(); indexes = None
     identifier = r'[A-Za-z_][A-Za-z0-9_]*'
     addition_pattern = re.compile(r'[ \t]*(?P<field>'+identifier+r')[ \t]*:[ \t]*'
-        r'(?P<value>(?:'+identifier+r'::)+'+identifier+r')[ \t]*,[ \t]*', re.ASCII)
+        r'(?P<value>(?:'+identifier+r'::)+'+identifier+r'(?P<call>\(\))?)[ \t]*,[ \t]*', re.ASCII)
+    module_path = name.removeprefix('src/').removesuffix('.rs').split('/')
     for prefix, left in descriptors[0].items():
         _construct_charge(work, 1)
         right = descriptors[1].get(prefix)
-        if (right is None or any(left[key] != right[key] for key in ('signature','attributes','context'))
-                or not all(row['row']['supported'] for row in (left,right))):
+        if right is None or any(left[key] != right[key] for key in ('signature','attributes')):
+            continue
+        supported = all(row['row']['supported'] for row in (left,right))
+        if not supported and left['signature'][:8] != _TEST_TAIL_RECORD_HEADER:
+            continue
+        contexts_match = left['context'] == right['context']
+        parameters = tail_record_parameters(left['signature'],work) if not contexts_match else None
+        if not contexts_match and parameters is None:
             continue
         groups = left['group'], right['group']; spans = [group[:2] for group in groups]
         if spans[1][1]-spans[1][0] != spans[0][1]-spans[0][0]+1:
@@ -3882,6 +4064,21 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                 and spans[1][0] <= r['head_range'][0] <= r['head_line'] <= r['head_range'][1] <= spans[1][1]) for r in related)):
             continue
         field = match['field']; records = []; phases = []; references = []; valid = True
+        call = match['call'] is not None
+        value_end = (match.start('call') if call else match.end('value'))+1
+        addition = (added,match.start('value')+1,added,value_end)
+        if not call and (not supported or not contexts_match):
+            continue
+        tail_values = []; shorthand_entries = []; initializer_roots = set(); implementation = None
+        if call:
+            if contexts_match:
+                parameters = tail_record_parameters(left['signature'],work)
+            scopes = left['context'][0]
+            _construct_charge(work,len(name)+len(scopes)+1)
+            if (parameters is None or scopes!=right['context'][0] or len(scopes)!=1 or len(scopes[0])!=2
+                    or scopes[0][0]!='impl' or any(re.fullmatch(identifier, part) is None for part in module_path)):
+                continue
+            implementation = scopes[0][1]
         for side,(inventory,descriptor) in enumerate(zip(inventories,(left,right))):
             code,rows = inventory[:2]; function = descriptor['row']
             _construct_charge(work, 3*len(rows)+len(code.words).bit_length()+1)
@@ -3911,14 +4108,30 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
             _construct_charge(work,record['end']-holding+1)
             if side and (code.position(code.starts[holding])[0]!=added-1 or token!=holding+1):
                 valid=False;break
-            if side:
+            if side and not call:
                 line_end=code.offsets[added] if added < len(code.offsets) else len(code.text)
                 stop=bisect.bisect_left(code.starts,line_end)
                 if any(code.parents[i]!=holding for i in range(token,stop)):
                     valid=False;break
-            else:
-                if field in code.words[holding+1:record['end']]:
+            if not side and field in code.words[holding+1:record['end']]:
+                valid=False;break
+            if call:
+                if parameters:
+                    guard_line=code.position(code.starts[function['first']])[0]
+                    guard_text=sources[side][guard_line-1]
+                    _construct_charge(work,len(guard_text)+1)
+                    if guard_line!=spans[side][0]-1 or guard_text.strip()!='#[cfg(test)]':
+                        valid=False;break
+                values=tail_record_value_spans(code,function,record,sources[side],parameters,work)
+                if values is None:
                     valid=False;break
+                geometry, roots, first_slot = values
+                _construct_charge(work,len(roots))
+                tail_values.append(geometry);initializer_roots.update(roots)
+                shorthand_entries.append(first_slot)
+                records.append(record);phases.append([])
+                continue
+            if not side:
                 first=holding+1;end=first
                 while end < record['end'] and code.words[end]!=',':
                     _construct_charge(work,1);end+=1
@@ -3953,10 +4166,14 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
             records.append(record);phases.append(selected)
         if not valid or tuple(records[0]['header'])!=tuple(records[1]['header']):
             continue
+        if call and not tail_record_import_context(left['context'][1],right['context'][1],
+                (initializer_roots-{'super','crate','self'})|{implementation},work):
+            continue
         def forward(line):
             return line+spans[1][0]-spans[0][0]+int(line>=spans[0][0]+position)
-        reference=references[0]
-        references.append((forward(reference[0]),reference[1],forward(reference[2]),reference[3]))
+        if not call:
+            reference=references[0]
+            references.append((forward(reference[0]),reference[1],forward(reference[2]),reference[3]))
         if indexes is None:
             indexes=indexes_factory()
         roles=[];forest_receipts=[]
@@ -3986,7 +4203,20 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
             if not valid:break
             for root in roots:
                 plain=plain_rust_function_symbol(root['name']);nom=shapes.get(id(root))
-                if plain is not None and plain.identifiers[-1]==descriptor['declaration']:
+                if call and nom is not None:
+                    namespace=('crate',nom.instantiating_crate[0])
+                    for module in module_path:
+                        namespace=('type',namespace,(module,''))
+                    _construct_charge(work,len(module_path)+1)
+                    if (nom.kind!='M' or nom.impl_scope or nom.namespace!=namespace or nom.callbacks
+                            or nom.method!=(descriptor['declaration'],'')
+                            or nom.self_type!=('type',namespace,(implementation,''))):
+                        valid=False;break
+                    members=nominal[nom.copy_identity];role=nom.parent_scope,nom.method;identity=nom.copy_identity
+                    if set(members)!={0}:
+                        valid=False;break
+                    ordinals=()
+                elif not call and plain is not None and plain.identifiers[-1]==descriptor['declaration']:
                     if tuple(kind for row,kind in phases[side])!=('block','block'):
                         valid=False;break
                     members={0:root};role=('free',plain.identity);identity=root['name']
@@ -3998,7 +4228,7 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                         members[depth]=candidates[0]
                     if not valid:break
                     ordinals=tuple(members[d]['name'][len('_R'+'NC'*d+root['name'][2:]):] for d in (1,2))
-                elif nom is not None and nom.kind=='Y' and not nom.callbacks and nom.method[0]==descriptor['declaration']:
+                elif not call and nom is not None and nom.kind=='Y' and not nom.callbacks and nom.method[0]==descriptor['declaration']:
                     trait_headers=[head for head in descriptor['context'][0] if 'trait' in head]
                     if (len(trait_headers)!=1 or nom.trait is None or nom.trait[-1][0]!=trait_headers[0][trait_headers[0].index('trait')+1]
                             or tuple(kind for row,kind in phases[side])!=('async','record')):
@@ -4013,14 +4243,15 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                     valid=False;break
                 if not valid:break
                 geometry=[];states=[];extra=None
-                for depth in (0,1,2):
+                for depth in range(len(members)):
                     owner=members[depth]
                     if id(owner) in owned:
                         valid=False;break
                     owned.add(id(owner));raw=owner['regions'];count=owner['count']
                     _construct_charge(work,10*len(raw)+(len(raw).bit_length()+1)*len(raw))
                     if depth==0:
-                        opening=code.position(code.starts[function['first']]);closing=code.position(code.ends[function['end']])
+                        declaration=function['first']+(len(_TEST_TAIL_RECORD_HEADER)-1 if call and parameters else 0)
+                        opening=code.position(code.starts[declaration]);closing=code.position(code.ends[function['end']])
                         ends=(code.position(code.ends[function['opening']-1]),code.position(code.starts[function['opening']]))
                         entries=[r for r in raw if tuple(r[:2])==opening and tuple(r[2:4]) in ends]
                     else:
@@ -4034,12 +4265,23 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                     if (min(tuple(r[:2]) for r in raw)!=opening or max(tuple(r[2:4]) for r in raw)!=closing
                             or len(entries)!=1 or entries[0][4]!=count):
                         valid=False;break
+                    if call:
+                        record=records[side]
+                        whole=(*code.position(code.starts[record['first']]),*code.position(code.ends[record['end']]))
+                        ending=(*code.position(code.starts[function['end']]),*closing)
+                        spans_seen={tuple(r[:4]) for r in raw}
+                        required={tuple(entries[0][:4]),whole,ending}
+                        if shorthand_entries[side] is not None:
+                            required.add(shorthand_entries[side])
+                        if (len(spans_seen)!=len(raw) or not required<=spans_seen
+                                or spans_seen-required-tail_values[side] or any(r[4]!=count for r in raw)):
+                            valid=False;break
                     projected=[]
                     for r in raw:
                         row=list(r)
                         if side:
                             if row[0]==row[2]==added:
-                                if depth!=2 or tuple(row[:4])!=(added,match.start('value')+1,added,match.end('value')+1) or extra is not None:
+                                if depth!=(0 if call else 2) or tuple(row[:4])!=addition or extra is not None:
                                     valid=False;break
                                 extra=row;continue
                             if row[0]==added or row[2]==added:
@@ -4051,22 +4293,25 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                     geometry.append(tuple(tuple(r[:4]+r[5:]) for r in projected))
                     states.extend((int(count>0),*[int(r[4]>0) for r in projected]))
                 if not valid:break
-                reference_rows=[r for r in members[2]['regions'] if tuple(r[:4])==references[side]]
-                if len(reference_rows)!=1:
-                    valid=False;break
-                construction=reference_rows[0][4]
-                if phases[side][1][1]=='block':
+                if call:
+                    construction=root['count']
+                else:
+                    reference_rows=[r for r in members[2]['regions'] if tuple(r[:4])==references[side]]
+                    if len(reference_rows)!=1:
+                        valid=False;break
+                    construction=reference_rows[0][4]
+                if not call and phases[side][1][1]=='block':
                     record=records[side];start=code.position(code.starts[record['opening']]);end=code.position(code.ends[record['end']])
                     envelopes=[r for r in members[2]['regions'] if r[0]==start[0] and r[2]==end[0]
                                and tuple(r[:2])<=start and tuple(r[2:4])>=end]
                     if len(envelopes)!=1 or envelopes[0][4]!=construction:
                         valid=False;break
-                elif construction!=members[2]['count']:
+                elif not call and construction!=members[2]['count']:
                     valid=False;break
                 if side and (extra is None or extra[4]!=construction):
                     valid=False;break
                 copies.append(dict(role=role,identity=identity,geometry=tuple(geometry),states=tuple(states),
-                    ordinals=ordinals,names=[members[d]['name'] for d in (0,1,2)],construction=construction,extra=extra))
+                    ordinals=ordinals,names=[members[d]['name'] for d in range(len(members))],construction=construction,extra=extra))
             if not valid or owned!={id(o) for o in forest}:
                 valid=False;break
             observer=_ObserverWork(work)
@@ -4106,10 +4351,14 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                 or any(line in pairs and pairs[line]!=target or target in target_owners and target_owners[target]!=line for line,target in mapped.items())):
             raise ValueError('Ambiguous retained record field correspondence')
         pairs.update(mapped);target_owners.update((target,line) for line,target in mapped.items());proved.add(spans[0])
-        receipts.append(dict(kind='retained-record-field-forest',file=name,base_range=list(spans[0]),head_range=list(spans[1]),
-            pairs=[list(row) for row in sorted(mapped.items())],field=field,added_line=added,scalar_value=match['value'],
+        receipt = dict(kind='retained-record-field-forest',file=name,base_range=list(spans[0]),head_range=list(spans[1]),
+            pairs=[list(row) for row in sorted(mapped.items())],field=field,added_line=added,
+            **{'initializer' if call else 'scalar_value':match['value']},
             forests=forest_receipts,role_matching=matches,source_sha256=[hashlib.sha256(('\n'.join(body)+'\n').encode()).hexdigest() for body in bodies],
-            claim='Complete retained-source forest only; added scalar counter kept separately; zero deletion credit'))
+            claim='Complete retained-source forest only; added field counter kept separately; zero deletion credit')
+        if call and parameters:
+            receipt.update(typed_parameter_slots=parameters,first_shorthand_spans=shorthand_entries)
+        receipts.append(receipt)
     return pairs,receipts,proved
 
 
@@ -6833,9 +7082,10 @@ def retained_boolean_argument_paint(name, old, new, before, after, base, head, b
     return results
 
 
-def retained_default_trait_additions(name, sides, indexes, work):
-    """Match every original default-trait specialization and observe extra types in full."""
-    layouts = []; roles = []; spans = []; traits = []; summaries = []; source_bytes = []; compiled_traits = set()
+def retained_specialization_additions(name, sides, indexes, work, *, path_reference=False):
+    """Match every original specialization and observe additional consumers in full."""
+    layouts = []; roles = []; spans = []; containers = []; summaries = []; source_bytes = []; compiled_methods = set()
+    source_tokens = []
     for (source, counts, candidates), index in zip(sides, indexes, strict=True):
         _construct_charge(work, sum(3*len(owner['regions'])+1 for owner in candidates))
         bounds = {source_owner_span(owner, name, index.files, source) for owner in candidates}
@@ -6852,18 +7102,36 @@ def retained_default_trait_additions(name, sides, indexes, work):
         code, rows = inventory[:2]
         _construct_charge(work, 2*len(rows))
         methods = [row for row in rows if row['kind'] == 'fn' and row['supported']
-                   and row['header'][:1] == ('fn',) and row['header'][2:6] == ('(', '&', 'self', ')')
                    and code.position(code.starts[row['first']])[0] == first
                    and code.position(code.ends[row['end']])[0] == last]
         if len(methods) != 1:
             return None
         method = methods[0]; holding = code.parents[method['opening']]
-        containers = [row for row in rows if row['opening'] == holding and row['kind'] == 'trait'
-                      and row['header'][:2] == ('pub', 'trait') and code.parents[holding] is None]
-        if len(containers) != 1:
+        if holding is None or code.parents[holding] is not None:
             return None
-        trait = containers[0]['header']; owner_roles = {}; projections = Counter(); geometries = set()
-        traits.append(trait)
+        enclosing = [row for row in rows if row['opening'] == holding]
+        if len(enclosing) != 1:
+            return None
+        container = enclosing[0]['header']; header = method['header']
+        if path_reference:
+            if (enclosing[0]['kind'] != 'impl' or len(container) != 2 or container[0] != 'impl'
+                    or header[:2] != ('pub', 'fn') or len(header) != 19
+                    or header[3:6] != ('(', header[4], ':')
+                    or header[6:10] != ('&', 'str', ',', header[9])
+                    or header[10:] != (':', 'impl', 'AsRef', '<', 'Path', '>', ')', '->', 'Self')
+                    or _boolean_attributes(code, enclosing[0]['first']) != []
+                    or _boolean_attributes(code, method['first']) != []):
+                return None
+            method_name = header[2]
+            source_tokens.append(code.words)
+            _construct_charge(work, len(code.words))
+        else:
+            if (enclosing[0]['kind'] != 'trait' or len(container) < 3 or container[:2] != ('pub', 'trait')
+                    or header[:1] != ('fn',) or header[2:6] != ('(', '&', 'self', ')')):
+                return None
+            method_name = header[1]
+        owner_roles = {}; projections = Counter(); geometries = set()
+        containers.append(container)
         entire_file = index.inventories.get(name, ())
         _construct_charge(work, sum(len(owner['regions'])+1 for owner in entire_file))
         touching = {id(owner) for owner in entire_file if any(
@@ -6874,16 +7142,29 @@ def retained_default_trait_additions(name, sides, indexes, work):
         for owner in candidates:
             symbol = owner['name']; regions = owner['regions']; count = owner.get('count')
             _construct_charge(work, len(symbol)+3*len(regions)+1)
-            shape = nominal_method_path(symbol)
-            if (shape is None or shape.kind != 'Y' or shape.callbacks or shape.trait[0] != 'type'
-                    or shape.trait[-1][0] != trait[2] or shape.method[0] != method['header'][1]
+            shape = nominal_method_path(symbol, path_reference=path_reference)
+            if (shape is None or shape.callbacks or shape.method[0] != method_name
                     or index.name_counts[symbol] != 1 or type(count) is not int or not 0 <= count < COUNTER_LIMIT
                     or owner.get('branches') or owner.get('mcdc_records')):
                 return None
             geometry, states = fragment_region_states(owner, first, last, source, work)
+            if path_reference:
+                namespace = shape.namespace
+                for part in reversed(name.removeprefix('src/').removesuffix('.rs').split('/')):
+                    if namespace[0] != 'type' or namespace[-1] != (part, ''):
+                        return None
+                    namespace = namespace[1]
+                if (namespace[0] != 'crate'
+                        or shape.self_type != ('type', shape.namespace, (container[1], ''))
+                        or shape.type_argument == ('placeholder',) and (count or any(states))):
+                    return None
+                compiled_methods.add((shape.parent_scope, shape.method))
+            else:
+                if shape.kind != 'Y' or shape.trait[0] != 'type' or shape.trait[-1][0] != container[2]:
+                    return None
+                compiled_methods.add((shape.trait, shape.method))
             geometries.add(geometry)
-            compiled_traits.add((shape.trait, shape.method))
-            signature = (shape.parent_scope, shape.method, shape.instantiating_crate[0])
+            signature = (shape.parent_scope, shape.method, shape.instantiating_crate[0], shape.type_argument)
             owner_roles.setdefault(signature, []).append((shape.copy_identity, (int(count > 0), *states)))
             projections.update(_owner_line_counts(owner, observer))
         summary = {line: counts[line] for line in range(first,last+1) if line in counts}
@@ -6892,12 +7173,15 @@ def retained_default_trait_additions(name, sides, indexes, work):
         if any(len({identity for identity, _ in entries}) != len(entries) for entries in owner_roles.values()):
             return None
         summaries.append(summary); layouts.append(next(iter(geometries))); roles.append(owner_roles)
-    if (source_bytes[0] != source_bytes[1] or traits[0] != traits[1]
-            or layouts[0] != layouts[1] or len(compiled_traits) != 1):
+    if (source_bytes[0] != source_bytes[1] or containers[0] != containers[1]
+            or layouts[0] != layouts[1] or len(compiled_methods) != 1
+            or path_reference and source_tokens[0] != source_tokens[1]):
         return None
     base, head = roles
     added = head.keys() - base.keys()
     if not added or base.keys() - head.keys() or any(not all(states) for role in added for _, states in head[role]):
+        return None
+    if path_reference and {role[-1] for role in added} - {role[-1] for role in base}:
         return None
     for role, previous in base.items():
         current = head[role]
@@ -6960,7 +7244,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
-    head_fn_names = set(); retirement_receipts = []; additive_trait_receipts = []; retired_declaration_receipts = []
+    head_fn_names = set(); retirement_receipts = []; retired_declaration_receipts = []
+    specialization_receipts = {}
     retired_assertion_receipts = []
     parent_file_cache = {}; method_parent_files = None; plain_parent_files = None; owner_indexes = None
     def source_owner_indexes():
@@ -7107,16 +7392,20 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             if frozenset(map(id, previous)) not in closed[0]:
                 continue
             if len(previous) != len(current):
-                if (len(current) > len(previous) and frozenset(map(id, current)) in closed[1]
-                        and all(owner['name'].startswith('_RNvY') for owner in (*previous, *current))):
-                    proof = retained_default_trait_additions(name, ((old, before, previous), (new, after, current)),
-                                                              source_owner_indexes(), construct_work)
+                if len(current) > len(previous) and frozenset(map(id, current)) in closed[1]:
+                    candidates = (*previous, *current)
+                    path_reference = all(owner['name'].startswith('_RINvM') for owner in candidates)
+                    default_trait = all(owner['name'].startswith('_RNvY') for owner in candidates)
+                    proof = retained_specialization_additions(name, ((old, before, previous), (new, after, current)),
+                        source_owner_indexes(), construct_work, path_reference=path_reference) if (
+                            path_reference or default_trait) else None
                     if proof is not None:
                         for line, target in proof['pairs']:
                             if line in anchored and anchored[line] != target:
-                                raise ValueError('Ambiguous retained default trait owner')
+                                raise ValueError('Ambiguous retained specialization owner')
                             anchored[line] = target
-                        additive_trait_receipts.append(proof)
+                        key = 'additive_path_reference_copies' if path_reference else 'additive_trait_copies'
+                        specialization_receipts.setdefault(key, []).append(proof)
                         continue
                 raise ValueError(f'Ambiguous unchanged source correspondence: {name}; '
                                  'Retained covered line requires a complete compiled-copy inventory')
@@ -7587,8 +7876,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         paint_receipt['retired_declarations'] = retired_declaration_receipts
     if retired_assertion_receipts:
         paint_receipt['retired_assertion_delimiters'] = retired_assertion_receipts
-    if additive_trait_receipts:
-        paint_receipt['additive_trait_copies'] = additive_trait_receipts
+    paint_receipt.update(specialization_receipts)
     if construct_receipts:
         paint_receipt['retained_constructs'] = construct_receipts
     if obligation_receipts:

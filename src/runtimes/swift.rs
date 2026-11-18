@@ -1142,6 +1142,14 @@ mod tests {
             fixture.versions.clone(),
             fixture.owner.path().join("keys.asc"),
         );
+        let error = manager
+            .use_version("6.2.0")
+            .expect_err("refuse selection without the internal Swift launcher");
+        assert!(
+            format!("{error:#}").contains("Failed to inspect runtime binary"),
+            "{error:#}"
+        );
+        fixture.assert_previous();
         let url = "https://download.swift.org/swift-6.2.0-release/ubuntu2404/swift-6.2.0-RELEASE/swift-6.2.0-RELEASE-ubuntu24.04.tar.gz";
         for case in [
             "missing-archive",
