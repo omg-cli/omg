@@ -2298,42 +2298,50 @@ mod tests {
                         .to_string()
                         .contains("Security policy exceeds elevation handoff limit")
                 );
-                assert_current_policy_rejects_changed_handoff(&file, decoded);
                 Ok(())
             },
         )
     }
 
-    fn assert_current_policy_rejects_changed_handoff(
-        file: &std::path::Path,
-        inherited: SecurityPolicy,
-    ) {
-        let original = toml::to_string(&inherited).expect("serialize inherited policy");
-        fs::write(file, &original).expect("write the trusted policy");
-        validate_inherited_policy(&inherited).expect("accept the matching policy");
-        INHERITED_POLICY
-            .set(inherited.clone())
-            .expect("isolated handoff fixture");
-        assert_eq!(
-            SecurityPolicy::load_current().expect("unchanged trusted policy"),
-            inherited
-        );
+    #[test]
+    fn current_policy_refuses_changes_after_handoff() -> anyhow::Result<()> {
+        const TEST: &str =
+            "core::security::policy::tests::current_policy_refuses_changes_after_handoff";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
 
-        let updated = SecurityPolicy {
-            allow_aur: true,
-            ..inherited
-        };
-        let changed = toml::to_string(&updated).expect("serialize changed policy");
-        fs::write(file, &changed).expect("replace the trusted policy");
-        let error = SecurityPolicy::load_current().expect_err("changed policy must refuse");
-        assert_eq!(
-            error.to_string(),
-            "Security policy changed after elevation; retry the operation"
-        );
-        assert_eq!(
-            fs::read_to_string(file).expect("read changed policy"),
-            changed
-        );
+        assert!(!crate::core::privilege::is_root());
+        let directory = tempfile::tempdir()?;
+        temp_env::with_var("OMG_CONFIG_DIR", Some(directory.path()), || {
+            let inherited = SecurityPolicy {
+                allow_aur: false,
+                ..SecurityPolicy::default()
+            };
+            let file = directory.path().join("policy.toml");
+            fs::write(&file, toml::to_string(&inherited)?)?;
+            validate_inherited_policy(&inherited)?;
+            INHERITED_POLICY
+                .set(inherited.clone())
+                .expect("isolated handoff fixture");
+            assert_eq!(SecurityPolicy::load_current()?, inherited);
+
+            let updated = SecurityPolicy {
+                allow_aur: true,
+                ..inherited
+            };
+            let changed = toml::to_string(&updated)?;
+            fs::write(&file, &changed)?;
+            let error = SecurityPolicy::load_current().expect_err("changed policy must refuse");
+            assert_eq!(
+                error.to_string(),
+                "Security policy changed after elevation; retry the operation"
+            );
+            assert_eq!(fs::read_to_string(&file)?, changed);
+            Ok(())
+        })
     }
 
     #[test]

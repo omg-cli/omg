@@ -1948,6 +1948,59 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertIn([9, 9], proof['pairs'])
         self.assertTrue(all(row['owners'][0] and row['owners'][1] for row in statements))
 
+    def paused_daemon_source_compare(self, fault=None):
+        name='src/daemon/server.rs'
+        sources=[];documents=[];counts=[]
+        for side,method in enumerate(('scan_package','assess_packages')):
+            lines=['#[cfg(test)]','mod tests {',
+                   '    impl crate::core::security::vulnerability::VulnerabilitySource for PausedAdvisorySource {',
+                   f"        fn {method}<'a>(","            &'a self,",
+                   "            packages: &'a [Package]," if side else "            _name: &'a str,",
+                   '        ) -> Pin<Box<dyn Future<Output = '+('PackageAssessment' if side else 'VulnerabilityReport')+'>>> {',
+                   '            Box::pin(async move {',
+                   '                self.started.notify_one();',
+                   '                self.resume.notified().await;',
+                   '                Ok(packages.iter().map(|package| package.clone()).collect())' if side else '                Ok(vec![])',
+                   '            })','        }','    }','}']
+            if side and fault=='receiver':
+                lines[9]=lines[9].replace('self.resume','self.other')
+            if fault=='production-scope':
+                lines[0]='#[cfg(feature = "daemon")]'
+            def slot(line,text,count=2):
+                start=lines[line-1].index(text)+1
+                return [line,start,line,start+len(text),count,0,0,0]
+            qualified=f'NtNtNtCs{side+1}_7omg_lib6daemon6server5tests'
+            def owner(kind,binding,trait,suffix,count,regions):
+                return dict(name=f'_R{kind}NvX{qualified}Nt{binding}_20PausedAdvisorySourceNtNtNtNt{trait}_4core8security13vulnerability19VulnerabilitySource{len(method)}{method}{suffix}',
+                            count=count,filenames=['/src/'+name],regions=regions)
+            members=[owner('','B2','B8','',2,[[4,9,7,len(lines[6]),2,0,0,0],slot(8,'Box::pin'),slot(13,'}')]),
+                     owner('NC','B4','Ba','0Ba_',2,[slot(8,'{'),slot(9,'self.started'),slot(9,'notify_one'),
+                           slot(10,'self.resume'),slot(10,lines[9].strip().removesuffix(';')),
+                           slot(11,'Ok',1),slot(12,'}',1)])]
+            if side and fault!='missing-mapper':
+                hit=int(fault!='cold-mapper')
+                members.append(owner('NCNC','B6','Bc','00Bc_',hit,[slot(11,'package.clone()',hit)]))
+            sources.append({name:('\n'.join(lines)+'\n').encode(),
+                'other.rs':b'fn notification_fixture() {\n    self.started.notify_one();\n    self.resume.notified().await;\n}\n'})
+            documents.append(members)
+            work=coverage._ObserverWork()
+            counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [row for item in members for row in item['regions']],work),work)))
+        def owners(base,head):
+            for document,members in zip((base,head),documents):
+                document['data'][0]['functions']=members
+        return self.compare(before=counts[0],after=counts[1],mutate=owners,sources=sources,filename=name)
+
+    def test_daemon_advisory_wait_requires_complete_test_only_compiler_owners(self):
+        receipt=self.paused_daemon_source_compare()
+        proof,=[row for row in receipt['retained_replacement_obligations'] if row.get('qualified_test_statement')]
+        self.assertEqual([len(side) for side in proof['fully_covered_replacement_owners']],[2,3])
+        self.assertTrue({(9,9),(10,10)}<={tuple(pair) for pair in proof['pairs']})
+        self.assertEqual(proof['mapped_credit'],[0,0])
+        for fault in ('cold-mapper','missing-mapper','receiver','production-scope'):
+            with self.subTest(fault=fault),self.assertRaises(ValueError):
+                self.paused_daemon_source_compare(fault)
+
     def test_qualified_test_seed_has_no_partial_fallback_when_full_owner_proof_fails(self):
         with patch.object(coverage, 'fully_covered_replacement', return_value=None):
             with self.assertRaisesRegex(ValueError, r'example.rs:6 -> 6'):
@@ -4554,6 +4607,138 @@ class SourceAwareCoverageTests(unittest.TestCase):
         return self.compare(before=counts[0],after=counts[1],mutate=owners,sources=(
             {'example.rs':('\n'.join(sources[0])+'\n').encode()},
             {'example.rs':('\n'.join(sources[1])+'\n').encode()}))
+
+    def named_record_child_callback_fixture(self, fault=None):
+        old = [
+            'fn inventory(input: &[Row]) -> Result<Vec<Row>> {',
+            '    input.iter()',
+            '        .map(|row| {',
+            '            let values = row.values.iter()',
+            '                .map(|value| Child {',
+            '                    name: value.name.clone(),',
+            '                    kind: value.kind.clone(),',
+            '                })',
+            '                .collect();',
+            '            Ok(values)',
+            '        })',
+            '        .collect()',
+            '}',
+        ]
+        new = old[:2] + ['        .filter(|row| {', '            visible(row)', '        })'] + old[2:]
+        sources = [old, new]
+        documents = []
+        for side, source in enumerate(sources):
+            members = []
+            shift = 3 * side
+            for copy_number, state in enumerate((1, 0), 1):
+                root = f'_RNvCs{copy_number}_7example9inventory'
+                ordinal = 's_' if side else ''
+                def row(line, start, end, quantity):
+                    return [line, start, line, end, quantity, 0, 0, 0]
+                def owner(symbol, count, regions):
+                    return dict(name=symbol, count=count, filenames=['/src/example.rs'],
+                                regions=regions, branches=[], mcdc_records=[])
+                prefix_start=source[2+shift].index('map')+1
+                members.append(owner(root, state, [row(1, 1, source[0].index('{') + 1, state),
+                    row(3+shift,prefix_start,prefix_start+3,4*state),row(len(source), 1, 2, state)]))
+                if side:
+                    opening = source[2].index('{') + 1
+                    members.append(owner('_RNC' + root[2:] + '0B3_', 4 * state,
+                        [row(3, opening, opening + 1, 4 * state), row(4, 13, 20, 4 * state),
+                         row(5, 9, 10, 4 * state)]))
+                opening = source[2 + shift].index('{') + 1
+                members.append(owner('_RNC' + root[2:] + ordinal + '0B3_', 3 * state,
+                    [row(3 + shift, opening, opening + 1, 3 * state),
+                     row(4 + shift, 13, 16, 3 * state),
+                     row(4 + shift, source[3 + shift].index('row.values') + 1, len(source[3 + shift]) + 1, 3 * state),
+                     row(5 + shift, 18, 21, 3 * state),
+                     row(9 + shift, 18, 25, 3 * state), row(10 + shift, 13, 15, 3 * state),
+                     row(11 + shift, 9, 10, 3 * state)]))
+                raw = []
+                for number in (6 + shift, 7 + shift):
+                    text = source[number - 1]
+                    if number==6+shift:
+                        raw.append(row(number, text.index('value.') + 1, len(text), 2 * state))
+                    else:
+                        raw.extend([row(number,text.index('value.')+1,text.index('.clone')+1,2*state),
+                                    row(number,text.index('clone')+1,text.index('clone')+6,2*state)])
+                raw.append(row(8 + shift, 17, 18, 2 * state))
+                members.append(owner('_RNCNC' + root[2:] + ordinal + '00B5_', 2 * state, raw))
+            documents.append(members)
+        children = [owner for owner in documents[1] if owner['name'].startswith('_RNCNC')]
+        hot, cold = children
+        if fault == 'foreign-prefix':
+            foreign=copy.deepcopy(documents[1][0]);foreign['name']='foreign'
+            foreign['regions']=[foreign['regions'][1]];documents[1].append(foreign)
+        elif fault == 'cold-prefix':
+            documents[1][0]['regions'][1][4]=0
+        elif fault == 'missing-cold-prefix':
+            next(o for o in documents[1] if o['name']=='_RNvCs2_7example9inventory')['regions'].pop(1)
+        elif fault == 'wide-prefix':
+            documents[1][0]['regions'][1][3]+=1
+        elif fault == 'missing-cold':
+            documents[1].remove(cold)
+        elif fault == 'lost-hot':
+            hot['count'] = 0
+            for region in hot['regions']: region[4] = 0
+        elif fault == 'hidden-cold':
+            hot['regions'][1][4] = 0
+        elif fault == 'entry-count':
+            hot['count'] += 1
+        elif fault == 'truncated-method':
+            hot['regions'][2][3] -= 1
+        elif fault == 'partial-call':
+            hot['regions'][2][3] += 1
+        elif fault == 'dropped-receiver':
+            hot['regions'].pop(1)
+        elif fault == 'foreign-copy':
+            hot['name'] = hot['name'].replace('Cs1_', 'Cs9_')
+        elif fault == 'extra-owner':
+            foreign = copy.deepcopy(hot); foreign['name'] = 'foreign'; documents[1].append(foreign)
+        elif fault == 'missing-field':
+            hot['regions'].pop(1)
+        elif fault == 'prefix-paint':
+            hot['regions'].insert(0, [8, 30, 8, 35, hot['count'], 0, 0, 0])
+        elif fault == 'channel':
+            hot['regions'][0][7] = 1
+        elif fault == 'changed-type':
+            sources[1][7] = sources[1][7].replace('Child', 'Other')
+        elif fault == 'changed-field':
+            sources[1][9] = sources[1][9].replace('value.kind', 'value.name')
+        counts = []
+        for members in documents:
+            work = coverage._ObserverWork()
+            counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [region for owner in members for region in owner['regions']], work), work)))
+        if fault == 'missing-da':
+            counts[1] = [(line, quantity) for line, quantity in counts[1] if line != 9]
+        def owners(base, head):
+            for document, members in zip((base, head), documents):
+                document['data'][0]['functions'] = members
+                document['data'][0]['files'][0].update(expansions=[], branches=[], mcdc_records=[])
+        return self.compare(before=counts[0], after=counts[1], mutate=owners, sources=(
+            {'example.rs': ('\n'.join(sources[0]) + '\n').encode()},
+            {'example.rs': ('\n'.join(sources[1]) + '\n').encode()}))
+
+    def test_named_record_child_keeps_complete_cold_and_hot_field_geometry(self):
+        receipt = self.named_record_child_callback_fixture()
+        proof, = [row for row in receipt['retained_replacement_obligations']
+                  if row['kind'] == 'closed-retained-callback-island']
+        self.assertEqual([len(names) for names in proof['forest_names'][0]], [2, 2])
+        self.assertEqual(receipt['deleted_mapped'], 0)
+        self.assertIn([6, 9], proof['pairs'])
+        self.assertIn([8, 11], proof['pairs'])
+
+    def test_named_record_child_refuses_changed_counts_copies_source_or_fields(self):
+        for fault in ('missing-cold', 'lost-hot', 'hidden-cold', 'entry-count', 'foreign-copy',
+                      'extra-owner', 'missing-field', 'prefix-paint', 'channel', 'changed-type',
+                      'changed-field', 'missing-da', 'truncated-method', 'partial-call', 'dropped-receiver',
+                      'foreign-prefix', 'cold-prefix', 'missing-cold-prefix', 'wide-prefix'):
+            with self.subTest(fault=fault):
+                try: receipt = self.named_record_child_callback_fixture(fault)
+                except ValueError: continue
+                self.assertFalse(any(row['kind'] == 'closed-retained-callback-island'
+                    for row in receipt.get('retained_replacement_obligations', [])))
 
     def test_block_mapper_preserves_complete_cold_descendant_and_context(self):
         receipt=self.closed_retained_callback_island_fixture()

@@ -7548,6 +7548,67 @@ def callback_island_import_context(name, contexts, words, blobs, work):
     return len(found)==1 and found[0][0]=='enum'
 
 
+def closed_record_child_fields(code, first, last, work):
+    """Read only an explicit named-record callback value, without updates or control flow."""
+    _construct_charge(work, last-first+1)
+    if last-first>512 or first>=last:
+        return None
+    identifier=r'[A-Za-z_]\w*'
+    at=first
+    while at<last and re.fullmatch(identifier,code.words[at],re.ASCII):
+        at+=1
+        if code.words[at]!='::':break
+        at+=1
+    if (at>=last or code.words[at]!='{' or code.pairs.get(at)!=last
+            or re.fullmatch(r'[A-Z]\w*',code.words[at-1],re.ASCII) is None):
+        return None
+    opening=at; fields=[];names=set();start=opening+1
+    for end in range(start,last+1):
+        if end!=last and not (code.parents[end]==opening and code.words[end]==','):
+            continue
+        if start==end:
+            return None
+        if (end-start<3 or code.parents[start]!=opening or code.words[start+1]!=':'
+                or re.fullmatch(identifier,code.words[start],re.ASCII) is None
+                or code.words[start] in names):
+            return None
+        names.add(code.words[start]);value=start+2
+        if any(code.words[i] in ('?','await','return','break','continue','yield','async','move',
+                '|','||','unsafe','loop','if','match','for','while','{','}','..','..=','#')
+               for i in range(value,end)):
+            return None
+        trailer=None; expression=code.words[value:end]
+        if (len(expression)>=5 and expression[-2:]==['(',')']
+                and code.pairs.get(end-2)==end-1):
+            path=expression[:-2]
+            if (len(path)%2==1 and all(re.fullmatch(identifier,word,re.ASCII) for word in path[::2])
+                    and all(word=='.' for word in path[1::2])):
+                trailer=code.position(code.ends[end-3])
+        fields.append((code.words[start],code.region(value,end-1),trailer))
+        start=end+1
+        if start==last:break
+    return tuple(fields) if 1<=len(fields)<=8 else None
+
+
+def closed_record_child_geometry(raw, entry, bounds, fields, work):
+    """Require every field's exact extent and the closing marker in the owned channel."""
+    _construct_charge(work,len(raw)*(len(fields)+1))
+    terminal=(*bounds[2:3],bounds[3]-1,*bounds[2:])
+    if (any(len(row)!=8 or row[5:]!=[0,0,0] or type(row[4]) is not int or row[4]!=entry for row in raw)
+            or [row[4] for row in raw if tuple(row[:4])==terminal]!=[entry]):
+        return False
+    classified=set()
+    for _,field,trailer in fields:
+        members=[i for i,row in enumerate(raw)
+                 if tuple(field[:2])<=tuple(row[:2])<tuple(row[2:4])<=tuple(field[2:])]
+        if (not members or any(i in classified for i in members)
+                or min(tuple(raw[i][:2]) for i in members)!=tuple(field[:2])
+                or max(tuple(raw[i][2:4]) for i in members) not in (tuple(field[2:]),trailer)):
+            return False
+        classified.update(members)
+    return classified=={i for i,row in enumerate(raw) if tuple(row[:4])!=terminal}
+
+
 def retained_callback_island_obligations(name, sources, counts, descriptors, inventories,
                                         replacements, work, indexes_factory, expansions, blobs=None):
     """Bind an unchanged iterator callback and every overlapping compiled child."""
@@ -7645,9 +7706,25 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                     valid=False;break
                 end=code.pairs[call]-1
                 slots.append((code.region(body,end),
-                    (*code.position(code.starts[body]),*code.position(code.ends[body+int(code.words[body+1]=='!')]))))
+                    (*code.position(code.starts[body]),*code.position(code.ends[body+int(code.words[body+1]=='!')])),
+                    closed_record_child_fields(code,body,end,work)))
                 at=end+1
             if not valid or len(slots)>8:valid=False;break
+            prefix_rows={}
+            if any(fields is not None for _,_,fields in slots):
+                call=code.parents[callback['first']]
+                if call is None or code.words[call-1]!='map':valid=False;break
+                prefix=code.region(call-1,call-1);lo,hi=prefix[:2],prefix[2:]
+                roots={o['name'] for o in descriptor['group'][2]}
+                _construct_charge(work,sum(len(o['regions'])+1 for o in available))
+                for owner in available:
+                    touches=[r for r in owner['regions'] if tuple(r[:2])<tuple(hi) and tuple(lo)<tuple(r[2:4])]
+                    if not touches:continue
+                    if (owner['name'] not in roots or len(touches)!=1 or tuple(touches[0][:4])!=tuple(prefix)
+                            or touches[0][5:]!=[0,0,0] or type(touches[0][4]) is not int
+                            or not 0<=touches[0][4]<COUNTER_LIMIT):valid=False;break
+                    prefix_rows[owner['name']]=touches
+                if not valid or prefix_rows and set(prefix_rows)!=roots:valid=False;break
             roles=[];owned=set();filter_owned=set();filter_evidence=[]
             filter_touching=[]
             if filters:
@@ -7701,7 +7778,7 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                 for path,owner in related.items():
                     if len(path)==1:continue
                     if path[:1]!=outer_path:valid=False;break
-                    matches=[number for number,(bounds,_) in enumerate(slots)
+                    matches=[number for number,(bounds,_,_) in enumerate(slots)
                         if all(tuple(bounds[:2])<=tuple(r[:2])<tuple(r[2:4])<=tuple(bounds[2:]) for r in owner['regions'])]
                     if len(matches)!=1 or matches[0] in members:valid=False;break
                     members[matches[0]]=owner
@@ -7724,19 +7801,30 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
                     else:
                         suffix=symbol[len('_RNCNC'+root['name'][2:]):]
                         nested_ordinals.append(tuple(re.findall(r'(s[0-9A-Za-z]{0,32}_)?0',suffix)[:2])[1])
-                        bounds,marker=slots[role]
-                        if (min(tuple(r[:2]) for r in raw)!=tuple(bounds[:2])
-                                or [r[4] for r in raw if tuple(r[:4])==marker]!=[entry]):valid=False;break
+                        bounds,marker,fields=slots[role]
+                        if fields is None:
+                            if (min(tuple(r[:2]) for r in raw)!=tuple(bounds[:2])
+                                    or [r[4] for r in raw if tuple(r[:4])==marker]!=[entry]):valid=False;break
+                        elif not closed_record_child_geometry(raw,entry,bounds,fields,work):
+                            valid=False;break
                     owned.add(id(owner));names.append(symbol)
                     ordered=sorted(raw,key=lambda r:tuple(r[:4]+r[5:]));_construct_charge(work,len(raw)*(len(raw).bit_length()+1))
                     geometry.append(tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in ordered))
                     states.extend([int(entry>0),*[int(r[4]>0) for r in ordered]])
                 if not valid:break
+                prefix=prefix_rows.get(root['name'],[])
+                if prefix and (mapper['count']>prefix[0][4] or prefix[0][4]>0 and root['count']==0):
+                    valid=False;break
+                if any(fields is not None for _,_,fields in slots):
+                    geometry.append(tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in prefix))
+                    states.extend(int(r[4]>0) for r in prefix)
                 roles.append(dict(role=shape.identity,identity=root['name'],geometry=tuple(geometry),states=tuple(states),
                     nested_ordinals=tuple(nested_ordinals),names=names))
             if (not valid or owned!={id(o) for o in forest}
                     or filters and filter_owned!={id(o) for o in filter_touching}):valid=False;break
-            observer=_ObserverWork(work);observed=dict(_llvm22_rows(_llvm22_segments([r for o in forest for r in o['regions']],observer),observer))
+            reconstruction=[r for o in forest for r in o['regions']]
+            reconstruction.extend(r for rows in prefix_rows.values() for r in rows)
+            observer=_ObserverWork(work);observed=dict(_llvm22_rows(_llvm22_segments(reconstruction,observer),observer))
             if not observed:valid=False;break
             first,last=min(observed),max(observed);_construct_charge(work,last-first+1)
             measured={line:counts[side][line] for line in range(first,last+1) if line in counts[side]}
@@ -8657,7 +8745,7 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     if any(n in extra_pairs and extra_pairs[n]!=t or t in projection_targets and projection_targets[t]!=n for n,t in projection_pairs.items()):
         raise ValueError('Ambiguous projected iterator and retained correspondence')
     extra_pairs.update(projection_pairs);extra_receipts.extend(projection_receipts);extra_proved.update(projection_proved)
-    candidates = []; receiver_candidates = []
+    candidates = []; receiver_candidates = []; paused_wait_migrations = set()
     previous, current = descriptors
     _construct_charge(work,len(current))
     added_functions = [(prefix, descriptor) for prefix, descriptor in current.items() if prefix not in previous]
@@ -8699,13 +8787,31 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 if None in parents[0] or None in parents[1] or len(parents[0]) != 1 or parents[0] != parents[1]:
                     continue
                 parent = next(iter(parents[0]))
+                paused_waits = ()
+                if (name=='src/daemon/server.rs' and method_migration
+                        and (left['declaration'],right['declaration'])==('scan_package','assess_packages')
+                        and left['context'][0]==(
+                            tuple('impl crate :: core :: security :: vulnerability :: VulnerabilitySource for PausedAdvisorySource'.split()),
+                            ('#','[','cfg','(','test',')',']','mod','tests'))):
+                    prefix='Box :: pin ( async move {'.split()
+                    notify='self . started . notify_one ( ) ;'.split()
+                    wait='self . resume . notified ( ) . await ;'.split()
+                    code_prefix=prefix+notify+wait
+                    starts=[descriptor['row']['opening']+1 for descriptor in (left,right)]
+                    _construct_charge(work,2*len(code_prefix))
+                    if all(inventory[0].words[start:start+len(code_prefix)]==code_prefix
+                           for inventory,start in zip(inventories,starts)):
+                        paused_waits=tuple(tuple(start+offset for start in starts)
+                            for offset in (len(prefix),len(prefix)+len(notify)))
                 for digest, rows in left['statements'].items():
                     targets = right['statements'].get(digest, [])
                     tokens = inventories[0][0].words[rows[0]['first']:rows[0]['end'] + 1]
                     _construct_charge(work, len(tokens))
-                    if (len(rows) == len(targets) == file_counts[0][digest] == file_counts[1][digest] == 1
-                            and rows[0]['supported'] and targets[0]['supported']
-                            and len(tokens) >= 12 and tokens[0] not in
+                    unique = (len(rows) == len(targets) == file_counts[0][digest] == file_counts[1][digest] == 1
+                              and rows[0]['supported'] and targets[0]['supported'])
+                    if unique and (rows[0]['first'],targets[0]['first']) in paused_waits:
+                        qualified_seeds.append((rows[0],targets[0]))
+                    elif (unique and len(tokens) >= 12 and tokens[0] not in
                                 ('let', 'Ok', 'Err', 'return', 'fn', 'struct', 'enum', 'impl', 'mod',
                                  'static', 'const', 'type', 'use', 'extern', '#')):
                         if head_counts is None or head_counts[digest] == 1:
@@ -8717,6 +8823,11 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                                 and statement_context(left, inventories[0][0], rows[0])
                                     == statement_context(right, inventories[1][0], targets[0])):
                             qualified_seeds.append((rows[0], targets[0]))
+                if paused_waits:
+                    observed = {(old_row['first'],new_row['first']) for old_row,new_row in qualified_seeds}
+                    if not set(paused_waits)<=observed:
+                        continue
+                    paused_wait_migrations.add((left_prefix,right_prefix))
                 if (not seeds and not method_migration
                         or parent_files is not None and parent_files(parent) != {name}):
                     continue
@@ -8810,6 +8921,14 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
             if covered is not None and (seeds or qualified_seeds or all(len(owners) == len(group[2])
                     for owners, group in zip(covered[1]['fully_covered_replacement_owners'], groups))):
                 mapped, receipt = covered
+                if (left_prefix,right_prefix) in paused_wait_migrations:
+                    shapes = [[nominal_method_path(owner['name']) for owner in owners]
+                              for owners in receipt['fully_covered_replacement_owners']]
+                    if any(shape is None for owners in shapes for shape in owners):
+                        continue
+                    depths = [sorted(len(shape.callbacks) for shape in owners) for owners in shapes]
+                    if depths != [[0,1],[0,1,2]]:
+                        continue
                 if qualified_seeds and not seeds:
                     retained = qualified_test_retained_statements((old, new), (left, right), inventories,
                         grouped, file_counts, selected, qualified_seeds, receipt, work)
