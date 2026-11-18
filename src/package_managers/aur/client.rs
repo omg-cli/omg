@@ -4437,30 +4437,6 @@ impl AurClient {
     }
 
     #[cfg(test)]
-    fn cache_key(&self, pkg_dir: &Path, makeflags: &str) -> Result<String> {
-        let source = ReviewedSource::capture(pkg_dir)?;
-        let makepkg_args = self.makepkg_args().join(" ");
-        let build_method = format!("{:?}", self.settings.aur.build_method);
-        let mut hasher = Sha256::new();
-        hasher.update(b"omg-aur-source-v2\0");
-        for value in [
-            source.digest.as_str(),
-            makeflags,
-            makepkg_args.as_str(),
-            build_method.as_str(),
-            if self.settings.aur.secure_makepkg {
-                "true"
-            } else {
-                "false"
-            },
-        ] {
-            hasher.update((value.len() as u64).to_le_bytes());
-            hasher.update(value.as_bytes());
-        }
-        Ok(hex::encode(hasher.finalize()))
-    }
-
-    #[cfg(test)]
     fn cache_path(&self, package: &str) -> PathBuf {
         self.build_dir
             .join("_buildcache")
@@ -7887,12 +7863,40 @@ mod tests {
         std::fs::write(dir.path().join("PKGBUILD"), "pkgname=demo\n").unwrap();
         std::fs::write(dir.path().join(".SRCINFO"), "pkgbase = demo\n").unwrap();
         std::fs::write(dir.path().join("fix.patch"), "original").unwrap();
-        let before = client.cache_key(dir.path(), "").unwrap();
-        assert_eq!(before, client.cache_key(dir.path(), "").unwrap());
+        let invocation = tempfile::tempdir().unwrap();
+        let archive = invocation.path().join("demo-1-1-any.pkg.tar.gz");
+        write_pkg_archive(
+            &archive,
+            "pkgname = demo\npkgbase = demo\npkgver = 1-1\n",
+            None,
+        );
+        let inspection = artifact_inspector::inspect_archive(&archive)
+            .unwrap()
+            .into_inspection();
+        let env = MakepkgEnv {
+            pkgdest: invocation.path().join("pkg"),
+            srcdest: invocation.path().join("src"),
+            builddir: invocation.path().join("build"),
+            _invocation: invocation,
+            makeflags: String::new(),
+            compiler_cache_dirs: Vec::new(),
+            extra_env: Vec::new(),
+            pgp_home: None,
+        };
+        let source_and_key = || {
+            let source = ReviewedSource::capture(dir.path()).unwrap();
+            let key =
+                client.paired_build_cache_key(&source, &env, std::slice::from_ref(&inspection));
+            (source.digest, key)
+        };
+        let before = source_and_key();
+        assert_eq!(before, source_and_key());
         std::fs::write(dir.path().join("fix.patch"), "modified").unwrap();
-        assert_ne!(before, client.cache_key(dir.path(), "").unwrap());
+        let modified = source_and_key();
+        assert_ne!(before.0, modified.0);
+        assert_ne!(before.1, modified.1);
         std::fs::write(dir.path().join("fix.patch"), "original").unwrap();
-        assert_eq!(before, client.cache_key(dir.path(), "").unwrap());
+        assert_eq!(before, source_and_key());
     }
 
     #[tokio::test]
@@ -8072,15 +8076,18 @@ mod tests {
 
     #[test]
     fn cache_key_requires_reviewable_srcinfo() {
-        let client = AurClient::new().expect("test settings must load");
         let dir = tempfile::tempdir().expect("temp dir");
         let pkg_dir = dir.path().join("mypkg");
         std::fs::create_dir(&pkg_dir).expect("pkg dir");
         std::fs::write(pkg_dir.join("PKGBUILD"), "pkgname=mypkg\n").expect("pkgbuild");
 
-        client
-            .cache_key(&pkg_dir, "")
-            .expect_err("missing .SRCINFO must not produce a source cache identity");
+        let error = ReviewedSource::capture(&pkg_dir)
+            .err()
+            .expect("missing .SRCINFO must not produce a source cache identity");
+        assert_eq!(
+            error.to_string(),
+            "AUR review requires PKGBUILD and .SRCINFO"
+        );
     }
 
     #[test]
@@ -8098,11 +8105,6 @@ mod tests {
         );
 
         let dir = tempfile::tempdir().expect("temp dir");
-        let client = AurClient {
-            build_dir: dir.path().to_path_buf(),
-            settings: Settings::default(),
-            package_base_locks: Arc::new(dashmap::DashMap::new()),
-        };
         let pkg_dir = dir.path().join("mypkg");
         std::fs::create_dir(&pkg_dir).expect("pkg dir");
         std::fs::write(pkg_dir.join("PKGBUILD"), "pkgname=mypkg\n").expect("pkgbuild");
@@ -8115,7 +8117,7 @@ mod tests {
         permissions.set_mode(0o000);
         std::fs::set_permissions(&srcinfo, permissions).expect("chmod");
 
-        let result = client.cache_key(&pkg_dir, "");
+        let result = ReviewedSource::capture(&pkg_dir);
         let denied = std::fs::read(&srcinfo).expect_err("fixture must enforce permission denial");
         assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
         println!(
@@ -8125,7 +8127,7 @@ mod tests {
 
         std::fs::set_permissions(&srcinfo, original).expect("restore chmod");
 
-        let error = result.expect_err("unreadable .SRCINFO must fail closed");
+        let error = result.err().expect("unreadable .SRCINFO must fail closed");
         assert!(
             error.chain().any(|cause| cause
                 .downcast_ref::<std::io::Error>()

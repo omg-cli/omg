@@ -2419,6 +2419,8 @@ esac
     #[cfg(unix)]
     #[test]
     fn dropping_successful_managed_install_still_verifies_and_activates() {
+        use self::install_managed_fixture as install_managed;
+
         if crate::core::testing::run_isolated_test(
             "cli::tool::tests::dropping_successful_managed_install_still_verifies_and_activates",
         ) {
@@ -2488,7 +2490,7 @@ esac
                 .tempfile_in(&managers)
                 .expect("manager release gate");
             runtime.block_on(async {
-                let install = install_managed_with_advisories("npm", "fixture-tool", "fixture-tool", &tools, &bin, std::sync::Arc::new(TestNpmAdvisories::default()), crate::runtimes::security::RuntimeSecurity::fixture());
+                let install = install_managed("npm", "fixture-tool", "fixture-tool", &tools, &bin);
                 {
                     tokio::pin!(install);
                     tokio::select! {
