@@ -1046,7 +1046,6 @@ fn install_managed_blocking(
                     advisories.as_ref(),
                     runtime_security,
                 )?);
-                Ok(())
             }
             "cargo" | "go" | "pip" => {
                 let install = match manager {
@@ -1062,12 +1061,12 @@ fn install_managed_blocking(
                     std::sync::Arc::clone(advisories),
                     runtime_security,
                 )?);
-                Ok(())
             }
             _ => anyhow::bail!(
                 "Unknown package manager '{manager}'. Supported: npm, cargo, pip, go, pacman"
             ),
         }
+        Ok(())
     };
     let outcome: Result<()> = run_install();
 

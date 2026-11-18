@@ -2175,7 +2175,7 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     "python", &version, &runtime, &runtime,
                 )
                 .unwrap();
-                execute_process_in(
+                let executed = execute_process_in(
                     "python3",
                     &["-B".into(), "-c".into(), program.clone()],
                     &[],
@@ -2183,10 +2183,12 @@ pathlib.Path({}).write_text(sys.prefix + '|' + omg_local_venv_probe.VALUE)
                     owner.path(),
                     owner.path(),
                     owner.path(),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("real venv task failed: expected_base={} config={original_config:?}: {error:#}", bin.display())
-                });
+                );
+                assert!(
+                    executed.is_ok(),
+                    "real venv task failed: expected_base={} config={original_config:?}: {executed:#?}",
+                    bin.display()
+                );
                 assert_eq!(
                     fs::read_to_string(&observed).unwrap(),
                     format!("{}|local-package", venv.display())

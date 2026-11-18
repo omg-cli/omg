@@ -392,6 +392,19 @@ mod runtime_matrix {
             assert!(!project.path().join(name).exists(), "{stack} wrote files");
         }
         assert!(!project.path().join("invalid").exists());
+        project.create_file("blocked-parent", "existing file\n");
+        let blocked = project.run_with_env(&["new", "rust", "blocked-parent/starter"], &env);
+        blocked.assert_failure();
+        blocked.assert_stdout_contains("Creating new rust project");
+        assert!(
+            blocked
+                .combined_output()
+                .contains("Failed to create project parent directories")
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("blocked-parent")).unwrap(),
+            "existing file\n"
+        );
         assert!(
             !marker.exists(),
             "rejected scaffold executed an ambient command"

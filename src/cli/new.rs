@@ -99,9 +99,10 @@ pub fn run(stack: &str, name: &str) -> Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or(name);
     validate_manifest_name(canonical_stack, project_name, name)?;
-    if let Some(parent) = target_dir.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = target_dir
+        .parent()
+        .context("Project directory needs a parent")?;
+    fs::create_dir_all(parent).context("Failed to create project parent directories")?;
     fs::create_dir(&target_dir)?;
     match canonical_stack {
         ProjectStack::Rust => scaffold_rust(&target_dir, project_name)?,
