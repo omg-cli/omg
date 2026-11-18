@@ -121,8 +121,8 @@ impl std::fmt::Display for SecurityGrade {
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdvisoryRequirement {
-    #[default]
     Optional,
+    #[default]
     Review,
     FreshSnapshot,
 }
@@ -242,21 +242,11 @@ impl SecurityPolicy {
             path: path.display().to_string(),
             source,
         })?;
-        let parsed = toml::from_str(&content).and_then(Self::decode_document);
-        let policy = parsed.map_err(|source| PolicyError::Parse {
+        let policy: Self = toml::from_str(&content).map_err(|source| PolicyError::Parse {
             path: path.display().to_string(),
             source,
         })?;
         policy.validate_advisory_scope()?;
-        Ok(policy)
-    }
-
-    fn decode_document(value: toml::Value) -> Result<Self, toml::de::Error> {
-        let legacy = value.get("advisory_requirement").is_none();
-        let mut policy: Self = value.try_into()?;
-        if legacy {
-            policy.advisory_requirement = AdvisoryRequirement::Review;
-        }
         Ok(policy)
     }
 
@@ -968,7 +958,15 @@ mod tests {
             AdvisoryRequirement::Optional
         );
         let pure: SecurityPolicy = toml::from_str("")?;
-        assert_eq!(pure, SecurityPolicy::default());
+        assert_eq!(
+            pure,
+            SecurityPolicy {
+                advisory_requirement: AdvisoryRequirement::Review,
+                ..SecurityPolicy::default()
+            }
+        );
+        let wire: SecurityPolicy = serde_json::from_str("{}")?;
+        assert_eq!(wire, pure);
         fs::write(&path, "minimum_grade = 'Community'\n")?;
         assert_eq!(
             SecurityPolicy::load(&path)?.advisory_requirement,
@@ -2314,11 +2312,11 @@ mod tests {
             !crate::core::privilege::is_root(),
             "fixture must be unprivileged"
         );
-        let policy: SecurityPolicy = toml::from_str("")?;
+        let policy = SecurityPolicy::default();
         assert_eq!(
-            policy,
-            SecurityPolicy::default(),
-            "omitted fields retain defaults"
+            policy.advisory_requirement,
+            AdvisoryRequirement::Optional,
+            "the built-in policy allows optional advisory coverage"
         );
         assert!(policy.allow_aur, "the default allows AUR");
         let argument = format!(
