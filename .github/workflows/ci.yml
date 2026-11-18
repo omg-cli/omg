@@ -1151,8 +1151,8 @@ jobs:
             python3 scripts/check-alpm-pins.py --prepare-cargo-source "$RUNNER_TEMP/omg-alpm-source"
             cargo_source=(--config "$RUNNER_TEMP/omg-alpm-source/cargo-config.toml")
           fi
-          cargo clippy "${cargo_source[@]}" --all-targets --no-default-features --features ${{ matrix.features }} \
-            --locked -- -D warnings
+          cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
+            "${cargo_source[@]}" --locked -- -D warnings
 
       - name: Test emitted shell hooks
         if: matrix.phase == 'validation' && matrix.platform == 'fedora'
