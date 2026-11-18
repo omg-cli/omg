@@ -323,7 +323,8 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         configuration += '[' + repository + ']\nSigLevel = Required TrustedOnly\nServer = file://' + str(owner / 'repos' / repository) + '\n'
     (owner / 'pacman.conf').write_text(configuration)
     receipt = {'status': 'PREPARED_DATA_ONLY_NOT_RUNTIME_PROOF', 'owner': str(owner), 'created_unix': time.time(),
-               'fixture_signer_fingerprint': fingerprint, 'signer_is_authored_throwaway_key': True,
+               'fixture_signer_fingerprint': fingerprint, 'fixture_app_signer_fingerprint': unknown_signer,
+               'signer_is_authored_throwaway_key': True,
                'host_or_publisher_secret_material_used': False, 'siglevel_weakened': False,
                'initial_packages': initial, 'migration_packages': migration_packages, 'config_sha256': sha(owner / 'pacman.conf'),
                'running_kernel_modules': running_modules,
@@ -377,7 +378,10 @@ FRESH_ADMISSION_CASES = (
     FreshAdmissionCase('repository-accept', 'none', '', True, ''),
     FreshAdmissionCase('repository-stale-evidence', 'none', 'stale', False, 'stale Arch snapshot'),
     FreshAdmissionCase('repository-unknown-signing-key', 'none', '', False, 'Unknown signing key refused'),
+    FreshAdmissionCase('repository-decline-signing-key', 'key-decline', '', False, 'import an untrusted signing key'),
 )
+
+UNKNOWN_SIGNING_KEY_CASES = {'repository-unknown-signing-key', 'repository-decline-signing-key'}
 
 
 # Additional decoder evidence never replaces the original admission matrix.
@@ -535,6 +539,15 @@ def fresh_admission_terminal(cli, arguments, environment, case, directory, state
                     data = b''
                 transcript.extend(data)
                 require(len(transcript) <= 1024 * 1024, 'Fresh admission transcript exceeds budget')
+            if case.interaction == 'key-decline':
+                if not state.get('install_confirmed') and b'Proceed with installation of 1 package(s)? (y/n)' in transcript:
+                    state['install_confirmed'] = True
+                    os.write(terminal, b'y')
+                fingerprint = state['signing_key_fingerprint'][-16:].encode()
+                if not state.get('signing_key_declined') and b'Import PGP key ' + fingerprint + b'? (y/n)' in transcript:
+                    require(state.get('install_confirmed'), 'Signing-key prompt preceded installation confirmation')
+                    os.write(terminal, b'n')
+                    state['signing_key_declined'] = True
             if not answered and b'seconds to continue (default: cancel): ' in transcript:
                 found = re.search(rb'Full prepared batch SHA-256: ([a-f0-9]{64})', transcript)
                 require(found is not None, 'Native acknowledgement must publish its exact batch digest')
@@ -681,7 +694,8 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             current['requests'].append(dict(path=self.path, prompt_seen=current['prompt_seen']))
             try:
                 case, fixture, archive = current['definition'], current['fixture'], current['archive']
-                require(case.interaction == 'none' or current['prompt_seen'],
+                require(case.interaction == 'none' or current['prompt_seen']
+                        or case.interaction == 'key-decline' and current.get('install_confirmed'),
                         'Advisory fetch preceded mandatory archive acknowledgement')
                 if case.mutation == 'policy':
                     (config / 'policy.toml').write_text(current['policy'] + 'banned_packages = ["omg-fresh-archive"]\n')
@@ -734,7 +748,7 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             directory.mkdir()
             fixture = owner.parent / (owner.name + '-' + case.name)
             read_only = case.name == 'repository-bzip2-info'
-            unknown_key = case.name == 'repository-unknown-signing-key'
+            unknown_key = case.name in UNKNOWN_SIGNING_KEY_CASES
             prepared = create_signed_fixture(fixture, native_migrations=read_only,
                 repository_compression='bz2' if read_only else 'gz', unknown_app_signer=unknown_key)
             for repository in ('core', 'omarchy'):
@@ -759,7 +773,9 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             keyring_before = sha(keyring) if unknown_key else None
             arguments = ['install', str(archive), '--allow-local-file', '--yes']
             if case.name.startswith('repository-'):
-                arguments = ['install', 'omg-coverage-app', '--yes']
+                arguments = ['install', 'omg-coverage-app']
+                if case.interaction != 'key-decline':
+                    arguments.append('--yes')
             if read_only:
                 require(not (fixture / 'db/local/xorg-xrandr-3-1').exists(),
                         'Bzip2 info must query a repository-only package')
@@ -777,6 +793,8 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
             current = dict(definition=case, fixture=fixture, archive=archive, policy=policy,
                 prompt_seen=False, requests=[], server_errors=[],
                 old_stages=set(Path('/var/tmp').glob('omg-package-*/' + archive.name)))
+            if case.interaction == 'key-decline':
+                current['signing_key_fingerprint'] = prepared['fixture_app_signer_fingerprint']
             state['case'] = current
             environment = dict(PATH='/usr/bin:/bin', LANG='C.UTF-8', HOME='/root', SUDO_USER='bench',
                 OMG_DISABLE_DAEMON='1', OMG_DISABLE_TELEMETRY='1', OMG_COLORS='never', RUST_LOG='warn',
@@ -826,6 +844,12 @@ def run_fresh_admission_fixture(owner, cli, names=None, profiles=None, decoder_c
                     keyring_after = sha(keyring)
                     require(keyring_after == keyring_before, 'Refused package changed the verification keyring')
                     row['keyring_sha256'] = [keyring_before, keyring_after]
+                if case.interaction == 'key-decline':
+                    fingerprint = current['signing_key_fingerprint']
+                    require(current.get('signing_key_declined')
+                            and f'Import PGP key {fingerprint[-16:]}? · no' in result['output'],
+                            'Native signing key refusal did not decline the fixture key')
+                    row.update(signing_key_fingerprint=fingerprint, signing_key_declined=True)
                 require(not (fixture / 'db/db.lck').exists(), 'Native admission left its transaction lock')
                 if case.interaction == 'timeout':
                     require(result['elapsed_seconds'] >= 59, 'Native acknowledgement timed out prematurely')
@@ -883,7 +907,7 @@ def validate_fresh_admission(value, cli_sha256, decoder_cases=False):
                 and type(row.get('exit_code')) is int and row['exit_code'] == fresh_case_exit(case)
                 and row.get('stopped_signal') is None and row.get('transaction_lock_remains') is False
                 and row.get('server_errors') == [], 'Native admission failed or left a stopped transaction: ' + case.name)
-        prompt = case.interaction not in ('none', 'noninteractive')
+        prompt = case.interaction not in ('none', 'noninteractive', 'key-decline')
         require(row.get('prompt_seen') is prompt, 'Native attended admission was not exercised: ' + case.name)
         output = row.get('output')
         require(type(output) is str and len(output.encode()) <= 1024 * 1024
@@ -910,11 +934,17 @@ def validate_fresh_admission(value, cli_sha256, decoder_cases=False):
             require(package + '/desc' in row['database_after'] and row['database_before'] != row['database_after']
                     and row['payload_after'].get(path) == hashlib.sha256(payload).hexdigest(),
                     'Native admission did not commit the approved package bytes: ' + case.name)
-        if case.name == 'repository-unknown-signing-key':
+        if case.name in UNKNOWN_SIGNING_KEY_CASES:
             keyring = row.get('keyring_sha256')
             require(type(keyring) is list and len(keyring) == 2 and keyring[0] == keyring[1]
                     and type(keyring[0]) is str and re.fullmatch('[0-9a-f]{64}', keyring[0]),
                     'Unknown signing key refusal lacks an unchanged verification keyring')
+        if case.interaction == 'key-decline':
+            fingerprint = row.get('signing_key_fingerprint')
+            require(row.get('signing_key_declined') is True and type(fingerprint) is str
+                    and re.fullmatch('[0-9A-F]{40}', fingerprint)
+                    and f'Import PGP key {fingerprint[-16:]}? · no' in output,
+                    'Attended signing key refusal must decline the exact fixture key')
         if decoder_cases:
             validate_signed_decoder_input(case, row)
         if case.interaction == 'foreground-loss':

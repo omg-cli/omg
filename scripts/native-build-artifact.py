@@ -22,6 +22,7 @@ import zipfile
 
 MAX_DOWNLOAD = 128 * 1024 * 1024
 MAX_EXPANDED = 256 * 1024 * 1024
+MAX_HTTP_HEADERS = 64 * 1024
 FEATURES = {'arch': 'arch,pgp,license', 'debian': 'debian,pgp,license',
             'debian-trixie': 'debian,pgp,license',
             'ubuntu': 'debian,pgp,license', 'fedora': 'fedora,pgp,license'}
@@ -161,32 +162,31 @@ def api(path, limit=1024 * 1024, *, include_status=False, timeout=90):
         return output.read(limit + 1)
 
 
-def metadata_response(data):
+def http_response(data, body_limit):
     parts = re.split(rb'\r?\n\r?\n', data, maxsplit=1)
-    require(len(parts) == 2 and len(parts[0]) <= 64 * 1024, 'invalid GitHub response headers')
+    require(len(parts) == 2 and len(parts[0]) <= MAX_HTTP_HEADERS, 'invalid GitHub response headers')
     headers, body = parts
     status_line, *fields = headers.splitlines()
     status = re.fullmatch(rb'HTTP/(?:1\.[01]|2(?:\.0)?|3(?:\.0)?) ([1-5][0-9]{2})(?: [^\r\n]*)?', status_line)
     require(status is not None and all(b':' in field for field in fields), 'invalid GitHub response headers')
-    require(len(body) <= 1024 * 1024, 'GitHub response exceeds limit')
+    require(len(body) <= body_limit, 'GitHub response exceeds limit')
     retry_after = any(field.split(b':', 1)[0].lower() == b'retry-after' for field in fields)
     return int(status[1]), body, retry_after
 
 
-def api_json(path):
-    # Metadata GETs share one deadline and attempt budget across transport failures.
-    # A fresh temporary output prevents partial/error bodies from entering admission.
-    deadline = time.monotonic() + 90
+def request_body(path, body_limit, timeout, kind):
+    # Each retry starts a fresh request and cannot reuse a partial response.
+    deadline = time.monotonic() + timeout
     for attempt in range(3):
         remaining = deadline - time.monotonic()
-        require(remaining > 0, 'GitHub metadata request deadline exhausted')
+        require(remaining > 0, 'GitHub ' + kind + ' request deadline exhausted')
         try:
-            data = api(path, 1024 * 1024 + 64 * 1024, include_status=True, timeout=remaining)
+            data = api(path, body_limit + MAX_HTTP_HEADERS, include_status=True, timeout=min(remaining, 90))
         except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
             if isinstance(error, subprocess.CalledProcessError):
                 if not error.output or not error.output.startswith(b'HTTP/'):
                     raise
-                status, _, retry_after = metadata_response(error.output)
+                status, _, retry_after = http_response(error.output, body_limit)
                 # Leave rate limits and server-directed delays as explicit failures.
                 if status not in (502, 503, 504) or retry_after:
                     raise
@@ -195,22 +195,18 @@ def api_json(path):
                 raise
             time.sleep(delay)
         else:
-            status, body, _ = metadata_response(data)
-            require(200 <= status < 300, 'unsuccessful GitHub metadata response')
-            return json.loads(body, object_pairs_hook=unique_object, parse_constant=reject_constant)
+            status, body, _ = http_response(data, body_limit)
+            require(200 <= status < 300, 'unsuccessful GitHub ' + kind + ' response')
+            return body
+
+
+def api_json(path):
+    return json.loads(request_body(path, 1024 * 1024, 90, 'metadata'),
+                      object_pairs_hook=unique_object, parse_constant=reject_constant)
 
 
 def download_artifact(path):
-    # Each request obtains a new short-lived redirect from GitHub. Never reuse a
-    # partial response after a transport timeout; admission still checks the
-    # server digest and the complete bundle below.
-    for attempt in range(3):
-        try:
-            return api(path, MAX_DOWNLOAD)
-        except subprocess.TimeoutExpired:
-            if attempt == 2:
-                raise
-            time.sleep(2 ** attempt)
+    return request_body(path, MAX_DOWNLOAD, 270, 'artifact')
 
 
 class ArtifactUnavailable(ValueError):

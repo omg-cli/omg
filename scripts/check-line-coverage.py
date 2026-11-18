@@ -4435,7 +4435,354 @@ def async_test_expected_variant(name, source, counts, group, owners, names, inve
     return (*identity,code.words[value],message,tuple(named)), dict(witness,wrapped=wrapped)
 
 
-def direct_assertion_anchor(code, start, stop, work):
+def retained_osv_request(sides, work):
+    """Observe the same request fields before and after extracting the OSV scan."""
+    observations = []
+    for modern, (source, counts, inventory, owners, copies, first) in enumerate(sides):
+        code = inventory[0]
+        _construct_charge(work, len(code.starts).bit_length() + 45)
+        start = bisect.bisect_left(code.starts, code.offsets[first-1])
+        ecosystem = 'ecosystem : ecosystem . to_owned ( )' if modern else 'ecosystem'
+        version = 'version . to_owned ( )' if modern else 'version_str'
+        request = (f'let mut request = OsvRequest {{ package : OsvPackage {{ '
+                   f'name : name . to_string ( ) , {ecosystem} , }} , '
+                   f'version : {version} , page_token : None , }} ;').split()
+        if code.words[start:start+len(request)] != request:
+            return None
+        last = code.position(code.ends[start+len(request)-1])[0]
+        if last != first+7 or not copies:
+            return None
+        slots = [(1,2),(4,len(request)-2),(8,code.pairs[start+9]-start),(12,12)]
+        if modern:
+            offset = request.index('version') + 2
+            slots.append((offset,offset))
+        expected = {code.region(start+a,start+b) for a,b in slots}
+        name_call = code.region(start+14,start+14)
+        bodies = {id(copy.body): copy for copy in copies}
+        if len(bodies) != len(copies):
+            return None
+        observed = {}; raw = []
+        for owner in owners:
+            _construct_charge(work, len(owner['regions']))
+            selected = [r for r in owner['regions'] if r[0] <= last and first <= r[2]]
+            if not selected:
+                continue
+            key = id(owner)
+            if key not in bodies or key in observed or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            hits = selected[0][4]
+            spans = {tuple(row[:4]) for row in selected}
+            if (len(selected) != len(spans) or spans - {name_call} != expected
+                    or not 0 <= hits <= owner['count'] < COUNTER_LIMIT
+                    or any(row[4:] != [hits,0,0,0] for row in selected)):
+                return None
+            observed[key] = (int(hits > 0), int(name_call in spans))
+            raw.extend(selected)
+        if observed.keys() != bodies.keys() or not all(active for active, _ in observed.values()):
+            return None
+        projection = _owner_line_counts({'regions': raw}, _ObserverWork(work))
+        if projection != {i:counts[i] for i in range(first,last+1) if i in counts}:
+            return None
+        observed_lines = {offset:source[first+offset-1] for offset in (0,1,2,4,6,7)
+                          if projection.get(first+offset,0)>0}
+        observations.append((first, observed_lines, [
+            dict(constructor=copy.constructor['name'], body=copy.body['name'],
+                 state=[int(copy.constructor['count']>0), int(copy.body['count']>0), *observed[id(copy.body)]])
+            for copy in copies]))
+    (first, old, left), (start, new, right) = observations
+    matching = compiled_hit_state_matching([x['state'] for x in left], [x['state'] for x in right])
+    if old != new or not old or matching is None:
+        return None
+    return dict(kind='retained-osv-request', pairs=[[first+i,start+i] for i in sorted(old)],
+                async_copies=dict(base=left,head=right), instance_matching=matching,
+                summary_credit=[0,0], mapped_credit=[0,0])
+
+
+def osv_request_obligations(sources, counts, inventories, grouped, work):
+    namespace = ('crate', 'omg_lib')
+    for component in ('core', 'security', 'vulnerability'):
+        namespace = ('type', namespace, (component, ''))
+    scanner = ('type', namespace, ('VulnerabilityScanner', ''))
+    sides = []
+    excerpts = []
+    methods = ('scan_package', 'scan_osv_coordinates')
+    for source, mapped, inventory, compiled, method in zip(
+            sources, counts, inventories, grouped, methods, strict=True):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(source) + len(rows))
+        request = [i for i, text in enumerate(source, 1) if text.strip() == 'let mut request = OsvRequest {']
+        if len(request) != 1:
+            return None
+        line, = request
+        implementations = {row['opening']:row for row in rows if row['kind'] == 'impl'}
+        scopes = [row for row in rows if row['kind'] == 'fn' and 'async' in row['header']
+                  and row['header'][row['header'].index('fn')+1] == method
+                  and inherent_async_type(code,row,implementations) == 'VulnerabilityScanner'
+                  and code.position(code.starts[row['opening']])[0] < line < code.position(code.ends[row['end']])[0]]
+        if len(scopes) != 1:
+            return None
+        scope, = scopes
+        first = code.position(code.starts[scope['first']])
+        opening = code.position(code.starts[scope['opening']])
+        terminal = code.position(code.ends[scope['end']])
+        constructors = {}; bodies = {}
+        for owner in compiled[0]:
+            symbol = owner['name']
+            _construct_charge(work,len(symbol)+1)
+            if method not in symbol:
+                continue
+            shape = nominal_method_path(symbol, inventory=True)
+            if (shape is None or shape.kind != 'M' or shape.namespace != namespace or shape.self_type != scanner
+                    or shape.method != (method, '') or shape.callbacks not in ((), ('',))):
+                continue
+            count = owner['count']; raw = owner['regions']; identity = shape.copy_identity
+            _construct_charge(work, len(raw)+1)
+            if compiled[2][symbol] != 1 or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            if not shape.callbacks:
+                if identity in constructors or raw != [[*first,opening[0],opening[1]-1,count,0,0,0]]:
+                    return None
+                constructors[identity] = owner
+            else:
+                if (identity in bodies or raw[0] != [*opening,opening[0],opening[1]+1,count,0,0,0]
+                        or raw[-1][:4] != [terminal[0],terminal[1]-1,*terminal]
+                        or not 0 <= raw[-1][4] <= count < COUNTER_LIMIT):
+                    return None
+                bodies[identity] = owner
+        if not constructors or constructors.keys() != bodies.keys() or any(
+                constructors[key]['filenames'] != bodies[key]['filenames']
+                or not 0 <= bodies[key]['count'] <= constructors[key]['count'] < COUNTER_LIMIT for key in bodies):
+            return None
+        copies = tuple(AsyncCompiledCopy(constructors[key],body,key) for key,body in bodies.items())
+        sides.append((source,mapped,inventory,compiled[0],copies,line))
+        excerpts.append(('\n'.join(source[first[0]-1:terminal[0]])+'\n').encode())
+    request = retained_osv_request(sides, work)
+    if request is not None:
+        require_rustfmt_syntax(excerpts)
+    return request
+
+
+def retained_sbom_metadata(sides, work):
+    """Observe the unchanged leading fields of the system component record."""
+    evidence = []
+    for source, counts, group, owners, names, inventory, line in sides:
+        code = inventory[0]
+        _construct_charge(work, len(code.starts).bit_length() * 2)
+        start = bisect.bisect_left(code.starts, code.offsets[line-1])
+        outer = code.parents[start]
+        if (outer is None or code.words[outer-2:outer+2] != ['(', 'Sbom', '{', 'bom_format']
+                or code.words[outer-3] != 'Ok'):
+            return None
+        close = code.pairs[outer]
+        _construct_charge(work, close - start + 1)
+        component = [i+4 for i in range(start,close) if code.words[i:i+5] ==
+                     ['component', ':', 'Some', '(', 'SbomComponent']]
+        if len(component) != 1:
+            return None
+        record = component[0] + 1
+        if code.words[record] != '{':
+            return None
+        properties = [i for i in range(record+1,code.pairs[record]) if code.parents[i]==record
+                      and code.words[i:i+2]==['properties',':']]
+        if len(properties) != 1:
+            return None
+        last = code.position(code.starts[properties[0]])[0] - 1
+        if last <= line:
+            return None
+        assigned = {}; raw = []
+        roots = {id(root) for root in group[2]}
+        for owner in owners:
+            _construct_charge(work,len(owner['regions'])+1)
+            regions = [r for r in owner['regions'] if r[0]<=last and line<=r[2]]
+            if not regions:
+                continue
+            symbol = owner['name']; shape = plain_rust_function_symbol(symbol)
+            _construct_charge(work,len(symbol)+len(regions)*(len(regions).bit_length()+1))
+            if (id(owner) not in roots or symbol in assigned or names[symbol]!=1
+                    or shape is None or shape.identifiers!=('omg_lib','core','security','sbom_shared','compose')
+                    or owner.get('branches') or owner.get('mcdc_records')
+                    or any(not line<=r[0]<=r[2]<=last or r[5:]!=[0,0,0] or not 0<=r[4]<COUNTER_LIMIT
+                           or r[4] and not owner['count'] for r in regions)):
+                return None
+            slots=sorted(((a-line,b,c-line,d), int(hits>0)) for a,b,c,d,hits,*_ in regions)
+            geometry, states = zip(*slots,strict=True)
+            if len(set(geometry)) != len(geometry):
+                return None
+            assigned[symbol] = (geometry,states)
+            raw.extend(regions)
+        if not roots or len(assigned) != len(roots):
+            return None
+        projection = _owner_line_counts({'regions':raw},_ObserverWork(work))
+        _construct_charge(work,last-line+1)
+        if projection != {i:counts[i] for i in range(line,last+1) if i in counts} or not counts.get(line,0):
+            return None
+        evidence.append((source[line-1:last], {i-line for i in projection}, assigned,line))
+    old,new = evidence
+    if old[:2]!=new[:2]:
+        return None
+    geometries = {geometry for side in evidence for geometry,_ in side[2].values()}
+    if len(geometries)!=1:
+        return None
+    matching = compiled_hit_state_matching(*[[states for _,states in side[2].values()] for side in evidence],
+                                           [list(side[2]) for side in evidence])
+    if matching is None:
+        return None
+    return dict(kind='retained-sbom-metadata', pairs=[[old[3]+i,new[3]+i] for i in sorted(old[1])],
+                geometry=list(geometries)[0], owners=[list(side[2]) for side in evidence], role_matching=matching)
+
+
+def retained_sbom_push(sides, work, vulnerability=False):
+    """Match the retained record fields and their complete callback forest."""
+    witnesses = []
+    receiver, record_type, loop_variable, callback_field, depths = (
+        ('vulnerabilities', 'SbomVulnerability', 'finding', 'advisories', (0,1,2)) if vulnerability else
+        ('components', 'SbomComponent', 'package', 'licenses', (0,1)))
+    iterable = 'findings' if vulnerability else 'installed'
+    for modern, (source, counts, group, owners, names, inventory, line) in enumerate(sides):
+        code = inventory[0]
+        _construct_charge(work, len(code.starts).bit_length())
+        start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+        if code.words[start:start+5] != [receiver, '.', 'push', '(', record_type]:
+            return None
+        scope = code.parents[start]
+        record = start + 5
+        closing = code.pairs.get(record)
+        if (scope is None or code.words[scope-4:scope+1] != ['for', loop_variable, 'in', iterable, '{']
+                or code.words[record] != '{' or closing is None or code.pairs[start+3] != closing+1
+                or code.words[closing-1:closing+3] != [',','}',')',';']):
+            return None
+        _construct_charge(work, closing - start + 1)
+        field = None
+        if vulnerability:
+            changed = max((i+1 for i in range(record+1,closing-1) if code.parents[i] == record
+                           and code.words[i] == ','), default=record+1)
+            if (modern and code.words[changed:closing] != ['properties',',']
+                    or not modern and code.words[changed:changed+4] != ['properties',':','finding','.']):
+                return None
+            high = (code.position(code.starts[changed])[0],1)
+            last = high[0]-1
+        else:
+            value = ['Some', '(', 'properties', ')'] if modern else ['None']
+            changed = closing - len(value) - 3
+            if code.words[changed:closing] != ['properties', ':', *value, ',']:
+                return None
+            field = code.region(changed+2, closing-2)
+            high = code.region(start, closing+2)[2:]
+            last = high[0]
+        fields = [i for i in range(record+1, changed) if code.parents[i] == record
+                  and code.words[i:i+2] == [callback_field, ':']]
+        if len(fields) != 1:
+            return None
+        callback_start, = fields
+        callback_end = next((i for i in range(callback_start+2, changed) if code.parents[i] == record
+                             and code.words[i] == ','), None)
+        if callback_end is None:
+            return None
+        callback_span = code.region(callback_start+2, callback_end-1)
+        entry = {code.region(start, start), code.region(start+2, start+2)}
+        low = code.region(start, closing+2)[:2]
+        roots = group[2]
+        normal = ('omg_lib', 'core', 'security', 'sbom_shared', 'compose')
+        parts = {root['name']: plain_rust_function_symbol(root['name']) for root in roots}
+        if (not 1 <= len(roots) <= 16 or len(parts) != len(roots)
+                or any(shape is None or shape.identifiers != normal for shape in parts.values())):
+            return None
+        records = {}
+        raw = []
+        for owner in owners:
+            _construct_charge(work, len(owner['regions']) + 1)
+            touching = [r for r in owner['regions'] if tuple(r[:2]) < high and low < tuple(r[2:4])]
+            if not touching:
+                continue
+            symbol = owner['name']
+            parents = [(root, depth) for root in roots for depth in depths if
+                       (root is owner if depth == 0 else direct_rust_callback_symbol(
+                           symbol, root['name'], parts[root['name']].modules, depth))]
+            _construct_charge(work, len(depths)*len(roots)*(len(symbol)+1) + 4*len(touching))
+            if len(parents) != 1 or names[symbol] != 1 or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            (parent, depth), = parents
+            geometry = {tuple(row[:4]): row[4] for row in touching}
+            hits = touching[0][4]
+            if (len(geometry) != len(touching) or owner['filenames'] != parent['filenames']
+                    or not 0 <= hits < COUNTER_LIMIT or (hits and not parent['count'])
+                    or any(row[4:] != [hits, 0, 0, 0] or not low <= tuple(row[:2]) < tuple(row[2:4]) <= high
+                           for row in touching)):
+                return None
+            if (depth==0 and (not entry <= geometry.keys() or field is not None and field not in geometry)
+                    or depth>0 and (touching != owner['regions'] or hits != owner['count']
+                        or any(not callback_span[:2] <= span[:2] < span[2:] <= callback_span[2:]
+                               for span in geometry))):
+                return None
+            key = parent['name'], depth
+            if key in records:
+                return None
+            retained = sorted((a-line,b,c-line,d) for a,b,c,d in geometry.keys() - {field})
+            records[key] = (tuple(retained), bool(hits), symbol)
+            raw.extend(touching)
+        if records.keys() != {(root['name'], depth) for root in roots for depth in depths}:
+            return None
+        projection = _owner_line_counts({'regions': raw}, _ObserverWork(work))
+        _construct_charge(work, last - line + 1)
+        if projection != {i: counts[i] for i in range(line, last+1) if i in counts} or not counts.get(line, 0):
+            return None
+        property_line = field[0] if field is not None else None
+        retained_lines = {i-line for i in projection if i != property_line}
+        source_lines = tuple(source[i-1] for i in range(line, last+1) if i != property_line)
+        witnesses.append((tuple(code.words[start:changed]), source_lines, retained_lines, records, line))
+    old, new = witnesses
+    if old[:3] != new[:3]:
+        return None
+    instances = []
+    identities = []
+    geometries = []
+    for _, _, _, records, _ in witnesses:
+        parents = [name for name, depth in records if depth==0]
+        geometries.extend(tuple(records[name, depth][0] for depth in depths) for name in parents)
+        instances.append([tuple(records[name, depth][1] for depth in depths) for name in parents])
+        identities.append(parents)
+    if any(geometry != geometries[0] for geometry in geometries):
+        return None
+    matching = compiled_hit_state_matching(*instances, identities)
+    if matching is None:
+        return None
+    return dict(kind='retained-sbom-record-push', record=record_type,
+                pairs=[[old[4]+offset,new[4]+offset] for offset in sorted(old[2])],
+                role_matching=matching, geometry=geometries[0], instances=instances,
+                owners=[[entry[2] for entry in witness[3].values()] for witness in witnesses])
+
+
+def advisory_count_assertion(code, args, work):
+    (left, end), (right, last) = args
+    call = 'vulnerability_count_from_scan'
+    if code.words[left] != call:
+        return None
+    opening = left + 1
+    if code.words[opening:opening+5] == ['::', '<', '(', ')', '>']:
+        opening += 5
+    if code.pairs.get(opening) != end - 1 or code.words[opening] != '(':
+        return None
+    operands = _boolean_arguments(code, opening)
+    if operands is None or len(operands) != 2:
+        return None
+    parts = [tuple(code.words[first:stop]) for first, stop in (*operands, (right, last))]
+    identity = []
+    for words, constructors in zip(parts, (('& Ok', '& Err'), ('Some',), ('Some', 'None')), strict=True):
+        _construct_charge(work, len(words))
+        plain = ' '.join(words)
+        value = re.fullmatch(r'(& Ok|Some) \( (?:(\d+) |\( (\d+) , 0 \) )\)', plain, re.ASCII)
+        if value is not None and value[1] in constructors:
+            identity.append((value[1], value[2] or value[3]))
+        elif plain == '& Err ( "alsa unavailable" )' and '& Err' in constructors or (
+                plain == 'None' and constructors != ('& Ok', '& Err')):
+            identity.append(plain)
+        else:
+            return None
+    entries = (code.region(left, opening - 1), *(code.region(a, b - 1) for a, b in operands))
+    return ('assert_eq', call, *identity), (), entries
+
+
+def direct_assertion_anchor(code, start, stop, work, advisory_count=False):
     """Identify one direct assertion by a stable condition role or expected value."""
     macro = code.words[start]
     if (macro not in ('assert', 'assert_eq') or code.words[start+1:start+3]!=['!','(']
@@ -4445,6 +4792,10 @@ def direct_assertion_anchor(code, start, stop, work):
     args = _boolean_arguments(code,start+2)
     if args is None or len(args)!=2:
         return None
+    if advisory_count and macro == 'assert_eq':
+        count = advisory_count_assertion(code, args, work)
+        if count is not None:
+            return count
     (left,end),(right,last) = args
     if last-right!=1 or not code.words[right].startswith('"'):
         return None
@@ -4506,7 +4857,8 @@ def retained_direct_unit_assertion(name, source, line, mapped, group, owners, na
     statement = [(row,anchor) for row in rows
                  if row['kind']=='statement' and row['supported'] and code.parents[row['first']]==function_open
                  and code.words[row['first']]==code.words[line_start]
-                 and (anchor:=direct_assertion_anchor(code,row['first'],row['end'],work)) is not None]
+                 and (anchor:=direct_assertion_anchor(code,row['first'],row['end'],work,
+                     advisory_count=name=='src/daemon/status_policy.rs')) is not None]
     current = [(row,anchor) for row,anchor in statement if row['first']==line_start]
     if len(current)!=1:
         return None
@@ -5331,6 +5683,32 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     first,last=group[:2]
                     _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
+                continue
+        if (name=='src/core/security/sbom_shared.rs' and construct_inventories is not None
+                and macro_expansions==([],[]) and a+1==b and c+1==d and tuple(pending)==(b,)
+                and old[a].strip() == new[c].strip()
+                and old[a].strip() in ('components.push(SbomComponent {', 'vulnerabilities.push(SbomVulnerability {',
+                                       'bom_format: "CycloneDX".into(),')):
+            sides = [
+                (source, counts, group, inventories[side], inventory_names[side],
+                 construct_inventories[side], line)
+                for side, (source, counts, group, line) in enumerate(((old,before,bg,b),(new,after,hg,d)))
+            ]
+            if old[a].lstrip().startswith('bom_format:'):
+                component = retained_sbom_metadata(sides,work)
+            else:
+                component = retained_sbom_push(sides,work,vulnerability=old[a].lstrip().startswith('vulnerabilities.'))
+            if component is not None:
+                matched = component['pairs']
+                if any(line in pairs and pairs[line] != target for line, target in matched):
+                    refuse()
+                pairs.update(matched)
+                preproved_callback_pairs.update(matched)
+                for side, (source, group) in enumerate(((old,bg),(new,hg))):
+                    first,last = group[:2]
+                    _construct_charge(work, sum(len(text)+1 for text in source[first-1:last]))
+                    excerpts[side,first,last] = ('\n'.join(source[first-1:last])+'\n').encode()
+                receipts.append(dict(file=name, **component, callback_fragments=[dict(pairs=matched)]))
                 continue
         if (construct_inventories is not None and macro_expansions==([],[])
                 and a+1==b and c+1==d and tuple(pending)==(b,)
@@ -12258,6 +12636,15 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             construct_work, head_capsule_counts, parent_files, record_indexes=source_owner_indexes,
             record_expansions=(bs[name]['expansions'],hs[name]['expansions']),island_blobs=(base_sources,head_sources),
             line_operations=line_operations) if inventories is not None else ({}, [], set())
+        if (name == 'src/core/security/vulnerability.rs' and inventories is not None
+                and bs[name]['expansions'] == hs[name]['expansions'] == []):
+            request = osv_request_obligations((old,new), (before,after), inventories, grouped, construct_work)
+            if request is not None:
+                for line, target in request['pairs']:
+                    if line in obligation_pairs and obligation_pairs[line] != target:
+                        raise ValueError('Ambiguous OSV request correspondence')
+                    obligation_pairs[line] = target
+                residual_receipts.append(dict(file=name, **request))
         anchored.update(obligation_pairs); obligation_receipts.extend(residual_receipts)
         retained_statement_rows = {}
         def retire_declaration(line,target):

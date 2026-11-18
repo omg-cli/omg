@@ -1112,7 +1112,7 @@ class SignedDecoderFixtures(unittest.TestCase):
                 PRODUCER.validate_fresh_admission(value, 'a' * 64, decoder_cases=True)
 
     def test_decoder_cases_are_additive_and_have_distinct_mandatory_cli_profiles(self):
-        self.assertEqual(len(PRODUCER.FRESH_ADMISSION_CASES), 21)
+        self.assertEqual(len(PRODUCER.FRESH_ADMISSION_CASES), 22)
         self.assertEqual({case.name for case in PRODUCER.FRESH_ADMISSION_CASES if case.commits},
                          {'archive-accept', 'archive-source-replaced', 'repository-accept'})
         for case in PRODUCER.SIGNED_DECODER_CASES:
@@ -1129,7 +1129,7 @@ def fresh_admission_receipt(decoder_cases=False):
     rows = []
     cases = PRODUCER.SIGNED_DECODER_CASES if decoder_cases else PRODUCER.FRESH_ADMISSION_CASES
     for case in cases:
-        prompt = case.interaction not in ('none', 'noninteractive')
+        prompt = case.interaction not in ('none', 'noninteractive', 'key-decline')
         fetched = case.interaction == 'accept' or (case.name.startswith('repository-')
                                                    and case.name != 'repository-bzip2-info')
         before = {'installed-1-1/desc': 'd' * 64}
@@ -1164,8 +1164,11 @@ def fresh_admission_receipt(decoder_cases=False):
                     description='inert signed coverage fixture', url=None,
                     size=len(b'xorg-xrandr: upgraded3\n'), install_size=len(b'xorg-xrandr: upgraded3\n'),
                     download_size=512, repo='core', depends=[], licenses=['MIT'], installed=False))
-        if case.name == 'repository-unknown-signing-key':
+        if case.name in PRODUCER.UNKNOWN_SIGNING_KEY_CASES:
             rows[-1]['keyring_sha256'] = ['c' * 64, 'c' * 64]
+        if case.interaction == 'key-decline':
+            rows[-1].update(signing_key_fingerprint='A' * 40, signing_key_declined=True,
+                            output=f'Import PGP key {"A" * 16}? · no\n{case.diagnostic}')
     return dict(status='PASS', cli_sha256='a' * 64, cases=rows,
         selected=[row['name'] for row in rows], complete_matrix=True,
         profile_stages=['fresh-' + row['name'] for row in rows],
@@ -1597,8 +1600,8 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 22)
-            self.assertEqual(len(receipt['process_checks']), 75)
-            self.assertEqual(len(receipt['fresh_admission']), 21)
+            self.assertEqual(len(receipt['process_checks']), 76)
+            self.assertEqual(len(receipt['fresh_admission']), 22)
             self.assertEqual(len(receipt['signed_decoders']), 2)
             self.assertEqual(len(files), len(receipt['profiles']))
 
@@ -1905,6 +1908,7 @@ class FreshAdmissionFixture(unittest.TestCase):
                          'archive-source-replaced', 'archive-identity-changed',
                          'archive-stale-evidence', 'archive-minimum-verified',
                          'repository-accept', 'repository-stale-evidence', 'repository-unknown-signing-key',
+                         'repository-decline-signing-key',
                          'archive-long-input', 'archive-timeout', 'archive-batch-limit'} <= by_name.keys())
         self.assertEqual({case.name for case in cases if case.commits},
                          {'archive-accept', 'archive-source-replaced', 'repository-accept'})
@@ -1935,6 +1939,17 @@ class FreshAdmissionFixture(unittest.TestCase):
             with self.subTest(keyring=keyring), self.assertRaisesRegex(ValueError, 'keyring'):
                 row['keyring_sha256'] = keyring
                 PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
+
+    def test_attended_signer_refusal_requires_the_fixture_key_and_decline(self):
+        receipt = fresh_admission_receipt()
+        PRODUCER.validate_fresh_admission(receipt, 'a' * 64)
+        for change in (dict(signing_key_declined=False), dict(signing_key_fingerprint='0' * 40),
+                       dict(output='import an untrusted signing key')):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'signing.key'):
+                candidate = fresh_admission_receipt()
+                row, = [item for item in candidate['cases'] if item['name'] == 'repository-decline-signing-key']
+                row.update(change)
+                PRODUCER.validate_fresh_admission(candidate, 'a' * 64)
 
     def test_native_matrix_refuses_an_ordinary_process_before_creating_fixtures(self):
         with patch.object(PRODUCER.os, 'geteuid', return_value=1000), \

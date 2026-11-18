@@ -2040,16 +2040,12 @@ mod tests {
                     grade: SecurityGrade::Risk,
                     minimum: SecurityGrade::Community,
                 };
-                assert_eq!(
-                    std::mem::discriminant(&refusal),
+                let actual = (std::mem::discriminant(&refusal), refusal.to_string());
+                let expected = (
                     std::mem::discriminant(&expected_refusal),
-                    "score={score:?}, origin={origin:?}: {refusal}"
-                );
-                assert_eq!(
-                    refusal.to_string(),
                     expected_refusal.to_string(),
-                    "score={score:?}, origin={origin:?}"
                 );
+                assert_eq!(actual, expected, "score={score:?}, origin={origin:?}");
             }
         }
     }

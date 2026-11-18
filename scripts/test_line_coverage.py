@@ -1355,6 +1355,186 @@ class RetainedPolicyDefaultRecordTests(unittest.TestCase):
                 self.assertIsNone(self.compare(fault))
 
 
+class OsvRequestMigrationTests(unittest.TestCase):
+    def test_request_observation_requires_exact_coordinates_and_all_compiled_copies(self):
+        def scenario(modern, fault=None):
+            name = 'scan_osv_coordinates' if modern else 'scan_package'
+            source = [f'async fn {name}() {{', '    let mut request = OsvRequest {',
+                      '        package: OsvPackage {', '            name: name.to_string(),',
+                      '            ecosystem: ecosystem.to_owned(),' if modern else '            ecosystem,',
+                      '        },', '        version: version.to_owned(),' if modern else '        version: version_str,',
+                      '        page_token: None,', '    };', '}']
+            if fault == 'changed-page':
+                source[7] = '        page_token: page,'
+            spans = [[2,9,2,20], [2,23,9,6], [3,18,6,10], [4,19,4,23], [4,24,4,33]]
+            if modern:
+                spans.append([7,18,7,25])
+            owners = []
+            copies = []
+            for role in range(2):
+                hits = 0 if fault == 'cold-copy' and role == 1 else 1
+                regions = [[*span, hits, 0,0,0] for span in spans]
+                if fault == 'missing-operand':
+                    regions.pop(3)
+                if fault == 'lost-call-region' and role == 1:
+                    regions.pop(4)
+                parent = dict(name=f'root-{role}', count=1)
+                body = dict(name=f'body-{role}', regions=regions, count=1)
+                copies.append(coverage.AsyncCompiledCopy(parent, body, ('compiled', str(role))))
+                owners.append(body)
+            if fault == 'foreign-owner':
+                owners.append(dict(owners[0], name='foreign'))
+            work = [100_000]
+            counts = coverage._owner_line_counts({'regions':[r for o in owners for r in o['regions']]},
+                                                  coverage._ObserverWork(work))
+            return (source, counts, coverage._construct_inventory(source, work), owners, tuple(copies), 2)
+
+        base = scenario(False)
+        proof = coverage.retained_osv_request((base, scenario(True)), [100_000])
+        self.assertEqual(proof['pairs'], [[2,2], [3,3], [4,4], [6,6], [8,8], [9,9]])
+        for fault in ('changed-page', 'missing-operand', 'lost-call-region', 'cold-copy', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(coverage.retained_osv_request((base, scenario(True, fault)), [100_000]))
+
+
+class SbomComponentPushTests(unittest.TestCase):
+    def test_system_component_metadata_requires_its_original_fields_and_regions(self):
+        name = '_RNvNtNtNtCs1_7omg_lib4core8security11sbom_shared7compose'
+
+        def scenario(properties, name_field='os_name', hits=1):
+            source = ['fn compose() {', '    Ok(Sbom {', '        bom_format: "CycloneDX".into(),',
+                      '        metadata: SbomMetadata {', '            component: Some(SbomComponent {',
+                      f'                name: {name_field}.into(),', f'                properties: {properties},',
+                      '            }),', '        },', '    })', '}']
+            raw = [[3,21,3,32,1,0,0,0], [6,23,6,30,hits,0,0,0]]
+            root = dict(name=name, regions=raw, count=1)
+            work = [100_000]
+            return (source, {3:1,6:hits}, (1,len(source),[root]), [root], Counter({name:1}),
+                    coverage._construct_inventory(source,work), 3)
+
+        base = scenario('None')
+        proof = coverage.retained_sbom_metadata((base,scenario('Some(properties)')), [100_000])
+        self.assertEqual(proof['pairs'], [[3,3], [6,6]])
+        self.assertIsNone(coverage.retained_sbom_metadata(
+            (base,scenario('Some(properties)', name_field='new_name')), [100_000]))
+        self.assertIsNone(coverage.retained_sbom_metadata(
+            (base,scenario('Some(properties)', hits=0)), [100_000]))
+
+    def test_component_properties_cannot_replace_coverage_of_the_record_or_its_mapper(self):
+        name = 'src/core/security/sbom_shared.rs'
+        filename = '/artifact/' + name
+
+        def scenario(properties, fault=None, vulnerability=False):
+            source = ['fn compose() {', '    for package in installed {',
+                      '        components.push(SbomComponent {',
+                      '            name: package.name.clone(),',
+                      '            licenses: package.licenses.iter().map(|label| label.clone()).collect(),',
+                      f'            properties: {properties},', '        });', '    }', '}']
+            receiver = 'components'
+            if vulnerability:
+                receiver = 'vulnerabilities'
+                source = ['fn compose() {', '    for finding in findings {',
+                          '        vulnerabilities.push(SbomVulnerability {',
+                          '            id: finding.id.clone(),',
+                          '            advisories: finding.iter().map(|native| {',
+                          '                native.iter().map(|reference| reference.id.clone()).collect()',
+                          '            }).collect(),', f'            {properties},', '        });', '    }', '}']
+            if fault == 'changed-field':
+                source[3] = '            name: package.description.clone(),'
+            def region(line, value, hits):
+                start = source[line - 1].index(value) + 1
+                return [line, start, line, start + len(value), hits, 0, 0, 0]
+            roots = []
+            owners = []
+            for role, hits in (('1', 1), ('2', 0)):
+                symbol = f'_RNvNtNtNtCs{role}_7omg_lib4core8security11sbom_shared7compose'
+                regions = [region(3, receiver, hits), region(3, 'push', hits),
+                           region(4, source[3].strip(), hits)]
+                if not vulnerability:
+                    regions.append(region(6, properties, hits))
+                if fault == 'missing-property':
+                    regions.pop()
+                if fault == 'mixed-root' and role == '1':
+                    regions[1][4] = 0
+                if fault == 'moved-field-region':
+                    regions[2] = region(4, 'package.name', hits)
+                root = dict(name=symbol, filenames=[filename], count=1, regions=regions)
+                roots.append(root)
+                owners.append(root)
+                child_hits = 0 if fault == 'cold-mapper' else hits
+                expression = 'native.iter()' if vulnerability else 'label.clone()'
+                mapper = dict(root, name='_RNC' + symbol[2:] + '0B9_', count=child_hits,
+                              regions=[region(6 if vulnerability else 5, expression, child_hits)])
+                owners.append(mapper)
+                if vulnerability and fault != 'missing-nested':
+                    owners.append(dict(mapper, name='_RNCNC' + symbol[2:] + '00Bb_',
+                                       regions=[region(6, 'reference.id.clone()', child_hits)]))
+            if fault == 'duplicate-mapper':
+                owners.append(owners[-1])
+            raw = [region for owner in owners for region in owner['regions']]
+            work = [100_000]
+            counts = coverage._owner_line_counts({'regions': raw}, coverage._ObserverWork(work))
+            return (source, counts, (1, len(source), roots), owners, Counter(o['name'] for o in owners),
+                    coverage._construct_inventory(source, work), 3)
+
+        base = scenario('None')
+        result = coverage.retained_sbom_push((base, scenario('Some(properties)')), [100_000])
+        self.assertEqual(result['pairs'], [[3, 3], [4, 4], [5, 5]])
+        for fault in ('changed-field', 'missing-property', 'mixed-root', 'moved-field-region',
+                      'cold-mapper', 'duplicate-mapper'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(coverage.retained_sbom_push(
+                    (base, scenario('Some(properties)', fault)), [100_000]))
+        base = scenario('properties: finding.props', vulnerability=True)
+        head = scenario('properties', vulnerability=True)
+        result = coverage.retained_sbom_push((base,head), [100_000], vulnerability=True)
+        self.assertEqual(result['pairs'], [[3,3], [4,4], [6,6]])
+        incomplete = scenario('properties', 'missing-nested', vulnerability=True)
+        self.assertIsNone(coverage.retained_sbom_push((base,incomplete), [100_000], vulnerability=True))
+
+
+class AdvisoryCountAssertionTests(unittest.TestCase):
+    def test_daemon_status_assertion_retains_the_known_count_and_requires_no_missing_regions(self):
+        name = 'src/daemon/status_policy.rs'
+        filename = '/artifact/' + name
+        symbol = '_RNvNtNtNtCs1_7omg_lib6daemon13status_policy5tests43successful_scan_replaces_the_previous_count'
+        counts = {4: 1, 5: 1, 6: 1, 9: 1}
+
+        def observe(result, prior, expected, fault=None):
+            call = 'vulnerability_count_from_scan::<()>'
+            source = ['#[cfg(test)]', 'mod tests {', '    #[test]',
+                      '    fn successful_scan_replaces_the_previous_count() {',
+                      '        assert_eq!(', f'            {call}({result}, {prior}),',
+                      f'            {expected}', '        );', '    }', '}']
+            def region(line, token):
+                start = source[line - 1].index(token) + 1
+                return [line, start, line, start + len(token), 1, 0, 0, 0]
+            raw = [region(4, source[3].strip()), region(5, 'assert_eq!'),
+                   region(6, call), region(6, result), region(6, prior), region(9, '}')]
+            if fault == 'missing':
+                raw.pop(4)
+            if fault == 'cold':
+                raw[3][4] = 0
+            root = dict(name=symbol, filenames=[filename], regions=raw, count=1)
+            owners = [root]
+            if fault == 'foreign':
+                owners.append(dict(root, name='foreign', regions=[region(6, prior)]))
+            work = [100_000]
+            return coverage.retained_direct_unit_assertion(name, source, 5, counts,
+                (4, 9, [root]), owners, Counter(owner['name'] for owner in owners),
+                {filename: name}, coverage._construct_inventory(source, work), work)
+
+        previous = observe('&Ok(3)', 'Some(5)', 'Some(3)')
+        current = observe('&Ok((3, 0))', 'Some((5, 0))', 'Some((3, 0))')
+        self.assertIsNotNone(previous)
+        self.assertEqual(previous[:3], current[:3])
+        for fault in ('missing', 'cold', 'foreign'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(observe('&Ok((3, 0))', 'Some((5, 0))', 'Some((3, 0))', fault))
+        self.assertIsNone(observe('&Ok((3, 1))', 'Some((5, 0))', 'Some((3, 0))'))
+        self.assertNotEqual(previous[1], observe('&Ok(4)', 'Some(5)', 'Some(4)')[1])
+
+
 class PolicyLicenseFixtureAssertionTests(unittest.TestCase):
     def observe(self, modern, fault=None):
         name='src/core/security/policy.rs'
