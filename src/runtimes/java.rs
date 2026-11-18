@@ -178,13 +178,15 @@ impl JavaManager {
             &version_dir,
             &download_path,
             &binary.package.link,
-        )?;
+        )
+        .context("Failed to record authenticated Java archive identity")?;
         super::security::record_exact_release(
             &version_dir,
             &asset.version.semver,
             &asset.release_name,
             std::collections::BTreeMap::new(),
-        )?;
+        )
+        .context("Failed to record exact Adoptium release metadata")?;
         let staging = begin_staged_install(&self.versions_dir)?;
         extract_tar_gz(&download_path, staging.path(), 1).await?;
         self.publish_install(&staging, &version)?;
@@ -198,12 +200,15 @@ impl JavaManager {
         normalize_java_home(staging.path())?;
         super::common::require_regular_file(&staging.path().join("bin/java"))?;
         super::security::validate_java_release(staging.path(), &self.versions_dir.join(version))?;
-        let _admission = self.security.prepare_staged(
-            "java",
-            version,
-            staging.path(),
-            &self.versions_dir.join(version),
-        )?;
+        let _admission = self
+            .security
+            .prepare_staged(
+                "java",
+                version,
+                staging.path(),
+                &self.versions_dir.join(version),
+            )
+            .context("Failed to review staged Java runtime")?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
     }
 
@@ -213,11 +218,14 @@ impl JavaManager {
         let version_dir = self.versions_dir.join(&version);
         crate::core::security::validate_runtime_version(&version)?;
         super::common::require_regular_file(&self.versions_dir.join(&version).join("bin/java"))?;
-        let admission = self.security.installed(
-            "java",
-            &self.versions_dir.join(&version),
-            super::security::ReviewMode::FreshAttended,
-        )?;
+        let admission = self
+            .security
+            .installed(
+                "java",
+                &self.versions_dir.join(&version),
+                super::security::ReviewMode::FreshAttended,
+            )
+            .context("Failed to review installed Java runtime")?;
         admission.verify(&self.versions_dir.join(&version))?;
         activate_version(&self.versions_dir, &version, Path::new("bin/java"))?;
 
@@ -330,6 +338,8 @@ fn java_platform() -> Result<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::runtimes::security::fixture_bind_candidate as bind_candidate;
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
@@ -512,12 +522,8 @@ mod tests {
         };
         let staging = stage_java_archive(versions.path(), "Contents/Home/").await?;
 
-        crate::runtimes::security::fixture_bind_candidate(
-            "java",
-            "21",
-            staging.path(),
-            &manager.versions_dir.join("21"),
-        )?;
+        let destination = manager.versions_dir.join("21");
+        bind_candidate("java", "21", staging.path(), &destination)?;
 
         manager.publish_install(&staging, "21")?;
         manager.use_version("21")?;
@@ -545,12 +551,8 @@ mod tests {
         };
         let staging = stage_java_archive(versions.path(), "").await?;
 
-        crate::runtimes::security::fixture_bind_candidate(
-            "java",
-            "21",
-            staging.path(),
-            &manager.versions_dir.join("21"),
-        )?;
+        let destination = manager.versions_dir.join("21");
+        bind_candidate("java", "21", staging.path(), &destination)?;
 
         manager.publish_install(&staging, "21")?;
         manager.use_version("21")?;
@@ -614,12 +616,8 @@ mod tests {
         fs::write(staging.path().join("Contents/Home/lib/server/jvm"), b"jvm")?;
         std::os::unix::fs::symlink("server", staging.path().join("Contents/Home/lib/current"))?;
 
-        crate::runtimes::security::fixture_bind_candidate(
-            "java",
-            "21",
-            staging.path(),
-            &manager.versions_dir.join("21"),
-        )?;
+        let destination = manager.versions_dir.join("21");
+        bind_candidate("java", "21", staging.path(), &destination)?;
 
         manager.publish_install(&staging, "21")?;
 
@@ -690,8 +688,7 @@ mod tests {
             client: download_client(),
         };
 
-        crate::runtimes::security::fixture_bind_candidate("java", "17", &version_dir, &version_dir)
-            .unwrap();
+        bind_candidate("java", "17", &version_dir, &version_dir).unwrap();
         manager.use_version("v17").expect("v prefix must normalize");
 
         assert_eq!(
@@ -755,6 +752,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn activation_refuses_invalid_publisher_identity_without_changing_current() {
+        let fixture = super::super::test_archive::PublicationFixture::new("java", "bin/java");
+        let candidate = fixture.versions.join("21");
+        fs::create_dir_all(candidate.join("bin")).expect("create candidate Java bin directory");
+        fs::write(candidate.join("bin/java"), b"candidate Java launcher")
+            .expect("write candidate Java launcher");
+        crate::runtimes::security::fixture_prepare("java", "21", &candidate, &candidate)
+            .expect("admit the controlled candidate before corrupting its identity");
+        fixture.corrupt_identity("21");
+        let identity = fs::read(fixture.identity_path("21")).expect("read corrupted identity");
+        let manager = JavaManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+
+        let error = manager
+            .use_version("21")
+            .expect_err("invalid installed publisher evidence must prevent Java activation");
+
+        assert_eq!(error.to_string(), "Failed to review installed Java runtime");
+        assert!(format!("{error:#}").contains("Invalid runtime publisher identity"));
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        assert_eq!(
+            fs::read(fixture.identity_path("21")).expect("failed review preserves evidence"),
+            identity
+        );
+        assert_eq!(
+            fs::read(candidate.join("bin/java")).expect("candidate bytes remain unchanged"),
+            b"candidate Java launcher"
+        );
+        fixture.assert_previous();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn activation_keeps_sibling_executables_in_the_runtime_bin_directory() {
         let temp = tempfile::tempdir().expect("temp dir");
         let version_dir = temp.path().join("21");
@@ -767,8 +800,7 @@ mod tests {
             client: download_client(),
         };
 
-        crate::runtimes::security::fixture_bind_candidate("java", "21", &version_dir, &version_dir)
-            .unwrap();
+        bind_candidate("java", "21", &version_dir, &version_dir).unwrap();
         manager
             .use_version("21")
             .expect("feature request must activate");

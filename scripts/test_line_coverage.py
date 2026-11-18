@@ -29,6 +29,35 @@ def report(hit=1, found=2, counts=(1, 0)):
 
 
 class LineCoverageTests(unittest.TestCase):
+    def test_module_tokens_keep_the_same_bounded_lexical_scope(self):
+        code = coverage._boolean_source([
+            'mod outer {',
+            '    fn example() {',
+            '        /* mod ignored */ log("mod ignored");',
+            '        mod local {} r#mod();',
+            '    }',
+            '}',
+        ])
+        self.assertEqual(len(code.module_tokens), 3)
+        work = [100_000]
+        for start in range(len(code.words) + 1):
+            for end in range(start, len(code.words) + 1):
+                self.assertEqual(code.has_module_token(start, end, work),
+                                 'mod' in code.words[start:end], (start, end))
+
+    def test_foreign_compiled_regions_respect_half_open_utf8_line_boundaries(self):
+        source = ['abc', '', 'é', '𐀀', 'xy']
+        positions = [(line, column) for line, row in enumerate(source, 1)
+                     for column in range(1, len(row.encode('utf-8')) + 2)]
+        for selected in ([], [2], [3], [1, 3, 4], [2, 3, 4, 5]):
+            ends = [(line, len(source[line - 1].encode('utf-8')) + 1) for line in selected]
+            for index, start in enumerate(positions):
+                for end in positions[index + 1:]:
+                    expected = any(start < (line, width) and end > (line, 1)
+                                   for line, width in ends)
+                    self.assertEqual(coverage.region_overlaps_observed_lines((*start, *end), ends),
+                                     expected, (selected, start, end))
+
     def read(self, text):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "lcov.info"
@@ -715,6 +744,255 @@ class RetainedAlpmRegistrationTests(unittest.TestCase):
                       'missing-descendant','wrong-descendant-layout','foreign'):
             with self.subTest(fault=fault):
                 self.assertIsNone(self.compare(fault))
+
+
+class RetainedSourceEntryTests(unittest.TestCase):
+    def observe(self, name, variants, source_observer, *, fault=None):
+        sides=[]; indexes=[]
+        work=[coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        files={'/artifact/'+name:name}
+        for side,(source,line,markers,hit_counts,root_counts,scope) in enumerate(variants):
+            owners=[]
+            for copy,(hits,count) in enumerate(zip(hit_counts,root_counts)):
+                if side and fault=='missing-copy' and not copy:
+                    continue
+                prefix=f'_RNvNt{"Nt" if name.endswith("alpm_ops.rs") else ""}Cs{side+1}{copy+1}_7omg_lib'
+                symbol=prefix+scope
+                def region(number,text,value):
+                    col=source[number-1].index(text)+1
+                    return [number,col,number,col+len(text),value,0,0,0]
+                raw=[region(1,'fn',count),region(len(source),'}',count)]
+                raw.extend(region(number,text,hits) for number,text in markers)
+                if side and fault=='missing-slot' and copy:
+                    raw.pop()
+                if side and fault=='prefix-lost' and copy:
+                    raw[3][4]=0
+                owner=dict(name=symbol,filenames=list(files),regions=raw,count=count)
+                owners.append(owner)
+            if side and fault=='foreign':
+                owners.append(dict(owners[0],name='opaque',regions=[owners[0]['regions'][2]]))
+            counts=coverage._owner_line_counts({'regions':[r for item in owners for r in item['regions']]},
+                                              coverage._ObserverWork(work))
+            spans={id(item):coverage.source_owner_span(item,name,files,source) for item in owners}
+            sides.append((source,coverage._construct_inventory(source,work),spans,counts,line))
+            indexes.append(coverage.index_compiled_owner_sources(owners,files,work,{name}))
+        return coverage.retained_observed_entry(name,sides,indexes,work,source_observer)
+
+    def map_entry(self, fault=None):
+        variants=[]
+        for side in range(2):
+            result='Result<Vec<UpdateInfo>>' if side else 'Vec<UpdateInfo>'
+            value='alpm::Package' if side else 'str'
+            if side and fault=='changed-map-type':
+                value='Other'
+            count_method='count' if side and fault=='changed-precondition' else 'len'
+            source=[f'pub(crate) fn collect_updates(alpm: &alpm::Alpm) -> {result} {{',
+                    '    let localdb = alpm.localdb();','    let syncdbs = alpm.syncdbs();',
+                    f'    let local_pkg_count = localdb.pkgs().{count_method}();',
+                    f'    let mut sync_map: ahash::AHashMap<&str, (&{value}, &str)> =',
+                    '        ahash::AHashMap::with_capacity(local_pkg_count);',
+                    '    finish(sync_map)','}']
+            hits=(6,7) if side else (0,4)
+            if side and fault=='lost-hit':
+                hits=(0,0)
+            variants.append((source,6,[(6,'ahash::AHashMap::with_capacity'),(6,'local_pkg_count')],
+                             hits,hits,'16package_managers8alpm_ops15collect_updates'))
+        return self.observe('src/package_managers/alpm_ops.rs',variants,coverage.map_capacity_entry_source,fault=fault)
+
+    def repeated_ensure(self,fault=None):
+        variants=[]
+        for side in range(2):
+            sibling='1' if side and fault=='same-control-role' else '0'
+            source=['fn checked() -> anyhow::Result<()> {']
+            repeated=not (side and fault=='outside-loop')
+            source.append('    for value in [0, 1] {' if repeated else '    let value = 1;')
+            source.extend([f'        if value == {sibling} {{',
+                           '            anyhow::ensure!(',
+                           '                true,',
+                           '                "same diagnostic"',
+                           '            );',
+                           '        }',
+                           '        if value == 1 {',
+                           '            anyhow::ensure!(',
+                           '                true,',
+                           '                "same diagnostic"',
+                           '            );',
+                           '        }'])
+            if repeated:
+                source.append('    }')
+            source.extend(['    Ok(())','}'])
+            hits=(0,3) if side else (0,2)
+            if side and fault=='cold-entry-count':
+                hits=(3,3)
+            variants.append((source,10,[(10,'anyhow::ensure!'),(11,'true')],hits,(0,1),'7example7checked'))
+        return self.observe('src/example.rs',variants,coverage.ensure_entry_source,fault=fault)
+
+    def leading_ensure(self, fault=None):
+        variants=[]
+        for side in range(2):
+            receiver='other' if side and fault=='changed-receiver' else 'path'
+            operand=f'{receiver}.is_file()'
+            operator='||' if side and fault=='not-conjunction' else '&&'
+            suffix='new_limit()' if side else 'old_limit()'
+            source=['fn checked() -> anyhow::Result<()> {',
+                    '    anyhow::ensure!(',f'        {operand}',f'            {operator} {suffix},',
+                    '        "same diagnostic"','    );','    Ok(())','}']
+            markers=[(2,'anyhow::ensure!'),(3,operand),(4,suffix)]
+            if side and fault=='foreign-prefix-paint':
+                markers.append((3,'    '))
+            variants.append((source,2,markers,(0,1),(0,1),'7example7checked'))
+        return self.observe('src/example.rs',variants,coverage.ensure_entry_source,fault=fault)
+
+    def test_changed_tail_leaves_only_the_exact_first_conjunct(self):
+        proof=self.leading_ensure()
+        self.assertEqual(proof['pairs'],[[2,2],[3,3]])
+        self.assertEqual(proof['condition_pairs'],[[3,3]])
+        for fault in ('changed-receiver','not-conjunction','foreign-prefix-paint','prefix-lost'):
+            with self.subTest(fault=fault):
+                proof=self.leading_ensure(fault)
+                self.assertEqual(proof['pairs'],[[2,2]])
+                self.assertEqual(proof['condition_pairs'],[])
+
+
+    def test_map_initializer_tracks_both_copies_when_a_cold_copy_executes(self):
+        proof=self.map_entry()
+        self.assertEqual(proof['pairs'],[[6,6]])
+        self.assertEqual(proof['instance_states'],[[False,True],[True,True]])
+        self.assertEqual([[copy['entry_count'] for copy in side['owners']] for side in proof['observations']],
+                         [[0,4],[6,7]])
+        for fault in ('lost-hit','missing-copy','missing-slot','foreign','changed-map-type','changed-precondition'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(self.map_entry(fault))
+
+    def test_duplicate_labels_and_repeated_hits_require_distinct_loop_control(self):
+        proof=self.repeated_ensure()
+        self.assertEqual(proof['pairs'],[[10,10],[11,11]])
+        self.assertEqual(proof['instance_states'],[[False,True],[False,True]])
+        for fault in ('same-control-role','outside-loop','cold-entry-count'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(self.repeated_ensure(fault))
+
+
+class AsyncPolicyUnavailableAssertionTests(unittest.TestCase):
+    def observe(self, typed, fault=None):
+        lines=['#[cfg(test)]','mod tests {','    #[tokio::test]',
+               '    async fn checked() -> anyhow::Result<()> {']
+        if typed:
+            mode='FreshSnapshot' if fault=='changed-policy' else 'Review'
+            lines.extend(['        let service = update_service(',
+                '            SecurityPolicy {',
+                f'                advisory_requirement: AdvisoryRequirement::{mode},',
+                '                ..policy','            },',
+                '            std::sync::Arc::new(FailingVulns),','        )',
+                '        .expect("construct the fake package-service fixture");',
+                '        let error = service','            .update()','            .await',
+                '            .expect_err("review must preserve unavailable evidence");'])
+        assertion=len(lines)+1
+        lines.append('        assert!(')
+        if typed:
+            reason='different' if fault=='changed-reason' else 'osv unavailable'
+            lines.append('            matches!(error.downcast_ref::<VulnerabilityError>(), '
+                         f'Some(VulnerabilityError::Unavailable {{ reason }}) if reason == "{reason}")')
+        else:
+            lines.extend(['            check_prepared_with_source(&policy, package(false), &FailingVulns)',
+                          '                .await','                .is_err()'])
+        lines.extend(['        );','        Ok(())','    }','}'])
+        first,end=4,len(lines)-1
+        def marker(line,text,count=1):
+            col=lines[line-1].index(text)+1
+            return [line,col,line,col+len(text),count,0,0,0]
+        opening=lines[3].index('{')+1
+        filename='/artifact/src/example.rs'
+        root_symbol='_RNvNtNtCs1_7omg_lib7example5tests7checked'
+        root=dict(name=root_symbol,filenames=[filename],count=1,
+                  regions=[[4,11,4,opening-1,1,0,0,0],marker(end-1,'Ok(())'),marker(end,'}')])
+        raw=[marker(4,'{'),marker(assertion,'assert!'),marker(end-1,'Ok(())')]
+        if typed:
+            raw.extend([marker(10,'std::sync::Arc::new(FailingVulns)'),
+                        [13,21,15,19,1,0,0,0],marker(16,'expect_err'),marker(assertion+1,'downcast_ref')])
+        else:
+            raw.extend([marker(assertion+1,'check_prepared_with_source'),
+                        marker(assertion+1,'&FailingVulns'),marker(assertion+2,'await'),
+                        marker(assertion+3,'is_err')])
+        if fault=='missing-await':
+            del raw[4]
+        if fault=='missing-tail':
+            del root['regions'][1]
+        owners=[root,dict(root,name='_RNC'+root_symbol[2:]+'0B7_',regions=raw)]
+        if fault=='foreign':
+            owners.append(dict(root,name='opaque',regions=[marker(assertion,'assert!')]))
+        work=[coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        counts=coverage._owner_line_counts({'regions':[r for item in owners for r in item['regions']]},
+                                          coverage._ObserverWork(work))
+        inventory=coverage._construct_inventory(lines,work)
+        return coverage.async_policy_unavailable_assertion('src/example.rs',lines,counts,(first,end,[root]),
+            owners,Counter(item['name'] for item in owners),inventory,assertion,assertion,work)
+
+    def test_requires_executed_terminal_assertion_and_exact_typed_driver(self):
+        old, head=[self.observe(typed) for typed in (False,True)]
+        self.assertEqual(old[0],head[0])
+        self.assertEqual([item[1]['typed'] for item in (old,head)],[False,True])
+        self.assertEqual([item[1]['entry'][1] for item in (old,head)],[9,9])
+        for fault in ('changed-policy','changed-reason','missing-await','missing-tail','foreign'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(self.observe(True,fault))
+
+
+class PreparedPolicyEnvironmentEntryTests(unittest.TestCase):
+    def observe(self, modern, fault=None):
+        lines=['#[cfg(test)]','mod tests {','    #[cfg(debug_assertions)]','    #[test]',
+               '    fn checked() -> anyhow::Result<()> {','        let directory = tempfile::tempdir()?;']
+        if modern:
+            lines.append('        let data_dir = directory.path().join("data");')
+        call=len(lines)+1
+        config='OMG_CACHE_DIR' if fault=='changed-config' else 'OMG_CONFIG_DIR'
+        lines.extend(['        temp_env::with_vars(','            [',
+                      f'                ("{config}", Some(directory.path().as_os_str())),',
+                      '                ("OMG_TEST_MODE", Some(std::ffi::OsStr::new("1"))),',
+                      '                ("OMG_DATA_DIR", Some(data_dir.as_os_str())),' if modern else
+                      '                ("OMG_TEST_DISTRO", Some(std::ffi::OsStr::new("fedora"))),',
+                      '            ],','            || -> anyhow::Result<()> {'])
+        opening=len(lines)
+        if modern:
+            field='other_field' if fault=='lost-legacy-control' else 'advisory_requirement'
+            lines.extend([f'                policy.remove("{field}");',
+                          '                assert_eq!(loaded.advisory_requirement, AdvisoryRequirement::Review);'])
+        else:
+            lines.append('                let package = || { 1 };')
+        lines.extend(['                assert_eq!(fs::read_to_string(&path)?, bytes);',
+                      '                Ok(())','            },','        )','    }','}'])
+        closing=len(lines)-3
+        def row(line,text,count=1):
+            col=lines[line-1].index(text)+1
+            return [line,col,line,col+len(text),count,0,0,0]
+        symbol='_RNvNtNtCs1_7omg_lib7example5tests7checked'
+        root=dict(name=symbol,filenames=['/artifact/src/example.rs'],count=2,
+                  regions=[row(5,'fn checked()',2),row(6,'directory'),row(call,'temp_env::with_vars'),
+                           [call+1,13,opening-1,14,1,0,0,0],row(len(lines)-1,'}',2)])
+        child=dict(root,name='_RNC'+symbol[2:]+'0B7_',count=1,
+                   regions=[row(opening,'{',0 if fault=='cold-opener' else 1),row(closing,'}')])
+        owners=[root,child]
+        if not modern and fault!='missing-factory':
+            owners.append(dict(root,name='_RNCNC'+symbol[2:]+'00B9_',count=1,
+                               regions=[row(opening+1,'{ 1 }')]))
+        if fault=='foreign':
+            owners.append(dict(root,name='opaque',regions=[row(opening,'{')]))
+        work=[coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        counts=coverage._owner_line_counts({'regions':[r for item in owners for r in item['regions']]},
+                                          coverage._ObserverWork(work))
+        inventory=coverage._construct_inventory(lines,work)
+        return coverage.prepared_policy_environment_entry('src/example.rs',lines,counts,(5,len(lines)-1,[root]),
+            owners,Counter(item['name'] for item in owners),inventory,opening,work)
+
+    def test_distinct_environment_arguments_preserve_only_the_direct_closure_entry(self):
+        old,head=[self.observe(modern) for modern in (False,True)]
+        self.assertEqual(old[0],head[0])
+        self.assertEqual([old[1]['modern'],head[1]['modern']],[False,True])
+        self.assertEqual([len(old[1]['nested']),len(head[1]['nested'])],[1,0])
+        for modern,fault in ((True,'changed-config'),(True,'lost-legacy-control'),
+                             (True,'cold-opener'),(True,'foreign'),(False,'missing-factory')):
+            with self.subTest(fault=fault):
+                self.assertIsNone(self.observe(modern,fault))
 
 
 class QualifiedFunctionCompletionTests(unittest.TestCase):
@@ -3338,7 +3616,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
             coverage.compiled_async_function_groups('example.rs', [], {},
                 ['async fn checked() {', '    verify();', '}'], work=[0])
 
-    def test_async_phase_reuses_an_already_checked_lexical_signature(self):
+    def test_async_phase_reuses_checked_source_owners_and_their_lexical_signature(self):
         source = ['async fn checked() {', '    verify();', '}']
         file = '/src/example.rs'
         opening = source[0].index('{')+1
@@ -3350,11 +3628,16 @@ class SourceAwareCoverageTests(unittest.TestCase):
         files = {file:'example.rs'}
         expected = coverage.compiled_async_function_groups('example.rs',owners,files,source)
         self.assertEqual(len(expected),1)
-        with mock.patch.object(coverage,'source_function_prefixes',wraps=coverage.source_function_prefixes) as parse:
-            actual = coverage.compiled_async_function_groups('example.rs',owners,files,source,
-                compiled_prefixes={(1,3):'async fn checked()'})
+        compiled = coverage._compiled_function_groups('example.rs',owners,files,source)
+        with (mock.patch.object(coverage,'source_function_prefixes',wraps=coverage.source_function_prefixes) as parse,
+              mock.patch.object(coverage,'source_owner_span',wraps=coverage.source_owner_span) as inspect):
+            actual = coverage.compiled_async_function_groups('example.rs',compiled[0],files,source,
+                compiled_groups=compiled)
         self.assertEqual(actual,expected)
         parse.assert_not_called()
+        inspect.assert_not_called()
+        self.assertEqual(coverage.compiled_async_function_groups('example.rs',owners,files,source,
+            compiled_groups=compiled),{})
 
     def retained_record_field_compare(self, head_counts=(1, 1), ancestor_counts=None,
                                       refinement_counts=None, base_refinement_counts=None):
@@ -3701,10 +3984,10 @@ class SourceAwareCoverageTests(unittest.TestCase):
         class Unreadable:
             def __getitem__(self, index):
                 raise AssertionError('ancestry read before budget admission')
-        malformed = coverage._BooleanSource('', ['value'], [0], [5], Unreadable(), {}, [0])
+        malformed = coverage._BooleanSource('', ['value'], [0], [5], Unreadable(), {}, [0], ())
         with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
             coverage._construct_ancestors(malformed, 0, [0])
-        cyclic = coverage._BooleanSource('', ['value'], [0], [5], [0], {}, [0])
+        cyclic = coverage._BooleanSource('', ['value'], [0], [5], [0], {}, [0], ())
         with self.assertRaisesRegex(ValueError, 'ancestr'):
             coverage._construct_ancestors(cyclic, 0, [32])
 
@@ -9388,6 +9671,67 @@ class ConstructorDelimiterTests(unittest.TestCase):
                 'lost-iteration-channel','changed-outer-values','different-loop-cardinality','foreign-root',
                 'cold-completion','early-transfer','executable-delimiter','unknown-attribute','missing-test-gate','foreign-owner-copy'):
    with self.subTest(fault=fault):self.assertIsNone(self.constructor_fixture(fault))
+
+class CfgMethodTests(unittest.TestCase):
+ def fixture(self,fault=None):
+  name='src/runtimes/node.rs';filename='/src/runtimes/node.rs'
+  source=['impl NodeManager {','    #[cfg(feature = "pgp")]',
+    '    async fn fetch_checksum(&self, version: &str, filename: &str) -> Result<String> {',
+    '        first(version)?;','        Ok(filename.into())','    }',
+    '    #[cfg(not(feature = "pgp"))]',
+    '    fn fetch_checksum(&self, _version: &str, _filename: &str) -> std::future::Ready<Result<String>> {',
+    '        std::future::ready(Err(anyhow::anyhow!("PGP required")))','    }','}']
+  if fault=='non-complement':source[6]='    #[cfg(not(feature = "other"))]'
+  elif fault=='missing-active-cfg':source[1]='    #[cfg(feature = "other")]'
+  elif fault=='extra-attribute':source[1]='    #[allow(dead_code)] #[cfg(feature = "pgp")]'
+  elif fault=='extra-gated-prefix':source[1:1]=['    #[cfg(', '        feature = "extra"', '    )]']
+  elif fault=='extra-inactive-attribute':source[6]='    #[allow(dead_code)] #[cfg(not(feature = "pgp"))]'
+  elif fault=='different-impl':source[5:7]=['    }','}','impl OtherManager {','    #[cfg(not(feature = "pgp"))]']
+  active=next(n for n,line in enumerate(source,1) if 'async fn fetch_checksum' in line);last=active+3
+  owners=[]
+  for scope,quantity in [('s1_',1),('s2_',0)]:
+   ctor=f'_RNvMs0_NtNtC{scope}7omg_lib8runtimes4nodeNtB5_11NodeManager14fetch_checksum'
+   body=f'_RNCNvMs0_NtNtC{scope}7omg_lib8runtimes4nodeNtB7_11NodeManager14fetch_checksum0Bb_'
+   opening=source[active-1].find('{')+1;end=len(source[active-1].split('{')[0].rstrip())+1
+   def owner(symbol,rows):return dict(name=symbol,count=quantity,filenames=[filename],regions=rows,branches=[],mcdc_records=[])
+   owners.extend([owner(ctor,[[active,5,active,end,quantity,0,0,0]]),owner(body,[
+      [active,opening,active,opening+1,quantity,0,0,0],
+      [active+1,9,active+1,len(source[active])+1,quantity,0,0,0],
+      [active+1,len(source[active])-1,active+1,len(source[active]),0,0,0,0],
+      [active+2,9,active+2,len(source[active+1])+1,quantity,0,0,0],
+      [last,5,last,6,quantity,0,0,0]])])
+  if fault=='missing-constructor':owners.pop(0)
+  elif fault=='missing-body':owners.pop(1)
+  elif fault=='wrong-source':owners[1]['filenames']=['/other.rs']
+  elif fault=='wrong-instance':owners[1]['name']=owners[1]['name'].replace('s1_','s3_')
+  elif fault=='raw-channel':owners[1]['regions'][0][5]=1
+  elif fault=='wrong-entry':owners[1]['regions'][0][1]+=1
+  elif fault=='inactive-owner':
+   extra=copy.deepcopy(owners[0]);extra['name']=extra['name'].replace('s1_','s9_');extra['regions']=[[8,5,8,6,1,0,0,0],[10,5,10,6,1,0,0,0]];owners.append(extra)
+  elif fault=='foreign-envelope':
+   extra=copy.deepcopy(owners[0]);extra['name']='foreign';extra['regions']=[[1,1,1,2,1,0,0,0],[7,1,7,2,1,0,0,0]];owners.append(extra)
+  elif fault=='extra-nested-child':
+   extra=copy.deepcopy(owners[1]);extra['name']=extra['name'].replace('_RNCNv','_RNCNCNv').replace('0Bb_','00Bd_');owners.append(extra)
+  result=coverage._compiled_function_groups(name,owners,{filename:name},source,[64000000])
+  return source,owners,result
+ def test_complementary_pgp_method_has_complete_active_cold_and_hot_copies(self):
+  source,owners,result=self.fixture()
+  groups=list(result[1].values());self.assertEqual(len(groups),1)
+  self.assertEqual(groups[0][:2],(3,6));self.assertEqual({o['name'] for o in groups[0][2]},{owners[1]['name'],owners[3]['name']})
+  self.assertEqual(groups[0][2],[owners[1],owners[3]])
+  self.assertEqual([o['count'] for o in groups[0][2]],[1,0])
+  self.assertEqual(sum(r[4]==0 for o in groups[0][2] for r in o['regions']),6)
+ def test_default_function_name_uniqueness_remains_strict(self):
+  source,owners,result=self.fixture()
+  self.assertEqual(coverage.source_function_prefixes(source,[(3,6)]),{})
+  self.assertFalse(coverage._compiled_function_groups('src/runtimes/node.rs',owners,{'/src/runtimes/node.rs':'src/runtimes/node.rs'},source)[1])
+  self.assertFalse(coverage._compiled_function_groups('src/runtimes/node.rs',owners,{'/src/runtimes/node.rs':'src/runtimes/node.rs'},source,[64000000],shared_prefixes={})[1])
+ def test_complementary_pgp_method_refuses_unsupported_cfg_and_unclosed_owners(self):
+  for fault in ('non-complement','missing-active-cfg','extra-attribute','extra-gated-prefix','extra-inactive-attribute','different-impl','missing-constructor','missing-body','wrong-source','wrong-instance','raw-channel','wrong-entry','inactive-owner','foreign-envelope','extra-nested-child'):
+   with self.subTest(fault=fault):
+    try:source,owners,result=self.fixture(fault)
+    except ValueError:continue
+    self.assertFalse(result and result[1])
 
 if __name__ == "__main__":
     unittest.main()

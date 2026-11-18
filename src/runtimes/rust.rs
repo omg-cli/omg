@@ -379,11 +379,14 @@ impl RustManager {
     ) -> Result<()> {
         let toolchain_name = toolchain.name();
         let version_dir = self.toolchain_dir(toolchain);
-        let admission = self.security.installed(
-            "rust",
-            &version_dir,
-            super::security::ReviewMode::FreshAttended,
-        )?;
+        let admission = self
+            .security
+            .installed(
+                "rust",
+                &version_dir,
+                super::security::ReviewMode::FreshAttended,
+            )
+            .context("Failed to review installed Rust toolchain")?;
         admission.verify(&version_dir)?;
         activate_version_with_lease(
             &self.versions_dir,
@@ -506,16 +509,19 @@ impl RustManager {
             &version_dir,
             "https://static.rust-lang.org/dist/",
             &serde_json::to_vec(manifest)?,
-        )?;
+        )
+        .context("Failed to record Rust manifest publisher identity")?;
         super::security::record_exact_release(
             &version_dir,
             &manifest_version(manifest).context("Rust manifest has no exact release")?,
             &manifest_release(manifest)?,
             BTreeMap::new(),
-        )?;
-        let _admission =
-            self.security
-                .prepare_staged("rust", &toolchain.name(), dest_dir, &version_dir)?;
+        )
+        .context("Failed to record exact Rust release metadata")?;
+        let _admission = self
+            .security
+            .prepare_staged("rust", &toolchain.name(), dest_dir, &version_dir)
+            .context("Failed to review staged Rust toolchain")?;
         match publication {
             ToolchainPublication::Create => {
                 complete_staged_install_with_lease(
@@ -611,25 +617,26 @@ impl RustManager {
             &version_dir,
             "https://static.rust-lang.org/dist/",
             &serde_json::to_vec(manifest)?,
-        )?;
+        )
+        .context("Failed to record Rust manifest publisher identity")?;
         super::security::record_exact_release(
             &version_dir,
             &manifest_version(manifest).context("Rust manifest has no exact release")?,
             &manifest_release(manifest)?,
             BTreeMap::new(),
-        )?;
-        let _admission = self.security.prepare_staged(
-            "rust",
-            &toolchain.name(),
-            staging.path(),
-            &version_dir,
-        )?;
+        )
+        .context("Failed to record exact Rust release metadata")?;
+        let _admission = self
+            .security
+            .prepare_staged("rust", &toolchain.name(), staging.path(), &version_dir)
+            .context("Failed to review staged Rust component update")?;
         replace_staged_install_with_lease(
             &staging,
             &version_dir,
             &toolchain.name(),
             mutation_lease,
-        )?;
+        )
+        .context("Failed to publish reviewed Rust component update")?;
         publisher.commit();
         Ok(())
     }
@@ -918,6 +925,122 @@ fn manifest_component_checksum(
 #[expect(clippy::unwrap_used)] // Idiomatic in tests: panics on failure with clear error context
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn available_channels_require_a_concrete_stable_release_without_installing() -> Result<()>
+    {
+        let path = "/dist/channel-rust-stable.toml";
+        let fixture = super::super::test_https::HttpsFixture::new(
+            "static.rust-lang.org",
+            vec![
+                (
+                    path.into(),
+                    b"[pkg.rustc]\nversion = '1.93.1 (owned fixture)'\n".to_vec(),
+                ),
+                (path.into(), b"manifest-version = '2'\n".to_vec()),
+            ],
+        )
+        .await?;
+        let directory = TempDir::new()?;
+        let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: directory.path().to_path_buf(),
+            client: Box::leak(Box::new(fixture.client(true)?)),
+        };
+
+        let channels = manager.list_available().await?;
+        let actual = channels
+            .iter()
+            .map(|entry| (entry.version.as_str(), entry.channel.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                ("1.93.1", "stable"),
+                ("beta", "beta"),
+                ("nightly", "nightly")
+            ]
+        );
+        let error = manager
+            .list_available()
+            .await
+            .expect_err("missing stable rustc identity must fail");
+        assert_eq!(
+            error.to_string(),
+            "Stable Rust channel manifest is missing a rustc version"
+        );
+        assert_eq!(
+            fixture.finish().await?,
+            vec![format!("GET {path} HTTP/1.1"); 2]
+        );
+        assert_eq!(
+            fs::read_dir(directory.path())?.count(),
+            0,
+            "listing must not create installation state"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pinned_install_refuses_invalid_publisher_identity_without_changing_current() {
+        let fixture = super::super::test_archive::PublicationFixture::new("rust", "bin/rustc");
+        let manager = RustManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        let toolchain = RustToolchainSpec::parse("1.93.1").expect("exact pinned Rust coordinate");
+        let candidate = manager.toolchain_dir(&toolchain);
+        fs::create_dir_all(candidate.join("bin")).expect("create owned installed Rust fixture");
+        fs::write(
+            candidate.join("bin/rustc"),
+            b"owned inert candidate compiler",
+        )
+        .expect("candidate Rust compiler");
+        RustManager::write_metadata(
+            &candidate,
+            &RustToolchainMetadata {
+                release: Some("1.93.1".to_owned()),
+                components: BTreeSet::from(["rustc".to_owned()]),
+                targets: BTreeSet::new(),
+            },
+        )
+        .expect("installed Rust component identity");
+        crate::runtimes::security::fixture_prepare(
+            "rust",
+            &toolchain.name(),
+            &candidate,
+            &candidate,
+        )
+        .expect("admit the controlled installed Rust tree before corrupting identity");
+        fixture.corrupt_identity(&toolchain.name());
+        let identity =
+            fs::read(fixture.identity_path(&toolchain.name())).expect("corrupted identity");
+        let binary = fs::read(candidate.join("bin/rustc")).expect("original candidate bytes");
+
+        let error = manager
+            .install("1.93.1")
+            .await
+            .expect_err("unreviewable pinned Rust must not activate");
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to review installed Rust toolchain"
+        );
+        assert!(format!("{error:#}").contains("Invalid runtime publisher identity"));
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        assert_eq!(
+            fs::read(candidate.join("bin/rustc")).expect("candidate unchanged"),
+            binary
+        );
+        assert_eq!(
+            fs::read(fixture.identity_path(&toolchain.name()))
+                .expect("publisher evidence unchanged"),
+            identity
+        );
+        fixture.assert_previous();
+    }
 
     #[tokio::test]
     async fn metadata_retry_recovers_rust_manifest_without_publishing_toolchain() -> Result<()> {
@@ -1215,7 +1338,8 @@ mod tests {
                 "rust",
                 &directory,
                 crate::runtimes::security::ReviewMode::CachedOnly,
-            )?
+            )
+            .context("Published Rust fixture must retain cached advisory authority")?
             .verify(&directory)?;
         assert_eq!(
             fs::read_dir(versions.path().join(".security"))?.count(),
@@ -1398,7 +1522,8 @@ mod tests {
             &previous.name(),
             &previous_dir,
             &previous_dir,
-        )?;
+        )
+        .context("Bind the previous Rust source-installation fixture")?;
         manager.activate_toolchain(&previous, &lease)?;
         drop(lease);
         let metadata_before = fs::read(previous_dir.join(RUST_METADATA_FILE))?;
@@ -2071,7 +2196,8 @@ mod tests {
             "stable-x86_64-unknown-linux-gnu",
             staging.path(),
             &version_dir,
-        )?;
+        )
+        .context("Admit initial Rust staging fixture before publication")?;
         crate::runtimes::common::complete_staged_install(
             &staging,
             &version_dir,
@@ -2111,7 +2237,8 @@ mod tests {
             "stable-x86_64-unknown-linux-gnu",
             staging.path(),
             &version_dir,
-        )?;
+        )
+        .context("Admit incremental Rust staging fixture before replacement")?;
         crate::runtimes::common::replace_staged_install(
             &staging,
             &version_dir,

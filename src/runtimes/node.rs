@@ -227,12 +227,15 @@ impl NodeManager {
 
     fn publish_install(&self, staging: &tempfile::TempDir, version: &str) -> Result<()> {
         super::common::require_regular_file(&staging.path().join("bin/node"))?;
-        let admission = self.security.prepare_staged(
-            "node",
-            version,
-            staging.path(),
-            &self.versions_dir.join(version),
-        )?;
+        let admission = self
+            .security
+            .prepare_staged(
+                "node",
+                version,
+                staging.path(),
+                &self.versions_dir.join(version),
+            )
+            .context("Failed to review staged Node.js runtime")?;
         admission.before_execution(staging.path())?;
         smoke_node(staging.path(), version)?;
         complete_staged_install(staging, &self.versions_dir.join(version), version)
@@ -292,11 +295,14 @@ impl NodeManager {
             "Node.js version {version} is not installed as a valid directory"
         );
         super::common::require_regular_file(&version_dir.join("bin/node"))?;
-        let admission = self.security.installed(
-            "node",
-            &self.versions_dir.join(&version),
-            super::security::ReviewMode::FreshAttended,
-        )?;
+        let admission = self
+            .security
+            .installed(
+                "node",
+                &self.versions_dir.join(&version),
+                super::security::ReviewMode::FreshAttended,
+            )
+            .context("Failed to review installed Node.js runtime")?;
         admission.verify(&self.versions_dir.join(&version))?;
         smoke_node(&version_dir, &version)?;
         activate_version_with_lease(&self.versions_dir, &version, Path::new("bin/node"), &lease)?;
@@ -893,10 +899,10 @@ mod tests {
     #[cfg(feature = "pgp")]
     fn node_manifest_interoperates_with_exact_pinned_public_authorities() -> Result<()> {
         use sequoia_openpgp::parse::Parse as _;
-        let certs = sequoia_openpgp::cert::CertParser::from_bytes(include_bytes!(
-            "keys/node-release-keys.asc"
-        ))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        let pinned = include_bytes!("keys/node-release-keys.asc");
+        let certs = sequoia_openpgp::cert::CertParser::from_bytes(pinned)
+            .context("Pinned Node release certificates must parse")?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         assert_eq!(certs.len(), NODE_RELEASE_FINGERPRINTS.len());
         assert!(certs.iter().all(|cert| !cert.is_tsk()));
         let mut fingerprints = certs
@@ -1501,6 +1507,70 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn installed_node_fast_path_refuses_invalid_identity_before_execution() {
+        let fixture = super::super::test_archive::PublicationFixture::new("node", "bin/node");
+        let candidate = fixture.versions.join("24.22.3");
+        let marker = fixture.owner.path().join("node-probe-invoked");
+        let quoted_marker = format!("'{}'", marker.display().to_string().replace('\'', "'\\''"));
+        write_node_probe(
+            &candidate,
+            &format!("printf invoked > {quoted_marker}; printf 'v24.22.3\\n'"),
+            true,
+        )
+        .expect("create executable owned Node candidate");
+        crate::runtimes::security::fixture_prepare("node", "24.22.3", &candidate, &candidate)
+            .expect("admit exact installed Node fixture");
+        let manager = NodeManager {
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            versions_dir: fixture.versions.clone(),
+            client: download_client(),
+        };
+        manager
+            .install("24.22.3")
+            .await
+            .expect("existing exact Node installation activates without a download");
+        assert_eq!(
+            fs::read(&marker).expect("valid Node candidate was probed"),
+            b"invoked"
+        );
+        assert_eq!(manager.current_version().as_deref(), Some("24.22.3"));
+
+        fs::remove_file(&marker).expect("clear the first probe marker");
+        fs::remove_file(fixture.versions.join("current")).expect("restore prior selection");
+        std::os::unix::fs::symlink("1.0.0", fixture.versions.join("current"))
+            .expect("reselect previously reviewed Node");
+        fixture.corrupt_identity("24.22.3");
+        let identity = fs::read(fixture.identity_path("24.22.3")).expect("corrupted identity");
+        let binary = fs::read(candidate.join("bin/node")).expect("candidate launcher");
+
+        let error = manager
+            .install("24.22.3")
+            .await
+            .expect_err("invalid installed identity must stop the existing-version fast path");
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to review installed Node.js runtime"
+        );
+        assert!(format!("{error:#}").contains("Invalid runtime publisher identity"));
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        assert!(
+            !marker.exists(),
+            "unreviewed Node must never reach the version probe"
+        );
+        assert_eq!(
+            fs::read(candidate.join("bin/node")).expect("preserved launcher"),
+            binary
+        );
+        assert_eq!(
+            fs::read(fixture.identity_path("24.22.3")).expect("preserved evidence"),
+            identity
+        );
+        fixture.assert_previous();
+    }
+
     #[test]
     fn incomplete_node_install_is_not_published_and_can_be_retried() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1523,7 +1593,8 @@ mod tests {
             "22.0.0",
             staging.path(),
             &manager.versions_dir.join("22.0.0"),
-        )?;
+        )
+        .context("Bind complete Node publication retry fixture")?;
         manager.publish_install(&staging, "22.0.0")?;
         assert_eq!(manager.list_installed()?, vec!["22.0.0"]);
         Ok(())
@@ -1599,7 +1670,8 @@ mod tests {
             "20.0.0",
             &manager.versions_dir.join("20.0.0"),
             &manager.versions_dir.join("20.0.0"),
-        )?;
+        )
+        .context("Bind previous Node refusal-control runtime")?;
         manager.use_version("20.0.0")?;
         let original = fs::read(previous.join("bin/node"))?;
         let staging = begin_staged_install(directory.path())?;
@@ -1614,7 +1686,8 @@ mod tests {
             "22.0.0",
             &candidate,
             &directory.path().join("22.0.0"),
-        )?;
+        )
+        .context("Bind candidate Node refusal-control runtime")?;
         let candidate_bytes = fs::read(candidate.join("bin/node"))?;
         let result = if publication {
             manager.publish_install(&staging, "22.0.0")
@@ -2089,7 +2162,8 @@ mod tests {
             "20.0.0",
             &manager.versions_dir.join("20.0.0"),
             &manager.versions_dir.join("20.0.0"),
-        )?;
+        )
+        .context("Bind previous Node lease-control runtime")?;
         manager.use_version("20.0.0")?;
         let candidate = directory.path().join("22.0.0");
         let control = tempfile::tempdir()?;
@@ -2102,9 +2176,8 @@ mod tests {
             ),
             true,
         )?;
-        crate::runtimes::security::fixture_bind_candidate(
-            "node", "22.0.0", &candidate, &candidate,
-        )?;
+        crate::runtimes::security::fixture_bind_candidate("node", "22.0.0", &candidate, &candidate)
+            .context("Bind Node lease-control candidate")?;
         let worker = std::thread::spawn(move || manager.use_version("22.0.0"));
         let start = std::time::Instant::now();
         while !control.path().join("ready").try_exists()?
@@ -2148,7 +2221,8 @@ mod tests {
             "20.0.0",
             &manager.versions_dir.join("20.0.0"),
             &manager.versions_dir.join("20.0.0"),
-        )?;
+        )
+        .context("Bind previous Node unsafe-path control runtime")?;
         manager.use_version("20.0.0")?;
         let outside = tempfile::tempdir()?;
         write_node_probe(
@@ -2181,14 +2255,16 @@ mod tests {
             "22.0.0",
             staging.path(),
             &manager.versions_dir.join("22.0.0"),
-        )?;
+        )
+        .context("Bind Node staging fixture before current-thread publication")?;
         manager.publish_install(&staging, "22.0.0")?;
         crate::runtimes::security::fixture_bind_candidate(
             "node",
             "22.0.0",
             &manager.versions_dir.join("22.0.0"),
             &manager.versions_dir.join("22.0.0"),
-        )?;
+        )
+        .context("Bind published Node fixture before current-thread activation")?;
         manager.use_version("22.0.0")?;
         assert_eq!(manager.current_version(), Some("22.0.0".to_owned()));
         Ok(())
@@ -2282,7 +2358,7 @@ mod tests {
         let body = br#"[{"version":"v21.0.0","lts":false},{"version":"v20.10.0","lts":"Iron"},{"version":"v18.19.0","lts":"Hydrogen"}]"#;
         let fixture = super::super::test_https::HttpsFixture::new(
             "nodejs.org",
-            (0..4)
+            (0..6)
                 .map(|_| ("/dist/index.json".into(), body.to_vec()))
                 .collect(),
         )
@@ -2298,9 +2374,11 @@ mod tests {
         assert_eq!(manager.resolve_alias("lts/iron").await?, "20.10.0");
         assert!(manager.resolve_alias("lts/missing").await.is_err());
         assert_eq!(manager.resolve_alias("v20.10.0").await?, "20.10.0");
+        assert_eq!(manager.resolve_requested_version("20").await?, "20.10.0");
+        assert_eq!(manager.resolve_requested_version("20.10").await?, "20.10.0");
         assert_eq!(
             fixture.finish().await?,
-            vec!["GET /dist/index.json HTTP/1.1"; 4]
+            vec!["GET /dist/index.json HTTP/1.1"; 6]
         );
         assert_eq!(std::fs::read_dir(versions.path())?.count(), 0);
         Ok(())
