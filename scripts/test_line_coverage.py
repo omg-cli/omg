@@ -1387,6 +1387,10 @@ class OsvRequestMigrationTests(unittest.TestCase):
         proof = coverage.retained_osv_fixture_migration((old,side('scan_osv_package')),[100_000])
         self.assertIsNotNone(proof)
         self.assertIn([9,9],proof['pairs'])
+        self.assertEqual(proof['async_copies']['base'][0]['body'], '_RNC'+symbol[2:]+'0Bb_')
+        self.assertEqual(proof['async_copies']['head'][0]['body_state'], 1)
+        self.assertEqual(proof['async_fragment_regions'][0]['base_range'], [4,11])
+        self.assertEqual(proof['async_fragment_regions'][0]['head_range'], [4,11])
         for mismatch in ({'missing_future':True},{'cold':True},{'endpoint':'"Alpine:v3"'}):
             with self.subTest(mismatch=mismatch):
                 self.assertIsNone(coverage.retained_osv_fixture_migration((old,side('scan_osv_package',**mismatch)),[100_000]))
@@ -1489,6 +1493,101 @@ class OsvRequestMigrationTests(unittest.TestCase):
         self.assertNotEqual(old[0],observe(field,extra_region_delta=-1)[0])
         self.assertIsNone(observe(field,shortened=True))
         self.assertIsNone(observe('arch_endpoint: endpoint.clone(),'))
+
+
+
+    def test_scanner_constructor_retains_both_compiled_copies(self):
+        name = 'src/core/security/vulnerability.rs'
+        filename = '/artifact/' + name
+        files = {filename: name}
+
+        def compare(cold=False, drop=False, change=False):
+            sides, indexes = [], []
+            work = [1_000_000]
+            for side in range(2):
+                source = ['impl VulnerabilityScanner {','    pub fn new() -> Self {','        Self {',
+                          '            client: shared_client().clone(),',
+                          '            osv_api_url: "https://api.osv.dev/v1/query".to_string(),',
+                          '            osv_ecosystem_override: None,']
+                if side:
+                    source.append('            arch_endpoint: ARCH_ADVISORY_ENDPOINT.to_owned(),')
+                if side and change:
+                    source[3] = '            client: custom_client().clone(),'
+                source.extend(['        }','    }','}'])
+                last = len(source)-1
+                owners = []
+                for instance in range(2):
+                    if side and drop and instance:
+                        continue
+                    hits = int(not side or not cold or not instance)
+                    disambiguator = str(side+1)+str(instance+1)
+                    symbol = (f'_RNvMs_NtNtNtCs{disambiguator}_7omg_lib4core8security13vulnerability'
+                              'NtB4_20VulnerabilityScanner3new')
+                    rows = [[2,5,2,25], [3,9,last-1,10], [4,21,4,36], [4,37,4,42],
+                            [5,26,5,56], [last,5,last,6]]
+                    if side:
+                        rows.extend([[5,57,5,66],[6,37,6,41]])
+                    owners.append(dict(name=symbol,count=hits,filenames=[filename],
+                                       regions=[[*row,hits,0,0,0] for row in rows]))
+                counts = coverage._owner_line_counts({'regions':[r for o in owners for r in o['regions']]},
+                                                      coverage._ObserverWork(work))
+                spans = {id(o):coverage.source_owner_span(o,name,files,source) for o in owners}
+                sides.append((source,coverage._construct_inventory(source,work),spans,counts,4))
+                indexes.append(coverage.index_compiled_owner_sources(owners,files,work,{name}))
+            return coverage.retained_scanner_construction(name,sides,indexes,work)
+
+        proof = compare()
+        self.assertEqual(proof['pairs'], [[2,2],[3,3],[4,4],[5,5],[6,6],[7,8],[8,9]])
+        self.assertEqual(proof['instance_states'], [[True,True],[True,True]])
+        self.assertEqual(proof['added_lines'], [7])
+        self.assertIsNone(compare(cold=True))
+        self.assertIsNone(compare(drop=True))
+        self.assertIsNone(compare(change=True))
+
+    def test_scanner_fixture_keeps_the_covered_ecosystem_loop(self):
+        name = 'src/core/security/vulnerability.rs'
+        test = 'cache_key_includes_the_ecosystem'
+        symbol = f'_RNvNtNtNtNtCs1_7omg_lib4core8security13vulnerability5tests{len(test)}{test}'
+        def observe(modern=False, iterations=2, case='Debian:13', retained_field_hits=2):
+            source = ['#[cfg(test)]','mod tests {','    #[tokio::test]',
+                f'    async fn {test}() -> anyhow::Result<()> {{',
+                f'        for (expected_requests, ecosystem) in [(1, "Debian:12"), (2, "{case}")] {{',
+                '            let scanner = VulnerabilityScanner {',
+                '                client: shared_client().clone(),',
+                '                osv_api_url: endpoint.clone(),',
+                '                osv_ecosystem_override: Some(ecosystem.to_string()),']
+            if modern:
+                source.append('                arch_endpoint: ARCH_ADVISORY_ENDPOINT.to_owned(),')
+            source.extend(['            };','        }','        Ok(())','    }','}'])
+            close = len(source)-4
+            end = len(source)-1
+            brace = len(source[3])
+            rows = [[4,brace,4,brace+1,1,0,0,0],
+                [5,14,5,31,iterations,0,0,0], [5,33,5,42,2,0,0,0], [5,47,5,83,1,0,0,0],
+                [6,17,6,24,2,0,0,0], [6,27,close,14,2,0,0,0],
+                [7,25,7,40,2,0,0,0], [7,41,7,46,2,0,0,0],
+                [8,30,8,38,2,0,0,0], [8,39,8,44,2,0,0,0], [end,5,end,6,1,0,0,0]]
+            if modern:
+                rows.insert(-1,[9,41,9,68,retained_field_hits,0,0,0])
+            root = dict(name=symbol,filenames=['/artifact/'+name],count=1,
+                        regions=[[4,11,4,brace-1,1,0,0,0]])
+            child = dict(root,name='_RNC'+symbol[2:]+'0Bb_',regions=rows)
+            owners = (root,child)
+            work = [500_000]
+            counts = coverage._owner_line_counts({'regions':rows},coverage._ObserverWork(work))
+            return coverage.async_runtime_fixture_record(name,source,counts,(4,end,[root]),owners,
+                Counter(o['name'] for o in owners),coverage._construct_inventory(source,work),6,6,work)
+
+        old = observe()
+        head = observe(modern=True)
+        self.assertIsNotNone(old)
+        self.assertIsNotNone(head)
+        self.assertEqual(old[0],head[0])
+        self.assertEqual(head[1]['loop_iterations'],2)
+        self.assertIsNone(observe(modern=True, iterations=0))
+        self.assertIsNone(observe(modern=True, case='Debian:14'))
+        cold = observe(modern=True, retained_field_hits=0)
+        self.assertTrue(cold is None or cold[0] != old[0])
 
     def test_request_observation_requires_exact_coordinates_and_all_compiled_copies(self):
         def scenario(modern, fault=None):

@@ -3540,6 +3540,88 @@ def retained_policy_default_record(name, sides, indexes, work):
                 instance_states=states,direct_field_indices=refinements,added_lines=[item[1] for item in right[5:]])
 
 
+
+def retained_scanner_construction(name, sides, indexes, work):
+    """Match intact eager scanner constructors across the added Arch endpoint."""
+    namespace = ('type',('type',('type',('crate','omg_lib'),('core','')),('security','')),('vulnerability',''))
+    scanner_type = ('type',namespace,('VulnerabilityScanner',''))
+    observations = []
+    for side, ((source, inventory, spans, counts, line), index) in enumerate(zip(sides,indexes,strict=True)):
+        code, rows = inventory[:2]
+        token = bisect.bisect_left(code.starts,code.offsets[line-1])
+        parents = _construct_ancestors(code,token,work)
+        _construct_charge(work,len(rows)+len(code.starts).bit_length())
+        shapes = {row['opening']: row for row in rows if row['opening'] in parents}
+        if len(parents)!=3 or len(shapes)!=3:
+            return None
+        record, function, implementation = (shapes[parent] for parent in parents)
+        if (record['header']!=('Self',) or implementation['header']!=('impl','VulnerabilityScanner')
+                or record['first']!=function['opening']+1 or record['end']+1!=function['end']):
+            return None
+        first = code.position(code.starts[function['first']])[0]
+        last = code.position(code.ends[function['end']])[0]
+        method = re.fullmatch(r'    pub fn (new)\(\) -> Self \{|'
+            r'    pub fn (with_osv_endpoint)\(osv_api_url: String, ecosystem: String\) -> Self \{',source[first-1])
+        if method is None or line!=first+2 or last!=first+6+side:
+            return None
+        method = method[1] or method[2]
+        url = '"https://api.osv.dev/v1/query"'
+        fields = (['client: shared_client().clone(),',f'osv_api_url: {url}.to_string(),',
+                   'osv_ecosystem_override: None,'] if method=='new' else
+                  ['client: shared_client().clone(),','osv_api_url,','osv_ecosystem_override: Some(ecosystem),'])
+        fields += ['arch_endpoint: ARCH_ADVISORY_ENDPOINT.to_owned(),'] if side else []
+        if source[line-1:last-2] != ['            '+text for text in fields]:
+            return None
+
+        def marker(offset, text):
+            at = source[line+offset-1].index(text)+1
+            return line+offset,at,line+offset,at+len(text)
+
+        required = {code.region(function['first'],function['opening']-1),
+                    code.region(record['first'],record['end']),
+                    code.region(function['end'],function['end']),marker(0,'shared_client()'),marker(0,'clone')}
+        if method=='new':
+            required.add(marker(1,url))
+            optional = {marker(1,'to_string'),marker(2,'None')}
+        else:
+            optional = {marker(1,'osv_api_url'),marker(2,'Some(ecosystem)')}
+        owners = []
+        identities = set()
+        for owner in index.inventories.get(name,()):
+            raw = owner['regions']
+            _construct_charge(work,len(raw)+1)
+            if not any(row[0]<=last and row[2]>=first for row in raw):
+                continue
+            symbol = owner['name']
+            decoded = nominal_method_path(symbol)
+            hits = owner['count']
+            span = spans.get(id(owner))
+            geometry = {tuple(row[:4]) for row in raw}
+            if (span is None or span[:2]!=(first,last) or index.name_counts[symbol]!=1
+                    or decoded is None or decoded.kind!='M' or decoded.namespace!=namespace
+                    or decoded.self_type!=scanner_type or decoded.method!=(method,'') or decoded.callbacks
+                    or decoded.copy_identity in identities or owner.get('branches') or owner.get('mcdc_records')
+                    or type(hits) is not int or not 0<=hits<COUNTER_LIMIT
+                    or any(row[5:]!=[0,0,0] or row[4]!=hits for row in raw)
+                    or len(geometry)!=len(raw) or not required<=geometry<=required|optional):
+                return None
+            identities.add(decoded.copy_identity)
+            owners.append(dict(name=symbol,count=hits,regions=raw))
+        states = sorted(owner['count']>0 for owner in owners)
+        projected = _owner_line_counts({'regions':[r for o in owners for r in o['regions']]},_ObserverWork(work))
+        if (not any(states) or projected!={n:counts[n] for n in range(first,last+1) if n in counts}
+                or any(counts.get(n,0)<=0 for n in range(first,last+1))):
+            return None
+        observations.append((method, first, last, states, owners))
+    (old_method, old, last, base_states, base), (new_method, new, end, head_states, head) = observations
+    if old_method!=new_method or base_states!=head_states:
+        return None
+    pairs = [[number,new+number-old] for number in range(old,last-1)]
+    pairs.extend([[last-1,end-1],[last,end]])
+    return dict(file=name,kind='retained-scanner-construction',pairs=pairs,owners=[base,head],
+                instance_states=[base_states,head_states],added_lines=[end-2])
+
+
 def retained_match_selector(name, sides, indexes, work):
     """Bind a parameter selector or exact default refusal across every compiled root."""
     observed = []
@@ -4089,9 +4171,11 @@ def sync_runtime_fragment_owners(name, group, owners, names, inventory, first, l
     return fn,(shape.identity,words),dict(root=root['name'],regions=affected[0][1],entry=entry,synchronous=True),hits
 
 
-def incremental_rust_fixture_loop(inventory, function, record, owners, witness, entries, work):
+def fixture_record_loop(inventory, function, record, owners, witness, entries, work, *, ecosystem=False):
     code, rows=inventory[:2]
-    if function['header'][:3]!=('async','fn','incremental_updates_fixture'):
+    declaration = function['header']
+    function_name = 'cache_key_includes_the_ecosystem' if ecosystem else 'incremental_updates_fixture'
+    if declaration[declaration.index('fn')+1] != function_name:
         return None
     opening=code.parents[record['first']]
     _construct_charge(work,len(rows))
@@ -4099,10 +4183,11 @@ def incremental_rust_fixture_loop(inventory, function, record, owners, witness, 
     if len(matches)!=1:
         return None
     loop,=matches
-    header=('for','(','installed',',','candidate',',','compatible',')','in','[')
+    header = (('for','(','expected_requests',',','ecosystem',')','in','[') if ecosystem
+              else ('for','(','installed',',','candidate',',','compatible',')','in','['))
+    setup = [] if ecosystem else ['let','versions','=','TempDir','::','new','(',')','?',';']
     if (loop['header'][:len(header)]!=header or code.parents[loop['first']]!=function['opening']
-            or code.words[opening+1:record['first']]!=
-                ['let','versions','=','TempDir','::','new','(',')','?',';']):
+            or code.words[opening+1:record['first']] != setup):
         return None
     array=loop['first']+len(header)-1
     if code.pairs.get(array)!=opening-1 or opening-array>512:
@@ -4112,7 +4197,10 @@ def incremental_rust_fixture_loop(inventory, function, record, owners, witness, 
         return None
     _construct_charge(work,opening-array)
     literals=re.compile(r'"[^"\\\r\n]{0,256}"',re.ASCII)
-    for begin,end in cases:
+    if ecosystem and [code.words[begin:end] for begin,end in cases] != [
+            ['(', '1', ',', '"Debian:12"', ')'], ['(', '2', ',', '"Debian:13"', ')']]:
+        return None
+    for begin,end in [] if ecosystem else cases:
         if code.words[begin]!='(' or code.pairs.get(begin)!=end-1:
             return None
         parts=_boolean_arguments(code,begin)
@@ -4124,9 +4212,10 @@ def incremental_rust_fixture_loop(inventory, function, record, owners, witness, 
                 or len(candidate)!=1 or literals.fullmatch(candidate[0]) is None
                 or compatible not in (['true'],['false'])):
             return None
-    bindings=[code.region(loop['first']+offset,loop['first']+offset) for offset in (2,4,6)]
+    offsets = (2,4) if ecosystem else (2,4,6)
+    bindings=[code.region(loop['first']+offset,loop['first']+offset) for offset in offsets]
     envelope=code.region(array,opening-1)
-    case_spans=[code.region(begin,end-1) for begin,end in cases[:-1]]
+    case_spans=[] if ecosystem else [code.region(begin,end-1) for begin,end in cases[:-1]]
     expected={*bindings,envelope,*case_spans}
     low,high=code.region(loop['first'],opening-1)[:2],envelope[2:]
     rows_seen={}
@@ -4183,6 +4272,10 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
         return None
     record, = candidates
     closing = code.position(code.ends[record['end']])[0]
+    compact_scanner = scanner and closing-first in (4,5)
+    if compact_scanner:
+        original_size = 4
+        fields = [(4,f'arch_endpoint: {initializer},',initializer)]
     if closing-first not in (original_size,original_size+len(fields)) or source[closing-1].strip()!='};':
         return None
     synchronous=source[group[0]-1].lstrip().startswith('fn ')
@@ -4190,12 +4283,16 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
         bound=sync_runtime_fragment_owners(name,group,owners,names,inventory,first,closing,work)
     else:
         bound = async_test_fragment_owners(name,group,owners,names,inventory,first,closing,work,
-                                           result_alias=True,runtime_helper=True)
+                                           result_alias=not scanner,runtime_helper=True)
     if bound is None:
         return None
     function, identity, witness, entry_hits = bound
-    if code.parents[record['first']]!=function['opening']:
-        loop=incremental_rust_fixture_loop(inventory,function,record,owners,witness,entry_hits,work)
+    in_loop = code.parents[record['first']] != function['opening']
+    if compact_scanner and not in_loop:
+        return None
+    if in_loop:
+        loop=fixture_record_loop(inventory,function,record,owners,witness,entry_hits,work,
+                                 ecosystem=compact_scanner)
         if loop is None:
             return None
         entry_hits, header=loop
@@ -4204,7 +4301,8 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
             return None
         identity=(*identity,header)
         witness['loop_iterations']=entry_hits
-    if (synchronous or identity[1][:2]==('async','fn')) and any(row[4]>entry_hits for row in witness['regions']):
+    if (synchronous or in_loop or identity[1][:2]==('async','fn')) and any(
+            row[4]>entry_hits for row in witness['regions']):
         return None
     if counts.get(first,0)<=0:
         return None
@@ -4248,7 +4346,8 @@ def async_runtime_fixture_record(name, source, counts, group, owners, names, inv
             return None
         if scanner and witness.get('initializer_uses_record_envelope'):
             preceding = source[added-2]
-            value = 'Some("Debian:12".to_string())'
+            value = ('Some(ecosystem.to_string())' if compact_scanner
+                     else 'Some("Debian:12".to_string())')
             if preceding.strip()==f'osv_ecosystem_override: {value},':
                 start = preceding.index(value)+1
                 field = (added-1,start,added-1,start+len(value))
@@ -4363,7 +4462,7 @@ def retained_osv_fixture_migration(sides, work):
             if start<position<start+width:
                 return None
             return position-(width-len(methods[0]))*int(position>=start+width)
-        records = {}; all_rows = []
+        records = {}; body = None; all_rows = []
         for owner in owners:
             child = owner['name']
             _construct_charge(work,4*len(owner['regions'])+len(child)+1)
@@ -4388,20 +4487,27 @@ def retained_osv_fixture_migration(sides, work):
                         or not 0<=hit<COUNTER_LIMIT):
                     return None
                 rows.append((a-first,begin,c-first,end,hit))
+            if depth and depth[1]=='NC':
+                if body is not None or not 0<owner['count']<=root['count']:
+                    return None
+                body=dict(constructor=symbol,body=child,constructor_state=1,body_state=1)
             records[role] = (owner['count'],tuple(rows))
             all_rows.extend(touching)
         compared = {i:counts[i] for i in range(first,last+1) if i in counts}
-        if ('' not in records or len(records)<2 or
+        if ('' not in records or body is None or
                 _owner_line_counts({'regions':all_rows},_ObserverWork(work))!=compared):
             return None
-        observations.append((shape.identity,tuple(projection),records,list(compared),first,widths))
+        observations.append((shape.identity,tuple(projection),records,list(compared),first,widths,last,body))
     before, after = observations
     if before[:3]!=after[:3] or before[5]!={len('scan_package')} or after[5]!={len('scan_osv_package')}:
         return None
     pairs = [[line,line+after[4]-before[4]] for line in before[3]]
     if [target for _,target in pairs]!=after[3]:
         return None
-    return dict(kind='retained-osv-fixture-migration',pairs=pairs,counter_roles=list(before[2]))
+    return dict(kind='retained-osv-fixture-migration',pairs=pairs,counter_roles=list(before[2]),
+                async_copies=dict(base=[before[7]],head=[after[7]]),
+                async_fragment_regions=[dict(base_range=[before[4],before[6]],head_range=[after[4],after[6]],
+                                             normalized_regions={role:rows for role,(_,rows) in before[2].items()})])
 
 
 def async_runtime_inventory_assertion(name, source, counts, group, owners, names, inventory, first, last, work):
@@ -13234,6 +13340,19 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         if proof is not None:
                             if any(n in anchored and anchored[n]!=t for n,t in proof['pairs']):
                                 raise ValueError('Ambiguous policy default correspondence')
+                            anchored.update(proof['pairs'])
+                            obligation_receipts.append(proof)
+                            continue
+                    if (name=='src/core/security/vulnerability.rs' and inventories is not None
+                            and old[line-1]==new[target-1]
+                            and old[line-1].strip()=='client: shared_client().clone(),'
+                            and (bs[name]['expansions'],hs[name]['expansions'])==([],[])):
+                        sides=((old,inventories[0],base_spans,before,line),
+                               (new,inventories[1],head_spans,after,target))
+                        proof=retained_scanner_construction(name,sides,source_owner_indexes(),construct_work)
+                        if proof is not None:
+                            if any(n in anchored and anchored[n]!=t for n,t in proof['pairs']):
+                                raise ValueError('Ambiguous scanner constructor correspondence')
                             anchored.update(proof['pairs'])
                             obligation_receipts.append(proof)
                             continue
