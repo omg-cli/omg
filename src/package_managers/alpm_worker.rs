@@ -190,12 +190,17 @@ mod tests {
                 .expect("request within the daemon connection cap must fit");
         }
         let (reply, _response) = oneshot::channel();
-        let overflow = tx.try_send(reply).expect_err("queue must refuse request 129");
+        let overflow = tx
+            .try_send(reply)
+            .expect_err("queue must refuse request 129");
         assert!(
             matches!(&overflow, TrySendError::Full(_)),
             "capacity must refuse a request while the worker remains connected"
         );
-        drop(rx.try_recv().expect("the worker can drain a queued request"));
+        drop(
+            rx.try_recv()
+                .expect("the worker can drain a queued request"),
+        );
         tx.try_send(overflow.into_inner())
             .expect("draining the queue admits the original request");
     }
