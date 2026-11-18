@@ -865,17 +865,15 @@ assert_rc 3 "$qemu_runner" --distro debian --arch "$foreign_arch" --release v9.9
 jq -e --arg case "qemu-debian${foreign_suffix}-lifecycle" 'length == 1 and .[0].result == "HARNESS_ERROR" and .[0].exit_code == 3 and .[0].case_id == $case' "$(results_file "$scratch/qemu-arch-mismatch")" >/dev/null || fail "arch mismatch was not a harness error"
 assert_rc 3 "$qemu_runner" --distro arch --arch aarch64 --release v9.9.9 --staged-dir "$scratch/valid" --evidence-dir "$scratch/qemu-arch-nopin"
 jq -e 'length == 1 and .[0].result == "HARNESS_ERROR" and .[0].exit_code == 3' "$(results_file "$scratch/qemu-arch-nopin")" >/dev/null || fail "unpinned arch/aarch64 was not a harness error"
-# Pin audit: exact publisher hashes, both arches, arch/aarch64 absent.
+# Pin audit: all supported profiles agree with the reviewed publisher manifest.
 pins="$("$qemu_runner" --print-pins)"
 expected_pin_keys=$(printf '%s\n' arch-x86_64 debian-x86_64 debian-aarch64 debian-trixie-x86_64 ubuntu-x86_64 ubuntu-aarch64 fedora-x86_64 fedora-aarch64 | LC_ALL=C sort)
 actual_pin_keys=$(printf '%s\n' "$pins" | awk -F '\t' '{print $1 "-" $2}' | LC_ALL=C sort)
 [[ "$actual_pin_keys" == "$expected_pin_keys" ]] || fail "pin table differs from the supported guest profiles"
-printf '%s\n' "$pins" | awk -F '\t' '$1 == "debian-trixie" && $2 == "x86_64" && $3 == "https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2" && $4 == "f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d" && $5 == "sha512sum" {found++} END {exit found != 1}' || fail "Trixie x86_64 publisher pin mismatch"
-printf '%s\n' "$pins" | grep -Fq 'debian	aarch64	https://cloud.debian.org/images/cloud/bookworm/20261006-2623/debian-12-generic-arm64-20261006-2623.qcow2	991f0dd77ee442eb2406568fc27c537190af0c78ab211b0e2adcf568cd203aebf696b94a05e64c7e00d3e05e0e532fdd941311e34ef862ad06bc1bc69a92a3fb' || fail "debian aarch64 pin mismatch"
-printf '%s\n' "$pins" | grep -Fq 'ubuntu	aarch64	https://cloud-images.ubuntu.com/noble/20260926/noble-server-cloudimg-arm64.img	1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55' || fail "ubuntu aarch64 pin mismatch"
-printf '%s\n' "$pins" | grep -Fq 'fedora	aarch64	https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2	55c60a3b80d3616a08705afd0459e75fe9f03c54aba7a46e4002a41a72fa0d5b' || fail "fedora aarch64 pin mismatch"
-if printf '%s\n' "$pins" | grep -Fq 'arch	aarch64'; then fail "arch/aarch64 must have no pin"; fi
-printf '%s\n' "$pins" | grep -Fq 'arch	x86_64' || fail "x86_64 pins missing"
+reviewed_pins=$(jq -er '.images | to_entries[] | [.key, .value.url, .value.digest, (.value.algorithm + "sum")] | @tsv' \
+  "$repo_root/tests/qemu-image-provenance/manifest.json" | LC_ALL=C sort)
+actual_pins=$(printf '%s\n' "$pins" | awk -F '\t' 'BEGIN {OFS="\t"} {print $1 "-" $2, $3, $4, $5}' | LC_ALL=C sort)
+[[ "$actual_pins" == "$reviewed_pins" ]] || fail "QEMU publisher pins differ from the reviewed manifest"
 unset FAKE_QEMU_INFO_EXIT FAKE_QEMU_STATE FAKE_QEMU_GUEST_EXIT FAKE_QEMU_CLEANUP_FAIL FAKE_QEMU_TRANSPORT_EXIT FAKE_QEMU_MISSING_RECEIPT OMG_QEMU_ALLOW_NO_KVM
 
 cat > "$scratch/bin/brew" <<'EOF'

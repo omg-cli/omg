@@ -431,6 +431,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn program_processes_nested_batch_and_exec_in_order() {
+        struct RecordingModel(std::sync::Arc<std::sync::Mutex<Vec<usize>>>);
+
+        impl Model for RecordingModel {
+            type Msg = usize;
+
+            fn init(&self) -> Cmd<usize> {
+                Cmd::batch([Cmd::msg(1), Cmd::batch([Cmd::exec(|| 2), Cmd::msg(3)])])
+            }
+
+            fn update(&mut self, msg: usize) -> Cmd<usize> {
+                self.0.lock().unwrap().push(msg);
+                Cmd::none()
+            }
+
+            fn view(&self) -> String {
+                String::new()
+            }
+        }
+
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        Program::new(RecordingModel(std::sync::Arc::clone(&observed)))
+            .run()
+            .unwrap();
+        assert_eq!(*observed.lock().unwrap(), [1, 2, 3]);
+    }
+
     struct ErrorModel;
 
     impl Model for ErrorModel {

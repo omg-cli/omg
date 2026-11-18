@@ -52,7 +52,8 @@ impl PiManager {
         let prefix = staging.path().to_path_buf();
         let package_spec = format!("{PI_PACKAGE}@{version}");
         let output = tokio::task::spawn_blocking(move || {
-            Command::new(&npm)
+            let mut command = Command::new(&npm);
+            command
                 .args([
                     "install",
                     "--global",
@@ -72,8 +73,23 @@ impl PiManager {
                 .env_remove("NPM_CONFIG_USERCONFIG")
                 .env_remove("npm_config_userconfig")
                 .env_remove("NPM_CONFIG_GLOBALCONFIG")
-                .env_remove("npm_config_globalconfig")
-                .output()
+                .env_remove("npm_config_globalconfig");
+            let startup_end = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            loop {
+                match command.output() {
+                    Err(error)
+                        if error.raw_os_error() == Some(nix::libc::ETXTBSY)
+                            && std::time::Instant::now() < startup_end =>
+                    {
+                        std::thread::sleep(
+                            startup_end
+                                .saturating_duration_since(std::time::Instant::now())
+                                .min(std::time::Duration::from_millis(10)),
+                        );
+                    }
+                    result => return result,
+                }
+            }
         })
         .await
         .context("npm task failed while installing Pi")?
@@ -223,6 +239,38 @@ mod tests {
                 .lines()
                 .any(|argument| argument == "@earendil-works/pi-coding-agent@0.83.0")
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn busy_npm_remains_unpublished_and_can_be_retried_after_its_writer_closes() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let versions_dir = temp.path().join("versions/pi");
+        let npm = fake_npm(temp.path(), "0.83.0", true)?;
+        let writer = fs::OpenOptions::new().write(true).open(&npm)?;
+        let inherited = writer.try_clone()?;
+        drop(writer);
+        let manager = PiManager::with_paths(versions_dir.clone(), npm);
+
+        let error = manager
+            .install("0.83.0")
+            .await
+            .expect_err("npm with a live executable writer must remain an error");
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .context("startup error must preserve its OS cause")?
+                .raw_os_error(),
+            Some(nix::libc::ETXTBSY)
+        );
+        assert!(!versions_dir.join("0.83.0").exists());
+        assert_eq!(manager.current_version(), None);
+        drop(inherited);
+
+        manager.install("0.83.0").await?;
+        assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
         Ok(())
     }
 

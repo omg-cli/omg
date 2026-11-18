@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::common::{
-    MAX_DECOMPRESSED_BYTES, activate_version_with_lease, begin_staged_install,
+    MAX_DECOMPRESSED_BYTES, RuntimeLease, activate_version_with_lease, begin_staged_install,
     complete_staged_install_with_lease, copy_regular_tree, download_with_progress,
     extract_component_tar_gz, extract_component_tar_xz, is_valid_version_dir, parse_sha256_digest,
     print_already_installed, print_installed, print_using, replace_staged_install_with_lease,
@@ -250,7 +250,7 @@ impl RustManager {
     /// The root-wide lease protects toolchain snapshots and the shared current pointer.
     /// Acquisition never waits, so holding it across downloads cannot block the executor.
     /// Keep the lock file in place; unlinking it would permit locks on different inodes.
-    fn lock_mutations(&self) -> Result<fs::File> {
+    fn lock_mutations(&self) -> Result<RuntimeLease> {
         fs::create_dir_all(&self.versions_dir)?;
         let path = self.versions_dir.join(".mutation.lock");
         let mut options = fs::OpenOptions::new();
@@ -263,8 +263,8 @@ impl RustManager {
         let lock = options
             .open(&path)
             .with_context(|| format!("Failed to open Rust mutation lock: {}", path.display()))?;
-        match lock.try_lock() {
-            Ok(()) => Ok(lock),
+        match RuntimeLease::try_lock(lock) {
+            Ok(lease) => Ok(lease),
             Err(fs::TryLockError::WouldBlock) => {
                 anyhow::bail!("Another Rust toolchain operation is running; retry when it finishes")
             }
@@ -281,7 +281,7 @@ impl RustManager {
     async fn refresh_rolling_toolchain(
         &self,
         toolchain: &RustToolchainSpec,
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<bool> {
         if !is_rolling_channel(toolchain) {
             return Ok(false);
@@ -373,7 +373,7 @@ impl RustManager {
     fn activate_toolchain(
         &self,
         toolchain: &RustToolchainSpec,
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let toolchain_name = toolchain.name();
         activate_version_with_lease(
@@ -428,7 +428,7 @@ impl RustManager {
         profile: &str,
         components: &[String],
         targets: &[String],
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let mut required_components = profile_components(profile)?;
         required_components.extend_from_slice(components);
@@ -455,7 +455,7 @@ impl RustManager {
         targets: &[String],
         manifest: &toml::Value,
         publication: ToolchainPublication,
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let version_dir = self.toolchain_dir(toolchain);
         let staging = begin_staged_install(&self.versions_dir)?;
@@ -520,7 +520,7 @@ impl RustManager {
         toolchain: &RustToolchainSpec,
         components: &[String],
         targets: &[String],
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let version_dir = self.toolchain_dir(toolchain);
         if !is_valid_version_dir(&version_dir) {
@@ -549,7 +549,7 @@ impl RustManager {
         components: &[String],
         targets: &[String],
         manifest: &toml::Value,
-        mutation_lease: &fs::File,
+        mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let version_dir = self.toolchain_dir(toolchain);
         let mut metadata = Self::read_metadata(&version_dir)?;
@@ -1699,8 +1699,8 @@ mod tests {
         let version_dir = manager.toolchain_dir(&RustToolchainSpec::parse(&request.channel)?);
         fs::create_dir(&version_dir)?;
         fs::write(version_dir.join(RUST_METADATA_FILE), "[invalid metadata")?;
-        let lock = fs::File::create(versions.path().join(".mutation.lock"))?;
-        lock.lock()?;
+        let lock =
+            RuntimeLease::try_lock(fs::File::create(versions.path().join(".mutation.lock"))?)?;
 
         let busy = manager
             .ensure_toolchain(&request)
@@ -1738,34 +1738,27 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn incremental_updates_require_matching_release_identity() -> Result<()> {
+    #[test]
+    fn incremental_updates_require_matching_release_identity() -> Result<()> {
+        const NAME: &str =
+            "runtimes::rust::tests::incremental_updates_require_matching_release_identity";
+        if crate::core::testing::run_isolated_test_with_timeout(
+            NAME,
+            std::time::Duration::from_secs(35),
+        ) {
+            return Ok(());
+        }
+        temp_env::with_var("OMG_TEST_MODE", Some("1"), || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(incremental_updates_fixture())
+        })
+    }
+
+    async fn incremental_updates_fixture() -> Result<()> {
         use sha2::{Digest as _, Sha256};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        // The fixture downloads a component from a loopback HTTP server.
-        // Hermetic test mode is the only context where plain-HTTP loopback
-        // download targets are tolerated (release binaries always pin
-        // HTTPS); serialize because the switch is process-global.
-        struct TestModeGuard;
-        impl Drop for TestModeGuard {
-            fn drop(&mut self) {
-                // SAFETY: Test-only code, serialized by serial_test.
-                #[expect(unsafe_code)]
-                unsafe {
-                    std::env::remove_var("OMG_TEST_MODE");
-                }
-            }
-        }
-        // SAFETY: Test-only code, serialized by serial_test; no other test
-        // reads OMG_TEST_MODE concurrently.
-        #[expect(unsafe_code)]
-        unsafe {
-            std::env::set_var("OMG_TEST_MODE", "1");
-        }
-        let _test_mode = TestModeGuard;
-
         let archive = gzip_tar(&component_archive(
             "clippy/clippy/bin/cargo-clippy",
             EntryType::Regular,
@@ -1879,6 +1872,38 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn incremental_fixture_child_respects_its_deadline() {
+        const NAME: &str = "runtimes::rust::tests::incremental_fixture_child_respects_its_deadline";
+        if std::env::var("OMG_ISOLATED_FIXTURE_TEST").as_deref() == Ok(NAME) {
+            let ready = std::env::var_os("OMG_RUST_DEADLINE_READY").expect("ready marker path");
+            std::fs::write(ready, b"child ready").expect("write ready marker");
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        } else {
+            let directory = tempfile::tempdir().expect("deadline fixture directory");
+            let ready = directory.path().join("ready");
+            temp_env::with_var("OMG_RUST_DEADLINE_READY", Some(ready.as_os_str()), || {
+                let failure = std::panic::catch_unwind(|| {
+                    crate::core::testing::run_isolated_test_with_timeout(
+                        NAME,
+                        std::time::Duration::from_secs(5),
+                    );
+                })
+                .expect_err("the stalled child must exceed its deadline");
+                let message = failure
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| failure.downcast_ref::<&str>().copied())
+                    .expect("deadline failure must carry a message");
+                assert!(message.contains("exceeded its time or capture bound"));
+                assert_eq!(
+                    std::fs::read(&ready).expect("child became ready"),
+                    b"child ready"
+                );
+            });
+        }
     }
 
     #[test]

@@ -287,14 +287,18 @@ mod install_resolution_tests {
 
     #[test]
     fn test_install_nonexistent_package() {
-        let result = run_omg(&["install", "-y", "this-package-does-not-exist-xyz-12345"]);
-        result.assert_failure();
-        let combined = result.combined();
-        assert!(
-            combined.contains("not found") || combined.contains("error"),
-            "Should show not found error. Got: {}",
-            combined
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("available-fixture", "1.0").unwrap();
+        let state = project.data_dir.path().join("mock_state_pacman.json");
+        let before = std::fs::read(&state).unwrap();
+        let result = run_in_project(
+            &project,
+            &["install", "-y", "this-package-does-not-exist-xyz-12345"],
         );
+        assert_eq!(result.exit_code, 1, "{}", result.combined());
+        assert!(result.stderr.contains("Package 'this-package-does-not-exist-xyz-12345' not found. Suggestion: use 'omg search'"), "{}", result.combined());
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        project.close_checked();
     }
 
     #[test]
@@ -342,9 +346,22 @@ mod install_error_tests {
 
     #[test]
     fn test_install_no_panic_on_error() {
-        let result = run_omg(&["install", "-y", "definitely-fake-package"]);
-        result.assert_failure();
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("available-fixture", "1.0").unwrap();
+        let state = project.data_dir.path().join("mock_state_pacman.json");
+        let before = std::fs::read(&state).unwrap();
+        let result = run_in_project(&project, &["install", "-y", "definitely-fake-package"]);
+        assert_eq!(result.exit_code, 1, "{}", result.combined());
         result.assert_no_panic();
+        assert!(
+            result.stderr.contains(
+                "Package 'definitely-fake-package' not found. Suggestion: use 'omg search'"
+            ),
+            "{}",
+            result.combined()
+        );
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        project.close_checked();
     }
 
     #[test]
@@ -840,33 +857,36 @@ mod e2e_workflow_tests {
 
     #[test]
     fn test_install_dry_run_lists_available_official_package() {
-        if !system_tests_enabled() {
-            return;
-        }
-
-        // pacman exists in every Arch repository set; dry-run must list it
-        // as an available Official package.
-        let result = run_omg(&["install", "--dry-run", "pacman"]);
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("pacman", "6.0.2").unwrap();
+        let state_path = project.data_dir.path().join("mock_state_pacman.json");
+        let before = std::fs::read(&state_path).expect("read package state");
+        assert_no_installed_packages(&project);
+        let result = run_in_project(&project, &["install", "--dry-run", "pacman"]);
         result.assert_success();
         result.assert_contains("pacman");
         result.assert_contains("Official");
+        assert_preview_rows(&result, &[("pacman", "6.0.2", "Official")]);
+        assert_no_installed_packages(&project);
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        project.close_checked();
     }
 
     #[test]
     fn test_search_then_install_pipeline() {
-        if !system_tests_enabled() {
-            return;
-        }
-
-        // Realistic user workflow against the seeded mock index; the final
-        // dry-run reads real repository metadata.
-        let search = run_omg(&["search", "firefox"]);
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("firefox", "122.0").unwrap();
+        let state_path = project.data_dir.path().join("mock_state_pacman.json");
+        let before = std::fs::read(&state_path).unwrap();
+        let search = run_in_project(&project, &["search", "firefox"]);
         search.assert_success();
-        search.assert_contains("firefox");
+        search.assert_contains("firefox 122.0  Official");
 
-        let install = run_omg(&["install", "--dry-run", "firefox"]);
-        install.assert_success();
-        install.assert_contains("firefox");
+        let install = run_in_project(&project, &["install", "--dry-run", "firefox"]);
+        assert_preview_rows(&install, &[("firefox", "122.0", "Official")]);
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        assert_no_installed_packages(&project);
+        project.close_checked();
     }
 
     #[test]
@@ -967,16 +987,16 @@ mod edge_case_tests {
 
     #[test]
     fn test_multiple_flags_combination() {
-        if !system_tests_enabled() {
-            return;
-        }
-
-        // -y and --dry-run compose: the dry-run preview wins and nothing is
-        // installed or prompted.
-        let result = run_omg(&["install", "-y", "--dry-run", "firefox"]);
-        result.assert_success();
-        result.assert_contains("(dry run)");
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("firefox", "122.0").unwrap();
+        let state_path = project.data_dir.path().join("mock_state_pacman.json");
+        let before = std::fs::read(&state_path).unwrap();
+        let result = run_in_project(&project, &["install", "-y", "--dry-run", "firefox"]);
+        assert_preview_rows(&result, &[("firefox", "122.0", "Official")]);
         result.assert_no_password_prompt();
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        assert_no_installed_packages(&project);
+        project.close_checked();
     }
 
     #[test]
@@ -1112,18 +1132,25 @@ mod command_integration_tests {
 
     #[test]
     fn test_install_then_remove_workflow() {
-        if !destructive_tests_enabled() {
-            return;
-        }
+        let project = common::TestProject::for_distro("arch");
+        project.mock_install("firefox", "122.0").unwrap();
+        let state_path = project.data_dir.path().join("mock_state_pacman.json");
+        let before = std::fs::read(&state_path).unwrap();
+        let install = run_in_project(&project, &["install", "--dry-run", "firefox"]);
+        assert_preview_rows(&install, &[("firefox", "122.0", "Official")]);
 
-        // Preview workflow: both sides must show their dry-run contract.
-        let install = run_omg(&["install", "--dry-run", "firefox"]);
-        install.assert_success();
-        install.assert_contains("(dry run)");
-
-        let remove = run_omg(&["remove", "--dry-run", "firefox"]);
+        let remove = run_in_project(&project, &["remove", "--dry-run", "firefox"]);
         remove.assert_success();
+        remove.assert_contains("firefox 122.0 (0.00 MB)");
         remove.assert_contains("No changes made (dry run)");
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        let inventory = project.run(&["explicit", "--json"]);
+        inventory.assert_success();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&inventory.stdout).unwrap(),
+            serde_json::json!({"packages": ["firefox"], "count": 1})
+        );
+        project.close_checked();
     }
 
     #[test]
@@ -1143,22 +1170,25 @@ mod command_integration_tests {
 
     #[test]
     fn test_search_info_install_pipeline() {
-        if !system_tests_enabled() {
-            return;
-        }
-
-        // Complete user journey across the three read/preview surfaces.
-        let search = run_omg(&["search", "firefox"]);
+        let project = common::TestProject::for_distro("arch");
+        project.mock_available("firefox", "122.0").unwrap();
+        let state_path = project.data_dir.path().join("mock_state_pacman.json");
+        let before = std::fs::read(&state_path).unwrap();
+        let search = run_in_project(&project, &["search", "firefox"]);
         search.assert_success();
-        search.assert_contains("firefox");
+        search.assert_contains("firefox 122.0  Official");
 
-        let info = run_omg(&["info", "firefox"]);
+        let info = run_in_project(&project, &["info", "firefox"]);
         info.assert_success();
-        info.assert_contains("Description");
+        info.assert_contains("Name: firefox");
+        info.assert_contains("Version: 122.0");
+        info.assert_contains("Description: Web browser");
 
-        let install = run_omg(&["install", "--dry-run", "firefox"]);
-        install.assert_success();
-        install.assert_contains("firefox");
+        let install = run_in_project(&project, &["install", "--dry-run", "firefox"]);
+        assert_preview_rows(&install, &[("firefox", "122.0", "Official")]);
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        assert_no_installed_packages(&project);
+        project.close_checked();
     }
 
     #[test]

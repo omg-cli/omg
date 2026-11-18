@@ -714,21 +714,24 @@ mod tests {
             error.to_string(),
             "Package 'missing-fixture-package' not found. Suggestion: use 'omg search' to check available package names"
         );
-        assert!(
-            error
-                .chain()
-                .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
-        );
+        let original = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .expect("original I/O error remains in the chain");
+        assert_eq!(original.kind(), std::io::ErrorKind::NotFound);
         assert!(format!("{error:#}").contains("official fixture missing"));
     }
 
-    struct VulnerableSource;
+    struct FixtureSource {
+        calls: std::sync::atomic::AtomicUsize,
+        vulnerable: bool,
+    }
 
-    impl crate::core::security::vulnerability::VulnerabilitySource for VulnerableSource {
+    impl crate::core::security::vulnerability::VulnerabilitySource for FixtureSource {
         fn scan_package<'a>(
             &'a self,
-            _name: &'a str,
-            _version: &'a crate::package_managers::types::Version,
+            name: &'a str,
+            version: &'a crate::package_managers::types::Version,
         ) -> Pin<
             Box<
                 dyn Future<
@@ -740,40 +743,113 @@ mod tests {
                     + 'a,
             >,
         > {
-            Box::pin(async {
-                Ok(vec![
-                    crate::core::security::vulnerability::VulnerabilityReport {
+            assert_eq!(name, "example");
+            assert_eq!(version.to_string(), "1.0-1");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(if self.vulnerable {
+                    vec![crate::core::security::vulnerability::VulnerabilityReport {
                         id: "CVE-test".to_string(),
                         summary: "known vulnerability".to_string(),
                         score: None,
-                    },
-                ])
+                    }]
+                } else {
+                    Vec::new()
+                })
             })
         }
     }
 
-    #[tokio::test]
-    async fn install_policy_rejects_known_vulnerabilities() {
-        let policy = crate::core::security::SecurityPolicy::default();
-        let version = crate::package_managers::parse_version_or_zero("1.0-1");
+    #[test]
+    fn install_policy_rejects_known_vulnerabilities() {
+        const NAME: &str =
+            "cli::packages::install::arch::tests::install_policy_rejects_known_vulnerabilities";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        temp_env::with_var_unset("OMG_TEST_MODE", || {
+            let policy = crate::core::security::SecurityPolicy::default();
+            let version = crate::package_managers::parse_version_or_zero("1.0-1");
+            let scanner = FixtureSource {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                vulnerable: true,
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("private test runtime");
+            let error = runtime
+                .block_on(enforce_install_policy(
+                    &policy,
+                    &scanner,
+                    "example",
+                    &version,
+                    false,
+                    Some("MIT"),
+                ))
+                .expect_err("vulnerable packages must be below the default Community grade");
 
-        let error = enforce_install_policy(
-            &policy,
-            &VulnerableSource,
-            "example",
-            &version,
-            false,
-            Some("MIT"),
-        )
-        .await
-        .expect_err("vulnerable packages must be below the default Community grade");
+            assert!(error.to_string().contains("below required minimum"));
+            assert!(matches!(
+                error.downcast_ref::<crate::core::security::PolicyError>(),
+                Some(crate::core::security::PolicyError::GradeTooLow {
+                    name,
+                    grade: crate::core::security::SecurityGrade::Risk,
+                    minimum: crate::core::security::SecurityGrade::Community,
+                }) if name == "example"
+            ));
+            assert_eq!(scanner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        assert!(error.to_string().contains("below required minimum"));
+            let clean_scanner = FixtureSource {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                vulnerable: false,
+            };
+            runtime
+                .block_on(enforce_install_policy(
+                    &policy,
+                    &clean_scanner,
+                    "example",
+                    &version,
+                    false,
+                    Some("MIT"),
+                ))
+                .expect("clean official package must be accepted");
+            assert_eq!(
+                clean_scanner
+                    .calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+        });
     }
 
     #[test]
     fn dry_run_rejects_unreadable_local_archive_metadata() {
+        const NAME: &str = "cli::packages::install::arch::tests::dry_run_rejects_unreadable_local_archive_metadata";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
         let directory = tempfile::tempdir().expect("temporary directory");
+        let database = directory.path().join("var/lib/pacman");
+        let local = database.join("local");
+        std::fs::create_dir_all(&local).expect("private package database");
+        std::fs::write(local.join("ALPM_DB_VERSION"), b"9\n").expect("database version");
+        struct ResetPaths;
+        impl Drop for ResetPaths {
+            fn drop(&mut self) {
+                crate::core::paths::reset_test_overrides();
+            }
+        }
+        crate::core::paths::set_test_overrides(
+            Some(directory.path().to_path_buf()),
+            Some(database.clone()),
+        );
+        let _reset = ResetPaths;
+        let handle =
+            crate::package_managers::alpm_ops::open_default_alpm().expect("private ALPM handle");
+        assert_eq!(std::path::Path::new(handle.root()), directory.path());
+        assert_eq!(std::path::Path::new(handle.dbpath()), database);
+        drop(handle);
         let archive = directory.path().join("fixture.pkg.tar.zst");
         std::fs::write(&archive, b"not a package archive").expect("write archive fixture");
 
@@ -783,8 +859,8 @@ mod tests {
             error
                 .to_string()
                 .contains("Failed to read local package metadata")
-                || error.to_string().contains("Failed to initialize ALPM")
         );
+        assert_eq!(std::fs::read(archive).unwrap(), b"not a package archive");
     }
 
     fn aur_package(name: &str) -> crate::core::Package {
@@ -1022,6 +1098,25 @@ mod tests {
         let requested = vec!["aur-only".to_string()];
         assert!(parent_install_changes(&requested, &requested).is_empty());
         assert!(packages_excluding(&requested, &requested).is_empty());
+
+        let mixed = vec![
+            "official-a".to_string(),
+            "aur-only".to_string(),
+            "official-b".to_string(),
+        ];
+        let aur = vec!["aur-only".to_string()];
+        let expected =
+            ["official-a", "official-b"].map(|name| crate::core::history::PackageChange {
+                name: name.to_string(),
+                old_version: None,
+                new_version: None,
+                source: "pacman".to_string(),
+            });
+        assert_eq!(parent_install_changes(&mixed, &aur), expected);
+        assert_eq!(
+            packages_excluding(&mixed, &aur),
+            ["official-a", "official-b"]
+        );
     }
 
     #[test]

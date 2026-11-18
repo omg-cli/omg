@@ -223,18 +223,123 @@ fn explicit_shortcut_uses_the_same_isolated_state_as_explicit_count() {
 #[cfg(feature = "arch")]
 #[test]
 fn mock_fedora_sync_does_not_start_aur_metadata_io() {
-    let project = TestProject::for_distro("fedora");
-    let aur_metadata = project.data_dir.path().join("cache/aur/_meta");
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+
+    const {
+        assert!(
+            cfg!(debug_assertions),
+            "mock CLI fixtures require a debug build"
+        );
+    }
+    let fixture = tempfile::tempdir_in("/var/tmp").expect("private sync fixture");
+    let home = fixture.path().join("home");
+    std::fs::create_dir(&home).expect("private sync home");
+    let original_cli = common::fixture_cli_path();
+    if let Some(expected) = std::env::var_os("OMG_CONTRACT_EXPECTED_CLI") {
+        let compiled = std::path::Path::new(env!("CARGO_BIN_EXE_omg"));
+        if original_cli == compiled {
+            assert_eq!(
+                original_cli.canonicalize().unwrap(),
+                std::path::Path::new(&expected).canonicalize().unwrap()
+            );
+        } else {
+            assert_eq!(compiled, std::path::Path::new(&expected));
+        }
+    }
+    let account = if omg_lib::core::is_root() {
+        Some(
+            nix::unistd::User::from_name("nobody")
+                .expect("lookup ordinary user")
+                .expect("ordinary user required for root test"),
+        )
+    } else {
+        None
+    };
+    let cli = if let Some(account) = &account {
+        assert_ne!(account.uid.as_raw(), 0);
+        assert!(
+            std::fs::symlink_metadata(&original_cli)
+                .expect("CLI metadata")
+                .is_file()
+        );
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("ordinary user can traverse fixture");
+        nix::unistd::chown(&home, Some(account.uid), Some(account.gid))
+            .expect("assign only the private home to ordinary user");
+        let copy = fixture.path().join("omg");
+        std::fs::copy(&original_cli, &copy).expect("copy admitted CLI");
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755))
+            .expect("ordinary user can execute CLI copy");
+        assert_eq!(
+            common::fixture_program_hash(&original_cli),
+            common::fixture_program_hash(&copy)
+        );
+        copy
+    } else {
+        original_cli.clone()
+    };
+    let aur_metadata = home.join("cache/aur/_meta");
     assert!(!aur_metadata.exists());
 
-    let result = project.run_with_env(&["sync"], &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "8")]);
-    result.assert_success();
+    let proxy = recovery_fixture::RejectedProxy::new();
+    let mut command = Command::new(
+        omg_lib::core::privilege::root_controlled_program_path("timeout")
+            .expect("trusted command timeout"),
+    );
+    command.args(["--kill-after=2s", "15s"]);
+    if let Some(account) = &account {
+        command
+            .arg(
+                omg_lib::core::privilege::root_controlled_program_path("setpriv")
+                    .expect("trusted privilege drop"),
+            )
+            .args(["--clear-groups", "--no-new-privs"])
+            .arg(format!("--reuid={}", account.uid))
+            .arg(format!("--regid={}", account.gid));
+    }
+    command
+        .arg(&cli)
+        .arg("sync")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+        .env("XDG_DATA_HOME", home.join("xdg-data"))
+        .env("XDG_CACHE_HOME", home.join("xdg-cache"))
+        .env("OMG_CONFIG_DIR", home.join("config"))
+        .env("OMG_DATA_DIR", home.join("data"))
+        .env("OMG_CACHE_DIR", home.join("cache"))
+        .env("OMG_TEST_MODE", "1")
+        .env("OMG_TEST_DISTRO", "fedora")
+        .env("OMG_DISABLE_DAEMON", "1")
+        .env("OMG_DISABLE_TELEMETRY", "1")
+        .current_dir(&home);
+    for (key, value) in proxy.env() {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run ordinary-user mock sync");
+    assert!(
+        output.status.success(),
+        "sync failed: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         !aur_metadata.exists(),
         "non-Arch sync created AUR metadata state at {}",
         aur_metadata.display()
     );
-    project.close_checked();
+    assert_eq!(
+        proxy.requests(),
+        0,
+        "non-Arch sync attempted network access"
+    );
+    assert_eq!(
+        common::fixture_program_hash(&original_cli),
+        common::fixture_program_hash(&cli)
+    );
 }
 
 #[cfg(feature = "arch")]
@@ -1866,7 +1971,26 @@ fn uses_golden_path_config(id: &str) -> bool {
 
 #[test]
 fn golden_path_flags_use_the_same_explicit_config_route() {
-    for case in behavior_cases() {
+    let cases = behavior_cases();
+    let mut owned_cases: Vec<&str> = cases
+        .iter()
+        .filter(|case| {
+            case.owned_contract()
+                .is_some_and(|contract| contract.starts_with("local:team-golden-"))
+        })
+        .map(|case| case.id.as_str())
+        .collect();
+    owned_cases.sort_unstable();
+    assert_eq!(
+        owned_cases,
+        [
+            "team-golden-create",
+            "team-golden-create-flags",
+            "team-golden-delete",
+            "team-golden-list"
+        ]
+    );
+    for case in cases {
         if case.assertions.iter().any(|assertion| {
             matches!(
                 assertion,

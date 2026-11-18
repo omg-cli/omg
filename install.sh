@@ -1272,7 +1272,7 @@ main() {
   if [[ "$IS_SOURCE_INSTALL" == "true" ]]; then
     check_platform
     check_dependencies
-    build_omg
+    build_omg || error "Source build or installation failed"
   else
     install_from_release || error "No verified prebuilt release is available; refusing unverified installation or source fallback"
   fi

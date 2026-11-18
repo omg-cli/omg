@@ -383,7 +383,10 @@ mod tests {
     fn test_dependency_graph_simple() {
         let jobs = vec![
             BuildJob::new("a".to_string(), vec![]),
-            BuildJob::new("b".to_string(), vec!["a".to_string()]),
+            BuildJob::new(
+                "b".to_string(),
+                vec!["a".to_string(), "outside".to_string()],
+            ),
             BuildJob::new("c".to_string(), vec!["b".to_string()]),
         ];
 
@@ -392,6 +395,14 @@ mod tests {
         assert_eq!(graph.get("a").unwrap().len(), 0);
         assert!(graph.get("b").unwrap().contains("a"));
         assert!(graph.get("c").unwrap().contains("b"));
+        assert_eq!(
+            graph,
+            HashMap::from([
+                ("a".to_string(), HashSet::new()),
+                ("b".to_string(), HashSet::from(["a".to_string()])),
+                ("c".to_string(), HashSet::from(["b".to_string()])),
+            ])
+        );
     }
 
     #[test]
@@ -407,6 +418,12 @@ mod tests {
             error.to_string().contains("Duplicate AUR build job"),
             "{error}"
         );
+        ParallelBuilder::validate_unique_jobs(&[]).expect("empty jobs are valid");
+        ParallelBuilder::validate_unique_jobs(&[
+            BuildJob::new("first-base".to_string(), Vec::new()),
+            BuildJob::new("second-base".to_string(), Vec::new()),
+        ])
+        .expect("distinct package bases are valid");
     }
 
     #[test]
@@ -438,6 +455,7 @@ mod tests {
 
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].len(), 3);
+        assert_eq!(levels[0], ["pkg1", "pkg2", "pkg3"]);
     }
 
     #[test]

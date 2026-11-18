@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 task_dir=$(mktemp -d "${TMPDIR:-/tmp}/installer-source.XXXXXX")
 trap 'rm -rf "$task_dir"' EXIT
 
-for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch arch-missing-libarchive fedora macos ubuntu-retry ubuntu-rename-directory; do
+for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch arch-missing-libarchive fedora macos ubuntu-retry ubuntu-rename-directory ubuntu-missing-binary ubuntu-rustc-failure ubuntu-configured-success; do
   fixture="$task_dir/$scenario"
   mkdir -p "$fixture/source" "$fixture/tools" "$fixture/home"
   distro=ubuntu
@@ -26,6 +26,13 @@ for scenario in ubuntu22-x86 ubuntu22-arm ubuntu24-x86 ubuntu24-arm debian arch 
   # installation and configuration code remain the production installer.
   sed "s|/etc/os-release|$fixture/os-release|g" install.sh > "$fixture/source/install.sh"
   cp Cargo.toml "$fixture/source/Cargo.toml"
+  for tool in git gcc; do
+    cat > "$fixture/tools/$tool" <<'EOF'
+#!/usr/bin/env bash
+printf 'Unexpected fixture tool invocation: %s\n' "$0" >&2
+exit 2
+EOF
+  done
   cat > "$fixture/tools/uname" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
@@ -37,6 +44,7 @@ EOF
   cat > "$fixture/tools/rustc" <<'EOF'
 #!/usr/bin/env bash
 [[ "$*" == '--print host-tuple' ]] || exit 2
+[[ "$FIXTURE_SCENARIO" != ubuntu-rustc-failure ]] || exit 1
 printf '%s\n' "$FIXTURE_TARGET"
 EOF
   cat > "$fixture/tools/cargo" <<'EOF'
@@ -50,6 +58,7 @@ if [[ "$FIXTURE_RETRY" == 1 && ! -e "$FIXTURE/retried" ]]; then
 fi
 mkdir -p "$CARGO_TARGET_DIR/$FIXTURE_TARGET/release"
 for binary in omg omgd; do
+  if [[ "$FIXTURE_SCENARIO" == ubuntu-missing-binary && "$binary" == omg ]]; then continue; fi
   printf '#!/bin/sh\nprintf "fixture binary\\n"\n' > "$CARGO_TARGET_DIR/$FIXTURE_TARGET/release/$binary"
   chmod +x "$CARGO_TARGET_DIR/$FIXTURE_TARGET/release/$binary"
 done
@@ -80,27 +89,55 @@ EOF
   [[ "$scenario" != arch-missing-libarchive ]] || missing_libarchive=1
   rename_directory=0
   [[ "$scenario" != ubuntu-rename-directory ]] || rename_directory=1
+  fixture_shell=/bin/sh
+  skip_shell=1
+  case "$scenario" in
+    ubuntu-missing-binary | ubuntu-rustc-failure | ubuntu-configured-success)
+      fixture_shell=/bin/bash
+      skip_shell=0
+      printf '# Existing shell configuration\n' > "$fixture/home/.bashrc"
+      cp "$fixture/home/.bashrc" "$fixture/original-bashrc"
+      ;;
+  esac
   status=0
   env -u BASH_ENV -u ENV -u OMG_UNINSTALL \
-    HOME="$fixture/home" SHELL=/bin/sh TERM= \
+    HOME="$fixture/home" SHELL="$fixture_shell" TERM= \
     PATH="$fixture/tools:$PATH" FIXTURE="$fixture" \
+    FIXTURE_SCENARIO="$scenario" \
     FIXTURE_SYSTEM="$system" FIXTURE_MACHINE="$machine" \
     FIXTURE_TARGET="$target" FIXTURE_RETRY="$retry" \
     FIXTURE_MISSING_LIBARCHIVE="$missing_libarchive" \
     FIXTURE_RENAME_DIRECTORY="$rename_directory" \
     INSTALL_DIR="$fixture/bin" XDG_CONFIG_HOME="$fixture/config" \
     XDG_DATA_HOME="$fixture/data" CARGO_TARGET_DIR="$fixture/target" \
-    OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL=1 \
+    OMG_NO_TELEMETRY=1 OMG_SKIP_SHELL="$skip_shell" \
     bash "$fixture/source/install.sh" --from-source > "$fixture/output" 2>&1 || status=$?
+  if grep -Fq 'Unexpected fixture tool invocation:' "$fixture/output"; then
+    cat "$fixture/output" >&2
+    exit 1
+  fi
   # The diagnostic retry exits 1 even when its second build succeeds.
   expected_status=0
   [[ "$retry" == 0 ]] || expected_status=1
   [[ "$missing_libarchive" == 0 ]] || expected_status=1
   [[ "$rename_directory" == 0 ]] || expected_status=1
+  case "$scenario" in ubuntu-missing-binary | ubuntu-rustc-failure) expected_status=1 ;; esac
   if [[ "$status" != "$expected_status" ]]; then
     cat "$fixture/output" >&2
     printf '%s: expected exit %s, got %s\n' "$scenario" "$expected_status" "$status" >&2
     exit 1
+  fi
+  if [[ "$scenario" == ubuntu-missing-binary || "$scenario" == ubuntu-rustc-failure ]]; then
+    ! grep -Fq 'Installation Complete!' "$fixture/output"
+    [[ ! -e "$fixture/config" && ! -e "$fixture/data" && ! -e "$fixture/bin/omg" ]]
+    cmp "$fixture/original-bashrc" "$fixture/home/.bashrc"
+    [[ ! -e "$fixture/home/.bashrc.omg-backup" ]]
+    if [[ "$scenario" == ubuntu-rustc-failure ]]; then
+      [[ ! -e "$fixture/cargo-argv" ]]
+      printf '%s: host lookup failure refused before build or configuration\n' "$scenario"
+      continue
+    fi
+    grep -Fq 'binary missing from install source' "$fixture/output"
   fi
   if [[ "$missing_libarchive" == 1 ]]; then
     grep -Fq 'Missing dependencies: libarchive' "$fixture/output"
@@ -126,12 +163,21 @@ EOF
   if [[ "$scenario" != arch ]]; then
     [[ $(grep -Fxc -- '--no-default-features' "$fixture/cargo-argv") == "$expected_builds" ]]
   fi
-  if [[ "$rename_directory" == 1 ]]; then
+  if [[ "$scenario" == ubuntu-missing-binary ]]; then
+    [[ -x "$fixture/target/$target/release/omgd" && ! -e "$fixture/bin/omgd" ]]
+  elif [[ "$rename_directory" == 1 ]]; then
     grep -Fq 'Fixture rename failed:' "$fixture/output"
     [[ -d "$fixture/bin/omg" && ! -e "$fixture/bin/omg/omg" && ! -e "$fixture/bin/omgd" ]]
   elif [[ "$retry" == 0 ]]; then
     [[ -x "$fixture/bin/omg" && -x "$fixture/bin/omgd" ]]
     [[ -f "$fixture/config/omg/config.toml" ]]
+    grep -Fq 'Installation Complete!' "$fixture/output"
+    if [[ "$scenario" == ubuntu-configured-success ]]; then
+      [[ -d "$fixture/data/omg/versions" && -d "$fixture/data/omg/cache" && -d "$fixture/data/omg/db" ]]
+      grep -Fxq 'export OMG_TELEMETRY=0' "$fixture/home/.bashrc"
+      grep -Fxq 'eval "$(omg hook bash)"' "$fixture/home/.bashrc"
+      grep -Fq "$fixture/bin" "$fixture/home/.bashrc"
+    fi
   else
     [[ ! -e "$fixture/bin/omg" ]]
   fi

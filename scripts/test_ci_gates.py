@@ -1,6 +1,7 @@
 # pyright: strict
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -34,6 +35,115 @@ def job_block(text: str, job: str) -> str:
     nxt = re.search(r"\n  [a-zA-Z0-9_-]+:\n", rest[1:])
     end = start + 1 + nxt.start() + 1 if nxt else len(text)
     return text[start:end]
+
+
+class NativePhaseMatrixTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workflow = CI_YML.read_text(encoding="utf-8")
+        self.job = job_block(self.workflow, "linux-matrix")
+        self.steps = dict(re.findall(
+            r"^      - name: ([^\n]+)\n(.*?)(?=^      - (?:name:|uses:)|\Z)",
+            self.job, re.MULTILINE | re.DOTALL,
+        ))
+
+    def test_all_platforms_have_required_validation_and_clippy_with_five_runner_limit(self) -> None:
+        clippy = job_block(self.workflow, "linux-clippy")
+        self.assertIn("        phase: [validation]\n", self.job)
+        self.assertIn("        phase: [clippy]\n", clippy)
+        self.assertIn("    needs: [quick-gate, linux-matrix]\n", clippy)
+        platforms = ["arch", "debian", "debian-trixie", "ubuntu-2604", "fedora"]
+        match = re.search(r"^        platform: &linux_platforms \[([^\]]+)\]$", self.job, re.MULTILINE)
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.group(1).split(", "), platforms)
+        for field, anchor in (("platform", "linux_platforms"), ("include", "linux_images"),
+                              ("env", "linux_environment"), ("container", "linux_container"),
+                              ("steps", "linux_steps")):
+            self.assertRegex(self.job, rf"(?m)^\s+{field}: &{anchor}\b")
+            self.assertRegex(clippy, rf"(?m)^\s+{field}: \*{anchor}$")
+        rows = re.findall(
+            r"^          - platform: (\S+)\n(.*?)(?=^          - platform:|^    container:)",
+            self.job, re.MULTILINE | re.DOTALL,
+        )
+        self.assertEqual([platform for platform, _ in rows], platforms)
+        for platform, metadata in rows:
+            for field in ("image", "features", "setup", "rust_install", "rust_components"):
+                self.assertRegex(metadata, rf"(?m)^            {field}: .+")
+            self.assertNotRegex(metadata, r"(?m)^            phase:")
+        self.assertIn(
+            "    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && "
+            "matrix.phase == 'validation' && 45 || 30 }}\n", self.job,
+        )
+        for job in (self.job, clippy):
+            self.assertIn("      max-parallel: 5\n", job)
+            self.assertIn("      fail-fast: false\n", job)
+            self.assertNotIn("continue-on-error", job)
+            self.assertNotIn("exclude:", job)
+        self.assertIn("matrix.phase == 'validation' && format('Linux ({0})', matrix.platform)", self.job)
+        self.assertIn("format('Linux clippy ({0})', matrix.platform)", self.job)
+        self.assertIn("linux-matrix", job_block(self.workflow, "ci-success").split("    steps:", 1)[0])
+        self.assertIn("linux-clippy", job_block(self.workflow, "ci-success").split("    steps:", 1)[0])
+        self.assertIn("needs: [quick-gate, linux-matrix]", job_block(self.workflow, "sandbox-cancellation"))
+        self.assertIn("needs: [qemu-preflight, linux-matrix, ubuntu]", job_block(self.workflow, "qemu"))
+        self.assertIn("needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]", job_block(self.workflow, "qemu-fedora"))
+
+    def test_validation_outputs_and_commands_never_run_in_clippy_phase(self) -> None:
+        validation = "matrix.phase == 'validation'"
+        conditions = {
+            "Run unit tests": validation,
+            "Build release": validation + " && matrix.platform != 'ubuntu-2604'",
+            "Build Ubuntu 26.04 validation binary": validation + " && matrix.platform == 'ubuntu-2604'",
+            "Verify complete native APT daemon catalogue": validation + " && contains(matrix.features, 'debian')",
+            "Preserve native APT catalogue proof": "always() && " + validation + " && contains(matrix.features, 'debian')",
+            "Upload native release pair": validation + " && matrix.platform != 'ubuntu-2604'",
+            "Test emitted shell hooks": validation + " && matrix.platform == 'fedora'",
+            "Run serial library and binary contracts": validation + " && matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'",
+            "Native Fedora ignored integration fixtures": validation + " && matrix.platform == 'fedora'",
+            "Upload native Fedora ignored integration evidence": "always() && " + validation + " && matrix.platform == 'fedora'",
+            "Prepare sandbox regression executable": validation + " && matrix.platform == 'arch'",
+            "Upload sandbox regression executable": validation + " && matrix.platform == 'arch'",
+            "Debian deterministic benchmark regression check": validation + " && matrix.platform == 'debian'",
+            "Upload Debian benchmark artifact": validation + " && matrix.platform == 'debian'",
+            "Publish Debian benchmark summary": validation + " && matrix.platform == 'debian'",
+            "Verify binary": validation,
+            "Upload binary": validation,
+            "Preserve compiled parser surfaces": "always() && " + validation,
+            "Platform clippy": "matrix.phase == 'clippy'",
+        }
+        for name, condition in conditions.items():
+            with self.subTest(step=name):
+                self.assertIn(f"        if: {condition}\n", self.steps[name])
+        clippy = self.steps["Platform clippy"]
+        self.assertIn("cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \\\n            --locked -- -D warnings", clippy)
+        for name, command in {
+            "Run unit tests": "python3 scripts/run-native-contracts.py --features ${{ matrix.features }}",
+            "Run serial library and binary contracts": "--locked --no-fail-fast -- --test-threads=1",
+            "Debian deterministic benchmark regression check": "cargo test --test bench_debian --no-default-features --features ${{ matrix.features }} --locked",
+            "Prepare sandbox regression executable": "cargo test --lib --no-run --no-default-features --features arch,pgp,license",
+        }.items():
+            self.assertIn(command, self.steps[name])
+        self.assertIn("name: native-release-${{ matrix.platform }}-${{ github.run_attempt }}", self.steps["Upload native release pair"])
+        self.assertIn("name: cli-surfaces-${{ matrix.platform }}", self.steps["Preserve compiled parser surfaces"])
+
+    def test_cache_keeps_compatibility_hash_without_run_specific_diagnostics_or_extra_writers(self) -> None:
+        cache = self.steps["Cache Rust dependencies"]
+        self.assertIn("          RUSTUP_DIAGNOSTICS_DIR: \"\"\n", cache)
+        self.assertIn("          ZSTD_CLEVEL: \"6\"\n", cache)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' && matrix.phase == 'validation' }}", cache)
+        self.assertIn("shared-key: ${{ steps.cache-key.outputs.key }}", cache)
+        self.assertNotIn("add-rust-environment-hash-key", cache)
+        self.assertNotIn("env-vars:", cache)
+        self.assertEqual(self.job.count('RUSTUP_DIAGNOSTICS_DIR: ""'), 1)
+        self.assertIn("RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}", self.job)
+        self.assertIn("name: rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}", self.steps["Preserve Rustup diagnostics"])
+        self.assertIn("path: ${{ env.RUSTUP_DIAGNOSTICS_DIR }}/", self.steps["Preserve Rustup diagnostics"])
+        for platform, row in re.findall(
+            r"^          - platform: (\S+)\n(.*?)(?=^          - platform:|^    container:)",
+            self.job, re.MULTILINE | re.DOTALL,
+        ):
+            if platform in ("debian", "debian-trixie", "ubuntu-2604"):
+                setup = row.split("            setup: |\n", 1)[1].split("            rust_install:", 1)[0]
+                self.assertRegex(setup, r"\bzstd\b")
 
 
 class QuickGateOfflineTests(unittest.TestCase):
@@ -80,6 +190,84 @@ class QuickGateOfflineTests(unittest.TestCase):
             portable,
             "relocated completion check must keep its timeout bound",
         )
+
+
+class UbuntuMirrorSetupTests(unittest.TestCase):
+    def test_ca_bootstrap_precedes_exact_https_rewrite_and_stops_failures(self) -> None:
+        workflow = CI_YML.read_text(encoding="utf-8")
+        row = job_block(workflow, "linux-matrix").split("          - platform: ubuntu-2604\n", 1)[1]
+        setup = row.split("            setup: |\n", 1)[1].split("            rust_install:", 1)[0]
+        script = "\n".join(line[14:] for line in setup.splitlines())
+        script = script[script.index("apt-get update"):script.index("ldconfig -p")]
+        expected_packages = [
+            "ca-certificates", "curl", "git", "build-essential", "pkg-config", "sudo",
+            "python3", "python3-apt", "python3-venv", "fish", "jq", "zstd",
+            "libssl-dev", "libapt-pkg-dev", "clang", "cmake", "zlib1g-dev", "liblzma-dev", "libbz2-dev",
+        ]
+        for forbidden in ("Verify-Peer", "Verify-Host", "trusted=yes", "--allow-unauthenticated"):
+            self.assertNotIn(forbidden, script)
+        scenarios = [
+            ("success", "", 0, 4), ("success-slash", "/", 0, 4),
+            ("apt-1", "", 41, 1), ("apt-2", "", 42, 2),
+            ("apt-3", "", 43, 3), ("apt-4", "", 44, 4),
+            ("missing-ca", "", 1, 2), ("unknown-archive", "", 1, 2), ("unknown-security", "", 1, 2),
+        ]
+        for scenario, slash, exit_code, expected_calls in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                sources = root / "ubuntu.sources"
+                certificate = root / "ca-certificates.crt"
+                receipt = root / "apt.jsonl"
+                original = (
+                    "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu" + slash + "\n"
+                    "Suites: resolute resolute-updates resolute-backports\nComponents: main universe restricted multiverse\n"
+                    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n\n"
+                    "Types: deb\nURIs: http://security.ubuntu.com/ubuntu" + slash + "\n"
+                    "Suites: resolute-security\nComponents: main universe restricted multiverse\n"
+                    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+                )
+                if scenario == "unknown-archive":
+                    original = original.replace("archive.ubuntu.com", "unexpected.example")
+                if scenario == "unknown-security":
+                    original = original.replace("security.ubuntu.com", "unexpected.example")
+                sources.write_text(original, encoding="utf-8")
+                apt = root / "apt-get"
+                apt.write_text(
+                    f"#!{sys.executable}\n"
+                    "import json,os,sys\nfrom pathlib import Path\n"
+                    "receipt=Path(os.environ['APT_RECEIPT'])\n"
+                    "prior=receipt.read_text().splitlines() if receipt.exists() else []\n"
+                    "with receipt.open('a') as out:out.write(json.dumps({'args':sys.argv[1:],'sources':Path(os.environ['APT_SOURCES']).read_text()})+'\\n')\n"
+                    "scenario=os.environ['APT_SCENARIO']\n"
+                    "number=len(prior)+1\n"
+                    "if scenario=='apt-'+str(number):sys.exit(40+number)\n"
+                    "if sys.argv[-1]=='ca-certificates' and scenario!='missing-ca':Path(os.environ['APT_CA']).write_text('fixture CA')\n",
+                    encoding="utf-8",
+                )
+                apt.chmod(0o755)
+                fixture_script = script.replace("/etc/apt/sources.list.d/ubuntu.sources", str(sources))
+                fixture_script = fixture_script.replace("/etc/ssl/certs/ca-certificates.crt", str(certificate))
+                result = subprocess.run(
+                    ["bash", "-e", "-c", fixture_script], cwd=root,
+                    env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", APT_RECEIPT=str(receipt),
+                             APT_SOURCES=str(sources), APT_CA=str(certificate), APT_SCENARIO=scenario),
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                calls = [json.loads(line) for line in receipt.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(calls), expected_calls)
+                self.assertEqual(calls[0]["args"], ["update"])
+                if len(calls) >= 2:
+                    self.assertEqual(calls[1]["args"], ["install", "-y", "--no-install-recommends", "ca-certificates"])
+                    self.assertEqual(calls[1]["sources"], original)
+                if len(calls) >= 3:
+                    self.assertEqual(calls[2]["args"], ["update"])
+                    self.assertEqual(calls[2]["sources"], original.replace("URIs: http://", "URIs: https://"))
+                if len(calls) >= 4:
+                    self.assertEqual(calls[3]["args"], ["install", "-y", "--no-install-recommends", *expected_packages])
+                    self.assertEqual(calls[3]["sources"], calls[2]["sources"])
+                if len(calls) < 3:
+                    self.assertEqual(sources.read_text(encoding="utf-8"), original)
 
 
 class FedoraSetupSourceTests(unittest.TestCase):
@@ -140,7 +328,7 @@ class FedoraSetupSourceTests(unittest.TestCase):
                             self.assertEqual(result.returncode, 0 if unavailable == "fedora-cisco-openh264" else 44, result.stderr)
                     arguments = json.loads(receipt.read_text(encoding="utf-8"))
                     package_index = arguments.index("--setopt=install_weak_deps=False") + 1
-                    expected = ["git", "clang", "cmake", "openssl-devel", "pkgconfig", "findutils", "curl"]
+                    expected = ["git", "clang", "cmake", "make", "perl-core", "openssl-devel", "pkgconfig", "findutils", "curl"]
                     if workflow != "release.yml":
                         expected.append("procps-ng")
                     if workflow == "ci.yml":
@@ -188,12 +376,48 @@ class FedoraSetupSourceTests(unittest.TestCase):
         script = step.split("        run: |\n", 1)[1]
         script = "\n".join(line[10:] for line in script.splitlines())
         # Exercise provisioning, receipt accounting, and the helper gate together.
-        script = "set -euo pipefail\nmkdir -p target/fedora-ignored\n" + script[script.index("started=$(date +%s)"):]
+        script = "set -euo pipefail\n" + script[script.index("mkdir -p"):]
         script = script.replace("${{ matrix.features }}", "fedora,pgp,license")
-        for exit_code in [0, 42]:
-            with self.subTest(dnf_exit=exit_code):
+        helper_source = (CI_YML.parents[2] / "scripts/run-fedora-ignored-integrations.py").read_text(encoding="utf-8")
+        main = next(node for node in ast.parse(helper_source).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "main")
+        allocation = next(index for index, node in enumerate(main.body)
+                          if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "out")
+        # Execute the helper's actual fresh-directory allocation before native RPM work.
+        allocation_source = "\n".join(ast.unparse(node) for node in main.body[allocation:allocation + 2])
+        self.assertIn("exist_ok=False", allocation_source)
+        upload = source.split("      - name: Upload native Fedora ignored integration evidence\n", 1)[1]
+        upload = upload.split("\n      - name:", 1)[0]
+        serial_upload = source.split("      - name: Upload native Fedora serial libtest diagnostics\n", 1)[1]
+        serial_upload = serial_upload.split("\n      - name:", 1)[0]
+        for uploader, artifact, path in [
+            (upload, "fedora-ignored-integrations", "${{ env.FEDORA_IGNORED_EVIDENCE_DIR }}/"),
+            (serial_upload, "fedora-serial-libtest", "target/fedora-serial-libtest.jsonl"),
+        ]:
+            self.assertIn("        if: always() && matrix.phase == 'validation' && matrix.platform == 'fedora'\n", uploader)
+            self.assertIn("uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", uploader)
+            self.assertIn(f"          name: {artifact}\n", uploader)
+            self.assertEqual(re.findall(r"^          path: (.+)$", uploader, re.M), [path])
+            self.assertIn("          retention-days: 7\n", uploader)
+            self.assertIn("          if-no-files-found: error\n", uploader)
+        self.assertIn(
+            "      FEDORA_IGNORED_EVIDENCE_DIR: /tmp/omg-fedora-ignored-${{ github.run_id }}-${{ github.run_attempt }}\n",
+            job_block(source, "linux-matrix"),
+        )
+        self.assertNotIn("target/fedora-serial-libtest.jsonl", upload)
+        for stale_path in ("target/fedora-ignored", "RUNNER_TEMP", "runner.temp"):
+            self.assertNotIn(stale_path, step + upload)
+        for dnf_exit, missing_receipt, expected_exit in [(0, False, 0), (42, False, 42), (0, True, 1)]:
+            with self.subTest(dnf_exit=dnf_exit, missing_receipt=missing_receipt):
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
+                    cached = root / "target/fedora-ignored/fixture"
+                    cached.mkdir(parents=True)
+                    marker = cached / "unrelated-cache-marker"
+                    marker.write_text("preserve cached evidence", encoding="utf-8")
+                    evidence = root / "explicit evidence dir"
+                    container_temp = root / "container default temp"
+                    host_temp = root / "host default temp"
                     (root / "dnf").write_text(
                         f"#!{sys.executable}\n"
                         "import json,os,sys\n"
@@ -204,33 +428,53 @@ class FedoraSetupSourceTests(unittest.TestCase):
                     )
                     (root / "python3").write_text(
                         f"#!{sys.executable}\n"
-                        "import os\nfrom pathlib import Path\n"
-                        "Path(os.environ['HELPER_CALL']).write_text('helper reached')\n",
+                        "import os,sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n"
+                        "args=SimpleNamespace(evidence_dir=Path(sys.argv[sys.argv.index('--evidence-dir')+1]))\n"
+                        + allocation_source + "\n"
+                        "Path(os.environ['HELPER_CALL']).write_text(str(out))\n"
+                        "if os.environ['MISSING_RECEIPT']=='False':(out/'receipt.json').write_text('{\"fixture\":true}\\n')\n",
                         encoding="utf-8",
                     )
                     for name in ["dnf", "python3"]:
                         (root / name).chmod(0o755)
                     receipt = root / "call.json"
                     helper = root / "helper.txt"
+                    environment = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", RUNNER_TEMP=str(container_temp),
+                                       RUNNER_CONTEXT_TEMP=str(host_temp), FEDORA_IGNORED_EVIDENCE_DIR=str(evidence),
+                                       DNF_CALL=str(receipt), DNF_EXIT=str(dnf_exit), HELPER_CALL=str(helper),
+                                       MISSING_RECEIPT=str(missing_receipt))
                     result = subprocess.run(
                         ["bash", "-e", "-c", script],
                         cwd=root,
-                        env=dict(os.environ, PATH=f"{root}:{os.environ['PATH']}",
-                                 DNF_CALL=str(receipt), DNF_EXIT=str(exit_code), HELPER_CALL=str(helper)),
+                        env=environment,
                         capture_output=True, text=True, timeout=10, check=False,
                     )
-                    self.assertEqual(result.returncode, exit_code, result.stderr)
+                    self.assertEqual(result.returncode, expected_exit, result.stderr)
                     self.assertEqual(json.loads(receipt.read_text(encoding="utf-8")), [
                         "--setopt=*.skip_if_unavailable=False", "--disable-repo=fedora-cisco-openh264", "install", "-y",
                         "--setopt=install_weak_deps=False", "tree", "createrepo_c", "gnupg2",
                     ])
-                    provision = json.loads((root / "target/fedora-ignored/provision.json").read_text(encoding="utf-8"))
-                    self.assertEqual(provision["exit_code"], exit_code)
+                    provision = json.loads((evidence / "provision.json").read_text(encoding="utf-8"))
+                    self.assertEqual(provision["exit_code"], dnf_exit)
                     self.assertGreaterEqual(provision["elapsed_seconds"], 0)
-                    if exit_code == 0:
-                        self.assertEqual(helper.read_text(encoding="utf-8"), "helper reached")
+                    if dnf_exit == 0:
+                        fresh = evidence / "fixture"
+                        self.assertEqual(helper.read_text(encoding="utf-8"), str(fresh))
+                        self.assertTrue(fresh.is_dir())
+                        self.assertEqual((fresh / "receipt.json").exists(), not missing_receipt)
+                        if not missing_receipt:
+                            self.assertGreater((fresh / "receipt.json").stat().st_size, 0)
+                        repeated = subprocess.run(
+                            ["bash", "-e", "-c", script], cwd=root, env=environment,
+                            capture_output=True, text=True, timeout=10, check=False,
+                        )
+                        self.assertNotEqual(repeated.returncode, 0)
+                        self.assertIn("FileExistsError", repeated.stderr)
                     else:
                         self.assertFalse(helper.exists(), "failed provisioning must stop before the helper")
+                    self.assertEqual(marker.read_text(encoding="utf-8"), "preserve cached evidence")
+                    self.assertFalse(container_temp.exists())
+                    self.assertFalse(host_temp.exists())
 
 
 class QemuConcurrencyTests(unittest.TestCase):
@@ -279,6 +523,25 @@ class LocalCiGateExecutesTests(unittest.TestCase):
 
 
 class CiDeduplicationTests(unittest.TestCase):
+    def test_portable_roles_keep_matching_admission_and_bounds(self) -> None:
+        workflow = CI_YML.read_text(encoding="utf-8")
+        admissions = []
+        for role in ("portable", "portable-release"):
+            with self.subTest(role=role):
+                block = job_block(workflow, role)
+                self.assertRegex(block, r"(?m)^    timeout-minutes: 40$")
+                self.assertEqual(block.count("timeout-minutes:"), 1)
+                self.assertNotIn("continue-on-error:", block)
+                self.assertIn("runs-on: ubuntu-24.04", block)
+                self.assertIn("needs: quick-gate", block)
+                self.assertIn('toolchain: "1.95.0"', block)
+                admissions.append(next(line for line in block.splitlines() if line.startswith("    if:")))
+        self.assertEqual(admissions[0], admissions[1])
+        gate = job_block(workflow, "ci-success")
+        needs = next(line for line in gate.splitlines() if line.startswith("    needs:"))
+        self.assertIn("portable-release", needs.split("[", 1)[1].split("]", 1)[0].split(", "))
+        self.assertIn("PORTABLE_RELEASE: ${{ needs.portable-release.result }}", gate)
+
     def test_workflow_checks_execute_shared_checks_only_once(self) -> None:
         gate = job_block(CI_YML.read_text(encoding="utf-8"), "workflow-checks")
         self.assertEqual(gate.count("run: make ci-workflow-quick"), 1)
@@ -460,54 +723,50 @@ class OwnerInventoryError(AssertionError):
 
 
 class NormalPrOriginalOwners(unittest.TestCase):
-    EXPECTED = [
-        [
-            "cargo", "test", "--test", "distro_override", "--no-default-features",
-            "--features", "pgp,license", "--locked",
+    EXPECTED = {
+        "portable": [
+            ["cargo", "test", "--test", "distro_override", "--no-default-features",
+             "--features", "pgp,license", "--locked"],
+            ["cargo", "test", "--doc", "--no-default-features", "--features",
+             "pgp,license", "--locked"],
         ],
-        [
-            "cargo", "test", "--release", "--test", "distro_override",
-            "--no-default-features", "--features", "pgp,license", "--locked",
+        "portable-release": [
+            ["cargo", "test", "--release", "--test", "distro_override",
+             "--no-default-features", "--features", "pgp,license", "--locked"],
         ],
-        [
-            "cargo", "test", "--doc", "--no-default-features", "--features",
-            "pgp,license", "--locked",
-        ],
-    ]
+    }
 
-    @staticmethod
-    def owners(text: str) -> list[tuple[str, str, list[str]]]:
+    @classmethod
+    def owners(cls, text: str) -> dict[str, list[tuple[str, str, list[str]]]]:
         import shlex
 
-        block = job_block(text, "portable")
-        steps = re.split(r"(?=^      - )", block, flags=re.M)
-        commands: list[tuple[str, str, list[str]]] = []
-        for step in steps:
-            run = re.search(r"^        run: (cargo .+)$", step, re.M)
-            if not run:
-                continue
-            argv = shlex.split(run[1])
-            if "--doc" in argv or (
-                "--test" in argv
-                and argv[argv.index("--test") + 1] == "distro_override"
-            ):
-                if re.search(r"^        (if:|continue-on-error:)", step, re.M):
-                    raise OwnerInventoryError(
-                        "Owner has independent conditional/error suppression"
-                    )
-                commands.append((step, run[1], argv))
-        keys = [
-            "docs" if "--doc" in argv else "release" if "--release" in argv else "debug"
-            for _, _, argv in commands
-        ]
-        if keys != ["debug", "release", "docs"]:
-            raise OwnerInventoryError(
-                "Missing/duplicate/reordered original owner inventory: " + repr(keys)
-            )
-        return commands
+        owners: dict[str, list[tuple[str, str, list[str]]]] = {}
+        for job, expected in cls.EXPECTED.items():
+            try:
+                block = job_block(text, job)
+            except ValueError as error:
+                raise OwnerInventoryError("Missing required owner job: " + job) from error
+            steps = re.split(r"(?=^      - )", block, flags=re.M)
+            commands: list[tuple[str, str, list[str]]] = []
+            for step in steps:
+                run = re.search(r"^        run: (cargo .+)$", step, re.M)
+                if not run:
+                    continue
+                argv = shlex.split(run[1])
+                if "--doc" in argv or (
+                    "--test" in argv
+                    and argv[argv.index("--test") + 1] == "distro_override"
+                ):
+                    if re.search(r"^        (if:|continue-on-error:)", step, re.M):
+                        raise OwnerInventoryError("Owner has independent conditional/error suppression")
+                    commands.append((step, run[1], argv))
+            if [argv for _, _, argv in commands] != expected:
+                raise OwnerInventoryError("Missing/duplicate/changed original owner inventory: " + job)
+            owners[job] = commands
+        return owners
 
     def test_selected_original_owners_execute_literal_argv_and_stop_each_failure(self) -> None:
-        commands = self.owners(CI_YML.read_text(encoding="utf-8"))
+        owners = self.owners(CI_YML.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             record = root / "record.py"
@@ -520,38 +779,31 @@ class NormalPrOriginalOwners(unittest.TestCase):
                 encoding="utf-8",
             )
             cargo = root / "cargo"
-            cargo.write_text(
-                f'#!/bin/sh\nexec "{sys.executable}" "{record}" "$@"\n',
-                encoding="utf-8",
-            )
+            cargo.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{record}" "$@"\n', encoding="utf-8")
             cargo.chmod(0o755)
             log = root / "rows.jsonl"
-            for failed in (0, 1, 2, 3):
-                with self.subTest(failed=failed):
-                    log.unlink(missing_ok=True)
-                    result = subprocess.run(
-                        ["bash", "-e", "-c", "\n".join(x[1] for x in commands)],
-                        env=dict(
-                            os.environ,
-                            PATH=str(root) + os.pathsep + os.environ["PATH"],
-                            OWNER_LOG=str(log),
-                            FAIL_OWNER=str(failed),
-                        ),
-                        capture_output=True,
-                        timeout=10,
-                    )
-                    self.assertEqual(result.returncode, 0 if failed == 0 else 23, result.stderr)
-                    self.assertEqual(
-                        [json.loads(x) for x in log.read_text().splitlines()],
-                        self.EXPECTED[:failed or 3],
-                    )
+            bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
+            for job, commands in owners.items():
+                for failed in range(len(commands) + 1):
+                    with self.subTest(job=job, failed=failed):
+                        log.unlink(missing_ok=True)
+                        result = subprocess.run(
+                            [bash, "-e", "-c", "\n".join(x[1] for x in commands)],
+                            env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                                     OWNER_LOG=str(log), FAIL_OWNER=str(failed)),
+                            capture_output=True, timeout=10,
+                        )
+                        self.assertEqual(result.returncode, 0 if failed == 0 else 23, result.stderr)
+                        self.assertEqual([json.loads(x) for x in log.read_text().splitlines()],
+                                         self.EXPECTED[job][:failed or len(commands)])
 
     def test_missing_each_named_owner_refuses_even_when_other_owners_succeed(self) -> None:
         text = CI_YML.read_text(encoding="utf-8")
-        commands = self.owners(text)
-        for step, _, _ in commands:
-            with self.subTest(omitted=step.splitlines()[0]):
-                with self.assertRaises(OwnerInventoryError):
+        for job, commands in self.owners(text).items():
+            with self.subTest(omitted=job), self.assertRaises(OwnerInventoryError):
+                self.owners(text.replace(job_block(text, job), "", 1))
+            for step, _, _ in commands:
+                with self.subTest(omitted=step.splitlines()[0]), self.assertRaises(OwnerInventoryError):
                     self.owners(text.replace(step, "", 1))
 
     def test_original_source_paths_select_normal_pr_owner_using_real_git_diff(self) -> None:

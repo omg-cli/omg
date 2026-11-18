@@ -194,8 +194,13 @@ def build_bundle(destination, policy_path, policy, revision):
     material = policy_path.parent
     if digest(material/policy['patch']) != policy['patch_sha256'] or digest(material/policy['keyring']) != policy['keyring_sha256']:
         raise ValueError('reviewed source patch or Fedora keyring changed')
+    diagnostics = destination.parent/'diagnostics'/destination.name
+    diagnostics.mkdir(parents=True, exist_ok=True)
+    (diagnostics/'attempt.json').write_text(json.dumps({'stage': 'build-dependencies', 'status': 'attempted',
+        'source_sha': revision, 'timeout_seconds': 600})+'\n')
     run(['dnf', '--releasever=44', '--disablerepo=*', '--enablerepo=fedora', '--enablerepo=updates',
-         '--setopt=gpgcheck=1', '--setopt=localpkg_gpgcheck=1', '-y', 'install',
+         '--setopt=gpgcheck=1', '--setopt=localpkg_gpgcheck=1', '--setopt=timeout=20', '--setopt=minrate=100k',
+         '--setopt=logdir='+str(diagnostics), '--setopt=log_size=1M', '--setopt=log_rotate=1', '-y', 'install',
          'rpm-build', 'rpmdevtools', 'curl-minimal', 'gcc', 'gcc-c++', 'make', 'ncurses-devel', 'readline-devel',
          'glibc-devel', 'autoconf', 'tcl', 'tcl-devel', 'zlib-ng-compat-devel', 'chrpath',
          'patch', 'cpio', 'gnupg2', 'shadow-utils'], timeout=600)

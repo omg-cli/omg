@@ -12,10 +12,14 @@ keywords = ["package-manager", "arch-linux", "version-manager", "runtime"]
 categories = ["command-line-utilities", "development-tools"]
 
 [package.metadata.cargo-machete]
+# Feature-only dependency selecting Sequoia's patched vendored crypto backend.
+ignored = ["openssl-sys"]
 
 [patch.crates-io]
 # Temporary bounded-version correction; provenance/removal criteria in vendor note.
 rust-apt = { path = "vendor/rust-apt-0.11.3" }
+# Remove when a released openssl-sys vendors patched OpenSSL; see vendor/openssl-sys-vendored-4.md.
+openssl-sys = { git = "https://github.com/rust-openssl/rust-openssl", rev = "9e94ed8675853c09e98a86ca3bb99a989f12b674" }
 
 [lib]
 name = "omg_lib"
@@ -151,7 +155,7 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 lz4_flex = { version = "0.14.0", default-features = false, features = [
   "frame",
 ] }
-zip = { version = "9.0.4", default-features = false, features = [
+zip = { version = "9.0.5", default-features = false, features = [
   "deflate",
   "time",
 ] }
@@ -199,14 +203,14 @@ notify = "8.2"
 home = "0.5.12"
 
 # Cryptography
-# Pinned: SLSA/Fulcio verifier was audited against these exact APIs.
-sha2 = "=0.10.9"
+# Retained for the RSA verifier's digest API.
+sha2 = { version = "=0.10.9", features = ["oid"] }
 hex = "0.4.3"
 base64 = "0.23"
 # SLSA/Sigstore verification: RSA (PKCS#1 v1.5, SPKI keys) and P-256 ECDSA
 rsa = { version = "0.9" }
-p256 = { version = "=0.13.2", features = ["ecdsa", "pkcs8"] }
-p384 = { version = "=0.13.1", features = ["ecdsa", "pkcs8"] }
+p256 = { version = "=0.14.0", features = ["ecdsa", "pkcs8"] }
+p384 = { version = "=0.14.0", features = ["ecdsa", "pkcs8"] }
 x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }
 
 # System calls (for disk space checks, etc.)
@@ -252,11 +256,10 @@ rayon = "1.11.0"
 # (already present transitively; direct because the Arch cache path uses it)
 globset = { version = "0.4.18", optional = true }
 
-# Security (Phase 4.2) - PURE RUST crypto backend (for package verification, not secrets)
+# Bundle the production crypto backend for portable package-signature verification.
+openssl-sys = { version = "=0.9.117", features = ["vendored", "vendored-4"], optional = true }
 sequoia-openpgp = { version = "2", default-features = false, features = [
-  "crypto-rust",
-  "allow-experimental-crypto",
-  "allow-variable-time-crypto",
+  "crypto-openssl",
 ], optional = true }
 nucleo-matcher = "0.3.1"
 dirs = "6.0.0"
@@ -279,7 +282,7 @@ rkyv = { version = "0.8.17", features = [
 whoami = "2.0.2"
 governor = "0.10.4"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = [
-  "rust_crypto",
+  "aws_lc_rs",
 ] } # >=10.3.0 required: CVE-2026-25537 fix
 sentry = { version = "0.49.0", default-features = false, features = [
   "anyhow",
@@ -294,7 +297,7 @@ sentry = { version = "0.49.0", default-features = false, features = [
 sentry-tracing = "0.49.0"
 
 # Cross-platform package manager support
-rusqlite = { version = "0.40", features = [
+rusqlite = { version = "0.41.1", features = [
   "bundled",
 ], optional = true } # SQLite for RPM db
 cvss = "2.2.0"
@@ -369,7 +372,7 @@ split-debuginfo = "unpacked" # Faster linking on Linux
 # combination. They are not feature-gated.
 #
 # RELEASE FEATURE POLICY: every platform artifact explicitly enables its
-# backend plus `pgp,license`. PGP uses the pure-Rust Sequoia backend above, so
+# backend plus `pgp,license`. PGP bundles the Sequoia OpenSSL backend above, so
 # no platform requires a reduced-security artifact. The primary CI platform
 # matrix uses the exact same feature sets as release.yml.
 # ----------------------------------------------------------------------------
@@ -385,7 +388,7 @@ arch = [
 ]
 # Optional PGP verification of package signatures (sequoia-openpgp).
 # Built against the MSRV pinned in rust-toolchain.toml / package.rust-version.
-pgp = ["sequoia-openpgp"]
+pgp = ["sequoia-openpgp", "dep:openssl-sys"]
 
 # Debian/Ubuntu support - unified feature
 # Requires libapt-pkg-dev: `apt install libapt-pkg-dev`
@@ -394,10 +397,10 @@ debian = ["ar", "rust-apt"]
 # Pure Rust Debian support (no FFI, no system dependencies) - for testing/indexing
 debian-pure = ["ar"]
 
-# Fedora/RHEL support (DNF/RPM) - Pure Rust, no system dependencies
+# Fedora/RHEL support (DNF/RPM) with bundled SQLite.
 fedora = ["rusqlite"]
 
-# macOS/Homebrew support - Pure Rust
+# macOS/Homebrew support.
 macos = []
 
 license = [

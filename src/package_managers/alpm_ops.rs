@@ -1880,6 +1880,8 @@ mod tests {
         assert_eq!(transaction_overall_percent(50, 1, 9), 5);
         assert_eq!(transaction_overall_percent(100, 9, 9), 100);
         assert_eq!(transaction_overall_percent(40, 0, 0), 40);
+        assert_eq!(transaction_overall_percent(-1, 0, 0), 0);
+        assert_eq!(transaction_overall_percent(140, 0, 0), 100);
     }
 
     #[test]
@@ -2292,39 +2294,41 @@ mod tests {
         ) {
             return;
         }
-        let temp = tempfile::tempdir().expect("private cache fixture");
-        let cache = temp.path().join("var/cache/pacman/pkg");
-        std::fs::create_dir_all(&cache).expect("create cache");
-        let old = cache.join("demo-1.0-1-x86_64.pkg.tar.zst");
-        let old_signature = old.with_added_extension("sig");
-        let current = cache.join("demo-2.0-1-x86_64.pkg.tar.zst");
-        let current_signature = current.with_added_extension("sig");
-        std::fs::write(&old, b"old").expect("old archive");
-        std::fs::write(&old_signature, b"sig").expect("old signature");
-        std::fs::write(&current, b"current").expect("current archive");
-        std::fs::write(&current_signature, b"current-signature").expect("current signature");
-        paths::set_test_overrides(Some(temp.path().to_path_buf()), None);
+        temp_env::with_var_unset("OMG_PACMAN_CACHE_DIR", || {
+            let temp = tempfile::tempdir().expect("private cache fixture");
+            let cache = temp.path().join("var/cache/pacman/pkg");
+            std::fs::create_dir_all(&cache).expect("create cache");
+            let old = cache.join("demo-1.0-1-x86_64.pkg.tar.zst");
+            let old_signature = old.with_added_extension("sig");
+            let current = cache.join("demo-2.0-1-x86_64.pkg.tar.zst");
+            let current_signature = current.with_added_extension("sig");
+            std::fs::write(&old, b"old").expect("old archive");
+            std::fs::write(&old_signature, b"sig").expect("old signature");
+            std::fs::write(&current, b"current").expect("current archive");
+            std::fs::write(&current_signature, b"current-signature").expect("current signature");
+            paths::set_test_overrides(Some(temp.path().to_path_buf()), None);
 
-        let preview = clean_cache_preview(1).expect("preview");
-        assert_eq!(std::fs::read(&old).unwrap(), b"old");
-        assert_eq!(std::fs::read(&old_signature).unwrap(), b"sig");
-        assert_eq!(std::fs::read(&current).unwrap(), b"current");
-        assert_eq!(
-            std::fs::read(&current_signature).unwrap(),
-            b"current-signature"
-        );
-        assert_eq!(preview, (1, 6), "preview must include companion bytes");
+            let preview = clean_cache_preview(1).expect("preview");
+            assert_eq!(std::fs::read(&old).unwrap(), b"old");
+            assert_eq!(std::fs::read(&old_signature).unwrap(), b"sig");
+            assert_eq!(std::fs::read(&current).unwrap(), b"current");
+            assert_eq!(
+                std::fs::read(&current_signature).unwrap(),
+                b"current-signature"
+            );
+            assert_eq!(preview, (1, 6), "preview must include companion bytes");
 
-        let cleaned = clean_cache(1).expect("cleanup");
-        paths::reset_test_overrides();
-        assert_eq!(cleaned, (2, 6));
-        assert!(!old.exists());
-        assert!(!old_signature.exists());
-        assert_eq!(std::fs::read(&current).unwrap(), b"current");
-        assert_eq!(
-            std::fs::read(&current_signature).unwrap(),
-            b"current-signature"
-        );
+            let cleaned = clean_cache(1).expect("cleanup");
+            paths::reset_test_overrides();
+            assert_eq!(cleaned, (2, 6));
+            assert!(!old.exists());
+            assert!(!old_signature.exists());
+            assert_eq!(std::fs::read(&current).unwrap(), b"current");
+            assert_eq!(
+                std::fs::read(&current_signature).unwrap(),
+                b"current-signature"
+            );
+        });
     }
 
     #[test]
@@ -2334,44 +2338,47 @@ mod tests {
         ) {
             return;
         }
-        let temp = tempfile::tempdir().expect("tempdir");
-        let cache_dir = temp.path().join("var/cache/pacman/pkg");
-        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+        temp_env::with_var_unset("OMG_PACMAN_CACHE_DIR", || {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cache_dir = temp.path().join("var/cache/pacman/pkg");
+            std::fs::create_dir_all(&cache_dir).expect("create cache dir");
 
-        // Write packages with version numbers where alphabetical/mtime sorting differs from vercmp:
-        // 1.10.0-1 is newer than 1.2.0-1 and 1.0.0-1
-        let v1_0 = cache_dir.join("testpkg-1.0.0-1-x86_64.pkg.tar.zst");
-        let v1_2 = cache_dir.join("testpkg-1.2.0-1-x86_64.pkg.tar.zst");
-        let v1_10 = cache_dir.join("testpkg-1.10.0-1-x86_64.pkg.tar.zst");
+            // Write packages with version numbers where alphabetical/mtime sorting differs from vercmp:
+            // 1.10.0-1 is newer than 1.2.0-1 and 1.0.0-1
+            let v1_0 = cache_dir.join("testpkg-1.0.0-1-x86_64.pkg.tar.zst");
+            let v1_2 = cache_dir.join("testpkg-1.2.0-1-x86_64.pkg.tar.zst");
+            let v1_10 = cache_dir.join("testpkg-1.10.0-1-x86_64.pkg.tar.zst");
 
-        std::fs::write(&v1_0, b"content-1.0").expect("write v1.0");
-        std::fs::write(&v1_2, b"content-1.2").expect("write v1.2");
-        std::fs::write(&v1_10, b"content-1.10").expect("write v1.10");
+            std::fs::write(&v1_0, b"content-1.0").expect("write v1.0");
+            std::fs::write(&v1_2, b"content-1.2").expect("write v1.2");
+            std::fs::write(&v1_10, b"content-1.10").expect("write v1.10");
 
-        paths::set_test_overrides(Some(temp.path().to_path_buf()), None);
+            paths::set_test_overrides(Some(temp.path().to_path_buf()), None);
 
-        let (preview_removed, preview_freed) = clean_cache_preview(1).expect("preview succeeds");
-        assert_eq!(
-            preview_removed, 2,
-            "preview should identify 2 older versions"
-        );
-        assert_eq!(
-            preview_freed, 22,
-            "preview should count freed bytes accurately"
-        );
-        assert!(v1_0.exists());
-        assert!(v1_2.exists());
-        assert!(v1_10.exists());
+            let (preview_removed, preview_freed) =
+                clean_cache_preview(1).expect("preview succeeds");
+            assert_eq!(
+                preview_removed, 2,
+                "preview should identify 2 older versions"
+            );
+            assert_eq!(
+                preview_freed, 22,
+                "preview should count freed bytes accurately"
+            );
+            assert!(v1_0.exists());
+            assert!(v1_2.exists());
+            assert!(v1_10.exists());
 
-        let (removed, freed) = clean_cache(1).expect("clean succeeds");
-        paths::reset_test_overrides();
+            let (removed, freed) = clean_cache(1).expect("clean succeeds");
+            paths::reset_test_overrides();
 
-        assert_eq!(removed, 2, "clean should remove 2 older versions");
-        assert_eq!(freed, 22);
-        // ALPM vercmp ensures the highest version (1.10.0-1) is kept, NOT deleted!
-        assert!(v1_10.exists(), "newest version 1.10.0-1 must be kept");
-        assert!(!v1_0.exists(), "older version 1.0.0-1 must be removed");
-        assert!(!v1_2.exists(), "older version 1.2.0-1 must be removed");
+            assert_eq!(removed, 2, "clean should remove 2 older versions");
+            assert_eq!(freed, 22);
+            // ALPM vercmp ensures the highest version (1.10.0-1) is kept, NOT deleted!
+            assert!(v1_10.exists(), "newest version 1.10.0-1 must be kept");
+            assert!(!v1_0.exists(), "older version 1.0.0-1 must be removed");
+            assert!(!v1_2.exists(), "older version 1.2.0-1 must be removed");
+        });
     }
 
     #[test]
@@ -2379,7 +2386,10 @@ mod tests {
         assert!(is_keyring_related_error(
             "invalid or corrupted package (PGP signature)"
         ));
-        assert!(is_keyring_related_error("keyring is not writable"));
+        assert!(is_keyring_related_error("KEYRING is not writable"));
+        assert!(is_keyring_related_error("SIGNATURE validation failed"));
+        assert!(is_keyring_related_error("PGP validation failed"));
+        assert!(is_keyring_related_error("package is CORRUPT"));
         assert!(!is_keyring_related_error("conflicting dependencies"));
     }
 
@@ -2406,10 +2416,34 @@ mod tests {
         assert!(super::progress_event_is_due(&mut last, "foo", 6));
         assert!(super::progress_event_is_due(&mut last, "bar", 7));
         assert_eq!(last.0, "bar");
+        assert!(super::progress_event_is_due(&mut last, "bar", 0));
+        assert_eq!(last, ("bar".to_string(), 0));
+        assert!(super::progress_event_is_due(&mut last, "bar", 100));
+        assert!(super::progress_event_is_due(&mut last, "bar", 100));
+        assert_eq!(last, ("bar".to_string(), 100));
     }
 
     #[test]
     fn aur_transactions_require_sealed_handoff_targets() {
+        let sealed = "/__omg_archive/sealed-descriptor".to_owned();
+        let unsealed = "/tmp/package.pkg.tar.zst".to_owned();
+        for packages in [
+            vec![sealed.clone(), unsealed.clone()],
+            vec![unsealed, sealed.clone()],
+        ] {
+            let error =
+                validate_aur_artifact_handoffs(TransactionKind::InstallAurArtifact, &packages)
+                    .expect_err("every artifact must use a sealed handoff");
+            assert_eq!(
+                error.to_string(),
+                "AUR artifacts must arrive through an immutable sealed handoff"
+            );
+        }
+        validate_aur_artifact_handoffs(
+            TransactionKind::InstallAurArtifact,
+            &[sealed.clone(), sealed],
+        )
+        .expect("multiple sealed handoffs are accepted");
         assert!(
             validate_aur_artifact_handoffs(
                 TransactionKind::InstallAurArtifact,

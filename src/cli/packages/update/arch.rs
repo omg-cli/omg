@@ -558,6 +558,16 @@ mod tests {
             update_info("paru", "aur"),
         ];
         let recorded = history_changes(&all);
+        let expected =
+            [("linux", "core"), ("firefox", "extra"), ("paru", "aur")].map(|(name, source)| {
+                crate::core::history::PackageChange {
+                    name: name.to_string(),
+                    old_version: Some("1.0".to_string()),
+                    new_version: Some("2.0".to_string()),
+                    source: source.to_string(),
+                }
+            });
+        assert_eq!(recorded, expected);
 
         assert_eq!(
             recorded
@@ -581,15 +591,15 @@ mod tests {
         )?;
         parent.add_transaction(
             crate::core::history::TransactionType::Update,
-            recorded.clone(),
+            recorded,
             true,
         )?;
         let parent_history = parent.load()?;
         assert_eq!(parent_history.len(), 1);
-        assert_eq!(parent_history[0].changes, recorded);
+        assert_eq!(parent_history[0].changes, expected);
         let child_history = child.load()?;
         assert_eq!(child_history.len(), 1);
-        assert_eq!(child_history[0].changes, history_changes(&all[..2]));
+        assert_eq!(child_history[0].changes, expected[..2]);
         Ok(())
     }
 
@@ -598,7 +608,15 @@ mod tests {
         let all = vec![update_info("linux", "core"), update_info("paru", "aur")];
         let recorded = history_changes(&all);
 
-        assert_eq!(recorded.len(), 2);
+        let expected = [("linux", "core"), ("paru", "aur")].map(|(name, source)| {
+            crate::core::history::PackageChange {
+                name: name.to_string(),
+                old_version: Some("1.0".to_string()),
+                new_version: Some("2.0".to_string()),
+                source: source.to_string(),
+            }
+        });
+        assert_eq!(recorded, expected);
     }
 
     #[test]
@@ -725,9 +743,9 @@ mod tests {
         assert_eq!(
             allowed
                 .iter()
-                .map(|(name, _, _)| name.as_str())
+                .map(|(name, old, new)| (name.as_str(), old.to_string(), new.to_string()))
                 .collect::<Vec<_>>(),
-            ["good"],
+            [("good", "1.0-1".to_string(), "2.0-1".to_string())],
             "only the banned candidate may be skipped"
         );
         assert_eq!(
@@ -787,9 +805,12 @@ mod tests {
         assert_eq!(
             allowed
                 .iter()
-                .map(|(name, _, _)| name.as_str())
+                .map(|(name, old, new)| (name.as_str(), old.to_string(), new.to_string()))
                 .collect::<Vec<_>>(),
-            ["paru", "yay"],
+            [
+                ("paru", "1.0-1".to_string(), "2.0-1".to_string()),
+                ("yay", "1.0-1".to_string(), "2.0-1".to_string()),
+            ],
             "no policy file means no enforcement and zero behavior change"
         );
         assert!(skipped.is_empty());

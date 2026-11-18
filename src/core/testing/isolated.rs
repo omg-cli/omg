@@ -1,6 +1,12 @@
 /// Runs process-wide fixture mutations outside the parallel parent harness.
 #[cfg(test)]
 pub(crate) fn run_isolated_test(name: &str) -> bool {
+    run_isolated_test_with_timeout(name, std::time::Duration::from_secs(20))
+}
+
+/// Run an isolated test with a caller-selected total deadline.
+#[cfg(test)]
+pub(crate) fn run_isolated_test_with_timeout(name: &str, timeout: std::time::Duration) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -43,7 +49,7 @@ pub(crate) fn run_isolated_test(name: &str) -> bool {
             }
         }
         let within_capture_limit = output.metadata().is_ok_and(|meta| meta.len() <= LIMIT);
-        if started.elapsed() >= Duration::from_secs(20) || !within_capture_limit {
+        if started.elapsed() >= timeout || !within_capture_limit {
             child.kill().expect("stop bounded isolated fixture test");
             child.wait().expect("reap bounded isolated fixture test");
             panic!("isolated test {name} exceeded its time or capture bound");

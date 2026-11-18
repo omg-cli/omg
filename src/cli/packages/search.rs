@@ -936,6 +936,15 @@ mod tests {
         assert_eq!(display.version, "123.0-1");
         assert_eq!(display.description, "Fast web browser");
         assert_eq!(display.source, "Official");
+        assert_eq!(
+            serde_json::to_value(&display).expect("serialize search result"),
+            serde_json::json!({
+                "name": "firefox",
+                "version": "123.0-1",
+                "description": "Fast web browser",
+                "source": "Official",
+            })
+        );
     }
 
     #[test]

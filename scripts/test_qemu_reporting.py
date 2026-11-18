@@ -961,6 +961,26 @@ class ReportingBoundaryTests(unittest.TestCase):
             workflow_path='.github/workflows/ci.yml', all_distros=True)
         self.assertIsNone(historical, 'historical four-guest CI must remain admissible')
 
+
+    def test_dual_partition_workflow_reports_are_admitted_without_duplicate_failures(self):
+        row = dict(self.row(), case_id="qemu-matrix-workflow", distro="ubuntu")
+        jobs = [dict(name="QEMU behavioral verification / QEMU matrix result", conclusion="failure"),
+                dict(name="QEMU behavioral verification (Fedora) / QEMU matrix result", conclusion="failure")]
+        reports = {name: [row] for name in ("qemu-workflow-report-non-fedora", "qemu-workflow-report-fedora")}
+        _, catalog = self.run_report_fixture([], no_artifacts=True, jobs=jobs, workflow_reports=reports)
+        self.assertFalse(catalog["evidence_invalid_or_unavailable"])
+        self.assertEqual(len(catalog["failures"]), 1)
+
+    def test_only_exact_coordinator_artifact_names_admit_workflow_rows(self):
+        for name in ("qemu-workflow-report", "qemu-workflow-report-non-fedora", "qemu-workflow-report-fedora"):
+            for rows in ([self.row()], b"invalid zip"):
+                with self.subTest(name=name, rows=type(rows).__name__):
+                    _, catalog = self.run_report_fixture([], no_artifacts=True, workflow_reports={name: rows})
+                    self.assertTrue(catalog["evidence_invalid_or_unavailable"])
+        _, catalog = self.run_report_fixture([], no_artifacts=True,
+            workflow_reports={"qemu-workflow-report-other": b"invalid zip"})
+        self.assertFalse(catalog["evidence_invalid_or_unavailable"])
+
     def run_report_fixture(self, rows, *, conclusion="failure", event_kind="push",
                            corrupt=False, expired=False, helper_fails=False, case_log=None,
                            log_case="search", main_shas=None, changed_attempt=False,
@@ -973,7 +993,7 @@ class ReportingBoundaryTests(unittest.TestCase):
                             no_artifacts=False, artifact_listing_error=False,
                             catalog_damage=None, jobs_payload=None, jobs_api_error=None,
                             artifacts_payload=None, published_damage=None,
-                            workflow_distros=None, artifact_distros=None, sender_envs=None):
+                            workflow_distros=None, artifact_distros=None, sender_envs=None, workflow_reports=None):
         run = dict(repository={"full_name": "owner/repo"}, id=10, run_attempt=2,
                    head_sha="a" * 40, workflow_id=20, path=workflow_path,
                    status="completed", event=event_kind, conclusion=conclusion,
@@ -1061,6 +1081,16 @@ class ReportingBoundaryTests(unittest.TestCase):
                          started_at=old_start if distro != "fedora" else run["run_started_at"],
                          completed_at=old_end if distro != "fedora" else "2026-09-20T00:20:00Z")
                     for distro in REPORT.DISTROS]
+        for identifier, (name, report_rows) in enumerate((workflow_reports or {}).items(), 50):
+            if isinstance(report_rows, bytes):
+                payloads[identifier] = report_rows
+            else:
+                output = io.BytesIO()
+                with zipfile.ZipFile(output, "w") as archive:
+                    archive.writestr("run/results.json", json.dumps(report_rows))
+                payloads[identifier] = output.getvalue()
+            artifacts.append(dict(artifact, id=identifier, name=name,
+                                  size_in_bytes=len(payloads[identifier])))
         if jobs is None:
             guests = {REPORT.artifact_guest_identity(item["name"]) for item in artifacts}
             guests.discard(None)

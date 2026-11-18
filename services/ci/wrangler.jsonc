@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "omg-native-ci",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-10",
+  "workers_dev": true,
+  "preview_urls": false,
+  "containers": [{
+    "class_name": "NativeRunner",
+    "scheduling_policy": "default",
+    "image": "registry.cloudflare.com/f1e95b3e1b502cf366dfc81a863695fa/omg-native-ci@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "instance_type": "standard-4",
+    "max_instances": 1
+  }],
+  "durable_objects": {"bindings": [{"name": "CI_RUNNER", "class_name": "NativeRunner"}]},
+  "exports": {"NativeRunner": {"type": "durable-object", "storage": "sqlite"}},
+  "workflows": [{"name": "omg-native-ci", "binding": "CI_WORKFLOW", "class_name": "NativeCIWorkflow"}],
+  "r2_buckets": [{"binding": "CI_BUCKET", "bucket_name": "omg-native-ci"}],
+  "vars": {"CI_IMAGE_DIGEST": "sha256:0000000000000000000000000000000000000000000000000000000000000000"},
+  "observability": {"enabled": true},
+  "limits": {"cpu_ms": 300000}
+}

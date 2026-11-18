@@ -491,7 +491,14 @@ mod tests {
             Ok(std::path::PathBuf::from("/usr/bin/gpg"))
         })
         .expect("trusted GnuPG installation");
-        assert!(Path::new(command.get_program()).is_absolute());
+        assert_eq!(Path::new(command.get_program()), Path::new("/usr/bin/gpg"));
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["--no-options", "--batch", "--homedir", "/tmp/gnupg"]
+        );
     }
 
     fn test_key_handle() -> KeyHandle {
@@ -620,6 +627,12 @@ mod tests {
             "00112233445566778899AABBCCDDEEFF00112233"
         ));
         assert!(gnupg_listing_contains_key(listing, "CCDDEEFF00112233"));
+        assert!(gnupg_listing_contains_key(listing, "0xccddeeff00112233"));
         assert!(!gnupg_listing_contains_key(listing, "FFFFFFFFFFFFFFFF"));
+
+        let decoys = "uid:::::::::00112233445566778899AABBCCDDEEFF00112233:\n\
+                      pub:::::::::00112233445566778899AABBCCDDEEFF00112233:\n\
+                      fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n";
+        assert!(!gnupg_listing_contains_key(decoys, "CCDDEEFF00112233"));
     }
 }

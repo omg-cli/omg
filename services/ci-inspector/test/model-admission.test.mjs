@@ -18,6 +18,30 @@ test("DeepSeek binding inputs carry the exact routed model and preserve the call
 
 const model = "@cf/deepseek-ai/deepseek-v4.1-flash-1017";
 
+test("direct Workers AI drops SDK gateway defaults while retaining every other call option", async () => {
+  const calls = [];
+  let admissions = 0;
+  const binding = { async run(...args) { calls.push(args); return "direct inference"; } };
+  const ai = pacedAI(binding, { getByName() { return { async admit(selected) {
+    expect(selected).toBe(PACING_MODEL);
+    admissions++;
+    return { granted: true };
+  } }; } });
+  const inputs = { messages: [{ role: "user", content: "fixture" }] };
+  const signal = new AbortController().signal;
+  const extraHeaders = { "x-fixture": "retained" };
+  const gateway = { id: "default", metadata: { fixture: "not routed" } };
+  const options = { gateway, signal, extraHeaders, returnRawResponse: true };
+  expect(await ai.run(PACING_MODEL, inputs, options)).toBe("direct inference");
+  expect(admissions).toBe(1);
+  expect(calls).toEqual([[PACING_MODEL, { ...inputs, model: PACING_MODEL }, { signal, extraHeaders, returnRawResponse: true }]]);
+  expect(Object.hasOwn(calls[0][2], "gateway")).toBe(false);
+  expect(calls[0][2].signal).toBe(signal);
+  expect(calls[0][2].extraHeaders).toBe(extraHeaders);
+  expect(options.gateway).toBe(gateway);
+  expect(Object.hasOwn(inputs, "model")).toBe(false);
+});
+
 test("model admission waits before sending the original request and preserves binding ownership", async () => {
   const events = [];
   let admissions = 0;

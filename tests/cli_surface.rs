@@ -212,12 +212,24 @@ fn account_expiry_output_fixture(expiry: &str) -> anyhow::Result<String> {
         "machine_id": null
     }))?;
     std::fs::write(&path, &bytes)?;
-    let result = project.run(&["account", "status"]);
+    let result = project.run_with_env(&["account", "status"], &[("NO_COLOR", "1")]);
     let after = std::fs::read(path)?;
     project.close_checked();
     assert_eq!(after, bytes, "account status must preserve stored metadata");
     assert!(result.success, "{}", result.combined_output());
     assert!(result.stdout.contains("Stored token is invalid or expired"));
+    let status_lines: Vec<_> = result
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("Status:"))
+        .collect();
+    assert_eq!(
+        status_lines,
+        ["Status: Stored token is invalid or expired"],
+        "{}",
+        result.combined_output()
+    );
     assert!(!result.stdout.contains("private-account-fixture-key"));
     Ok(result.stdout)
 }

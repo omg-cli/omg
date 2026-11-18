@@ -961,8 +961,8 @@ const GH_CANDIDATES: &[&str] = &[];
 ///
 /// Returns `None` when no attestation-capable tool is installed, which maps
 /// to the existing fail-closed "no `gh`" provenance outcome.
-fn locate_gh() -> Option<std::path::PathBuf> {
-    GH_CANDIDATES
+fn locate_gh(candidates: &[&str]) -> Option<std::path::PathBuf> {
+    candidates
         .iter()
         .find_map(|path| trusted_attestation_helper(std::path::Path::new(path)))
 }
@@ -1007,9 +1007,17 @@ fn trusted_attestation_helper(path: &std::path::Path) -> Option<std::path::PathB
 }
 
 fn verify_attestation(archive_path: &std::path::Path, tag: &str) -> Result<bool> {
+    verify_attestation_with_candidates(archive_path, tag, GH_CANDIDATES)
+}
+
+fn verify_attestation_with_candidates(
+    archive_path: &std::path::Path,
+    tag: &str,
+    candidates: &[&str],
+) -> Result<bool> {
     let repository = attestation_repository(tag)?;
     let signer_workflow = format!("{repository}/.github/workflows/release.yml");
-    let Some(gh) = locate_gh() else {
+    let Some(gh) = locate_gh(candidates) else {
         return Ok(false);
     };
     let output = std::process::Command::new(gh)
@@ -1536,6 +1544,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn attestation_rejects_an_invalid_tag_before_tool_lookup() {
+        let error = verify_attestation(std::path::Path::new("unused-archive"), "../release")
+            .expect_err("invalid release tag must refuse attestation");
+        assert_eq!(error.to_string(), "Invalid release tag");
+    }
+
     #[cfg(unix)]
     #[test]
     fn attestation_helper_rejects_writable_files_and_symlink_namespaces() {
@@ -1570,10 +1585,11 @@ mod tests {
             return;
         }
         use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in("/var/tmp").unwrap();
         let helper = temp.path().canonicalize().unwrap().join("gh");
         fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(trusted_attestation_helper(&helper), Some(helper.clone()));
         nix::unistd::chown(&helper, Some(nix::unistd::Uid::from_raw(65534)), None).unwrap();
         assert!(trusted_attestation_helper(&helper).is_none());
     }
@@ -2169,68 +2185,64 @@ mod tests {
             .expect_err("symlink binary must fail closed");
     }
 
-    /// A PATH-hijacked `gh` must never be the tool that approves an
-    /// update: resolution is restricted to absolute system paths, so a
-    /// project-controlled impostor is ignored (and the gate fails closed
-    /// to the "no gh" outcome).
+    /// A PATH-hijacked `gh` must never approve an update.
+    #[cfg(unix)]
     #[test]
-    #[serial_test::serial]
     fn attestation_ignores_path_hijacked_gh() {
-        if locate_gh().is_some() {
-            // A real GitHub CLI is installed at a trusted absolute path in
-            // this environment; running the impostor scenario would invoke
-            // it against a synthetic archive. The impostor-ignoring behavior
-            // is still covered on environments without a system `gh`.
-            eprintln!("[omg-skip] PATH impostor test requires a host without a trusted gh binary");
+        use std::os::unix::fs::PermissionsExt;
+
+        const NAME: &str = "cli::self_update::tests::attestation_ignores_path_hijacked_gh";
+        if crate::core::testing::run_isolated_test(NAME) {
             return;
         }
-        let impostor_dir = tempfile::tempdir().expect("impostor directory");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let impostor = impostor_dir.path().join("gh");
-            std::fs::write(&impostor, "#!/bin/sh\ntouch gh-impostor-marker\nexit 0\n")
-                .expect("impostor script");
-            std::fs::set_permissions(&impostor, std::fs::Permissions::from_mode(0o755))
-                .expect("impostor permissions");
-        }
+        let fixture = tempfile::tempdir_in("/var/tmp").expect("private fixture");
+        let impostor = fixture.path().join("gh");
+        let marker = fixture.path().join("impostor-executed");
+        fs::write(
+            &impostor,
+            "#!/bin/sh\nprintf executed > \"$OMG_ATTESTATION_TEST_MARKER\"\n",
+        )
+        .expect("impostor script");
+        fs::set_permissions(&impostor, fs::Permissions::from_mode(0o755))
+            .expect("impostor permissions");
+        let status = std::process::Command::new(&impostor)
+            .env("OMG_ATTESTATION_TEST_MARKER", &marker)
+            .status()
+            .expect("run marker control");
+        assert!(status.success());
+        assert_eq!(fs::read(&marker).expect("marker control"), b"executed");
+        fs::remove_file(&marker).expect("reset marker");
 
-        let archive = tempfile::tempdir().expect("archive directory");
-        let archive_path = archive.path().join("archive.tar.gz");
-        std::fs::write(&archive_path, b"unverified archive").expect("archive fixture");
+        let archive = fixture.path().join("archive.tar.gz");
+        fs::write(&archive, b"unverified archive").expect("archive fixture");
+        let absent = fixture.path().join("no-trusted-gh");
+        temp_env::with_vars(
+            [
+                ("PATH", Some(fixture.path().to_str().expect("fixture path"))),
+                (
+                    "OMG_ATTESTATION_TEST_MARKER",
+                    Some(marker.to_str().expect("marker path")),
+                ),
+            ],
+            || {
+                let verified = verify_attestation_with_candidates(
+                    &archive,
+                    "v0.0.0-test",
+                    &[absent.to_str().expect("candidate path")],
+                )
+                .expect("impostor must not error");
+                assert!(!verified, "PATH impostor must not approve the archive");
+                assert!(!marker.exists(), "PATH impostor must never run");
 
-        let previous_path = env::var("PATH").ok();
-        #[cfg(unix)]
-        {
-            // SAFETY: Test-only code, serialized by serial_test; no other
-            // thread reads PATH concurrently.
-            #[expect(unsafe_code)]
-            unsafe {
-                env::set_var(
-                    "PATH",
-                    format!(
-                        "{}:{}",
-                        impostor_dir.path().display(),
-                        previous_path.as_deref().unwrap_or("/usr/bin")
-                    ),
-                );
-            }
-        }
-        let verified = verify_attestation(&archive_path, "v0.0.0-test");
-        if let Some(path) = previous_path {
-            // SAFETY: see above.
-            #[expect(unsafe_code)]
-            unsafe {
-                env::set_var("PATH", path);
-            }
-        }
-
-        // A PATH impostor is not an attestation tool: fail closed to the
-        // same "no gh" outcome instead of executing it.
-        assert!(!verified.expect("impostor must not error"));
-        assert!(
-            !archive.path().join("gh-impostor-marker").exists(),
-            "a PATH-hijacked gh must never run"
+                let verified = verify_attestation_with_candidates(
+                    &archive,
+                    "v0.0.0-test",
+                    &[impostor.to_str().expect("trusted candidate path")],
+                )
+                .expect("trusted fixture must execute");
+                assert!(verified, "explicit trusted fixture must be accepted");
+                assert_eq!(fs::read(&marker).expect("trusted marker"), b"executed");
+            },
         );
     }
 

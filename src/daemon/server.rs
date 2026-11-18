@@ -1438,6 +1438,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn real_handler_delivers_frames_above_the_request_budget() {
         let directory = tempfile::tempdir().expect("private codec fixture");
         let state = Arc::new(
@@ -1659,8 +1660,8 @@ mod tests {
         // If the reader TTL is shorter than the writer interval, the
         // zero-IPC fast path rejects every file between daemon refreshes.
         assert_eq!(
-            STATUS_REFRESH_INTERVAL.as_secs(),
-            crate::core::fast_status::FAST_STATUS_FRESHNESS_SECS,
+            STATUS_REFRESH_INTERVAL,
+            Duration::from_secs(crate::core::fast_status::FAST_STATUS_FRESHNESS_SECS),
             "FastStatus TTL must equal the daemon writer interval"
         );
     }

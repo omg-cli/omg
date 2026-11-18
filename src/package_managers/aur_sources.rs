@@ -901,6 +901,19 @@ mod tests {
         let error = validate_unique_destinations(&sources)
             .expect_err("different URLs must not race for one destination");
         assert!(error.to_string().contains("multiple URLs"), "{error}");
+
+        let identical = vec![sources[0].clone(), sources[0].clone()];
+        validate_unique_destinations(&identical)
+            .expect("repeated identical sources are not a destination conflict");
+        let distinct = vec![
+            sources[0].clone(),
+            SourceFile {
+                url: sources[1].url.clone(),
+                filename: "other.tar.gz".to_string(),
+            },
+        ];
+        validate_unique_destinations(&distinct)
+            .expect("different destinations are not a destination conflict");
     }
 
     #[test]
@@ -917,6 +930,7 @@ mod tests {
         let result = extract_http_source("https://example.com/file.tar.gz?token=abc");
         assert!(result.is_some());
         let source = result.unwrap();
+        assert_eq!(source.url, "https://example.com/file.tar.gz?token=abc");
         assert_eq!(source.filename, "file.tar.gz");
     }
 
@@ -925,6 +939,7 @@ mod tests {
         let result = extract_http_source("https://example.com/file.tar.gz#hash");
         assert!(result.is_some());
         let source = result.unwrap();
+        assert_eq!(source.url, "https://example.com/file.tar.gz#hash");
         assert_eq!(source.filename, "file.tar.gz");
     }
 

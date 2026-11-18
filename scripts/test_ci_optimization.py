@@ -5,11 +5,16 @@ import gzip
 import json
 from pathlib import Path
 import re
+import shlex
 import subprocess
+import sys
+import tarfile
 import tempfile
 import textwrap
 import tomllib
 import unittest
+
+from test_ci_gates import job_block
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / '.github/workflows'
@@ -23,6 +28,115 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_privileged_coverage_case_requires_real_execution_and_profiles(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        self.assertIn('run_case() {', script)
+        function = textwrap.dedent(re.search(r'(?ms)^ +run_case\(\) \{.*?^ +\}', script).group())
+        fixture = """\
+        #!/bin/bash
+        set -eu
+        test "$1" = --exact
+        test "$3" = --include-ignored
+        profile=${LLVM_PROFILE_FILE//%p/123}
+        profile=${profile//%m/1}
+        profile=${profile//%c/}
+        case "$FIXTURE_BEHAVIOR" in
+          fail) exit 23 ;;
+          missing-profile) ;;
+          empty-profile) : > "$profile" ;;
+          *) printf counters > "$profile" ;;
+        esac
+        case "$FIXTURE_BEHAVIOR" in
+          skipped) printf '[omg-skip] fixture did not execute\\n' ;;
+          profile-error) printf 'LLVM Profile Error: cannot write profile\\n' >&2 ;;
+        esac
+        if [ "$FIXTURE_BEHAVIOR" = empty-selection ]; then
+          printf 'test result: ok. 0 passed; 0 failed; 0 ignored;\\n'
+        else
+          printf 'test result: ok. 1 passed; 0 failed; 0 ignored;\\n'
+        fi
+        """
+        for behavior in ('pass', 'fail', 'skipped', 'profile-error', 'empty-selection',
+                         'missing-profile', 'empty-profile', 'missing-registry'):
+            with self.subTest(behavior=behavior), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary = root / 'fixture'
+                binary.write_bytes(textwrap.dedent(fixture).encode())
+                binary.chmod(0o755)
+                profiles, evidence = root / 'profiles', root / 'evidence'
+                profiles.mkdir(); evidence.mkdir()
+                (evidence / 'registry.txt').write_bytes(b'' if behavior == 'missing-registry' else b'probe::case: test\n')
+                body = '\n'.join((function,
+                    'fixture_binary=$TEST_BINARY', 'fixture_profiles=$TEST_PROFILES',
+                    'fixture_evidence=$TEST_EVIDENCE', 'run_case probe::case'))
+                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', body],
+                    env=dict(os.environ, TEST_BINARY=binary.as_posix(), TEST_PROFILES=profiles.as_posix(),
+                             TEST_EVIDENCE=evidence.as_posix(), FIXTURE_BEHAVIOR=behavior),
+                    capture_output=True, text=True)
+                if behavior == 'pass':
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual((evidence / 'passed.tsv').read_text(), 'probe::case\t1\n')
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse((evidence / 'passed.tsv').exists())
+
+    def test_privileged_coverage_keeps_isolation_and_state_mount_last(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        cases = re.search(r'(?ms)^ +cases=\(\n(.*?)^ +\)', script)
+        self.assertIsNotNone(cases, 'coverage must select its required fixture cases explicitly')
+        selected = [line.strip() for line in cases.group(1).splitlines() if line.strip()]
+        self.assertEqual(len(selected), len(set(selected)))
+        self.assertEqual(len(selected), 14)
+        self.assertEqual(selected[0], 'package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman')
+        self.assertEqual(selected[-1], 'core::usage::tests::elevated_state_roundtrip_preserves_caller_files')
+        self.assertIn('mkdir -m 1777 /profiles', script)
+        self.assertIn('--network none --pids-limit 128 --memory 1g --cpus 2', script)
+        self.assertIn('mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib', script)
+        self.assertNotIn('--env GH_TOKEN', script)
+        self.assertNotIn('--env GITHUB_TOKEN', script)
+
+    def test_privileged_coverage_receipt_requires_complete_nonempty_profiles(self):
+        script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
+        payload = re.search(r"(?ms)^python3 - .* <<'PY'\n(.*?)^PY$", script).group(1)
+        for behavior in ('pass', 'missing-result', 'duplicate-result', 'reordered-results',
+                         'missing-profile', 'empty-profile', 'wrong-profile-count'):
+            with self.subTest(behavior=behavior), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binary, profiles, evidence = root / 'fixture', root / 'profiles', root / 'evidence'
+                binary.write_bytes(b'fixture binary')
+                profiles.mkdir(); evidence.mkdir()
+                names = ['probe::first', 'probe::second']
+                (evidence / 'expected-tests.txt').write_text('\n'.join(names) + '\n')
+                rows = [name + '\t1' for name in names]
+                if behavior == 'missing-result': rows.pop()
+                if behavior == 'duplicate-result': rows.append(rows[0])
+                if behavior == 'reordered-results': rows.reverse()
+                if behavior == 'wrong-profile-count': rows[0] = names[0] + '\t2'
+                (evidence / 'passed.tsv').write_text('\n'.join(rows) + '\n')
+                for name in names:
+                    profile = profiles / ('omg-fixture-' + name.replace('::', '_') + '-123-1.profraw')
+                    if behavior != 'missing-profile' or name != names[0]:
+                        profile.write_bytes(b'' if behavior == 'empty-profile' else b'counters')
+                result = subprocess.run([sys.executable, '-c', payload, str(binary), str(profiles),
+                                         str(evidence), 'a' * 40], capture_output=True, text=True)
+                receipt = evidence / 'receipt.json'
+                if behavior == 'pass':
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    value = json.loads(receipt.read_text())
+                    self.assertEqual(value['binary_sha256'], hashlib.sha256(b'fixture binary').hexdigest())
+                    self.assertEqual([case['name'] for case in value['tests']], names)
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(receipt.exists())
+
+    def test_continuous_profiles_require_the_verified_coverage_toolchain(self):
+        workflow = (WORKFLOWS / 'coverage.yml').read_text()
+        self.assertNotIn('runtime-counter-relocation', workflow.split('jobs:', 1)[0])
+        coverage = workflow.split('  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
+        self.assertIn('RUSTFLAGS: -C llvm-args=-runtime-counter-relocation', coverage)
+        self.assertIn('LLVM_PROFILE_FILE_NAME: omg-%p-%m%c.profraw', coverage)
+        self.assertIn('tool: cargo-llvm-cov@0.9.0,nextest', coverage)
+
     def test_sandbox_coverage_requires_one_existing_instrumented_binary(self):
         script = step_script('coverage.yml', 'Cover sandbox descendant cancellation')
         selection = script.split('docker build', 1)[0]
@@ -37,7 +151,8 @@ class OptimizationContracts(unittest.TestCase):
                 result = subprocess.run(
                     [BASH, '-c', 'cargo() { return 97; };\n' + selection
                      + 'printf "%s" "$binary"'],
-                    env={**os.environ, 'GITHUB_WORKSPACE': Path(directory).as_posix()},
+                    env={**os.environ, 'GITHUB_WORKSPACE': Path(directory).as_posix(),
+                         'RUNNER_TEMP': Path(directory).as_posix()},
                     text=True, capture_output=True)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 if count == 1:
@@ -69,7 +184,7 @@ class OptimizationContracts(unittest.TestCase):
             with self.subTest(export_status=export_status), tempfile.TemporaryDirectory() as directory:
                 exporter = """
                 cargo() {
-                    test "$*" = 'llvm-cov report --json --output-path coverage-regions.json' || return 99
+                    test "$*" = 'llvm-cov report --json --output-path coverage-regions.json --verbose' || return 99
                     test "$EXPORT_STATUS" = 0 || return "$EXPORT_STATUS"
                     printf '%s' '{"data":[{"functions":[{"regions":[[16,29,16,86,10,0,0,0]]}]}]}' > coverage-regions.json
                 }
@@ -118,10 +233,46 @@ class OptimizationContracts(unittest.TestCase):
                 blocks = re.split(r'(?m)^      - ', text)
                 caches = [block for block in blocks
                           if 'uses: Swatinem/rust-cache@' in block and new_prefix in block]
-                self.assertEqual(len(caches), 1, 'registry-only cache must use a fresh prefix')
-                self.assertIn('cache-targets: false', caches[0])
-                self.assertIn('cache-bin: false', caches[0])
+                self.assertEqual(len(caches), 2 if filename == 'ci.yml' else 1,
+                                 'registry-only cache must use a fresh prefix')
+                for cache in caches:
+                    self.assertIn('cache-targets: false', cache)
+                    self.assertIn('cache-bin: false', cache)
+                if filename == 'ci.yml':
+                    for role in ('portable', 'portable-release'):
+                        self.assertEqual(job_block(text, role).count(new_prefix), 1)
                 self.assertNotIn(old_prefix, text)
+
+    def test_compiler_cache_upload_contains_both_diagnostics_in_one_directory(self):
+        for filename, job in (('ci.yml', 'portable'), ('ci.yml', 'portable-release'),
+                              ('benchmark.yml', 'benchmark')):
+            with self.subTest(workflow=filename, job=job), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                tools = root / 'bin'
+                tools.mkdir()
+                cache = tools / 'sccache'
+                cache.write_text('#!/bin/sh\nif [ "$*" = "--show-stats --stats-format=json" ]; then\n'
+                                 '  printf \'{"stats":{"cache_read_errors":0}}\\n\'\nfi\n')
+                cache.chmod(0o755)
+                block = job_block((WORKFLOWS / filename).read_text(), job)
+                report = re.search(r'(?m)^      - name: Report .* compiler cache\n', block)
+                report_step = block[report.end():].split('\n      - ', 1)[0]
+                script = textwrap.dedent(report_step.split('        run: |\n', 1)[1])
+                result = subprocess.run([BASH, '-eu', '-c', script], capture_output=True, text=True,
+                    env=dict(os.environ, PATH=tools.as_posix() + os.pathsep + os.environ['PATH'],
+                             RUNNER_TEMP=root.as_posix(), GITHUB_SHA='a' * 40,
+                             SCCACHE_S3_KEY_PREFIX='benchmark-v1/'), timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                upload = re.split(r'      - name: Preserve .* compiler cache diagnostics\n', block)[1]
+                path = re.search(r'(?m)^          path: (.+)$', upload).group(1)
+                self.assertNotEqual(path, '|', 'Container uploads need one scalar directory path')
+                uploaded = Path(path.replace('${{ runner.temp }}', root.as_posix()))
+                self.assertEqual(sorted(item.name for item in uploaded.iterdir()),
+                                 ['omg-r2-cache-context.txt', 'omg-r2-cache-stats.json'])
+                self.assertEqual(json.loads((uploaded / 'omg-r2-cache-stats.json').read_text()),
+                                 {'stats': {'cache_read_errors': 0}})
+                self.assertEqual((uploaded / 'omg-r2-cache-context.txt').read_text(),
+                                 'source=' + 'a' * 40 + '\nprefix=benchmark-v1/\n')
 
     def test_ci_profiles_do_not_retry_failures(self):
         config = tomllib.loads((ROOT / '.config/nextest.toml').read_text())
@@ -265,6 +416,158 @@ class OptimizationContracts(unittest.TestCase):
             self.assertNotEqual(cron.split()[0], '0')
             schedules.append(cron)
         self.assertEqual(len(schedules), len(set(schedules)))
+
+
+class CoverageProducerDiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        (self.directory / 'scripts').mkdir()
+        (self.directory / 'scripts/check-line-coverage.py').write_bytes(
+            (ROOT / 'scripts/check-line-coverage.py').read_bytes())
+        (self.directory / '.github/workflows').mkdir(parents=True)
+        (self.directory / '.github/workflows/coverage.yml').write_bytes(
+            (WORKFLOWS / 'coverage.yml').read_bytes())
+        (self.directory / 'src').mkdir()
+        (self.directory / 'src/a.rs').write_text('fn a() {}\n')
+        for command in (['git', 'init', '-q'], ['git', 'add', 'src/a.rs'],
+                        ['git', '-c', 'user.name=Coverage fixture', '-c',
+                         'user.email=coverage@example.invalid', 'commit', '-qm', 'fixture']):
+            subprocess.run(command, cwd=self.directory, check=True, capture_output=True)
+        self.revision = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=self.directory, text=True).strip()
+        self.environment = dict(os.environ, GITHUB_SHA=self.revision, GITHUB_RUN_ID='123',
+                                GITHUB_RUN_ATTEMPT='2', GITHUB_JOB='coverage',
+                                RUNNER_TEMP=self.directory.as_posix(), TEST_PYTHON=sys.executable)
+
+    def reports(self, count=1, schema='3.1.0'):
+        (self.directory / 'lcov.info').write_text(
+            'SF:/fixture/src/a.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n')
+        document = {'type': 'llvm.coverage.json.export', 'version': schema, 'data': [{
+            'files': [{'filename': '/fixture/src/a.rs', 'summary': {'lines': {'count': 1, 'covered': 1}}}],
+            'functions': [{'name': 'a', 'filenames': ['/fixture/src/a.rs'],
+                           'regions': [[1, 1, 1, 10, count, 0, 0, 0]]}]}]}
+        (self.directory / 'export.json').write_text(json.dumps(document))
+
+    def run_shell(self, script, environment=None):
+        launcher = 'python3() { "$TEST_PYTHON" "$@"; };\n'
+        return subprocess.run([BASH, '-e', '-c', launcher + script], cwd=self.directory,
+                              env=environment or self.environment, text=True,
+                              capture_output=True, timeout=30)
+
+    def export_and_validate(self):
+        exporter = '''cargo() {
+          test "$EXPORT_STATUS" = 0 || return "$EXPORT_STATUS"
+          cp export.json coverage-regions.json
+        };\n'''
+        script = step_script('coverage.yml', 'Generate region evidence')
+        text = (WORKFLOWS / 'coverage.yml').read_text()
+        if '      - name: Validate local coverage evidence\n' in text:
+            script += step_script('coverage.yml', 'Validate local coverage evidence')
+        return self.run_shell(exporter + script, dict(self.environment, EXPORT_STATUS='0'))
+
+    def test_producer_rejects_saturation_before_runner_disappears(self):
+        self.reports(2**63 - 1)
+        result = self.export_and_validate()
+        self.assertNotEqual(result.returncode, 0, 'producer accepted a saturated region')
+        self.assertIn('wrapped or saturated count', result.stderr)
+        self.assertTrue((self.directory / 'coverage-regions.json.gz').is_file())
+
+    def test_producer_preserves_healthy_report_and_rejects_bad_schema(self):
+        self.reports()
+        result = self.export_and_validate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.directory / 'coverage-diagnostics').exists())
+        self.reports(schema='unsupported')
+        (self.directory / 'coverage-regions.json.gz').unlink()
+        result = self.export_and_validate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Unsupported region schema', result.stderr)
+
+    def collect(self):
+        result = self.run_shell(step_script('coverage.yml', 'Collect invalid coverage diagnostics'))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = self.directory / 'coverage-diagnostics'
+        return json.loads((output / 'receipt.json').read_text()), output / 'profiles.tar.gz'
+
+    def test_failure_diagnostics_capture_profiles_and_object_identity_without_executable(self):
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        (target / (self.directory.name + '.profdata')).write_bytes(b'merged')
+        (target / (self.directory.name + '-profraw-list')).write_text('one.profraw\n')
+        (target / 'one.profraw').write_bytes(b'raw profile')
+        executable = target / 'fixture-object'
+        executable.write_bytes(b'\x7fELF executable remains outside archive')
+        self.environment['GITHUB_TOKEN'] = 'diagnostic-secret-must-not-be-recorded'
+        (self.directory / 'coverage-region-export.log').write_text(
+            'Running `llvm-cov export -object ' + shlex.quote(executable.as_posix()) + '`\n')
+        receipt, archive = self.collect()
+        self.assertEqual((receipt['source_commit'], receipt['run_id'], receipt['run_attempt']),
+                         (self.revision, '123', '2'))
+        self.assertEqual(receipt['objects'], [{'path': executable.as_posix(),
+            'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(), 'bytes': executable.stat().st_size,
+            'changed_during_collection': False}])
+        self.assertEqual(receipt['workflow_sha256'], hashlib.sha256((WORKFLOWS / 'coverage.yml').read_bytes()).hexdigest())
+        self.assertIn('@sha256:', receipt['image'])
+        self.assertEqual(receipt['archive_sha256'], hashlib.sha256(archive.read_bytes()).hexdigest())
+        self.assertNotIn(self.environment['GITHUB_TOKEN'], json.dumps(receipt))
+        with tarfile.open(archive) as bundle:
+            raw = bundle.extractfile('target/llvm-cov-target/one.profraw').read()
+            self.assertEqual(raw, b'raw profile')
+            files = {item['path']: item for item in receipt['files']}
+            self.assertEqual(files['target/llvm-cov-target/one.profraw']['sha256'], hashlib.sha256(raw).hexdigest())
+            self.assertFalse(any('fixture-object' in name for name in bundle.getnames()))
+        self.assertIn('rustc', receipt['tools'])
+
+    def test_diagnostics_read_colored_export_commands(self):
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        executable = target / 'fixture object'
+        executable.write_bytes(b'\x7fELF colored-log fixture')
+        (self.directory / 'coverage-region-export.log').write_text(
+            '\x1b[1;32mRunning\x1b[0m `llvm-cov export -object '
+            + shlex.quote(executable.as_posix()) + '`\n')
+        receipt, _ = self.collect()
+        self.assertEqual(receipt['objects'], [{'path': executable.as_posix(),
+            'sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
+            'bytes': executable.stat().st_size, 'changed_during_collection': False}])
+
+    def test_diagnostics_bound_input_and_report_missing_and_symlink_profiles(self):
+        target = self.directory / 'target/llvm-cov-target'
+        target.mkdir(parents=True)
+        (target / 'one.profraw').write_bytes(b'raw')
+        with (target / 'oversize.profraw').open('wb') as stream:
+            stream.truncate(128 * 1024 * 1024 + 1)
+        outside = self.directory / 'private.txt'
+        outside.write_text('must not be archived')
+        try:
+            (target / 'linked.profraw').symlink_to(outside)
+        except OSError as error:
+            self.skipTest(f'symlink fixture unavailable: {error}')
+        receipt, archive = self.collect()
+        self.assertFalse(receipt['complete'])
+        self.assertLessEqual(receipt['captured_input_bytes'], 128 * 1024 * 1024)
+        self.assertLessEqual(receipt['admitted_input_bytes'], 128 * 1024 * 1024)
+        files = {Path(item['path']).name: item for item in receipt['files']}
+        self.assertIn('budget', files['oversize.profraw']['omitted'])
+        self.assertIn('symlinks', files['linked.profraw']['omitted'])
+        self.assertIn('omitted', files[self.directory.name + '.profdata'])
+        with tarfile.open(archive) as bundle:
+            self.assertEqual(bundle.getnames(), ['target/llvm-cov-target/one.profraw'])
+
+    def test_missing_profiles_are_explicit_and_uploads_do_not_mask_validation(self):
+        receipt, _ = self.collect()
+        self.assertTrue(receipt['raw_profiles_missing'])
+        self.assertFalse(receipt['complete'])
+        text = (WORKFLOWS / 'coverage.yml').read_text()
+        for name in ('Collect invalid coverage diagnostics', 'Preserve invalid coverage diagnostics'):
+            block = text.split(f'      - name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("!cancelled() && steps.coverage_sanity.outcome == 'failure'", block)
+        validator = text.split('      - name: Validate local coverage evidence\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertNotIn('continue-on-error', validator)
+        for name in ('lcov', 'regions', 'comparison', 'diagnostics'):
+            self.assertIn('name: coverage-' + name + '-${{ github.run_id }}-${{ github.run_attempt }}', text)
 
 
 if __name__ == '__main__':

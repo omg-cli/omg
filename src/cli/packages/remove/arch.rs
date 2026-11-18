@@ -59,17 +59,19 @@ mod tests {
 
     fn with_native_removal_fixture(test: impl FnOnce()) {
         temp_env::with_vars(
-            [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
+            [
+                ("OMG_TEST_MODE", None::<&str>),
+                ("OMG_TEST_DISTRO", None),
+                ("OMG_PACMAN_LOCAL_DIR", None),
+                ("OMG_PACMAN_SYNC_DIR", None),
+            ],
             || {
-                if crate::core::is_root()
-                    || crate::core::env::distro::detect_distro()
-                        != crate::core::env::distro::Distro::Arch
-                {
-                    eprintln!(
-                        "skipped: native removal fixture requires an unprivileged Arch process"
-                    );
-                    return;
-                }
+                assert!(!crate::core::is_root(), "fixture requires an ordinary user");
+                assert_eq!(
+                    crate::core::env::distro::detect_distro(),
+                    crate::core::env::distro::Distro::Arch,
+                    "native removal fixture requires Arch"
+                );
 
                 struct Restore;
                 impl Drop for Restore {
@@ -127,9 +129,14 @@ mod tests {
                 let _restore = Restore;
                 crate::package_managers::alpm_direct::clear_alpm_cache();
                 crate::core::paths::set_test_overrides(Some(root), Some(database));
-                temp_env::with_var(
-                    "OMG_PACMAN_CONF",
-                    Some(config.to_str().expect("UTF-8 config")),
+                temp_env::with_vars(
+                    [
+                        ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                        ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
+                        ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
+                        ("OMG_DATA_DIR", Some(directory.path().as_os_str())),
+                        ("HOME", Some(directory.path().as_os_str())),
+                    ],
                     test,
                 );
             },
@@ -139,9 +146,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn removal_preview_rejects_sync_only_package_but_preserves_repository_info() {
-        if crate::core::testing::run_isolated_test(
-            "cli::packages::remove::arch::tests::removal_preview_rejects_sync_only_package_but_preserves_repository_info",
-        ) {
+        const NAME: &str = "cli::packages::remove::arch::tests::removal_preview_rejects_sync_only_package_but_preserves_repository_info";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
             return;
         }
         with_native_removal_fixture(|| {
@@ -176,9 +184,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn removal_preview_rejects_mixed_installed_and_sync_only_targets() {
-        if crate::core::testing::run_isolated_test(
-            "cli::packages::remove::arch::tests::removal_preview_rejects_mixed_installed_and_sync_only_targets",
-        ) {
+        const NAME: &str = "cli::packages::remove::arch::tests::removal_preview_rejects_mixed_installed_and_sync_only_targets";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
             return;
         }
         with_native_removal_fixture(|| {
@@ -211,9 +220,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn recursive_removal_preview_rejects_sync_only_package() {
-        if crate::core::testing::run_isolated_test(
-            "cli::packages::remove::arch::tests::recursive_removal_preview_rejects_sync_only_package",
-        ) {
+        const NAME: &str = "cli::packages::remove::arch::tests::recursive_removal_preview_rejects_sync_only_package";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
             return;
         }
         with_native_removal_fixture(|| {
@@ -236,9 +246,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn removal_preview_accepts_installed_native_package() {
-        if crate::core::testing::run_isolated_test(
-            "cli::packages::remove::arch::tests::removal_preview_accepts_installed_native_package",
-        ) {
+        const NAME: &str =
+            "cli::packages::remove::arch::tests::removal_preview_accepts_installed_native_package";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
             return;
         }
         with_native_removal_fixture(|| {
@@ -278,9 +290,10 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn removal_preview_refuses_package_absent_from_local_and_sync_databases() {
-        if crate::core::testing::run_isolated_test(
-            "cli::packages::remove::arch::tests::removal_preview_refuses_package_absent_from_local_and_sync_databases",
-        ) {
+        const NAME: &str = "cli::packages::remove::arch::tests::removal_preview_refuses_package_absent_from_local_and_sync_databases";
+        if crate::config::Settings::rerun_test_unprivileged(NAME)
+            || crate::core::testing::run_isolated_test(NAME)
+        {
             return;
         }
         with_native_removal_fixture(|| {

@@ -84,12 +84,25 @@ mod tests {
         inspection.privileged_files.push(PrivilegedFile {
             path: "usr/bin/demo".into(),
             mode: 0o4755,
+            capability: Some("010203".into()),
+        });
+        inspection.privileged_files.push(PrivilegedFile {
+            path: "usr/bin/group-tool".into(),
+            mode: 0o2755,
             capability: None,
         });
         let prompt = exception_prompt(&[inspection])?.expect("exception prompt");
         assert!(prompt.contains(".INSTALL hook sha256="));
         assert!(prompt.contains("usr/bin/demo mode=4755"));
         assert!(prompt.contains(&"a".repeat(64)));
+        assert_eq!(
+            prompt,
+            format!(
+                "AUR package contents request exceptional install-time privileges:\n\ndemo 1-1 [{}]\n  .INSTALL hook sha256={}\n  usr/bin/demo mode=4755 capability=010203\n  usr/bin/group-tool mode=2755\n\nInstall these exact inspected archives?",
+                "a".repeat(64),
+                "b".repeat(64)
+            )
+        );
         Ok(())
     }
 }

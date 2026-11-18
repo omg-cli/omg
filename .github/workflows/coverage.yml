@@ -43,6 +43,9 @@ jobs:
     if: needs.changes.outputs.coverage_required == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      RUSTFLAGS: -C llvm-args=-runtime-counter-relocation
+      LLVM_PROFILE_FILE_NAME: omg-%p-%m%c.profraw
     container:
       image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
 
@@ -91,14 +94,14 @@ jobs:
       - name: Install coverage tools
         uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
         with:
-          tool: cargo-llvm-cov,nextest
+          tool: cargo-llvm-cov@0.9.0,nextest
 
       - name: Cache instrumented dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         env:
           ZSTD_CLEVEL: "6"
         with:
-          prefix-key: v2-coverage-dependencies
+          prefix-key: v3-coverage-continuous-dependencies
           shared-key: arch-f3691b4dde62ba4c4-arch-pgp-license
           # Keep main's reusable cache; PR merge-ref writes cannot warm main.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -176,6 +179,7 @@ jobs:
           retention-days: 14
 
       - name: Cover sandbox descendant cancellation
+        id: native_fixture_tests
         shell: bash
         timeout-minutes: 5
         run: |
@@ -186,6 +190,9 @@ jobs:
           mapfile -d '' binaries < <(find "$profile_dir/debug/deps" -maxdepth 1 -type f -name 'omg_lib-*' -executable -print0)
           test "${#binaries[@]}" -eq 1
           binary=${binaries[0]}
+          evidence_dir="$RUNNER_TEMP/native-coverage-evidence"
+          mkdir -p "$evidence_dir"
+          sha256sum "$binary" > "$evidence_dir/binary.sha256"
 
           docker build --tag omg-coverage-sandbox - <<'DOCKERFILE'
           FROM archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
@@ -200,21 +207,105 @@ jobs:
           container=$(docker create --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
             --security-opt seccomp=/tmp/coverage-sandbox-seccomp.json \
             --network none --pids-limit 128 --memory 1g --cpus 2 \
-            --env LLVM_PROFILE_FILE='/profiles/omg-sandbox-%p-%m.profraw' \
             omg-coverage-sandbox /bin/bash -euo pipefail -c '
-              mkdir /profiles
+              mkdir -m 1777 /profiles
+              mkdir /evidence
+              fixture_binary=/fixture
+              fixture_profiles=/profiles
+              fixture_evidence=/evidence
               command -v fakeroot
               bwrap --ro-bind / / --unshare-pid --proc /proc -- /bin/true
               bwrap --unshare-user --uid "$(id -u nobody)" --gid "$(id -g nobody)" \
                 --cap-drop ALL --ro-bind / / --proc /proc -- /usr/bin/id
-              /fixture --exact package_managers::aur::client::tests::cancelling_logged_sandbox_build_terminates_descendants --ignored --nocapture
+              /fixture --include-ignored --list > /evidence/registry.txt
+              run_case() {
+                local test_name=$1
+                local case_id=${test_name//::/_}
+                local log="$fixture_evidence/$case_id.log"
+                grep -Fx "$test_name: test" "$fixture_evidence/registry.txt"
+                LLVM_PROFILE_FILE="$fixture_profiles/omg-fixture-$case_id-%p-%m%c.profraw" \
+                  timeout --kill-after=2s 35s "$fixture_binary" --exact "$test_name" \
+                  --include-ignored --nocapture --test-threads=1 2>&1 | tee "$log"
+                grep -Eq "^test result: ok\. 1 passed; 0 failed; 0 ignored;" "$log"
+                if grep -Eq "\[omg-skip\]|skipped:|LLVM Profile (Error|Warning)" "$log"; then
+                  return 1
+                fi
+                local profiles=("$fixture_profiles/omg-fixture-$case_id-"*.profraw)
+                for profile in "${profiles[@]}"; do test -s "$profile"; done
+                printf "%s\t%s\n" "$test_name" "${#profiles[@]}" >> "$fixture_evidence/passed.tsv"
+              }
+              cases=(
+                package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman
+                package_managers::aur::client::tests::cancelling_logged_sandbox_build_terminates_descendants
+                cli::self_update::tests::elevated_verifier_rejects_another_users_helper
+                core::pacman_conf::tests::missing_pacman_config_is_not_replaced_with_fabricated_repositories
+                daemon::handlers::tests::daemon_native_initializer_does_not_block_the_async_executor
+                daemon::handlers::tests::daemon_native_retirement_releases_backend_lock_and_executor
+                daemon::handlers::tests::daemon_native_cancelled_request_retains_serialization_until_work_finishes
+                daemon::handlers::tests::daemon_native_retirement_keeps_final_join_off_the_request_executor
+                package_managers::alpm_direct::tests::security_update_eligibility_respects_repository_priority_and_ignore_filters
+                package_managers::alpm_direct::tests::list_installed_fast_includes_pacman
+                package_managers::alpm_worker::tests::initialization_errors_are_returned_to_the_caller
+                package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_agree_on_fixture_local_db
+                package_managers::pacman_db::db::tests::fast_path_and_libalpm_counts_preserve_distinct_soname_dependencies
+                core::usage::tests::elevated_state_roundtrip_preserves_caller_files
+              )
+              printf "%s\n" "${cases[@]}" > /evidence/expected-tests.txt
+              for test_name in "${cases[@]}"; do
+                if [ "$test_name" = core::usage::tests::elevated_state_roundtrip_preserves_caller_files ]; then
+                  mount -t tmpfs -o nosuid,nodev,noexec,mode=755 tmpfs /var/lib
+                  printf isolated > /var/lib/.omg-state-isolation-fixture
+                  caller=$(mktemp -d /tmp/omg-state-caller.XXXXXX)
+                  printf caller-history-sentinel > "$caller/history-target"
+                  ln -s history-target "$caller/history.json"
+                  printf caller-usage-sentinel > "$caller/usage.json"
+                  chown -hR nobody: "$caller"
+                  OMG_DATA_DIR="$caller" run_case "$test_name"
+                else
+                  run_case "$test_name"
+                fi
+              done
             ')
           trap 'docker rm --force "$container"' EXIT
           docker cp "$binary" "$container:/fixture"
-          timeout --kill-after=5s 90s docker start --attach "$container" | tee /tmp/coverage-sandbox.log
-          grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored;' /tmp/coverage-sandbox.log
-          docker cp "$container:/profiles/." "$profile_dir/"
-          test -n "$(find "$profile_dir" -maxdepth 1 -name 'omg-sandbox-*.profraw' -print -quit)"
+          if timeout --kill-after=5s 180s docker start --attach "$container" 2>&1 | tee "$evidence_dir/tests.log"; then
+            run_status=0
+          else
+            run_status=$?
+          fi
+          collection_status=0
+          docker cp "$container:/evidence/." "$evidence_dir/" || collection_status=$?
+          docker cp "$container:/profiles/." "$profile_dir/" || collection_status=$?
+          if [ "$run_status" -ne 0 ]; then exit "$run_status"; fi
+          test "$collection_status" -eq 0
+          python3 - "$binary" "$profile_dir" "$evidence_dir" "$(git rev-parse HEAD)" <<'PY'
+          import hashlib, json, sys
+          from pathlib import Path
+          binary, profiles, evidence = map(Path, sys.argv[1:4])
+          expected = (evidence / 'expected-tests.txt').read_text().splitlines()
+          passed = [line.split('\t') for line in (evidence / 'passed.tsv').read_text().splitlines()]
+          assert expected and len(expected) == len(set(expected)), 'Invalid fixture selection'
+          assert [row[0] for row in passed] == expected, 'Incomplete or reordered fixture results'
+          tests = []
+          for name, count in passed:
+              files = sorted(profiles.glob('omg-fixture-' + name.replace('::', '_') + '-*.profraw'))
+              assert len(files) == int(count) and files, 'Missing fixture profiles'
+              assert all(path.is_file() and not path.is_symlink() and path.stat().st_size > 0 for path in files), 'Empty or unsafe fixture profile'
+              tests.append({'name': name, 'profiles': [
+                  {'name': path.name, 'bytes': path.stat().st_size,
+                   'sha256': hashlib.sha256(path.read_bytes()).hexdigest()} for path in files]})
+          receipt = {'source_commit': sys.argv[4], 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'tests': tests}
+          (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PY
+
+      - name: Preserve native fixture coverage evidence
+        if: ${{ !cancelled() && (steps.native_fixture_tests.outcome == 'success' || steps.native_fixture_tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage-native-fixtures
+          path: ${{ runner.temp }}/native-coverage-evidence/
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Generate LCOV report
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
@@ -251,7 +342,7 @@ jobs:
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-lcov
+          name: coverage-lcov-${{ github.run_id }}-${{ github.run_attempt }}
           path: lcov.info
           retention-days: 14
           if-no-files-found: warn
@@ -259,14 +350,174 @@ jobs:
       - name: Generate region evidence
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         run: |
-          cargo llvm-cov report --json --output-path coverage-regions.json
+          if cargo llvm-cov report --json --output-path coverage-regions.json --verbose 2> coverage-region-export.log; then
+            :
+          else
+            status=$?
+            tail -c 28000 coverage-region-export.log >&2
+            exit "$status"
+          fi
           gzip -9 coverage-regions.json
+
+      - name: Validate local coverage evidence
+        id: coverage_sanity
+        if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util, os, sys
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('coverage_check', 'scripts/check-line-coverage.py')
+          checker = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = checker
+          spec.loader.exec_module(checker)
+          report = checker.read_coverage(Path('lcov.info'), 'producer')
+          sources = checker.source_blobs(Path.cwd(), os.environ['GITHUB_SHA'])
+          checker.region_evidence(Path('coverage-regions.json.gz'), report, sources, 'producer')
+          print('PASS: current producer coverage evidence is valid')
+          PY
+
+      - name: Collect invalid coverage diagnostics
+        if: ${{ !cancelled() && steps.coverage_sanity.outcome == 'failure' }}
+        timeout-minutes: 3
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, shlex, stat, subprocess, tarfile
+          from pathlib import Path
+          root = Path.cwd()
+          profiles = root / 'target/llvm-cov-target'
+          output = Path(os.environ['RUNNER_TEMP']) / 'coverage-diagnostics'
+          output.mkdir(exist_ok=False)
+          budget = 128 * 1024 * 1024
+          receipt = {'schema_version': 1, 'source_commit': os.environ['GITHUB_SHA'],
+              'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'job': os.environ['GITHUB_JOB'], 'input_budget_bytes': budget,
+              'flags': {key: os.environ.get(key) for key in ('RUSTFLAGS', 'LLVM_PROFILE_FILE_NAME')},
+              'files': [], 'objects': [], 'tools': {}}
+          workflow = (root / '.github/workflows/coverage.yml').read_bytes()
+          receipt['workflow_sha256'] = hashlib.sha256(workflow).hexdigest()
+          job = workflow.decode().split('\n  coverage:\n', 1)[1].split('\n  coverage-result:', 1)[0]
+          receipt['image'] = re.search(r'(?m)^      image: (.+)$', job)[1]
+          def command(argv):
+              try:
+                  result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+                  return {'exit_code': result.returncode, 'output': (result.stdout + result.stderr)[:8192]}
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  return {'error': str(error)}
+          receipt['tools']['rustc'] = command(['rustc', '-vV'])
+          receipt['tools']['cargo-llvm-cov'] = command(['cargo', 'llvm-cov', '--version'])
+          receipt['tools']['nextest'] = command(['cargo', 'nextest', '--version'])
+          libdir = command(['rustc', '--print', 'target-libdir'])
+          if libdir.get('exit_code') == 0:
+              tools = Path(libdir['output'].strip()).parent / 'bin'
+              for name in ('llvm-cov', 'llvm-profdata'):
+                  receipt['tools'][name] = command([str(tools / name), '--version'])
+          export_log = root / 'coverage-region-export.log'
+          object_paths = set()
+          if export_log.is_file() and not export_log.is_symlink():
+              with export_log.open('rb') as stream:
+                  log = stream.read(2 * 1024 * 1024 + 1)
+              receipt['export_log_truncated'] = len(log) > 2 * 1024 * 1024
+              command_log = re.sub(r'\x1b\[[0-9;]*m', '', log[:2 * 1024 * 1024].decode('utf-8', errors='replace'))
+              for line in command_log.splitlines():
+                  match = re.search(r'Running `(.*)`$', line)
+                  if match:
+                      try:
+                          argv = shlex.split(match[1])
+                      except ValueError:
+                          receipt['export_log_unparsed'] = True
+                          continue
+                      object_paths.update(argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == '-object')
+          for name in sorted(object_paths):
+              path = Path(name)
+              entry = {'path': name}
+              try:
+                  if (path.is_symlink() or not path.resolve().is_relative_to(root)
+                          or not path.resolve().is_relative_to(profiles.resolve())):
+                      raise ValueError('object is a symlink or outside the profile target')
+                  descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                  with os.fdopen(descriptor, 'rb') as stream:
+                      before = os.fstat(stream.fileno())
+                      if not stat.S_ISREG(before.st_mode):
+                          raise ValueError('object is not a regular file')
+                      entry['bytes'] = remaining = before.st_size
+                      digest = hashlib.sha256()
+                      while remaining:
+                          data = stream.read(min(remaining, 1024 * 1024))
+                          if not data:
+                              raise ValueError('object shrank during hashing')
+                          digest.update(data)
+                          remaining -= len(data)
+                      entry['sha256'] = digest.hexdigest()
+                      after = os.fstat(stream.fileno())
+                      entry['changed_during_collection'] = (
+                          after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns)
+              except (OSError, ValueError) as error:
+                  entry['omitted'] = str(error)
+              receipt['objects'].append(entry)
+          expected = [profiles / (root.name + '.profdata'), profiles / (root.name + '-profraw-list')]
+          candidates = expected + sorted(profiles.glob('*.profraw')) + [export_log]
+          used = 0
+          archive = output / 'profiles.tar.gz'
+          with tarfile.open(archive, 'w:gz', compresslevel=1) as bundle:
+              for path in candidates:
+                  entry = {'path': path.relative_to(root).as_posix()}
+                  receipt['files'].append(entry)
+                  try:
+                      info = path.lstat()
+                      entry['bytes'] = info.st_size
+                      if not stat.S_ISREG(info.st_mode) or not path.resolve().is_relative_to(root):
+                          raise ValueError('not a regular contained file; symlinks are not followed')
+                      if used + info.st_size > budget:
+                          raise ValueError('input byte budget exceeded')
+                      descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                      with os.fdopen(descriptor, 'rb') as stream:
+                          digest = hashlib.sha256()
+                          class ProfileReader:
+                              def read(self, size):
+                                  data = stream.read(size)
+                                  digest.update(data)
+                                  entry['captured_bytes'] = entry.get('captured_bytes', 0) + len(data)
+                                  return data
+                          member = tarfile.TarInfo(entry['path'])
+                          member.size = info.st_size
+                          used += info.st_size
+                          bundle.addfile(member, ProfileReader())
+                          entry['sha256'] = digest.hexdigest()
+                          changed = os.fstat(stream.fileno())
+                          entry['changed_during_collection'] = (
+                              changed.st_size != info.st_size or changed.st_mtime_ns != info.st_mtime_ns)
+                  except (OSError, ValueError) as error:
+                      entry['omitted'] = str(error)
+          receipt['raw_profiles_missing'] = not any(
+              entry['path'].endswith('.profraw') and 'omitted' not in entry for entry in receipt['files'])
+          receipt['admitted_input_bytes'] = used
+          receipt['captured_input_bytes'] = sum(entry.get('captured_bytes', 0) for entry in receipt['files'])
+          receipt['complete'] = bool(object_paths) and not receipt['raw_profiles_missing'] and not any(
+              entry.get('omitted') or entry.get('changed_during_collection')
+              for entry in receipt['files'] + receipt['objects']) and not receipt.get('export_log_truncated') and not receipt.get('export_log_unparsed') and all(
+              receipt['tools'].get(name, {}).get('exit_code') == 0
+              for name in ('rustc', 'cargo-llvm-cov', 'nextest', 'llvm-cov', 'llvm-profdata'))
+          with archive.open('rb') as stream:
+              receipt['archive_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
+          receipt['archive_bytes'] = archive.stat().st_size
+          (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          print(json.dumps({'diagnostics': str(output), 'complete': receipt['complete'], 'captured_input_bytes': receipt['captured_input_bytes']}))
+          PY
+
+      - name: Preserve invalid coverage diagnostics
+        if: ${{ !cancelled() && steps.coverage_sanity.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/coverage-diagnostics/
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Preserve region evidence
         if: ${{ !cancelled() && (steps.instrumented_tests.outcome == 'success' || steps.instrumented_tests.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-regions
+          name: coverage-regions-${{ github.run_id }}-${{ github.run_attempt }}
           path: coverage-regions.json.gz
           retention-days: 14
           if-no-files-found: error
@@ -342,7 +593,7 @@ jobs:
         if: ${{ always() && needs.changes.outputs.coverage_required == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: coverage-comparison
+          name: coverage-comparison-${{ github.run_id }}-${{ github.run_attempt }}
           path: coverage-comparison/
           if-no-files-found: error
           retention-days: 30

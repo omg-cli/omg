@@ -1,5 +1,7 @@
 """Refuse source/run/artifact substitution before coverage comparison."""
 import copy
+from datetime import datetime, timedelta
+import json
 import os
 import sys
 import subprocess
@@ -65,6 +67,18 @@ class BaseCoverageTests(unittest.TestCase):
         run = self.run_fixture()
         run.update(event="pull_request", head_branch="feature", status="in_progress", conclusion=None)
         coverage.validate_run(run, SHA, "pull_request", 123)
+
+    def test_current_job_cannot_admit_a_newer_consumer_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            event = Path(directory) / "event.json"
+            event.write_text(json.dumps({"before": "b" * 40}))
+            environment = {"GITHUB_REPOSITORY": coverage.REPOSITORY, "GITHUB_EVENT_NAME": "push",
+                           "GITHUB_EVENT_PATH": str(event), "GITHUB_SHA": SHA,
+                           "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "2"}
+            with patch.dict(os.environ, environment), patch.object(coverage, "ensure_source_commit"):
+                with patch.object(coverage, "api", return_value={"id": 101, "run_attempt": 3}):
+                    with self.assertRaisesRegex(ValueError, "Current coverage run attempt no longer matches"):
+                        coverage.main()
 
     def test_regions_require_the_same_exact_run_and_commit(self):
         artifact = self.artifact_fixture()
@@ -144,7 +158,20 @@ class GenuineNodeCoverageTests(unittest.TestCase):
 class DownloadMemberBehaviorTests(unittest.TestCase):
     payload = b"SF:/fixture/src/shared.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"
 
-    def download(self, destination, extra):
+    def test_archive_fixture_is_stable_across_zip_clock_boundary(self):
+        spec = importlib.util.spec_from_file_location(
+            "coverage_transport_fixture", Path(__file__).parent / "fixtures" / "coverage_gh.py")
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        for extra in (False, True):
+            with self.subTest(extra=extra):
+                with patch("zipfile.time.localtime", return_value=(2026, 11, 10, 12, 0, 0, 1, 314, -1)):
+                    first = fixture.archive("lcov.info", extra=extra)
+                with patch("zipfile.time.localtime", return_value=(2026, 11, 10, 12, 0, 2, 1, 314, -1)):
+                    second = fixture.archive("lcov.info", extra=extra)
+                self.assertEqual(first, second)
+
+    def download(self, destination, extra=False, kind="coverage-lcov", **scenario):
         real_run = subprocess.run
         fixture = Path(__file__).parent / "fixtures" / "coverage_gh.py"
         def transport(argv, **kwargs):
@@ -152,9 +179,14 @@ class DownloadMemberBehaviorTests(unittest.TestCase):
                 raise AssertionError("Undeclared transport command: " + repr(argv))
             return real_run([sys.executable, "-X", "utf8", "-I", "-B",
                              str(fixture), *argv[1:]], **kwargs)
-        with patch.dict(os.environ, {"COVERAGE_GH_EXTRA": "1" if extra else "0"}):
+        scenario["extra"] = extra
+        with patch.dict(os.environ, {"COVERAGE_GH_SCENARIO": json.dumps(scenario)}):
             with patch.object(coverage.subprocess, "run", side_effect=transport):
-                return coverage.download({"id": 101}, "a" * 40, destination)
+                return coverage.download({"id": 101, "head_sha": "a" * 40,
+                                          "run_attempt": scenario.get("attempt", 2),
+                                          "run_started_at": (datetime(2026, 11, 10) + timedelta(
+                                              minutes=scenario.get("attempt", 2) * 10 - 1)).strftime("%Y-%m-%dT%H:%M:%SZ")},
+                                         "a" * 40, destination, kind)
 
     def test_download_refuses_unexpected_artifact_member(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -167,9 +199,83 @@ class DownloadMemberBehaviorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "download"
             artifact, report = self.download(destination, extra=False)
-            self.assertEqual(artifact["id"], 102)
+            self.assertEqual(artifact["id"], 122)
             self.assertEqual(report, destination / "lcov.info")
             self.assertEqual(report.read_bytes(), self.payload)
+
+    def test_full_producer_rerun_selects_current_pair_from_legacy_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, report = self.download(Path(directory) / "download",
+                                             legacy=True, old_artifacts=True)
+            self.assertEqual(artifact["id"], 122)
+            self.assertEqual(report.read_bytes(), self.payload)
+
+    def test_report_only_rerun_accepts_carried_producer_despite_relabelled_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, report = self.download(Path(directory) / "download", attempt=3,
+                                             producer_attempt=2, old_artifacts=True)
+            self.assertEqual(artifact["name"], "coverage-lcov-101-2")
+            self.assertEqual(report.read_bytes(), self.payload)
+
+    def test_newer_failed_cancelled_or_incomplete_producer_cannot_reuse_old_pair(self):
+        for conclusion in ("failure", "cancelled", None):
+            with self.subTest(conclusion=conclusion), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(ValueError):
+                    self.download(Path(directory) / "download", legacy=True,
+                                  old_artifacts=True, conclusion=conclusion)
+
+    def test_legacy_single_pair_still_requires_successful_owner(self):
+        for conclusion in ("failure", "cancelled", None):
+            with self.subTest(conclusion=conclusion), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(ValueError):
+                    self.download(Path(directory) / "download", legacy=True, conclusion=conclusion)
+
+    def test_transport_faults_refuse_admission(self):
+        for fault in ("mixed_regions", "duplicate", "bad_digest", "wrong_source", "wrong_name",
+                      "outside", "wrong_owner", "incomplete", "incomplete_jobs", "attempt_changed", "symlink",
+                      "invalid_archive", "missing_digest", "oversize_member", "mixed_names",
+                      "bad_size", "boolean_size", "string_size", "changing_total", "duplicate_page",
+                      "wrong_job_source", "wrong_job_run"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                destination = Path(directory) / "download"
+                with self.assertRaises(ValueError):
+                    self.download(destination, **{fault: True})
+                self.assertFalse((destination / "lcov.info").exists())
+
+    def test_legacy_pair_is_admitted_inside_its_owner_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, report = self.download(Path(directory) / "download", legacy=True)
+            self.assertEqual(artifact["id"], 122)
+            self.assertEqual(report.read_bytes(), self.payload)
+
+    def test_full_rerun_does_not_require_a_cancelled_previous_attempt_to_have_created_a_producer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, _ = self.download(Path(directory) / "download", missing_previous=True)
+            self.assertEqual(artifact["id"], 122)
+
+    def test_paginated_artifact_listing_and_region_id_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, report = self.download(Path(directory) / "download", kind="coverage-regions", paginate=True)
+            self.assertEqual(artifact["id"], 123)
+            self.assertEqual(report.name, "coverage-regions.json.gz")
+            self.assertEqual(report.read_bytes(), self.payload)
+
+    def test_fiftieth_rerun_has_no_invented_attempt_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, _ = self.download(Path(directory) / "download", attempt=51)
+            self.assertEqual(artifact["name"], "coverage-lcov-101-51")
+
+    def test_report_only_legacy_pair_retains_original_producer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact, _ = self.download(Path(directory) / "download", attempt=3,
+                                        producer_attempt=2, legacy=True)
+            self.assertEqual(artifact["id"], 122)
+
+    def test_changed_carried_owner_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "Carried coverage producer execution changed"):
+                self.download(Path(directory) / "download", attempt=3, producer_attempt=2,
+                              changed_carried_owner=True)
 
 if __name__ == "__main__":
     unittest.main()

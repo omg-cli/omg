@@ -12,10 +12,8 @@
 //! `is_enhanced_telemetry_enabled()` cannot be true in a test process.
 //! The gate itself IS tested below from the disabled side.
 
-#[path = "../src/core/testing/isolated.rs"]
-mod isolated_fixture;
-
 pub mod common;
+use common::isolated_fixture;
 use common::*;
 
 use std::fs;
@@ -36,11 +34,31 @@ use tempfile::TempDir;
 #[test]
 fn config_and_telemetry_mutations_respect_the_config_lock() -> anyhow::Result<()> {
     let project = TestProject::new();
-    let config = project.config_dir.path().join("config.toml");
+    #[cfg(unix)]
+    let config_dir = if nix::unistd::geteuid().is_root() {
+        project.home_dir.path().join(".config/omg")
+    } else {
+        project.config_dir.path().to_path_buf()
+    };
+    #[cfg(not(unix))]
+    let config_dir = project.config_dir.path().to_path_buf();
+    fs::create_dir_all(&config_dir)?;
+    let config = config_dir.join("config.toml");
+    let run = |args: &[&str]| {
+        project.run_with_env(
+            args,
+            &[
+                ("SUDO_USER", ""),
+                ("SUDO_HOME", ""),
+                ("DOAS_USER", ""),
+                ("OMG_TEST_COMMAND_TIMEOUT_SECS", "5"),
+            ],
+        )
+    };
     let original =
         b"# preserve comments\ntelemetry_enabled = false\n[aur]\nenable_ccache = false\n";
     fs::write(&config, original)?;
-    let lock = fs::File::create(project.config_dir.path().join("config.lock"))?;
+    let lock = fs::File::create(config_dir.join("config.lock"))?;
     lock.lock()?;
     for args in [
         vec!["config", "set", "aur.enable_ccache", "true"],
@@ -48,7 +66,7 @@ fn config_and_telemetry_mutations_respect_the_config_lock() -> anyhow::Result<()
         vec!["privacy", "opt-out"],
         vec!["config", "reset", "--yes"],
     ] {
-        let result = project.run_with_env(&args, &[("OMG_TEST_COMMAND_TIMEOUT_SECS", "5")]);
+        let result = run(&args);
         result.assert_failure();
         assert!(
             result
@@ -60,16 +78,17 @@ fn config_and_telemetry_mutations_respect_the_config_lock() -> anyhow::Result<()
         assert_eq!(fs::read(&config)?, original);
     }
     drop(lock);
-    project
-        .run(&["config", "set", "aur.enable_ccache", "true"])
-        .assert_success();
-    project.run(&["privacy", "opt-out"]).assert_success();
+    run(&["config", "set", "aur.enable_ccache", "true"]).assert_success();
+    run(&["privacy", "opt-in"]).assert_success();
+    let opted_in: toml::Value = toml::from_str(&fs::read_to_string(&config)?)?;
+    assert_eq!(opted_in["telemetry_enabled"].as_bool(), Some(true));
+    run(&["privacy", "opt-out"]).assert_success();
     let content = fs::read_to_string(&config)?;
     assert!(content.contains("# preserve comments"));
     let settings: toml::Value = toml::from_str(&content)?;
     assert_eq!(settings["telemetry_enabled"].as_bool(), Some(false));
     assert_eq!(settings["aur"]["enable_ccache"].as_bool(), Some(true));
-    project.run(&["config", "reset", "--yes"]).assert_success();
+    run(&["config", "reset", "--yes"]).assert_success();
     assert_eq!(
         fs::read_to_string(config.with_extension("toml.backup"))?,
         content

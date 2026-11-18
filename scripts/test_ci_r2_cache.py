@@ -3,6 +3,7 @@ import importlib.util
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,6 +31,60 @@ def statistics(writes=0, misses=0, hits=0, errors=0, language='Rust'):
 
 
 class R2CacheTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'posix', 'portable compiler wrapper runs on Linux')
+    def test_assembler_help_reaches_compiler_while_real_builds_use_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compiler = root / 'cc'
+            cache = root / 'sccache'
+            for path, label, status in ((compiler, 'compiler', 17), (cache, 'cache', 23)):
+                path.write_text(f'#!/bin/sh\nprintf "%s\\n" {label} "$@"\nexit {status}\n')
+                path.chmod(0o755)
+            env = dict(os.environ, PATH=f'{root}{os.pathsep}{os.environ["PATH"]}')
+            wrapper = CACHE.configuration(trusted())['RUSTC_WRAPPER']
+            probe = ['-Wa,--help', '-c', '-o', 'null.123.o', '-x', 'assembler', '/dev/null']
+            direct = subprocess.run([wrapper, str(compiler), *probe], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual((direct.returncode, direct.stdout.splitlines()), (17, ['compiler', *probe]))
+            for tool, args in ((str(compiler), ['-c', 'real.S', '-o', 'real.o']),
+                               (str(compiler), [*probe[:-1], 'real.S']),
+                               ('rustc', ['--crate-name', 'fixture', 'file with spaces.rs'])):
+                with self.subTest(tool=tool, args=args):
+                    cached = subprocess.run([wrapper, tool, *args], env=env,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual((cached.returncode, cached.stdout.splitlines()),
+                                     (23, ['cache', tool, *args]))
+
+    def test_release_owner_and_isolated_manual_generation_keep_the_cache_boundary(self):
+        for job in ('portable', 'portable-release'):
+            config = CACHE.configuration(dict(trusted(), GITHUB_JOB=job))
+            self.assertEqual(config['SCCACHE_S3_KEY_PREFIX'], 'portable-v1/')
+            isolated = dict(trusted(), GITHUB_JOB=job, GITHUB_EVENT_NAME='workflow_dispatch',
+                            OMG_R2_CACHE_ISOLATED='true', GITHUB_RUN_ID='123456789')
+            self.assertEqual(CACHE.configuration(isolated)['SCCACHE_S3_KEY_PREFIX'],
+                             'portable-diagnostic-v1/123456789/')
+            for name, value in [('GITHUB_EVENT_NAME', 'push'), ('GITHUB_RUN_ID', '0'),
+                                ('GITHUB_RUN_ID', '../123'), ('GITHUB_RUN_ID', '1\nINJECT=true'),
+                                ('OMG_R2_CACHE_ISOLATED', 'yes')]:
+                with self.subTest(job=job, name=name, value=value), self.assertRaises(ValueError):
+                    CACHE.configuration(dict(isolated, **{name: value}))
+
+    def test_benchmark_uses_r2_with_its_own_prefix_for_trusted_events(self):
+        for event in ('push', 'workflow_dispatch', 'schedule'):
+            with self.subTest(event=event):
+                config = CACHE.configuration(dict(trusted(), GITHUB_JOB='benchmark', GITHUB_EVENT_NAME=event))
+                self.assertEqual(config['SCCACHE_S3_KEY_PREFIX'], 'benchmark-v1/')
+                self.assertEqual(config['SCCACHE_S3_RW_MODE'], 'READ_WRITE')
+        for job in ('portable', 'portable-release'):
+            with self.subTest(job=job), self.assertRaises(ValueError):
+                CACHE.configuration(dict(trusted(), GITHUB_JOB=job, GITHUB_EVENT_NAME='schedule'))
+        for name, value in [('GITHUB_EVENT_NAME', 'pull_request'),
+                            ('GITHUB_EVENT_NAME', 'pull_request_target'),
+                            ('GITHUB_REF', 'refs/heads/topic'),
+                            ('GITHUB_REPOSITORY', 'someone/omg')]:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                CACHE.configuration(dict(trusted(), GITHUB_JOB='benchmark', **{name: value}))
+
     def server(self, root, snapshots=None, failure=None, corrupt_replay=False):
         snapshots = iter(snapshots if snapshots is not None else
                          [statistics(), statistics(1, 1), statistics(1, 1, 1)])
@@ -81,14 +136,14 @@ class R2CacheTests(unittest.TestCase):
     def test_outputs_follow_write_and_replay_without_client_credentials(self):
         names = []
         sockets = []
-        for _ in range(2):
+        for job in ('portable', 'portable-release', 'benchmark'):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                env = dict(trusted(), GITHUB_ENV=str(root / 'env'), GITHUB_OUTPUT=str(root / 'output'))
+                env = dict(trusted(), GITHUB_JOB=job, GITHUB_ENV=str(root / 'env'), GITHUB_OUTPUT=str(root / 'output'))
                 runner, compilations = self.server(root)
                 CACHE.configure(env, runner)
                 content = (root / 'env').read_text()
-                self.assertIn('RUSTC_WRAPPER=sccache\n', content)
+                self.assertIn(f'RUSTC_WRAPPER={compilations[0][0]}\n', content)
                 self.assertIn('SCCACHE_REGION=auto\n', content)
                 self.assertNotIn('test-secret', content)
                 self.assertNotIn('test-access', content)
@@ -156,19 +211,36 @@ class R2CacheTests(unittest.TestCase):
             self.assertFalse((root / 'env').exists())
             self.assertFalse((root / 'output').exists())
 
-    def test_workflow_cache_is_portable_only_and_no_pr_credentials(self):
+    def test_native_producers_keep_their_cache_and_no_pr_credentials(self):
         source = CI_YML.read_text()
-        portable = job_block(source, 'portable')
-        self.assertIn('python3 scripts/ci-r2-cache.py', portable)
-        self.assertIn("github.event_name == 'push' || github.event_name == 'workflow_dispatch'", portable)
-        self.assertIn("github.ref == 'refs/heads/main'", portable)
-        self.assertIn("inputs.skip-cache != true", portable)
-        self.assertIn('sccache@0.18.0', portable)
-        self.assertIn('sccache --show-stats', portable)
+        for job in ('portable', 'portable-release'):
+            portable = job_block(source, job)
+            self.assertIn('python3 scripts/ci-r2-cache.py', portable)
+            self.assertIn("github.event_name == 'push' || github.event_name == 'workflow_dispatch'", portable)
+            self.assertIn("github.ref == 'refs/heads/main'", portable)
+            self.assertIn("inputs.skip-cache != true", portable)
+            self.assertIn('sccache@0.18.0', portable)
+            self.assertIn('sccache --show-stats', portable)
         for job in ('linux-matrix', 'ubuntu', 'macos', 'qemu'):
             block = job_block(source, job)
             self.assertNotIn('ci-r2-cache.py', block)
             self.assertNotIn('OMG_R2_CACHE_SECRET_ACCESS_KEY', block)
+
+    def test_benchmark_workflow_verifies_cache_before_compiling_and_keeps_diagnostics(self):
+        source = (CI_YML.parent / 'benchmark.yml').read_text()
+        block = job_block(source, 'benchmark')
+        self.assertIn('sccache@0.18.0', block)
+        self.assertIn('python3 scripts/ci-r2-cache.py', block)
+        self.assertLess(block.index('python3 scripts/ci-r2-cache.py'), block.index('run: cargo build'))
+        self.assertNotIn('SCCACHE_GHA_ENABLED', block)
+        for name in ('Install benchmark compiler cache', 'Configure benchmark R2 cache'):
+            step = block.split(f'      - name: {name}\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn("github.ref == 'refs/heads/main'", step)
+            self.assertIn("vars.OMG_R2_CACHE_ENABLED == 'true'", step)
+        self.assertIn("if: always() && steps.r2-cache.outputs.enabled == 'true'", block)
+        self.assertIn('sccache --stop-server', block)
+        self.assertIn('sccache --show-stats --stats-format=json', block)
+        self.assertIn('compiler-cache-${{ github.job }}-${{ github.run_attempt }}', block)
 
 
 if __name__ == '__main__':

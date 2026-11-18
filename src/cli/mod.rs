@@ -159,6 +159,7 @@ mod tests {
         fs::write(db.join("local/ALPM_DB_VERSION"), "9\n").expect("write database version");
         write_local_package(&db, "provider", "%PROVIDES%\nvirtual-api=1\n\n");
         write_local_package(&db, "consumer", "%DEPENDS%\nvirtual-api>=1\n\n");
+        write_local_package(&db, "unrelated", "");
 
         let handle = alpm::Alpm::new(
             directory.path().to_string_lossy().into_owned(),
@@ -167,5 +168,8 @@ mod tests {
         .expect("open isolated ALPM database");
 
         assert_eq!(local_reverse_deps(&handle, "provider"), ["consumer"]);
+        assert!(local_reverse_deps(&handle, "unrelated").is_empty());
+        assert!(local_reverse_deps(&handle, "consumer").is_empty());
+        assert!(local_reverse_deps(&handle, "not-installed").is_empty());
     }
 }

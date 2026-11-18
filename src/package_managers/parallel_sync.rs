@@ -1025,6 +1025,17 @@ mod tests {
         let error = commit_staged_databases(&[(staged.clone(), live.clone())], 0, &mut directory)
             .expect_err("publication must refuse an existing unheld database lock");
         assert!(error.to_string().contains("lock"));
+        assert_eq!(
+            error.downcast_ref::<alpm::Error>(),
+            Some(&alpm::Error::HandleLock)
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Package database lock {} exists without an observed open holder; refusing automatic removal. Stop all package managers and verify their transactions have ended before explicitly recovering the lock. Run `omg doctor` for lock diagnostics.",
+                lock.display()
+            )
+        );
         assert_eq!(std::fs::read(&live)?, b"old");
         assert_eq!(std::fs::read(&staged)?, b"new");
         assert_eq!(std::fs::read(&lock)?, b"unheld-lock-evidence");
@@ -1160,6 +1171,7 @@ mod tests {
         commit_staged_databases(&[(staged, live.clone())], 0, &mut directory)
             .expect("publish staged database");
 
+        assert_eq!(std::fs::read(&live).unwrap(), b"new");
         let mode = std::fs::metadata(&live)
             .expect("live database")
             .permissions()
@@ -1218,6 +1230,10 @@ mod tests {
             build_signature_url("https://mirror.example/core/os/x86_64/core.db"),
             "https://mirror.example/core/os/x86_64/core.db.sig"
         );
+        assert_eq!(
+            build_signature_url("https://backup.example/extra/extra.db"),
+            "https://backup.example/extra/extra.db.sig"
+        );
     }
 
     #[test]
@@ -1228,12 +1244,18 @@ mod tests {
             url,
             format!("https://mirror.example.com/core/os/{arch}/core.db")
         );
+        let extra = build_db_url("https://mirror.example.com/$repo/os/$arch", "extra");
+        assert_eq!(
+            extra,
+            format!("https://mirror.example.com/extra/os/{arch}/extra.db")
+        );
     }
 
     #[test]
     fn every_repository_uses_its_own_configured_servers() {
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
-            "[options]\n\n[core]\nServer = https://internal.example/$repo/os/$arch\n\n\
+            "[options]\n\n[core]\nServer = https://internal.example/$repo/os/$arch\n\
+             Server = https://backup.example/$repo/$arch\n\n\
              [chaotic-aur]\nServer = https://community.example/$repo/$arch\n",
         )
         .expect("pacman config");
@@ -1245,7 +1267,10 @@ mod tests {
             [
                 (
                     "core".to_string(),
-                    vec!["https://internal.example/core/os/test-arch/core.db".to_string()]
+                    vec![
+                        "https://internal.example/core/os/test-arch/core.db".to_string(),
+                        "https://backup.example/core/test-arch/core.db".to_string(),
+                    ]
                 ),
                 (
                     "chaotic-aur".to_string(),

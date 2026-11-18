@@ -660,6 +660,11 @@ random text here
                 .contains("Failed to read APT sources directory entry"),
             "got: {error}"
         );
+        let cause = error
+            .downcast_ref::<std::io::Error>()
+            .expect("original I/O error must remain available");
+        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(cause.to_string(), "denied");
     }
     #[test]
     fn commented_source_entries_are_preserved_as_disabled() {

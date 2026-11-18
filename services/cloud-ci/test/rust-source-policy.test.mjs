@@ -8,9 +8,12 @@ import { assertRustSourceChange } from "../../../scripts/rust-source-policy.mjs"
 const read = (path) => readFileSync(new URL(`../../../${path}`, import.meta.url), "utf8");
 const explicitPath = "src/cli/packages/explicit.rs";
 const cleanPath = "src/cli/packages/clean.rs";
+const explicitFixturePath = "services/cloud-ci/test/fixtures/rust-source-policy/explicit.rs";
 const cleanFixturePath = "services/cloud-ci/test/fixtures/rust-source-policy/clean.rs";
 const explicitSource = read(explicitPath);
 const cleanSource = read(cleanPath);
+const explicitFixtureBytes = readFileSync(new URL(`../../../${explicitFixturePath}`, import.meta.url));
+const explicitFixtureSource = explicitFixtureBytes.toString("utf8");
 const cleanFixtureBytes = readFileSync(new URL(`../../../${cleanFixturePath}`, import.meta.url));
 const cleanFixtureSource = cleanFixtureBytes.toString("utf8");
 
@@ -27,10 +30,31 @@ const editClean = (source) =>
     let distro = detect_distro();`,
     );
 
+test("pinned explicit.rs fixture matches the reviewed snapshot", () => {
+    assert.equal(
+        createHash("sha256").update(explicitFixtureBytes).digest("hex"),
+        "c7ae9b268a77ab2a3ce70fd9be05c86dbb92af2ef1753a890e9eaff82eb7871e",
+    );
+});
+
 test("pinned explicit.rs allows a production edit after the helper cfg", () => {
-    const updated = editExplicit(explicitSource);
-    assert.notEqual(updated, explicitSource);
-    assert.doesNotThrow(() => assertRustSourceChange(explicitPath, explicitSource, updated));
+    const updated = editExplicit(explicitFixtureSource);
+    assert.notEqual(updated, explicitFixtureSource);
+    assert.doesNotThrow(() => assertRustSourceChange(explicitPath, explicitFixtureSource, updated));
+});
+
+test("unknown explicit.rs snapshot rejects a production edit", () => {
+    const unknown = explicitFixtureSource.replace(
+        "//! Explicit package listing functionality",
+        "//! Explicit package listing functionality (unreviewed)",
+    );
+    const updated = editExplicit(unknown);
+    assert.notEqual(unknown, explicitFixtureSource);
+    assert.notEqual(updated, unknown);
+    assert.throws(
+        () => assertRustSourceChange(explicitPath, unknown, updated),
+        /Automatic repairs cannot change existing Rust tests/,
+    );
 });
 
 test("pinned clean.rs fixture matches the reviewed snapshot", () => {
@@ -72,11 +96,11 @@ test("unknown clean.rs snapshot rejects a production edit", () => {
     );
 });
 
-test("pinned explicit.rs rejects test-body mutation", () => {
-    const updated = explicitSource.replace('"got: {error}"', '"got: {error} mutated"');
-    assert.notEqual(updated, explicitSource);
+test("pinned explicit.rs fixture rejects test-body mutation", () => {
+    const updated = explicitFixtureSource.replace('"got: {error}"', '"got: {error} mutated"');
+    assert.notEqual(updated, explicitFixtureSource);
     assert.throws(
-        () => assertRustSourceChange(explicitPath, explicitSource, updated),
+        () => assertRustSourceChange(explicitPath, explicitFixtureSource, updated),
         /Automatic repairs cannot change existing Rust tests/,
     );
 });

@@ -618,4 +618,53 @@ mod tests {
             "got: {error}"
         );
     }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            feature = "arch",
+            feature = "debian",
+            feature = "debian-pure",
+            feature = "fedora"
+        ))
+    ))]
+    #[test]
+    fn capture_without_backend_is_an_error() {
+        const NAME: &str = "core::env::fingerprint::tests::capture_without_backend_is_an_error";
+        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+            return;
+        }
+        println!(
+            "[fingerprint-fixture-identity] euid={} groups={:?}",
+            nix::unistd::geteuid().as_raw(),
+            rustix::process::getgroups().expect("read fixture supplementary groups")
+        );
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        assert!(
+            !crate::core::is_root(),
+            "capture fixture must use an ordinary user"
+        );
+        let directory = tempfile::tempdir_in("/var/tmp").expect("private runtime fixture");
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None::<&std::ffi::OsStr>),
+                ("OMG_TEST_DISTRO", None),
+                ("OMG_DATA_DIR", Some(directory.path().as_os_str())),
+            ],
+            || {
+                let error = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("create isolated test runtime")
+                    .block_on(EnvironmentState::capture())
+                    .expect_err("backendless capture must not invent an empty package list");
+                assert_eq!(
+                    error.to_string(),
+                    "Environment fingerprinting is not available without an Arch, Debian, or Fedora package backend"
+                );
+            },
+        );
+    }
 }

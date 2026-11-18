@@ -1,0 +1,71 @@
+{
+  "observedAt": "2026-11-11",
+  "sourceSha": "6e37c4b1b558d7a4637ba0bf0496db508d13c6e3",
+  "runId": 42957876635,
+  "elapsedBasis": "attempt-specific API created_at to updated_at; job/step started_at to completed_at",
+  "samples": [
+    {
+      "attempt": 1,
+      "conclusion": "success",
+      "label": "first observed prefix use",
+      "workflowSeconds": 710.0,
+      "benchmarkJobSeconds": 707.0,
+      "releaseBuildSeconds": 637.0,
+      "helperJobSeconds": 595.0,
+      "compilerCache": {
+        "version": "0.18.0",
+        "location": "s3, name: omg-ci-compiler-cache, prefix: /benchmark-v1/",
+        "hits": 76,
+        "misses": 2047,
+        "readErrors": 0,
+        "writeErrors": 0,
+        "timeouts": 0
+      },
+      "statisticsArtifact": {
+        "id": 13828591763,
+        "sha256": "sha256:d1c2f9e39eda7837e682834104be9be48709e4bec5a656b0b1c2bc052556776d",
+        "archiveBytes": 674,
+        "members": [
+          "__w/_temp/omg-r2-cache-stats.json"
+        ],
+        "sourceContextPresent": false
+      },
+      "attemptUrl": "https://github.com/omg-cli/omg/actions/runs/42957876635/attempts/1"
+    },
+    {
+      "attempt": 2,
+      "conclusion": "success",
+      "label": "same-source warm rerun",
+      "workflowSeconds": 551.0,
+      "benchmarkJobSeconds": 479.0,
+      "releaseBuildSeconds": 401.0,
+      "helperJobSeconds": 547.0,
+      "compilerCache": {
+        "version": "0.18.0",
+        "location": "s3, name: omg-ci-compiler-cache, prefix: /benchmark-v1/",
+        "hits": 2118,
+        "misses": 5,
+        "readErrors": 0,
+        "writeErrors": 0,
+        "timeouts": 0
+      },
+      "statisticsArtifact": {
+        "id": 13830120031,
+        "sha256": "sha256:7c2254cfedf9561ee97deb1d89b179265cd9608f7c47cf51e8244b17245a728b",
+        "archiveBytes": 659,
+        "members": [
+          "__w/_temp/omg-r2-cache-stats.json"
+        ],
+        "sourceContextPresent": false
+      },
+      "attemptUrl": "https://github.com/omg-cli/omg/actions/runs/42957876635/attempts/2"
+    }
+  ],
+  "limitations": [
+    "One pair. First prefix use was not independently proven empty.",
+    "Both old-source container diagnostic ZIPs omit the context sidecar. Run metadata and actual S3 backend statistics establish this observation.",
+    "This Benchmark workflow excludes the complete required CI and coverage gates.",
+    "Original ZIPs, metadata and job logs were verified and retained privately before artifacts were replaced on rerun."
+  ],
+  "completeRequiredGateTargetProven": false
+}

@@ -59,8 +59,8 @@ class ImageProvenanceTests(unittest.TestCase):
         self.assertEqual(len(rows), 1, 'Trixie ARM is not an admitted build profile')
         distro, arch, url, digest, algorithm, _ = rows[0]
         self.assertEqual((distro, arch, algorithm), ('debian-trixie', 'x86_64', 'sha512sum'))
-        self.assertEqual(url, 'https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-genericcloud-amd64-20261001-2618.qcow2')
-        self.assertEqual(digest, 'f46f0671a6e5bdec5291ab8972bae2f10e5408c2f64a74078f11efc2f06a436a9d0313ed50e0472542eeabf780e9f7c792ac0a314c6c20507fcd9fd81b468c3d')
+        self.assertEqual(url, 'https://cloud.debian.org/images/cloud/trixie/20261103-2651/debian-13-genericcloud-amd64-20261103-2651.qcow2')
+        self.assertEqual(digest, 'd25999de0770d4cde1be72c299ba3ad94eac7ea8fd4d18f8cc86c69df69337e2e8a91d64465a9bfd8f2a78c566fcbcb0842eacc91c09efdef72d719d9f13b535')
         entry = IMAGE.policy(MANIFEST, 'debian-trixie-x86_64', url, digest,
                              date.fromisoformat(self.manifest['reviewed_on']))
         self.assertEqual(entry['algorithm'], 'sha512')

@@ -124,6 +124,21 @@ mod tests {
     fn blank_advisory_identifiers_cannot_be_admitted_as_clean_evidence() {
         let valid: AlsaIssue = serde_json::from_str(r#"{"name":"AVG-test","packages":["fixture"],"status":"Vulnerable","severity":"High","affected":"1.0-1","fixed":null,"issues":["CVE-test"],"type":"code execution"}"#).unwrap();
         for status in ["Vulnerable", "Not affected"] {
+            let mut complete = valid.clone();
+            complete.status = status.into();
+            let result = audit_result(&[], std::slice::from_ref(&complete))
+                .expect("complete advisory must be accepted without installed packages");
+            assert_eq!(result.total_vulnerabilities, 0);
+            assert_eq!(result.high_severity, 0);
+            let mut missing_packages = complete.clone();
+            missing_packages.packages.clear();
+            let mut missing_issues = complete.clone();
+            missing_issues.issues.clear();
+            for invalid in [missing_packages, missing_issues] {
+                let error = audit_result(&[], &[invalid])
+                    .expect_err("empty advisory identity lists must be rejected");
+                assert_eq!(error.to_string(), "Incomplete Arch advisory identity");
+            }
             for field in ["name", "packages", "issues"] {
                 let mut invalid = valid.clone();
                 invalid.status = status.into();

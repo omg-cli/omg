@@ -1,5 +1,7 @@
 # OMG cloud repair operation
 
+> Retired for OMG on November 10, 2026. This document describes the former autonomous repair framework. Use [plain Cloudflare CI](plain-cloudflare-ci.md) for the replacement and current activation status.
+
 This document describes the repair paths added after the original Cloudflare CI adaptation. Source implementation, deployed configuration, and end-to-end acceptance are separate gates. An installed GitHub App or a passing unit suite does not establish a working unattended repair.
 
 ## Cloud model and required skills

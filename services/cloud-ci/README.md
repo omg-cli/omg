@@ -40,6 +40,17 @@ The check uses the existing `CLOUDFLARE_API_TOKEN`. A local operator can instead
 
 After this gate succeeds, run the existing authenticated plan preflight, then resume courier admissions. This is an operator deployment check; the CI Worker and candidate runners receive no new administrative credentials. It does not certify passing tests or replace the final receipt verifier.
 
+Before releasing the rollout hold, run the finite operator probe against the accepted main controller:
+
+```sh
+gh workflow run cloud-ci.yml --repo omg-cli/omg --ref main \
+  -f task=runtime-probe \
+  -f expected_controller='<accepted-main-sha>' \
+  -f rollout_lock_run='<active-hold-run-id>'
+```
+
+The probe uses the existing protected service credentials to check verifier health, a fresh source-only coder diagnosis and a stateless inspector call. It requires the live hold owners and enough lease time for verification and rollback. Keep its sanitized runtime receipt with provider-side before/after readbacks of the active Worker versions, bindings, policy pins and monitoring. These checks establish model and tool execution; native, coverage, QEMU and product-test acceptance remain separate. The task neither continues an audit campaign nor publishes a repair.
+
 ## Rebuild the stable runtime base
 
 `Dockerfile.base` reconstructs the custom toolchain from digest-pinned Sandbox 0.12.14, Node 24.22.1 and Rust 1.95.0 stages. It preserves Python 3.12.15, the candidate account, system prerequisites and the Sandbox entrypoint. Bun 1.4.4 is checked against both its official archive digest and extracted binary digest. Candidate Python uses the updated system certificate bundle.

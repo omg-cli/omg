@@ -1,0 +1,74 @@
+{
+  "observedAt": "2026-11-10",
+  "executor": "local operator courier submitting to hosted native Cloudflare API",
+  "sourceSha": "041a4c111369c7f052886d96f4a0f558b1752471",
+  "cloudflareImageDigest": "sha256:aa0ee8136c79b8780d594d27049ae91dc7aeb58b1e0ceb76c0d7f5195da5735f",
+  "instance": {
+    "type": "standard-4",
+    "vcpu": 4,
+    "memoryGiB": 12,
+    "diskGB": 20,
+    "observedCandidateCpuAffinity": "0-3"
+  },
+  "accepted": false,
+  "containerDestroyed": true,
+  "candidateProcessesStopped": true,
+  "error": "release-build timed out",
+  "commands": [
+    {
+      "label": "git-init",
+      "exitCode": 0,
+      "seconds": 0.038897256999973706
+    },
+    {
+      "label": "git-fetch",
+      "exitCode": 0,
+      "seconds": 1.938217917999964
+    },
+    {
+      "label": "git-checkout",
+      "exitCode": 0,
+      "seconds": 0.23872089799999685
+    },
+    {
+      "label": "source-identity",
+      "exitCode": 0,
+      "seconds": 0.00961453000002166
+    },
+    {
+      "label": "candidate-boundary",
+      "exitCode": 0,
+      "seconds": 0.07464273100003993
+    },
+    {
+      "label": "compiler",
+      "exitCode": 0,
+      "seconds": 0.6644576239999651
+    },
+    {
+      "label": "inventory-before",
+      "exitCode": 0,
+      "seconds": 5.325913409999998
+    },
+    {
+      "label": "dependencies",
+      "exitCode": 0,
+      "seconds": 21.892324309000003
+    },
+    {
+      "label": "release-build",
+      "exitCode": -9,
+      "seconds": 1200.0939224580002
+    }
+  ],
+  "rawReceiptSha256": "d12d15532c75b36d384c855b655dd8e3f0fafa10adbd4042ee45b8348e0172c4",
+  "rawStdoutSha256": "b4ced254f9c2343b41b72737dea9470e41b90f6443bd8719e9c02d789936411a",
+  "releaseProfile": {
+    "lto": "fat",
+    "codegen-units": 1,
+    "opt-level": 3,
+    "incremental": false
+  },
+  "features": "debian,pgp,license",
+  "limit": "Release build timed out at1200.094seconds beforebothbinariesfinished. This is a lower bound, not a completed performance sample. Cause of slower execution is not established. No profile or acceptance setting was reduced."
+}

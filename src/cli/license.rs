@@ -219,6 +219,11 @@ mod tests {
         );
         assert!(stdout.contains("Account: Normal Customer"), "{stdout:?}");
         assert!(stdout.contains("Expires: 2030-01-01"), "{stdout:?}");
+        assert!(
+            stdout.contains("Account: ]52;c;fixtureCustomer"),
+            "{stdout:?}"
+        );
+        assert!(stdout.contains("Expires: [31mexpiry"), "{stdout:?}");
         assert!(!stdout.contains("private-account-fixture-key"));
         for forbidden in ['\u{1b}', '\u{7}', '\u{202e}', '\u{2066}'] {
             assert!(

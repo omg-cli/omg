@@ -15,6 +15,7 @@ import unittest
 WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/qemu-matrix.yml'
 PARENT = WORKFLOW.read_text(encoding='utf-8')
 LANE = WORKFLOW.with_name('qemu-lane.yml').read_text(encoding='utf-8')
+PREFLIGHT = (WORKFLOW.parent.parent / 'actions/qemu-preflight/action.yml').read_text(encoding='utf-8')
 TEXT = PARENT.replace('\n  guest:\n', '\n  lane-caller:\n') + LANE
 
 
@@ -25,16 +26,17 @@ def literal(text, key, indent):
     return textwrap.dedent(match[1])
 
 
-def step(name):
-    start = TEXT.index('      - name: ' + name + '\n')
-    remaining = TEXT[start + 1:]
-    end = re.search(r'^      - |^  [a-z][\w-]*:', remaining, re.M)
-    return TEXT[start:start + 1 + end.start()] if end else TEXT[start:]
+def step(name, source=TEXT, indent=6):
+    prefix = ' ' * indent + '- '
+    start = source.index(prefix + 'name: ' + name + '\n')
+    remaining = source[start + 1:]
+    end = re.search(r'^' + prefix + r'|^  [a-z][\w-]*:', remaining, re.M)
+    return source[start:start + 1 + end.start()] if end else source[start:]
 
 
 class QemuWorkflowTests(unittest.TestCase):
     def _required_companion_prepare_control(self, mode):
-        script = literal(step('Workflow selection regression checks'), 'run', 8)
+        script = literal(step('Workflow selection regression checks', PREFLIGHT, 4), 'run', 6)
         fixture_base = WORKFLOW.parents[2] / 'tests' / 'fixtures' / 'qemu-companion-completeness'
         expected = sorted(json.loads((fixture_base / 'expected-identities.json').read_text())["identities"])
         with tempfile.TemporaryDirectory() as directory:
@@ -99,9 +101,10 @@ class QemuWorkflowTests(unittest.TestCase):
     def test_prepare_executes_boot_observer_and_budget_regressions_before_selection(self):
         # Execute the real prepare step. The private executables record the
         # discovery payload and fail on demand; they do not run guests or sudo.
-        regression = step('Workflow selection regression checks')
-        self.assertLess(PARENT.index(regression), PARENT.index('      - name: Resolve selection\n'))
-        script = literal(regression, 'run', 8)
+        regression = step('Workflow selection regression checks', PREFLIGHT, 4)
+        self.assertLess(PARENT.index('      - name: Verify QEMU preflight\n'),
+                        PARENT.index('      - name: Resolve selection\n'))
+        script = literal(regression, 'run', 6)
         observer = ['-m', 'unittest', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_diagnostics.py']
         budget = ['scripts/run_qemu_boot_timeout_budget.py', 'discover', '-s', 'scripts', '-p', 'test_qemu_boot_timeout_budget.py']
         for failed, expected in (('', 0), ('test_qemu_boot_diagnostics.py', 37),
@@ -136,7 +139,7 @@ class QemuWorkflowTests(unittest.TestCase):
                     if failed:
                         self.assertEqual(calls[-1], budget)
 
-        script = literal(step('Workflow selection regression checks'), 'run', 8)
+        script = literal(step('Workflow selection regression checks', PREFLIGHT, 4), 'run', 6)
         dispatch = ['-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_qemu_companion_completeness.py']
         control_root = WORKFLOW.parents[2]
         wanted = [
@@ -419,7 +422,7 @@ exit "$rc"
 
     def test_merge_group_requires_current_candidate_guests_and_native_reuse(self):
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
-        automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  docs-audit:', 1)[0]
+        automatic = ci.split('\n  qemu-preflight:\n', 1)[1].split('\n  qemu:', 1)[0]
         expressions = {
             'producer': ' '.join(line.strip() for line in re.search(
                 r'^    if: >-\n((?:      [^\n]+\n)+)', automatic, re.M)[1].splitlines()),
@@ -431,18 +434,15 @@ exit "$rc"
             with self.subTest(boundary=name):
                 expression = expression.replace('github.event_name', "'merge_group'").replace(
                     'needs.quick-gate.outputs.should-build', "'false'").replace('inputs.staged', '0 == 1').replace(
-                    'needs.quick-gate.result', "'success'").replace('!cancelled()', '0 == 0')
+                    'needs.quick-gate.result', "'success'")
                 result = subprocess.run([self.bash, '-c', '[[ ' + expression + ' ]]'],
                                         text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
         producer = expressions['producer'].replace('github.event_name', "'merge_group'").replace(
             'needs.quick-gate.outputs.should-build', "'false'")
-        for quick_gate, cancelled, expected in (('success', False, 0),
-                                               ('failure', False, 1),
-                                               ('success', True, 1)):
-            with self.subTest(quick_gate=quick_gate, cancelled=cancelled):
-                expression = producer.replace('needs.quick-gate.result', repr(quick_gate)).replace(
-                    '!cancelled()', '0 == 1' if cancelled else '0 == 0')
+        for quick_gate, expected in (('success', 0), ('failure', 1), ('skipped', 1)):
+            with self.subTest(quick_gate=quick_gate):
+                expression = producer.replace('needs.quick-gate.result', repr(quick_gate))
                 result = subprocess.run([self.bash, '-c', '[[ ' + expression + ' ]]'],
                                         text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, expected, result.stderr)
@@ -474,13 +474,16 @@ exit "$rc"
         self.assertNotIn('launched', result.stdout)
 
     def test_all_qa_reporting_harnesses_gate_guest_builds(self):
-        reporting = step('Verify harness and reporting fixtures before guest builds')
+        reporting = step('Verify harness and reporting fixtures before guest builds', PREFLIGHT, 4)
         for name in ('qa-file-issue', 'qa-audit', 'qa-open-pr'):
             self.assertIn(f'./scripts/test-{name}.sh', reporting)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         self.assertIn('  pull_request:\n  merge_group:', ci)
         self.assertIn('uses: ./.github/workflows/qemu-matrix.yml', ci)
-        self.assertLess(PARENT.index(reporting), PARENT.index('      - name: Resolve selection'))
+        gate = step('Verify QEMU preflight')
+        self.assertIn("if: inputs.preflight-result == ''", gate)
+        self.assertIn('uses: ./.github/actions/qemu-preflight', gate)
+        self.assertLess(PARENT.index(gate), PARENT.index('      - name: Resolve selection'))
 
     @classmethod
     def setUpClass(cls):
@@ -500,13 +503,55 @@ exit "$rc"
         values = dict(line.split('=', 1) for line in output.read_text().splitlines()) if output.exists() else {}
         return result, values
 
-    def selection(self, directory, staged, distro, arch, tag='', event_name='workflow_dispatch'):
+    def selection(self, directory, staged, distro, arch, tag='', event_name='workflow_dispatch', partition='all'):
         block = step('Resolve selection')
         env = dict(STAGED=str(staged).lower(), REQUESTED_DISTRO=distro,
-                   REQUESTED_ARCH=arch, REQUESTED_RELEASE_TAG=tag, EVENT_NAME=event_name,
+                   REQUESTED_ARCH=arch, REQUESTED_RELEASE_TAG=tag, EVENT_NAME=event_name, PARTITION=partition,
                    BUILD_X64=literal(block, 'BUILD_X64', 10), BUILD_ARM64=literal(block, 'BUILD_ARM64', 10))
         # A local shell function replaces the only release API call.
         return self.run_script('gh() { printf "v9.8.7\\n"; }\n' + literal(block, 'run', 8), env, directory)
+
+
+    def test_automatic_partitions_are_disjoint_and_complete(self):
+        for event in ('push', 'pull_request', 'merge_group'):
+            selected = {}
+            for partition in ('all', 'non-fedora', 'fedora'):
+                with self.subTest(event=event, partition=partition), tempfile.TemporaryDirectory() as tmp:
+                    result, values = self.selection(Path(tmp), True, 'all', 'all',
+                                                    event_name=event, partition=partition)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    distros = json.loads(values['distros'])
+                    lanes = [row['distro'] for row in json.loads(values['lanes'])]
+                    self.assertEqual(len(distros), len(set(distros)))
+                    self.assertEqual(len(lanes), len(set(lanes)))
+                    self.assertEqual(set(lanes), set(distros))
+                    self.assertEqual((values['x64'], values['arm64']), ('true', 'false'))
+                    self.assertEqual({row['distro'] for row in json.loads(values['build-x64'])},
+                                     set(distros) - {'ubuntu'})
+                    selected[partition] = set(distros)
+            self.assertEqual(selected['fedora'], {'fedora'})
+            self.assertEqual(selected['non-fedora'], {'arch', 'debian', 'debian-trixie', 'ubuntu'})
+            self.assertFalse(selected['fedora'] & selected['non-fedora'])
+            self.assertEqual(selected['fedora'] | selected['non-fedora'], selected['all'])
+
+    def test_partition_boundary_rejects_unknown_and_standalone_splits(self):
+        cases = [('pull_request', partition) for partition in ('', 'unknown', 'Fedora', 'fedora,arch')]
+        cases += [(event, partition) for event in ('schedule', 'workflow_dispatch')
+                  for partition in ('non-fedora', 'fedora')]
+        for event, partition in cases:
+            with self.subTest(event=event, partition=partition), tempfile.TemporaryDirectory() as tmp:
+                result, values = self.selection(Path(tmp), True, 'all', 'all',
+                                                event_name=event, partition=partition)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {}, 'invalid partition published guest selection')
+
+    def test_default_all_nightly_keeps_all_five_x64_guests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, values = self.selection(Path(tmp), True, 'all', 'all', event_name='schedule')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(values['distros']),
+                             ['arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'])
+            self.assertEqual((values['x64'], values['arm64']), ('true', 'false'))
 
     def test_dispatch_cross_product(self):
         for staged, distro, arch in itertools.product([False, True], ['all', 'arch', 'debian', 'debian-trixie', 'ubuntu', 'fedora'], ['all', 'x64', 'arm64']):
@@ -712,7 +757,9 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotIn('native-build-artifact.py ready', PARENT)
         ci = WORKFLOW.with_name('ci.yml').read_text(encoding='utf-8')
         automatic = ci.split('\n  qemu:\n', 1)[1].split('\n  ci-success:', 1)[0]
-        self.assertIn('needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]', automatic)
+        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu]', automatic)
+        self.assertIn('needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]',
+                      ci.split('\n  qemu-fedora:\n', 1)[1].split('\n  docs-audit:', 1)[0])
         self.assertIn('inputs.staged && inputs.reuse-ci', LANE)
         self.assertIn('needs: [build-staged, build-staged-ubuntu, fedora-sqlite]', LANE)
         self.assertIn("inputs.distro != 'ubuntu' && needs.build-staged.result == 'success'", LANE)
@@ -755,7 +802,7 @@ class SecurityBoundaryTests(unittest.TestCase):
 import json, os, pathlib, sys, xml.etree.ElementTree as ET
 args = sys.argv[1:]
 with open(os.environ['CAPTURE'], 'a') as output: output.write(json.dumps(args)+'\n')
-fedora = {'dnf_integration::native_daemon_starts_and_searches_without_installed_inventory_changes': False, 'dnf_integration::native_catalog_observation_survives_readonly_rpm_and_dnf_queries': False, 'dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal': False, 'dnf_integration::test_dnf_package_manager_creation': False, 'dnf_integration::repository_lookup_finds_uninstalled_package': False, 'dnf_integration::repository_info_resolves_architecture_and_nevra_selectors': False, 'dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch': False, 'dnf_integration::installed_status_resolves_native_full_nevra_with_zero_epoch': False, 'dnf_integration::cli_info_resolves_native_full_nevra': False, 'dnf_integration::cli_json_info_resolves_native_full_nevra': False, 'dnf_integration::repository_search_has_one_installed_row_per_architecture': False, 'dnf_integration::explicit_cli_matches_native_backend_without_a_daemon': False, 'dnf_integration::size_cli_matches_native_installed_packages': False, 'dnf_integration::installed_metadata_does_not_hide_excluded_packages': False, 'dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements': False, 'dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history': False, 'dnf_integration::native_transactions_record_install_remove_and_ignore_noops': False, 'dnf_integration::native_history_honors_custom_and_disabled_service_history': False, 'dnf_integration::cleanup_preview_preserves_installed_packages': False, 'dnf_integration::test_search_common_package': False, 'dnf_integration::test_search_nonexistent_package': False, 'dnf_integration::test_list_installed_packages': False, 'dnf_integration::installed_rpm_selection_rejects_inexact_or_noninstalled_records': False, 'dnf_integration::test_list_updates': False, 'dnf_integration::test_is_installed_check': False, 'dnf_rpm_database::test_rpm_database_query': False, 'dnf_operations::test_orphan_cleanup_history': True, 'dnf_operations::test_update_all_packages': True, 'dnf_operations::test_sync_repository_metadata': True, 'dnf_error_handling::test_install_invalid_package': False, 'common::tests::explicit_timeout_overrides_inherited_timeout': False}
+fedora = {'dnf_integration::bounded_cli_child_is_terminated_and_reaped_after_timeout': False, 'dnf_integration::bounded_cli_child_rejects_excess_output': False, 'dnf_integration::native_daemon_starts_and_searches_without_installed_inventory_changes': False, 'dnf_integration::native_catalog_observation_survives_readonly_rpm_and_dnf_queries': False, 'dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal': False, 'dnf_integration::test_dnf_package_manager_creation': False, 'dnf_integration::repository_lookup_finds_uninstalled_package': False, 'dnf_integration::repository_info_resolves_architecture_and_nevra_selectors': False, 'dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch': False, 'dnf_integration::installed_status_resolves_native_full_nevra_with_zero_epoch': False, 'dnf_integration::cli_info_resolves_native_full_nevra': False, 'dnf_integration::cli_json_info_resolves_native_full_nevra': False, 'dnf_integration::repository_search_has_one_installed_row_per_architecture': False, 'dnf_integration::explicit_cli_matches_native_backend_without_a_daemon': False, 'dnf_integration::size_cli_matches_native_installed_packages': False, 'dnf_integration::installed_metadata_does_not_hide_excluded_packages': False, 'dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements': False, 'dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history': False, 'dnf_integration::native_transactions_record_install_remove_and_ignore_noops': True, 'dnf_integration::native_history_honors_custom_and_disabled_service_history': True, 'dnf_integration::cleanup_preview_preserves_installed_packages': False, 'dnf_integration::test_search_common_package': False, 'dnf_integration::test_search_nonexistent_package': False, 'dnf_integration::test_list_installed_packages': False, 'dnf_integration::installed_rpm_selection_rejects_inexact_or_noninstalled_records': False, 'dnf_integration::test_list_updates': False, 'dnf_integration::test_is_installed_check': False, 'dnf_rpm_database::test_rpm_database_query': False, 'dnf_operations::test_orphan_cleanup_history': True, 'dnf_operations::test_update_all_packages': True, 'dnf_operations::test_sync_repository_metadata': True, 'dnf_error_handling::test_install_invalid_package': False, 'common::tests::explicit_timeout_overrides_inherited_timeout': False}
 listing = {'rust-suites': {
     'omg': {'binary-id': 'omg', 'status': 'listed', 'testcases': {
         'library_smoke': {'ignored': False, 'filter-match': {'status': 'matches'}}}},
@@ -853,12 +900,12 @@ elif args[:2] == ['nextest', 'run']:
                           status=result.returncode, calls=calls, error=json.loads(error.read_text()))))
                     continue
                 observed = json.loads((root / 'staged-unit-tests' / 'selection.json').read_text())
-                self.assertEqual(observed['counts'], dict(discovered=34, selected=31, executed=31,
-                                  passed=31, failed=0, skipped=3, filtered=0, retried=0) if mode == 'intact'
-                                  else dict(discovered=34, selected=31, executed=30, passed=30, failed=0,
-                                            skipped=4, filtered=0, retried=0))
+                self.assertEqual(observed['counts'], dict(discovered=36, selected=31, executed=31,
+                                  passed=31, failed=0, skipped=5, filtered=0, retried=0) if mode == 'intact'
+                                  else dict(discovered=36, selected=31, executed=30, passed=30, failed=0,
+                                            skipped=6, filtered=0, retried=0))
                 self.assertTrue(observed['executed_required_binaries'])
-                self.assertEqual(set(observed['tests']), {'omg::bin/omg::cli_smoke', 'omg::fedora_tests::dnf_integration::installed_rpm_selection_rejects_inexact_or_noninstalled_records', 'omg::fedora_tests::dnf_integration::explicit_cli_matches_native_backend_without_a_daemon', 'omg::fedora_tests::dnf_integration::test_is_installed_check', 'omg::fedora_tests::dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements', 'omg::fedora_tests::dnf_integration::installed_metadata_does_not_hide_excluded_packages', 'omg::fedora_tests::dnf_integration::cli_info_resolves_native_full_nevra', 'omg::fedora_tests::dnf_integration::test_search_common_package', 'omg::fedora_tests::dnf_integration::repository_search_has_one_installed_row_per_architecture', 'omg::fedora_tests::dnf_integration::size_cli_matches_native_installed_packages', 'omg::fedora_tests::dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal', 'omg::fedora_tests::dnf_integration::test_list_installed_packages', 'omg::fedora_tests::dnf_rpm_database::test_rpm_database_query', 'omg::fedora_tests::dnf_integration::repository_lookup_finds_uninstalled_package', 'omg::fedora_tests::dnf_integration::native_catalog_observation_survives_readonly_rpm_and_dnf_queries', 'omg::fedora_tests::dnf_integration::cleanup_preview_preserves_installed_packages', 'omg::fedora_tests::dnf_integration::test_list_updates', 'omg::library_smoke', 'omg::fedora_tests::dnf_integration::installed_status_resolves_native_full_nevra_with_zero_epoch', 'omg::fedora_tests::dnf_integration::native_transactions_record_install_remove_and_ignore_noops', 'omg::fedora_tests::dnf_integration::native_daemon_starts_and_searches_without_installed_inventory_changes', 'omg::fedora_tests::dnf_integration::repository_info_resolves_architecture_and_nevra_selectors', 'omg::bin/omgd::daemon_smoke', 'omg::fedora_tests::dnf_integration::native_history_honors_custom_and_disabled_service_history', 'omg::fedora_tests::dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch', 'omg::fedora_tests::common::tests::explicit_timeout_overrides_inherited_timeout', 'omg::fedora_tests::dnf_error_handling::test_install_invalid_package', 'omg::fedora_tests::dnf_integration::test_dnf_package_manager_creation', 'omg::fedora_tests::dnf_integration::test_search_nonexistent_package', 'omg::fedora_tests::dnf_integration::cli_json_info_resolves_native_full_nevra', 'omg::fedora_tests::dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history'})
+                self.assertEqual(set(observed['tests']), {'omg::fedora_tests::dnf_integration::bounded_cli_child_is_terminated_and_reaped_after_timeout', 'omg::fedora_tests::dnf_integration::bounded_cli_child_rejects_excess_output', 'omg::bin/omg::cli_smoke', 'omg::fedora_tests::dnf_integration::installed_rpm_selection_rejects_inexact_or_noninstalled_records', 'omg::fedora_tests::dnf_integration::explicit_cli_matches_native_backend_without_a_daemon', 'omg::fedora_tests::dnf_integration::test_is_installed_check', 'omg::fedora_tests::dnf_integration::why_cli_matches_native_reasons_and_reverse_requirements', 'omg::fedora_tests::dnf_integration::installed_metadata_does_not_hide_excluded_packages', 'omg::fedora_tests::dnf_integration::cli_info_resolves_native_full_nevra', 'omg::fedora_tests::dnf_integration::test_search_common_package', 'omg::fedora_tests::dnf_integration::repository_search_has_one_installed_row_per_architecture', 'omg::fedora_tests::dnf_integration::size_cli_matches_native_installed_packages', 'omg::fedora_tests::dnf_integration::native_catalog_observation_survives_ordinary_user_readonly_wal', 'omg::fedora_tests::dnf_integration::test_list_installed_packages', 'omg::fedora_tests::dnf_rpm_database::test_rpm_database_query', 'omg::fedora_tests::dnf_integration::repository_lookup_finds_uninstalled_package', 'omg::fedora_tests::dnf_integration::native_catalog_observation_survives_readonly_rpm_and_dnf_queries', 'omg::fedora_tests::dnf_integration::cleanup_preview_preserves_installed_packages', 'omg::fedora_tests::dnf_integration::test_list_updates', 'omg::library_smoke', 'omg::fedora_tests::dnf_integration::installed_status_resolves_native_full_nevra_with_zero_epoch', 'omg::fedora_tests::dnf_integration::native_daemon_starts_and_searches_without_installed_inventory_changes', 'omg::fedora_tests::dnf_integration::repository_info_resolves_architecture_and_nevra_selectors', 'omg::bin/omgd::daemon_smoke', 'omg::fedora_tests::dnf_integration::installed_info_resolves_native_full_nevra_with_zero_epoch', 'omg::fedora_tests::common::tests::explicit_timeout_overrides_inherited_timeout', 'omg::fedora_tests::dnf_error_handling::test_install_invalid_package', 'omg::fedora_tests::dnf_integration::test_dnf_package_manager_creation', 'omg::fedora_tests::dnf_integration::test_search_nonexistent_package', 'omg::fedora_tests::dnf_integration::cli_json_info_resolves_native_full_nevra', 'omg::fedora_tests::dnf_integration::blame_cli_uses_native_details_and_canonical_omg_history'})
                 print('STAGED_UNIT_FIXTURE '+json.dumps(dict(workflow=label, mode=mode,
                       status=result.returncode, calls=calls, selection=observed)))
 

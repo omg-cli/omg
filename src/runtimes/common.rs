@@ -1332,7 +1332,7 @@ pub(crate) fn complete_staged_install_with_lease(
     staging: &tempfile::TempDir,
     version_dir: &Path,
     version: &str,
-    _mutation_lease: &fs::File,
+    _mutation_lease: &RuntimeLease,
 ) -> Result<()> {
     write_install_marker(staging.path(), version)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1380,7 +1380,7 @@ pub(crate) fn replace_staged_install_with_lease(
     staging: &tempfile::TempDir,
     version_dir: &Path,
     version: &str,
-    _mutation_lease: &fs::File,
+    _mutation_lease: &RuntimeLease,
 ) -> Result<()> {
     write_install_marker(staging.path(), version)?;
     if !is_valid_version_dir(version_dir) {
@@ -1480,12 +1480,33 @@ fn write_install_marker(version_dir: &Path, version: &str) -> Result<()> {
 pub(crate) const TEST_RUNTIME_MARKER: &str = ".omg-test-mock";
 pub(crate) const INSTALL_PENDING_MARKER: &str = ".omg-installing";
 
-pub(crate) fn try_lock_runtime_install(versions_dir: &Path, version: &str) -> Result<File> {
+#[derive(Debug)]
+pub(crate) struct RuntimeLease {
+    file: File,
+}
+
+impl RuntimeLease {
+    pub(crate) fn try_lock(file: File) -> std::result::Result<Self, fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for RuntimeLease {
+    fn drop(&mut self) {
+        // Closing alone leaves the lock held by descriptors inherited during a concurrent fork.
+        if let Err(error) = self.file.unlock() {
+            tracing::warn!(%error, "Failed to release runtime lease");
+        }
+    }
+}
+
+pub(crate) fn try_lock_runtime_install(versions_dir: &Path, version: &str) -> Result<RuntimeLease> {
     crate::core::security::validate_runtime_version(version)?;
     try_lock_runtime_file(versions_dir, &format!(".install-{version}.lock"))
 }
 
-pub(crate) fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<File> {
+pub(crate) fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<RuntimeLease> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     crate::core::paths::create_private_data_directory(versions_dir)?;
     let lock = fs::OpenOptions::new()
@@ -1501,9 +1522,8 @@ pub(crate) fn try_lock_runtime_file(versions_dir: &Path, name: &str) -> Result<F
         metadata.is_file() && metadata.nlink() == 1,
         "Unsafe runtime install lock"
     );
-    lock.try_lock()
-        .context("Another runtime mutation is in progress; retry when it finishes")?;
-    Ok(lock)
+    RuntimeLease::try_lock(lock)
+        .context("Another runtime mutation is in progress; retry when it finishes")
 }
 
 /// Return whether a runtime version path is a real production directory.
@@ -1599,7 +1619,7 @@ pub(crate) fn activate_version_with_lease(
     versions_dir: &Path,
     version: &str,
     expected_binary: &Path,
-    mutation_lease: &fs::File,
+    mutation_lease: &RuntimeLease,
 ) -> Result<()> {
     require_regular_file(&versions_dir.join(version).join(expected_binary))?;
     set_current_version_with_lease(versions_dir, version, mutation_lease)
@@ -1630,7 +1650,7 @@ pub(crate) fn activate_version_with_linked_binary_with_lease(
     versions_dir: &Path,
     version: &str,
     expected_binary: &Path,
-    mutation_lease: &fs::File,
+    mutation_lease: &RuntimeLease,
 ) -> Result<()> {
     require_internal_runtime_binary(&versions_dir.join(version), expected_binary)?;
     set_current_version_with_lease(versions_dir, version, mutation_lease)
@@ -1686,7 +1706,7 @@ pub(crate) fn uninstall_version(versions_dir: &Path, version: &str) -> Result<()
 pub(crate) fn uninstall_version_with_lease(
     versions_dir: &Path,
     version: &str,
-    _mutation_lease: &fs::File,
+    _mutation_lease: &RuntimeLease,
 ) -> Result<()> {
     crate::core::security::validate_runtime_version(version)?;
 
@@ -1722,7 +1742,7 @@ pub(crate) fn set_current_version(versions_dir: &Path, version: &str) -> Result<
 pub(crate) fn set_current_version_with_lease(
     versions_dir: &Path,
     version: &str,
-    _mutation_lease: &fs::File,
+    _mutation_lease: &RuntimeLease,
 ) -> Result<()> {
     crate::core::security::validate_runtime_version(version)?;
 
@@ -3971,6 +3991,65 @@ mod tests {
         set_current_version(temp.path(), "1.0.0")?;
         assert!(uninstall_version(temp.path(), "1.0.0").is_err());
         assert!(version.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_lease_release_is_not_delayed_by_a_duplicate_descriptor() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let lease = try_lock_runtime_file(temp.path(), ".mutation.lock")?;
+        let inherited = lease.file.try_clone()?;
+        drop(lease);
+        let _next = try_lock_runtime_file(temp.path(), ".mutation.lock")?;
+        drop(inherited);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_lease_drop_reports_os_fault_without_unlocking_another_owner() -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl<'a> MakeWriter<'a> for Capture {
+            type Writer = <Mutex<Vec<u8>> as MakeWriter<'a>>::Writer;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                MakeWriter::make_writer(self.0.as_ref())
+            }
+        }
+
+        let temp = TempDir::new()?;
+        let lease = try_lock_runtime_file(temp.path(), ".mutation.lock")?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_PATH)
+            .open(temp.path().join(".mutation.lock"))?;
+        assert_eq!(file.metadata()?.ino(), lease.file.metadata()?.ino());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Capture(Arc::clone(&captured)))
+            .finish();
+        // O_PATH remains a valid owned handle, but cannot unlock. Inject it only into this fault fixture.
+        tracing::subscriber::with_default(subscriber, || drop(RuntimeLease { file }));
+        let log = String::from_utf8(captured.lock().unwrap().clone())?;
+        assert!(log.contains("WARN"));
+        assert!(log.contains("Failed to release runtime lease"));
+        assert!(log.contains(&io::Error::from_raw_os_error(nix::libc::EBADF).to_string()));
+
+        let error = try_lock_runtime_file(temp.path(), ".mutation.lock")
+            .expect_err("failed unlock must preserve the real owner's lease");
+        assert!(matches!(
+            error.downcast_ref::<fs::TryLockError>(),
+            Some(fs::TryLockError::WouldBlock)
+        ));
+        drop(lease);
+        let _next = try_lock_runtime_file(temp.path(), ".mutation.lock")?;
         Ok(())
     }
 

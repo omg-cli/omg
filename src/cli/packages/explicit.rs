@@ -258,4 +258,53 @@ mod tests {
             "got: {error}"
         );
     }
+
+    #[cfg(all(
+        target_os = "linux",
+        not(any(
+            feature = "arch",
+            feature = "debian",
+            feature = "debian-pure",
+            feature = "fedora",
+            feature = "macos"
+        ))
+    ))]
+    #[test]
+    fn public_explicit_listing_without_backend_fails_in_every_mode() {
+        use crate::core::env::distro::Distro;
+        const NAME: &str = "cli::packages::explicit::tests::public_explicit_listing_without_backend_fails_in_every_mode";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return;
+        }
+        temp_env::with_vars(
+            [("OMG_TEST_MODE", None::<&str>), ("OMG_TEST_DISTRO", None)],
+            || {
+                let expected = match crate::core::env::distro::detect_distro() {
+                    Distro::Arch => {
+                        "This omg binary lacks the arch package backend required by Arch. Install the matching distro build, or rebuild with --no-default-features --features arch,pgp,license"
+                    }
+                    Distro::Debian => {
+                        "This omg binary lacks the debian package backend required by Debian. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+                    }
+                    Distro::Ubuntu => {
+                        "This omg binary lacks the debian package backend required by Ubuntu. Install the matching distro build, or rebuild with --no-default-features --features debian,pgp,license"
+                    }
+                    Distro::Fedora => {
+                        "This omg binary lacks the fedora package backend required by Fedora. Install the matching distro build, or rebuild with --no-default-features --features fedora,pgp,license"
+                    }
+                    Distro::Unknown => {
+                        "Unsupported Linux distribution: no live package backend can be selected"
+                    }
+                    Distro::MacOS => panic!("Linux fixture must not select Homebrew"),
+                };
+                for count in [false, true] {
+                    for json in [false, true] {
+                        let error = explicit_sync_with_json(count, json)
+                            .expect_err("listing without a backend must fail");
+                        assert_eq!(error.to_string(), expected, "count={count}, json={json}");
+                    }
+                }
+            },
+        );
+    }
 }

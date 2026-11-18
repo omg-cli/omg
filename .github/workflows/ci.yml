@@ -27,11 +27,15 @@ on:
         description: "Skip cache restoration"
         type: boolean
         default: false
+      isolated-cache:
+        description: "Use an isolated R2 cache; rerun the same run for a warm comparison"
+        type: boolean
+        default: false
 
 concurrency:
-  group: ci-${{ github.head_ref || github.ref }}
-  # PRs cancel superseded runs; main never cancels so queued main runs
-  # (e.g. #175 behind #172) still complete instead of being dropped.
+  # An isolated experiment must never replace a pending main push.
+  group: ${{ inputs.isolated-cache == true && format('ci-isolated-cache-{0}', github.run_id) || format('ci-{0}', github.head_ref || github.ref) }}
+  # PRs cancel superseded runs; active main pushes keep running.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -64,6 +68,18 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Validate isolated cache selection
+        if: inputs.isolated-cache == true
+        env:
+          R2_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
+          SKIP_CACHE: ${{ inputs.skip-cache }}
+        run: |
+          test "$GITHUB_REPOSITORY" = omg-cli/omg
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$R2_ENABLED" = true
+          test "$SKIP_CACHE" = false
 
       - name: Detect changes
         id: changes
@@ -152,7 +168,7 @@ jobs:
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
       OMG_CONTRACT_SOURCE_SHA: ${{ github.sha }}
@@ -201,6 +217,7 @@ jobs:
         env:
           OMG_R2_CACHE_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
           OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          OMG_R2_CACHE_ISOLATED: ${{ inputs.isolated-cache == true && 'true' || 'false' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
         run: python3 scripts/ci-r2-cache.py
@@ -247,9 +264,6 @@ jobs:
       - name: Test isolated distro override harness
         run: cargo test --test distro_override --no-default-features --features pgp,license --locked
 
-      - name: Test release distro override guard
-        run: cargo test --release --test distro_override --no-default-features --features pgp,license --locked
-
       - name: Test root library documentation contracts
         run: cargo test --doc --no-default-features --features pgp,license --locked
 
@@ -278,7 +292,95 @@ jobs:
         if: always() && steps.r2-cache.outputs.enabled == 'true'
         run: |
           trap 'sccache --stop-server' EXIT
+          mkdir -p "$RUNNER_TEMP/omg-r2-cache"
           sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-stats.json"
+          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-context.txt"
+
+      - name: Preserve portable compiler cache diagnostics
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/omg-r2-cache/
+          retention-days: 3
+          if-no-files-found: warn
+
+  portable-release:
+    name: "Portable release"
+    needs: quick-gate
+    if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.95.0"
+          components: clippy
+
+      - name: Setup cache
+        if: inputs.skip-cache != true
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          ZSTD_CLEVEL: "6"
+        with:
+          # Reserve compiled-cache storage for native producers and coverage.
+          prefix-key: "v3-portable-registry"
+          shared-key: "portable"
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
+          # PRs restore main's cache; merge-ref writes only benefit that PR's reruns.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install portable compiler cache
+        if: >-
+          vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2.87.4
+        with:
+          tool: sccache@0.18.0
+
+      - name: Configure portable R2 cache
+        id: r2-cache
+        if: >-
+          vars.OMG_R2_CACHE_ENABLED == 'true' && inputs.skip-cache != true &&
+          github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        env:
+          OMG_R2_CACHE_ENABLED: ${{ vars.OMG_R2_CACHE_ENABLED }}
+          OMG_R2_CACHE_ACCOUNT_ID: ${{ vars.OMG_R2_CACHE_ACCOUNT_ID }}
+          OMG_R2_CACHE_ISOLATED: ${{ inputs.isolated-cache == true && 'true' || 'false' }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMG_R2_CACHE_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMG_R2_CACHE_SECRET_ACCESS_KEY }}
+        run: python3 scripts/ci-r2-cache.py
+
+      - name: Test release distro override guard
+        run: cargo test --release --test distro_override --no-default-features --features pgp,license --locked
+
+      - name: Report portable compiler cache
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        run: |
+          trap 'sccache --stop-server' EXIT
+          mkdir -p "$RUNNER_TEMP/omg-r2-cache"
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-stats.json"
+          printf 'source=%s\nprefix=%s\n' "$GITHUB_SHA" "$SCCACHE_S3_KEY_PREFIX" > "$RUNNER_TEMP/omg-r2-cache/omg-r2-cache-context.txt"
+
+      - name: Preserve portable compiler cache diagnostics
+        if: always() && steps.r2-cache.outputs.enabled == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: compiler-cache-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/omg-r2-cache/
+          retention-days: 3
+          if-no-files-found: warn
 
   #############################################################################
   # STAGE 2: Platform Matrix (Linux containers)
@@ -295,13 +397,16 @@ jobs:
       arch: x86_64
 
   linux-matrix:
-    name: "Linux (${{ matrix.platform }})"
+    name: "${{ matrix.phase == 'validation' && format('Linux ({0})', matrix.platform) || format('Linux clippy ({0})', matrix.platform) }}"
     needs: quick-gate
     if: needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}
+    # Ubuntu's cold validation build also needs room for slow package mirrors.
+    timeout-minutes: ${{ matrix.platform == 'ubuntu-2604' && matrix.phase == 'validation' && 45 || 30 }}
+    env: &linux_environment
+      # Shell and upload action must use the same container path.
+      FEDORA_IGNORED_EVIDENCE_DIR: /tmp/omg-fedora-ignored-${{ github.run_id }}-${{ github.run_attempt }}
+      RUSTUP_DIAGNOSTICS_DIR: /tmp/rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}
       DIAGNOSTIC_IMAGE: ${{ matrix.image }}
       DIAGNOSTIC_PLATFORM: ${{ matrix.platform }}
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
@@ -315,8 +420,11 @@ jobs:
       OMG_CONTRACT_PLATFORM: ${{ matrix.contract_platform || matrix.platform }}
     strategy:
       fail-fast: false
+      max-parallel: 5
       matrix:
-        include:
+        phase: [validation]
+        platform: &linux_platforms [arch, debian, debian-trixie, ubuntu-2604, fedora]
+        include: &linux_images
           - platform: arch
             image: archlinux:latest@sha256:f3691b4dde62ba4c4b6f0ae2c1fbf28e8c0c8c4b9a35c7e06dc1f70e21aa29f6
             features: arch,pgp,license
@@ -366,7 +474,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish zstd \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
             rust_install: |
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -386,7 +494,7 @@ jobs:
             setup: |
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish zstd \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
             rust_install: |
               curl --proto '=https' --tlsv1.2 -fsSL \
@@ -412,8 +520,18 @@ jobs:
               test "$ID" = ubuntu && test "$VERSION_ID" = 26.04
               test "$(uname -m)" = x86_64
               apt-get update
+              # The minimal image needs CA trust before using HTTPS mirrors.
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates
+              test -s /etc/ssl/certs/ca-certificates.crt
+              grep -Eq '^URIs: http://archive\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
+              grep -Eq '^URIs: http://security\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
+              sed -Ei 's#^(URIs: )http://((archive|security)\.ubuntu\.com/ubuntu/?)$#\1https://\2#' /etc/apt/sources.list.d/ubuntu.sources
+              grep -Eq '^URIs: https://archive\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
+              grep -Eq '^URIs: https://security\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources
+              if grep -Eq '^URIs: http://(archive|security)\.ubuntu\.com/ubuntu/?$' /etc/apt/sources.list.d/ubuntu.sources; then exit 1; fi
+              apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish jq \
+                ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv fish jq zstd \
                 libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev
               ldconfig -p | grep -F 'libapt-pkg.so.7'
             rust_install: |
@@ -435,7 +553,7 @@ jobs:
               timeout -k 10s 12m dnf \
                 --setopt='*.skip_if_unavailable=False' --disable-repo=fedora-cisco-openh264 \
                 install -y --setopt=install_weak_deps=False \
-                git clang cmake openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
+                git clang cmake make perl-core openssl-devel pkgconfig findutils curl procps-ng python3 zsh fish \
                 rpm dnf sqlite yum-utils fedora-release
               rpm --initdb
             rust_install: |
@@ -450,10 +568,10 @@ jobs:
             rust_components: |
               "$HOME/.cargo/bin/rustup" component add clippy rustfmt
 
-    container:
+    container: &linux_container
       image: ${{ matrix.image }}
 
-    steps:
+    steps: &linux_steps
       - name: Setup environment
         run: ${{ matrix.setup }}
 
@@ -880,7 +998,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}
+          name: rustup-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.phase }}-${{ matrix.platform }}
           path: ${{ env.RUSTUP_DIAGNOSTICS_DIR }}/
           retention-days: 14
           if-no-files-found: error
@@ -906,10 +1024,12 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         env:
           ZSTD_CLEVEL: "6"
+          # Diagnostic output paths contain run IDs, not compiler settings.
+          RUSTUP_DIAGNOSTICS_DIR: ""
         with:
           prefix-key: v2-platform-dependencies
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.phase == 'validation' }}
           # Never restore across distro ABI or feature contracts. The action
           # additionally keys rustc, Cargo config, lockfiles and compiler flags.
           shared-key: ${{ steps.cache-key.outputs.key }}
@@ -928,10 +1048,11 @@ jobs:
         run: timeout -k 5s 180s python3 scripts/prepare-node-test-fixture.py --destination "$RUNNER_TEMP/node-test-fixture"
 
       - name: Run unit tests
+        if: matrix.phase == 'validation'
         run: python3 scripts/run-native-contracts.py --features ${{ matrix.features }}
 
       - name: Build release
-        if: matrix.platform != 'ubuntu-2604'
+        if: matrix.phase == 'validation' && matrix.platform != 'ubuntu-2604'
         shell: bash
         env:
           DISTRO: ${{ matrix.platform }}
@@ -942,11 +1063,11 @@ jobs:
             --image "$BUILD_IMAGE" --features "$BUILD_FEATURES" --destination "$RUNNER_TEMP/native-release"
 
       - name: Build Ubuntu 26.04 validation binary
-        if: matrix.platform == 'ubuntu-2604'
+        if: matrix.phase == 'validation' && matrix.platform == 'ubuntu-2604'
         run: cargo build --release --no-default-features --features debian,pgp,license --locked
 
       - name: Verify complete native APT daemon catalogue
-        if: contains(matrix.features, 'debian')
+        if: matrix.phase == 'validation' && contains(matrix.features, 'debian')
         shell: bash
         run: |
           set -euo pipefail
@@ -958,7 +1079,7 @@ jobs:
             --evidence-dir "/tmp/omg-catalog-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}"
 
       - name: Preserve native APT catalogue proof
-        if: always() && contains(matrix.features, 'debian')
+        if: always() && matrix.phase == 'validation' && contains(matrix.features, 'debian')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: apt-daemon-catalog-${{ matrix.platform }}
@@ -969,7 +1090,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload native release pair
-        if: matrix.platform != 'ubuntu-2604'
+        if: matrix.phase == 'validation' && matrix.platform != 'ubuntu-2604'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-release-${{ matrix.platform }}-${{ github.run_attempt }}
@@ -979,12 +1100,13 @@ jobs:
           if-no-files-found: error
 
       - name: Platform clippy
+        if: matrix.phase == 'clippy'
         run: |
           cargo clippy --all-targets --no-default-features --features ${{ matrix.features }} \
             --locked -- -D warnings
 
       - name: Test emitted shell hooks
-        if: matrix.platform == 'fedora'
+        if: matrix.phase == 'validation' && matrix.platform == 'fedora'
         env:
           OMG_HOOK_TEST_BINARY: ${{ github.workspace }}/target/debug/omg
           OMG_HOOK_TEST_REQUIRE_SHELLS: bash,zsh,fish
@@ -994,7 +1116,7 @@ jobs:
           python3 -m unittest discover -s tests -p test_shell_hook_ci.py
 
       - name: Run serial library and binary contracts
-        if: matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'
+        if: matrix.phase == 'validation' && matrix.platform != 'debian-trixie' && matrix.platform != 'ubuntu-2604'
         # Preserve the former staged-QEMU libtest owner alongside nextest.
         shell: bash
         run: |
@@ -1008,38 +1130,47 @@ jobs:
           fi
 
       - name: Native Fedora ignored integration fixtures
-        if: matrix.platform == 'fedora'
+        if: matrix.phase == 'validation' && matrix.platform == 'fedora'
         timeout-minutes: 4
         shell: bash
         run: |
           set -euo pipefail
           python3 -I -B -m unittest discover -s scripts -p test_fedora_ignored_integrations.py
-          mkdir -p target/fedora-ignored
+          mkdir -p "$FEDORA_IGNORED_EVIDENCE_DIR"
           started=$(date +%s)
           status=0
           timeout --kill-after=5s 90s dnf --setopt='*.skip_if_unavailable=False' --disable-repo=fedora-cisco-openh264 \
             install -y --setopt=install_weak_deps=False tree createrepo_c gnupg2 \
-            > target/fedora-ignored/provision.stdout 2> target/fedora-ignored/provision.stderr || status=$?
+            > "$FEDORA_IGNORED_EVIDENCE_DIR/provision.stdout" 2> "$FEDORA_IGNORED_EVIDENCE_DIR/provision.stderr" || status=$?
           elapsed=$(($(date +%s)-started))
-          printf '{"exit_code":%s,"elapsed_seconds":%s}\n' "$status" "$elapsed" > target/fedora-ignored/provision.json
+          printf '{"exit_code":%s,"elapsed_seconds":%s}\n' "$status" "$elapsed" > "$FEDORA_IGNORED_EVIDENCE_DIR/provision.json"
           [[ "$status" == 0 ]] || exit "$status"
           timeout --kill-after=5s 140s python3 -I -B scripts/run-fedora-ignored-integrations.py \
             --artifacts target/fedora-serial-libtest.jsonl --features '${{ matrix.features }}' \
-            --evidence-dir target/fedora-ignored/fixture
+            --evidence-dir "$FEDORA_IGNORED_EVIDENCE_DIR/fixture"
+          test -s "$FEDORA_IGNORED_EVIDENCE_DIR/fixture/receipt.json"
 
       - name: Upload native Fedora ignored integration evidence
-        if: always() && matrix.platform == 'fedora'
+        if: always() && matrix.phase == 'validation' && matrix.platform == 'fedora'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fedora-ignored-integrations
-          path: |
-            target/fedora-serial-libtest.jsonl
-            target/fedora-ignored/
+          # Compiler metadata must not hide missing fixture evidence.
+          path: ${{ env.FEDORA_IGNORED_EVIDENCE_DIR }}/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload native Fedora serial libtest diagnostics
+        if: always() && matrix.phase == 'validation' && matrix.platform == 'fedora'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora-serial-libtest
+          path: target/fedora-serial-libtest.jsonl
           retention-days: 7
           if-no-files-found: error
 
       - name: Prepare sandbox regression executable
-        if: matrix.platform == 'arch'
+        if: matrix.phase == 'validation' && matrix.platform == 'arch'
         shell: bash
         run: |
           set -euo pipefail
@@ -1050,7 +1181,7 @@ jobs:
           install -Dm755 "$binary" target/sandbox-test/omg-lib-tests
 
       - name: Upload sandbox regression executable
-        if: matrix.platform == 'arch'
+        if: matrix.phase == 'validation' && matrix.platform == 'arch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aur-sandbox-test
@@ -1059,7 +1190,7 @@ jobs:
           if-no-files-found: error
 
       - name: Debian deterministic benchmark regression check
-        if: matrix.platform == 'debian'
+        if: matrix.phase == 'validation' && matrix.platform == 'debian'
         env:
           OMG_BENCH_WRITE_JSON: "1"
           OMG_BENCH_JSON_OUT: target/bench/debian-matrix.json
@@ -1070,7 +1201,7 @@ jobs:
             -- --nocapture
 
       - name: Upload Debian benchmark artifact
-        if: matrix.platform == 'debian'
+        if: matrix.phase == 'validation' && matrix.platform == 'debian'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-debian-matrix
@@ -1079,7 +1210,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish Debian benchmark summary
-        if: matrix.platform == 'debian'
+        if: matrix.phase == 'validation' && matrix.platform == 'debian'
         run: |
           echo "## Debian Deterministic Benchmark" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -1088,11 +1219,13 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Verify binary
+        if: matrix.phase == 'validation'
         run: |
           ./target/release/omg --version
           ./target/release/omg --help | head -20
 
       - name: Upload binary
+        if: matrix.phase == 'validation'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: omg-${{ matrix.platform }}
@@ -1101,13 +1234,32 @@ jobs:
           if-no-files-found: error
 
       - name: Preserve compiled parser surfaces
-        if: always()
+        if: always() && matrix.phase == 'validation'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cli-surfaces-${{ matrix.platform }}
           path: target/contract-surfaces/
           retention-days: 14
           if-no-files-found: error
+
+  linux-clippy:
+    name: "Linux clippy (${{ matrix.platform }})"
+    needs: [quick-gate, linux-matrix]
+    if: >-
+      !cancelled() && needs.quick-gate.result == 'success' &&
+      (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env: *linux_environment
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        phase: [clippy]
+        platform: *linux_platforms
+        include: *linux_images
+    container: *linux_container
+    steps: *linux_steps
 
   sandbox-cancellation:
     name: "AUR sandbox security regressions"
@@ -1337,7 +1489,7 @@ jobs:
     # `!github.event.act` skips this leg during local act runs (no macOS
     # containers exist); the condition is always true on GitHub.
     if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       OMG_CONTRACT_SURFACE_OUT: target/contract-surfaces
@@ -1439,7 +1591,7 @@ jobs:
     name: "macOS nextest source contract"
     needs: quick-gate
     if: (needs.quick-gate.outputs.should-build == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && !github.event.act
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1667,15 +1819,46 @@ jobs:
   # (PR-controlled) copy of this file, so a PR must never be able to run
   # workflow code holding a write-scoped token. All write-scoped steps live
   # in the push-to-main-only release-tag job below.
-  qemu:
-    name: QEMU behavioral verification
-    needs: [quick-gate, linux-matrix, ubuntu, fedora-sqlite]
+  qemu-preflight:
+    name: QEMU behavioral verification preflight
+    needs: quick-gate
     if: >-
-      !cancelled() &&
       (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
       needs.quick-gate.result == 'success' &&
       (github.event_name == 'merge_group' || needs.quick-gate.outputs.should-build == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: ./.github/actions/qemu-preflight
+
+  qemu:
+    name: QEMU behavioral verification (non-Fedora)
+    needs: [qemu-preflight, linux-matrix, ubuntu]
+    if: >-
+      !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
+    with:
+      partition: non-fedora
+      preflight-result: ${{ needs.qemu-preflight.result }}
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      OMG_SMOKE_SENTRY_DSN: ${{ github.event_name != 'pull_request' && secrets.OMG_SMOKE_SENTRY_DSN || '' }}
+
+  qemu-fedora:
+    name: QEMU behavioral verification (Fedora)
+    needs: [qemu-preflight, linux-matrix, ubuntu, fedora-sqlite]
+    if: >-
+      !cancelled() && needs.qemu-preflight.result != 'skipped'
+    uses: ./.github/workflows/qemu-matrix.yml
+    with:
+      partition: fedora
+      preflight-result: ${{ needs.qemu-preflight.result }}
     permissions:
       contents: read
       actions: read
@@ -1740,7 +1923,7 @@ jobs:
 
   ci-success:
     name: "CI Success"
-    needs: [quick-gate, workflow-checks, standalone-suites, portable, linux-matrix, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, docs-audit, runtime-usage]
+    needs: [quick-gate, workflow-checks, standalone-suites, portable, portable-release, linux-matrix, linux-clippy, fedora-sqlite, sandbox-cancellation, feature-intersections, macos, macos-nextest-source, ubuntu, qemu, qemu-fedora, docs-audit, runtime-usage]
     if: always() && !cancelled()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1754,7 +1937,9 @@ jobs:
           WORKFLOW_CHECKS: ${{ needs.workflow-checks.result }}
           STANDALONE_SUITES: ${{ needs.standalone-suites.result }}
           PORTABLE: ${{ needs.portable.result }}
+          PORTABLE_RELEASE: ${{ needs.portable-release.result }}
           LINUX_MATRIX: ${{ needs.linux-matrix.result }}
+          LINUX_CLIPPY: ${{ needs.linux-clippy.result }}
           FEDORA_SQLITE: ${{ needs.fedora-sqlite.result }}
           SANDBOX_CANCELLATION: ${{ needs.sandbox-cancellation.result }}
           FEATURE_INTERSECTIONS: ${{ needs.feature-intersections.result }}
@@ -1763,6 +1948,7 @@ jobs:
           UBUNTU: ${{ needs.ubuntu.result }}
           RUNTIME_USAGE: ${{ needs.runtime-usage.result }}
           QEMU: ${{ needs.qemu.result }}
+          QEMU_FEDORA: ${{ needs.qemu-fedora.result }}
           QEMU_REQUIRED: ${{ github.event_name == 'merge_group' || ((github.event_name == 'push' || github.event_name == 'pull_request') && needs.quick-gate.outputs.should-build == 'true') }}
           DOCS_AUDIT: ${{ needs.docs-audit.result }}
         run: |
@@ -1774,7 +1960,9 @@ jobs:
           echo "| Workflow checks | $WORKFLOW_CHECKS |" >> $GITHUB_STEP_SUMMARY
           echo "| Standalone suites | $STANDALONE_SUITES |" >> $GITHUB_STEP_SUMMARY
           echo "| Portable Rust | $PORTABLE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Portable release | $PORTABLE_RELEASE |" >> $GITHUB_STEP_SUMMARY
           echo "| Linux Matrix | $LINUX_MATRIX |" >> $GITHUB_STEP_SUMMARY
+          echo "| Linux Clippy | $LINUX_CLIPPY |" >> $GITHUB_STEP_SUMMARY
           echo "| Fedora SQLite supply | $FEDORA_SQLITE |" >> $GITHUB_STEP_SUMMARY
           echo "| AUR Sandbox Cancellation | $SANDBOX_CANCELLATION |" >> $GITHUB_STEP_SUMMARY
           echo "| Feature Intersections | $FEATURE_INTERSECTIONS |" >> $GITHUB_STEP_SUMMARY
@@ -1782,7 +1970,8 @@ jobs:
           echo "| macOS nextest source contract | $MACOS_NEXTEST_SOURCE |" >> $GITHUB_STEP_SUMMARY
           echo "| Ubuntu | $UBUNTU |" >> $GITHUB_STEP_SUMMARY
           echo "| Runtime usage accounting | $RUNTIME_USAGE |" >> $GITHUB_STEP_SUMMARY
-          echo "| QEMU | $QEMU |" >> $GITHUB_STEP_SUMMARY
+          echo "| QEMU non-Fedora | $QEMU |" >> $GITHUB_STEP_SUMMARY
+          echo "| QEMU Fedora | $QEMU_FEDORA |" >> $GITHUB_STEP_SUMMARY
           echo "| Docs audit | $DOCS_AUDIT |" >> $GITHUB_STEP_SUMMARY
 
           if [[ "$DOCS_AUDIT" != "success" ]]; then
@@ -1790,8 +1979,8 @@ jobs:
             exit 1
           fi
 
-          if [[ "$QEMU_REQUIRED" == "true" && "$QEMU" != "success" ]]; then
-            echo "::error::Required QEMU verification did not succeed: $QEMU"
+          if [[ "$QEMU_REQUIRED" == "true" && ( "$QEMU" != "success" || "$QEMU_FEDORA" != "success" ) ]]; then
+            echo "::error::Required QEMU verification did not succeed: non-Fedora=$QEMU Fedora=$QEMU_FEDORA"
             exit 1
           fi
 
@@ -1808,7 +1997,9 @@ jobs:
           declare -A required_results=(
             ["Standalone suites"]="$STANDALONE_SUITES"
             ["Portable Rust"]="$PORTABLE"
+            ["Portable release"]="$PORTABLE_RELEASE"
             ["Linux Matrix"]="$LINUX_MATRIX"
+            ["Linux Clippy"]="$LINUX_CLIPPY"
             ["Fedora SQLite supply"]="$FEDORA_SQLITE"
             ["AUR Sandbox Cancellation"]="$SANDBOX_CANCELLATION"
             ["Feature Intersections"]="$FEATURE_INTERSECTIONS"

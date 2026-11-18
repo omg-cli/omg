@@ -750,7 +750,9 @@ async fn isolated_refresh_refusal_preserves_server_liveness() -> Result<()> {
 #[tokio::test]
 #[serial]
 async fn custom_socket_publishes_status_in_its_private_directory() -> Result<()> {
-    let fixture = RealServerFixture::new().await?;
+    let fixture =
+        RealServerFixture::with_packages(&[("git", "1.0"), ("pacman", "1.0")], &[("git", "2.0")])
+            .await?;
     let status_path = fixture.socket_path.with_file_name("omg.status");
     let published = timeout(READ_TIMEOUT, async {
         loop {
@@ -772,9 +774,10 @@ async fn custom_socket_publishes_status_in_its_private_directory() -> Result<()>
     });
     fixture.shutdown().await?;
     let status = published?;
-    assert_eq!(status.total_packages, 0);
-    assert_eq!(status.explicit_packages, 0);
-    assert_eq!(status.updates_available, 0);
+    assert_eq!(status.total_packages, 2);
+    assert_eq!(status.explicit_packages, 2);
+    assert_eq!(status.orphan_packages, 0);
+    assert_eq!(status.updates_available, 1);
     Ok(())
 }
 

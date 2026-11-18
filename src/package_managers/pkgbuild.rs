@@ -565,6 +565,7 @@ mod tests {
                     )
                 );
                 let work = SUBSTITUTION_SCAN_BYTES.with(std::cell::Cell::get);
+                assert!(work > 0, "substitution scan counter did not record work");
                 assert!(
                     work <= 8 * content.len(),
                     "scanned {work} bytes for {} input bytes",
@@ -596,6 +597,7 @@ mod tests {
                     .contains("unterminated array assignment for depends")
             );
             let work = ARRAY_SCAN_BYTES.with(std::cell::Cell::get);
+            assert!(work > 0, "array scan counter did not record work");
             assert!(
                 work <= content.len(),
                 "scanned {work} bytes for {} input bytes",
@@ -652,7 +654,17 @@ mod tests {
 
         let error = PkgBuild::parse(&path).expect_err("oversized PKGBUILD must fail");
 
-        assert!(format!("{error:#}").contains("exceeds"));
+        assert!(format!("{error:#}").contains(&format!(
+            "PKGBUILD exceeds the {MAX_PKGBUILD_BYTES}-byte limit"
+        )));
+
+        let mut boundary = b"pkgname=demo\npkgver=1\npkgrel=1\n#".to_vec();
+        boundary.resize(MAX_PKGBUILD_BYTES as usize, b'x');
+        std::fs::write(&path, boundary).expect("write boundary fixture");
+        let package = PkgBuild::parse(&path).expect("exactly the byte limit must be accepted");
+        assert_eq!(package.name, "demo");
+        assert_eq!(package.version.to_string(), "1");
+        assert_eq!(package.release, "1");
     }
 
     #[cfg(unix)]

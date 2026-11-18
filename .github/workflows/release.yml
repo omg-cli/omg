@@ -313,7 +313,7 @@ jobs:
           timeout -k 10s 12m dnf \
             --setopt='*.skip_if_unavailable=False' --disable-repo=fedora-cisco-openh264 \
             install -y --setopt=install_weak_deps=False \
-            git clang cmake openssl-devel pkgconfig findutils curl \
+            git clang cmake make perl-core openssl-devel pkgconfig findutils curl \
             rpm dnf sqlite yum-utils fedora-release
           rpm --initdb
           curl --proto '=https' --tlsv1.2 -fsSL \
@@ -355,7 +355,7 @@ jobs:
   build-macos:
     name: "Build macOS (ARM64)"
     needs: gate-on-ci
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     outputs:
       archive_sha256: ${{ steps.package.outputs.archive_sha256 }}
@@ -556,7 +556,7 @@ jobs:
   smoke-macos:
     name: "Staged macOS release smoke"
     needs: build-macos
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"

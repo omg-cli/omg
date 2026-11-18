@@ -1,0 +1,80 @@
+diff --git a/dist/index.mjs b/dist/index.mjs
+index dcf71c6..8444bef 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -277,3 +277,3 @@ var init_gitlab_direct_access_cache = __esm({
+     init_gitlab_direct_access_cache_prune();
+-    tokenSchema = z.object({ token: z.string().min(1), headers: z.record(z.string()) });
++    tokenSchema = z.object({ token: z.string().min(1), headers: z.record(z.string(), z.string()) });
+     entrySchema = z.object({ expiresAt: z.number(), value: tokenSchema });
+@@ -904,3 +904,3 @@ var GitLabWorkflowTokenClient = class {
+ var directAccessTokenSchema = z2.object({
+-  headers: z2.record(z2.string()),
++  headers: z2.record(z2.string(), z2.string()),
+   token: z2.string()
+diff --git a/dist/index.js b/dist/index.js
+index cc9bfa5..0579a00 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -298,3 +298,3 @@ var init_gitlab_direct_access_cache = __esm({
+     init_gitlab_direct_access_cache_prune();
+-    tokenSchema = import_zod.z.object({ token: import_zod.z.string().min(1), headers: import_zod.z.record(import_zod.z.string()) });
++    tokenSchema = import_zod.z.object({ token: import_zod.z.string().min(1), headers: import_zod.z.record(import_zod.z.string(), import_zod.z.string()) });
+     entrySchema = import_zod.z.object({ expiresAt: import_zod.z.number(), value: tokenSchema });
+@@ -976,3 +976,3 @@ var GitLabWorkflowTokenClient = class {
+ var directAccessTokenSchema = import_zod2.z.object({
+-  headers: import_zod2.z.record(import_zod2.z.string()),
++  headers: import_zod2.z.record(import_zod2.z.string(), import_zod2.z.string()),
+   token: import_zod2.z.string()
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index b5eef9f..607b235 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -1409,12 +1409,2 @@ declare const gitlabOAuthTokenResponseSchema: z.ZodObject<{
+     created_at: z.ZodNumber;
+-}, "strip", z.ZodTypeAny, {
+-    created_at?: number;
+-    access_token?: string;
+-    refresh_token?: string;
+-    expires_in?: number;
+-}, {
+-    created_at?: number;
+-    access_token?: string;
+-    refresh_token?: string;
+-    expires_in?: number;
+ }>;
+@@ -1621,8 +1611,2 @@ declare const directAccessTokenSchema: z.ZodObject<{
+     token: z.ZodString;
+-}, "strip", z.ZodTypeAny, {
+-    token?: string;
+-    headers?: Record<string, string>;
+-}, {
+-    token?: string;
+-    headers?: Record<string, string>;
+ }>;
+diff --git a/dist/index.d.mts b/dist/index.d.mts
+index b5eef9f..607b235 100644
+--- a/dist/index.d.mts
++++ b/dist/index.d.mts
+@@ -1409,12 +1409,2 @@ declare const gitlabOAuthTokenResponseSchema: z.ZodObject<{
+     created_at: z.ZodNumber;
+-}, "strip", z.ZodTypeAny, {
+-    created_at?: number;
+-    access_token?: string;
+-    refresh_token?: string;
+-    expires_in?: number;
+-}, {
+-    created_at?: number;
+-    access_token?: string;
+-    refresh_token?: string;
+-    expires_in?: number;
+ }>;
+@@ -1621,8 +1611,2 @@ declare const directAccessTokenSchema: z.ZodObject<{
+     token: z.ZodString;
+-}, "strip", z.ZodTypeAny, {
+-    token?: string;
+-    headers?: Record<string, string>;
+-}, {
+-    token?: string;
+-    headers?: Record<string, string>;
+ }>;

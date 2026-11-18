@@ -2058,6 +2058,12 @@ mod fast_path_tests {
             "explicit", "--count", "--json"
         ])));
         assert!(!has_json_flag(&args_or_panic(&["explicit", "--count"])));
+        for token in ["--jsonx", "--json=1", "-j"] {
+            assert!(
+                !has_json_flag(&args_or_panic(&["explicit", "--count", token])),
+                "{token} is not the global --json flag"
+            );
+        }
     }
 
     #[test]
