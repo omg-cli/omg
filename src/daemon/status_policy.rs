@@ -7,6 +7,20 @@
 //! types stay declarative and the invariants stay tested in one place.
 
 use super::protocol::StatusResult;
+use crate::core::security::scan::{AuditCoverage, SecurityAuditResult};
+
+pub(super) fn reported_vulnerability_counts(
+    scan: SecurityAuditResult,
+) -> anyhow::Result<(usize, usize)> {
+    match scan.coverage {
+        AuditCoverage::Reported { unassessed, .. } => {
+            Ok((scan.total_vulnerabilities, unassessed.len()))
+        }
+        AuditCoverage::Unreported => {
+            Err(anyhow::anyhow!("Security scan omitted advisory coverage"))
+        }
+    }
+}
 
 /// Map a vulnerability scan onto a previously published count.
 ///
@@ -50,7 +64,8 @@ pub fn status_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::{status_snapshot, vulnerability_count_from_scan};
+    use super::{reported_vulnerability_counts, status_snapshot, vulnerability_count_from_scan};
+    use crate::core::security::scan::{AuditCoverage, SecurityAuditResult};
 
     #[test]
     fn successful_scan_replaces_the_previous_count() {
@@ -73,6 +88,29 @@ mod tests {
         assert_eq!(
             vulnerability_count_from_scan(&Err("alsa unavailable"), None),
             None
+        );
+    }
+
+    #[test]
+    fn unreported_package_coverage_does_not_replace_the_last_scan() {
+        let scan = SecurityAuditResult {
+            coverage: AuditCoverage::Unreported,
+            total_vulnerabilities: 0,
+            high_severity: 0,
+            vulnerabilities: Vec::new(),
+        };
+        let summary = reported_vulnerability_counts(scan);
+        assert_eq!(
+            summary
+                .as_ref()
+                .expect_err("unreported scan must refuse")
+                .to_string(),
+            "Security scan omitted advisory coverage"
+        );
+        assert_eq!(vulnerability_count_from_scan(&summary, None), None);
+        assert_eq!(
+            vulnerability_count_from_scan(&summary, Some((5, 2))),
+            Some((5, 2))
         );
     }
 

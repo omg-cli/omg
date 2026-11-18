@@ -993,7 +993,8 @@ mod tests {
         fs::write(
             &path,
             "advisory_requirement = 'fresh_snapshot'\narch_advisory_repositories = ['core', 'extra']\n",
-        )?;
+        )
+        .expect("write the fresh advisory policy fixture");
         let policy = SecurityPolicy::load(&path)?;
         assert_eq!(
             policy.advisory_requirement,
@@ -1141,9 +1142,17 @@ mod tests {
         let address = listener.local_addr()?;
         let payload = r#"[{"name":"AVG-fixture","packages":["fixture"],"status":"Fixed","severity":"High","affected":"1-1","fixed":"2-1","issues":["CVE-2026-1234"],"type":"code execution"}]"#;
         let now = jiff::Timestamp::now().to_string();
-        let body = serde_json::to_vec(
-            &serde_json::json!({"schema_version":1,"source":"arch-security","source_url":"https://security.archlinux.org/issues/all.json","fetched_at":now,"checked_at":now,"complete":true,"payload_sha256":hex::encode(Sha256::digest(payload.as_bytes())),"payload_json":payload}),
-        )?;
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "source": "arch-security",
+            "source_url": "https://security.archlinux.org/issues/all.json",
+            "fetched_at": now,
+            "checked_at": now,
+            "complete": true,
+            "payload_sha256": hex::encode(Sha256::digest(payload.as_bytes())),
+            "payload_json": payload,
+        })
+        .to_string();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await?;
             let mut request = [0_u8; 4096];
@@ -1161,7 +1170,7 @@ mod tests {
                     .as_bytes(),
                 )
                 .await?;
-            socket.write_all(&body).await?;
+            socket.write_all(body.as_bytes()).await?;
             Ok::<_, anyhow::Error>(())
         });
         let package = |origin| SecurityPackage {

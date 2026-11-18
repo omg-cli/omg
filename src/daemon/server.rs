@@ -291,10 +291,7 @@ async fn run_with_status_path(
                     tracing::debug!("Cancelled background security refresh during shutdown");
                     return;
                 }
-                result = state.scan_security() => result.and_then(|scan| match scan.coverage {
-                    crate::core::security::scan::AuditCoverage::Reported { unassessed, .. } => Ok((scan.total_vulnerabilities, unassessed.len())),
-                    crate::core::security::scan::AuditCoverage::Unreported => Err(anyhow::anyhow!("Security scan omitted advisory coverage")),
-                }),
+                result = state.scan_security() => result.and_then(super::status_policy::reported_vulnerability_counts),
             };
             if let Err(error) = &scan {
                 tracing::warn!("Vulnerability scan failed during status refresh: {error}");

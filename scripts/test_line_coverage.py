@@ -2001,6 +2001,85 @@ class SourceAwareCoverageTests(unittest.TestCase):
             with self.subTest(fault=fault),self.assertRaises(ValueError):
                 self.paused_daemon_source_compare(fault)
 
+    def daemon_audit_record_compare(self, fault=None):
+        name = 'src/daemon/server.rs'
+        old = [
+            '#[cfg(test)]', 'mod tests {', '    #[test]',
+            '    fn oversized_security_audit_is_not_reported_as_complete() {',
+            '        let vulnerability = super::super::protocol::Vulnerability {',
+            '            id: "CVE-fixture".into(),',
+            '        };',
+            '        let response = Response::Success {',
+            '            result: ResponseResult::SecurityAudit(SecurityAuditResult {',
+            '                vulnerabilities: (0..2)',
+            '                    .map(|index| (format!("package-{index}"), vec![vulnerability.clone()]))',
+            '                    .collect(),',
+            '            }),',
+            '        };',
+            '        assert!(encode_frame(&response).is_err());',
+            '    }', '}',
+        ]
+        new = old.copy()
+        new.insert(5, '            applicability: crate::core::security::scan::FindingApplicability::Possible,')
+        new.insert(10, '                coverage: crate::core::security::scan::AuditCoverage::Unreported,')
+        if fault == 'variant':
+            new[5] = new[5].replace('Possible', 'Applicable')
+        documents = []
+        counts = []
+        for side, source in enumerate((old, new)):
+            def line(number):
+                return number + side * (int(number >= 6) + int(number >= 10))
+            def span(number, text, hits=1):
+                start = source[number - 1].index(text) + 1
+                return [number, start, number, start + len(text), hits, 0, 0, 0]
+            root = f'_RNvNtNtNtCs{side + 1}_7omg_lib6daemon6server5testss_52oversized_security_audit_is_not_reported_as_complete'
+            rows = [
+                span(4, 'fn oversized_security_audit_is_not_reported_as_complete()'),
+                [5, 29, line(7), 10, 1, 0, 0, 0],
+                [line(8), 24, line(14), 10, 1, 0, 0, 0],
+                span(line(10), '(0..2)'),
+                span(line(12), 'collect'),
+                span(line(15), 'encode_frame', int(fault != 'cold-retained' or not side)),
+                span(line(16), '}'),
+            ]
+            if side:
+                rows += [span(6, source[5].strip().split(': ', 1)[1][:-1]),
+                         span(11, 'crate::core::security::scan::AuditCoverage::Unreported')]
+                if fault == 'missing-field':
+                    rows.pop()
+            child = '_RNC' + root[2:] + ('s_0B9_' if side and fault == 'wrong-owner' else '0B9_')
+            members = [
+                dict(name=root, count=1, regions=rows, filenames=['/src/' + name]),
+                dict(name=child, count=2, regions=[span(line(11), 'format!', 2),
+                     span(line(11), 'vulnerability.clone()', 2)], filenames=['/src/' + name]),
+            ]
+            observer = coverage._ObserverWork()
+            counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [row for owner in members for row in owner['regions']], observer), observer)))
+            documents.append(members)
+        def owners(base, head):
+            for document, members in zip((base, head), documents):
+                document['data'][0]['functions'] = members
+                document['data'][0]['files'][0]['expansions'] = []
+        return self.compare(before=counts[0], after=counts[1], mutate=owners, filename=name,
+            sources=tuple({name: ('\n'.join(source) + '\n').encode()} for source in (old, new)))
+
+    def test_daemon_audit_fixture_retains_mapper_after_enum_fields_are_added(self):
+        result = self.daemon_audit_record_compare()
+        receipt, = [row for row in result['retained_replacement_obligations']
+                    if row['kind'] == 'retained-daemon-audit-fixture-fields']
+        self.assertEqual(receipt['added_lines'], [6, 11])
+        self.assertIn([11, 13], receipt['pairs'])
+        self.assertEqual(result['deleted_mapped'], 0)
+        for fault in ('variant', 'missing-field', 'cold-retained', 'wrong-owner'):
+            with self.subTest(fault=fault):
+                try:
+                    rejected = self.daemon_audit_record_compare(fault)
+                except ValueError:
+                    continue
+                self.assertFalse(any(row['kind'] == 'retained-daemon-audit-fixture-fields'
+                                     for row in rejected['retained_replacement_obligations']))
+
     def test_qualified_test_seed_has_no_partial_fallback_when_full_owner_proof_fails(self):
         with patch.object(coverage, 'fully_covered_replacement', return_value=None):
             with self.assertRaisesRegex(ValueError, r'example.rs:6 -> 6'):
@@ -4739,6 +4818,109 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 except ValueError: continue
                 self.assertFalse(any(row['kind'] == 'closed-retained-callback-island'
                     for row in receipt.get('retained_replacement_obligations', [])))
+
+    def sbom_advisory_property_array_compare(self, fault=None):
+        file = 'src/core/security/sbom_shared.rs'
+        entries = [
+            'SbomProperty {',
+            '    name: "omg:advisory:title".into(),',
+            '    value: finding.summary.clone(),',
+            '},',
+            'SbomProperty {',
+            '    name: "omg:advisory:nevra".into(),',
+            '    value: native.advisory_nevra.clone(),',
+            '},',
+            'SbomProperty {',
+            '    name: "omg:advisory:published-severity".into(),',
+            '    value: native.published_severity.clone(),',
+            '},',
+        ]
+        beginning = ['fn compose(audit: &Audit) {',
+                     '    for (name, findings) in &audit.vulnerabilities {',
+                     '        for finding in findings {']
+        advisories = [
+            '                advisories: finding.native_advisory.as_ref().map(|native| {',
+            '                    describe(native);',
+            '                }),',
+        ]
+        sources = [
+            [*beginning, '            vulnerabilities.push(SbomVulnerability {',
+             '                properties: finding.native_advisory.as_ref().map(|native| {',
+             '                    vec![', *['                        ' + line for line in entries],
+             '                    ]',
+             '                    .into_iter().filter(|property| !property.value.is_empty()).collect()',
+             '                }).unwrap_or_default(),', *advisories, '            });', '        }', '    }', '}'],
+            [*beginning, '            if let Some(native) = &finding.native_advisory {',
+             '                properties.extend(', '                    [',
+             *['                    ' + line for line in entries],
+             '                    ]',
+             '                    .into_iter().filter(|property| !property.value.is_empty()),',
+             '                );', '            }',
+             '            vulnerabilities.push(SbomVulnerability {',
+             '                properties,', *advisories, '            });',
+             '        }', '    }', '}'],
+        ]
+        docs = []
+        counts = []
+        for side, lines in enumerate(sources):
+            copies = []
+            for copy_number in (0, 1):
+                state = int(copy_number == 1)
+                if side and fault == 'redistributed-count':
+                    state = 1 - state
+                symbol = f'_RNvNtNtNtCs{1 + copy_number}_7omg_lib4core8security11sbom_shared7compose'
+                def span(number, value, quantity):
+                    column = lines[number - 1].index(value) + 1
+                    return [number, column, number, column + len(value), quantity, 0, 0, 0]
+                root = dict(name=symbol, count=1, filenames=['/src/' + file],
+                            regions=[span(1, 'fn compose(audit: &Audit)', 1), span(len(lines), '}', 1)])
+                raw = [[6, 21, 19, 22, state, 0, 0, 0]] if side else [span(6, 'vec!', state)]
+                for record in (7, 11, 15):
+                    first = lines[record - 1].index('SbomProperty') + 1
+                    if not side or record != 15:
+                        raw.append([record, first, record + 3, first + 1, state, 0, 0, 0])
+                    literal = entries[record - 6].split('"')[1]
+                    raw.extend([span(record + 1, '"' + literal + '"', state),
+                                span(record + 1, 'into', state)])
+                if side:
+                    if fault == 'foreign-record-owner' and copy_number == 0:
+                        copies.append(dict(name='foreign',count=1,filenames=['/src/' + file],regions=[raw.pop()]))
+                    root['regions'].extend(raw)
+                else:
+                    copies.append(dict(name='_RNC'+symbol[2:]+'s1_0B9_', count=state,
+                                       filenames=['/src/' + file], regions=raw))
+                callback = lines.index(advisories[0]) + 1
+                copies.append(dict(name='_RNC'+symbol[2:]+'0B9_', count=1,
+                    filenames=['/src/' + file], regions=[span(callback,'{',1),
+                    span(callback+1,'describe',1),span(callback+2,'}',1)]))
+                copies.append(root)
+            if side and fault == 'source-value':
+                lines[8] = lines[8].replace('finding.summary', 'finding.id')
+            work = coverage._ObserverWork()
+            counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [row for owner in copies for row in owner['regions']], work), work)))
+            docs.append(copies)
+        def owners(base, head):
+            for document, members in zip((base, head), docs):
+                document['data'][0]['functions'] = members
+                document['data'][0]['files'][0]['expansions'] = []
+        return self.compare(before=counts[0], after=counts[1], mutate=owners, filename=file,
+            sources=tuple({file: ('\n'.join(lines) + '\n').encode()} for lines in sources))
+
+    def test_sbom_advisory_properties_keep_all_observed_initializer_copies(self):
+        result = self.sbom_advisory_property_array_compare()
+        proof, = [row for row in result['retained_replacement_obligations']
+                  if row.get('kind') == 'retained-sbom-advisory-properties']
+        self.assertIn([12, 12], proof['pairs'])
+        self.assertEqual(result['deleted_mapped'], 0)
+        for fault in ('redistributed-count', 'foreign-record-owner', 'source-value'):
+            with self.subTest(fault=fault):
+                try:
+                    rejected = self.sbom_advisory_property_array_compare(fault)
+                except ValueError:
+                    continue
+                self.assertFalse(any(row.get('kind') == 'retained-sbom-advisory-properties'
+                                     for row in rejected['retained_replacement_obligations']))
 
     def test_block_mapper_preserves_complete_cold_descendant_and_context(self):
         receipt=self.closed_retained_callback_island_fixture()

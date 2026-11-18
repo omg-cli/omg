@@ -7859,6 +7859,238 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
     return pairs,receipts
 
 
+def retained_daemon_audit_fixture_fields(name, sources, counts, descriptors, grouped, work, expansions):
+    """Keep the oversized response fixture's coverage when its enum fields are initialized."""
+    if name != 'src/daemon/server.rs' or expansions != ([], []):
+        return None
+    declaration = 'oversized_security_audit_is_not_reported_as_complete'
+    entries = [[row for row in functions.values() if row['declaration'] == declaration]
+               for functions in descriptors]
+    _construct_charge(work, sum(map(len, descriptors)))
+    if any(len(rows) != 1 for rows in entries):
+        return None
+    left, right = (rows[0] for rows in entries)
+    if (left['signature'] != _RESULT_TEST_SIGNATURE[:8] or left['signature'] != right['signature']
+            or left['context'] != right['context']
+            or left['context'][0] != (('#','[','cfg','(','test',')',']','mod','tests'),)):
+        return None
+    groups = [entry['group'] for entry in (left, right)]
+    (first, last), (start, end) = (group[:2] for group in groups)
+    if not 1 <= last - first <= 128 or end - start != last - first + 2:
+        return None
+    expected = {
+        'applicability: crate::core::security::scan::FindingApplicability::Possible,':
+            'let vulnerability = super::super::protocol::Vulnerability {',
+        'coverage: crate::core::security::scan::AuditCoverage::Unreported,':
+            'result: ResponseResult::SecurityAudit(SecurityAuditResult {',
+    }
+    added = {}
+    retained = {}
+    previous = first
+    for line in range(start, end + 1):
+        text = sources[1][line - 1]
+        _construct_charge(work, len(text) + 1)
+        field = text.strip()
+        if previous <= last and text == sources[0][previous - 1]:
+            retained[line] = previous
+            previous += 1
+        elif (line > start and field in expected and sources[1][line - 2].strip() == expected[field]
+                and field not in added and text.isascii()):
+            column = text.index('crate::') + 1
+            added[field] = (line, column, line, len(text.rstrip()))
+        else:
+            return None
+    if previous != last + 1 or added.keys() != expected.keys():
+        return None
+    geometry = []
+    forests = []
+    for side, (group, compiled, mapped) in enumerate(zip(groups, grouped, counts, strict=True)):
+        low, high, roots = group
+        if len(roots) != 1:
+            return None
+        root, = roots
+        shape = plain_rust_function_symbol(root['name'])
+        if shape is None or shape.identifiers != ('omg_lib','daemon','server','tests',declaration):
+            return None
+        members = {}
+        names = []
+        raw = []
+        new_fields = set(added.values()) if side else set()
+        for owner in compiled[0]:
+            regions = owner['regions']
+            _construct_charge(work, len(regions) + 1)
+            if not any(row[0] <= high and low <= row[2] for row in regions):
+                continue
+            symbol = owner['name']
+            _construct_charge(work, 2 * len(symbol) + len(regions))
+            is_root = owner is root
+            if (not is_root and not direct_rust_callback_symbol(symbol, root['name'], shape.modules)
+                    or compiled[2][symbol] != 1 or owner['filenames'] != root['filenames']
+                    or owner.get('branches') or owner.get('mcdc_records')
+                    or not 0 < owner['count'] < COUNTER_LIMIT):
+                return None
+            role = '' if is_root else symbol[len('_RNC'+root['name'][2:]):]
+            if role in members:
+                return None
+            rows = []
+            for row in regions:
+                a, x, b, y, hits, *channel = row
+                if not low <= a <= b <= high or channel != [0,0,0] or not 0 <= hits < COUNTER_LIMIT:
+                    return None
+                if side and (a not in retained or b not in retained):
+                    field = (a,x,b,y)
+                    if not is_root or field not in new_fields or hits != root['count']:
+                        return None
+                    new_fields.remove(field)
+                    continue
+                rows.append((retained[a] if side else a, x, retained[b] if side else b, y, hits > 0))
+            _construct_charge(work, len(rows) * (len(rows).bit_length() + 1))
+            members[role] = tuple(sorted(rows))
+            names.append(symbol)
+            raw.extend(regions)
+        if new_fields or len(members) != 2 or '' not in members:
+            return None
+        observer = _ObserverWork(work)
+        observed = dict(_llvm22_rows(_llvm22_segments(raw, observer), observer))
+        _construct_charge(work, high - low + 1)
+        if observed != {line: mapped[line] for line in range(low, high + 1) if line in mapped}:
+            return None
+        geometry.append(members)
+        forests.append(sorted(names))
+    if geometry[0] != geometry[1]:
+        return None
+    pairs = {old: new for new, old in retained.items() if old in counts[0]}
+    if any(new not in counts[1] for new in pairs.values()) or any(counts[1].get(row[0],0) <= 0 for row in added.values()):
+        return None
+    return pairs, dict(kind='retained-daemon-audit-fixture-fields', file=name, base_range=[first,last],
+        head_range=[start,end], pairs=[list(pair) for pair in sorted(pairs.items())],
+        added_lines=sorted(row[0] for row in added.values()), forests=forests,
+        claim='Complete existing fixture and mapper geometry, with new field counters kept separately')
+
+
+def retained_sbom_advisory_properties(name, sources, counts, descriptors, inventories,
+                                      grouped, work, expansions, blobs):
+    """Bind the same three native advisory records in the optional mapper and borrowed array."""
+    if name != 'src/core/security/sbom_shared.rs' or expansions != ([], []):
+        return None
+    entries = [[row for row in side.values() if row['declaration'] == 'compose'] for side in descriptors]
+    _construct_charge(work, sum(map(len, descriptors)))
+    if any(len(rows) != 1 for rows in entries):
+        return None
+    left, right = (rows[0] for rows in entries)
+    fields = (
+        ('omg:advisory:title', 'finding . summary'),
+        ('omg:advisory:nevra', 'native . advisory_nevra'),
+        ('omg:advisory:published-severity', 'native . published_severity'),
+    )
+    prefixes = (
+        'properties : finding . native_advisory . as_ref ( ) . map ( | native | { vec !',
+        'if let Some ( native ) = & finding . native_advisory { properties . extend (',
+    )
+    filter_call = '. into_iter ( ) . filter ( | property | ! property . value . is_empty ( ) )'
+    suffixes = (filter_call + ' . collect ( ) } ) . unwrap_or_default ( ) ,',
+                filter_call + ' , ) ; }')
+    bindings = (' '.join(prefixes+suffixes) + ' SbomProperty name audit findings '
+                + ' '.join(value for _, value in fields)).split()
+    if (left['signature'] != right['signature'] or left['attributes'] != right['attributes']
+            or not callback_island_import_context(name, [row['context'] for row in (left,right)],
+                bindings, blobs, work)):
+        return None
+    results = []
+    for side, (source, inventory, descriptor, compiled) in enumerate(
+            zip(sources, inventories, (left,right), grouped, strict=True)):
+        code = inventory[0]
+        function = descriptor['row']
+        prefix, suffix = prefixes[side].split(), suffixes[side].split()
+        _construct_charge(work, function['end'] - function['opening'])
+        candidates = []
+        for token in range(function['opening']+1, function['end']):
+            if code.words[token] == '[':
+                _construct_charge(work, len(prefix))
+                if code.words[token-len(prefix):token] == prefix:
+                    candidates.append(token)
+        if len(candidates) != 1:
+            return None
+        opening, = candidates
+        closing = code.pairs[opening]
+        if code.words[closing+1:closing+1+len(suffix)] != suffix:
+            return None
+        containing = _construct_ancestors(code, opening, work)
+        controls = [head.split() for head in (
+            'for finding in findings', 'for ( name , findings ) in & audit . vulnerabilities')]
+        if any(sum(code.words[i-len(control):i] == control for i in containing) != 1 for control in controls):
+            return None
+        elements = _boolean_arguments(code, opening)
+        if elements is None or len(elements) != len(fields):
+            return None
+        marker = tuple(code.region(opening, closing) if side else code.region(opening-2,opening-1))
+        expected = {marker}
+        for ordinal, ((start, end), (label, value)) in enumerate(zip(elements, fields, strict=True)):
+            expression = ('SbomProperty { name : "' + label
+                          + '" . into ( ) , value : ' + value + ' . clone ( ) , }').split()
+            _construct_charge(work, end - start + 1)
+            if code.words[start:end] != expression:
+                return None
+            if not side or ordinal < len(fields)-1:
+                expected.add(tuple(code.region(start,end-1)))
+            expected.update(tuple(code.region(token,token)) for token in (start+4,start+6))
+        low, high = code.region(opening, closing)[::2]
+        _construct_charge(work, high - low + 1)
+        roots = descriptor['group'][2]
+        if len(roots) != 2:
+            return None
+        root_shapes = {item['name']:plain_rust_function_symbol(item['name']) for item in roots}
+        nominal = ('omg_lib','core','security','sbom_shared','compose')
+        if any(shape is None or shape.identifiers != nominal for shape in root_shapes.values()):
+            return None
+        copies = {}
+        raw = []
+        for owner in compiled[0]:
+            _construct_charge(work, len(owner['regions']) + 1)
+            selected = [row for row in owner['regions'] if row[0] <= high and low <= row[2]]
+            if not selected:
+                continue
+            symbol = owner['name']
+            parents = [root for root in roots if (root is owner if side else direct_rust_callback_symbol(
+                symbol,root['name'],root_shapes[root['name']].modules))]
+            if len(parents) != 1:
+                return None
+            parent, = parents
+            identity = parent['name']
+            _construct_charge(work, len(selected) + len(symbol))
+            state = selected[0][4]
+            if (identity in copies or compiled[2][symbol] != 1 or compiled[2][identity] != 1
+                    or owner['filenames'] != parent['filenames'] or owner.get('branches') or owner.get('mcdc_records')
+                    or not 0 <= state <= parent['count'] < COUNTER_LIMIT or not side and owner['count'] != state
+                    or any(row[4:] != [state,0,0,0] for row in selected)
+                    or len(selected) != len(expected) or {tuple(row[:4]) for row in selected} != expected):
+                return None
+            copies[identity] = (symbol,(int(state > 0),))
+            raw.extend(selected)
+        if set(copies) != root_shapes.keys():
+            return None
+        observer = _ObserverWork(work)
+        observed = dict(_llvm22_rows(_llvm22_segments(raw, observer), observer))
+        if observed != {line: counts[side][line] for line in range(low,high+1) if line in counts[side]}:
+            return None
+        body = source[low:high-1]
+        _construct_charge(work, sum(len(line)+1 for line in body))
+        results.append((low,high,[line.strip() for line in body],copies,observed))
+    (first,last,old_body,old_copies,old_rows),(start,end,new_body,new_copies,new_rows) = results
+    states = [[row[1] for row in copies.values()] for copies in (old_copies,new_copies)]
+    if old_body != new_body or sorted(states[0]) != sorted(states[1]):
+        return None
+    matching = compiled_hit_state_matching(*states, [tuple(old_copies),tuple(new_copies)])
+    pairs = {n:n+start-first for n in range(first+1,last) if n in old_rows}
+    if matching is None or not pairs or set(pairs.values()) != set(range(start+1,end)) & new_rows.keys():
+        return None
+    return pairs, dict(kind='retained-sbom-advisory-properties', file=name,
+        pairs=[list(pair) for pair in sorted(pairs.items())], base_range=list(left['group'][:2]),
+        head_range=list(right['group'][:2]), array_ranges=[[first,last],[start,end]],
+        copies=[list(copies.items()) for copies in (old_copies,new_copies)], role_matching=matching,
+        claim='Source-identical records in every measured array copy; no deletion credit')
+
+
 def projected_iterator_source(left, right, inventories, sources, work):
     """Bind one wildcard tuple input to an exact terminal borrowed-item projection."""
     codes=[i[0] for i in inventories];functions=[d['row'] for d in (left,right)]
@@ -8699,6 +8931,23 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     record_pairs, record_receipts, record_proved = retained_record_field_obligations(
         name,(old,new),(before,after),descriptors,inventories,grouped,replacements,work,
         record_indexes,record_expansions)
+    daemon_fields = retained_daemon_audit_fixture_fields(
+        name,(old,new),(before,after),descriptors,grouped,work,record_expansions)
+    if daemon_fields is not None:
+        fields, receipt = daemon_fields
+        if set(fields) & record_pairs.keys() or set(fields.values()) & set(record_pairs.values()):
+            raise ValueError('Ambiguous daemon fixture record correspondence')
+        record_pairs.update(fields)
+        record_receipts.append(receipt)
+        record_proved.add(tuple(receipt['base_range']))
+    sbom_fields = retained_sbom_advisory_properties(
+        name,(old,new),(before,after),descriptors,inventories,grouped,work,record_expansions,island_blobs)
+    if sbom_fields is not None:
+        fields, receipt = sbom_fields
+        if set(fields) & record_pairs.keys() or set(fields.values()) & set(record_pairs.values()):
+            raise ValueError('Ambiguous SBOM advisory-property correspondence')
+        record_pairs.update(fields)
+        record_receipts.append(receipt)
     island_pairs, island_receipts = retained_callback_island_obligations(
         name,(old,new),(before,after),descriptors,inventories,replacements,work,
         record_indexes,record_expansions,island_blobs)
@@ -11450,11 +11699,11 @@ def retained_boolean_argument_paint(name, old, new, before, after, base, head, b
     return results
 
 
-def retained_specialization_additions(name, sides, indexes, work, *, path_reference=False):
+def retained_specialization_additions(name, sides, indexes, inventory_for_side, work, *, path_reference=False):
     """Match every original specialization and observe additional consumers in full."""
     layouts = []; roles = []; spans = []; containers = []; summaries = []; source_bytes = []; compiled_methods = set()
-    source_tokens = []; previous_source = None; inventory = None
-    for (source, counts, candidates), index in zip(sides, indexes, strict=True):
+    source_tokens = []
+    for side, ((source, counts, candidates), index) in enumerate(zip(sides, indexes, strict=True)):
         _construct_charge(work, sum(3*len(owner['regions'])+1 for owner in candidates))
         bounds = {source_owner_span(owner, name, index.files, source) for owner in candidates}
         if len(bounds) != 1 or None in bounds:
@@ -11463,11 +11712,7 @@ def retained_specialization_additions(name, sides, indexes, work, *, path_refere
         if declaration is None:
             return None
         spans.append((first, last)); source_bytes.append(source[first-1:last])
-        _construct_charge(work,len(source))
-        if source!=previous_source:
-            _construct_charge(work, sum(len(line)+1 for line in source))
-            inventory = _construct_inventory(source, work)
-            previous_source = source
+        inventory = inventory_for_side(side)
         if inventory is None:
             return None
         code, rows = inventory[:2]
@@ -11676,6 +11921,16 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     for name in bs:
         old = base_sources[name].decode("utf-8").splitlines()
         new = head_sources[name].decode("utf-8").splitlines()
+        same_source = base_sources[name] == head_sources[name]
+        base_inventory = []
+
+        def inventory_for_side(side):
+            if side or same_source:
+                return head_constructs(name)
+            if not base_inventory:
+                base_inventory.append(_construct_inventory(old, construct_work))
+            return base_inventory[0]
+
         before, after = bs[name]["counts"], hs[name]["counts"]
         if any(line > len(old) for line in before) or any(line > len(new) for line in after):
             raise ValueError("Coverage line exceeds exact source blob")
@@ -11747,7 +12002,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             for other in function_scopes)]
         source_structure = None
         shared_prefixes = None
-        if base_sources[name] == head_sources[name]:
+        if same_source:
             _construct_charge(construct_work, sum(len(line) + 1 for line in old))
             source_structure = _source_structural_map(old)
             if source_structure is not None:
@@ -11774,7 +12029,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     path_reference = all(owner['name'].startswith('_RINvM') for owner in candidates)
                     default_trait = all(owner['name'].startswith('_RNvY') for owner in candidates)
                     proof = retained_specialization_additions(name, ((old, before, previous), (new, after, current)),
-                        source_owner_indexes(), construct_work, path_reference=path_reference) if (
+                        source_owner_indexes(), inventory_for_side, construct_work, path_reference=path_reference) if (
                             path_reference or default_trait) else None
                     if proof is not None:
                         for line, target in proof['pairs']:
@@ -11815,7 +12070,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     completion_receipts.append(dict(file=name, pairs=[[group[1], target[1]]],
                         source_prefix_sha256=hashlib.sha256(prefix.encode()).hexdigest(),
                         base_instance_states=states[0], head_instance_states=states[1], instance_matching=matching))
-        inventories = None if old == new else (_construct_inventory(old, construct_work), head_constructs(name))
+        inventories = None if old == new else tuple(inventory_for_side(side) for side in (0, 1))
         construct_pairs, witnesses = retained_construct_anchors(name, old, new, before, after,
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
