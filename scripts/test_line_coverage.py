@@ -3172,7 +3172,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
             {2: 1}, {2: 1}, UnreadOwners(), UnreadOwners(), {}, {}, work, inventories, grouped)
         self.assertEqual((pairs, receipts), ({}, []))
 
-    def single_bound_phase_fixture(self, *, repeated=False, mutate=None):
+    def single_bound_phase_fixture(self, *, repeated=False, mutate=None, compare=None):
         sources = [
             ['fn retained() {', '    dispatch(|handle| {', '        verify(handle);',
              *(['        verify(handle);'] if repeated else []), '        old_step();', '    });', '}'],
@@ -3217,7 +3217,8 @@ class SourceAwareCoverageTests(unittest.TestCase):
         counts = [{line: 1 for line in range(1, len(source)+1)} for source in sources]
         if mutate:
             mutate(replacements, counts)
-        return coverage.one_bound_phase_obligations('example.rs', sources, counts, descriptors,
+        compare = compare or coverage.one_bound_phase_obligations
+        return compare('example.rs', sources, counts, descriptors,
             inventories, grouped, replacements, work)
 
     def test_single_bound_phase_retains_complete_hot_and_cold_copies(self):
@@ -3249,6 +3250,203 @@ class SourceAwareCoverageTests(unittest.TestCase):
 
     def test_single_bound_phase_cannot_credit_repeated_old_calls_to_one_head_call(self):
         self.assertEqual(self.single_bound_phase_fixture(repeated=True), ({}, [], set()))
+
+    def test_callback_entry_reuses_immutable_source_and_owner_indexes(self):
+        class CountedRows(list):
+            document_scans = 0
+
+            def __iter__(self):
+                self.document_scans += 1
+                return super().__iter__()
+
+        def compare(name, sources, counts, descriptors, inventories, grouped, replacements, work):
+            code, rows, *rest = inventories[0]
+            counted = CountedRows(rows)
+            inventory = (code, counted, *rest)
+            owners, _, names = grouped[0]
+            args = (sources[0], descriptors[0]['fn retained()']['group'], owners, names, 2, 2, inventory, work)
+            cache = {}
+            first = coverage.zero_arg_callback_fragment(*args, single_binding=True, phase_cache=cache)
+            self.assertIsNotNone(first)
+            source_scans = counted.document_scans
+            charged_before = work[0]
+            second = coverage.zero_arg_callback_fragment(*args, single_binding=True, phase_cache=cache)
+            self.assertEqual(first, second)
+            self.assertEqual(counted.document_scans, source_scans)
+            self.assertLess(work[0], charged_before)
+
+        self.single_bound_phase_fixture(compare=compare)
+
+    def closed_record_field_forest_compare(self, kind='free', mutation=None):
+        if kind == 'free':
+            old = ['fn security_inventory() -> Vec<Row> {', '    with_handle(|handle| {',
+                   '        handle.map(|package| {', '            let name = package.name;',
+                   '            Row {', '                name,',
+                   '                version: package.version,', '            }',
+                   '        }).collect()', '    })', '}']
+        else:
+            old = ['pub trait PackageManager {',
+                   '    fn security_inventory(&self) -> Pin<Box<dyn Future<Output = Vec<Row>>>> {',
+                   '        Box::pin(async move {', '            source().map(|package| Row {',
+                   '                name: package.name,', '                version: package.version,',
+                   '            }).collect()', '        })', '    }', '}']
+        record = next(i for i, text in enumerate(old) if 'Row {' in text)
+        new = old[:record+1] + ['                origin: SecurityOrigin::Unknown,'] + old[record+1:]
+        sources = [old, new]; documents = []
+        for source in sources:
+            first = 1 if kind == 'free' else 2; last = len(source) if kind == 'free' else len(source)-1
+            outer = first+1; map_line = outer+1
+            record_line = next(i for i, text in enumerate(source, 1) if 'Row {' in text)
+            record_end = next(i for i in range(record_line+1, len(source)+1) if source[i-1].lstrip().startswith('}'))
+            map_end = record_end+1 if kind == 'free' else record_end
+            outer_end = last-1
+            members = []
+            for copy_number, state in enumerate((1, 0), 1):
+                if kind == 'free':
+                    parent = f'_RNvCs{copy_number}_7example18security_inventory'
+                    children = ['_RNC' + parent[2:] + '0B3_', '_RNCNC' + parent[2:] + '00B5_']
+                else:
+                    suffix = '14PackageManager18security_inventory'
+                    parent = f'_RNvYNtCs{copy_number}_7example4MockNtB4_' + suffix + 'B4_'
+                    children = [f'_RNCNvYNtCs{copy_number}_7example4MockNtB6_' + suffix + '0B6_',
+                                f'_RNCNCNvYNtCs{copy_number}_7example4MockNtB8_' + suffix + '00B8_']
+                    self.assertIsNotNone(coverage.nominal_method_path(children[1]))
+                def row(line, start, end, count=state):
+                    return [line, start, line, end, count, 0, 0, 0]
+                def owner(name, count, rows):
+                    return dict(name=name, count=count, filenames=['/src/example.rs'],
+                                regions=rows, branches=[], mcdc_records=[])
+                outer_open = source[outer-1].index('{')+1
+                map_open = source[map_line-1].index('{')+1
+                members.append(owner(parent, state, [
+                    row(first, len(source[first-1])-len(source[first-1].lstrip())+1,
+                        source[first-1].index('{')+1),
+                    row(outer, len(source[outer-1])-len(source[outer-1].lstrip())+1,
+                        source[outer-1].index('(')+1),
+                    row(last, source[last-1].index('}')+1, source[last-1].index('}')+2)]))
+                members.append(owner(children[0], state, [row(outer, outer_open, outer_open+1),
+                    row(map_line, len(source[map_line-1])-len(source[map_line-1].lstrip())+1,
+                        source[map_line-1].index('.map')+5),
+                    row(outer_end, source[outer_end-1].index('}')+1, source[outer_end-1].index('}')+2)]))
+                count = 3*state; mapped = []
+                if kind == 'free':
+                    mapped.extend([row(map_line, map_open, map_open+1, count),
+                        row(map_line+1, 13, len(source[map_line])+1, count),
+                        [record_line, 13, record_end, source[record_end-1].index('}')+2, count, 0, 0, 0]])
+                for line in range(record_line+1, record_end):
+                    text = source[line-1]
+                    start = (text.index(':')+2 if ':' in text else len(text)-len(text.lstrip()))+1
+                    mapped.append(row(line, start, text.index(',')+1, count))
+                mapped.append(row(map_end, source[map_end-1].index('}')+1,
+                                  source[map_end-1].index('}')+2, count))
+                members.append(owner(children[1], count, mapped))
+            documents.append(members)
+        counts = []
+        for members in documents:
+            work = coverage._ObserverWork()
+            counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [row for owner in members for row in owner['regions']], work), work)))
+        if mutation:
+            mutation(sources, documents, counts)
+        def owners(base, head):
+            for document, members in zip((base, head), documents):
+                document['data'][0]['functions'] = members
+                document['data'][0]['files'][0].update(expansions=[],branches=[],mcdc_records=[])
+        return self.compare(before=counts[0], after=counts[1], mutate=owners,
+            sources=({'example.rs': ('\n'.join(sources[0])+'\n').encode()},
+                     {'example.rs': ('\n'.join(sources[1])+'\n').encode()}))
+
+    def test_retained_record_field_preserves_nested_block_forest_and_cold_copy(self):
+        receipt = self.closed_record_field_forest_compare()
+        self.assertTrue(any(row.get('kind') == 'retained-record-field-forest'
+            for row in receipt.get('retained_replacement_obligations', [])))
+        self.assertEqual(receipt['deleted_mapped'], 0)
+
+    def test_retained_record_field_preserves_default_trait_expression_mapper(self):
+        receipt = self.closed_record_field_forest_compare('trait')
+        self.assertTrue(any(row.get('kind') == 'retained-record-field-forest'
+            for row in receipt.get('retained_replacement_obligations', [])))
+        self.assertEqual(receipt['deleted_summary_found'], 0)
+
+    def test_retained_record_field_refuses_changed_nested_callback_ordinal(self):
+        def mutate(sources, documents, counts):
+            for owner in documents[1][2::3]:
+                owner['name'] = owner['name'].replace('00B5_', '0s_0B5_')
+        with self.assertRaises(ValueError):
+            self.closed_record_field_forest_compare(mutation=mutate)
+
+    def test_retained_record_field_refuses_incomplete_forests_and_foreign_roles(self):
+        def mutate(sources, documents, counts, mode):
+            head = documents[1]
+            if mode == 'missing-mapper':
+                head.pop(2)
+            elif mode == 'duplicate-mapper':
+                head.append(copy.deepcopy(head[2]))
+            elif mode == 'foreign-owner':
+                foreign = copy.deepcopy(head[2]); foreign['name'] = 'foreign-owner'; head.append(foreign)
+            elif mode == 'wrong-file':
+                head[2]['filenames'] = ['/other/example.rs']
+            elif mode == 'different-receiver':
+                for owner in head:
+                    owner['name'] = owner['name'].replace('4Mock', '5Other')
+            elif mode == 'unbound-mapper-receiver':
+                head[2]['name'] = head[2]['name'].replace('4Mock', '5Other')
+            elif mode == 'reassigned-cold-copy':
+                for owner in head:
+                    owner['count'] = 0 if owner['count'] else 3 if owner is head[5] else 1
+                    for row in owner['regions']:
+                        row[4] = 0 if row[4] else owner['count']
+            else:
+                head[2]['regions'][0][5] = 1
+        for kind, mode in [('free','missing-mapper'),('free','duplicate-mapper'),('free','foreign-owner'),
+                           ('free','wrong-file'),('trait','different-receiver'),('trait','unbound-mapper-receiver'),
+                           ('free','reassigned-cold-copy'),('free','region-kind')]:
+            with self.subTest(kind=kind, mode=mode), self.assertRaises(ValueError):
+                self.closed_record_field_forest_compare(kind, lambda s,d,c: mutate(s,d,c,mode))
+
+    def test_retained_record_field_keeps_each_counter_channel_and_hidden_cold_region(self):
+        def mutate(sources, documents, counts, mode):
+            head = documents[1]; text = sources[1]
+            added = next(i for i,line in enumerate(text,1) if 'origin:' in line)
+            for owner in head[2::3]:
+                scalar = next(row for row in owner['regions'] if row[0]==row[2]==added)
+                if mode == 'wrong-positive-scalar-count':
+                    if scalar[4]: scalar[4] = 1
+                elif mode == 'borrowed-mapper-count':
+                    for row in owner['regions']:
+                        if (row[0] == added-1 and row[2] > added or row[0] in (added+1,added+2)) and row[4]:
+                            row[4] = 1
+                elif mode == 'cold-version-hidden-by-record':
+                    for row in owner['regions']:
+                        if row[0] == row[2] == added+2:
+                            row[4] = 0
+                else:
+                    owner['count'] += 1
+            if mode == 'borrowed-mapper-count':
+                work = coverage._ObserverWork()
+                counts[1][:] = coverage._llvm22_rows(coverage._llvm22_segments(
+                    [row for owner in head for row in owner['regions']], work), work)
+        for mode in ('wrong-positive-scalar-count','borrowed-mapper-count',
+                     'cold-version-hidden-by-record','entry-counter'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.closed_record_field_forest_compare(mutation=lambda s,d,c: mutate(s,d,c,mode))
+
+    def test_retained_record_field_requires_exact_source_and_da_reconstruction(self):
+        def mutate(sources, documents, counts, mode):
+            text = sources[1]; added = next(i for i,line in enumerate(text,1) if 'origin:' in line)
+            if mode == 'call-initializer':
+                text[added-1] = text[added-1].replace('SecurityOrigin::Unknown','make_origin()')
+            elif mode == 'changed-old-field':
+                text[added+1] = text[added+1].replace('package.version','package.changed')
+            elif mode == 'not-first-field':
+                text[added-1],text[added] = text[added],text[added-1]
+            elif mode == 'missing-old-da':
+                counts[1][:] = [(line,count) for line,count in counts[1] if line != added+1]
+            else:
+                counts[1][:] = [(line,count+1 if line == added+1 else count) for line,count in counts[1]]
+        for mode in ('call-initializer','changed-old-field','not-first-field','missing-old-da','wrong-da-count'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.closed_record_field_forest_compare(mutation=lambda s,d,c: mutate(s,d,c,mode))
 
     def attribution_obligations(self, old, new, *, excluded=(), painted=(), callbacks=False,
                                 parent_states=((1, 1), (1, 1)), child_states=None, mutation=None):
@@ -7276,6 +7474,178 @@ class RetiredDeclarationParameterTests(unittest.TestCase):
                 filenames=['/unselected/different.rs'], regions=[[1,1,1,5,1,0,0,0]]))
         with self.assertRaisesRegex(ValueError, 'Unproved retained execution in replaced construct'):
             self.compare(mutate_head=displaced_owner)
+
+
+class InherentAsyncLeafTests(unittest.TestCase):
+    def compare(self, kind, mutation=None):
+        if kind == 'assigned':
+            old = ['impl Manager {', '    async fn checked() {', '        let refreshed = async {',
+                   '            before();', '        }', '        .await;', '    }', '}']
+            new = [line.replace('before()', 'after()') for line in old]
+            line = 3
+        else:
+            old = ['impl Manager {', '    async fn checked() {', '        old_source',
+                   '            .error_for_status()', '            .with_context(|| format!("fixture"))?',
+                   '            .bounded_json();', '    }', '}']
+            new = [line.replace('old_source','new_source') for line in old]
+            line = 5
+        path = '/src/example.rs'
+        docs = []
+        for side, source in enumerate((old,new)):
+            owners = []
+            for slot in range(2):
+                crate = 1+slot+side*2
+                value = int(side and slot == 0)
+                anchor = source[1].index('{')+1
+                root = [[2,5,2,anchor-1,value,0,0,0]]
+                parent = [[2,anchor,2,anchor+1,value,0,0,0],[7,5,7,6,value,0,0,0]]
+                if kind == 'assigned':
+                    start = source[line-1].index('refreshed')+1
+                    opener = source[line-1].index('{')+1
+                    parent.append([line,start,line,start+len('refreshed'),value,0,0,0])
+                    child = [[line,opener,line,opener+1,value,0,0,0],[5,9,5,10,value,0,0,0]]
+                    child_count = value
+                else:
+                    method = source[line-1].index('with_context')+1
+                    question = source[line-1].index('?')+1
+                    macro = source[line-1].index('format!')+1
+                    parent.extend([[line,method,line,method+len('with_context'),value,0,0,0],
+                                   [line,question,line,question+1,0,0,0,0]])
+                    child = [[line,macro,line,macro+len('format!'),0,0,0,0]]
+                    child_count = 0
+                tail = f'MCs{crate}_7exampleNtB{{offset}}_7Manager7checked'
+                for symbol, count, regions in ((f'_RNv{tail.format(offset=2)}',value,root),
+                        (f'_RNCNv{tail.format(offset=4)}0B4_',value,parent),
+                        (f'_RNCNCNv{tail.format(offset=6)}00B6_',child_count,child)):
+                    owners.append(dict(name=symbol, count=count, filenames=[path], regions=sorted(regions)))
+            docs.append(owners)
+        if mutation:
+            mutation(docs,line)
+        files = {path:'example.rs'}
+        return coverage.positive_source_fragments('example.rs',old,new,{line:0},{line:1},*docs,files,files,
+                                                  [(line-1,line,line-1,line,[line])],
+                                                  inherent_async_lines=((line,),(line,)))
+
+    def test_closed_nested_inherent_phases_preserve_exact_entry_geometry(self):
+        for kind,line in (('assigned',3),('context',5)):
+            with self.subTest(kind=kind):
+                pairs, receipts = self.compare(kind)
+                self.assertEqual(pairs, {line:line})
+                self.assertEqual(receipts[0]['kind'], 'inherent-async-leaf-entry')
+                self.assertEqual(len(receipts[0]['async_copies']['base']), 2)
+                self.assertEqual(len(receipts[0]['async_copies']['head']), 2)
+
+    def test_refuses_missing_foreign_and_inconsistent_nested_phase_observations(self):
+        def missing(docs,line): docs[1].pop(2)
+        def other_copy(docs,line): docs[1][2]['name'] = docs[1][2]['name'].replace('Cs3_', 'Cs5_')
+        def foreign(docs,line):
+            docs[1].append(dict(copy.deepcopy(docs[1][2]),name='opaque'))
+        def shifted(docs,line): docs[1][2]['regions'][0][1] += 1
+        def disagree(docs,line): docs[1][1]['regions'][1][4] = 2
+        for mutation in (missing, other_copy, foreign, shifted, disagree):
+            with self.subTest(mutation=mutation.__name__), self.assertRaises(ValueError):
+                self.compare('assigned',mutation)
+
+
+class RetiredAssertionDelimiterTests(unittest.TestCase):
+    def proof(self, mutation=None):
+        name = 'src/example.rs'; path = '/src/example.rs'
+        old = ['fn trial() {', '    for value in input {', '        assert_eq!(',
+               '            value,', '            expected,', '        );', '    }', '}']
+        new = ['fn trial() {', '    for value in replacement {', '        assert!(',
+               '            accepts(value),', '            "fixture"', '        );', '    }', '}']
+        before = {6:1}; after = {}
+        owners = [[dict(name=f'_RNvNtCs{i}_7omg_lib7example5trial',count=1,filenames=[path],regions=[
+            [1,1,1,12,1,0,0,0], *([[2,5,7,6,1,0,0,0]] if i==1 else []), [8,1,8,2,1,0,0,0]])]
+            for i in (1,2)]
+        expansions = [[],[]]; retained = []
+        if mutation:
+            mutation(old,new,before,after,owners,expansions,retained)
+        work = [1_000_000]; files = {path:name}
+        inventories = [coverage._construct_inventory(source,work) for source in (old,new)]
+        indexes = [coverage.index_compiled_owner_sources(rows,files,work,{name}) for rows in owners]
+        sides = [(source,inv,{id(owner):coverage.source_owner_span(owner,name,files,source)
+                 for owner in owners[side]},counts,expansions[side])
+                 for side,(source,inv,counts) in enumerate(zip((old,new),inventories,(before,after)))]
+        head = set(inventories[1][5])
+        for source in retained:
+            head.update(coverage._construct_inventory(source,work)[5])
+        return coverage.retired_assertion_delimiter(name,6,6,sides,indexes,(set(),head),work)
+
+    def test_enclosing_ordinary_paint_supports_zero_credit_retirement(self):
+        proof = self.proof()
+        self.assertEqual(proof['base_range'], [3,6])
+        self.assertEqual(proof['pairs'], [])
+        self.assertEqual(proof['summary_credit'], [0,0])
+        self.assertEqual(proof['mapped_credit'], [0,0])
+
+    def test_refuses_nonassertions_real_paint_inconsistent_counts_and_retained_work(self):
+        def changed(a,b,*_): b[5] = '        ) ;'
+        def nonassertion(a,b,*_): b[2] = '        other!('
+        def old_direct(a,b,c,d,owners,*_): owners[0][0]['regions'].append([6,9,6,11,1,0,0,0])
+        def foreign_old(a,b,c,d,owners,*_):
+            owners[0].append(dict(name='foreign',count=1,filenames=['/src/example.rs'],regions=[[6,9,6,11,1,0,0,0]]))
+        def head_direct(a,b,c,d,owners,*_): owners[1][0]['regions'].append([6,9,6,11,0,0,0,0])
+        def repeat(a,b,c,d,owners,expansions,retained): retained.append(a[:])
+        def wrong_da(a,b,c,*_): c[6] = 2
+        def head_da(a,b,c,d,*_): d[6] = 0
+        def expand(a,b,c,d,owners,expansions,*_): expansions[1].append({'expanded':True})
+        for mutation in (changed,nonassertion,old_direct,foreign_old,head_direct,repeat,wrong_da,head_da,expand):
+            with self.subTest(mutation=mutation.__name__):
+                self.assertIsNone(self.proof(mutation))
+
+
+class IntactFixtureCallbackForestTests(unittest.TestCase):
+    def compare(self, mutation=None, expansions=([],[])):
+        old = ['#[cfg(test)]','mod tests {','    #[test]','    fn trial() {',
+               '        let path = std::env::join_paths(paths).expect("fixture PATH");',
+               '        with_managed_fixture_environment(&path, || {',
+               '            runtime.block_on(async {','                run_fixture();',
+               '                cold_fixture();','            });','        });','    }','}']
+        new = old[:4]+['        prepare_fixture();']+old[4:]
+        file = '/src/cli/tool.rs'; name = 'src/cli/tool.rs'; files = {file:name}
+        reports = []; mapped = []
+        for shift,source in enumerate((old,new)):
+            root = f'_RNvNtNtNtCs{1+shift}_7omg_lib3cli4tool5testss_5trial'
+            outer = source[5+shift].index('{')+1
+            inner = source[6+shift].index('{')+1
+            outer_regions = [[6+shift,outer,6+shift,outer+1,1,0,0,0],[11+shift,9,11+shift,10,1,0,0,0]]
+            inner_regions = [[7+shift,inner,7+shift,inner+1,1,0,0,0],
+                             [8+shift,17,8+shift,30,1,0,0,0],[9+shift,17,9+shift,31,0,0,0,0],
+                             [10+shift,13,10+shift,14,1,0,0,0]]
+            call_regions = [[6+shift,9,6+shift,41,1,0,0,0],[6+shift,42,6+shift,47,1,0,0,0]]
+            reports.append([dict(name=symbol, count=count, filenames=[file], regions=regions) for symbol,count,regions in (
+                (root,2,[[4,5,4,17,2,0,0,0],*call_regions,[12+shift,5,12+shift,6,2,0,0,0]]),
+                ('_RNC'+root[2:]+'0B9_',1,outer_regions),('_RNCNC'+root[2:]+'00Bb_',1,inner_regions))])
+            mapped.append(coverage._owner_line_counts({'regions':call_regions+outer_regions+inner_regions},
+                                                       coverage._ObserverWork([10_000])))
+        if mutation:
+            mutation(new,reports,mapped)
+        return coverage.positive_source_fragments(name,old,new,*mapped,*reports,files,files,
+            [(5,6,6,7,[6]),(7,8,8,9,[8]),(8,9,9,10,[9])],
+            callback_functions={'    fn trial()'},macro_expansions=expansions)
+
+    def test_whole_closed_fixture_call_preserves_covered_and_cold_rows_together(self):
+        pairs, receipts = self.compare()
+        self.assertEqual(pairs, {6:7,8:9,9:10})
+        proof, = receipts
+        self.assertEqual(proof['kind'], 'intact-fixture-callback-forest')
+        self.assertEqual([row['path'] for row in proof['owners']['base']], [(),('',),('','')])
+        self.assertEqual(len(proof['callback_fragments']), 3)
+
+    def test_refuses_incomplete_changed_or_foreign_call_observations(self):
+        def missing(s,o,c): o[1].pop()
+        def extra(s,o,c): o[1].append(dict(copy.deepcopy(o[1][-1]),name='opaque'))
+        def flags(s,o,c): o[1][-1]['regions'][1][7] = 1
+        def unrelated(s,o,c): o[1][-1]['name'] = o[1][-1]['name'].replace('Cs2_','Cs3_')
+        def shifted(s,o,c): o[1][-1]['regions'][1][1] += 1
+        def changed(s,o,c): s[9] = s[9].replace('cold','warm')
+        def loses_hit(s,o,c): o[1][-1]['regions'][1][4] = c[1][9] = 0
+        for mutation in (missing,extra,flags,unrelated,shifted,changed,loses_hit):
+            with self.subTest(mutation=mutation.__name__), self.assertRaises(ValueError):
+                self.compare(mutation)
+        with self.assertRaises(ValueError):
+            self.compare(expansions=([],[{'expansion':True}]))
 
 
 if __name__ == "__main__":

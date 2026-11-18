@@ -1,7 +1,9 @@
 import importlib.util
 import copy
+from contextlib import redirect_stderr
 from datetime import datetime, timezone
 import http.server
+import io
 import json
 import os
 from pathlib import Path
@@ -264,6 +266,24 @@ class AdvisoryBaselineDriverTests(unittest.TestCase):
         self.assertEqual(request.get_header("Cache-control"), "no-cache")
         self.assertIsNone(request.get_header("Authorization"))
         self.assertIsNone(request.data)
+
+    def test_status_names_archive_and_delta_blockers_without_printing_provider_text(self):
+        for archive_verified, reason in (
+            (False, "publisher archive verification is pending"),
+            (True, "CVE delta feed is incomplete or stale"),
+        ):
+            reply = status(self.binding)
+            reply["baseline"]["archive_verified"] = archive_verified
+            reply["bootstrap_complete"] = False
+            reply["feeds"][0].update(complete=False, bootstrap_complete=0, error=SECRET)
+            stderr = io.StringIO()
+            with self.subTest(archive_verified=archive_verified), \
+                    mock.patch.object(DRIVER.sys, "argv", ["advisory-baseline.py", "status"]), \
+                    mock.patch.object(DRIVER, "request_json", return_value=reply), \
+                    redirect_stderr(stderr):
+                self.assertEqual(DRIVER.main(), 1)
+                self.assertIn(reason, stderr.getvalue())
+                self.assertNotIn(SECRET, stderr.getvalue())
 
 
 class AdvisoryReleaseBoundaryTests(unittest.TestCase):

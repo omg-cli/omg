@@ -149,11 +149,19 @@ def _timestamp(value):
     return stamp
 
 
+class AdvisoryNotReady(ValueError):
+    """A release blocker with a fixed message safe to show to operators."""
+
+
 def release_readiness(reply, binding, *, now=None):
     reply = _object(reply)
     baseline = _object(reply.get("baseline"))
-    if type(reply.get("schema_version")) is not int or reply["schema_version"] != 1 or reply.get("bootstrap_complete") is not True or baseline.get("archive_verified") is not True or baseline.get("caught_up") is not True or _integer(baseline.get("imported")) == 0:
-        raise ValueError("server has not certified a complete archive baseline")
+    if type(reply.get("schema_version")) is not int or reply["schema_version"] != 1:
+        raise ValueError("invalid advisory status schema")
+    if baseline.get("archive_verified") is not True:
+        raise AdvisoryNotReady("publisher archive verification is pending")
+    if baseline.get("caught_up") is not True or _integer(baseline.get("imported")) == 0:
+        raise AdvisoryNotReady("publisher archive import or catch-up is incomplete")
     feeds = reply.get("feeds")
     if not isinstance(feeds, list) or not 1 <= len(feeds) <= 16 or any(type(feed) is not dict for feed in feeds):
         raise ValueError("invalid source status")
@@ -161,12 +169,16 @@ def release_readiness(reply, binding, *, now=None):
     if any(not isinstance(name, str) for name in names) or len(names) != len(set(names)) or names.count("cve") != 1:
         raise ValueError("ambiguous CVE source")
     cve = next(feed for feed in feeds if feed["source"] == "cve")
-    if cve.get("baseline_digest") != binding["digest"] or cve.get("complete") is not True or cve.get("fresh") is not True or type(cve.get("bootstrap_complete")) is not int or cve["bootstrap_complete"] != 1 or cve.get("error") is not None:
-        raise ValueError("CVE delta is incomplete or bound to a different archive")
+    if cve.get("baseline_digest") != binding["digest"]:
+        raise AdvisoryNotReady("CVE delta points to a different publisher archive")
+    if (reply.get("bootstrap_complete") is not True or cve.get("complete") is not True
+            or cve.get("fresh") is not True or type(cve.get("bootstrap_complete")) is not int
+            or cve["bootstrap_complete"] != 1 or cve.get("error") is not None):
+        raise AdvisoryNotReady("CVE delta feed is incomplete or stale")
     observed = now or datetime.now(timezone.utc)
     checked = _timestamp(cve.get("checked_at"))
     if not -60 <= (observed - checked).total_seconds() <= 30 * 60:
-        raise ValueError("CVE delta status is stale or future-dated")
+        raise AdvisoryNotReady("CVE delta status is stale or future-dated")
     cursor = cve.get("cursor")
     if not isinstance(cursor, str) or len(cursor) > 512:
         raise ValueError("CVE delta cursor unavailable")
@@ -192,6 +204,8 @@ def main():
     except urllib.error.HTTPError as error:
         print(f"Advisory {args.operation} refused: HTTP {error.code}", file=sys.stderr)
         error.close()
+    except AdvisoryNotReady as error:
+        print(f"Advisory release check refused because {error}.", file=sys.stderr)
     except (urllib.error.URLError, TimeoutError, ValueError, UnicodeError, OSError, KeyError, TypeError):
         print(f"Advisory {args.operation} unavailable, incomplete, or bound to a different baseline", file=sys.stderr)
     return 1

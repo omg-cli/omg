@@ -3130,10 +3130,10 @@ exit 1
         )
         .await
         .expect_err("installing a nonexistent crate must fail");
-        assert!(
-            error.to_string().contains("Cargo metadata resolution"),
-            "error: {error}"
-        );
+        let diagnostic = error.to_string();
+        let metadata_resolution = diagnostic.contains("Cargo metadata resolution");
+        let resolver_stderr = diagnostic.contains("controlled Cargo metadata failure");
+        assert!(metadata_resolution && resolver_stderr, "{diagnostic}");
 
         // The previous install survived the failed update...
         assert!(
