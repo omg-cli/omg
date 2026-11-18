@@ -29,7 +29,7 @@ trap 'rm -f "$work/sources"; rmdir "$work"' EXIT
 scheme=http
 if test -s "$ca_bundle"; then scheme=https; fi
 render_sources() {
-  awk -v suite="$VERSION_CODENAME" -v scheme="$scheme" '
+  awk -v suite="$VERSION_CODENAME" -v scheme="$scheme" -v mirror="$1" '
     BEGIN { RS=""; FS="\n" }
     {
       for (key in seen) delete seen[key]
@@ -51,7 +51,7 @@ render_sources() {
                 uri !~ /^https?:\/\/(archive|azure\.archive|security)\.ubuntu\.com\/ubuntu\/?$/ &&
                 uri !~ /^https?:\/\/mirrors\.edge\.kernel\.org\/ubuntu\/?$/) exit 1
           }
-          $i="URIs: " scheme "://mirrors.edge.kernel.org/ubuntu/"
+          $i="URIs: " scheme "://" mirror "/ubuntu/"
         }
         if (key == "signed-by" && value != "/usr/share/keyrings/ubuntu-archive-keyring.gpg") exit 1
         if (key == "suites") {
@@ -86,19 +86,28 @@ render_sources() {
 apply_sources() {
   as_root install -m 644 "$work/sources" "$source_file"
 }
-render_sources
 update() {
   as_root timeout --kill-after=5s 180 apt-get -o APT::Update::Error-Mode=any \
     -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
 }
-apply_sources
-update
+refresh_sources() {
+  local mirror
+  for mirror in archive.ubuntu.com mirrors.edge.kernel.org; do
+    render_sources "$mirror" || return 1
+    apply_sources || return 1
+    if update; then
+      return 0
+    fi
+    printf 'Signed Ubuntu index refresh failed via %s\n' "$mirror" >&2
+  done
+  return 1
+}
+
+refresh_sources
 if [ "$scheme" = http ]; then
   as_root timeout --kill-after=5s 180 apt-get -o Acquire::Retries=2 \
     -o Acquire::http::Timeout=20 install -y --no-install-recommends ca-certificates
   test -s "$ca_bundle"
   scheme=https
-  render_sources
-  apply_sources
-  update
+  refresh_sources
 fi

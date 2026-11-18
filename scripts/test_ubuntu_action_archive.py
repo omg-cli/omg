@@ -53,7 +53,10 @@ class UbuntuActionArchive(unittest.TestCase):
             tools.mkdir()
             calls = root / 'apt-calls'
             apt = tools / 'apt-get'
-            apt.write_text('#!/bin/sh\nprintf "%s\n" "$@" >> "$APT_CALLS"\n')
+            apt.write_text(
+                '#!/bin/sh\nprintf "%s\n" "$@" >> "$APT_CALLS"\n'
+                'if grep -q "^URIs: https://archive.ubuntu.com/ubuntu/" "$APT_SOURCES"; then exit 100; fi\n'
+            )
             apt.chmod(0o755)
             sudo = tools / 'sudo'
             sudo.write_text('#!/bin/sh\ntest "$1" = -n || exit 90\nshift\nexec "$@"\n')
@@ -68,7 +71,8 @@ class UbuntuActionArchive(unittest.TestCase):
                 script = re.sub(rf'(?m)^{variable}=.*$', f'{variable}={shlex.quote(str(fixture))}', script, count=1)
             result = subprocess.run(
                 [shutil.which('bash'), '-c', script],
-                env=dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", APT_CALLS=str(calls)),
+                env=dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", APT_CALLS=str(calls),
+                         APT_SOURCES=str(sources)),
                 capture_output=True, text=True, timeout=15,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -78,6 +82,7 @@ class UbuntuActionArchive(unittest.TestCase):
             self.assertIn('Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg', configured)
             self.assertNotIn('Trusted: yes', configured)
             self.assertEqual(calls.read_text().splitlines()[-1], 'update')
+            self.assertEqual(calls.read_text().splitlines().count('update'), 2)
             self.assertIn('APT::Update::Error-Mode=any', calls.read_text())
 
             prior_calls = calls.read_bytes()
@@ -85,7 +90,8 @@ class UbuntuActionArchive(unittest.TestCase):
             sources.write_text(unsafe)
             rejected = subprocess.run(
                 [shutil.which('bash'), '-c', script],
-                env=dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", APT_CALLS=str(calls)),
+                env=dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", APT_CALLS=str(calls),
+                         APT_SOURCES=str(sources)),
                 capture_output=True, text=True, timeout=15,
             )
             self.assertNotEqual(rejected.returncode, 0)
