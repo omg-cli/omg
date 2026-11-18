@@ -2524,6 +2524,8 @@ esac
     #[cfg(unix)]
     #[test]
     fn dropping_managed_install_keeps_child_and_cleanup_owned() {
+        use self::install_managed_fixture as install_managed;
+
         if crate::core::testing::run_isolated_test(
             "cli::tool::tests::dropping_managed_install_keeps_child_and_cleanup_owned",
         ) {
@@ -2576,7 +2578,7 @@ exit 1
                 .tempfile_in(&managers)
                 .expect("manager release gate");
             runtime.block_on(async {
-                let install = install_managed_fixture("npm", "fixture-tool", "fixture-tool", &tools, &bin);
+                let install = install_managed("npm", "fixture-tool", "fixture-tool", &tools, &bin);
                 {
                     tokio::pin!(install);
                     tokio::select! {
@@ -2597,7 +2599,7 @@ exit 1
                 // Caller cancellation must not release the worker's admission
                 // permit while its child is still running. A queued, cancelled
                 // install must not create another staging tree or child.
-                let queued = install_managed_fixture("npm", "fixture-tool", "queued-tool", &tools, &bin);
+                let queued = install_managed("npm", "fixture-tool", "queued-tool", &tools, &bin);
                 {
                     tokio::pin!(queued);
                     tokio::select! {
