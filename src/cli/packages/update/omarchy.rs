@@ -22,6 +22,8 @@ const AUTHORIZATION_INTERVAL: Duration = Duration::from_mins(1);
 const TERMINATION_GRACE: Duration = Duration::from_secs(10);
 const MAX_MIGRATIONS: usize = 4096;
 const MAX_MIGRATION_BYTES: u64 = 1024 * 1024;
+const OMARCHY_DEV_CONFIG: &str = "/etc/omarchy.conf";
+const MAX_DEV_CONFIG_BYTES: u64 = 4096;
 const INCOMPLETE_UPDATE_SCOPE: &str = "Omarchy requires its complete update lifecycle; --fast, --turbo and mutating --no-sync cannot preserve that scope. Use omg update, or --check/--dry-run/--aur-only for a scoped operation.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,9 +141,14 @@ async fn workflow(executor: &mut impl StageExecutor, yes: bool) -> Result<()> {
     let update = async {
         authorization_attempted = true;
         executor.execute(Stage::Authorize).await?;
-        executor
+        if let Err(error) = executor
             .execute(Stage::NativePackage(NativeOmarchyOperation::PruneCache))
-            .await?;
+            .await
+        {
+            crate::cli::modern_ui::print_warning(&format!(
+                "Continuing the Omarchy update without pruning the package cache: {error:#}"
+            ));
+        }
         if let Err(error) = executor.execute(Stage::Snapshot).await {
             crate::cli::modern_ui::print_warning(&format!(
                 "Continuing the Omarchy update without a snapshot: {error:#}"
@@ -234,6 +241,35 @@ fn stage_command(stage: Stage) -> Option<(&'static str, &'static [&'static str])
 struct OmarchyRuntime {
     root: PathBuf,
     migration_state: PathBuf,
+}
+
+fn parse_configured_omarchy_root(contents: &str) -> Result<PathBuf> {
+    let literal = contents
+        .trim_end_matches('\n')
+        .strip_prefix("export OMARCHY_PATH=\"")
+        .and_then(|value| value.strip_suffix('"'))
+        .context("Invalid Omarchy dev-link configuration")?;
+    let mut decoded = String::with_capacity(literal.len());
+    let mut chars = literal.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => {
+                let escaped = chars
+                    .next()
+                    .filter(|character| matches!(character, '\\' | '"' | '$' | '`'))
+                    .context("Invalid Omarchy dev-link escape")?;
+                decoded.push(escaped);
+            }
+            '"' | '$' | '`' => anyhow::bail!("Omarchy dev-link path must be literal"),
+            character if character.is_control() => {
+                anyhow::bail!("Invalid character in Omarchy dev-link path")
+            }
+            character => decoded.push(character),
+        }
+    }
+    let path = PathBuf::from(decoded);
+    anyhow::ensure!(path.is_absolute(), "Omarchy dev-link path must be absolute");
+    Ok(path)
 }
 
 impl OmarchyRuntime {
@@ -347,6 +383,46 @@ impl OmarchyRuntime {
         ensure_migrations_use_native_aur(&self.root.join("migrations"), &self.migration_state)
     }
 
+    fn development_root(&self) -> Result<PathBuf> {
+        use std::io::Read;
+
+        let config = match File::options()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(OMARCHY_DEV_CONFIG)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(self.root.clone());
+            }
+            Err(error) => return Err(error).context("Cannot open Omarchy dev-link configuration"),
+        };
+        let metadata = config.metadata()?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+            "Omarchy dev-link configuration must be a root-controlled regular file"
+        );
+        let mut contents = String::new();
+        config
+            .take(MAX_DEV_CONFIG_BYTES + 1)
+            .read_to_string(&mut contents)?;
+        anyhow::ensure!(
+            contents.len() as u64 <= MAX_DEV_CONFIG_BYTES,
+            "Omarchy dev-link configuration exceeds its size limit"
+        );
+        let checkout = parse_configured_omarchy_root(&contents)?;
+        if checkout == Path::new("/usr/share/omarchy") || checkout == self.root {
+            return Ok(self.root.clone());
+        }
+        anyhow::ensure!(
+            std::fs::canonicalize(&checkout).context("Cannot resolve Omarchy dev checkout")?
+                == checkout
+                && checkout.is_dir(),
+            "Omarchy dev checkout must be a canonical directory"
+        );
+        Ok(checkout)
+    }
+
     fn notice_normalization(&self) {
         if std::env::var_os("OMARCHY_PATH")
             .is_some_and(|requested| Path::new(&requested) != self.root)
@@ -404,13 +480,31 @@ impl Commands {
     }
 
     async fn run_program(&mut self, program: &Path, args: &[&str]) -> Result<ExitStatus> {
+        self.run_program_at(program, args, self.runtime.root.clone())
+            .await
+    }
+
+    async fn run_program_at(
+        &mut self,
+        program: &Path,
+        args: &[&str],
+        omarchy_root: PathBuf,
+    ) -> Result<ExitStatus> {
         anyhow::ensure!(self.active.is_none(), "An Omarchy stage is already running");
+        let path = std::env::join_paths(
+            std::iter::once(self.runtime.root.join("bin"))
+                .chain(std::env::split_paths(crate::core::privilege::SYSTEM_PATH)),
+        )
+        .context("Cannot build the selected Omarchy runtime's command path")?;
         let mut command = Command::new(program);
         command
             .args(args)
             .kill_on_drop(true)
             .process_group(0)
-            .env("OMARCHY_PATH", &self.runtime.root)
+            .env("PATH", path)
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .env("OMARCHY_PATH", omarchy_root)
             .env("OMARCHY_MIGRATION_STATE", &self.runtime.migration_state);
         command.env_remove(LOCK_FD).env_remove(LOG_FD);
         if self.yes {
@@ -655,7 +749,14 @@ impl StageExecutor for Commands {
         if stage == Stage::InhibitSleep {
             self.inhibitor_attempted = true;
         }
-        let status = self.run_program(&executable, args).await?;
+        let status = if stage == Stage::DevelopmentCheckout {
+            // The vendor helper only fast-forwards Git. Its command lookup and
+            // every other stage keep using the packaged runtime.
+            let checkout = self.runtime.development_root()?;
+            self.run_program_at(&executable, args, checkout).await?
+        } else {
+            self.run_program(&executable, args).await?
+        };
         if stage == Stage::ReleaseInhibitor && status.success() {
             self.inhibitor_attempted = false;
         }
@@ -2584,7 +2685,6 @@ mod tests {
     async fn failures_never_report_completion_or_leave_lifecycle_cleanup_out() {
         for failure in [
             Stage::Authorize,
-            Stage::NativePackage(NativeOmarchyOperation::PruneCache),
             Stage::InhibitSleep,
             Stage::DevelopmentCheckout,
             Stage::NativePackage(NativeOmarchyOperation::RefreshKeyrings),
@@ -2692,7 +2792,12 @@ mod tests {
 
     #[tokio::test]
     async fn optional_failures_do_not_skip_native_aur_or_boot_verification() {
-        for failure in [Stage::Snapshot, Stage::RestartShell, Stage::Mise] {
+        for failure in [
+            Stage::NativePackage(NativeOmarchyOperation::PruneCache),
+            Stage::Snapshot,
+            Stage::RestartShell,
+            Stage::Mise,
+        ] {
             let mut observed = ObservedStages {
                 failure: Some(failure),
                 ..ObservedStages::default()
@@ -2714,6 +2819,58 @@ mod tests {
             .expect("no snapshot and no pending migration");
         assert!(!observed.stages.contains(&Stage::RestartShell));
         assert!(!observed.stages.contains(&Stage::Confirm));
+    }
+
+    #[tokio::test]
+    async fn nested_omarchy_commands_use_the_selected_runtime() -> Result<()> {
+        let directory = private_directory();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let helper = bin.join("omarchy-fixture-nested");
+        std::fs::write(
+            &helper,
+            "#!/bin/bash\n[[ \"$OMARCHY_PATH/bin/omarchy-fixture-nested\" == \"$0\" ]]\n",
+        )?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+        let shell = crate::core::privilege::root_controlled_program_path("bash")?;
+        let mut commands = Commands::new(
+            false,
+            OmarchyRuntime {
+                root: directory.path().to_owned(),
+                migration_state: directory.path().join("markers"),
+            },
+        );
+        let status = commands
+            .run_program(
+                &shell,
+                &["--noprofile", "--norc", "-c", "omarchy-fixture-nested"],
+            )
+            .await?;
+        assert!(
+            status.success(),
+            "nested helper was not found in the selected runtime: {status}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dev_link_uses_the_literal_path_written_by_omarchy() -> Result<()> {
+        assert_eq!(
+            parse_configured_omarchy_root(
+                r#"export OMARCHY_PATH="/home/dev/checkout with \$ and \"quotes\"""#
+            )?,
+            Path::new(r#"/home/dev/checkout with $ and "quotes""#),
+        );
+        for invalid in [
+            r#"export OMARCHY_PATH="checkout""#,
+            r#"export OMARCHY_PATH="/home/$USER/checkout""#,
+            "export OMARCHY_PATH=\"/home/dev\"\ntrue\n",
+            "export OMARCHY_PATH=\"/home/dev`true`\"\n",
+        ] {
+            assert!(parse_configured_omarchy_root(invalid).is_err());
+        }
+        Ok(())
     }
 
     #[tokio::test]

@@ -1176,7 +1176,8 @@ class OmarchyCase(NamedTuple):
 
 
 OMARCHY_CASES = {
-    'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-success': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='dev-link', native_phase='complete'),
     'omarchy-native-migrations': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
         'omarchy-hw-aarch64-qualcomm', 'omarchy-hw-match\tOmniBook 3 Laptop',
         'omarchy-state\tset\treboot-required', 'omarchy-notification-dismiss\tOmarchy Migrations',
@@ -1355,7 +1356,13 @@ omarchy_security_require_source_root() {
     return 1
   fi
 }
-case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
+if [[ $name == omarchy-update-dev && ${OMARCHY_FIXTURE_SCENE:-none} == dev-link ]]; then
+  test "$OMARCHY_PATH" = "$HOME/dev-checkout"
+  test "$(command -v omarchy-migrate)" = /usr/bin/omarchy-migrate
+  printf 'configured_dev_checkout=selected nested_helper=packaged\n'
+else
+  case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
+fi
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
 case "$name:${OMARCHY_FIXTURE_SCENE:-none}:${1:-}" in
   omarchy-hw-aarch64-qualcomm:migration-hardware-unmatched:*) exit 1 ;;
@@ -1725,6 +1732,15 @@ OMG_NATIVE_MIGRATION_1794675791
   case "$stage" in
 OMARCHY_CASE_SETUP
   esac
+  caller_path=/usr/bin:/bin
+  if test "$scene" = dev-link; then
+    test ! -e /etc/omarchy.conf && test ! -L /etc/omarchy.conf
+    install -d -m 700 -o nobody -g nobody "$case_dir/dev-checkout"
+    printf 'export OMARCHY_PATH="%s"\n' "$case_dir/dev-checkout" > /etc/omarchy.conf
+    chmod 644 /etc/omarchy.conf
+    created+=(/etc/omarchy.conf)
+    caller_path="$case_dir/checkout/bin:$caller_path"
+  fi
   if test -n "$absent_helper"; then
     test -f "/usr/bin/$absent_helper" && test ! -L "/usr/bin/$absent_helper"
     test ! -e "$fixture/saved/$absent_helper"
@@ -1805,7 +1821,7 @@ OMARCHY_CASE_SETUP
   fi
   result=0
   timeout --signal=TERM --kill-after=3 "$stage_timeout" runuser -u nobody -- env -i \
-    PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
+    PATH="$caller_path" LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
     "${runtime_environment[@]}" XDG_CONFIG_HOME="$case_dir/config" \
     XDG_CACHE_HOME="$case_dir/cache" XDG_DATA_HOME="$case_dir/data" XDG_STATE_HOME="$case_dir/state" \
     OMG_CONFIG_DIR="$case_dir/config" OMG_CACHE_DIR="$case_dir/cache" OMG_DATA_DIR="$case_dir/data" \
@@ -1815,6 +1831,9 @@ OMARCHY_CASE_SETUP
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  if test "$scene" = dev-link; then
+    rm -- /etc/omarchy.conf
+  fi
   if test -n "$boundary_job"; then
     if test ! -f "$case_dir/helpers.tsv.boundary-done"; then
       kill "$boundary_job" 2>/dev/null || true
@@ -2360,6 +2379,9 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         if stage == 'omarchy-runtime-unset':
             require(log.splitlines().count('caller_runtime_hint=unset') == 1,
                     'Native caller runtime hint absence was not witnessed')
+        if case.scene == 'dev-link':
+            require(log.splitlines().count('configured_dev_checkout=selected nested_helper=packaged') == 1,
+                    'The dev checkout or packaged nested helper was not selected')
         if helpers:
             require((evidence / f'{stage}-coordination.txt').read_text()
                     == 'released private lock; owned transcript mode=600\n',

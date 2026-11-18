@@ -1275,6 +1275,14 @@ fn ensure_aur_rpc_success(status: reqwest::StatusCode) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn update_source_unavailable(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<AurRpcRequestError>() {
+        Some(AurRpcRequestError::Transport) => true,
+        Some(AurRpcRequestError::Http(status)) => crate::core::http::is_retryable_status(*status),
+        None => false,
+    }
+}
+
 fn decode_aur_rpc_body<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
     let value: serde_json::Value =
         serde_json::from_slice(body).context("Failed to parse AUR RPC response")?;
@@ -10941,6 +10949,7 @@ mod update_error_tests {
             b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 13\r\nConnection: close\r\n\r\nremote-secret",
         ), 3)
         .await?;
+        assert!(update_source_unavailable(&error));
         assert_eq!(
             crate::core::error::suggest_for_anyhow(&error),
             Some("Wait for the cooldown period, then retry your request")
@@ -10952,6 +10961,7 @@ mod update_error_tests {
     #[tokio::test]
     async fn failed_update_transport_preserves_redaction_and_network_guidance() -> Result<()> {
         let error = update_error_from_reply(None, 1).await?;
+        assert!(update_source_unavailable(&error));
         assert_eq!(
             crate::core::error::suggest_for_anyhow(&error),
             Some("Check your internet connection and try again")
@@ -10968,9 +10978,21 @@ mod update_error_tests {
         let error = update_error_from_reply(Some(
             b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         ), 3).await?;
+        assert!(update_source_unavailable(&error));
         assert!(format!("{error:#}").contains("HTTP 503"), "{error:#}");
         assert_eq!(crate::core::error::suggest_for_anyhow(&error), None);
         Ok(())
+    }
+
+    #[test]
+    fn aur_update_availability_does_not_hide_permanent_http_or_local_errors() {
+        let denied = ensure_aur_rpc_success(reqwest::StatusCode::FORBIDDEN)
+            .expect_err("HTTP 403 is a hard listing failure");
+        assert!(!update_source_unavailable(&denied));
+        let invalid = decode_aur_rpc_body::<AurResponse>(b"{").expect_err("invalid response");
+        assert!(!update_source_unavailable(&invalid));
+        let local = anyhow::anyhow!("Failed to load AUR update filters from pacman.conf");
+        assert!(!update_source_unavailable(&local));
     }
 
     #[tokio::test]

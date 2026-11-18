@@ -1353,7 +1353,7 @@ def evidence_fixture(root):
             (evidence / f'{stage}-layout.txt').write_text(
                 'foreign optional helpers never executed; original helpers restored\n')
         log = {
-            'omarchy-success': '| System is up to date',
+            'omarchy-success': 'configured_dev_checkout=selected nested_helper=packaged\n| System is up to date',
             'omarchy-native-migrations': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
             'omarchy-native-migrations-unmatched': '| System is up to date\nNative Omarchy migration-xrandr completed',
             'omarchy-native-migrations-notification-error': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed\nCannot dismiss the Omarchy migration notification:',

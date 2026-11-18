@@ -64,6 +64,12 @@ enum AurCheck {
     Failed(anyhow::Error),
 }
 
+#[derive(Clone, Copy)]
+enum AurUpdateMode {
+    Standard,
+    Omarchy,
+}
+
 /// AUR update candidates split by the user's security policy.
 struct ScreenedAurUpdates {
     allowed: Vec<(String, Version, Version)>,
@@ -259,24 +265,32 @@ pub async fn update(
     if super::omarchy::maybe_coordinate(intent).await? {
         return Ok(());
     }
-    update_with_aur_exclusions(check_only, yes, dry_run, no_sync, aur_only, &[]).await
+    update_packages(
+        check_only,
+        yes,
+        dry_run,
+        no_sync,
+        aur_only,
+        AurUpdateMode::Standard,
+    )
+    .await
 }
 
 pub(super) async fn update_omarchy_aur(yes: bool) -> Result<()> {
-    update_with_aur_exclusions(false, yes, false, true, true, &["gcc14", "gcc14-libs"]).await
+    update_packages(false, yes, false, true, true, AurUpdateMode::Omarchy).await
 }
 
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "Existing CLI flags enter the shared update implementation"
 )]
-async fn update_with_aur_exclusions(
+async fn update_packages(
     check_only: bool,
     yes: bool,
     dry_run: bool,
     no_sync: bool,
     aur_only: bool,
-    excluded: &[&str],
+    aur_mode: AurUpdateMode,
 ) -> Result<()> {
     let pm = get_package_manager()?;
 
@@ -363,6 +377,14 @@ async fn update_with_aur_exclusions(
         Err(error) => return Err(error),
         Ok(AurCheck::Skipped) => Vec::new(),
         Ok(AurCheck::Failed(error)) => {
+            if matches!(aur_mode, AurUpdateMode::Omarchy)
+                && crate::package_managers::aur::update_source_unavailable(&error)
+            {
+                modern_ui::print_warning(&format!(
+                    "AUR is unavailable. Skipping AUR updates and continuing to Omarchy boot verification: {error:#}"
+                ));
+                return Ok(());
+            }
             if official_count == 0 {
                 return Err(error).context("Failed to check AUR updates");
             }
@@ -372,7 +394,9 @@ async fn update_with_aur_exclusions(
             Vec::new()
         }
         Ok(AurCheck::Ready { policy, mut raw }) => {
-            raw.retain(|(name, _, _)| !excluded.contains(&name.as_str()));
+            if matches!(aur_mode, AurUpdateMode::Omarchy) {
+                raw.retain(|(name, _, _)| !matches!(name.as_str(), "gcc14" | "gcc14-libs"));
+            }
             let aur_elapsed = check_start.elapsed();
             let count = raw.len();
             let ScreenedAurUpdates { allowed, skipped } =
