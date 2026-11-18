@@ -205,27 +205,10 @@ impl RuntimeAdmission {
     }
 
     fn verify_tree(&self, tree: &Path) -> Result<()> {
-        let canonical = canonical_destination(tree)?;
-        ensure!(
-            canonical == self.tree || canonical == self.record.destination,
-            "Runtime advisory execution names another tree"
-        );
-        ensure!(
-            principal() == (self.record.uid, self.record.euid),
-            "Runtime advisory principal changed"
-        );
+        self.verify_content(tree)?;
         ensure!(
             policy_digest()? == self.record.policy_sha256,
             "Runtime advisory policy changed"
-        );
-        ensure!(
-            tree_digest(tree)? == self.record.content_sha256,
-            "Runtime content changed after advisory review"
-        );
-        let identity = read_identity(&self.record.destination)?;
-        ensure!(
-            identity_digest(identity.as_ref())? == self.record.identity_sha256,
-            "Runtime identity or publisher changed after advisory review"
         );
         validate_envelope(
             &self.record.report,
@@ -236,6 +219,28 @@ impl RuntimeAdmission {
         if self.record.query.runtime == "pi" {
             verify_pi_dependency(tree)?;
         }
+        Ok(())
+    }
+
+    fn verify_content(&self, tree: &Path) -> Result<()> {
+        let canonical = canonical_destination(tree)?;
+        ensure!(
+            canonical == self.tree || canonical == self.record.destination,
+            "Runtime advisory execution names another tree"
+        );
+        ensure!(
+            principal() == (self.record.uid, self.record.euid),
+            "Runtime advisory principal changed"
+        );
+        ensure!(
+            tree_digest(tree)? == self.record.content_sha256,
+            "Runtime content changed after advisory review"
+        );
+        let identity = read_identity(&self.record.destination)?;
+        ensure!(
+            identity_digest(identity.as_ref())? == self.record.identity_sha256,
+            "Runtime identity or publisher changed after advisory review"
+        );
         Ok(())
     }
 }
@@ -254,6 +259,10 @@ pub(crate) fn admit_installed_with_source(
     mode: ReviewMode,
     source: &dyn RuntimeEvidenceSource,
 ) -> Result<RuntimeAdmission> {
+    ensure!(
+        super::common::is_valid_version_dir(version_dir),
+        "Runtime is not fully installed"
+    );
     let _admission_lease = lock_admission(version_dir)?;
     let version = version_dir
         .file_name()
@@ -266,7 +275,7 @@ pub(crate) fn admit_installed_with_source(
         version_dir,
         mode,
         source,
-        false,
+        None,
     )
 }
 
@@ -298,7 +307,24 @@ impl RuntimeSecurity {
             destination,
             ReviewMode::FreshAttended,
             self.source.as_ref(),
-            true,
+            Some(&[]),
+        )
+    }
+
+    pub(crate) fn prepare_incremental(
+        &self,
+        base: &RuntimeAdmission,
+        requested: &str,
+        staging: &Path,
+    ) -> Result<RuntimeAdmission> {
+        admit_tree(
+            &base.record.query.runtime,
+            requested,
+            staging,
+            &base.record.destination,
+            ReviewMode::FreshAttended,
+            self.source.as_ref(),
+            Some(&base.record.local_gaps),
         )
     }
 
@@ -310,17 +336,33 @@ impl RuntimeSecurity {
 
 /// Common mutation helpers can consume only a validated, already reviewed installation.
 pub(crate) fn require_prepared(tree: &Path, destination: &Path) -> Result<RuntimeAdmission> {
+    let admission = recorded_admission(tree, destination)?;
+    admission.verify_tree(tree)?;
+    Ok(admission)
+}
+
+/// Updates verify the copied base against the old receipt and review the
+/// completed candidate under current policy with fresh advisory evidence.
+pub(crate) fn require_incremental_base(
+    tree: &Path,
+    destination: &Path,
+) -> Result<RuntimeAdmission> {
+    let admission = recorded_admission(tree, destination)?;
+    admission.verify_content(tree)?;
+    validate_acceptance(&admission.record)?;
+    Ok(admission)
+}
+
+fn recorded_admission(tree: &Path, destination: &Path) -> Result<RuntimeAdmission> {
     let destination = canonical_destination(destination)?;
     let record = load_cache(&destination)?.context(
         "Runtime advisory review is missing; run explicit omg use to review this version",
     )?;
-    let admission = RuntimeAdmission {
+    Ok(RuntimeAdmission {
         record,
         tree: canonical_destination(tree)?,
         _lease: None,
-    };
-    admission.verify_tree(tree)?;
-    Ok(admission)
+    })
 }
 
 /// Automatic hooks may validate current evidence, but cannot fetch or prompt.
@@ -376,8 +418,9 @@ fn admit_tree(
     destination: &Path,
     mode: ReviewMode,
     source: &dyn RuntimeEvidenceSource,
-    candidate: bool,
+    candidate_gaps: Option<&[String]>,
 ) -> Result<RuntimeAdmission> {
+    let candidate = candidate_gaps.is_some();
     let destination = canonical_destination(destination)?;
     let prior = load_cache(&destination)?;
     if mode == ReviewMode::CachedOnly {
@@ -421,14 +464,10 @@ fn admit_tree(
             Ok(None) | Err(_) => {}
         }
     }
-    let mut local_gaps = if candidate {
-        Vec::new()
-    } else {
-        prior
-            .as_ref()
-            .map(|record| record.local_gaps.clone())
-            .unwrap_or_default()
-    };
+    let mut local_gaps = candidate_gaps
+        .or_else(|| prior.as_ref().map(|record| record.local_gaps.as_slice()))
+        .unwrap_or_default()
+        .to_vec();
     local_gaps.extend(identity_gap);
     if !candidate
         && prior
@@ -2173,7 +2212,7 @@ assert len(reviews) == len(set(reviews)) == int(sys.argv[4]), transcript.decode(
         assert_eq!(refreshed.record.local_gaps, record.local_gaps);
         let versions = root.parent().context("Missing versions directory")?;
         let staging = super::super::common::begin_staged_install(versions)?;
-        super::super::common::copy_regular_tree(&root, staging.path())?;
+        super::super::common::copy_regular_tree(&root, staging.path(), true)?;
         fs::write(
             staging.path().join("lib/node_modules/npm/lib/install.js"),
             b"verified replacement implementation",
@@ -2195,6 +2234,18 @@ assert len(reviews) == len(set(reviews)) == int(sys.argv[4]), transcript.decode(
         let repaired = security.installed("node", &root, ReviewMode::CachedOnly)?;
         assert_eq!(repaired.record.report.coverage, Coverage::Assessed);
         assert!(repaired.record.local_gaps.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn selected_path_refuses_pending_install_with_valid_admission() -> Result<()> {
+        let (_owner, root) = node_fixture()?;
+        RuntimeSecurity::fixture().installed("node", &root, ReviewMode::FreshAttended)?;
+        let marker = root.join(super::super::common::INSTALL_PENDING_MARKER);
+        fs::write(&marker, [])?;
+        assert!(admit_selected_path("node", &root.join("bin"), ReviewMode::CachedOnly).is_err());
+        fs::remove_file(marker)?;
+        admit_selected_path("node", &root.join("bin"), ReviewMode::CachedOnly)?;
         Ok(())
     }
 

@@ -93,6 +93,7 @@ pub struct PacmanConfig {
     pub local_file_sig_level: Option<String>,
     pub remote_file_sig_level: Option<String>,
     pub parallel_downloads: Option<u32>,
+    pub download_user: Option<String>,
     pub repos: Vec<RepoConfig>,
 }
 
@@ -346,6 +347,14 @@ impl PacmanConfig {
                 );
                 config.parallel_downloads = Some(count);
             }
+            "DownloadUser" => {
+                let user = value.context("DownloadUser requires a value")?;
+                anyhow::ensure!(
+                    !user.is_empty() && !user.chars().any(|c| c.is_whitespace() || c.is_control()),
+                    "DownloadUser requires one valid account name"
+                );
+                config.download_user = Some(user.to_owned());
+            }
             _ => {}
         }
         Ok(())
@@ -372,6 +381,14 @@ impl PacmanConfig {
 
     pub fn get_repo_names(&self) -> Vec<&str> {
         self.repos.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    pub(crate) fn repository_architecture(&self) -> &str {
+        self.architecture
+            .as_deref()
+            .and_then(|value| value.split_whitespace().next())
+            .filter(|value| *value != "auto")
+            .unwrap_or(std::env::consts::ARCH)
     }
 
     pub fn resolve_servers(&self, repo: &RepoConfig, arch: &str) -> Result<Vec<String>> {

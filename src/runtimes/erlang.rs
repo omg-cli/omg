@@ -436,11 +436,10 @@ impl ErlangManager {
         }
 
         make_staged_executable(&version_dir.join("bin/erl"))?;
-        fs::remove_file(version_dir.join(super::common::INSTALL_PENDING_MARKER))?;
-
         let _finished =
             self.security
                 .prepare_staged("erlang", version, &version_dir, &version_dir)?;
+        fs::remove_file(version_dir.join(super::common::INSTALL_PENDING_MARKER))?;
         Ok(())
     }
 
@@ -492,26 +491,17 @@ fn require_staged_install_script(script: &Path) -> Result<()> {
 fn run_install_script(version_dir: &Path) -> Result<()> {
     let mut command = std::process::Command::new("sh");
     super::common::harden_untrusted_runtime_command(&mut command, version_dir);
-    let status = command
+    command
         .arg("Install")
         .arg("-minimal")
         .arg(version_dir)
-        .current_dir(version_dir)
-        .status()
-        .with_context(|| {
-            format!(
-                "Failed to run OTP Install script in {}",
-                version_dir.display()
-            )
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "OTP Install script failed with status {status} in {}",
-            version_dir.display()
-        )
-    }
+        .current_dir(version_dir);
+    super::tool_artifacts::run_with_timeout(
+        command,
+        "OTP Install script",
+        std::time::Duration::from_mins(2),
+    )?;
+    Ok(())
 }
 
 /// Smoke-test the installed runtime: `erl` must start and halt cleanly.
@@ -521,20 +511,13 @@ fn smoke_erl(version_dir: &Path) -> Result<()> {
     let erl = version_dir.join("bin/erl");
     let mut command = std::process::Command::new(&erl);
     super::common::harden_untrusted_runtime_command(&mut command, version_dir);
-    let status = command
-        .arg("-noshell")
-        .arg("-eval")
-        .arg("halt().")
-        .status()
-        .with_context(|| format!("Failed to run smoke test: {}", erl.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "Erlang/OTP smoke test failed with status {status}: {}",
-            erl.display()
-        )
-    }
+    command.args(["-noshell", "-eval", "halt()."]);
+    super::tool_artifacts::run_with_timeout(
+        command,
+        "Erlang/OTP smoke test",
+        std::time::Duration::from_secs(30),
+    )?;
+    Ok(())
 }
 
 /// Remove a published-but-broken install; logs the cleanup failure instead

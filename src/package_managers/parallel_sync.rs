@@ -46,10 +46,10 @@ async fn persist_same_dir_temp(
 }
 
 /// Build the URL for a database file
-fn build_db_url(mirror_template: &str, repo: &str) -> String {
+fn build_db_url(mirror_template: &str, repo: &str, architecture: &str) -> String {
     mirror_template
         .replace("$repo", repo)
-        .replace("$arch", std::env::consts::ARCH)
+        .replace("$arch", architecture)
         + "/"
         + repo
         + ".db"
@@ -631,9 +631,8 @@ fn verify_staged_databases(
         let database = alpm
             .register_syncdb(repo.name.as_str(), siglevel)
             .with_context(|| format!("Failed to register staged database '{}'", repo.name))?;
-        database
-            .is_valid()
-            .with_context(|| format!("Signature verification failed for '{}'", repo.name))?;
+        crate::package_managers::alpm_ops::validate_sync_database(&alpm, database)
+            .with_context(|| format!("Staged database verification failed for '{}'", repo.name))?;
     }
     Ok(())
 }
@@ -649,7 +648,7 @@ struct StagedRepository {
 pub async fn sync_databases_parallel() -> Result<()> {
     let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load repository servers from pacman.conf")?;
-    let repository_urls = repository_database_urls(&config, std::env::consts::ARCH)?;
+    let repository_urls = repository_database_urls(&config)?;
 
     // Sync directory (we should already be root at this point)
     let sync_dir = paths::pacman_sync_dir_result()?;
@@ -817,12 +816,12 @@ pub async fn sync_databases_parallel() -> Result<()> {
 
 fn repository_database_urls(
     config: &crate::core::pacman_conf::PacmanConfig,
-    architecture: &str,
 ) -> Result<Vec<(String, Vec<String>)>> {
     anyhow::ensure!(
         !config.repos.is_empty(),
         "pacman configuration contains no repositories"
     );
+    let architecture = config.repository_architecture();
     config
         .repos
         .iter()
@@ -842,7 +841,7 @@ fn repository_database_urls(
             let urls = servers
                 .iter()
                 .take(MAX_MIRRORS_PER_REPO)
-                .map(|server| build_db_url(server, &repo.name))
+                .map(|server| build_db_url(server, &repo.name, architecture))
                 .collect();
             Ok((repo.name.clone(), urls))
         })
@@ -856,9 +855,9 @@ mod tests {
     #[test]
     fn repository_database_urls_respect_sync_usage() {
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
-            "[hidden]\nUsage = Search Install Upgrade\n[visible]\nUsage = Sync\nServer = https://mirror.example/$repo/os/$arch\n"
+            "[options]\nArchitecture = x86_64\n[hidden]\nUsage = Search Install Upgrade\n[visible]\nUsage = Sync\nServer = https://mirror.example/$repo/os/$arch\n"
         ).unwrap();
-        let urls = repository_database_urls(&config, "x86_64").unwrap();
+        let urls = repository_database_urls(&config).unwrap();
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].0, "visible");
         assert_eq!(
@@ -1211,13 +1210,22 @@ mod tests {
         let keyring = directory.path().join("gnupg");
         std::fs::create_dir_all(&sync_dir).expect("staged sync directory");
         std::fs::create_dir_all(&keyring).expect("test keyring directory");
-        std::fs::write(sync_dir.join("core.db"), b"database").expect("staged database");
+        let database = sync_dir.join("core.db");
+        std::fs::write(&database, b"database").expect("malformed staged database");
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(&format!(
             "[options]\nGPGDir = {}\nSigLevel = Required DatabaseOptional\n\n[core]\nServer = https://mirror.example/$repo/$arch\n",
             keyring.display()
         ))
         .expect("pacman config");
 
+        assert!(verify_staged_databases(&database_root, &config).is_err());
+        let file = std::fs::File::create(&database).expect("create valid empty catalog");
+        let gzip = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        tar::Builder::new(gzip)
+            .into_inner()
+            .unwrap()
+            .finish()
+            .unwrap();
         verify_staged_databases(&database_root, &config)
             .expect("DatabaseOptional must permit an absent detached signature");
     }
@@ -1241,7 +1249,11 @@ mod tests {
 
         let error = verify_staged_databases(&database_root, &config)
             .expect_err("an invalid detached database signature must fail closed");
-        assert!(error.to_string().contains("Signature verification failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("Staged database verification failed")
+        );
     }
 
     #[test]
@@ -1259,12 +1271,12 @@ mod tests {
     #[test]
     fn db_urls_substitute_repo_and_runtime_arch() {
         let arch = std::env::consts::ARCH;
-        let url = build_db_url("https://mirror.example.com/$repo/os/$arch", "core");
+        let url = build_db_url("https://mirror.example.com/$repo/os/$arch", "core", arch);
         assert_eq!(
             url,
             format!("https://mirror.example.com/core/os/{arch}/core.db")
         );
-        let extra = build_db_url("https://mirror.example.com/$repo/os/$arch", "extra");
+        let extra = build_db_url("https://mirror.example.com/$repo/os/$arch", "extra", arch);
         assert_eq!(
             extra,
             format!("https://mirror.example.com/extra/os/{arch}/extra.db")
@@ -1274,14 +1286,13 @@ mod tests {
     #[test]
     fn every_repository_uses_its_own_configured_servers() {
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
-            "[options]\n\n[core]\nServer = https://internal.example/$repo/os/$arch\n\
+            "[options]\nArchitecture = test-arch auto\n\n[core]\nServer = https://internal.example/$repo/os/$arch\n\
              Server = https://backup.example/$repo/$arch\n\n\
              [chaotic-aur]\nServer = https://community.example/$repo/$arch\n",
         )
         .expect("pacman config");
 
-        let repos =
-            repository_database_urls(&config, "test-arch").expect("repository URLs should resolve");
+        let repos = repository_database_urls(&config).expect("repository URLs should resolve");
         assert_eq!(
             repos,
             [
@@ -1310,8 +1321,8 @@ mod tests {
         )
         .expect("pacman config");
 
-        let error = repository_database_urls(&config, "test-arch")
-            .expect_err("missing repo policy must fail closed");
+        let error =
+            repository_database_urls(&config).expect_err("missing repo policy must fail closed");
         assert!(error.to_string().contains("extra"), "{error:#}");
     }
 }

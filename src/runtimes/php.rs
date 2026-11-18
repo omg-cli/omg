@@ -561,29 +561,13 @@ fn smoke_php(version_dir: &Path) -> Result<()> {
     let php = version_dir.join("bin/php");
     let mut command = std::process::Command::new(&php);
     super::common::harden_untrusted_runtime_command(&mut command, version_dir);
-    let output = command
-        .arg("-v")
-        .output()
-        .with_context(|| format!("Failed to run smoke test: {}", php.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let detail: String =
-        crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr))
-            .trim()
-            .chars()
-            .take(300)
-            .collect();
-    anyhow::bail!(
-        "PHP smoke test (`php -v`) failed with status {}: {}{}",
-        output.status,
-        php.display(),
-        if detail.is_empty() {
-            String::new()
-        } else {
-            format!("\n{detail}")
-        }
-    )
+    command.arg("-v");
+    super::tool_artifacts::run_with_timeout(
+        command,
+        "PHP smoke test (`php -v`)",
+        std::time::Duration::from_secs(30),
+    )?;
+    Ok(())
 }
 
 /// Ensure the installed `php` is executable (tarballs may drop modes).
@@ -611,6 +595,22 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn smoke_php_refuses_excessive_output() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir()?;
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let php = bin.join("php");
+        std::fs::write(&php, b"#!/bin/sh\nhead -c 1100000 /dev/zero >&2\n")?;
+        std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o700))?;
+        let error = super::smoke_php(fixture.path()).expect_err("probe output must be bounded");
+        assert!(error.to_string().contains("output"));
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires the isolated fixed-public TLS native fixture"]

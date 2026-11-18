@@ -584,7 +584,11 @@ impl RustManager {
         mutation_lease: &RuntimeLease,
     ) -> Result<()> {
         let version_dir = self.toolchain_dir(toolchain);
-        let mut metadata = Self::read_metadata(&version_dir)?;
+        let staging = begin_staged_install(&self.versions_dir)?;
+        copy_regular_tree(&version_dir, staging.path(), true)?;
+        let base = super::security::require_incremental_base(staging.path(), &version_dir)
+            .context("Rust component update requires an unchanged reviewed base")?;
+        let mut metadata = Self::read_metadata(staging.path())?;
         let installed_release = metadata
             .release
             .as_deref()
@@ -594,9 +598,6 @@ impl RustManager {
             installed_release == manifest_release(manifest)?,
             "Rust manifest release identity does not match the installed toolchain; retry setup before adding components or targets"
         );
-        let staging = begin_staged_install(&self.versions_dir)?;
-        copy_regular_tree(&version_dir, staging.path())?;
-
         for component in components {
             self.install_component(staging.path(), component, &toolchain.host, manifest)
                 .await?;
@@ -628,7 +629,7 @@ impl RustManager {
         .context("Failed to record exact Rust release metadata")?;
         let _admission = self
             .security
-            .prepare_staged("rust", &toolchain.name(), staging.path(), &version_dir)
+            .prepare_incremental(&base, &toolchain.name(), staging.path())
             .context("Failed to review staged Rust component update")?;
         replace_staged_install_with_lease(
             &staging,
@@ -1969,16 +1970,18 @@ mod tests {
             b"candidate component",
         )?)?;
         let checksum = format!("{:x}", Sha256::digest(&archive));
-        for (installed, candidate, compatible) in [
+        for (installed, candidate, tampered, compatible) in [
             (
                 Some("1.95.0-nightly (aaaa 2026-01-01)"),
                 "1.95.0-nightly (bbbb 2026-01-02)",
                 false,
+                false,
             ),
-            (Some("1.93.1"), "1.94.0", false),
-            (None, "1.93.1", false),
-            (Some(""), "", false),
-            (Some("1.93.1"), "1.93.1", true),
+            (Some("1.93.1"), "1.94.0", false, false),
+            (None, "1.93.1", false, false),
+            (Some(""), "", false, false),
+            (Some("1.93.1"), "1.93.1", false, true),
+            (Some("1.93.1"), "1.93.1", true, false),
         ] {
             let versions = TempDir::new()?;
             let manager = RustManager {
@@ -1998,6 +2001,18 @@ mod tests {
                     targets: BTreeSet::new(),
                 },
             )?;
+            super::super::security::fixture_prepare(
+                "rust",
+                &toolchain.name(),
+                &version_dir,
+                &version_dir,
+            )?;
+            let compiler = if tampered {
+                fs::write(version_dir.join("bin/rustc"), b"changed compiler")?;
+                b"changed compiler".as_slice()
+            } else {
+                b"installed compiler".as_slice()
+            };
             let original_metadata = fs::read(version_dir.join(RUST_METADATA_FILE))?;
             let mutation_lock = manager.lock_mutations()?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2047,10 +2062,7 @@ mod tests {
                 version_dir.join("bin/cargo-clippy").exists()
             );
             assert_eq!(result.is_ok(), compatible, "{result:?}");
-            assert_eq!(
-                fs::read(version_dir.join("bin/rustc"))?,
-                b"installed compiler"
-            );
+            assert_eq!(fs::read(version_dir.join("bin/rustc"))?, compiler);
             if compatible {
                 assert_eq!(
                     fs::read(version_dir.join("bin/cargo-clippy"))?,
@@ -2067,7 +2079,11 @@ mod tests {
                     result
                         .expect_err("incompatible identity")
                         .to_string()
-                        .contains("release identity")
+                        .contains(if tampered {
+                            "reviewed base"
+                        } else {
+                            "release identity"
+                        })
                 );
                 assert!(!version_dir.join("bin/cargo-clippy").exists());
                 assert_eq!(
@@ -2227,7 +2243,7 @@ mod tests {
         )?;
 
         let staging = begin_staged_install(versions.path())?;
-        copy_regular_tree(&version_dir, staging.path())?;
+        copy_regular_tree(&version_dir, staging.path(), true)?;
         fs::write(staging.path().join("bin/clippy"), b"new")?;
         let mut metadata = RustManager::read_metadata(staging.path())?;
         metadata.components.insert("clippy".to_string());

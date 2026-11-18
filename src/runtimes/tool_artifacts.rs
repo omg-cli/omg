@@ -94,10 +94,22 @@ fn read_bounded(
 }
 
 pub(crate) fn run(command: Command, phase: &str, build: bool) -> Result<Vec<u8>> {
+    run_with_timeout(
+        command,
+        phase,
+        Duration::from_secs(if build { 3600 } else { 600 }),
+    )
+}
+
+pub(crate) fn run_with_timeout(
+    command: Command,
+    phase: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     run_owned(
         command,
         phase,
-        Instant::now() + Duration::from_secs(if build { 3600 } else { 600 }),
+        Instant::now() + timeout,
         &mut observe_child_exit,
     )
 }
