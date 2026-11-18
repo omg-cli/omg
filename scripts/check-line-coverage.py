@@ -759,19 +759,28 @@ def transparent_forwarder_groups(old, new, groups, fragments):
     return result
 
 
-def compiled_hit_state_matching(before, after):
+def compiled_hit_state_matching(before, after, copy_identities=None):
     """Assign each complete base hit vector to a distinct dominating head vector."""
-    before, after = sorted(map(tuple, before)), sorted(map(tuple, after))
     if len(before) != len(after):
         return None
-    if before == after:
+    fixed_before = fixed_after = None
+    if copy_identities is not None:
+        shared = set(copy_identities[0]) & set(copy_identities[1])
+        if shared:
+            ordered = [sorted(zip(map(tuple, rows), keys, strict=True), key=lambda pair: pair[0])
+                       for rows, keys in zip((before, after), copy_identities, strict=True)]
+            fixed_before, fixed_after = [[key if key in shared else None for _, key in rows]
+                                         for rows in ordered]
+    before, after = sorted(map(tuple, before)), sorted(map(tuple, after))
+    if before == after and fixed_before == fixed_after:
         return list(range(len(before)))
     width = max((len(row) for row in before), default=0)
     if len(before) * len(after) * max(width, 1) > 2**20:
         return None
     edges = [[index for index, candidate in enumerate(after)
-              if len(row) == len(candidate) and all(a <= b for a, b in zip(row, candidate))]
-             for row in before]
+              if (fixed_before is None or fixed_before[base_index] == fixed_after[index])
+              and len(row) == len(candidate) and all(a <= b for a, b in zip(row, candidate))]
+             for base_index, row in enumerate(before)]
     owners = [None] * len(after)
     work = 0
     for start in range(len(before)):
@@ -1107,6 +1116,7 @@ def _compiled_function_groups(name, owners, files, source, work=None, source_str
 class AsyncCompiledCopy:
     constructor: dict
     body: dict
+    identity: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -1146,7 +1156,22 @@ def guarded_async_context(code, row, modules, work):
                    tuple(tuple(attribute) for attribute in attributes))
 
 
-def compiled_async_function_groups(name, owners, files, source, work=None, inventory=None, owner_counts=None):
+def inherent_async_type(code, row, implementations):
+    implementation = implementations.get(code.parents[row['opening']])
+    header = row['header']; fn = header.index('fn')
+    if (implementation is None or len(implementation['header']) != 2
+            or code.parents[implementation['opening']] is not None
+            or _boolean_attributes(code, implementation['first']) != []
+            or _boolean_attributes(code, row['first']) != []
+            or header[:fn] not in (('async',), ('pub', 'async'))
+            or header[fn + 2:fn + 3] != ('(',) or 'where' in header):
+        return None
+    type_name = implementation['header'][1]
+    return type_name if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', type_name) else None
+
+
+def compiled_async_function_groups(name, owners, files, source, work=None, inventory=None,
+                                   owner_counts=None, inherent_lines=()):
     """Bind separate v0 constructor/body owners without merging their counters."""
     work = [20_000_000] if work is None else work
     inventory = _construct_inventory(source, work) if inventory is None else inventory
@@ -1157,6 +1182,10 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
     closing_kinds = {}
     _construct_charge(work, len(inventory[1]))
     modules = {row['opening']: row for row in inventory[1] if row['kind'] == 'mod'}
+    implementations = {}
+    if inherent_lines:
+        _construct_charge(work, len(inventory[1]))
+        implementations = {row['opening']: row for row in inventory[1] if row['kind'] == 'impl'}
     for line, rows in inventory[2].items():
         if len(rows) == 1 and rows[0]['supported']:
             row = rows[0]
@@ -1169,7 +1198,16 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
         if row['kind'] != 'fn' or 'async' not in header or 'fn' not in header:
             continue
         context = (); start = row['first']
-        if header[0] == '#' or not row['supported'] or code.parents[row['opening']] is not None:
+        inherent = None
+        if code.parents[row['opening']] in implementations:
+            _construct_charge(work, len(header) + len(inherent_lines) + 1)
+            first_line = code.position(code.starts[start])[0]
+            last_line = code.position(code.ends[row['end']])[0]
+            if any(first_line <= line <= last_line for line in inherent_lines):
+                inherent = inherent_async_type(code, row, implementations)
+        if inherent is not None:
+            context = (inherent, tuple(header))
+        elif header[0] == '#' or not row['supported'] or code.parents[row['opening']] is not None:
             scoped = guarded_async_context(code, row, modules, work)
             if scoped is None:
                 continue
@@ -1179,7 +1217,7 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
         opening = code.position(code.starts[row['opening']])
         closing = code.position(code.ends[row['end']])
         span = first[0], closing[0]
-        declarations.append((declaration, first, opening, closing, span, context))
+        declarations.append((declaration, first, opening, closing, span, context, inherent))
     prefixes = source_function_prefixes(source, [row[4] for row in declarations], work)
     if not prefixes:
         return {}
@@ -1197,25 +1235,56 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
         first = min(tuple(region[:2]) for region in regions)
         last = max(tuple(region[2:4]) for region in regions)
         bodies.setdefault((first, last), []).append(owner)
-    for declaration, first, opening, closing, span, context in declarations:
+    for declaration, first, opening, closing, span, context, inherent in declarations:
         if span not in prefixes:
             continue
-        parents = []; module_path = context[0] if context else ()
+        parents = []; module_path = context[0] if context and inherent is None else ()
         qualified_name = (*module_path, declaration)
-        for owner in constructors.get((*first, opening[0], opening[1] - 1), ()):
+        constructor_candidates = constructors.get((*first, opening[0], opening[1] - 1), ())
+        body_candidates = bodies.get((opening, closing), ())
+        for owner in constructor_candidates:
             _construct_charge(work, len(owner['name']))
-            shape = plain_rust_function_symbol(owner['name'])
-            if shape is not None and shape.identifiers[-len(qualified_name):] == qualified_name:
-                parents.append((owner, shape))
-        if not parents or len({shape.identity for _, shape in parents}) != 1:
+            if inherent is None:
+                shape = plain_rust_function_symbol(owner['name'])
+                if shape is not None and shape.identifiers[-len(qualified_name):] == qualified_name:
+                    parents.append((owner, shape, shape.identity))
+            else:
+                shape = nominal_method_path(owner['name'])
+                count = owner.get('count')
+                if (shape is not None and shape.kind == 'M' and not shape.callbacks
+                        and shape.method[0] == declaration and shape.self_type[0] == 'type'
+                        and shape.self_type[-1][0] == inherent
+                        and shape.self_type[1] == shape.namespace
+                        and type(count) is int and 0 <= count < COUNTER_LIMIT
+                        and owner['regions'][0][4:] == [count, 0, 0, 0]):
+                    parents.append((owner, shape, (shape.parent_scope, shape.method)))
+        identities = {identity for _, _, identity in parents}
+        if len(identities) != 1:
             continue
+        if inherent is not None:
+            copy_identities = {shape.copy_identity for _, shape, _ in parents}
+            if not len(copy_identities) == len(parents) == len(constructor_candidates) == len(body_candidates):
+                continue
         copies = []
-        for parent, shape in parents:
+        for parent, shape, _ in parents:
             children = []
-            for owner in bodies.get((opening, closing), ()):
+            for owner in body_candidates:
                 _construct_charge(work, len(owner['name']) + len(owner['regions']))
-                if not direct_rust_callback_symbol(owner['name'], parent['name'], shape.modules):
-                    continue
+                if inherent is None:
+                    if not direct_rust_callback_symbol(owner['name'], parent['name'], shape.modules):
+                        continue
+                else:
+                    child = nominal_method_path(owner['name'])
+                    count = owner.get('count')
+                    if (child is None or child.callbacks != ('',) or child.copy_identity != shape.copy_identity
+                            or owner['filenames'] != parent['filenames']
+                            or type(count) is not int or not 0 <= count < COUNTER_LIMIT
+                            or any(region[5:] != [0, 0, 0] for region in owner['regions'])
+                            or sum(tuple(region[:4]) == (closing[0], closing[1] - 1, *closing)
+                                   and region[4] == count for region in owner['regions']) != 1
+                            or sum(tuple(region[:4]) == (*opening, opening[0], opening[1] + 1)
+                                   and region[4] == count for region in owner['regions']) != 1):
+                        continue
                 if sum(tuple(region[:4]) == (*opening, opening[0], opening[1] + 1)
                        for region in owner['regions']) == 1:
                     children.append(owner)
@@ -1223,14 +1292,15 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
                     or owner_counts[children[0]['name']] != 1):
                 copies = []
                 break
-            copies.append(AsyncCompiledCopy(parent, children[0]))
+            copies.append(AsyncCompiledCopy(parent, children[0],
+                                            shape.copy_identity if inherent is not None else None))
         if not copies:
             continue
         geometry = {tuple(sorted(tuple(region[:4] + region[5:]) for region in copy.body['regions']))
                     for copy in copies}
         if len(geometry) != 1:
             continue
-        key = 'async:' + repr((parents[0][1].identity, context))
+        key = 'async:' + repr((parents[0][2], context))
         if key in result:
             return {}
         result[key] = AsyncFunctionGroup(prefixes[span], span, tuple(copies), closing_kinds, context)
@@ -1250,6 +1320,25 @@ def fragment_region_states(owner, first, last, source, work):
                            int(region[4] > 0)))
     pieces.sort()
     return tuple(shape for shape, _ in pieces), tuple(state for _, state in pieces)
+
+
+def awaited_zero_arg_method(code, line, work):
+    if code is None or line < 2:
+        return None
+    _construct_charge(work, 2 * len(code.starts).bit_length() + 6)
+    previous = bisect.bisect_left(code.starts, code.offsets[line - 2])
+    current = bisect.bisect_left(code.starts, code.offsets[line - 1])
+    if current - previous != 4:
+        return None
+    words = code.words[previous:current + 2]
+    if (len(words) != 6 or words[0] != '.'
+            or words[2:] != ['(', ')', '.', 'await']
+            or code.position(code.starts[current])[0] != line
+            or code.pairs[previous + 2] != previous + 3
+            or code.parents[previous] != code.parents[current]
+            or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', words[1])):
+        return None
+    return words[1]
 
 
 @dataclass(frozen=True)
@@ -1417,7 +1506,8 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     return CallbackFragmentEvidence(tuple(states), tuple(line_states), signature, witness)
 
 
-def nested_async_call_entry_fragment(source, group, owners, name_counts, first, last, inventory, work):
+def nested_async_call_entry_fragment(source, group, owners, name_counts, first, last, inventory, work,
+                                     *, loop_cache=None):
     """Prove one direct async method-call entry inside a proved test callback."""
     if inventory is None or first != last:
         return None
@@ -1437,10 +1527,6 @@ def nested_async_call_entry_fragment(source, group, owners, name_counts, first, 
         return None
     outer = outers[0]
     outer_line = code.position(code.starts[outer['opening']])[0]
-    authority = zero_arg_callback_fragment(source, group, owners, name_counts,
-        outer_line, outer_line, inventory, work, caller_entry=True)
-    if authority is None:
-        return None
     _construct_charge(work, len(rows) * (len(source).bit_length() + 4))
     phases = [row for row in rows if row['opening'] is not None
               and code.words[row['opening']-1] == 'async'
@@ -1449,8 +1535,28 @@ def nested_async_call_entry_fragment(source, group, owners, name_counts, first, 
     if len(phases) != 1:
         return None
     phase = phases[0]; paren = code.parents[phase['opening']]
-    if (paren is None or code.words[paren] != '(' or code.parents[paren] != outer['opening']
+    if (paren is None or code.words[paren] != '('
             or tuple(code.words[paren+1:phase['opening']]) != ('async',)):
+        return None
+    # Resolve the direct lexical container before spending authority work.
+    inside_literal_loop = code.parents[paren] != outer['opening']
+    container = outer
+    if inside_literal_loop:
+        loops = [row for row in rows if row['kind'] == 'for' and row['opening'] is not None
+                 and outer['opening'] < row['opening'] < phase['opening']
+                     < phase['end'] < row['end'] < outer['end']]
+        if len(loops) != 1:
+            return None
+        container = loops[0]
+        loop_line = code.position(code.starts[container['first']])[0]
+        authority = literal_pair_loop_fragment(source, group, owners, name_counts,
+            loop_line, loop_line, inventory, work, normalize_second=True, cache=loop_cache)
+    else:
+        authority = zero_arg_callback_fragment(source, group, owners, name_counts,
+            outer_line, outer_line, inventory, work, caller_entry=True)
+    if authority is None:
+        return None
+    if code.parents[paren] != container['opening']:
         return None
     _construct_charge(work, outer['end'] - outer['opening'] + 1)
     low = code.position(code.starts[outer['opening']])[0]
@@ -1495,6 +1601,9 @@ def nested_async_call_entry_fragment(source, group, owners, name_counts, first, 
                 or len(painted) != 2 or {tuple(row[:4]) for row in painted} != set(slots)
                 or any(len(row) != 8 or list(row[5:]) != [0, 0, 0] for row in painted)):
             return None
+        if inside_literal_loop and (child['count'] != witness['binding_counts'][0]
+                or any(row[4] != child['count'] for row in painted)):
+            return None
         nested_bound.add(id(child)); bound.update((id(root), id(parent), id(child)))
         parent_geometry, parent_states = fragment_region_states(parent, first, last, source, work)
         child_geometry, child_states = fragment_region_states(child, first, last, source, work)
@@ -1510,14 +1619,165 @@ def nested_async_call_entry_fragment(source, group, owners, name_counts, first, 
     if any(id(owner) not in bound and any(owner_covers_lines([row], first, first)
            for row in owner['regions']) for owner in owners):
         return None
-    signature = ('nested-async-call-entry', authority.signature,
+    kind = 'literal-pair-loop-async-call-entry' if inside_literal_loop else 'nested-async-call-entry'
+    signature = (kind, authority.signature,
                  call.group('receiver'), call.group('method'), geometries[0])
-    witness = dict(kind='nested-async-call-entry', owners=witnesses,
+    witness = dict(kind=kind, owners=witnesses,
         outer_entry=authority.witness, async_span=[list(opening), list(closing)],
         context_sha256=hashlib.sha256(repr(signature).encode()).hexdigest(),
         parent_geometry=geometries[0][0], child_geometry=geometries[0][1],
         limitation='Caller entry only; no setup, argument-value, callee or async-body equivalence')
     return CallbackFragmentEvidence(tuple(states), tuple(lines), signature, witness)
+
+
+
+def literal_pair_loop_fragment(source, group, owners, name_counts, first, last, inventory, work,
+                               *, normalize_second=False, cache=None):
+    """Prove only literal pair-array evaluation and bindings in a direct test callback."""
+    if inventory is None or not 1 <= first <= last <= len(source) or last-first > 65 or type(normalize_second) is not bool:
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows))
+    loops = [row for row in rows if row['kind'] == 'for' and row['opening'] is not None
+             and code.position(code.starts[row['first']])[0] <= first <= last
+                 <= code.position(code.ends[row['opening']-1])[0]]
+    if len(loops) != 1:
+        return None
+    loop = loops[0]
+    cache = {} if cache is None else cache
+    _construct_charge(work, len(group[2]) + 1)
+    key = (id(code), id(owners), id(name_counts), group[:2], tuple(id(owner) for owner in group[2]),
+           loop['opening'], normalize_second)
+    if key not in cache:
+        cache[key] = literal_pair_loop_authority(source, group, owners, name_counts, inventory,
+                                                 loop, work, normalize_second)
+    prepared = cache[key]
+    if prepared is None:
+        return None
+    states, context, evidence = prepared
+    header_first = evidence['header_range'][0]
+    signature = (*context, (first-header_first, last-header_first))
+    roles = [copy['raw_roles'] for copy in evidence['owners']]
+    _construct_charge(work, (last-first+1) * sum(len(rows) for rows in roles))
+    line_states = tuple(tuple(int(any(row[4] > 0 and owner_covers_lines([row], line, line)
+        for row in rows)) for line in range(first, last+1)) for rows in roles)
+    witness = dict(evidence, fragment_range=[first, last],
+        context_sha256=hashlib.sha256(repr(signature).encode()).hexdigest())
+    return CallbackFragmentEvidence(states, line_states, signature, witness)
+
+
+def literal_pair_loop_authority(source, group, owners, name_counts, inventory, loop, work, normalize_second):
+    code, rows = inventory[:2]
+    header = loop['header']
+    header_first = code.position(code.starts[loop['first']])[0]
+    line = source[header_first-1]
+    _construct_charge(work, len(line))
+    header_line = re.fullmatch(r'[ \t]*for[ \t]+\((?P<left>[A-Za-z][A-Za-z0-9_]*),[ \t]*'
+        r'(?P<right>[A-Za-z][A-Za-z0-9_]*)\)[ \t]+in[ \t]+(?P<array>\[)[ \t]*', line)
+    if header_line is None or header_line['left'] == header_line['right']:
+        return None
+    if (header[:8] != ('for', '(', header_line['left'], ',', header_line['right'], ')', 'in', '[')
+            or header[-1:] != (']',) or not 6 <= len(header)-9 <= 64*6
+            or (len(header)-9) % 6):
+        return None
+    pairs = []
+    for at in range(8, len(header)-1, 6):
+        item = header[at:at+6]
+        _construct_charge(work, sum(len(word)+1 for word in item))
+        literal = r'"[\x20-\x21\x23-\x5b\x5d-\x7e]{0,256}"'
+        if (item[0] != '(' or item[2] != ',' or item[4:] != (')', ',')
+                or re.fullmatch(literal, item[1]) is None
+                or re.fullmatch(literal, item[3]) is None):
+            return None
+        pairs.append((item[1], item[3]))
+    outers = [row for row in rows if row['opening'] is not None
+              and code.words[row['opening']-1] == '||'
+              and row['opening'] < loop['first'] < loop['end'] < row['end']]
+    if len(outers) != 1:
+        return None
+    outer = outers[0]
+    if code.parents[loop['first']] != outer['opening'] or code.parents[loop['opening']] != outer['opening']:
+        return None
+    outer_line = code.position(code.starts[outer['opening']])[0]
+    outer_end = code.position(code.ends[outer['end']])[0]
+    _construct_charge(work, outer_end-outer_line+1)
+    if sum(value == line for value in source[outer_line-1:outer_end]) != 1:
+        return None
+    authority = zero_arg_callback_fragment(source, group, owners, name_counts,
+        outer_line, outer_line, inventory, work, caller_entry=True)
+    if authority is None:
+        return None
+    start = code.position(code.starts[loop['first']])
+    array_end = code.position(code.ends[loop['opening']-1])
+    expected = ((header_first, header_line.start('left')+1, header_first, header_line.end('left')+1),
+                (header_first, header_line.start('right')+1, header_first, header_line.end('right')+1),
+                (header_first, header_line.start('array')+1, *array_end))
+    tuple_spans = []
+    for index in range(len(pairs)):
+        opening = loop['first']+8+6*index
+        low = code.position(code.starts[opening])
+        high = code.position(code.ends[opening+4])
+        if low[0] != header_first+index+1 or high[0] != low[0]:
+            return None
+        tuple_spans.append((*low, *high))
+    if array_end[0] != header_first+len(pairs)+1:
+        return None
+    # LLVM22 paints all but the final tuple separately under the array region.
+    expected += tuple(tuple_spans[:-1])
+    for token, role in ((loop['first']+2, expected[0]), (loop['first']+4, expected[1])):
+        if (*code.position(code.starts[token]), *code.position(code.ends[token])) != role:
+            return None
+    if (code.position(code.starts[loop['first']+7]) != expected[2][:2]
+            or code.words[loop['opening']-1] != ']' or array_end[0] <= header_first):
+        return None
+    closing_line = source[array_end[0]-1]
+    _construct_charge(work, len(closing_line))
+    if re.fullmatch(r'[ \t]*\][ \t]*\{[ \t]*', closing_line) is None:
+        return None
+    header_limit = array_end[0], len(closing_line.encode())+1
+    def overlaps(row):
+        return tuple(row[:2]) < header_limit and start < tuple(row[2:4])
+    _construct_charge(work, len(owners))
+    by_name = {owner['name']: owner for owner in owners}
+    allowed = set(); states = []; geometries = []; copies = []
+    for index, witness in enumerate(authority.witness['owners']):
+        parent = by_name[witness['parent']]; child = by_name[witness['child']]
+        _construct_charge(work, len(child['regions']) + len(parent['regions']))
+        if any(overlaps(row) for row in parent['regions']):
+            return None
+        selected = [row for row in child['regions'] if overlaps(row)]
+        if (len(selected) != len(expected) or {tuple(row[:4]) for row in selected} != set(expected)
+                or any(len(row) != 8 or row[5:] != [0, 0, 0]
+                       or type(row[4]) is not int or not 0 <= row[4] < COUNTER_LIMIT for row in selected)):
+            return None
+        roles = [next(row for row in selected if tuple(row[:4]) == span) for span in expected]
+        if (roles[0][4] != roles[1][4] or roles[0][4] != len(pairs)*roles[2][4]
+                or roles[2][4] > child['count']
+                or any(row[4] != roles[2][4] for row in roles[3:])):
+            return None
+        geometry = tuple((row[0]-header_first, row[1], row[2]-header_first,
+            row[3] - (len(pairs[index-3][1])-2 if normalize_second and index >= 3 else 0),
+            *row[5:]) for index, row in enumerate(roles))
+        geometries.append(geometry); allowed.add(id(child))
+        bits = tuple(int(row[4] > 0) for row in roles)
+        states.append((*authority.states[index], *bits))
+        copies.append(dict(parent=parent['name'], child=child['name'],
+                           binding_counts=[roles[0][4], roles[1][4]], array_count=roles[2][4],
+                           raw_roles=roles))
+    _construct_charge(work, sum(len(owner['regions']) for owner in owners))
+    if (not geometries or len(set(geometries)) != 1 or any(id(owner) not in allowed
+            and any(overlaps(row) for row in owner['regions']) for owner in owners)):
+        return None
+    first_values = tuple(item[0] for item in pairs)
+    second_values = tuple('<inert-second-literal>' if normalize_second else item[1] for item in pairs)
+    signature = ('literal-pair-loop-header', authority.signature,
+                 header_line['left'], header_line['right'], first_values, second_values, geometries[0])
+    witness = dict(kind='literal-pair-loop-header', owners=copies, outer_entry=authority.witness,
+        header_range=[header_first, array_end[0]], first_literals=first_values,
+        second_literals=[item[1] for item in pairs], normalized_inert_second_literals=normalize_second,
+        geometry=geometries[0],
+        limitation='Literal pair-array/tuple evaluation and exact bindings only; no callback-body, string-value use or manager-operation equivalence')
+    return tuple(states), signature, witness
 
 
 def nominal_phase_fragment(source, group, owners, name_counts, first, last, inventory, work, cache):
@@ -1810,7 +2070,7 @@ def qualified_function_completion(sides, work):
 
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
                               fragments, work=None, construct_inventories=None, compiled_groups=None,
-                              callback_functions=(), owner_indexes=None):
+                              callback_functions=(), owner_indexes=None, inherent_async_lines=((), ())):
     """Prove positive head pairs, retaining every base state, copy and candidate."""
     if not fragments:
         return {}, []
@@ -1847,7 +2107,8 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                      if all(names[owner['name']] == 1 for owner in group[2])}
         valid = dict(valid)
         phases = compiled_async_function_groups(name, inventory, files, source, work,
-                    None if construct_inventories is None else construct_inventories[side], names)
+                    None if construct_inventories is None else construct_inventories[side], names,
+                    inherent_async_lines[side])
         phase_bodies = {id(copy.body) for group in phases.values() for copy in group.copies}
         valid = {key: group for key, group in valid.items()
                  if not any(id(owner) in phase_bodies for owner in group[2])}
@@ -1860,7 +2121,7 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         groups[1][prefix] = group
     claimed = {}; pairs = {}; excerpts = {}; callback_sources = {}; callback_inventories = {}; callback_work = 20_000_000
     receipts = []
-    nominal_phase_cache = {}
+    nominal_phase_cache = {}; literal_loop_cache = {}
     for a, b, c, d, pending in fragments:
         current_fragment = (a, b, c, d, pending)
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
@@ -1922,10 +2183,20 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             start, end = entry['forwarder']['wrapper_range']
             excerpts[1, start, end] = ('\n'.join(new[start - 1:end]) + '\n').encode()
         endpoint_kind = None
+        await_method = None
         if prefix in async_groups[0] and b == a + 1 and old[a].strip() == '}':
             endpoint_kind = async_groups[0][prefix].closing_kinds.get(a + 1)
             if endpoint_kind is None or endpoint_kind != async_groups[1][prefix].closing_kinds.get(c + 1):
                 refuse()
+        elif prefix in async_groups[0] and b == a + 1 and old[a].strip() == '.await':
+            for side, source in enumerate((old, new)):
+                if side not in callback_sources:
+                    if construct_inventories is not None and construct_inventories[side] is not None:
+                        callback_sources[side] = construct_inventories[side][0]
+                    else:
+                        _construct_charge(work, sum(len(value) + 1 for value in source))
+                        callback_sources[side] = _boolean_source(source)
+            await_method = awaited_zero_arg_method(callback_sources[0], a + 1, work)
         nominal_fragments = {}; nominal_signature = None
         _construct_charge(work, len(bg[2][0]['name']) + 1)
         if prefix in callback_functions and nominal_method_path(bg[2][0]['name']) is not None:
@@ -1972,6 +2243,14 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     side=side, kind=endpoint_kind,
                     candidates=[[offset + 1, kinds[offset + 1]] for offset in starts]))
                 starts = [offset for offset in starts if kinds[offset + 1] == endpoint_kind]
+            if await_method is not None:
+                context = [(offset, awaited_zero_arg_method(callback_sources[side], offset + 1, work))
+                           for offset in starts]
+                if any(method is None for _, method in context):
+                    refuse()
+                entry.setdefault('async_await_contexts', []).append(dict(side=side, method=await_method,
+                    candidates=[[offset + 1, method] for offset, method in context]))
+                starts = [offset for offset, method in context if method == await_method]
             if proposed not in starts:
                 refuse()
             observed = None; precise_observed = None
@@ -2021,7 +2300,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                         if callback is None:
                             callback = nested_async_call_entry_fragment(source, group, inventories[side],
                                 inventory_names[side], offset + 1, offset + b - a,
-                                callback_inventories[side], work)
+                                callback_inventories[side], work, loop_cache=literal_loop_cache)
+                        if callback is None:
+                            callback = literal_pair_loop_fragment(source, group, inventories[side],
+                                inventory_names[side], offset + 1, offset + b - a,
+                                callback_inventories[side], work, normalize_second=True, cache=literal_loop_cache)
                         if callback is None:
                             callback = nominal_fragments.get((side, offset))
                             if callback is None:
@@ -2082,9 +2365,12 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 refuse()
             pairs[line] = target
             entry["pairs"].append([line, target])
-    for entry in claimed.values():
+    for prefix, entry in claimed.items():
         states = entry.pop("states")
-        matching = compiled_hit_state_matching(*states)
+        identities = None
+        if prefix in async_groups[0] and async_groups[0][prefix].copies[0].identity is not None:
+            identities = [tuple(copy.identity for copy in side[prefix].copies) for side in async_groups]
+        matching = compiled_hit_state_matching(*states, identities)
         if matching is None:
             refuse()
         entry["instance_states"] = sorted(states[0])
@@ -3685,6 +3971,94 @@ def _owner_line_counts(owner, work):
     return {line + first - 1: count for line, count in projected}
 
 
+def retired_async_methods(name, probes, source, inventory, before, base_index, head_index,
+                          head_inventory, head_declarations, work):
+    """Prove the complete disappearance of a closed async owner with zero ratio credit."""
+    if not probes or inventory is None or head_inventory is None:
+        return []
+    file_scope = re.fullmatch(r'src/([A-Za-z_]\w*(?:/[A-Za-z_]\w*)*)\.rs', name, re.ASCII)
+    if file_scope is None:
+        return []
+    scope = ('crate', 'omg_lib')
+    for part in file_scope[1].split('/'):
+        scope = ('type', scope, (part, ''))
+    owners = base_index.inventories.get(name, ())
+    phases = compiled_async_function_groups(name, owners, base_index.files, source, work,
+                                            inventory, base_index.name_counts, probes)
+    code, rows = inventory[:2]
+    head_owners = head_index.inventories.get(name, ())
+    bodies, statements = head_inventory
+    receipts = []
+    for phase in phases.values():
+        if phase.copies[0].identity is None:
+            continue
+        header = phase.source_context[1]
+        method = header[header.index('fn') + 1]
+        parent = nominal_method_path(phase.copies[0].constructor['name'])
+        if method in head_declarations or parent.namespace != scope:
+            continue
+        first, last = phase.span
+        _construct_charge(work, len(rows) + len(probes))
+        candidates = [row for row in rows if row['kind'] == 'fn' and row['header'] == header
+                      and code.position(code.starts[row['first']])[0] == first
+                      and code.position(code.ends[row['end']])[0] == last]
+        if len(candidates) != 1:
+            continue
+        row, = candidates
+        opening = code.position(code.starts[row['opening']]); closing = code.position(code.ends[row['end']])
+        if not any(first < line < opening[0] for line in probes) or row['body'] in bodies:
+            continue
+        _construct_charge(work, len(rows))
+        descendants = [node for node in rows if row['opening'] <= node['first'] <= node['end'] < row['end']]
+        _construct_charge(work, len(descendants))
+        if (not descendants or any(node['kind'] not in ('if', 'for', 'while', 'loop', 'match', 'statement')
+                or (node['body'] in bodies if node['body'] is not None else node['digest'] in statements)
+                for node in descendants)):
+            continue
+        start = code.position(code.starts[row['first']]); touching = set()
+        _construct_charge(work, len(owners))
+        for owner in owners:
+            _construct_charge(work, len(owner['regions']))
+            if any(tuple(raw[:2]) < closing and start < tuple(raw[2:4]) for raw in owner['regions']):
+                touching.add(id(owner))
+        pairs = [(copy.constructor, copy.body) for copy in phase.copies]
+        owned = [owner for pair in pairs for owner in pair]
+        _construct_charge(work, len(owned) + len(touching))
+        if touching != {id(owner) for owner in owned} or any(owner.get('branches') or owner.get('mcdc_records')
+                or owner['name'] in head_index.name_counts for owner in owned):
+            continue
+        project = _ObserverWork(work); mapped = Counter()
+        for constructor, body in pairs:
+            mapped.update(_owner_line_counts({'regions': constructor['regions']+body['regions']}, project))
+        _construct_charge(work, last-first+1)
+        expected = {line: before[line] for line in range(first,last+1) if line in before}
+        if not expected or mapped != expected:
+            continue
+        _construct_charge(work, sum(len(owner['name'])+1 for owner in head_owners))
+        if any(method in owner['name'] for owner in head_owners):
+            continue
+        def comparable_name_survives():
+            for symbol in head_index.name_counts:
+                _construct_charge(work, min(len(symbol),8)+1)
+                if symbol.startswith('_RNvM'):
+                    _construct_charge(work, len(method)+1)
+                    if symbol.endswith(method):
+                        return True
+                elif symbol.startswith('_RNCNvM'):
+                    # A direct nominal callback adds up to 34 disambiguator bytes, one ordinal and six backreference bytes.
+                    tail = symbol[-(len(method)+41):]
+                    _construct_charge(work, len(tail)+1)
+                    if method in tail:
+                        return True
+            return False
+        if comparable_name_survives():
+            continue
+        receipts.append(dict(file=name, kind='retired-inherent-async-method', declaration=method,
+            base_range=[first,last], owners=[[owner['name'] for owner in pair] for pair in pairs],
+            mapped_rows=len(expected), summary_credit=[0,0], mapped_credit=[0,0]))
+    return receipts
+
+
 def retained_construct_anchors(name, old, new, before, after, base, head, base_files, head_files,
                                work=None, inventories=None, grouped=None):
     if old == new:
@@ -5199,6 +5573,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for name in {base_files[path] for path in function["filenames"] if path in base_files}:
             owners_by_file.setdefault(name, []).append(function)
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
+    head_fn_names = set(); retirement_receipts = []
     parent_file_cache = {}; method_parent_files = None; plain_parent_files = None; owner_indexes = None
     def parent_files(parent):
         nonlocal method_parent_files, plain_parent_files
@@ -5233,7 +5608,14 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 _construct_charge(construct_work, len(inventory[4]) + len(inventory[5]))
                 bodies.update(inventory[4]); statements.update(inventory[5])
                 _construct_charge(construct_work, len(inventory[1]))
-                head_capsule_counts.update(row['digest'] for row in inventory[1] if row['kind'] == 'statement')
+                for row in inventory[1]:
+                    if row['kind'] == 'statement':
+                        head_capsule_counts[row['digest']] += 1
+                    elif row['kind'] == 'fn':
+                        header = row['header']; _construct_charge(construct_work, len(header))
+                        at = header.index('fn')+1
+                        if at < len(header):
+                            head_fn_names.add(header[at].removeprefix('r#'))
             else:
                 complete_head.append((bodies, statements))
         return complete_head[0]
@@ -5578,9 +5960,35 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         if unresolved_fragments and owner_indexes is None:
             owner_indexes = (index_compiled_owner_sources(bf, base_files, construct_work, bs.keys()),
                              index_compiled_owner_sources(hf, head_files, construct_work, bs.keys()))
+        if unresolved_fragments and inventories is not None:
+            _construct_charge(construct_work, sum(len(pending) for *_, pending in unresolved_fragments))
+            probes = {line for *_, pending in unresolved_fragments for line in pending
+                      if re.fullmatch(r'\s*&(?:mut\s+)?self,\s*', old[line-1])}
+            if probes:
+                proofs = retired_async_methods(name, probes, old, inventories[0], before, *owner_indexes,
+                    head_construct_inventory(), head_fn_names, construct_work)
+                retired = set()
+                for proof in proofs:
+                    first, last = proof['base_range']
+                    _construct_charge(construct_work, last-first+1)
+                    lines = set(range(first,last+1))
+                    if lines.intersection(anchored) or lines.intersection(deferred_fragments):
+                        continue
+                    retired.update(lines)
+                    retirement_receipts.append(proof)
+                if retired:
+                    gone.difference_update(retired)
+                    for line in retired:
+                        retained.pop(line, None)
+                    unresolved_fragments = [(*bounds, active) for *bounds, pending in unresolved_fragments
+                        if (active := [line for line in pending if line not in retired])]
+        async_obligations = [(line, fragment.target) for line, fragment in deferred_fragments.items()
+                             if fragment.kind == 'async']
+        _construct_charge(construct_work, len(deferred_fragments))
         positive, receipts = positive_source_fragments(
             name, old, new, before, after, bf, hf, base_files, head_files, unresolved_fragments,
-            construct_work, inventories, grouped, callback_functions, owner_indexes)
+            construct_work, inventories, grouped, callback_functions, owner_indexes,
+            tuple(zip(*async_obligations)) if async_obligations else ((), ()))
         proof_pairs = {
             'async': {tuple(pair) for receipt in receipts
                       if 'async_copies' in receipt and 'async_fragment_regions' in receipt
@@ -5676,6 +6084,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         paint_receipt["positive_source_fragments"] = positive_receipts
     if replacement_receipts:
         paint_receipt['source_replacements'] = replacement_receipts
+    if retirement_receipts:
+        paint_receipt['retired_async_methods'] = retirement_receipts
     if construct_receipts:
         paint_receipt['retained_constructs'] = construct_receipts
     if obligation_receipts:

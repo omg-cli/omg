@@ -1291,6 +1291,268 @@ class SourceAwareCoverageTests(unittest.TestCase):
         args[5] = 6
         self.assertIsNone(original(*args, caller_entry=True))
 
+
+    def literal_pair_loop_compare(self, mutation=None, body=False, fragment=None):
+        captured = {}
+        def nest(old, new, base, head):
+            for source, members, suffix in ((old, base, 'before'), (new, head, 'after')):
+                operation = source[5].strip()
+                source[5:6] = [
+                    '        for (manager, expected_error) in [',
+                    '            ("npm", "' + ('NPM install' if suffix == 'before' else 'NPM materialization') + '"),',
+                    '            ("cargo", "' + suffix + '"),',
+                    '        ] {',
+                    '            ' + operation,
+                    '        }',
+                ]
+                for owner in members:
+                    for row in owner['regions']:
+                        for column in (0, 2):
+                            if row[column] >= 7:
+                                row[column] += 5
+                for outer in (members[1], members[3]):
+                    outer['regions'] = [row for row in outer['regions'] if row[0] != 6]
+                    line = source[5]
+                    slots = [(line.index('manager')+1, len('manager')),
+                             (line.index('expected_error')+1, len('expected_error'))]
+                    outer['regions'].extend([[6, column, 6, column+width, 2, 0, 0, 0]
+                                             for column, width in slots])
+                    outer['regions'].extend([
+                        [6, line.index('[')+1, 9, source[8].index(']')+2, 1, 0, 0, 0],
+                        [7, source[6].index('(')+1, 7, source[6].rindex(')')+2, 1, 0, 0, 0],
+                        [10, 13, 10, len(source[9])+1, 2, 0, 0, 0],
+                        [11, 9, 11, 10, 1, 0, 0, 0],
+                    ])
+            if mutation:
+                mutation(old, new, base, head)
+            captured.update(old=old, new=new, base=base, head=head)
+        self.caller_entry_compare(mutation=nest)
+        first, last = fragment or ((6, 10) if body else (6, 6))
+        return coverage.positive_source_fragments(
+            'example.rs', captured['old'], captured['new'], {n: 1 for n in range(1, 23)},
+            {n: 1 for n in range(1, 23)}, captured['base'], captured['head'],
+            {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'},
+            [(first-1, last, first-1, last, list(range(first, last+1)))],
+            callback_functions=('fn checked()',))
+
+    def test_literal_pair_loop_retains_binding_and_array_roles_with_inert_error_updates(self):
+        pairs, receipts = self.literal_pair_loop_compare()
+        self.assertEqual(pairs, {6: 6})
+        self.assertTrue(any(proof['kind'] == 'literal-pair-loop-header'
+            for receipt in receipts for proof in receipt.get('callback_owners', [])))
+
+    def test_literal_pair_loop_binds_retained_tuple_and_array_close_lines(self):
+        def unchanged_first_pair(old, new, base, head):
+            new[6] = old[6]
+            for outer in (head[1], head[3]):
+                outer['regions'][5][3] = old[6].rindex(')')+2
+        for fragment in ((7, 7), (9, 9)):
+            with self.subTest(fragment=fragment):
+                pairs, _ = self.literal_pair_loop_compare(unchanged_first_pair, fragment=fragment)
+                self.assertEqual(pairs, {fragment[0]: fragment[1]})
+
+    def test_literal_pair_loop_refuses_missing_foreign_cold_or_rebound_roles(self):
+        def mutate(old, new, base, head, mode):
+            if mode == 'missing-copy':
+                del head[2:4]
+            elif mode == 'missing-child':
+                del head[1]
+            elif mode == 'duplicate-owner':
+                head.append(copy.deepcopy(head[1]))
+            elif mode == 'foreign-overlap':
+                head.append(dict(name='foreign', count=1, filenames=['/src/example.rs'],
+                    regions=[[6, 14, 6, 21, 1, 0, 0, 0]]))
+            elif mode == 'wrong-child-file':
+                head[1]['filenames'] = ['/src/foreign.rs']
+            elif mode == 'wrong-child-symbol':
+                head[1]['name'] = head[1]['name'].replace('7checked', '7another')
+            elif mode in ('cold-binding', 'cold-array', 'disagreed-binding', 'disagreed-array'):
+                row = head[1]['regions'][2 if mode.endswith('binding') else 4]
+                row[4] = 0 if mode.startswith('cold') else row[4]+1
+            elif mode == 'missing-tuple-role':
+                del head[1]['regions'][5]
+            elif mode == 'cold-tuple-role':
+                head[1]['regions'][5][4] = 0
+            elif mode == 'stable-wrong-tuple-span':
+                for members in (base, head):
+                    for outer in (members[1], members[3]):
+                        outer['regions'][5][3] -= 1
+            elif mode == 'cold-complete-header-copy':
+                for row in head[1]['regions'][2:6]:
+                    row[4] = 0
+            elif mode == 'cold-outer':
+                head[1]['count'] = head[1]['regions'][0][4] = 0
+            elif mode == 'cold-root':
+                head[0]['count'] = head[0]['regions'][0][4] = 0
+            elif mode in ('stable-wrong-slot', 'stable-extra-role', 'stable-wrong-tail'):
+                for members in (base, head):
+                    for outer in (members[1], members[3]):
+                        if mode == 'stable-wrong-slot':
+                            outer['regions'][2][1] += 1
+                        elif mode == 'stable-wrong-tail':
+                            outer['regions'][2][7] = 1
+                        else:
+                            outer['regions'].append([7, 1, 7, 2, 1, 0, 0, 0])
+            elif mode == 'array-spans-body':
+                head[1]['regions'][4][2] = 10
+            elif mode == 'changed-first-value':
+                new[6] = new[6].replace('npm', 'bun')
+            elif mode == 'changed-binding':
+                new[5] = new[5].replace('manager', 'carrier')
+            elif mode == 'changed-caller':
+                new[4] = new[4].replace('caller', 'otherf')
+            elif mode == 'conditional-placement':
+                for source in (old, new):
+                    source[5] = '        if ready { ' + source[5]
+                    source[10] += ' }'
+            elif mode == 'nonliteral-second':
+                for source in (old, new):
+                    source[7] = '            ("cargo", compute()),'
+            elif mode == 'escaped-second':
+                for source in (old, new):
+                    source[7] = '            ("cargo", "escaped\\ntext"),'
+            elif mode == 'rebound-complete-loop':
+                for source in (old, new):
+                    source[5] = source[5].replace('(manager, expected_error)', '(manager, manager)')
+        for mode in ('missing-copy', 'missing-child', 'duplicate-owner', 'foreign-overlap',
+                'wrong-child-file', 'wrong-child-symbol', 'cold-binding', 'cold-array',
+                'disagreed-binding', 'disagreed-array', 'missing-tuple-role', 'cold-tuple-role',
+                'stable-wrong-tuple-span', 'cold-complete-header-copy', 'cold-outer', 'cold-root',
+                'stable-wrong-slot', 'stable-extra-role', 'stable-wrong-tail', 'array-spans-body',
+                'changed-first-value', 'changed-binding', 'changed-caller', 'conditional-placement',
+                'nonliteral-second', 'escaped-second', 'rebound-complete-loop'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.literal_pair_loop_compare(lambda old, new, base, head: mutate(old, new, base, head, mode))
+
+    def test_literal_pair_loop_normalization_is_explicit_and_work_is_bounded(self):
+        original = coverage.literal_pair_loop_fragment
+        captured = []
+        def record(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if result is not None:
+                captured.append((args, kwargs))
+            return result
+        with patch.object(coverage, 'literal_pair_loop_fragment', side_effect=record):
+            self.literal_pair_loop_compare()
+        self.assertTrue(captured)
+        args, kwargs = captured[0]
+        exhausted = list(args); exhausted[-1] = [0]
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            original(*exhausted, **kwargs)
+        def exact(*args, **kwargs):
+            return original(*args, **(kwargs | {'normalize_second': False}))
+        with patch.object(coverage, 'literal_pair_loop_fragment', side_effect=exact):
+            with self.assertRaises(ValueError):
+                self.literal_pair_loop_compare()
+
+    def test_literal_pair_loop_never_credits_changed_body(self):
+        with self.assertRaises(ValueError):
+            self.literal_pair_loop_compare(body=True)
+
+
+    def literal_loop_async_compare(self, mutation=None, body=False):
+        captured = {}
+        def nest(old, new, base, head):
+            for source, members in ((old, base), (new, head)):
+                operation = source[9].strip()
+                source[9:10] = ['            runtime.block_on(async {',
+                               '                ' + operation, '            });']
+                for owner in members:
+                    for row in owner['regions']:
+                        for column in (0, 2):
+                            if row[column] >= 11:
+                                row[column] += 2
+                line = source[9]; brace = line.index('{')+1
+                for root, outer in ((members[0], members[1]), (members[2], members[3])):
+                    outer['regions'] = [row for row in outer['regions'] if row[0] != 10]
+                    for name in ('runtime', 'block_on'):
+                        first = line.index(name)+1
+                        outer['regions'].append([10, first, 10, first+len(name), 2, 0, 0, 0])
+                    members.append(dict(name='_RNCNC'+root['name'][2:]+'00B5_', count=2,
+                        filenames=['/src/example.rs'], regions=[
+                            [10, brace, 10, brace+1, 2, 0, 0, 0],
+                            [11, 17, 11, len(source[10])+1, 2, 0, 0, 0],
+                            [12, 13, 12, 14, 2, 0, 0, 0]]))
+            if mutation:
+                mutation(old, new, base, head)
+            captured.update(old=old, new=new, base=base, head=head)
+        self.literal_pair_loop_compare(nest)
+        first, last = (10, 11) if body else (10, 10)
+        return coverage.positive_source_fragments('example.rs', captured['old'], captured['new'],
+            {n: 1 for n in range(1, 25)}, {n: 1 for n in range(1, 25)},
+            captured['base'], captured['head'], {'/src/example.rs': 'example.rs'},
+            {'/src/example.rs': 'example.rs'},
+            [(first-1, last, first-1, last, list(range(first, last+1)))],
+            callback_functions=('fn checked()',))
+
+    def test_literal_loop_async_entry_retains_full_loop_and_call_authority(self):
+        pairs, receipts = self.literal_loop_async_compare()
+        self.assertEqual(pairs, {10: 10})
+        self.assertTrue(any(proof['kind'] == 'literal-pair-loop-async-call-entry'
+            for receipt in receipts for proof in receipt.get('callback_owners', [])))
+
+    def test_literal_loop_async_entry_refuses_rebound_missing_cold_and_deeper_paths(self):
+        def mutate(old, new, base, head, mode):
+            if mode == 'missing-async':
+                del head[8]
+            elif mode == 'duplicate-async':
+                head.append(copy.deepcopy(head[8]))
+            elif mode == 'foreign-overlap':
+                head.append(dict(name='foreign', count=1, filenames=['/src/example.rs'],
+                    regions=[copy.deepcopy(head[8]['regions'][0])]))
+            elif mode == 'wrong-depth':
+                head[8]['name'] = head[8]['name'].replace('_RNCNC', '_RNC')
+            elif mode == 'foreign-file':
+                head[8]['filenames'] = ['/src/foreign.rs']
+            elif mode == 'cold-async':
+                head[8]['count'] = head[8]['regions'][0][4] = 0
+            elif mode == 'disagreed-entry':
+                head[8]['count'] += 1
+            elif mode == 'different-loop-count':
+                head[8]['count'] = head[8]['regions'][0][4] = 1
+                head[1]['regions'][-2][4] = head[1]['regions'][-1][4] = 1
+            elif mode == 'cold-receiver':
+                head[1]['regions'][-2][4] = 0
+            elif mode == 'cold-method':
+                head[1]['regions'][-1][4] = 0
+            elif mode == 'cold-loop':
+                for row in head[1]['regions'][2:6]:
+                    row[4] = 0
+            elif mode == 'changed-first-literal':
+                new[6] = new[6].replace('npm', 'bun')
+            elif mode == 'changed-method':
+                new[9] = new[9].replace('block_on', 'other_fn')
+            elif mode == 'changed-receiver':
+                new[9] = new[9].replace('runtime', 'another')
+            elif mode == 'conditional-call':
+                for source in (old, new):
+                    source[9] = '            if ready { ' + source[9]
+                    source[11] += ' }'
+            elif mode == 'deeper-loop':
+                for source in (old, new):
+                    source[9] = '            for inner in [1] { ' + source[9]
+                    source[11] += ' }'
+            elif mode in ('stable-wrong-slot', 'stable-wrong-tail'):
+                for members in (base, head):
+                    for outer in (members[1], members[3]):
+                        outer['regions'][-1][1 if mode == 'stable-wrong-slot' else 7] += 1
+            elif mode == 'wrong-span':
+                head[8]['regions'][-1][3] += 1
+            elif mode == 'async-move':
+                for source in (old, new):
+                    source[9] = source[9].replace('async {', 'async move {')
+        for mode in ('missing-async', 'duplicate-async', 'foreign-overlap', 'wrong-depth',
+                'foreign-file', 'cold-async', 'disagreed-entry', 'different-loop-count',
+                'cold-receiver', 'cold-method', 'cold-loop', 'changed-first-literal',
+                'changed-method', 'changed-receiver', 'conditional-call', 'deeper-loop',
+                'stable-wrong-slot', 'stable-wrong-tail', 'wrong-span', 'async-move'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.literal_loop_async_compare(lambda old, new, base, head: mutate(old, new, base, head, mode))
+
+    def test_literal_loop_async_entry_never_credits_body_work(self):
+        with self.assertRaises(ValueError):
+            self.literal_loop_async_compare(body=True)
+
     def nested_async_entry_compare(self, mutation=None, body=False):
         captured = {}
         def nest(old, new, base, head):
@@ -1421,8 +1683,8 @@ class SourceAwareCoverageTests(unittest.TestCase):
             self.nested_async_entry_compare(body=True)
         original = coverage.nested_async_call_entry_fragment
         captured = []
-        def record(*args):
-            result = original(*args)
+        def record(*args, **kwargs):
+            result = original(*args, **kwargs)
             if result is not None:
                 captured.append(args)
             return result
@@ -2001,7 +2263,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 self.changed_async_arguments_compare(lambda owners: mutate(owners, mode))
 
-    def async_positive_fragment_compare(self, mutation=None, joint=False):
+    def async_positive_fragment_compare(self, mutation=None, joint=False, inherent=False):
         old = ['async fn checked(', '    old: bool,', ') {',
                '    verify();', '    finish();', '}']
         new = [line.replace('old:', 'new:') for line in old]
@@ -2020,17 +2282,35 @@ class SourceAwareCoverageTests(unittest.TestCase):
                              [5, 5, 5, 14, int(not joint or copy_number == 0), 0, 0, 0],
                              [6, 1, 6, 2, 1, 0, 0, 0]])])
             documents.append(owners)
-        if mutation:
-            mutation(documents)
         fragments = [(3, 4, 3, 4, (4,))]
         if joint:
             fragments.append((4, 5, 4, 5, (5,)))
+        before = {4: 1 if joint else 2, 5: 1 if joint else 2}
+        if inherent:
+            new = old if joint else [line.replace('finish();', 'review();') for line in old]
+            old, new = (['impl Manager {', *('    ' + line for line in source), '}']
+                        for source in (old, new))
+            for owners in documents:
+                for owner in owners:
+                    child = owner['name'].startswith('_RNC')
+                    reference = 'B4_' if child else 'B2_'
+                    owner['name'] = owner['name'].replace('NvC', 'NvMC').replace(
+                        '7example7checked', f'7exampleNt{reference}7Manager7checked')
+                    if child:
+                        owner['name'] = owner['name'].removesuffix('B3_') + reference
+                    for region in owner['regions']:
+                        region[0] += 1; region[2] += 1
+                        region[1] += 4; region[3] += 4
+            fragments = [(a + 1, b + 1, c + 1, d + 1, tuple(line + 1 for line in lines))
+                         for a, b, c, d, lines in fragments]
+            before = {line + 1: count for line, count in before.items()}
+        if mutation:
+            mutation(documents)
         original = copy.deepcopy(documents)
+        phase_lines = dict(inherent_async_lines=((5,), (5,))) if inherent else {}
         try:
-            return coverage.positive_source_fragments('example.rs', old, new,
-                {4: 1 if joint else 2, 5: 1 if joint else 2},
-                {4: 1 if joint else 2, 5: 1 if joint else 2}, *documents,
-                {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'}, fragments)
+            return coverage.positive_source_fragments('example.rs', old, new, before, before.copy(), *documents,
+                {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'}, fragments, **phase_lines)
         finally:
             self.assertEqual(documents, original, 'phase proof must preserve the raw producer evidence')
 
@@ -2040,6 +2320,43 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertEqual(receipts[0]['instances'], 2)
         self.assertEqual(len(receipts[0]['async_copies']['base']), 2)
         self.assertEqual(len(receipts[0]['async_copies']['head']), 2)
+
+    def test_inherent_async_fragment_preserves_both_phases_of_each_compiled_copy(self):
+        pairs, receipts = self.async_positive_fragment_compare(inherent=True)
+        self.assertEqual(pairs, {5: 5})
+        self.assertEqual(receipts[0]['instances'], 2)
+        self.assertEqual(len(receipts[0]['async_copies']['head']), 2)
+
+    def test_inherent_async_fragment_refuses_unbound_or_cold_evidence(self):
+        def change(owners, mode):
+            head = owners[1]
+            if mode == 'foreign-type':
+                head[1]['name'] = head[1]['name'].replace('Manager', 'Another')
+            elif mode == 'foreign-copy':
+                head[1]['name'] = head[1]['name'].replace('Cs1_', 'Cs3_')
+            elif mode == 'same-copy-different-spelling':
+                head[2]['name'] = head[0]['name'].replace('B2_', 'Cs1_7example')
+            elif mode == 'cold-constructor':
+                head[0]['regions'][0][4] = 0
+            elif mode == 'cold-body':
+                head[1]['regions'][1][4] = 0
+            elif mode == 'missing-body':
+                head.pop(1)
+            else:
+                head.append(copy.deepcopy(head[1]))
+        for mode in ('foreign-type', 'foreign-copy', 'same-copy-different-spelling', 'cold-constructor', 'cold-body',
+                     'missing-body', 'duplicate-body'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.async_positive_fragment_compare(lambda owners: change(owners, mode), inherent=True)
+
+    def test_inherent_async_retains_execution_within_matching_copy_identities(self):
+        def move_hits(owners):
+            owners[1][1]['regions'][1][4] = owners[1][1]['regions'][2][4] = 0
+            owners[1][3]['regions'][1][4] = owners[1][3]['regions'][2][4] = 1
+        pairs, _ = self.async_positive_fragment_compare(joint=True, inherent=True)
+        self.assertEqual(pairs, {5: 5, 6: 6})
+        with self.assertRaisesRegex(ValueError, 'Ambiguous unchanged'):
+            self.async_positive_fragment_compare(move_hits, joint=True, inherent=True)
 
     def guarded_async_compare(self, mutation=None, modules=('tests',), feature_guard=True,
                               joint=False, exhausted=False):
@@ -2217,6 +2534,34 @@ class SourceAwareCoverageTests(unittest.TestCase):
         pairs, receipts = self.async_endpoint_compare()
         self.assertEqual(pairs, {6: 6})
         self.assertTrue(receipts[0]['async_endpoint_contexts'])
+
+    def test_async_await_fragments_compare_their_immediate_call(self):
+        source = ['async fn checked() {', '    let first = request', '        .send()',
+                  '        .await', '        .done();', '    let second = first',
+                  '        .decode()', '        .await', '        .done();', '}']
+        filename = '/src/example.rs'
+        files = {filename: 'example.rs'}
+        def owners(crate, second_column):
+            parent = f'_RNvCs{crate}_7example7checked'
+            opening = source[0].index('{') + 1
+            return [dict(name=parent, count=1, filenames=[filename],
+                         regions=[[1, 1, 1, opening - 1, 1, 0, 0, 0]]),
+                    dict(name='_RNC' + parent[2:] + '0B3_', count=1, filenames=[filename],
+                         regions=[[1, opening, 1, opening + 1, 1, 0, 0, 0],
+                                  [4, 1, 4, 15, 1, 0, 0, 0],
+                                  [8, second_column, 8, 15, 1, 0, 0, 0],
+                                  [10, 1, 10, 2, 1, 0, 0, 0]])]
+        def compare(head, target, head_owners):
+            return coverage.positive_source_fragments('example.rs', source, head,
+                {4: 1, 8: 1}, {4: 1, 8: 1}, owners(1, 9), head_owners, files, files,
+                [(3, 4, target - 1, target, (4,))])
+        pairs, receipts = compare(source, 4, owners(2, 9))
+        self.assertEqual(pairs, {4: 4})
+        self.assertEqual(receipts[0]['async_await_contexts'][1]['candidates'], [[4, 'send'], [8, 'decode']])
+        with self.assertRaisesRegex(ValueError, 'Ambiguous unchanged'):
+            compare(source, 8, owners(2, 1))
+        with self.assertRaisesRegex(ValueError, 'Ambiguous unchanged'):
+            compare([*source[:2], '        .publish()', *source[3:]], 4, owners(2, 9))
 
     def test_async_endpoint_keeps_unmapped_candidates_of_the_same_control_kind(self):
         with self.assertRaises(ValueError):
@@ -6438,6 +6783,93 @@ class ConstructBudgetAndConstructorRegressions(unittest.TestCase):
             coverage.retained_construct_anchors('example.rs',old,new,{4:1},{4:1},*owners,
                 {'/src/example.rs':'example.rs'}, {'/src/example.rs':'example.rs'},
                 work=[0], inventories=inventories)
+
+
+class RetiredAsyncMethodTests(unittest.TestCase):
+    def fixture(self, file):
+        source = '''struct SecurityPolicy;
+impl SecurityPolicy {
+    pub async fn assign_grade(
+        &self,
+    ) -> u8 {
+        step()
+    }
+}'''.splitlines()
+        scope, crate_backref = (('NtC{crate}7omg_lib7example','9') if file == '/src/example.rs'
+                                else ('NtNtNtC{crate}7omg_lib4core8security6policy','d'))
+        root = '_RNvMs0_'+scope+'NtB5_14SecurityPolicy12assign_grade'
+        body = '_RNCNvMs0_'+scope+'NtB7_14SecurityPolicy12assign_grade0B'+crate_backref+'_'
+        owners = []
+        for crate, count in (('saJq9CMLDmry_', 1), ('s40j12eeWnis_', 3)):
+            for symbol, regions in ((root, [[3,5,5,12,count,0,0,0]]), (body,
+                    [[5,13,5,14,count,0,0,0], [6,9,6,15,count,0,0,0], [7,5,7,6,count,0,0,0]])):
+                owners.append(dict(name=symbol.format(crate=crate), count=count, filenames=[file], regions=regions))
+        return source, owners
+
+    def witness(self, mutation=None):
+        file = '/__w/omg/omg/src/core/security/policy.rs'
+        source, owners = self.fixture(file)
+        work = [1_000_000]
+        inventory = coverage._construct_inventory(source, work)
+        args = dict(owners=owners, files={file:'src/core/security/policy.rs'}, before={line:4 for line in range(3,8)}, head_names=set(),
+                    head_file_owners=[], head_inventory=(set(),set()), head_declarations=set())
+        if mutation is not None:
+            mutation(args)
+        name = args['files'][file]
+        indexes = (coverage.index_compiled_owner_sources(owners, args['files'], work, {name}),
+                   coverage.index_compiled_owner_sources([{'name':symbol,'filenames':['/other.rs']}
+                       for symbol in args['head_names']]+[dict(row,filenames=[file])
+                       for row in args['head_file_owners']], args['files'], work, {name}))
+        return coverage.retired_async_methods(name, {4}, source, inventory, args['before'], *indexes,
+            args['head_inventory'], args['head_declarations'], work)
+
+    def test_exact_retired_owner_receives_no_ratio_adjustment(self):
+        receipt, = self.witness()
+        self.assertEqual(receipt['base_range'], [3, 7])
+        self.assertEqual(len(receipt['owners']), 2)
+        self.assertEqual(receipt['summary_credit'], [0, 0])
+        self.assertEqual(receipt['mapped_credit'], [0, 0])
+
+    def test_comparator_keeps_new_owner_independent_after_retirement(self):
+        file = '/src/example.rs'
+        old, baseline = self.fixture(file)
+        new = (old[:2] + ['    pub fn replacement(', *old[3:5], '        new_step()', '    }',
+                         '    pub fn another(', *old[3:5], '        another_step()', '    }', '}'])
+        def compare(cold_head_line=None):
+            before = [(line,4) for line in range(3,8)]
+            after = [(line,int(line != cold_head_line)) for line in range(3,13)]
+            def mutate(base, head):
+                base['data'][0]['functions'] = baseline
+                head['data'][0]['functions'] = [dict(name=f'head_method_{start}', filenames=[file],
+                    regions=[[line,5,line,len(new[line-1])+1,count,0,0,0]
+                             for line,count in after if start <= line <= start+4]) for start in (3,8)]
+            return SourceAwareCoverageTests().compare(before, after, mutate,
+                tuple({'src/example.rs': ('\n'.join(source)+'\n').encode()} for source in (old,new)))
+        receipt = compare()
+        self.assertEqual(receipt['retired_async_methods'][0]['base_range'], [3,7])
+        self.assertEqual({key: value for key,value in receipt.items() if key.startswith('deleted_')},
+                         dict(deleted_summary_found=0, deleted_summary_hit=0, deleted_mapped=0, deleted_mapped_hit=0))
+        with self.assertRaisesRegex(ValueError, 'New uncovered instrumented line: src/example.rs:4'):
+            compare(cold_head_line=4)
+
+    def test_refuses_partial_ambiguous_or_persisting_method_evidence(self):
+        def missing_child(a): a['owners'].pop()
+        def missing_copy(a): del a['owners'][-2:]
+        def opaque_touch(a): a['owners'].append(dict(a['owners'][0], name='opaque'))
+        def wrong_scope(a): a['owners'][0]['name'] = a['owners'][0]['name'].replace('8security6policy', '8security6otherx')
+        def wrong_geometry(a): a['owners'][1]['regions'][0][1] -= 1
+        def wrong_lcov(a): a['before'][4] = 5
+        def stale_head(a): a['head_names'].add(a['owners'][0]['name'].replace('saJq9CMLDmry_', 'saaaaaaaaaaa_'))
+        def stale_body(a): a['head_names'].add(a['owners'][1]['name'].replace('saJq9CMLDmry_', 'saaaaaaaaaaa_'))
+        def opaque_head(a): a['head_file_owners'].append(dict(name='unknown::assign_grade'))
+        def keeps_declaration(a): a['head_declarations'].add('assign_grade')
+        def relocated_statement(a):
+            lines = ['fn other() {','    step()','}']
+            a['head_inventory'][1].update(coverage._construct_inventory(lines,[10_000])[5])
+        for mutate in (missing_child, missing_copy, opaque_touch, wrong_scope, wrong_geometry, wrong_lcov,
+                       stale_head, stale_body, opaque_head, keeps_declaration, relocated_statement):
+            with self.subTest(mutate=mutate.__name__):
+                self.assertEqual(self.witness(mutate), [])
 
 
 if __name__ == "__main__":
