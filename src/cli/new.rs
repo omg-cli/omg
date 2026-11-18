@@ -150,16 +150,13 @@ enum ScaffoldEntry<'a> {
 }
 
 fn write_scaffold(root: &Path, stack: &str, entries: &[ScaffoldEntry<'_>]) -> Result<()> {
-    for entry in entries {
-        match entry {
-            Directory(path) => fs::create_dir(root.join(path))
-                .with_context(|| format!("Failed to create the {stack} directory {path}"))?,
-            File(path, contents) => fs::File::create_new(root.join(path))
-                .and_then(|mut file| file.write_all(contents))
-                .with_context(|| format!("Failed to write the {stack} {path}"))?,
-        }
-    }
-    Ok(())
+    entries.iter().try_for_each(|entry| match entry {
+        Directory(path) => fs::create_dir(root.join(path))
+            .with_context(|| format!("Failed to create the {stack} directory {path}")),
+        File(path, contents) => fs::File::create_new(root.join(path))
+            .and_then(|mut file| file.write_all(contents))
+            .with_context(|| format!("Failed to write the {stack} {path}")),
+    })
 }
 
 fn scaffold_rust(root: &Path, name: &str) -> Result<()> {
