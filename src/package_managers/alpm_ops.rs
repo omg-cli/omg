@@ -2137,10 +2137,10 @@ mod tests {
         }
         paths::set_test_overrides(Some(root.to_path_buf()), None);
         let _reset = ResetPaths;
-        let mut alpm = alpm::Alpm::new(
-            root.to_str().expect("UTF-8 root"),
-            root.join("db").to_str().expect("UTF-8 database"),
-        )?;
+        let root_path = root.to_str().expect("UTF-8 root");
+        let db = root.join("db");
+        let db_path = db.to_str().expect("UTF-8 database");
+        let mut alpm = alpm::Alpm::new(root_path, db_path)?;
         let config =
             crate::core::pacman_conf::PacmanConfig::parse_str("[options]\nDownloadUser = root\n")?;
         super::configure_transaction_options(&mut alpm, &config)?;

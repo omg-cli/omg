@@ -2628,6 +2628,7 @@ mod tests {
 
     #[test]
     fn persisted_package_cache_rejects_symlink_and_oversized_file() -> Result<()> {
+        use nix::sys::stat::Mode;
         let directory = tempfile::tempdir()?;
         let target = directory.path().join("valid");
         fs::write(&target, bitcode::serialize(&DbCache::default())?)?;
@@ -2642,10 +2643,7 @@ mod tests {
             .context("oversized cache must fail before decoding")?;
         assert!(error.to_string().contains("size limit"), "{error:#}");
         fs::remove_file(&path)?;
-        nix::unistd::mkfifo(
-            &path,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )?;
+        nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR)?;
         assert!(load_cache_from_disk_in::<DbCache>(directory.path(), "fixture").is_err());
         Ok(())
     }

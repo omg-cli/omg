@@ -167,16 +167,10 @@ impl PacmanConfig {
                 (line, None)
             };
 
-            match current_section.as_deref() {
-                Some("options") => {
-                    Self::parse_option(&mut config, key, value)?;
-                }
-                Some(_) => {
-                    if let Some(ref mut repo) = current_repo {
-                        Self::parse_repo_option(repo, key, value)?;
-                    }
-                }
-                None => {}
+            match (current_section.as_deref(), current_repo.as_mut()) {
+                (Some("options"), _) => Self::parse_option(&mut config, key, value)?,
+                (Some(_), Some(repo)) => Self::parse_repo_option(repo, key, value)?,
+                _ => {}
             }
         }
 

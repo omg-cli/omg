@@ -1611,21 +1611,20 @@ impl AurClient {
         // 1. Get all packages not in official repos
         let (foreign_packages, installed) = tokio::task::spawn_blocking(|| -> Result<_> {
             let mut packages = get_potential_aur_packages()?;
-            if !packages.is_empty() {
-                let config =
-                    crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
-                        .context("Failed to load AUR update filters from pacman.conf")?;
-                let ignored = pacman_db::compile_ignore_patterns(&config.ignore_pkg, "IgnorePkg")?;
-                packages.retain(|name| !ignored.is_match(name));
+            if packages.is_empty() {
+                return Ok((packages, Arc::new(HashMap::new())));
             }
-            let installed = if packages.is_empty() {
-                HashMap::new()
-            } else {
-                pacman_db::list_local_cached()?
-                    .into_iter()
-                    .map(|package| (package.name, package.version))
-                    .collect()
-            };
+            let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
+                .context("Failed to load AUR update filters from pacman.conf")?;
+            let ignored = pacman_db::compile_ignore_patterns(&config.ignore_pkg, "IgnorePkg")?;
+            packages.retain(|name| !ignored.is_match(name));
+            if packages.is_empty() {
+                return Ok((packages, Arc::new(HashMap::new())));
+            }
+            let installed = pacman_db::list_local_cached()?
+                .into_iter()
+                .map(|package| (package.name, package.version))
+                .collect();
             Ok((packages, Arc::new(installed)))
         })
         .await

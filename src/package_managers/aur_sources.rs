@@ -785,47 +785,55 @@ async fn download_file(url: &str, dest_path: &Path, task: ProgressTask) -> Resul
     tokio::time::timeout(MAX_AUR_SOURCE_DURATION, async {
         let response = fetch_public_source(url).await?;
 
-        if !response.status().is_success() {
-            task.set_message(&format!("HTTP {}", response.status()));
-            task.finish(Outcome::Failed);
-            return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
-        }
-
-        // Get content length for progress bar and reject an oversized response
-        // before creating a large temporary file.
-        let expected_length = response.content_length();
-        if let Some(total) = expected_length {
-            anyhow::ensure!(
-                total <= MAX_AUR_SOURCE_BYTES,
-                "AUR source declares {total} bytes, exceeding the {MAX_AUR_SOURCE_BYTES}-byte limit"
-            );
-            task.set_total(Some(total));
-        }
-
-        let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
-        let temporary = tempfile::Builder::new()
-            .prefix(".src-")
-            .tempfile_in(parent)
-            .with_context(|| {
-                format!(
-                    "Failed to create temporary AUR source in {}",
-                    parent.display()
-                )
-            })?;
-        let (std_file, temporary_path) = temporary.into_parts();
-
-        download_to_file(
-            std_file,
-            temporary_path,
-            dest_path,
-            &task,
-            expected_length,
-            response,
-        )
-        .await
+        store_source_response(response, dest_path, &task).await
     })
     .await
     .context("AUR source download deadline exceeded")?
+}
+
+async fn store_source_response(
+    response: reqwest::Response,
+    dest_path: &Path,
+    task: &ProgressTask,
+) -> Result<()> {
+    if !response.status().is_success() {
+        task.set_message(&format!("HTTP {}", response.status()));
+        task.finish(Outcome::Failed);
+        return Err(anyhow::anyhow!("HTTP error: {}", response.status()));
+    }
+
+    // Get content length for progress bar and reject an oversized response
+    // before creating a large temporary file.
+    let expected_length = response.content_length();
+    if let Some(total) = expected_length {
+        anyhow::ensure!(
+            total <= MAX_AUR_SOURCE_BYTES,
+            "AUR source declares {total} bytes, exceeding the {MAX_AUR_SOURCE_BYTES}-byte limit"
+        );
+        task.set_total(Some(total));
+    }
+
+    let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .prefix(".src-")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "Failed to create temporary AUR source in {}",
+                parent.display()
+            )
+        })?;
+    let (std_file, temporary_path) = temporary.into_parts();
+
+    download_to_file(
+        std_file,
+        temporary_path,
+        dest_path,
+        task,
+        expected_length,
+        response,
+    )
+    .await
 }
 
 /// Stream the response into a same-directory temp file, then persist it.
@@ -892,6 +900,68 @@ async fn download_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn source_response_is_published_only_after_a_successful_bounded_transfer() -> Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        for (response, expected_error) in [
+            (
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc".to_owned(),
+                None,
+            ),
+            (
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabc".to_owned(),
+                None,
+            ),
+            (
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_owned(),
+                Some("HTTP error"),
+            ),
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    MAX_AUR_SOURCE_BYTES + 1
+                ),
+                Some("exceeding"),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await?;
+                let mut request = [0; 4096];
+                anyhow::ensure!(socket.read(&mut request).await? > 0, "empty source request");
+                socket.write_all(response.as_bytes()).await?;
+                anyhow::Ok(())
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()?
+                .get(format!("http://{address}"))
+                .send()
+                .await?;
+            let directory = tempfile::tempdir()?;
+            let destination = directory.path().join("source");
+            let task = ProgressTask::start(&TaskSpec {
+                label: "source response fixture".into(),
+                kind: TaskKind::Bytes { total: None },
+                accent: Accent::Network,
+            });
+            let result = store_source_response(response, &destination, &task).await;
+            server.await??;
+            if let Some(message) = expected_error {
+                let error = result.expect_err("inadmissible response must fail");
+                assert!(format!("{error:#}").contains(message), "{error:#}");
+                assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+            } else {
+                result?;
+                assert_eq!(std::fs::read(&destination)?, b"abc");
+            }
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn source_body_deadline_removes_partial_download() -> Result<()> {

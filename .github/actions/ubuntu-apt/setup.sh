@@ -2,7 +2,6 @@
 set -euo pipefail
 os_release=/etc/os-release
 source_file=/etc/apt/sources.list.d/ubuntu.sources
-mirror_file=/etc/apt/apt-mirrors.txt
 ca_bundle=/etc/ssl/certs/ca-certificates.crt
 keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 . "$os_release"
@@ -14,15 +13,19 @@ case "$(dpkg --print-architecture)" in
   amd64|amd64v3) ;;
   *) echo 'Unsupported Ubuntu archive architecture' >&2; exit 1 ;;
 esac
-test -f "$source_file"
-test ! -L "$source_file"
-test -s "$keyring"
-test ! -L "$keyring"
+if ! test -f "$source_file" || test -L "$source_file"; then
+  echo 'Ubuntu archive sources must be a regular file' >&2
+  exit 1
+fi
+if ! test -f "$keyring" || ! test -s "$keyring" || test -L "$keyring"; then
+  echo 'Ubuntu archive keyring must be a nonempty regular file' >&2
+  exit 1
+fi
 as_root() {
   if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi
 }
 work=$(mktemp -d)
-trap 'rm -f "$work/sources" "$work/mirrors"; rmdir "$work"' EXIT
+trap 'rm -f "$work/sources"; rmdir "$work"' EXIT
 scheme=http
 if test -s "$ca_bundle"; then scheme=https; fi
 render_sources() {
@@ -40,12 +43,14 @@ render_sources() {
         if (seen[key]++) exit 1
         fields++
         if (key == "uris") {
-          if (value == "mirror+file:/etc/apt/apt-mirrors.txt") {
-            $i="URIs: " value
-            continue
+          n=split(value, uris, /[ \t]+/)
+          if (!n) exit 1
+          for (j=1; j<=n; j++) {
+            uri=uris[j]
+            if (uri != "mirror+file:/etc/apt/apt-mirrors.txt" &&
+                uri !~ /^https?:\/\/(archive|azure\.archive|security)\.ubuntu\.com\/ubuntu\/?$/ &&
+                uri !~ /^https?:\/\/mirrors\.edge\.kernel\.org\/ubuntu\/?$/) exit 1
           }
-          if (value !~ /^https?:\/\/(archive|azure\.archive|security)\.ubuntu\.com\/ubuntu\/?$/ &&
-              value !~ /^https?:\/\/mirrors\.edge\.kernel\.org\/ubuntu\/?$/) exit 1
           $i="URIs: " scheme "://mirrors.edge.kernel.org/ubuntu/"
         }
         if (key == "signed-by" && value != "/usr/share/keyrings/ubuntu-archive-keyring.gpg") exit 1
@@ -73,32 +78,15 @@ render_sources() {
       for (i=1; i<=NF; i++) print $i
     }
     END { if (!count) exit 1 }
-  ' "$source_file" > "$work/sources"
+  ' "$source_file" > "$work/sources" || {
+    echo 'Ubuntu archive source definition failed validation' >&2
+    return 1
+  }
 }
-render_sources
-uses_mirrors=false
-if grep -q '^URIs: mirror+file:/etc/apt/apt-mirrors.txt$' "$work/sources"; then
-  test -f "$mirror_file"
-  test ! -L "$mirror_file"
-  awk '
-    /^[ \t]*(#|$)/ { next }
-    {
-      if ($1 !~ /^https?:\/\/(archive|azure\.archive|security)\.ubuntu\.com\/ubuntu\/?$/ &&
-          $1 !~ /^https?:\/\/mirrors\.edge\.kernel\.org\/ubuntu\/?$/) exit 1
-      if (NF > 2 || (NF == 2 && $2 !~ /^priority:[0-9]+$/)) exit 1
-      count++
-    }
-    END { if (!count) exit 1 }
-  ' "$mirror_file"
-  uses_mirrors=true
-fi
 apply_sources() {
   as_root install -m 644 "$work/sources" "$source_file"
-  if "$uses_mirrors"; then
-    printf '%s://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n' "$scheme" > "$work/mirrors"
-    as_root install -m 644 "$work/mirrors" "$mirror_file"
-  fi
 }
+render_sources
 update() {
   as_root timeout --kill-after=5s 180 apt-get -o APT::Update::Error-Mode=any \
     -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
