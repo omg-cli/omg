@@ -3571,7 +3571,7 @@ printf '%s\\n' 'Error: No omg.lock file found' 'Error: 1 project(s) need attenti
     def test_offline_doctor_launch_admits_only_exact_capability_cleanup(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
-        launch = source[start:source.index('  # Bash SECONDS', start)]
+        launch = source[start:source.index('  budget=$(', start)]
         defaults = dict(distro='debian', case='doctor-turbo', safety='isolated-write',
                         assertions='doctor-capability-cleanup', expected_ux='pass',
                         requires='-', tier='container',
@@ -3635,7 +3635,7 @@ export -f sudo unshare setpriv
     def test_offline_doctor_rejects_an_initial_root_user_before_sudo(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
-        launch = source[start:source.index('  # Bash SECONDS', start)]
+        launch = source[start:source.index('  budget=$(', start)]
         setup = '''
 distro=debian; case=doctor-turbo; safety=isolated-write
 assertions=doctor-capability-cleanup; expected_ux=pass; requires=-
@@ -3657,7 +3657,7 @@ export -f id sudo
     def test_offline_preview_launch_admits_only_the_exact_fedora_dry_run(self):
         source = (ROOT / 'scripts/qemu-inventory.sh').read_text(encoding='utf-8')
         start = source.index('  if [[ "$network_scope" == offline ]]; then\n')
-        launch = source[start:source.index('  # Bash SECONDS', start)]
+        launch = source[start:source.index('  budget=$(', start)]
         defaults = dict(distro='fedora', case='remove', safety='read',
                         assertions='package-dry-run-remove', expected_ux='pass',
                         requires='-', tier='hermetic', targets='hermetic:pass',
