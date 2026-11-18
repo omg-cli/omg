@@ -3200,18 +3200,14 @@ def retained_test_queue_expectation(name, source, line, mapped, group, owners, n
 
 _INITIAL_TEST_RECORD = re.compile(r'[ \t]*let ([A-Za-z_]\w*) = ([A-Z]\w*) \{', re.ASCII)
 _QUALIFIED_FIELD = re.compile(r'[ \t]*[A-Za-z_]\w*: (?:[A-Za-z_]\w*::)+[A-Za-z_]\w*,', re.ASCII)
+_TEST_EXPECTED_ERROR = re.compile(r'[ \t]*\.expect_err\("[A-Za-z_0-9 -]{1,120}"\);', re.ASCII)
 
 
-def initial_async_test_record(name, source, counts, group, owners, names, inventory, first, last, work):
-    """Bind an unchanged eager record to its independently observed async body entry."""
-    if inventory is None or last-first!=3 or len(group[2])!=1:
-        return None
-    header = _INITIAL_TEST_RECORD.fullmatch(source[first-1]); field = source[first]
-    if (header is None or _QUALIFIED_FIELD.fullmatch(field) is None
-            or source[first+1].strip()!=f'..{header[2]}::default()' or source[last-1].strip()!='};'):
+def async_test_fragment_owners(name, group, owners, names, inventory, first, last, work):
+    if inventory is None or len(group[2])!=1:
         return None
     code, rows = inventory[:2]
-    _construct_charge(work,2*len(rows)+4)
+    _construct_charge(work,len(rows)+4)
     functions = [row for row in rows if row['kind']=='fn' and 'async' in row['header']
                  and code.position(code.starts[row['first']+row['header'].index('async')])[0]==group[0]
                  and code.position(code.ends[row['end']])[0]==group[1]]
@@ -3222,6 +3218,46 @@ def initial_async_test_record(name, source, counts, group, owners, names, invent
             or words[9:]!=_RESULT_TEST_SIGNATURE[6:]
             or scope is None or scope[:2]!=(['tests'],['tests'])):
         return None
+    root, = group[2]; shape=plain_rust_function_symbol(root['name'])
+    path = ('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests',words[8])
+    open_at = code.position(code.starts[fn['opening']]); close_at = code.position(code.ends[fn['end']])
+    entry = (*code.position(code.starts[fn['first']+7]),*code.position(code.ends[fn['opening']-1]))
+    if (shape is None or shape.identifiers!=path or names[root['name']]!=1
+            or type(root.get('count')) is not int or not 0<root['count']<COUNTER_LIMIT
+            or [r[4] for r in root['regions'] if tuple(r[:4])==entry and r[5:]==[0,0,0]]!=[root['count']]):
+        return None
+    _construct_charge(work,sum(4*len(owner['regions'])+len(owner['name'])+1 for owner in owners))
+    touching = [(owner,[r for r in owner['regions'] if r[0]<=last and (r[2]>first or r[2]==first and r[3]>1)]) for owner in owners]
+    affected = [(owner,raw) for owner,raw in touching if raw]
+    if len(affected)!=1:
+        return None
+    child, raw = affected[0]
+    body_entry = (*open_at,open_at[0],open_at[1]+1)
+    children = [owner for owner in owners if direct_rust_callback_symbol(owner['name'],root['name'],shape.modules)]
+    if (len(children)!=1 or children[0] is not child
+            or names[child['name']]!=1 or child['filenames']!=root['filenames']
+            or any(owner.get('branches') or owner.get('mcdc_records') for owner in (root,child))
+            or type(child.get('count')) is not int or not 0<child['count']<=root['count']
+            or [r[4] for r in child['regions'] if tuple(r[:4])==body_entry and r[5:]==[0,0,0]]!=[child['count']]
+            or any(not open_at<=tuple(r[:2])<tuple(r[2:4])<=close_at for r in child['regions'])):
+        return None
+    return fn, (shape.identity,words), dict(root=root['name'],body=child['name'],regions=raw,entry=body_entry), child['count']
+
+
+def initial_async_test_record(name, source, counts, group, owners, names, inventory, first, last, work):
+    """Bind an unchanged eager record to its independently observed async body entry."""
+    if last-first!=3:
+        return None
+    header = _INITIAL_TEST_RECORD.fullmatch(source[first-1]); field = source[first]
+    if (header is None or _QUALIFIED_FIELD.fullmatch(field) is None
+            or source[first+1].strip()!=f'..{header[2]}::default()' or source[last-1].strip()!='};'):
+        return None
+    scope = async_test_fragment_owners(name,group,owners,names,inventory,first,last,work)
+    if scope is None:
+        return None
+    fn, identity, witness, hits = scope
+    code, rows = inventory[:2]
+    _construct_charge(work,len(rows))
     records = [row for row in rows if row.get('header')==('let',header[1],'=',header[2])
                and code.parents[row['first']]==fn['opening']
                and code.position(code.starts[row['first']])[0]==first
@@ -3232,40 +3268,237 @@ def initial_async_test_record(name, source, counts, group, owners, names, invent
     start = record['first']; end = record['end']
     prefix = code.words[fn['opening']+1:start]
     _construct_charge(work,len(prefix)+end-start+1)
-    if prefix:
-        if (prefix[0]!='use' or prefix[-1]!=';' or len(prefix)%2!=1
-                or any(re.fullmatch(r'[A-Za-z_]\w*',part,re.ASCII) is None for part in prefix[1:-1:2])
-                or any(part!='::' for part in prefix[2:-1:2])
-                or prefix[-2] in code.words[start:end+1]):
-            return None
-    root, = group[2]; shape=plain_rust_function_symbol(root['name'])
-    path = ('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests',words[8])
-    open_at = code.position(code.starts[fn['opening']]); close_at = code.position(code.ends[fn['end']])
-    entry = (*code.position(code.starts[fn['first']+7]),*code.position(code.ends[fn['opening']-1]))
-    if (shape is None or shape.identifiers!=path or names[root['name']]!=1
-            or type(root.get('count')) is not int or not 0<root['count']<COUNTER_LIMIT
-            or [r[4] for r in root['regions'] if tuple(r[:4])==entry and r[5:]==[0,0,0]]!=[root['count']]):
-        return None
-    _construct_charge(work,sum(4*len(owner['regions'])+len(owner['name'])+1 for owner in owners))
-    touching = [(owner,[r for r in owner['regions'] if any(owner_covers_lines([r],line,line)
-                 for line in range(first,last+1))]) for owner in owners]
-    affected = [(owner,raw) for owner,raw in touching if raw]
-    if len(affected)!=1:
-        return None
-    child, raw = affected[0]
-    body_entry = (*open_at,open_at[0],open_at[1]+1)
-    if (not direct_rust_callback_symbol(child['name'],root['name'],shape.modules)
-            or names[child['name']]!=1 or child['filenames']!=root['filenames']
-            or any(owner.get('branches') or owner.get('mcdc_records') for owner in (root,child))
-            or type(child.get('count')) is not int or not 0<child['count']<=root['count']
-            or [r[4] for r in child['regions'] if tuple(r[:4])==body_entry and r[5:]==[0,0,0]]!=[child['count']]
-            or any(not open_at<=tuple(r[:2])<tuple(r[2:4])<=close_at for r in child['regions'])):
+    if prefix and (prefix[0]!='use' or prefix[-1]!=';' or len(prefix)%2!=1
+            or any(re.fullmatch(r'[A-Za-z_]\w*',part,re.ASCII) is None for part in prefix[1:-1:2])
+            or any(part!='::' for part in prefix[2:-1:2])
+            or prefix[-2] in code.words[start:end+1]):
         return None
     slots = [code.region(start+1,start+1),code.region(start+3,end)]
-    if (raw!=[[*slot,child['count'],0,0,0] for slot in slots]
-            or any(counts.get(line)!=child['count'] for line in range(first,last+1))):
+    if (witness['regions']!=[[*slot,hits,0,0,0] for slot in slots]
+            or any(counts.get(line)!=hits for line in range(first,last+1))):
         return None
-    return (shape.identity,words), dict(root=root['name'],body=child['name'],regions=raw,entry=body_entry)
+    return identity,witness
+
+
+def async_test_expected_error(name, source, counts, group, owners, names, inventory, first, last, work):
+    if first!=last or _TEST_EXPECTED_ERROR.fullmatch(source[first-1]) is None:
+        return None
+    scope = async_test_fragment_owners(name,group,owners,names,inventory,first,last,work)
+    if scope is None:
+        return None
+    fn, identity, witness, hits = scope
+    code, rows = inventory[:2]
+    _construct_charge(work,len(rows)+len(code.starts).bit_length()+1)
+    start = bisect.bisect_left(code.starts,code.offsets[first-1])
+    if (code.parents[start]!=fn['opening']
+            or code.words[start:start+3]!=['.','expect_err','(']
+            or code.words[start+4:start+6]!=[')',';']):
+        return None
+    statements = [row for row in rows if row['kind']=='statement' and row['end']==start+5
+                  and code.parents[row['first']]==fn['opening']]
+    if len(statements)!=1:
+        return None
+    beginning = statements[0]['first']
+    binder = code.words[beginning:beginning+3]
+    if (len(binder)!=3 or binder[0]!='let' or binder[2]!='='
+            or re.fullmatch(r'[A-Za-z_]\w*',binder[1],re.ASCII) is None):
+        return None
+    slot = code.words[start+3]
+    _construct_charge(work,fn['end']-fn['opening'])
+    if code.words[fn['opening']+1:fn['end']].count(slot)!=1:
+        return None
+    spans = [code.region(start+1,start+1),code.region(start+3,start+3)]
+    if counts.get(first)!=hits or witness['regions']!=[[*span,hits,0,0,0] for span in spans]:
+        return None
+    return (*identity,tuple(binder),slot),witness
+
+
+def async_test_expected_variant(name, source, counts, group, owners, names, inventory, first, last, work):
+    """Observe the assertion entry after an independently executed test error binding."""
+    if first!=last or not 1<first<len(source) or _TEST_EXPECTED_ERROR.fullmatch(source[first-2]) is None:
+        return None
+    code = inventory[0]
+    _construct_charge(work,2*len(code.starts).bit_length()+1)
+    start = bisect.bisect_left(code.starts,code.offsets[first-1])
+    before = bisect.bisect_left(code.starts,code.offsets[first-2])
+    if (code.words[start:start+6]!=['assert','!','(','matches','!','(']
+            or code.words[before:before+3]!=['.','expect_err','(']
+            or before+6!=start or code.words[before+4:start]!=[')',';']
+            or code.parents[start]!=code.parents[before]):
+        return None
+    close = code.pairs[start+5]
+    if code.pairs[start+2]!=close+1 or code.words[close+2]!=';':
+        return None
+    final = code.position(code.ends[close+2])[0]
+    if not 0<final-first<=7:
+        return None
+    _construct_charge(work,4*(close-start+3))
+    args = _boolean_arguments(code,start+5)
+    if args is None or len(args)!=2:
+        return None
+    (value,value_end),(pattern,pattern_end) = args
+    named = code.words[pattern:pattern_end]
+    wrapped = named[:2]==['Some','('] and code.pairs[pattern+1]==pattern_end-1
+    if wrapped:
+        named=named[2:-1]
+    if (len(named)!=13 or tuple(named[i] for i in (1,3,5,7,9,10,11,12))!=('::','{',':','::',',','.','.','}')
+            or any(re.fullmatch(r'[A-Za-z_]\w*',named[i],re.ASCII) is None for i in (0,2,4,6,8))):
+        return None
+    tail = ['.','downcast_ref','::','<',named[0],'>','(',')'] if wrapped else []
+    if code.words[value+1:value_end]!=tail:
+        return None
+    expected_statements = inventory[3].get(first-1,())
+    assertion_statements = inventory[3].get(first,())
+    _construct_charge(work,len(expected_statements)+len(assertion_statements))
+    bindings = [row for row in expected_statements if row['kind']=='statement'
+                and row['supported'] and row['end']==start-1 and code.parents[row['first']]==code.parents[start]
+                and code.words[row['first']:row['first']+3]==['let',code.words[value],'=']]
+    if len(bindings)!=1 or not any(row['kind']=='statement' and row['supported']
+                                   and row['first']==start and row['end']==close+2 for row in assertion_statements):
+        return None
+    scope = async_test_fragment_owners(name,group,owners,names,inventory,first-1,final,work)
+    if scope is None:
+        return None
+    function, identity, witness, hits = scope
+    message = code.words[before+3]
+    _construct_charge(work,function['end']-function['opening'])
+    if (code.parents[start]!=function['opening']
+            or code.words[function['opening']+1:function['end']].count(message)!=1):
+        return None
+    slots = [(code.region(before+1,before+1),hits),(code.region(before+3,before+3),hits),
+             (code.region(start,start+1),hits),(code.region(start+3,start+4),0),(code.region(value,value),hits)]
+    if wrapped:
+        slots.append((code.region(value+2,value+2),hits))
+    if (witness['regions']!=[[*slot,count,0,0,0] for slot,count in slots]
+            or _owner_line_counts({'regions':witness['regions']},_ObserverWork(work))!={
+                line:counts[line] for line in range(first-1,final+1) if line in counts}):
+        return None
+    return (*identity,code.words[value],message,tuple(named)), dict(witness,wrapped=wrapped)
+
+
+def direct_assertion_anchor(code, start, stop, work):
+    """Identify one direct assertion by a stable condition role or expected value."""
+    macro = code.words[start]
+    if (macro not in ('assert', 'assert_eq') or code.words[start+1:start+3]!=['!','(']
+            or code.pairs.get(start+2)!=stop-1 or code.words[stop]!=';'):
+        return None
+    _construct_charge(work,4*(stop-start+1))
+    args = _boolean_arguments(code,start+2)
+    if args is None or len(args)!=2:
+        return None
+    (left,end),(right,last) = args
+    if last-right!=1 or not code.words[right].startswith('"'):
+        return None
+    if macro=='assert_eq':
+        closing = code.pairs.get(left+1)
+        if (not re.fullmatch(r'[A-Za-z_]\w*',code.words[left],re.ASCII)
+                or code.words[left+1]!='(' or closing is None or closing+5!=end
+                or code.words[closing+1:end]!=['.','unwrap','(',')']
+                or any(word in ('!','?','{','[','return','break','continue','await','yield')
+                       for word in code.words[left+2:closing])):
+            return None
+        return (macro,code.words[left],code.words[right]), (), (
+            code.region(left,left),code.region(closing+2,closing+2))
+    if (code.words[left:left+3]!=['matches','!','('] or code.pairs.get(left+2)!=end-1):
+        return None
+    nested = _boolean_arguments(code,left+2)
+    if nested is None or len(nested)!=2:
+        return None
+    (value,value_end),(pattern,pattern_end) = nested
+    if any(word in ('!','?','{','[','return','break','continue','await','yield')
+           for word in code.words[value:value_end]):
+        return None
+    if (code.words[pattern:pattern+2]==['Err','('] and code.pairs.get(pattern+1)==pattern_end-1):
+        pattern+=2; pattern_end-=1
+    path = code.words[pattern:pattern_end-3]
+    if (len(path)<3 or len(path)%2==0 or path[1::2]!=['::']*(len(path)//2)
+            or code.words[pattern_end-3:pattern_end]!=['(','_',')']
+            or any(re.fullmatch(r'[A-Za-z_]\w*',word,re.ASCII) is None for word in path[::2])):
+        return None
+    return (macro,*path), (code.region(left,left+1),), ()
+
+
+def retained_direct_unit_assertion(name, source, line, mapped, group, owners, names, files, inventory, work):
+    """Prove the direct assertion entry and stable subentry in a single test root."""
+    code,rows = inventory[:2]
+    first,last,roots = group
+    if len(roots)!=1 or not first<line<last:
+        return None
+    root, = roots
+    symbol=root['name']
+    _construct_charge(work,len(symbol)+len(name)+1)
+    shape=plain_rust_function_symbol(symbol)
+    modules=tuple(name.removeprefix('src/').removesuffix('.rs').split('/'))
+    if (shape is None or shape.identifiers[:-1]!=('omg_lib',*modules,'tests')
+            or names[symbol]!=1 or root['count']!=1 or root.get('branches') or root.get('mcdc_records')):
+        return None
+    line_start = bisect.bisect_left(code.starts,code.offsets[line-1])
+    line_end = bisect.bisect_left(code.starts,code.offsets[line])
+    if code.words[line_start:line_end] not in (['assert','!','('],['assert_eq','!','(']):
+        return None
+    function_open=code.parents[line_start]
+    test_open=code.parents[function_open] if function_open is not None else None
+    _construct_charge(work,2*len(rows))
+    expected=[('fn',function_open,('#','[','test',']','fn',shape.identifiers[-1],'(',')')),
+              ('mod',test_open,('#','[','cfg','(','test',')',']','mod','tests'))]
+    if (any(opening is None for _,opening,_ in expected)
+            or sum((row['kind'],row['opening'],row.get('header')) in expected for row in rows)!=2):
+        return None
+    statement = [(row,anchor) for row in rows
+                 if row['kind']=='statement' and row['supported'] and code.parents[row['first']]==function_open
+                 and code.words[row['first']]==code.words[line_start]
+                 and (anchor:=direct_assertion_anchor(code,row['first'],row['end'],work)) is not None]
+    current = [(row,anchor) for row,anchor in statement if row['first']==line_start]
+    if len(current)!=1:
+        return None
+    (row,(anchor,markers,entries)), = current
+    _construct_charge(work,len(statement))
+    if sum(candidate[0]==anchor for _,candidate in statement)!=1:
+        return None
+    if anchor[0]=='assert' and len(anchor)==4:
+        imports=[]
+        _construct_charge(work,len(rows))
+        for declaration in rows:
+            start, end = declaration['first'], declaration['end']
+            if (declaration['kind']!='statement' or not declaration['supported']
+                    or code.parents[start]!=function_open or code.words[start]!='use'
+                    or code.words[end-1:end+1]!=[anchor[1],';']):
+                continue
+            _construct_charge(work,end-start+1)
+            path=code.words[start+1:end]
+            if (len(path)<3 or len(path)%2==0 or path[1::2]!=['::']*(len(path)//2)
+                    or any(re.fullmatch(r'[A-Za-z_]\w*',word,re.ASCII) is None for word in path[::2])):
+                return None
+            imports.append(path)
+        if len(imports)!=1:
+            return None
+        anchor=('assert',*imports[0],*anchor[2:])
+    low,high = code.region(line_start,row['end'])[:2],code.region(line_start,row['end'])[2:]
+    expected_entry = code.region(line_start,line_start+1)
+    _construct_charge(work,sum(len(owner['regions'])+1 for owner in owners)+len(root['regions'])*(last-first+2))
+    owner_span = source_owner_span(root,name,files,source)
+    if owner_span is None or owner_span[:2]!=(first,last):
+        return None
+    scope=[]
+    for owner in owners:
+        touching=[region for region in owner['regions'] if tuple(region[:2])<high and low<tuple(region[2:4])]
+        if not touching:
+            continue
+        if (owner is not root or any(not low<=tuple(region[:2])<tuple(region[2:4])<=high
+                                     or not 0<=region[4]<COUNTER_LIMIT for region in touching)):
+            return None
+        scope.extend(touching)
+    _construct_charge(work,3*len(scope)+high[0]-low[0]+1)
+    observed={tuple(r[:4]):r[4] for r in scope}
+    if (len(observed)!=len(scope) or observed.get(expected_entry)!=root['count']
+            or [tuple(r[:4]) for r in scope if r[0]<=line<=r[2]]!=[expected_entry]
+            or any(slot not in observed for slot in (*markers,*entries))
+            or any(not count and region not in markers for region,count in observed.items())
+            or _owner_line_counts({'regions':scope},_ObserverWork(work))!={
+                n:mapped[n] for n in range(low[0],high[0]+1) if n in mapped}):
+        return None
+    return (shape.identity,anchor,tuple(bool(observed[slot]) for slot in (*markers,*entries)),
+            dict(owner=symbol,span=[*low,*high],entry=list(expected_entry),regions=scope))
 
 
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
@@ -3383,12 +3616,20 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         prefix, bg, hg = candidates[0]
         if len(bg[2]) != len(hg[2]):
             refuse()
-        if (b-a==4 and d-c==4 and macro_expansions==([],[]) and construct_inventories is not None
-                and _INITIAL_TEST_RECORD.fullmatch(old[a])):
-            observations = [initial_async_test_record(name,source,counts,group,inventories[side],
+        async_fragment = None
+        if b-a==4 and _INITIAL_TEST_RECORD.fullmatch(old[a]):
+            async_fragment = initial_async_test_record
+        elif b-a==1 and _TEST_EXPECTED_ERROR.fullmatch(old[a]):
+            async_fragment = async_test_expected_error
+        elif b-a==1 and tuple(pending)==(b,) and old[a].strip()=='assert!(matches!(':
+            async_fragment = async_test_expected_variant
+        if async_fragment is not None and macro_expansions==([],[]) and construct_inventories is not None:
+            observations = [async_fragment(name,source,counts,group,inventories[side],
                 inventory_names[side],construct_inventories[side],first,last,work)
                 for side,(source,counts,group,first,last) in enumerate(((old,before,bg,a+1,b),(new,after,hg,c+1,d)))]
-            if all(observations) and observations[0][0]==observations[1][0]:
+            if (all(observations) and observations[0][0]==observations[1][0]
+                and (async_fragment is not async_test_expected_variant or
+                         [entry[1]['wrapped'] for entry in observations]==[True,False])):
                 matched = [(line,line+c-a) for line in pending]
                 if any(line in pairs and pairs[line]!=target for line,target in matched):
                     refuse()
@@ -3397,7 +3638,10 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     first,last=group[:2]
                     _construct_charge(work,sum(len(line)+1 for line in source[first-1:last]))
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
-                receipts.append(dict(kind='initial-async-test-record',file=name,pairs=matched,
+                kind = {initial_async_test_record:'initial-async-test-record',
+                        async_test_expected_error:'async-test-expected-error-call',
+                        async_test_expected_variant:'async-test-expected-variant-entry'}[async_fragment]
+                receipts.append(dict(kind=kind,file=name,pairs=matched,
                     owners=[observation[1] for observation in observations]))
                 continue
         if (construct_inventories is not None and macro_expansions==([],[]) and prefix in callback_functions
@@ -3414,6 +3658,25 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                 pairs[b]=d
                 receipts.append(dict(file=name,kind='retained-test-queue-expectation',
                     pairs=[[b,d]],iterations=queue[0][1],owners=[value[2] for value in queue],
+                    callback_fragments=[dict(pairs=[[b,d]],base_range=[b,b],head_range=[d,d])]))
+                for side,(source,group) in enumerate(((old,bg),(new,hg))):
+                    first,last=group[:2]
+                    _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
+                    excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
+                continue
+        if (construct_inventories is not None and macro_expansions==([],[])
+                and a+1==b and c+1==d and tuple(pending)==(b,)
+                and old[a].strip() in ('assert!(','assert_eq!(')):
+            assertion=[retained_direct_unit_assertion(name,source,line,mapped,group,inventories[side],
+                       inventory_names[side],files,construct_inventories[side],work)
+                   for side,(source,line,mapped,group,files) in enumerate(
+                       ((old,b,before,bg,base_files),(new,d,after,hg,head_files)))]
+            if all(assertion) and assertion[0][:3]==assertion[1][:3]:
+                if b in pairs and pairs[b]!=d:
+                    refuse()
+                pairs[b]=d
+                receipts.append(dict(file=name,kind='retained-direct-unit-assertion',pairs=[[b,d]],
+                    anchor=assertion[0][1],states=assertion[0][2],owners=[value[3] for value in assertion],
                     callback_fragments=[dict(pairs=[[b,d]],base_range=[b,b],head_range=[d,d])]))
                 for side,(source,group) in enumerate(((old,bg),(new,hg))):
                     first,last=group[:2]
@@ -5999,6 +6262,120 @@ def retained_projected_iterator_obligations(name,sources,counts,descriptors,inve
     return pairs,receipts,proved
 
 
+def positive_sync_fixture_change(descriptors,inventories,work):
+    """Admit only one pure local fixture field addition before owner indexing."""
+    codes=[i[0] for i in inventories];functions=[d['row'] for d in descriptors]
+    if any(r['end']-r['first']>2048 for r in functions):return None
+    _construct_charge(work,sum(r['end']-r['first']+1 for r in functions))
+    words=[c.words[r['first']:r['end']+1] for c,r in zip(codes,functions)]
+    if len(words[1])==len(words[0])+6:
+        at=next((n for n,(a,b) in enumerate(zip(*words)) if a!=b),None)
+        if at is not None:
+            added=words[1][at:at+6]
+            if (added[1::2]==[':','::',','] and all(re.fullmatch(r'[A-Za-z_]\w*',added[n],re.ASCII) for n in (0,2,4))
+                    and words[0]==words[1][:at]+words[1][at+6:]):
+                parents=[c.parents[r['first']+at] for c,r in zip(codes,functions)]
+                if all(parent is not None and c.words[parent]=='{' and c.words[parent-2]=='='
+                        and re.fullmatch(r'[A-Za-z_]\w*',c.words[parent-1],re.ASCII)
+                        and (c.words[parent-4]=='let' or c.words[parent-5:parent-3]==['let','mut'])
+                        for c,parent in zip(codes,parents)):
+                    return 'scalar-record-field'
+    values=[];bindings=[]
+    def unique_fields(pairs):
+        value={}
+        for key,item in pairs:
+            if key in value:raise ValueError('duplicate fixture key')
+            value[key]=item
+        return value
+    for code,fn in zip(codes,functions):
+        first=fn['opening']+1;prefix=code.words[first:first+8]
+        if (len(prefix)!=8 or prefix[0]!='let' or prefix[2:]!=['=','serde_json','::','json','!','(']
+                or re.fullmatch(r'[A-Za-z_]\w*',prefix[1],re.ASCII) is None):return None
+        opening=first+7;closing=code.pairs[opening]
+        if code.words[closing+1]!=';':return None
+        text=code.text[code.ends[opening]:code.starts[closing]]
+        if len(text)>8192:return None
+        _construct_charge(work,len(text)+1)
+        try:value=json.loads(text,object_pairs_hook=unique_fields)
+        except (ValueError,RecursionError):return None
+        pending=[(value,0)];nodes=0
+        while pending:
+            item,depth=pending.pop();nodes+=1;_construct_charge(work,1)
+            if nodes>128 or depth>16:return None
+            if type(item) is dict:pending.extend((v,depth+1) for v in item.values())
+            elif type(item) is list:pending.extend((v,depth+1) for v in item)
+            elif type(item) not in (str,int,bool,type(None)):return None
+        bindings.append(prefix[1]);values.append(value)
+    if bindings[0]!=bindings[1]:return None
+    added=0;pending=[tuple(values)]
+    while pending:
+        old,new=pending.pop();_construct_charge(work,1)
+        if type(old) is not type(new):return None
+        if type(old) is dict:
+            if not old.keys()<=new.keys():return None
+            added+=len(new.keys()-old.keys());pending.extend((v,new[k]) for k,v in old.items())
+        elif type(old) is list:
+            if len(old)!=len(new):return None
+            pending.extend(zip(old,new))
+        elif old!=new:return None
+    return 'literal-json-field' if added==1 else None
+
+
+def positive_sync_test_slots(descriptor,inventory,source,work):
+    """Recognize a small sync unit routine with only direct expression callbacks."""
+    code=inventory[0];fn=descriptor['row'];first,last=fn['opening']+1,fn['end']
+    if last-first>2048:return None
+    _construct_charge(work,last-first+1)
+    words=code.words[first:last]
+    if any(w in ('fn','struct','enum','impl','trait','mod','type','union','unsafe','async','move','||') for w in words):return None
+    low,high=code.position(code.starts[fn['first']])[0],code.position(code.ends[fn['end']])[0]
+    _construct_charge(work,sum(len(line)+1 for line in source[low-1:high]))
+    if any(not line.isascii() for line in source[low-1:high]):return None
+    slots=[];at=first
+    while at<last:
+        _construct_charge(work,1)
+        if code.words[at]!='|':at+=1;continue
+        call=code.parents[at]
+        if (call is None or code.words[call]!='(' or code.words[call-2]!='.'
+                or code.words[call-1] not in ('map','any','find') or call+1!=at):return None
+        if code.words[at+2:at+3]==['|']:
+            variable=code.words[at+1];body=at+3
+        elif code.words[at+1:at+4]==['(','_',','] and code.words[at+5:at+7]==[')','|']:
+            variable=code.words[at+4];body=at+7
+        else:return None
+        if re.fullmatch(r'[A-Za-z_]\w*',variable,re.ASCII) is None:return None
+        end=code.pairs[call]-1
+        if (not body<=end<last or end-body>64 or any(w in ('{','}','|','||','async','!') for w in code.words[body:end+1])
+                or any(code.parents[n]==call and code.words[n]==',' for n in range(body,end+1))):return None
+        begin,finish=code.position(code.starts[body]),code.position(code.ends[end])
+        if begin[0]!=finish[0]:return None
+        slots.append((begin,finish,code.words[call-1],tuple(code.words[at:body])))
+        if len(slots)>2:return None
+        _construct_charge(work,end-body+1);at=end+1
+    return tuple(slots)
+
+
+def positive_sync_callback_members(root,forest,slots,work):
+    """Close every direct expression callback to one exact source argument slot."""
+    shape=plain_rust_function_symbol(root['name'])
+    if shape is None:return None
+    _construct_charge(work,sum(len(o['name'])+len(o['regions'])+1 for o in forest))
+    children=[o for o in forest if direct_rust_callback_symbol(o['name'],root['name'],shape.modules)]
+    if len(children)!=len(slots):return None
+    selected=[];roles=[]
+    for first,last,method,header in slots:
+        _construct_charge(work,sum(len(o['regions'])+1 for o in children))
+        matches=[o for o in children if all(first<=tuple(r[:2])<tuple(r[2:4])<=last for r in o['regions'])]
+        if len(matches)!=1:return None
+        owner=matches[0];quantity=owner.get('count')
+        if (any(owner is other for other in selected)
+                or type(quantity) is not int or not 0<quantity<COUNTER_LIMIT
+                or min(tuple(r[:2]) for r in owner['regions'])!=first
+                or any(r[4]!=quantity for r in owner['regions'])):return None
+        selected.append(owner);roles.append((method,header,first,last,owner['name']))
+    return selected,tuple(roles)
+
+
 def positive_local_impl_members(descriptor, root, forest, inventory, work):
     """Bind source-local trait methods to their enclosing async test copy."""
     code,rows=inventory[:2];function=descriptor['row'];plain=plain_rust_function_symbol(root['name'])
@@ -6058,24 +6435,41 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
     """Retain source only through a complete positive forest of the same test."""
     if indexes_factory is None or expansions!=([],[]):return {},[],set()
     allowed=(('#','[','test',']'),('#','[','tokio','::','test',']','async'))
-    candidates=[]
+    candidates=[];sync_shapes={}
+    _construct_charge(work,sum(len(d) for d in descriptors))
+    digests=[{} for _ in descriptors]
+    for side,functions in enumerate(descriptors):
+        for d in functions.values():digests[side].setdefault(d['declaration'],set()).add(d['row']['digest'])
     for side,(inventory,functions) in enumerate(zip(inventories,descriptors)):
         code=inventory[0];chosen={};_construct_charge(work,len(functions))
         for descriptor in functions.values():
             row=descriptor['row'];header=tuple(row['header']);at=header.index('fn');declaration=header[at+1]
-            if (header[:at] not in ((allowed[1],) if side==0 else allowed)
-                    or header[at:]!=('fn',declaration,'(',')')):continue
+            if (header[:at] not in allowed or header[at:]!=('fn',declaration,'(',')')):continue
+            if side==0 and header[:at]==allowed[0] and row['digest'] in digests[1].get(declaration,()):continue
             context=_boolean_module(code,{'start':row['first']})
             if context is None or context[:2]!=(['tests'],['tests']):continue
             chosen.setdefault(declaration,[]).append(descriptor)
         candidates.append(chosen)
-    potential=[]
+    potential=[];sync_potential=[]
     for declaration,previous in candidates[0].items():
         current=candidates[1].get(declaration,[])
         if len(previous)!=1 or len(current)!=1:continue
         chosen=(previous[0],current[0])
         if chosen[0]['row']['digest']!=chosen[1]['row']['digest']:
-            potential.append((declaration,chosen))
+            if tuple(chosen[0]['attributes'])==allowed[0]:
+                if tuple(chosen[1]['attributes'])!=allowed[0]:continue
+                fixture=positive_sync_fixture_change(chosen,inventories,work)
+                if fixture is None:continue
+                _construct_charge(work,sum(len(o['regions'])+1 for d in chosen for o in d['group'][2]))
+                if any(type(o.get('count')) is not int or not 0<o['count']<COUNTER_LIMIT
+                        or any(not 0<r[4]<COUNTER_LIMIT for r in o['regions']) for d in chosen for o in d['group'][2]):continue
+                _construct_charge(work,sum(d['group'][1]-d['group'][0]+1 for d in chosen))
+                if any(any(da.get(n,1)<=0 for n in range(d['group'][0],d['group'][1]+1)) for da,d in zip(counts,chosen)):continue
+                slots=tuple(positive_sync_test_slots(d,i,s,work) for d,i,s in zip(chosen,inventories,sources))
+                if any(s is None for s in slots) or any(len(s)!=(0 if fixture=='scalar-record-field' else 2) for s in slots):continue
+                sync_shapes[declaration]=slots;sync_potential.append((declaration,chosen))
+            else:potential.append((declaration,chosen))
+    if len(sync_potential)<=16:potential.extend(sync_potential)
     if not potential:return {},[],set()
     indexes=indexes_factory();buckets=[]
     for side,index in enumerate(indexes):
@@ -6090,7 +6484,7 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
             _construct_charge(work,2*(len(spans).bit_length()+1))
             for position in range(bisect.bisect_left(ends,low),bisect.bisect_right(starts,high)):
                 first,last,declaration=spans[position];_construct_charge(work,len(owner['regions'])+1)
-                if any(tuple(r[:2])<(last+1,1) and (first,1)<tuple(r[2:4]) for r in owner['regions']):
+                if declaration in sync_shapes or any(tuple(r[:2])<(last+1,1) and (first,1)<tuple(r[2:4]) for r in owner['regions']):
                     result[declaration].append(owner)
         buckets.append(result)
     pairs={};targets={};receipts=[];proved=set()
@@ -6103,12 +6497,12 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
             for inventory,descriptor,group in zip(inventories,chosen,groups)]
         if any(not (lexical[0][0]<=r['base_range'][0]<=r['base_line']<=r['base_range'][1]<=lexical[0][1]
             and lexical[1][0]<=r['head_range'][0]<=r['head_line']<=r['head_range'][1]<=lexical[1][1]) for r in related):continue
-        roles=[];forests=[];local_forests=[];local_roles=[];valid=True
+        roles=[];forests=[];local_forests=[];local_roles=[];sync_roles=[];scope_forests=[];valid=True
         for side,(descriptor,inventory,index,group) in enumerate(zip(chosen,inventories,indexes,groups)):
             code=inventory[0];function=descriptor['row'];first,last=group[:2]
             forest=buckets[side][declaration]
             _construct_charge(work,sum(len(o['name'])+len(o['regions'])+1 for o in forest))
-            roots=group[2];owned=set();identities=[];copies=[];locals_for_side=[];roles_for_side=[]
+            roots=group[2];owned=set();identities=[];copies=[];locals_for_side=[];roles_for_side=[];sync_for_side=[]
             for root in roots:
                 shape=plain_rust_function_symbol(root['name'])
                 if (shape is None or shape.identifiers[-2:]!=('tests',declaration)
@@ -6122,9 +6516,13 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
                         and [r[4] for r in o['regions'] if tuple(r[:4])==(*entry,entry[0],entry[1]+1)]==[root['count']]]
                     if len(children)!=1:valid=False;break
                     members+=children
-                local=positive_local_impl_members(descriptor,root,forest,inventory,work)
+                local=([],()) if declaration in sync_shapes else positive_local_impl_members(descriptor,root,forest,inventory,work)
                 if local is None:valid=False;break
                 extra,local_role=local;members+=extra;locals_for_side.extend(extra);roles_for_side.append(local_role)
+                if declaration in sync_shapes:
+                    sync=positive_sync_callback_members(root,forest,sync_shapes[declaration][side],work)
+                    if sync is None:valid=False;break
+                    children,sync_role=sync;members+=children;locals_for_side.extend(children);sync_for_side.append(sync_role)
                 for member in members:
                     if (id(member) in owned or index.name_counts[member['name']]!=1 or len(member['filenames'])!=1
                             or index.files.get(member['filenames'][0])!=name or member.get('branches') or member.get('mcdc_records')
@@ -6134,11 +6532,18 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
                 if not valid:break
                 identities.append(shape.identity);copies.append([o['name'] for o in members])
             if not valid or not roots or owned!={id(o) for o in forest}:valid=False;break
-            roles.append(Counter(identities));forests.append(copies);local_forests.append(tuple(locals_for_side));local_roles.append(tuple(roles_for_side))
+            roles.append(Counter(identities));forests.append(copies);local_forests.append(tuple(locals_for_side));local_roles.append(tuple(roles_for_side));sync_roles.append(tuple(sync_for_side));scope_forests.append(forest)
         if not valid or roles[0]!=roles[1] or local_roles[0]!=local_roles[1]:continue
         selected=[r for r in replacements.values() if groups[0][0]<=r['base_line']<=groups[0][1]
                   and groups[1][0]<=r['head_line']<=groups[1][1]]
-        covered=fully_covered_replacement(name,*sources,*counts,chosen,grouped,selected,equal_rows,work,tuple(local_forests))
+        proof_counts=counts;proof_groups=grouped;proof_equal=equal_rows
+        if declaration in sync_shapes:
+            # The complete overlap index above already closes these exact scopes.
+            _construct_charge(work,len(equal_rows)+sum(g[1]-g[0]+1 for g in groups))
+            proof_counts=tuple({n:da[n] for n in range(g[0],g[1]+1) if n in da} for da,g in zip(counts,groups))
+            proof_groups=tuple((forest,{},Counter(o['name'] for o in forest)) for forest in scope_forests)
+            proof_equal=[(n,m) for n,m in equal_rows if groups[0][0]<=n<=groups[0][1] and groups[1][0]<=m<=groups[1][1]]
+        covered=fully_covered_replacement(name,*sources,*proof_counts,chosen,proof_groups,selected,proof_equal,work,tuple(local_forests))
         if covered is None:continue
         mapped,receipt=covered
         _construct_charge(work,len(mapped)+len(targets))
@@ -6146,7 +6551,7 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
             raise ValueError('Ambiguous same-qualified test correspondence')
         pairs.update(mapped);targets.update((target,line) for line,target in mapped.items())
         receipt.update(kind='same-qualified-positive-test',declaration=declaration,phase_forests=forests,
-            root_roles=[repr(role) for role in roles[0]],local_impl_roles=local_roles,
+            root_roles=[repr(role) for role in roles[0]],local_impl_roles=local_roles,sync_callback_roles=sync_roles,
             claim='Same qualified zero-arg test; every raw owner and region positive; changed calls not semantically equated; zero deletion credit')
         receipts.append(receipt);proved.add(groups[0][:2])
     return pairs,receipts,proved
@@ -6522,15 +6927,20 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         raise ValueError('Ambiguous projected iterator and retained correspondence')
     extra_pairs.update(projection_pairs);extra_receipts.extend(projection_receipts);extra_proved.update(projection_proved)
     candidates = []; receiver_candidates = []
-    for left_prefix, left in descriptors[0].items():
+    previous, current = descriptors
+    _construct_charge(work,len(current))
+    added_functions = [(prefix, descriptor) for prefix, descriptor in current.items() if prefix not in previous]
+    test_attributes = (['#', '[', 'test', ']'], ['#', '[', 'tokio', '::', 'test', ']', 'async'])
+    for left_prefix, left in previous.items():
         if left['group'][:2] in extra_proved:
             continue
-        for right_prefix, right in descriptors[1].items():
+        same_function = current.get(left_prefix)
+        right_candidates = [(left_prefix, same_function)] if same_function is not None else added_functions
+        for right_prefix, right in right_candidates:
             _construct_charge(work, 1)
             method_migration = (left_prefix != right_prefix
                 and all(nominal_method_parent(owner['name'], descriptor['declaration']) is not None
                         for descriptor in (left, right) for owner in descriptor['group'][2]))
-            test_attributes = (['#', '[', 'test', ']'], ['#', '[', 'tokio', '::', 'test', ']', 'async'])
             complete_test_rewrite = (left_prefix != right_prefix
                 and left['attributes'] in test_attributes and right['attributes'] in test_attributes
                 and left['context'][0] == right['context'][0]
@@ -6550,8 +6960,6 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     ['pub'], ['pub', '(', 'crate', ')'])
                 if (left['attributes'] not in ([], ['#', '[', 'test', ']'])
                         and not public_method and not complete_test_rewrite):
-                    continue
-                if left_prefix in descriptors[1] or right_prefix in descriptors[0]:
                     continue
                 _construct_charge(work, sum(len(owner['name']) + 1 for descriptor in (left, right)
                                             for owner in descriptor['group'][2]))

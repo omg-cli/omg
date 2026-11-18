@@ -1066,6 +1066,12 @@ fn install_managed_blocking(
                 "Unknown package manager '{manager}'. Supported: npm, cargo, pip, go, pacman"
             ),
         }
+        if let Some(admission) = &npm_admission {
+            admission.verify(&staging_dir)?;
+        }
+        if let Some(admission) = &tool_admission {
+            admission.verify(&staging_dir)?;
+        }
         Ok(())
     };
     let outcome: Result<()> = run_install();
@@ -1075,22 +1081,6 @@ fn install_managed_blocking(
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
-    if let Some(admission) = &npm_admission
-        && let Err(error) = admission.verify(&staging_dir)
-    {
-        pb.finish_and_clear();
-        let _ = fs::remove_dir_all(&staging_dir);
-        return Err(error);
-    }
-
-    if let Some(admission) = &tool_admission
-        && let Err(error) = admission.verify(&staging_dir)
-    {
-        pb.finish_and_clear();
-        let _ = fs::remove_dir_all(&staging_dir);
-        return Err(error);
-    }
-
     if let Err(error) = validate_tool_binary_containment(&staging_dir) {
         pb.finish_and_clear();
         let _ = fs::remove_dir_all(&staging_dir);
@@ -1101,15 +1091,11 @@ fn install_managed_blocking(
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
     }
-    if let Err(error) = write_security_receipt(&staging_dir, manager, pkg) {
-        pb.finish_and_clear();
-        let _ = fs::remove_dir_all(&staging_dir);
-        return Err(error);
-    }
-
-    if let Some(admission) = &tool_admission
-        && let Err(error) = admission.verify(&staging_dir)
-    {
+    if let Err(error) = write_security_receipt(&staging_dir, manager, pkg).and_then(|()| {
+        tool_admission
+            .as_ref()
+            .map_or(Ok(()), |admission| admission.verify(&staging_dir))
+    }) {
         pb.finish_and_clear();
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(error);
@@ -1810,11 +1796,11 @@ with zipfile.ZipFile(sys.argv[1], 'w') as archive:
             .arg(&staging)
             .output()
             .expect("real offline venv");
+        let stdout = String::from_utf8_lossy(&created.stdout);
+        let stderr = String::from_utf8_lossy(&created.stderr);
         assert!(
             created.status.success(),
-            "stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&created.stdout),
-            String::from_utf8_lossy(&created.stderr)
+            "stdout: {stdout}\nstderr: {stderr}"
         );
         let installed_wheel = Command::new(staging.join("bin/python"))
             .args([
@@ -1829,11 +1815,8 @@ with zipfile.ZipFile(sys.argv[1], 'w') as archive:
             .arg(&wheel)
             .output()
             .expect("genuine offline wheel installation");
-        assert!(
-            installed_wheel.status.success(),
-            "{}",
-            String::from_utf8_lossy(&installed_wheel.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&installed_wheel.stderr);
+        assert!(installed_wheel.status.success(), "{stderr}");
         validate_tool_binary_containment(&staging).expect("real pip payload is contained");
         relocate_venv_entry_points(&staging, &installed)
             .expect("production entry point relocation");
@@ -2291,12 +2274,9 @@ esac
             .arg(std::env::current_exe().unwrap())
             .output()
             .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
             let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(result["passed"], 16);
             assert_eq!(result["cases"].as_array().unwrap().len(), 16);
@@ -3178,6 +3158,91 @@ exit 1
         assert!(names.contains(&"custom-tool".to_string()));
         assert!(!names.contains(&"github.com".to_string()));
         assert!(!names.contains(&"diesel_cli".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewed_go_tool_publishes_payload_and_receipts() -> Result<()> {
+        let (fixture, advisories) =
+            crate::runtimes::tool_artifacts::managed_go_publication_fixture()?;
+        let tools = fixture.path().join("tools");
+        let bin = fixture.path().join("bin");
+        fs::create_dir(&bin)?;
+        install_managed_with_advisories(
+            "go",
+            "example.com/tool@v1.2.3",
+            "fixture-tool",
+            &tools,
+            &bin,
+            advisories,
+            crate::runtimes::security::RuntimeSecurity::fixture(),
+        )
+        .await?;
+
+        let destination = tools.join("go/fixture-tool");
+        let launcher = bin.join("fixture-tool");
+        let installed_binary = destination.join("bin/fixture-tool");
+        let advisory_receipt = destination.join(".omg-package-advisory-review.json");
+        assert_eq!(fs::read_link(&launcher)?, installed_binary);
+        let launcher_bytes = fs::read(launcher)?;
+        assert_eq!(launcher_bytes, b"#!/bin/sh\necho reviewed-tool-success\n");
+        assert!(advisory_receipt.is_file());
+        assert!(destination.join(".omg-security-receipt.json").is_file());
+        assert_eq!(fs::read_dir(tools.join("go"))?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_tool_receipt_write_preserves_previous_install() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir()?;
+        let tools = fixture.path().join("tools");
+        let bin = fixture.path().join("bin");
+        let previous = tools.join("npm/fixture-tool/bin/fixture-tool");
+        fs::create_dir_all(previous.parent().context("previous tool directory")?)?;
+        fs::write(&previous, b"previous tool fixture")?;
+        fs::create_dir(&bin)?;
+        symlink(&previous, bin.join("fixture-tool"))?;
+
+        let npm = fixture.path().join("npm");
+        fs::write(
+            &npm,
+            br#"#!/bin/sh
+set -eu
+fixture=$(dirname "$0")
+case "$1" in
+  install) cp "$fixture/lock.fixture.json" "$3/package-lock.json" ;;
+  ci)
+    mkdir -p "$3/node_modules/.bin" "$3/node_modules/fixture-tool" "$3/.omg-security-receipt.json"
+    printf '%s' '{"name":"fixture-tool","version":"1.0.0"}' > "$3/node_modules/fixture-tool/package.json"
+    printf '#!/bin/sh\nexit 0\n' > "$3/node_modules/.bin/fixture-tool"
+    chmod 755 "$3/node_modules/.bin/fixture-tool"
+    ;;
+  audit)
+    test -f "$4/node_modules/.bin/fixture-tool"
+    printf verified > "$fixture/verified"
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        )?;
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755))?;
+        prepare_managed_npm_fixture(&tools, &npm);
+
+        let error = install_managed_fixture("npm", "fixture-tool", "fixture-tool", &tools, &bin)
+            .await
+            .expect_err("receipt write failure must stop publication");
+        let diagnostic = format!("{error:#}");
+        let refused_receipt = diagnostic.contains("Write tool security receipt");
+        assert!(refused_receipt, "{diagnostic}");
+        assert_eq!(fs::read(fixture.path().join("verified"))?, b"verified");
+        assert_eq!(fs::read_link(bin.join("fixture-tool"))?, previous);
+        let unchanged_launcher = fs::read(bin.join("fixture-tool"))?;
+        assert_eq!(unchanged_launcher, b"previous tool fixture");
+        assert_eq!(fs::read_dir(tools.join("npm"))?.count(), 1);
+        Ok(())
     }
 
     /// W4-A-01 regression: a failed install must leave the previously working

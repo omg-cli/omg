@@ -448,6 +448,7 @@ mod runtime_matrix {
 import contextlib, errno, fcntl, os, pty, select, signal, struct, sys, termios, time
 
 binary, moves, source, package, expected = sys.argv[1:]
+pacman = moves == "0"
 pid, terminal = pty.fork()
 if pid == 0:
     os.execv(binary, [binary, 'tool', 'install', package])
@@ -455,6 +456,7 @@ if pid == 0:
 transcript = bytearray()
 status = None
 selected = False
+declined = False
 deadline = time.monotonic() + 20
 try:
     fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack('HHHH', 30, 120, 0, 0))
@@ -471,13 +473,17 @@ try:
             if not selected and b'Source?' in transcript and source.encode() in transcript:
                 os.write(terminal, b'\x1b[B' * int(moves) + b'\r')
                 selected = True
+            elif selected and pacman and not declined and b'Proceed with installation of 1 package(s)?' in transcript:
+                os.write(terminal, b'\r')
+                declined = True
             if not text:
                 child, value = os.waitpid(pid, os.WNOHANG)
                 if child:
                     status = value
                     break
     assert status is not None, 'tool process exceeded its fixture deadline'
-    assert selected and os.waitstatus_to_exitcode(status) == 1
+    assert selected and (not pacman or declined)
+    assert os.waitstatus_to_exitcode(status) == (0 if pacman else 1)
     assert expected.encode() in transcript
 finally:
     os.close(terminal)
@@ -488,6 +494,13 @@ finally:
     sys.stdout.buffer.write(transcript)
 "#;
         for (moves, source, runtime, package, expected) in [
+            (
+                "0",
+                "Pacman (System)",
+                "",
+                "omg-tool-source-fixture",
+                "Installation cancelled",
+            ),
             (
                 "1",
                 "Cargo (Isolated)",
@@ -517,6 +530,11 @@ finally:
                 "Package installation requires a selected OMG-managed go",
             ),
         ] {
+            if moves == "0"
+                && !(cfg!(feature = "arch") && std::path::Path::new("/etc/arch-release").is_file())
+            {
+                continue;
+            }
             let owner = tempfile::tempdir_in("/var/tmp")?;
             let home = owner.path();
             let data = home.join("data/omg");
@@ -544,6 +562,11 @@ finally:
                 .env("OMG_NATIVE_TEST_DATA_DIR", "1")
                 .env("OMG_DATA_DIR", &data)
                 .current_dir(home);
+            if moves == "0" {
+                command
+                    .env("OMG_PACMAN_ROOT", home.join("pacman-root"))
+                    .env("OMG_PACMAN_CONF", home.join("absent-pacman.conf"));
+            }
             for key in ["LLVM_PROFILE_FILE", "LD_LIBRARY_PATH"] {
                 if let Some(value) = std::env::var_os(key) {
                     command.env(key, value);
@@ -552,7 +575,7 @@ finally:
             let output = command.output()?;
             assert!(
                 output.status.success(),
-                "{source} PTY refusal failed:\n{}\n{}",
+                "{source} PTY install guard failed:\n{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );

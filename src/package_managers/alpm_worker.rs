@@ -241,10 +241,8 @@ mod tests {
         let sentinel_bytes = b"%NAME%\nalias-only\n\n%VERSION%\n99-1\n\n%REASON%\n0\n\n";
         std::fs::write(&sentinel, sentinel_bytes)?;
         let config = owner.path().join("pacman.conf");
-        std::fs::write(
-            &config,
-            "[options]\nSigLevel = Never\nArchitecture = x86_64\n",
-        )?;
+        let settings = "[options]\nSigLevel = Never\nArchitecture = x86_64\n";
+        std::fs::write(&config, settings)?;
         temp_env::with_vars(
             [
                 ("OMG_PACMAN_CONF", Some(config.as_os_str())),
@@ -269,13 +267,7 @@ mod tests {
                             ("OMG_PACMAN_ROOT", Some(selected_root.as_os_str())),
                             ("OMG_PACMAN_DB_DIR", Some(selected_database.as_os_str())),
                         ],
-                        || match AlpmWorker::new() {
-                            Ok(worker) => {
-                                drop(worker);
-                                None
-                            }
-                            Err(error) => Some(format!("{error:#}")),
-                        },
+                        || AlpmWorker::new().err().map(|error| format!("{error:#}")),
                     );
                     outcomes.push((field, outcome));
                 }
@@ -368,6 +360,19 @@ mod tests {
                     Ok(())
                 };
                 assert_update("1-1", "2-1")?;
+                assert_update("1-1", "2-1")?;
+
+                let saved_config = config.with_extension("saved");
+                std::fs::rename(&config, &saved_config)?;
+                let refresh = futures::executor::block_on(worker.list_updates());
+                std::fs::rename(&saved_config, &config)?;
+                let error = refresh.expect_err("worker must return a catalog observation failure");
+                let diagnostic = format!("{error:#}");
+                assert!(
+                    diagnostic.contains("Failed to observe ALPM catalog epoch")
+                        && diagnostic.contains("Failed to resolve pacman configuration"),
+                    "{diagnostic}"
+                );
                 assert_update("1-1", "2-1")?;
 
                 write_sync("3-1")?;

@@ -388,6 +388,154 @@ class RetainedTestQueueExpectationTests(unittest.TestCase):
                 self.assertFalse(any(entry.get('kind')=='retained-test-queue-expectation' for entry in receipts))
 
 
+class RetainedDirectUnitAssertionTests(unittest.TestCase):
+    def compare(self, macro, fault=None):
+        old_condition,new_condition = {
+            'assert':('matches!(tx.try_send(req), Err(channel::SendError::Full(_)))',
+                      'matches!(&overflow, channel::SendError::Full(_))'),
+            'assert_eq':('normalize(Path::new("./demo")).unwrap()',
+                         'normalize(Path::new("demo"), false).unwrap()'),
+        }[macro]
+        expected='"expected"'
+        filename='/artifact/src/example.rs'
+        files={filename:'src/example.rs'}
+        sources=[]; counts=[]; documents=[]; inventories=[]
+        for side,condition in enumerate((old_condition,new_condition)):
+            if side and fault=='changed-anchor':
+                condition=condition.replace('Full','Closed').replace('normalize','different')
+            if side and fault=='changed-qualified-path':
+                condition=condition.replace('channel::','elsewhere::')
+            message='"wrong"' if side and fault=='changed-anchor' else expected
+            source=['#[cfg(test)]','mod tests {','    #[test]','    fn checked() {',
+                    f'        {macro}!(',f'            {condition},',f'            {message}','        );']
+            if side and fault=='ambiguous-anchor':
+                source.extend(source[4:8])
+            source.extend(['    }','}'])
+            sources.append(source)
+            def region(line, text, count=1):
+                col=source[line-1].index(text)+1
+                return [line,col,line,col+len(text),count,0,0,0]
+            regions=[region(4,'fn checked()'),region(5,macro+'!'),region(len(source)-1,'}')]
+            if macro=='assert':
+                regions.extend([region(6,'matches!',int(bool(side and fault=='changed-marker-state'))),
+                                region(6,'overflow' if side else 'try_send')])
+            else:
+                regions.extend([region(6,condition.split('(')[0]),region(6,'unwrap')])
+            if side and fault=='missing-opener':
+                del regions[1]
+            if side and fault=='cold-argument':
+                regions[-1][4]=0
+            root=dict(name=f'_RNvNtNtCs{side+1}_7omg_lib7example5tests7checked',
+                      filenames=[filename],regions=regions,count=1,branches=[],mcdc_records=[])
+            owners=[root]
+            if side and fault=='foreign-owner':
+                owners.append(dict(root,name='opaque',regions=[region(6,condition.split('(')[0])]))
+            work=[coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+            observer=coverage._ObserverWork(work)
+            counts.append(dict(coverage._llvm22_rows(coverage._llvm22_segments(
+                 [r for owner in owners for r in owner['regions']],observer),observer)))
+            documents.append(owners)
+            inventories.append(coverage._construct_inventory(source,work))
+        return coverage.positive_source_fragments(
+            'src/example.rs',*sources,*counts,*documents,files,files,[(4,5,4,5,[5])],
+            construct_inventories=inventories,macro_expansions=([],[]))
+
+    def test_assertion_entry_and_stable_operand_slots_are_bound(self):
+        for macro,states in (('assert',(False,)),('assert_eq',(True,True))):
+            with self.subTest(macro=macro):
+                pairs,receipts=self.compare(macro)
+                self.assertEqual(pairs,{5:5})
+                proof,=[entry for entry in receipts if entry['kind']=='retained-direct-unit-assertion']
+                self.assertEqual(proof['states'],states)
+                self.assertEqual(proof['callback_fragments'][0]['pairs'],[[5,5]])
+
+    def test_assertion_entry_refuses_lost_or_ambiguous_observations(self):
+        for macro in ('assert','assert_eq'):
+            faults=['changed-anchor','ambiguous-anchor','missing-opener','cold-argument','foreign-owner']
+            if macro=='assert':
+                faults.extend(('changed-marker-state','changed-qualified-path'))
+            for fault in faults:
+                with self.subTest(macro=macro,fault=fault):
+                    try:
+                        _,receipts=self.compare(macro,fault)
+                    except ValueError:
+                        continue
+                    self.assertFalse(any(entry.get('kind')=='retained-direct-unit-assertion' for entry in receipts))
+
+
+
+class AsyncTestExpectedVariantTests(unittest.TestCase):
+    def compare(self, fault=None):
+        files={'/src/example.rs':'src/example.rs'}
+        sources=[]; documents=[]; counts=[]; inventories=[]
+        for side in range(2):
+            source=['#[cfg(test)]','mod tests {','    #[tokio::test]',
+                    '    async fn verify() -> anyhow::Result<()> {',
+                    '        let error = fixture().await',
+                    '            .expect_err("owned fixture refused");',
+                    '        assert!(matches!(',
+                    '            error,' if side else '            error.downcast_ref::<Error>(),',
+                    '            Error::TooLow {' if side else '            Some(Error::TooLow {',
+                    '                grade: Grade::Community,',
+                    '                ..',
+                    '            }' if side else '            })',
+                    '        ));','        Ok(())','    }','}']
+            if side and fault=='changed-variant':
+                source[8]=source[8].replace('TooLow','Forbidden')
+            if side and fault=='changed-field':
+                source[9]=source[9].replace('grade:','required:')
+            if side and fault=='changed-value':
+                source[7]=source[7].replace('error','different')
+            if side and fault=='duplicate-label':
+                source[13]='        Err(anyhow::anyhow!("owned fixture refused"))'
+            opening=source[3].index('{')+1
+            def region(line, text, count=1):
+                col=source[line-1].index(text)+1
+                return [line,col,line,col+len(text),count,0,0,0]
+            root=dict(name=f'_RNvNtNtCs{side+1}_7omg_lib7example5tests6verify',
+                      filenames=list(files),count=1,regions=[[4,11,4,opening-1,1,0,0,0],region(15,'}')])
+            rows=[[4,opening,4,opening+1,1,0,0,0],region(6,'expect_err'),region(6,'"owned fixture refused"'),
+                  region(7,'assert!'),region(7,'matches!',int(bool(side and fault=='changed-cold-marker'))),
+                  region(8,'different' if side and fault=='changed-value' else 'error')]
+            if not side:
+                rows.append(region(8,'downcast_ref'))
+            if side and fault=='missing-marker':
+                del rows[4]
+            if side and fault=='extra-pattern-paint':
+                rows.append(region(10,'grade'))
+            child=dict(root,name='_RNC'+root['name'][2:]+'0B7_',regions=rows)
+            owners=[root,child]
+            if side and fault=='foreign-owner':
+                owners.append(dict(root,name='opaque',regions=[region(8,'error')]))
+            work=[coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+            observer=coverage._ObserverWork(work)
+            counts.append(dict(coverage._llvm22_rows(coverage._llvm22_segments(
+                 [r for owner in owners for r in owner['regions']],observer),observer)))
+            inventories.append(coverage._construct_inventory(source,work))
+            sources.append(source)
+            documents.append(owners)
+        return coverage.positive_source_fragments('src/example.rs',*sources,*counts,*documents,files,files,
+            [(6,7,6,7,[7])],construct_inventories=inventories,macro_expansions=([],[]))
+
+    def test_observes_opener_and_stable_cold_matches_marker(self):
+        pairs,receipts=self.compare()
+        self.assertEqual(pairs,{7:7})
+        witnesses=[entry for entry in receipts if entry.get('kind')=='async-test-expected-variant-entry']
+        self.assertEqual(len(witnesses),1)
+        self.assertEqual([[row[4] for row in item['regions']] for item in witnesses[0]['owners']],
+                         [[1,1,1,0,1,1],[1,1,1,0,1]])
+
+    def test_refuses_rebound_or_incomplete_evidence(self):
+        for fault in ('changed-variant','changed-field','changed-value','duplicate-label',
+                      'changed-cold-marker','missing-marker','extra-pattern-paint','foreign-owner'):
+            with self.subTest(fault=fault):
+                try:
+                    _,receipts=self.compare(fault)
+                except ValueError:
+                    continue
+                self.assertFalse(any(entry.get('kind')=='async-test-expected-variant-entry' for entry in receipts))
+
+
 class QualifiedFunctionCompletionTests(unittest.TestCase):
     def compare(self, fault=None):
         misleading = fault is not None and fault.startswith('misleading-')
@@ -3825,6 +3973,79 @@ class SourceAwareCoverageTests(unittest.TestCase):
        except ValueError:continue
        self.assertFalse(any(r.get('kind')=='projected-iterator-input' for r in result.get('retained_replacement_obligations',[])))
 
+    def closed_sync_fixture(self,callbacks=True,fault=None):
+     old=['#[cfg(test)]','mod tests {','    #[test]','    fn routine() {',
+          '        let finding = Row {','            id: "fixture",','        };']
+     if callbacks:old+=['        let values = items().map(|item| item.name()).collect::<Vec<_>>();',
+                       '        assert!(items().any(|item| item.name() == "fixture"));']
+     old+=['        assert!(finding.id == "fixture");','    }','}']
+     new=old[:5]+['            status: Status::Applicable,']+old[5:]
+     if callbacks:
+      old=[line.replace('Row {','serde_json::json!({').replace('id: "fixture",','"id": "fixture"').replace('        };','        });') for line in old]
+      new=old[:5]+['            "status": "applicable",']+old[5:]
+     if callbacks:new=[line.replace('.any(|item|','.find(|(_, item)|') for line in new]
+     if fault=='changed-json-value':new=[line.replace('"id": "fixture"','"id": "other"') for line in new]
+     elif fault=='live-json-value':new=[line.replace('"status": "applicable"','"status": side_effect()') for line in new]
+     elif fault=='impure-record-field':new=[line.replace('Status::Applicable','Status::from_code()') for line in new]
+     elif fault=='changed-old-assert':new=[line.replace('finding.id == "fixture"','finding.id == "other"') for line in new]
+     if fault=='foreign-context':new=[line.replace('mod tests','mod other') for line in new]
+     elif fault=='missing-test-gate':new[0]='#[cfg(feature = "other")]'
+     elif fault=='unknown-callback':new=[line.replace('.find(','.inspect(') for line in new]
+     elif fault=='block-callback':new=[line.replace('| item.name() == "fixture"','| { item.name() == "fixture" }') for line in new]
+     sources=[old,new];documents=[]
+     for side,source in enumerate(sources):
+      root=f'_RNvNtCs{side+1}_7example5tests7routine'
+      def row(line,start,end,count=1):return [line,start,line,end,count,0,0,0]
+      def owner(name,quantity,regions):return dict(name=name,count=quantity,filenames=['/src/example.rs'],regions=regions,branches=[],mcdc_records=[])
+      last=len(source)-1
+      members=[owner(root,1,[row(4,5,source[3].index('{')),row(5,9,len(source[4])+1),row(last-1,9,len(source[last-2])+1),row(last,5,6)])]
+      if callbacks:
+       for number,method in enumerate(('map','any' if side==0 else 'find')):
+        line=[n for n,text in enumerate(source,1) if 'item.name()' in text][number]
+        first=source[line-1].index('item.name()')+1;lastcol=first+len('item.name()' if number==0 else 'item.name() == "fixture"')
+        ordinal=('0','s_0')[number if side==0 else 1-number]
+        quantity=number+2
+        members.append(owner('_RNC'+root[2:]+ordinal+'B5_',quantity,[row(line,first,first+len('item.name'),quantity),row(line,first+len('item.name()'),lastcol,quantity)] if number else [row(line,first,first+len('item'),quantity),row(line,first+len('item.'),lastcol-2,quantity)]))
+      documents.append(members)
+     if fault=='cold-root':documents[1][0]['count']=0;documents[1][0]['regions'][0][4]=0
+     elif fault=='cold-child':documents[1][1]['count']=0;documents[1][1]['regions'][0][4]=0
+     elif fault=='hidden-child-region':documents[1][1]['regions'][-1][4]=0
+     elif fault=='missing-child':documents[1].pop()
+     elif fault=='foreign-child':documents[1][1]['name']=documents[1][1]['name'].replace('7routine','7another')
+     elif fault=='wrong-child-slot':documents[1][1]['regions'][0][1]-=1
+     elif fault=='raw-channel':documents[1][1]['regions'][0][5]=1
+     elif fault=='foreign-source':documents[1][1]['filenames']=['/src/other.rs']
+     elif fault=='extra-cold-copy':
+      for member in copy.deepcopy(documents[1]):
+       member['name']=member['name'].replace('Cs2_','Cs9_');member['count']=0
+       for r in member['regions']:r[4]=0
+       documents[1].append(member)
+     counts=[]
+     for members in documents:
+      work=coverage._ObserverWork();counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments([r for o in members for r in o['regions']],work),work)))
+     def owners(base,head):
+      for document,members in zip((base,head),documents):document['data'][0]['functions']=members;document['data'][0]['files'][0].update(expansions=[],branches=[],mcdc_records=[])
+     return self.compare(before=counts[0],after=counts[1],mutate=owners,sources=tuple({'example.rs':('\n'.join(s)+'\n').encode()} for s in sources))
+    def test_closed_sync_test_forest_preserves_root_and_expression_callback_ownership(self):
+     for callbacks in (False,True):
+      with self.subTest(callbacks=callbacks):
+       result=self.closed_sync_fixture(callbacks)
+       proof,=[r for r in result.get('retained_replacement_obligations',[]) if r.get('kind')=='same-qualified-positive-test']
+       self.assertEqual([len(s[0]) for s in proof['phase_forests']],[3,3] if callbacks else [1,1])
+       self.assertEqual(proof['mapped_credit'],[0,0]);self.assertEqual(proof['summary_credit'],[0,0])
+    def test_closed_sync_fixture_growth_preserves_prior_values_and_rejects_live_inputs(self):
+     for callbacks,fault in ((True,'changed-json-value'),(True,'live-json-value'),(False,'impure-record-field'),(False,'changed-old-assert')):
+      with self.subTest(fault=fault):
+       try:result=self.closed_sync_fixture(callbacks,fault)
+       except ValueError:continue
+       self.assertFalse(any(r.get('kind')=='same-qualified-positive-test' for r in result.get('retained_replacement_obligations',[])))
+    def test_closed_sync_cohort_refuses_cold_foreign_or_unsupported_members(self):
+     for fault in ('cold-root','cold-child','hidden-child-region','missing-child','foreign-child','wrong-child-slot','raw-channel','foreign-source','extra-cold-copy','foreign-context','missing-test-gate','unknown-callback','block-callback'):
+      with self.subTest(fault=fault):
+       try:result=self.closed_sync_fixture(True,fault)
+       except ValueError:continue
+       self.assertFalse(any(r.get('kind')=='same-qualified-positive-test' for r in result.get('retained_replacement_obligations',[])))
+
     def closed_record_field_forest_compare(self, kind='free', mutation=None):
         if kind == 'free':
             old = ['fn security_inventory() -> Vec<Row> {', '    with_handle(|handle| {',
@@ -4122,6 +4343,32 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertIsNone(observe(owners=(root,cold)))
         extra = dict(root, name='unexpected', regions=[child['regions'][1]])
         self.assertIsNone(observe(owners=(root,child,extra)))
+
+    def test_async_test_expected_error_claims_only_the_unchanged_result_call(self):
+        source = ['#[cfg(test)]', 'mod tests {', '    #[tokio::test]',
+                  '    async fn verify() -> anyhow::Result<()> {',
+                  '        let error = fixture().await', '            .expect_err("owned fixture refused");',
+                  '        Ok(())', '    }', '}']
+        opening = source[3].index('{')+1
+        root = dict(name='_RNvNtNtCs1_7omg_lib7example5tests6verify',
+                    filenames=['/src/example.rs'], count=1, regions=[
+                        [4,11,4,opening-1,1,0,0,0], [8,5,8,6,1,0,0,0]])
+        literal = '"owned fixture refused"'
+        start = source[5].index(literal)+1
+        child = dict(root, name='_RNC'+root['name'][2:]+'0B7_', regions=[
+            [4,opening,4,opening+1,1,0,0,0], [6,14,6,24,1,0,0,0], [6,start,6,start+len(literal),1,0,0,0]])
+
+        def observe(lines=source, owner=child):
+            return coverage.async_test_expected_error('src/example.rs', lines, {6:1},
+                (4,8,[root]), (root,owner), Counter((root['name'],owner['name'])),
+                coverage._construct_inventory(lines,[1_000_000]), 6, 6, [1_000_000])
+
+        self.assertEqual(observe()[1]['regions'], child['regions'][1:])
+        call_changed = source[:4]+['        let error = another_fixture()']+source[5:]
+        self.assertEqual(observe(lines=call_changed)[0], observe()[0])
+        self.assertIsNone(observe(lines=source[:4]+['        fixture().await']+source[5:]))
+        extra = dict(child, regions=child['regions']+[[6,13,6,14,1,0,0,0]])
+        self.assertIsNone(observe(owner=extra))
 
     def test_tail_record_insertion_retains_inherited_and_direct_field_regions(self):
         for direct_first in (False, True):

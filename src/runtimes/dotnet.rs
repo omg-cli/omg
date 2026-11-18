@@ -677,6 +677,41 @@ mod tests {
         assert!(select_sdk_file(&files, "linux-x64").is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn invalid_installed_publisher_receipt_preserves_selected_sdk() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let versions_dir = fixture.path().join("dotnet");
+        let previous = versions_dir.join("9.0.316");
+        let candidate = versions_dir.join("9.0.317");
+        fs::create_dir_all(&previous)?;
+        fs::create_dir_all(&candidate)?;
+        fs::write(previous.join("dotnet"), b"previous SDK fixture")?;
+        fs::write(candidate.join("dotnet"), b"candidate SDK fixture")?;
+        let current = versions_dir.join("current");
+        std::os::unix::fs::symlink(&previous, &current)?;
+
+        crate::runtimes::security::fixture_install_identity("dotnet", &candidate)?;
+        let mut receipts = fs::read_dir(versions_dir.join(".security"))?;
+        let receipt = receipts.next().context("candidate publisher receipt")??;
+        let receipt_name = receipt.file_name();
+        assert!(receipt_name.to_string_lossy().ends_with(".identity.json"));
+        assert!(receipts.next().is_none());
+        fs::write(receipt.path(), b"{}")?;
+
+        let manager = DotnetManager {
+            versions_dir,
+            security: crate::runtimes::security::RuntimeSecurity::fixture(),
+            client: download_client(),
+        };
+        let error = manager
+            .use_version("9.0.317")
+            .expect_err("invalid publisher receipt must refuse activation");
+        assert!(format!("{error:#}").contains("Invalid runtime publisher identity"));
+        assert_eq!(fs::read_link(current)?, previous);
+        Ok(())
+    }
+
     #[test]
     fn dotnet_rid_names_the_host_platform() {
         #[cfg(all(

@@ -457,6 +457,9 @@ pub(crate) fn scoped_future<T: Send>(
 }
 
 #[cfg(all(test, unix))]
+pub(crate) use tests::managed_go_publication_fixture;
+
+#[cfg(all(test, unix))]
 pub(super) mod tests {
     use super::*;
     use crate::core::security::scan::{AdvisoryProvenance, FindingApplicability, Vulnerability};
@@ -1089,6 +1092,18 @@ esac
             &source,
             "list -m\nmod download\nmod edit\nmod download\nlist -mod=readonly\nmod verify\nbuild -mod=readonly\n",
         )
+    }
+
+    pub(crate) fn managed_go_publication_fixture()
+    -> Result<(tempfile::TempDir, Arc<dyn VulnerabilitySource>)> {
+        let (owner, data, _) = fixture("go", "go", GO)?;
+        go_source(&data, "root", "example.com/tool", "v1.2.3")?;
+        go_source(&data, "dependency", "example.com/dependency", "v2.3.4")?;
+        let source = Arc::new(TransitiveFinding {
+            no_findings: true,
+            ..TransitiveFinding::default()
+        });
+        Ok((owner, source))
     }
 
     pub(in crate::runtimes) struct FixtureWheels {
