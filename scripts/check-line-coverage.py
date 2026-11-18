@@ -1660,10 +1660,26 @@ def inherent_async_leaf_entry(source, inventory, phase, owners, names, line, cou
     return geometry, states, copy_ids, observations
 
 
+_RESULT_TEST_SIGNATURE = ('#','[','test',']','fn','<declaration>','(',')','->',
+    'anyhow','::','Result','<','(',')','>')
+_RESULT_CLOSURE = ('||','->','anyhow','::','Result','<','(',')','>')
+
+
+def environment_result_callback(code, function, callback):
+    opening = callback['opening']
+    parent = code.parents[opening]
+    return (parent is not None and code.words[parent]=='('
+        and code.parents[parent]==function['opening']
+        and code.words[parent-3:parent]==['temp_env','::','with_var']
+        and tuple(code.words[opening-len(_RESULT_CLOSURE):opening])==_RESULT_CLOSURE
+        and code.words[callback['end']+1:function['end']]==[',',')'])
+
+
 def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, inventory, work,
-                               *, caller_entry=False, single_binding=False, phase_cache=None):
+                               *, caller_entry=False, single_binding=False, phase_cache=None,
+                               environment_test=False):
     """Prove fragment execution through a uniquely source-bound direct callback."""
-    if single_binding and caller_entry:
+    if single_binding and caller_entry or environment_test and (caller_entry or single_binding):
         return None
     if inventory is None:
         return None
@@ -1682,6 +1698,11 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     if len(functions) != 1:
         return None
     function = functions[0]; header = function['header']; fn = header.index('fn')
+    if environment_test:
+        if ((*header[:fn+1],'<declaration>',*header[fn+2:])!=_RESULT_TEST_SIGNATURE
+                or (context:=_boolean_module(code,{'start':function['first']})) is None
+                or context[:2]!=(['tests'],['tests'])):
+            return None
     caller_scope = None
     if caller_entry:
         if first != last or list(header[fn:]) != ['fn', header[fn + 1], '(', ')']:
@@ -1703,14 +1724,15 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         caller_scope = (tuple(scope[0]), tuple(scope[1]), tuple(tuple(value) for value in attributes))
     elif list(header[:fn]) not in ([], ['pub'], ['pub', '(', 'crate', ')'], ['#', '[', 'test', ']']):
         return None
-    callbacks_key = ('callback-openings', id(code), function['opening'], single_binding)
+    callbacks_key = ('callback-openings', id(code), function['opening'], single_binding, environment_test)
     if callbacks_key not in cache:
         _construct_charge(work, len(inventory[1]))
         cache[callbacks_key] = [
             (code.position(code.starts[row['opening']])[0], code.position(code.ends[row['end']])[0], row)
             for row in inventory[1] if row['opening'] is not None
             and function['opening'] < row['opening'] < row['end'] < function['end']
-            and (code.words[row['opening'] - 1] == '||' if not single_binding else
+            and (environment_result_callback(code,function,row) if environment_test else
+                 code.words[row['opening'] - 1] == '||' if not single_binding else
                  row['opening'] >= 3
                  and code.words[row['opening'] - 3] == code.words[row['opening'] - 1] == '|'
                  and re.fullmatch(r'[A-Za-z_]\w*', code.words[row['opening'] - 2]) is not None)
@@ -1726,7 +1748,7 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         call_parent = code.parents[callback['opening']]
         if code.parents[call_parent] != function['opening']:
             return None
-    argument = callback['opening'] - (3 if single_binding else 1)
+    argument = callback['opening'] - (len(_RESULT_CLOSURE) if environment_test else 3 if single_binding else 1)
     if single_binding:
         if code.parents[code.parents[callback['opening']]] != function['opening']:
             return None
@@ -1768,13 +1790,35 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         prefix = tuple(code.words[function['opening'] + 1:callback['opening']])
     _construct_charge(work, len(prefix) + len(header))
     if not caller_entry and any(word in ('!', '#') for word in prefix):
-        return None
+        if not environment_test:
+            return None
+        assertion = ('assert','!','(','!','crate','::','core','::','privilege','::','is_root','(',')',')',';')
+        occurrences = [at for at in range(len(prefix)) if prefix[at:at+len(assertion)]==assertion]
+        _construct_charge(work,len(prefix)*len(assertion))
+        if (len(occurrences)!=1 or prefix.count('!')!=2 or '#' in prefix
+                or code.parents[function['opening']+1+occurrences[0]]!=function['opening']):
+            return None
     opening = code.position(code.starts[callback['opening']])
     closing = code.position(code.ends[callback['end']])
     body_opening = code.position(code.starts[function['opening']])
     header_end = code.position(code.ends[function['opening'] - 1])
     leading = len(source[group[0] - 1]) - len(source[group[0] - 1].lstrip()) + 1
     function_start = group[0], leading
+    assertion_slot = None
+    if environment_test:
+        if first != last:
+            return None
+        if source[first-1].strip()=='assert!(':
+            _construct_charge(work,len(code.starts).bit_length()+3)
+            token = bisect.bisect_left(code.starts,code.offsets[first-1])
+            if (code.words[token:token+3]!=['assert','!','(']
+                    or code.parents[token]!=callback['opening']
+                    or code.pairs[token+2]+1>=callback['end']
+                    or code.words[code.pairs[token+2]+1]!=';'):
+                return None
+            assertion_slot = (*code.position(code.starts[token]),*code.position(code.ends[token+1]))
+        elif opening[0]!=first or source[first-1].strip()!='|| -> anyhow::Result<()> {':
+            return None
     states = []; line_states = []; identities = []; geometries = []; witnesses = []
     bound = {id(parent) for parent in group[2]}; children_bound = set()
     for parent in group[2]:
@@ -1826,6 +1870,9 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
                 or not 0 <= child['count'] < COUNTER_LIMIT
                 or len(entries) != 1 or entries[0][4] != child['count']):
             return None
+        if environment_test and any(owner.get('branches') or owner.get('mcdc_records')
+                                    for owner in (parent,child)):
+            return None
         children_bound.add(id(child)); bound.add(id(child)); identities.append(shape.identity)
         parent_geometry, parent_states = fragment_region_states(parent, first, last, source, work)
         child_geometry, child_states = fragment_region_states(child, first, last, source, work)
@@ -1842,6 +1889,9 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
         else:
             context_geometry, context_states = fragment_region_states(parent, group[0], opening[0], source, work)
         if not child_geometry:
+            return None
+        if assertion_slot is not None and (parent_geometry or child_geometry!=(
+                (0,assertion_slot[1],0,assertion_slot[3],0,0,0),)):
             return None
         geometries.append((parent_geometry, child_geometry, context_geometry))
         states.append((int(parent['count'] > 0), int(child['count'] > 0),
@@ -3060,6 +3110,164 @@ def retained_fixture_script_write(name,sides,indexes,work):
                 owners=[old[3],new[3]],claim='Write call, destination and result handling only')
 
 
+def retained_test_queue_expectation(name, source, line, mapped, group, owners, names, files, inventory, work):
+    """Bind a direct queue expectation using both the loop and its executed successor."""
+    code, rows = inventory[:2]
+    first, last, roots = group
+    if len(roots) != 1 or mapped.get(line, 0) <= 0:
+        return None
+    root = roots[0]
+    symbol = root['name']
+    _construct_charge(work,len(symbol)+len(name)+1)
+    shape = plain_rust_function_symbol(symbol)
+    modules = tuple(name.removeprefix('src/').removesuffix('.rs').split('/'))
+    if (shape is None or shape.identifiers[1:-1] != (*modules,'tests')
+            or names[symbol] != 1 or root['count'] != 1 or root.get('branches') or root.get('mcdc_records')):
+        return None
+    _construct_charge(work,len(rows))
+    def line_at(token):
+        return code.position(code.starts[token])[0]
+    enclosing = [row for row in rows if row['opening'] is not None
+                 and line_at(row['first'])<=line<=line_at(row['end'])]
+    loops = [row for row in enclosing if row['kind']=='for']
+    functions = [row for row in enclosing if row['kind']=='fn']
+    tests = [row for row in enclosing if row['kind']=='mod']
+    if len(loops)!=1 or len(functions)!=1 or len(tests)!=1:
+        return None
+    loop, = loops
+    function, = functions
+    module, = tests
+    if (module['header']!=('#','[','cfg','(','test',')',']','mod','tests')
+            or function['header']!=('#','[','test',']','fn',shape.identifiers[-1],'(',')')
+            or line_at(function['first']+4)!=first or line_at(function['end'])!=last
+            or code.parents[function['opening']]!=module['opening']
+            or code.parents[loop['opening']]!=function['opening']):
+        return None
+    header = loop['header']
+    if len(header)!=4 or header[0]!='for' or header[2]!='in':
+        return None
+    literal = re.fullmatch(r'0\.\.([1-9][0-9]{0,17})', header[3], re.ASCII)
+    if literal is None or re.fullmatch(r'[A-Za-z_]\w*',header[1],re.ASCII) is None:
+        return None
+    iterations = int(literal[1])
+    start,stop = [bisect.bisect_left(code.starts,code.offsets[number-1]) for number in (line,line+1)]
+    previous = bisect.bisect_left(code.starts,code.offsets[line-2])
+    opening, closing = loop['opening'],loop['end']
+    successor = closing+1
+    following=['let','(','reply',',','_response',')','=','oneshot','::','channel','(',')',';']
+    _construct_charge(work,closing-opening+len(following)+1)
+    if (code.words[start:start+3]!=['.','expect','('] or stop-start!=6
+            or not code.words[start+3].startswith('"') or code.words[start+4:stop]!=[')',';']
+            or code.words[previous:previous+4]!=['tx','.','try_send','(']
+            or code.pairs.get(previous+3)!=start-1
+            or code.parents[previous]!=opening or code.parents[start]!=opening or stop!=closing
+            or code.words[opening+1:previous]!=following
+            or code.words[successor:successor+len(following)]!=following
+            or code.parents[successor]!=function['opening']):
+        return None
+    payload=code.words[previous+4:start-1]
+    if (payload!=['reply'] and (len(payload)!=12 or payload[1]!='::'
+            or payload[3:]!=['(',header[1],'.','to_string','(',')',',','reply',')']
+            or any(re.fullmatch(r'[A-Za-z_]\w*',word,re.ASCII) is None for word in payload[::2][:2]))):
+        return None
+    preceding=[row for row in inventory[3].get(line_at(loop['first'])-1, ())
+               if row['end']+1==loop['first'] and code.parents[row['first']]==function['opening']]
+    _construct_charge(work,len(preceding)+len(root['regions'])*(last-first+2))
+    if len(preceding)!=1:
+        return None
+    assignment=code.words[preceding[0]['first']:preceding[0]['end']+1]
+    if (assignment[:4]!=['let','(','tx',','] or assignment[-6:]!=[')','=','request_channel','(',')',';']
+            or len(assignment) not in (11,12) or len(assignment)==12 and assignment[4]!='mut'
+            or re.fullmatch(r'[A-Za-z_]\w*',assignment[-7],re.ASCII) is None):
+        return None
+    _construct_charge(work,sum(len(owner['regions'])+1 for owner in owners))
+    if (source_owner_span(root,name,files,source) is None
+            or [id(owner) for owner in owners if any(r[0]<=last and r[2]>=first for r in owner['regions'])]!=[id(root)]):
+        return None
+    envelope=code.region(opening,closing)
+    receiver=code.region(previous,previous)
+    call=code.region(previous+2,previous+2)
+    after_loop=code.region(successor+7,successor+11)
+    geometry={tuple(r[:4]):r[4] for r in root['regions']}
+    if (len(geometry)!=len(root['regions'])
+            or [geometry.get(span) for span in (envelope,receiver,call,after_loop)]!=[iterations]*3+[1]
+            or [r for r in root['regions'] if r[0]<=line<=r[2]]!=[[*envelope,iterations,0,0,0]]
+            or _owner_line_counts(root,_ObserverWork(work))!={n:mapped[n] for n in range(first,last+1) if n in mapped}):
+        return None
+    return shape.identity, iterations, dict(owner=symbol,loop_region=envelope,
+        sender_region=receiver,send_region=call,successor_region=after_loop,counts=[iterations]*3+[1])
+
+
+_INITIAL_TEST_RECORD = re.compile(r'[ \t]*let ([A-Za-z_]\w*) = ([A-Z]\w*) \{', re.ASCII)
+_QUALIFIED_FIELD = re.compile(r'[ \t]*[A-Za-z_]\w*: (?:[A-Za-z_]\w*::)+[A-Za-z_]\w*,', re.ASCII)
+
+
+def initial_async_test_record(name, source, counts, group, owners, names, inventory, first, last, work):
+    """Bind an unchanged eager record to its independently observed async body entry."""
+    if inventory is None or last-first!=3 or len(group[2])!=1:
+        return None
+    header = _INITIAL_TEST_RECORD.fullmatch(source[first-1]); field = source[first]
+    if (header is None or _QUALIFIED_FIELD.fullmatch(field) is None
+            or source[first+1].strip()!=f'..{header[2]}::default()' or source[last-1].strip()!='};'):
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work,2*len(rows)+4)
+    functions = [row for row in rows if row['kind']=='fn' and 'async' in row['header']
+                 and code.position(code.starts[row['first']+row['header'].index('async')])[0]==group[0]
+                 and code.position(code.ends[row['end']])[0]==group[1]]
+    if len(functions)!=1:
+        return None
+    fn, = functions; words=fn['header']; scope=_boolean_module(code,{'start':fn['first']})
+    if (words[:8]!=('#','[','tokio','::','test',']','async','fn')
+            or words[9:]!=_RESULT_TEST_SIGNATURE[6:]
+            or scope is None or scope[:2]!=(['tests'],['tests'])):
+        return None
+    records = [row for row in rows if row.get('header')==('let',header[1],'=',header[2])
+               and code.parents[row['first']]==fn['opening']
+               and code.position(code.starts[row['first']])[0]==first
+               and code.position(code.ends[row['end']])[0]==last]
+    if len(records)!=1:
+        return None
+    record, = records
+    start = record['first']; end = record['end']
+    prefix = code.words[fn['opening']+1:start]
+    _construct_charge(work,len(prefix)+end-start+1)
+    if prefix:
+        if (prefix[0]!='use' or prefix[-1]!=';' or len(prefix)%2!=1
+                or any(re.fullmatch(r'[A-Za-z_]\w*',part,re.ASCII) is None for part in prefix[1:-1:2])
+                or any(part!='::' for part in prefix[2:-1:2])
+                or prefix[-2] in code.words[start:end+1]):
+            return None
+    root, = group[2]; shape=plain_rust_function_symbol(root['name'])
+    path = ('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests',words[8])
+    open_at = code.position(code.starts[fn['opening']]); close_at = code.position(code.ends[fn['end']])
+    entry = (*code.position(code.starts[fn['first']+7]),*code.position(code.ends[fn['opening']-1]))
+    if (shape is None or shape.identifiers!=path or names[root['name']]!=1
+            or type(root.get('count')) is not int or not 0<root['count']<COUNTER_LIMIT
+            or [r[4] for r in root['regions'] if tuple(r[:4])==entry and r[5:]==[0,0,0]]!=[root['count']]):
+        return None
+    _construct_charge(work,sum(4*len(owner['regions'])+len(owner['name'])+1 for owner in owners))
+    touching = [(owner,[r for r in owner['regions'] if any(owner_covers_lines([r],line,line)
+                 for line in range(first,last+1))]) for owner in owners]
+    affected = [(owner,raw) for owner,raw in touching if raw]
+    if len(affected)!=1:
+        return None
+    child, raw = affected[0]
+    body_entry = (*open_at,open_at[0],open_at[1]+1)
+    if (not direct_rust_callback_symbol(child['name'],root['name'],shape.modules)
+            or names[child['name']]!=1 or child['filenames']!=root['filenames']
+            or any(owner.get('branches') or owner.get('mcdc_records') for owner in (root,child))
+            or type(child.get('count')) is not int or not 0<child['count']<=root['count']
+            or [r[4] for r in child['regions'] if tuple(r[:4])==body_entry and r[5:]==[0,0,0]]!=[child['count']]
+            or any(not open_at<=tuple(r[:2])<tuple(r[2:4])<=close_at for r in child['regions'])):
+        return None
+    slots = [code.region(start+1,start+1),code.region(start+3,end)]
+    if (raw!=[[*slot,child['count'],0,0,0] for slot in slots]
+            or any(counts.get(line)!=child['count'] for line in range(first,last+1))):
+        return None
+    return (shape.identity,words), dict(root=root['name'],body=child['name'],regions=raw,entry=body_entry)
+
+
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
                               fragments, work=None, construct_inventories=None, compiled_groups=None,
                               callback_functions=(), owner_indexes=None, inherent_async_lines=((), ()), macro_expansions=(None, None)):
@@ -3175,6 +3383,43 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         prefix, bg, hg = candidates[0]
         if len(bg[2]) != len(hg[2]):
             refuse()
+        if (b-a==4 and d-c==4 and macro_expansions==([],[]) and construct_inventories is not None
+                and _INITIAL_TEST_RECORD.fullmatch(old[a])):
+            observations = [initial_async_test_record(name,source,counts,group,inventories[side],
+                inventory_names[side],construct_inventories[side],first,last,work)
+                for side,(source,counts,group,first,last) in enumerate(((old,before,bg,a+1,b),(new,after,hg,c+1,d)))]
+            if all(observations) and observations[0][0]==observations[1][0]:
+                matched = [(line,line+c-a) for line in pending]
+                if any(line in pairs and pairs[line]!=target for line,target in matched):
+                    refuse()
+                pairs.update(matched)
+                for side,(source,group) in enumerate(((old,bg),(new,hg))):
+                    first,last=group[:2]
+                    _construct_charge(work,sum(len(line)+1 for line in source[first-1:last]))
+                    excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
+                receipts.append(dict(kind='initial-async-test-record',file=name,pairs=matched,
+                    owners=[observation[1] for observation in observations]))
+                continue
+        if (construct_inventories is not None and macro_expansions==([],[]) and prefix in callback_functions
+                and a and c and a+1==b and c+1==d and tuple(pending)==(b,)
+                and old[a].lstrip().startswith('.expect(')
+                and old[a-1].lstrip().startswith('tx.try_send(') and new[c-1].lstrip().startswith('tx.try_send(')):
+            queue=[retained_test_queue_expectation(name,source,number,mapped,group,inventories[side],
+                       inventory_names[side],files,construct_inventories[side],work)
+                   for side,(source,number,mapped,group,files) in enumerate(
+                       ((old,b,before,bg,base_files),(new,d,after,hg,head_files)))]
+            if all(queue) and queue[0][:2]==queue[1][:2]:
+                if b in pairs and pairs[b]!=d:
+                    refuse()
+                pairs[b]=d
+                receipts.append(dict(file=name,kind='retained-test-queue-expectation',
+                    pairs=[[b,d]],iterations=queue[0][1],owners=[value[2] for value in queue],
+                    callback_fragments=[dict(pairs=[[b,d]],base_range=[b,b],head_range=[d,d])]))
+                for side,(source,group) in enumerate(((old,bg),(new,hg))):
+                    first,last=group[:2]
+                    _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
+                    excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
+                continue
         if name=='src/cli/tool.rs' and macro_expansions==([],[]) and prefix in callback_functions:
             if prefix not in fixture_forests:
                 scopes = []
@@ -3390,6 +3635,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                                 inventory_names[side], offset + 1, offset + b - a,
                                 callback_inventories[side], work, caller_entry=True,
                                 phase_cache=callback_phase_cache)
+                        if (callback is None and macro_expansions==([],[]) and b==a+1
+                                and old[a].strip() in ('|| -> anyhow::Result<()> {','assert!(')):
+                            callback = zero_arg_callback_fragment(source,group,inventories[side],
+                                inventory_names[side],offset+1,offset+b-a,callback_inventories[side],work,
+                                phase_cache=callback_phase_cache,environment_test=True)
                         if callback is None:
                             callback = nested_async_call_entry_fragment(source, group, inventories[side],
                                 inventory_names[side], offset + 1, offset + b - a,
@@ -3590,7 +3840,7 @@ _NOMINAL_METHOD_PREFIX_WORK = len('_R' + 'NC' * 8 + 'NvX') + 1
 
 
 @lru_cache(maxsize=4096)
-def nominal_method_path(symbol, *, inventory=False, path_reference=False):
+def nominal_method_path(symbol, *, inventory=False, path_reference=False, local_scope=False):
     """Decode bounded nominal v0 inherent, trait-impl and default-trait methods.
 
     Replacement identity omits crate disambiguators; callback ownership retains
@@ -3646,6 +3896,17 @@ def nominal_method_path(symbol, *, inventory=False, path_reference=False):
             at += 1
             parent = path(depth + 1, external=external)
             result = ('type', parent, identifier())
+        elif local_scope and tag == 'N' and symbol[at:at+1] in ('v','C'):
+            namespace = symbol[at]; at += 1
+            parent = path(depth+1,external=external)
+            if namespace == 'v':
+                result = ('value',parent,identifier())
+            else:
+                scope = disambiguator()
+                if symbol[at:at+1] != '0':
+                    raise ValueError('unsupported local closure identifier')
+                at += 1
+                result = ('closure',parent,scope)
         elif tag == 'B':
             encoded = re.match(r'([0-9A-Za-z]{0,4})_', symbol[at:])
             if encoded is None:
@@ -3820,10 +4081,10 @@ def replacement_raw_parent(symbol, declaration=None):
 
 
 def fully_covered_replacement(name, old, new, before, after, descriptors, grouped,
-                              selected, equal_rows, work):
+                              selected, equal_rows, work, local_impl_members=((),())):
     """Certify correspondence only when every region in both owner trees is covered."""
     witnesses = []
-    for counts, descriptor, compiled in zip((before, after), descriptors, grouped):
+    for counts, descriptor, compiled, local_members in zip((before, after), descriptors, grouped,local_impl_members):
         first, last, parents = descriptor['group']
         _construct_charge(work, last - first + len(compiled[0]) + len(counts))
         if any(count <= 0 for line, count in counts.items() if first <= line <= last):
@@ -3845,7 +4106,8 @@ def fully_covered_replacement(name, old, new, before, after, descriptors, groupe
                 continue
             _construct_charge(work, name_length * (1 + 8 * len(parent_names)))
             shape = nominal_method_path(owner['name'])
-            child = (shape is not None and shape.callbacks and shape.copy_identity in parent_paths
+            child = (any(owner is member for member in local_members)
+                     or shape is not None and shape.callbacks and shape.copy_identity in parent_paths
                      or any(plain is not None and any(direct_rust_callback_symbol(
                          owner['name'], parent, plain.modules, depth) for depth in range(1, 9))
                             for parent, plain in plain_shapes.items()))
@@ -4425,10 +4687,9 @@ def tail_record_import_context(before, after, referenced, work):
 
 def retained_record_field_obligations(name, sources, counts, descriptors, inventories, grouped,
                                       replacements, work, indexes_factory, expansions):
-    """Retain a closed forest across one observed first record field.
+    """Retain a closed forest across one observed record initializer change.
 
-    This proves execution of old source only. The extra field's raw counter is
-    retained separately and must match the same record-construction channel.
+    The added initializer stays in the head ratios. This proves execution of retained source.
     """
     if indexes_factory is None or expansions != ([], []):
         return {}, [], set()
@@ -4436,6 +4697,8 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
     identifier = r'[A-Za-z_][A-Za-z0-9_]*'
     addition_pattern = re.compile(r'[ \t]*(?P<field>'+identifier+r')[ \t]*:[ \t]*'
         r'(?P<value>(?:'+identifier+r'::)+'+identifier+r'(?P<call>\(\))?)[ \t]*,[ \t]*', re.ASCII)
+    update_pattern = re.compile(r'[ \t]*\.\.(?P<type>[A-Z][A-Za-z_0-9]*)::default\(\)[ \t]*', re.ASCII)
+    literal_field = re.compile(r'[ \t]*'+identifier+r': vec!\[(?P<value>"[A-Za-z_0-9.-]+")\.into\(\)\],[ \t]*', re.ASCII)
     module_path = name.removeprefix('src/').removesuffix('.rs').split('/')
     for prefix, left in descriptors[0].items():
         _construct_charge(work, 1)
@@ -4443,11 +4706,12 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
         if right is None or any(left[key] != right[key] for key in ('signature','attributes')):
             continue
         supported = all(row['row']['supported'] for row in (left,right))
-        if not supported and left['signature'][:8] != _TEST_TAIL_RECORD_HEADER:
+        update_test = left['signature'] == _RESULT_TEST_SIGNATURE
+        if not supported and not update_test and left['signature'][:8] != _TEST_TAIL_RECORD_HEADER:
             continue
         contexts_match = left['context'] == right['context']
         parameters = tail_record_parameters(left['signature'],work) if not contexts_match else None
-        if not contexts_match and parameters is None:
+        if not contexts_match and parameters is None and not update_test:
             continue
         groups = left['group'], right['group']; spans = [group[:2] for group in groups]
         if spans[1][1]-spans[1][0] != spans[0][1]-spans[0][0]+1:
@@ -4464,20 +4728,40 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
         if bodies[1][position] in bodies[0][max(0,position-1):position+1]:
             continue
         match = addition_pattern.fullmatch(bodies[1][position])
-        if match is None:
+        update = update_pattern.fullmatch(bodies[1][position]) if match is None and update_test else None
+        if update is None and match is None:
             continue
         added = spans[1][0]+position
+        refinement = None
+        if update:
+            if any(descriptor['context'][0]!=(('#','[','cfg','(','test',')',']','mod','tests'),)
+                   for descriptor in (left,right)):
+                continue
+            imports = [Counter(descriptor['context'][1]) for descriptor in (left,right)]
+            changed = (imports[0]-imports[1]).keys() | (imports[1]-imports[0]).keys()
+            if any(len(clause)<3 or re.fullmatch(r'use (?:'+identifier+r' :: )*'+identifier+r' ;',
+                                               ' '.join(clause)) is None for clause in changed):
+                continue
+            referenced = {clause[-2] for clause in changed}
+            if position == 0:
+                continue
+            last_value = literal_field.fullmatch(bodies[1][position-1])
+            if last_value is None:
+                continue
+            refinement = (added-1,last_value.start('value')+1,added-1,last_value.end('value')+1)
         _construct_charge(work,len(replacements))
         related = [r for r in replacements.values() if r.get('retained_statements')
             and r['base_range'][0] <= spans[0][1] and spans[0][0] <= r['base_range'][1]]
         if (any(not (spans[0][0] <= r['base_range'][0] <= r['base_line'] <= r['base_range'][1] <= spans[0][1]
                 and spans[1][0] <= r['head_range'][0] <= r['head_line'] <= r['head_range'][1] <= spans[1][1]) for r in related)):
             continue
-        field = match['field']; records = []; phases = []; references = []; valid = True
-        call = match['call'] is not None
-        value_end = (match.start('call') if call else match.end('value'))+1
-        addition = (added,match.start('value')+1,added,value_end)
-        if not call and (not supported or not contexts_match):
+        field = match['field'] if match else None
+        records = []; phases = []; references = []; valid = True
+        call = match is not None and match['call'] is not None
+        if match:
+            value_end = (match.start('call') if call else match.end('value'))+1
+            addition = (added,match.start('value')+1,added,value_end)
+        if not call and not update and (not supported or not contexts_match):
             continue
         tail_values = []; shorthand_entries = []; initializer_roots = set(); implementation = None
         if call:
@@ -4494,7 +4778,15 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
             _construct_charge(work, 3*len(rows)+len(code.words).bit_length()+1)
             offset_line = added if side else spans[0][0]+position
             token = bisect.bisect_left(code.starts,code.offsets[offset_line-1])
-            if side:
+            if update:
+                if token >= len(code.words) or not side and code.words[token]!='}':
+                    valid=False;break
+                holding = code.parents[token] if side else code.pairs.get(token)
+                words = code.words[function['first']:function['end']+1]
+                _construct_charge(work,len(words))
+                if referenced.intersection(words):
+                    valid=False;break
+            elif side:
                 if token >= len(code.words) or code.words[token] != field:
                     valid=False;break
                 holding=code.parents[token]
@@ -4506,7 +4798,9 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
             if len(candidates)!=1 or holding is None or code.words[holding]!='{':
                 valid=False;break
             record=candidates[0];header=tuple(record['header'])
-            if len(header)>=3 and header[0]==header[2]=='|' and re.fullmatch(identifier,header[1]):
+            if update and len(header)==4 and header[0]=='let' and header[2]=='=':
+                type_path=header[3:]
+            elif len(header)>=3 and header[0]==header[2]=='|' and re.fullmatch(identifier,header[1]):
                 type_path=header[3:]
             else:
                 type_path=header
@@ -4516,6 +4810,16 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                     or not function['opening'] < holding < record['end'] < function['end']):
                 valid=False;break
             _construct_charge(work,record['end']-holding+1)
+            if update:
+                if type_path!=(update['type'],) or (side and (
+                        code.position(code.starts[record['end']])[0]!=added+1
+                        or code.words[token:record['end']]!=['.','.',update['type'],'::','default','(',')'])):
+                    valid=False;break
+                opening = code.parents[holding]
+                callback = next((row for row in rows if row['opening']==opening),None)
+                if opening is None or callback is None or not environment_result_callback(code,function,callback):
+                    valid=False;break
+                records.append(record);phases.append([(callback,'block')]);continue
             if side and (code.position(code.starts[holding])[0]!=added-1 or token!=holding+1):
                 valid=False;break
             if side and not call:
@@ -4581,7 +4885,7 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
             continue
         def forward(line):
             return line+spans[1][0]-spans[0][0]+int(line>=spans[0][0]+position)
-        if not call:
+        if not call and not update:
             reference=references[0]
             references.append((forward(reference[0]),reference[1],forward(reference[2]),reference[3]))
         if indexes is None:
@@ -4626,6 +4930,16 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                     if set(members)!={0}:
                         valid=False;break
                     ordinals=()
+                elif update and plain is not None and plain.identifiers==(
+                        'omg_lib',*module_path,'tests',descriptor['declaration']):
+                    if len(phases[side])!=1:
+                        valid=False;break
+                    candidates=[owner for owner in forest if direct_rust_callback_symbol(
+                        owner['name'],root['name'],plain.modules)]
+                    if len(candidates)!=1:
+                        valid=False;break
+                    members={0:root,1:candidates[0]};role=('result-test',plain.identity);identity=root['name']
+                    ordinals=(members[1]['name'][len('_RNC'+root['name'][2:]):],)
                 elif not call and plain is not None and plain.identifiers[-1]==descriptor['declaration']:
                     if tuple(kind for row,kind in phases[side])!=('block','block'):
                         valid=False;break
@@ -4660,7 +4974,11 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                     owned.add(id(owner));raw=owner['regions'];count=owner['count']
                     _construct_charge(work,10*len(raw)+(len(raw).bit_length()+1)*len(raw))
                     if depth==0:
-                        declaration=function['first']+(len(_TEST_TAIL_RECORD_HEADER)-1 if call and parameters else 0)
+                        declaration=function['first']
+                        if update:
+                            declaration+=_RESULT_TEST_SIGNATURE.index('fn')
+                        elif call and parameters:
+                            declaration+=len(_TEST_TAIL_RECORD_HEADER)-1
                         opening=code.position(code.starts[declaration]);closing=code.position(code.ends[function['end']])
                         ends=(code.position(code.ends[function['opening']-1]),code.position(code.starts[function['opening']]))
                         entries=[r for r in raw if tuple(r[:2])==opening and tuple(r[2:4]) in ends]
@@ -4690,7 +5008,11 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                     for r in raw:
                         row=list(r)
                         if side:
-                            if row[0]==row[2]==added:
+                            if update and tuple(row[:4])==refinement:
+                                if depth!=1 or extra is not None:
+                                    valid=False;break
+                                extra=row;continue
+                            if not update and row[0]==row[2]==added:
                                 if depth!=(0 if call else 2) or tuple(row[:4])!=addition or extra is not None:
                                     valid=False;break
                                 extra=row;continue
@@ -4703,20 +5025,27 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                     geometry.append(tuple(tuple(r[:4]+r[5:]) for r in projected))
                     states.extend((int(count>0),*[int(r[4]>0) for r in projected]))
                 if not valid:break
-                if call:
+                if update:
+                    record=records[side]
+                    envelope=(*code.position(code.starts[record['first']+3]),*code.position(code.ends[record['end']]))
+                    retained=[r for r in members[1]['regions'] if tuple(r[:4])==envelope]
+                    if len(retained)!=1 or retained[0][4]<=0:
+                        valid=False;break
+                    construction=retained[0][4]
+                elif call:
                     construction=root['count']
                 else:
                     reference_rows=[r for r in members[2]['regions'] if tuple(r[:4])==references[side]]
                     if len(reference_rows)!=1:
                         valid=False;break
                     construction=reference_rows[0][4]
-                if not call and phases[side][1][1]=='block':
+                if not call and not update and phases[side][1][1]=='block':
                     record=records[side];start=code.position(code.starts[record['opening']]);end=code.position(code.ends[record['end']])
                     envelopes=[r for r in members[2]['regions'] if r[0]==start[0] and r[2]==end[0]
                                and tuple(r[:2])<=start and tuple(r[2:4])>=end]
                     if len(envelopes)!=1 or envelopes[0][4]!=construction:
                         valid=False;break
-                elif not call and construction!=members[2]['count']:
+                elif not call and not update and construction!=members[2]['count']:
                     valid=False;break
                 if side and (extra is None or extra[4]!=construction):
                     valid=False;break
@@ -4761,9 +5090,10 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
                 or any(line in pairs and pairs[line]!=target or target in target_owners and target_owners[target]!=line for line,target in mapped.items())):
             raise ValueError('Ambiguous retained record field correspondence')
         pairs.update(mapped);target_owners.update((target,line) for line,target in mapped.items());proved.add(spans[0])
-        receipt = dict(kind='retained-record-field-forest',file=name,base_range=list(spans[0]),head_range=list(spans[1]),
+        receipt = dict(kind='retained-record-update-forest' if update else 'retained-record-field-forest',
+            file=name,base_range=list(spans[0]),head_range=list(spans[1]),
             pairs=[list(row) for row in sorted(mapped.items())],field=field,added_line=added,
-            **{'initializer' if call else 'scalar_value':match['value']},
+            **({'record_type':update['type']} if update else {'initializer' if call else 'scalar_value':match['value']}),
             forests=forest_receipts,role_matching=matches,source_sha256=[hashlib.sha256(('\n'.join(body)+'\n').encode()).hexdigest() for body in bodies],
             claim='Complete retained-source forest only; added field counter kept separately; zero deletion credit')
         if call and parameters:
@@ -5487,6 +5817,242 @@ def retained_callback_island_obligations(name, sources, counts, descriptors, inv
     return pairs,receipts
 
 
+def projected_iterator_source(left, right, inventories, sources, work):
+    """Bind one wildcard tuple input to an exact terminal borrowed-item projection."""
+    codes=[i[0] for i in inventories];functions=[d['row'] for d in (left,right)]
+    if (left['attributes'] or right['attributes'] or left['signature']!=right['signature']
+            or left['context'][0] or right['context'][0]):return None
+    _construct_charge(work,sum(r['end']-r['first']+1 for r in functions))
+    tokens=[c.words[r['first']:r['end']+1] for c,r in zip(codes,functions)]
+    if len(tokens[1])!=len(tokens[0])+4:return None
+    at=next((n for n,(a,b) in enumerate(zip(*tokens)) if a!=b),None)
+    if at is None or at<4:return None
+    variable=tokens[0][at]
+    if (re.fullmatch(r'[A-Za-z_]\w*',variable,re.ASCII) is None
+            or tokens[0][at-4:at]!=['.','filter_map','(','|']
+            or tokens[0][at+1:at+3]!=['|','{']
+            or tokens[1][at:at+5]!=['(','_',',',variable,')']
+            or tokens[0]!=tokens[1][:at]+[variable]+tokens[1][at+5:]):return None
+    # The callback is the first chain on a single direct free-function call.
+    body_start=functions[0]['opening']+1
+    prefix=codes[0].words[body_start:functions[0]['first']+at-4]
+    if (len(prefix)!=13 or prefix[:2]!=['let','mut'] or prefix[3:9]!=[':','Vec','<','_','>','=']
+            or prefix[10]!='(' or prefix[12]!=')'
+            or any(re.fullmatch(r'[A-Za-z_]\w*',prefix[n],re.ASCII) is None for n in (2,9,11))):return None
+    producer=prefix[9]
+    if tokens[0].count(producer)!=1:return None
+    contexts=[d['context'][1] for d in (left,right)]
+    _construct_charge(work,sum(len(clause)+1 for context in contexts for clause in context))
+    if contexts[0]!=contexts[1]:
+        old,new=map(Counter,contexts);added=list((new-old).elements())
+        if (old-new or added!=[('use','std','::','collections','::','BTreeMap',';')]
+                or 'BTreeMap' in tokens[0]):return None
+    producers=[]
+    for inventory,function in zip(inventories,functions):
+        code,rows=inventory[:2];_construct_charge(work,len(rows))
+        found=[r for r in rows if r['kind']=='fn' and r['header'][:2]==('fn',producer)
+            and code.parents[r['first']] is None]
+        if len(found)!=1:return None
+        row=found[0];opening=row['first']+2;closing=code.pairs.get(opening)
+        if (closing is None or code.words[opening]!='(' or row['opening'] is None
+                or code.parents[function['first']] is not None):return None
+        args=code.words[opening+1:closing];args=args[:-1] if args[-1:]==[','] else args
+        returned=code.words[closing+1:row['opening']]
+        body=code.words[row['opening']+1:row['end']]
+        _construct_charge(work,len(args)+len(returned)+len(body)+1)
+        producers.append((row,tuple(args),returned,body))
+    old,new=producers
+    if old[1]!=new[1] or old[2][:5]!=['->','impl','Iterator','<','Item'] or old[2][5:6]!=['='] or old[2][-1:]!=['>']:return None
+    item=old[2][6:-1]
+    if (not item or item[0]!='&' or len(item)%2!=0
+            or any(t!='::' for t in item[2::2])
+            or any(re.fullmatch(r'[A-Za-z_]\w*',t,re.ASCII) is None for t in item[1::2])
+            or new[2]!=old[2][:6]+['(']+item+[',']+item+[')', '>']):return None
+    added=[n for n in range(len(new[3])) if new[3][n:n+7]==['.','map','(','move','|',variable,'|']]
+    if len(added)!=1:return None
+    offset=added[0];term=new[3][offset:offset+13]
+    if (len(term)!=13 or term[:7]!=['.','map','(','move','|',variable,'|']
+            or term[7]!='(' or term[9:13]!=[',',variable,')',')']
+            or re.fullmatch(r'[A-Za-z_]\w*',term[8],re.ASCII) is None
+            or old[3]!=new[3][:offset]+new[3][offset+13:]):return None
+    if (item!=['&','serde_json','::','Value'] or len(old[1])!=6
+            or old[1][1:]!=(':','&','serde_json','::','Value')):return None
+    keys=[old[3][n+3] for n in range(len(old[3])-4) if old[3][n:n+3]==['.','get','('] and old[3][n+4]==')']
+    if len(keys)!=3 or any(re.fullmatch(r'"[A-Za-z_]\w*"',key,re.ASCII) is None for key in keys):return None
+    argument=old[1][0];capture=term[8]
+    template=(f'{argument}.get({keys[0]}).and_then(serde_json::Value::as_array).into_iter().flatten().flat_map(|{capture}| {{ '
+        f'{capture}.get({keys[1]}).into_iter().chain({capture}.get({keys[2]}).and_then(serde_json::Value::as_array).into_iter().flatten(),) }})')
+    _construct_charge(work,len(template)+1);expected=_boolean_source([template])
+    if expected is None or expected.words!=old[3]:return None
+    code=codes[1];row=new[0];actual=row['opening']+1+offset;scope=code.parents[actual]
+    if (scope is None or code.words[scope]!='{' or code.words[actual+13:code.pairs[scope]]
+            or code.words[scope-3:scope]!=['|',term[8],'|']
+            or code.words[scope-6:scope-3]!=['.','flat_map','(']):return None
+    starts=[c.position(c.starts[r['first']])[0] for c,r in zip(codes,functions)]
+    ends=[c.position(c.ends[r['end']])[0] for c,r in zip(codes,functions)]
+    bodies=[s[a-1:b] for s,a,b in zip(sources,starts,ends)]
+    if len(bodies[0])!=len(bodies[1]) or any(not line.isascii() for body in bodies for line in body):return None
+    changes=[n for n,(a,b) in enumerate(zip(*bodies)) if a!=b]
+    if len(changes)!=1:return None
+    line=changes[0];oldline,newline=bodies[0][line],bodies[1][line]
+    needle='|'+variable+'|';positions=[m.start() for m in re.finditer(re.escape(needle),oldline)]
+    if len(positions)!=1:return None
+    first=positions[0]+1
+    if newline!=oldline[:first]+'(_, '+variable+')'+oldline[first+len(variable):]:return None
+    return starts,ends,line,first+1,len(variable),producer
+
+
+def retained_projected_iterator_obligations(name,sources,counts,descriptors,inventories,
+                                            replacements,work,indexes_factory,expansions):
+    """Preserve every raw copy across a proven borrowed-item tuple projection."""
+    if indexes_factory is None or expansions!=([],[]):return {},[],set()
+    candidates=[]
+    _construct_charge(work,len(descriptors[0]))
+    for prefix,left in descriptors[0].items():
+        right=descriptors[1].get(prefix)
+        if (right is None or left['attributes'] or left['context'][0]
+                or left['signature'][-4:-2]!=('Vec','<')
+                or right['group'][1]-right['group'][0]!=left['group'][1]-left['group'][0]):continue
+        _construct_charge(work,len(replacements))
+        related=[r for r in replacements.values() if r.get('retained_statements') and max(r['base_range'][0],left['group'][0])<=min(r['base_range'][1],left['group'][1])]
+        if any(not (left['group'][0]<=r['base_range'][0]<=r['base_line']<=r['base_range'][1]<=left['group'][1]
+                and right['group'][0]<=r['head_range'][0]<=r['head_line']<=r['head_range'][1]<=right['group'][1]) for r in related):continue
+        proof=projected_iterator_source(left,right,inventories,sources,work)
+        if proof is not None:candidates.append((left,right,proof))
+    if not candidates:return {},[],set()
+    indexes=indexes_factory();pairs={};receipts=[];proved=set();targets={}
+    for left,right,(starts,ends,edit,binding,width,producer) in candidates:
+        sides=[];valid=True
+        for side,(descriptor,index,source,da) in enumerate(zip((left,right),indexes,sources,counts)):
+            low=(starts[side],1);high=(ends[side],len(source[ends[side]-1])+1)
+            available=index.inventories.get(name,());_construct_charge(work,sum(len(o['regions'])+1 for o in available))
+            touching=[o for o in available if any(tuple(r[:2])<high and low<tuple(r[2:4]) for r in o['regions'])]
+            symbols={o['name']:o for o in touching};owned=set();copies=[]
+            if len(symbols)!=len(touching):valid=False;break
+            def point(line,column):
+                relative=line-starts[side]
+                if side and relative==edit:
+                    if column>=binding+width+5:column-=5
+                    elif binding+4<=column<=binding+4+width:column-=4
+                    elif column!=binding and column>binding:return None
+                return relative,column
+            for root in descriptor['group'][2]:
+                shape=plain_rust_function_symbol(root['name'])
+                if (shape is None or shape.identifiers[-1]!=descriptor['declaration']
+                        or name.startswith('src/') and shape.identifiers[:-1]!=(
+                            'omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'))):valid=False;break
+                members={():root}
+                for owner in touching:
+                    _construct_charge(work,len(owner['name'])*8+1)
+                    depths=[d for d in range(1,9) if direct_rust_callback_symbol(owner['name'],root['name'],shape.modules,d)]
+                    if not depths:continue
+                    if len(depths)!=1:valid=False;break
+                    depth=depths[0];suffix=owner['name'][len('_R'+'NC'*depth+root['name'][2:]):]
+                    path=tuple(re.findall(r'(s[0-9A-Za-z]{0,32}_)?0',suffix)[:depth])
+                    if len(path)!=depth or path in members:valid=False;break
+                    members[path]=owner
+                if not valid or any(role[:-1] not in members for role in members if len(role)>1):valid=False;break
+                geometry=[];states=[];names=[]
+                for role,owner in sorted(members.items()):
+                    raw=owner['regions'];quantity=owner.get('count');symbol=owner['name']
+                    _construct_charge(work,len(raw)*10+1)
+                    if (id(owner) in owned or index.name_counts[symbol]!=1 or len(owner['filenames'])!=1
+                            or index.files.get(owner['filenames'][0])!=name or owner.get('branches') or owner.get('mcdc_records')
+                            or type(quantity) is not int or not 0<=quantity<COUNTER_LIMIT
+                            or any(len(r)!=8 or r[5:]!=[0,0,0] or not low<=tuple(r[:2])<tuple(r[2:4])<=high
+                                or not 0<=r[4]<COUNTER_LIMIT for r in raw)):valid=False;break
+                    if role==():
+                        code=inventories[side][0];fn=descriptor['row'];entry=code.region(fn['first'],fn['opening']-1);closing=code.region(fn['end'],fn['end'])
+                        if any([r[4] for r in raw if tuple(r[:4])==slot]!=[quantity] for slot in (entry,closing)):valid=False;break
+                    facts=[]
+                    for r in raw:
+                        begin,end=point(*r[:2]),point(*r[2:4])
+                        if begin is None or end is None or begin>=end:valid=False;break
+                        facts.append(((*begin,*end,*r[5:]),int(r[4]>0)))
+                    if not valid:break
+                    _construct_charge(work,len(facts)*(len(facts).bit_length()+1));facts.sort()
+                    geometry.append((role,tuple(k for k,v in facts)));states.extend([int(quantity>0),*[v for k,v in facts]])
+                    owned.add(id(owner));names.append(symbol)
+                if not valid:break
+                copies.append((shape.identity,root['name'],tuple(geometry),tuple(states),names))
+            if not valid or not copies or owned!={id(o) for o in touching}:valid=False;break
+            observer=_ObserverWork(work);observed=dict(_llvm22_rows(_llvm22_segments([r for o in touching for r in o['regions']],observer),observer))
+            _construct_charge(work,ends[side]-starts[side]+1)
+            if observed!={n:da[n] for n in range(starts[side],ends[side]+1) if n in da}:valid=False;break
+            sides.append((copies,observed))
+        if not valid:continue
+        copies=[s[0] for s in sides];roles={r[0] for group in copies for r in group}
+        if len(roles)!=1 or len(copies[0])!=len(copies[1]) or any(r[2]!=copies[0][0][2] for group in copies for r in group):continue
+        vectors=[[r[3] for r in group] for group in copies]
+        if sorted(vectors[0])!=sorted(vectors[1]):continue
+        _construct_charge(work,(len(copies[0])*len(copies[1])+1)*len(vectors[0][0]))
+        matching=compiled_hit_state_matching(*vectors,[tuple(r[1] for r in group) for group in copies])
+        if matching is None:continue
+        offset=starts[1]-starts[0];mapped={n:n+offset for n in sides[0][1]}
+        if set(mapped.values())!=set(sides[1][1]):continue
+        if any(n in pairs and pairs[n]!=t or t in targets and targets[t]!=n for n,t in mapped.items()):raise ValueError('Ambiguous projected iterator correspondence')
+        pairs.update(mapped);targets.update((t,n) for n,t in mapped.items());proved.add(left['group'][:2])
+        receipts.append(dict(kind='projected-iterator-input',file=name,base_range=list(left['group'][:2]),head_range=list(right['group'][:2]),
+            pairs=[list(v) for v in sorted(mapped.items())],forest_names=[[symbol for r in group for symbol in r[4]] for group in copies],
+            compiled_forests=[[r[4] for r in group] for group in copies],role_matching=matching,producer=producer,
+            summary_credit=[0,0],mapped_credit=[0,0],claim='Borrowed iterator second input retained; complete raw geometry/copies/cold roles; no producer or first tuple value execution claim'))
+    return pairs,receipts,proved
+
+
+def positive_local_impl_members(descriptor, root, forest, inventory, work):
+    """Bind source-local trait methods to their enclosing async test copy."""
+    code,rows=inventory[:2];function=descriptor['row'];plain=plain_rust_function_symbol(root['name'])
+    if plain is None:return None
+    namespace=('crate',plain.identifiers[0])
+    for position,(value,scope) in enumerate(zip(plain.identifiers[1:],plain.disambiguators[1:]),1):
+        namespace=('value' if position==len(plain.identifiers)-1 else 'type',namespace,(value,scope))
+    namespace=('closure',namespace,'')
+    crate=re.match(r'_RNv(?:Nt)*C(s[0-9A-Za-z]{0,32}_)?',root['name'])
+    if crate is None:return None
+    copy=(plain.identifiers[0],crate[1] or '')
+    _construct_charge(work,len(rows)+sum(len(o['name'])+1 for o in forest))
+    implementations=[r for r in rows if r['kind']=='impl' and r['supported'] and code.parents[r['first']]==function['opening']]
+    members=[];roles=[]
+    for implementation in implementations:
+        _construct_charge(work,2*len(rows)+sum(len(o['name'])+4 for o in forest))
+        header=tuple(implementation['header'])
+        if (len(header)!=4 or header[0]!='impl' or header[2]!='for'
+                or any(re.fullmatch(r'[A-Za-z_]\w*',value,re.ASCII) is None for value in (header[1],header[3]))):return None
+        declarations=[at for at in range(function['opening']+1,implementation['first'])
+            if code.words[at:at+2]==['struct',header[3]] and code.parents[at]==function['opening']]
+        _construct_charge(work,implementation['first']-function['opening'])
+        if len(declarations)!=1:return None
+        methods=[r for r in rows if r['kind']=='fn' and code.parents[r['first']]==implementation['opening']]
+        if len(methods)!=1 or methods[0]['header'][:1]!=('fn',):return None
+        method=methods[0];name=method['header'][1]
+        blocks=[r for r in rows if r['kind']=='expression' and r.get('header') in (('async',),('async','move'))
+                and method['opening']<r['opening']<r['end']<method['end']]
+        if len(blocks)!=1:return None
+        block=blocks[0];candidates=[]
+        for owner in forest:
+            shape=nominal_method_path(owner['name'],local_scope=True)
+            if shape is not None and shape.namespace==namespace and shape.self_type==('type',namespace,(header[3],'')):
+                candidates.append((shape,owner))
+        constructors=[(shape,owner) for shape,owner in candidates if not shape.callbacks]
+        if len(constructors)!=1:return None
+        shape,constructor=constructors[0]
+        if (shape.kind!='X' or shape.impl_scope or shape.method!=(name,'') or shape.trait is None
+                or shape.trait[-1]!=(header[1],'') or shape.instantiating_crate!=copy or shape.crate_graph!=(copy,)):
+            return None
+        bodies=[owner for other,owner in candidates if other.copy_identity==shape.copy_identity and other.callbacks==('',)]
+        if len(candidates)!=2 or len(bodies)!=1:return None
+        body=bodies[0];count=constructor.get('count')
+        entry=code.region(method['first'],method['opening']-1);end=code.region(method['end'],method['end'])
+        first=code.position(code.starts[block['opening']]);last=code.position(code.ends[block['end']])
+        if (body.get('count')!=count or [r[4] for r in constructor['regions'] if tuple(r[:4])==entry]!=[count]
+                or [r[4] for r in constructor['regions'] if tuple(r[:4])==end]!=[count]
+                or [r[4] for r in body['regions'] if tuple(r[:4])==(*first,first[0],first[1]+1)]!=[count]
+                or [r[4] for r in body['regions'] if tuple(r[:4])==(last[0],last[1]-1,*last)]!=[count]
+                or any(not first<=tuple(r[:2])<tuple(r[2:4])<=last for r in body['regions'])):return None
+        members.extend((constructor,body));roles.append((header[3],shape.trait))
+    return members,tuple(roles)
+
+
 def same_qualified_positive_test_obligations(name, sources, counts, descriptors, inventories, grouped,
                                               replacements, equal_rows, work, indexes_factory, expansions):
     """Retain source only through a complete positive forest of the same test."""
@@ -5537,12 +6103,12 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
             for inventory,descriptor,group in zip(inventories,chosen,groups)]
         if any(not (lexical[0][0]<=r['base_range'][0]<=r['base_line']<=r['base_range'][1]<=lexical[0][1]
             and lexical[1][0]<=r['head_range'][0]<=r['head_line']<=r['head_range'][1]<=lexical[1][1]) for r in related):continue
-        roles=[];forests=[];valid=True
+        roles=[];forests=[];local_forests=[];local_roles=[];valid=True
         for side,(descriptor,inventory,index,group) in enumerate(zip(chosen,inventories,indexes,groups)):
             code=inventory[0];function=descriptor['row'];first,last=group[:2]
             forest=buckets[side][declaration]
             _construct_charge(work,sum(len(o['name'])+len(o['regions'])+1 for o in forest))
-            roots=group[2];owned=set();identities=[];copies=[]
+            roots=group[2];owned=set();identities=[];copies=[];locals_for_side=[];roles_for_side=[]
             for root in roots:
                 shape=plain_rust_function_symbol(root['name'])
                 if (shape is None or shape.identifiers[-2:]!=('tests',declaration)
@@ -5556,6 +6122,9 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
                         and [r[4] for r in o['regions'] if tuple(r[:4])==(*entry,entry[0],entry[1]+1)]==[root['count']]]
                     if len(children)!=1:valid=False;break
                     members+=children
+                local=positive_local_impl_members(descriptor,root,forest,inventory,work)
+                if local is None:valid=False;break
+                extra,local_role=local;members+=extra;locals_for_side.extend(extra);roles_for_side.append(local_role)
                 for member in members:
                     if (id(member) in owned or index.name_counts[member['name']]!=1 or len(member['filenames'])!=1
                             or index.files.get(member['filenames'][0])!=name or member.get('branches') or member.get('mcdc_records')
@@ -5565,11 +6134,11 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
                 if not valid:break
                 identities.append(shape.identity);copies.append([o['name'] for o in members])
             if not valid or not roots or owned!={id(o) for o in forest}:valid=False;break
-            roles.append(Counter(identities));forests.append(copies)
-        if not valid or roles[0]!=roles[1]:continue
+            roles.append(Counter(identities));forests.append(copies);local_forests.append(tuple(locals_for_side));local_roles.append(tuple(roles_for_side))
+        if not valid or roles[0]!=roles[1] or local_roles[0]!=local_roles[1]:continue
         selected=[r for r in replacements.values() if groups[0][0]<=r['base_line']<=groups[0][1]
                   and groups[1][0]<=r['head_line']<=groups[1][1]]
-        covered=fully_covered_replacement(name,*sources,*counts,chosen,grouped,selected,equal_rows,work)
+        covered=fully_covered_replacement(name,*sources,*counts,chosen,grouped,selected,equal_rows,work,tuple(local_forests))
         if covered is None:continue
         mapped,receipt=covered
         _construct_charge(work,len(mapped)+len(targets))
@@ -5577,7 +6146,7 @@ def same_qualified_positive_test_obligations(name, sources, counts, descriptors,
             raise ValueError('Ambiguous same-qualified test correspondence')
         pairs.update(mapped);targets.update((target,line) for line,target in mapped.items())
         receipt.update(kind='same-qualified-positive-test',declaration=declaration,phase_forests=forests,
-            root_roles=[repr(role) for role in roles[0]],
+            root_roles=[repr(role) for role in roles[0]],local_impl_roles=local_roles,
             claim='Same qualified zero-arg test; every raw owner and region positive; changed calls not semantically equated; zero deletion credit')
         receipts.append(receipt);proved.add(groups[0][:2])
     return pairs,receipts,proved
@@ -5946,6 +6515,12 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                 raise ValueError('Ambiguous retained loop and callback correspondence')
             extra_pairs.update(mapped);extra_receipts.append(receipt)
             matched_targets.update((target,line) for line,target in mapped.items())
+    projection_pairs,projection_receipts,projection_proved=retained_projected_iterator_obligations(
+        name,(old,new),(before,after),descriptors,inventories,replacements,work,record_indexes,record_expansions)
+    _construct_charge(work,len(extra_pairs)+len(projection_pairs));projection_targets={t:n for n,t in extra_pairs.items()}
+    if any(n in extra_pairs and extra_pairs[n]!=t or t in projection_targets and projection_targets[t]!=n for n,t in projection_pairs.items()):
+        raise ValueError('Ambiguous projected iterator and retained correspondence')
+    extra_pairs.update(projection_pairs);extra_receipts.extend(projection_receipts);extra_proved.update(projection_proved)
     candidates = []; receiver_candidates = []
     for left_prefix, left in descriptors[0].items():
         if left['group'][:2] in extra_proved:

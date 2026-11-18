@@ -1,4 +1,5 @@
 """Exercise exact coverage comparison and refusal of incomplete evidence."""
+from collections import Counter
 import importlib.util
 import copy
 import contextlib
@@ -310,6 +311,81 @@ class RetainedSearchLoopTests(unittest.TestCase):
                       'changed-entry-count','mismatched-da'):
             with self.subTest(fault=fault):
                 self.assertIsNone(self.compare(fault))
+
+
+class RetainedTestQueueExpectationTests(unittest.TestCase):
+    def compare(self, refusal=None):
+        old = [
+            '#[cfg(test)]',
+            'mod tests {',
+            '    #[test]',
+            '    fn checked() {',
+            '        let (tx, _rx) = request_channel();',
+            '        for index in 0..2 {',
+            '            let (reply, _response) = oneshot::channel();',
+            '            tx.try_send(Request::Info(index.to_string(), reply))',
+            '                .expect("each queued response must fit");',
+            '        }',
+            '        let (reply, _response) = oneshot::channel();',
+            '        let _ = reply;',
+            '    }',
+            '}',
+        ]
+        new = old.copy()
+        new[4] = '        let (tx, mut rx) = request_channel();'
+        new[5] = '        for _ in 0..2 {'
+        new[7] = '            tx.try_send(reply)'
+        if refusal == 'changed-range':
+            new[5] = '        for _ in 0..3 {'
+        if refusal == 'control-escape':
+            new[6] = '            continue;'
+        filename = '/artifact/src/example.rs'
+        files = {filename: 'src/example.rs'}
+        documents = []
+        counts = []
+        inventories = []
+        for side, text in enumerate((old,new)):
+            def region(line, word, count):
+                column = text[line-1].index(word)+1
+                return [line,column,line,column+len(word),count,0,0,0]
+            rows = [[4,5,4,17,1,0,0,0],
+                    [6,text[5].index('{')+1,10,10,2,0,0,0],
+                    region(8,'tx',2),region(8,'try_send',2),
+                    region(11,'oneshot::channel()',0 if side and refusal=='cold-successor' else 1),
+                    region(13,'}',1)]
+            if side and refusal=='missing-send':
+                del rows[3]
+            root = dict(name=f'_RNvNtNtCs{side+1}_7omg_lib7example5tests7checked',
+                        filenames=[filename],regions=rows,count=1,branches=[],mcdc_records=[])
+            owners = [root]
+            if side and refusal=='foreign-owner':
+                owners.append(dict(root,name='opaque',regions=[region(9,'expect',1)]))
+            work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+            observer = coverage._ObserverWork(work)
+            counts.append(dict(coverage._llvm22_rows(coverage._llvm22_segments(
+                [r for owner in owners for r in owner['regions']],observer),observer)))
+            documents.append(owners)
+            inventories.append(coverage._construct_inventory(text,work))
+        return coverage.positive_source_fragments(
+            'src/example.rs',old,new,*counts,*documents,files,files,[(8,9,8,9,[9])],
+            construct_inventories=inventories,callback_functions=('    fn checked()',),
+            macro_expansions=([],[]))
+
+    def test_retained_queue_expectation_binds_the_loop_and_separate_successor(self):
+        pairs, receipts = self.compare()
+        self.assertEqual(pairs,{9:9})
+        witness, = [entry for entry in receipts if entry.get('kind')=='retained-test-queue-expectation']
+        self.assertEqual(witness['callback_fragments'][0]['pairs'],[[9,9]])
+        self.assertEqual(witness['iterations'],2)
+
+    def test_retained_queue_expectation_refuses_borrowed_loop_paint(self):
+        for mode in ('changed-range','control-escape','cold-successor','missing-send','foreign-owner'):
+            with self.subTest(mode=mode):
+                try:
+                    _, receipts = self.compare(mode)
+                except ValueError:
+                    continue
+                self.assertFalse(any(entry.get('kind')=='retained-test-queue-expectation' for entry in receipts))
 
 
 class QualifiedFunctionCompletionTests(unittest.TestCase):
@@ -3626,6 +3702,129 @@ class SourceAwareCoverageTests(unittest.TestCase):
        except ValueError:continue
        self.assertFalse(any(r.get('kind')=='same-qualified-positive-test' for r in result.get('retained_replacement_obligations',[])))
 
+    def local_impl_fixture(self,fault=None):
+     old=['#[cfg(test)]','mod tests {','    #[tokio::test]','    async fn routine() {','        struct Local;',
+          '        impl Source for Local {','            fn old_call(&self) -> Pin<Box<dyn Future<Output = ()>>> {',
+          '                Box::pin(async move {','                    checked_old();','                })','            }','        }',
+          '        route_old().await;','    }','}']
+     new=[line.replace('old_call','new_call').replace('checked_old','checked_new').replace('route_old','route_new') for line in old]
+     sources=[old,new];documents=[]
+     for side,source in enumerate(sources):
+      root=f'_RNvNtCs{side+1}_7example5tests7routine'
+      local=f'_RNvXNCNvNtCs{side+1}_7example5tests7routine0NtB2_5LocalNtB8_6Source8'+('old_call' if side==0 else 'new_call')
+      nested=f'_RNCNvXNCNvNtCs{side+1}_7example5tests7routine0NtB4_5LocalNtBa_6Source8'+('old_call' if side==0 else 'new_call')+'0Ba_'
+      def row(line,start,end,count=1):return [line,start,line,end,count,0,0,0]
+      def owner(name,regions):return dict(name=name,count=1,filenames=['/src/example.rs'],regions=regions,branches=[],mcdc_records=[])
+      outer_col=source[3].index('{')+1;inner_col=source[7].index('{')+1
+      members=[owner(root,[row(4,11,source[3].index('{')),row(13,9,len(source[12])+1),row(14,5,6)]),
+          owner('_RNC'+root[2:]+'0B5_',[row(4,outer_col,outer_col+1),row(13,9,len(source[12])+1)]),
+          owner(local,[row(7,13,source[6].index('{')),row(8,17,25),row(11,13,14)]),
+          owner(nested,[row(8,inner_col,inner_col+1),row(9,21,len(source[8])+1),row(10,17,18)])]
+      documents.append(members)
+     if fault=='cold-local-region':documents[1][3]['regions'][1][4]=0
+     elif fault=='cold-local-entry':documents[1][2]['count']=0
+     elif fault=='foreign-local-namespace':
+      for member in documents[1][2:]:member['name']=member['name'].replace('7routine','7another')
+     elif fault=='wrong-trait':
+      for member in documents[1][2:]:member['name']=member['name'].replace('6Source','6Differ')
+     elif fault=='wrong-self-type':
+      for member in documents[1][2:]:member['name']=member['name'].replace('5Local','5Other')
+     elif fault=='missing-local-body':documents[1].pop()
+     elif fault=='extra-local-body':documents[1].append(copy.deepcopy(documents[1][3]))
+     elif fault=='wrong-body-counter':documents[1][3]['regions'][0][4]=2
+     elif fault=='wrong-closing-counter':documents[1][2]['regions'][-1][4]=2
+     elif fault=='raw-flag':documents[1][3]['regions'][0][5]=1
+     counts=[]
+     for members in documents:
+      work=coverage._ObserverWork();counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments([r for o in members for r in o['regions']],work),work)))
+     def owners(base,head):
+      for document,members in zip((base,head),documents):
+       document['data'][0]['functions']=members;document['data'][0]['files'][0].update(expansions=[],branches=[],mcdc_records=[])
+     return self.compare(before=counts[0],after=counts[1],mutate=owners,sources=(
+       {'example.rs':('\n'.join(old)+'\n').encode()},{'example.rs':('\n'.join(new)+'\n').encode()}))
+
+    def test_positive_local_impl_forest_keeps_source_bound_constructor_and_body(self):
+     result=self.local_impl_fixture()
+     proof,=[r for r in result.get('retained_replacement_obligations',[]) if r.get('kind')=='same-qualified-positive-test']
+     self.assertEqual([len(side[0]) for side in proof['phase_forests']],[4,4])
+     self.assertEqual(proof['mapped_credit'],[0,0]);self.assertEqual(proof['summary_credit'],[0,0])
+     self.assertEqual(proof['local_impl_roles'][0],proof['local_impl_roles'][1])
+
+    def test_local_impl_forest_refuses_cold_foreign_or_incomplete_members(self):
+     for fault in ('cold-local-region','cold-local-entry','foreign-local-namespace','wrong-trait','wrong-self-type',
+                   'missing-local-body','extra-local-body','wrong-body-counter','wrong-closing-counter','raw-flag'):
+      with self.subTest(fault=fault):
+       try:r=self.local_impl_fixture(fault)
+       except ValueError:continue
+       self.assertFalse(any(p.get('kind')=='same-qualified-positive-test' and any(p.get('local_impl_roles',())) for p in r.get('retained_replacement_obligations',[])))
+
+    def test_local_scope_decoder_is_opt_in_and_requires_complete_backreferences(self):
+     symbol='_RNvXNCNvNtCs1_7example5tests7routine0NtB2_5LocalNtB8_6Source8old_call'
+     self.assertIsNone(coverage.nominal_method_path(symbol))
+     shape=coverage.nominal_method_path(symbol,local_scope=True)
+     self.assertEqual(shape.self_type[-1],('Local',''))
+     self.assertEqual(shape.method,('old_call',''))
+     for bad in (symbol.replace('B2_','B9_'),symbol.replace('routine0','routine1'),symbol+'extra'):
+      self.assertIsNone(coverage.nominal_method_path(bad,local_scope=True))
+
+    def projected_input_fixture(self,fault=None):
+     old=['fn channel_sdks(channel: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {', '    channel', '        .get("releases")', '        .and_then(serde_json::Value::as_array)', '        .into_iter()', '        .flatten()', '        .flat_map(|release| {', '            release.get("sdk").into_iter().chain(', '                release', '                    .get("sdks")', '                    .and_then(serde_json::Value::as_array)', '                    .into_iter()', '                    .flatten(),', '            )', '        })', '}', '', '/// Collect every SDK feature band from one channel document.', 'fn parse_channel_sdks(channel: &serde_json::Value, prerelease: bool) -> Vec<DotnetVersion> {', '    let mut versions: Vec<_> = channel_sdks(channel)', '        .filter_map(|sdk| {', '            sdk.get("version")', '                .and_then(serde_json::Value::as_str)', '                .filter(|version| !version.is_empty())', '                .map(|version| DotnetVersion {', '                    version: version.to_owned(),', '                    prerelease,', '                })', '        })', '        .collect();', '    versions.sort_by(|a, b| super::common::version_cmp(&b.version, &a.version));', '    versions.dedup_by(|a, b| a.version == b.version);', '    versions', '}']
+     new=['fn channel_sdks(channel: &serde_json::Value) -> impl Iterator<Item = (&serde_json::Value, &serde_json::Value)> {', '    channel', '        .get("releases")', '        .and_then(serde_json::Value::as_array)', '        .into_iter()', '        .flatten()', '        .flat_map(|release| {', '            release.get("sdk").into_iter().chain(', '                release', '                    .get("sdks")', '                    .and_then(serde_json::Value::as_array)', '                    .into_iter()', '                    .flatten(),', '            )', '                .map(move |sdk| (release, sdk))', '        })', '}', '', '/// Collect every SDK feature band from one channel document.', 'fn parse_channel_sdks(channel: &serde_json::Value, prerelease: bool) -> Vec<DotnetVersion> {', '    let mut versions: Vec<_> = channel_sdks(channel)', '        .filter_map(|(_, sdk)| {', '            sdk.get("version")', '                .and_then(serde_json::Value::as_str)', '                .filter(|version| !version.is_empty())', '                .map(|version| DotnetVersion {', '                    version: version.to_owned(),', '                    prerelease,', '                })', '        })', '        .collect();', '    versions.sort_by(|a, b| super::common::version_cmp(&b.version, &a.version));', '    versions.dedup_by(|a, b| a.version == b.version);', '    versions', '}']
+     if fault=='standard-unused-import':new=['use std::collections::BTreeMap;']+new
+     if fault=='impure-first-field':new=[s.replace('(release, sdk)','(inspect(release), sdk)') for s in new]
+     if fault=='unknown-producer-receiver':
+      old=[s.replace('release.get("sdk")','release.custom("sdk")') for s in old];new=[s.replace('release.get("sdk")','release.custom("sdk")') for s in new]
+     if fault=='wrong-projected-value':new=[s.replace('(release, sdk)','(sdk, release)') for s in new]
+     elif fault=='changed-producer':new=[s.replace('.get("sdks")','.get("other")') for s in new]
+     elif fault=='changed-caller':new=[s.replace('sdk.get("version")','sdk.get("other")') for s in new]
+     elif fault=='trait-import':new=['use extension::MapTrait;']+new
+     sources=[old,new];documents=[]
+     for side,source in enumerate(sources):
+      first=next(i for i,s in enumerate(source,1) if s.startswith('fn parse_channel_sdks'))
+      last=len(source);cb=next(i for i,s in enumerate(source,1) if '.filter_map(' in s)
+      cbend=next(i for i in range(cb+1,last+1) if source[i-1]=='        })')
+      filterline=next(i for i in range(first,last+1) if '.filter(|version|' in source[i-1]);record=filterline+1
+      sort=next(i for i in range(first,last+1) if 'versions.sort_by' in source[i-1]);dedup=sort+1
+      members=[]
+      for number,state in enumerate((0,1),1):
+       root=f'_RNvCs{side*2+number}_7example18parse_channel_sdks'
+       def row(line,start,end,count=state):return [line,start,line,end,count,0,0,0]
+       def owner(name,rows):return dict(name=name,count=state,filenames=['/src/example.rs'],regions=rows,branches=[],mcdc_records=[])
+       brace=source[cb-1].index('{')+1
+       members += [owner(root,[row(first,1,source[first-1].index('{')),row(first+1,9,len(source[first])+1),row(cbend+1,9,len(source[cbend])+1),row(last,1,2)]),
+         owner('_RNC'+root[2:]+'0B3_',[row(cb,brace,brace+1),row(cb+1,13,len(source[cb])+1),row(cbend,9,10)]),
+         owner('_RNCNC'+root[2:]+'00B5_',[row(filterline,source[filterline-1].index('!')+1,len(source[filterline-1])-1)]),
+         owner('_RNCNC'+root[2:]+'0s_0B5_',[row(record,source[record-1].index('DotnetVersion')+1,len(source[record-1])+1),row(record+1,21,len(source[record])+1),row(record+2,21,len(source[record+1])+1)]),
+         owner('_RNC'+root[2:]+'s_0B3_',[row(sort,29,len(source[sort-1]))]),
+         owner('_RNC'+root[2:]+'s0_0B3_',[row(dedup,30,len(source[dedup-1]))])]
+      documents.append(members)
+     if fault=='lost-hot-region':documents[1][-5]['regions'][1][4]=0
+     elif fault=='missing-cold-copy':documents[1]=documents[1][6:]
+     elif fault=='extra-cold-copy':
+      for o in copy.deepcopy(documents[1][:6]):o['name']=o['name'].replace('Cs3_','Cs9_');documents[1].append(o)
+     elif fault=='foreign-callback':documents[1][1]['name']=documents[1][1]['name'].replace('18parse_channel_sdks','18parse_channel_sdkz')
+     elif fault=='wrong-ordinal':documents[1][2]['name']=documents[1][2]['name'].replace('00B5_','0s0_0B5_')
+     elif fault=='raw-channel':documents[1][1]['regions'][0][5]=1
+     elif fault=='wrong-header-coordinate':documents[1][1]['regions'][0][1]-=1
+     counts=[]
+     for members in documents:
+      work=coverage._ObserverWork();counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments([r for o in members for r in o['regions']],work),work)))
+     def owners(base,head):
+      for document,members in zip((base,head),documents):document['data'][0]['functions']=members;document['data'][0]['files'][0].update(expansions=[],branches=[],mcdc_records=[])
+     return self.compare(before=counts[0],after=counts[1],mutate=owners,sources=tuple({'example.rs':('\n'.join(s)+'\n').encode()} for s in sources))
+    def test_projected_input_preserves_complete_hot_and_cold_forests(self):
+     result=self.projected_input_fixture();proof,=[r for r in result.get('retained_replacement_obligations',[]) if r.get('kind')=='projected-iterator-input']
+     self.assertEqual([len(s) for s in proof['forest_names']],[12,12]);self.assertEqual(proof['summary_credit'],[0,0]);self.assertEqual(proof['mapped_credit'],[0,0])
+    def test_projected_input_allows_only_unused_standard_collection_import(self):
+     result=self.projected_input_fixture('standard-unused-import')
+     self.assertTrue(any(r.get('kind')=='projected-iterator-input' for r in result.get('retained_replacement_obligations',[])))
+    def test_projected_input_refuses_changed_values_context_or_incomplete_forests(self):
+     for fault in ('impure-first-field','unknown-producer-receiver','wrong-projected-value','changed-producer','changed-caller','trait-import','lost-hot-region','missing-cold-copy','extra-cold-copy','foreign-callback','wrong-ordinal','raw-channel','wrong-header-coordinate'):
+      with self.subTest(fault=fault):
+       try:result=self.projected_input_fixture(fault)
+       except ValueError:continue
+       self.assertFalse(any(r.get('kind')=='projected-iterator-input' for r in result.get('retained_replacement_obligations',[])))
+
     def closed_record_field_forest_compare(self, kind='free', mutation=None):
         if kind == 'free':
             old = ['fn security_inventory() -> Vec<Row> {', '    with_handle(|handle| {',
@@ -3810,6 +4009,119 @@ class SourceAwareCoverageTests(unittest.TestCase):
         return self.compare(before=counts[0], after=counts[1], mutate=owners,
             sources=({'example.rs': ('\n'.join(old)+'\n').encode()},
                      {'example.rs': ('\n'.join(new)+'\n').encode()}))
+
+    def result_test_record_update_compare(self, fault=None):
+        old = ['use other::Unused;', '#[cfg(test)]', 'mod tests {', '    #[test]',
+               '    fn handoff() -> anyhow::Result<()> {', '        temp_env::with_var(',
+               '            "TEST_ROOT",', '            Some(root()),',
+               '            || -> anyhow::Result<()> {', '                let policy = Policy {',
+               '                    names: vec!["fixture".into()],', '                };',
+               '                assert!(admitted(&policy));', '                Ok(())',
+               '            },', '        )', '    }', '}']
+        new = old[:11] + ['                    ..Policy::default()'] + old[11:]
+        new[0] = 'use other::Separate;' if fault != 'changed-binding' else 'use other::Policy;'
+        documents = []
+        for side, source in enumerate((old, new)):
+            def slot(a, start, b, end, count=1):
+                return [a, start, b, end, count, 0, 0, 0]
+            root = f'_RNvNtNtCs{side+1}_7omg_lib7example5tests7handoff'
+            child = '_RNC' + root[2:] + '0B7_'
+            opening = source[8].index('{') + 1
+            members = [dict(name=root, count=1, filenames=['/src/example.rs'], regions=[
+                slot(5, 5, 5, source[4].index('{')+1), slot(6, 9, 6, 27),
+                slot(17+side, 5, 17+side, 6)]),
+                dict(name=child, count=1, filenames=['/src/example.rs'], regions=[
+                    slot(9, opening, 9, opening+1), slot(10, 30, 12+side, 18),
+                    slot(13+side, 17, 13+side, 39), slot(13+side, 40, 13+side, 41,
+                        int(not (side and fault == 'lost-region'))),
+                    slot(14+side, 17, 15+side, 14)])]
+            if side and fault != 'missing-refinement':
+                start = source[10].index('"fixture"') + 1
+                members[1]['regions'].append(slot(11, start, 11, start+len('"fixture"')))
+            documents.append(members)
+
+        def owners(base, head):
+            for document, members in zip((base, head), documents):
+                document['data'][0]['functions'] = members
+                document['data'][0]['files'][0].update(expansions=[], branches=[], mcdc_records=[])
+        counts = []
+        for members in documents:
+            work = coverage._ObserverWork()
+            counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [row for owner in members for row in owner['regions']], work), work)))
+        return self.compare(before=counts[0], after=counts[1], mutate=owners,
+            sources=({'example.rs': ('\n'.join(old)+'\n').encode()},
+                     {'example.rs': ('\n'.join(new)+'\n').encode()}))
+
+    def test_result_test_record_update_preserves_closed_callback_forest(self):
+        receipt = self.result_test_record_update_compare()
+        proof, = [row for row in receipt['retained_replacement_obligations']
+                  if row['kind'] == 'retained-record-update-forest']
+        self.assertIn([9, 9], proof['pairs'])
+        self.assertEqual(receipt['deleted_mapped_hit'], 0)
+        for fault in ('changed-binding', 'missing-refinement', 'lost-region'):
+            with self.subTest(fault=fault):
+                with self.assertRaises(ValueError):
+                    self.result_test_record_update_compare(fault)
+
+    def test_result_test_coverage_binds_the_environment_callback_and_assertion_entries(self):
+        source = ['#[cfg(test)]', 'mod tests {', '    #[test]',
+                  '    fn handoff() -> anyhow::Result<()> {', '        temp_env::with_var(',
+                  '            "TEST_ROOT",', '            Some(root()),',
+                  '            || -> anyhow::Result<()> {', '                assert!(',
+                  '                    admitted()', '                );', '                Ok(())',
+                  '            },', '        )', '    }', '}']
+        root_name = '_RNvNtNtCs1_7omg_lib7example5tests7handoff'
+        file = '/src/example.rs'
+        root = dict(name=root_name, count=2, filenames=[file], regions=[
+            [4,5,4,source[3].index('{')+1,2,0,0,0], [15,5,15,6,2,0,0,0]])
+        opening = source[7].index('{')+1
+        child = dict(name='_RNC'+root_name[2:]+'0B7_', count=1, filenames=[file], regions=[
+            [8,opening,8,opening+1,1,0,0,0], [9,17,9,24,1,0,0,0], [13,13,13,14,1,0,0,0]])
+
+        def observe(line, texts=source, owner=child):
+            return coverage.zero_arg_callback_fragment(texts, (4,15,[root]), [root,owner],
+                {root['name']:1,owner['name']:1}, line, line, coverage._construct_inventory(texts,[1_000_000]),
+                [1_000_000], environment_test=True)
+
+        for line in (8,9):
+            self.assertEqual(observe(line).line_states, ((1,),))
+        self.assertIsNone(observe(10))
+        wrong_extent = copy.deepcopy(child)
+        wrong_extent['regions'][1][3] += 1
+        self.assertIsNone(observe(9, owner=wrong_extent))
+        foreign_owner = dict(child, name=child['name'].replace('7handoff','7unknown'))
+        self.assertIsNone(observe(9, owner=foreign_owner))
+        changed = source[:4] + ['        temp_env::different('] + source[5:]
+        self.assertIsNone(observe(8, texts=changed))
+
+    def test_initial_async_test_record_requires_its_own_eager_body_counters(self):
+        source = ['#[cfg(test)]', 'mod tests {', '    #[tokio::test]',
+                  '    async fn verify() -> anyhow::Result<()> {',
+                  '        use fixture::Spare;', '        let policy = Policy {',
+                  '            grade: Grade::Verified,', '            ..Policy::default()',
+                  '        };', '        Ok(())', '    }', '}']
+        declaration = source[3]
+        opening = declaration.index('{')+1
+        root = dict(name='_RNvNtNtCs1_7omg_lib7example5tests6verify',
+                    filenames=['/src/example.rs'], count=1, regions=[
+                        [4,11,4,opening-1,1,0,0,0], [11,5,11,6,1,0,0,0]])
+        child = dict(root, name='_RNC'+root['name'][2:]+'0B7_', regions=[
+            [4,opening,4,opening+1,1,0,0,0], [6,13,6,19,1,0,0,0], [6,22,9,10,1,0,0,0]])
+
+        def observe(lines=source, owners=(root,child)):
+            return coverage.initial_async_test_record('src/example.rs', lines, dict.fromkeys(range(6,10),1),
+                (4,11,[root]), owners, Counter(owner['name'] for owner in owners),
+                coverage._construct_inventory(lines,[1_000_000]), 6, 9, [1_000_000])
+
+        self.assertEqual(observe()[1]['regions'], child['regions'][1:])
+        rebound = source[:4] + ['        use fixture::Policy;'] + source[5:]
+        self.assertIsNone(observe(lines=rebound))
+        cold = copy.deepcopy(child)
+        cold['regions'][2][4] = 0
+        self.assertIsNone(observe(owners=(root,cold)))
+        extra = dict(root, name='unexpected', regions=[child['regions'][1]])
+        self.assertIsNone(observe(owners=(root,child,extra)))
 
     def test_tail_record_insertion_retains_inherited_and_direct_field_regions(self):
         for direct_first in (False, True):

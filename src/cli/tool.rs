@@ -2518,9 +2518,19 @@ esac
                 assert!(managers.join("verified").exists(), "signatures checked before publication");
                 assert_eq!(fs::read_link(bin.join("fixture-tool")).expect("new link"), install_dir.join("node_modules/.bin/fixture-tool"));
             });
+        });
+        assert_fresh_owned_npm_publication(temp.path(), &path);
+    }
 
-            let fresh_tools = temp.path().join("fresh-tools");
-            let fresh_bin = temp.path().join("fresh-bin");
+    #[cfg(unix)]
+    fn assert_fresh_owned_npm_publication(root: &Path, path: &std::ffi::OsStr) {
+        with_managed_fixture_environment(path, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            let fresh_tools = root.join("fresh-tools");
+            let fresh_bin = root.join("fresh-bin");
             let fresh_install = fresh_tools.join("npm/fixture-tool");
             fs::create_dir(&fresh_bin).expect("fresh shared bin directory");
             assert!(
