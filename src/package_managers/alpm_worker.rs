@@ -332,19 +332,13 @@ mod tests {
         let config = directory.path().join("pacman.conf");
         let configuration = "[options]\nSigLevel = Never\nArchitecture = x86_64\n[core]\n";
         std::fs::write(&config, configuration)?;
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::core::paths::reset_test_overrides();
-            }
-        }
-        let _restore = Restore;
-        crate::core::paths::set_test_overrides(Some(root), Some(database));
         temp_env::with_vars(
             [
                 ("OMG_TEST_MODE", None),
                 ("OMG_CONFIG_DIR", Some(directory.path().as_os_str())),
                 ("OMG_PACMAN_CONF", Some(config.as_os_str())),
+                ("OMG_PACMAN_ROOT", Some(root.as_os_str())),
+                ("OMG_PACMAN_DB_DIR", Some(database.as_os_str())),
                 ("OMG_PACMAN_LOCAL_DIR", None),
                 ("OMG_PACMAN_SYNC_DIR", None),
             ],

@@ -1020,10 +1020,12 @@ mod public_source_tests {
                 .to_string()
                 .contains("non-public")
         );
-        assert!(
-            fetch_public_source("http://example.org/source")
+        assert_eq!(
+            fetch_public_source("http://127.0.0.1/source")
                 .await
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+            "AUR sources require HTTPS without URL credentials"
         );
     }
 

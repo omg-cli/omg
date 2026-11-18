@@ -1766,45 +1766,30 @@ mod tests {
                 }));
             }
             "stage-grace" => {
-                use tokio::io::AsyncWriteExt;
-                let ready = owner.path().join("ready");
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let shell = crate::core::privilege::root_controlled_program_path("sh").unwrap();
                 let mut child = Command::new(shell)
                     .args([
                         "-c",
-                        "trap '' TERM; read -r gate && test \"$gate\" = ready || exit 1; printf ready > \"$1\"; sleep 30",
-                        "fixture",
-                        ready.to_str().unwrap(),
+                        "trap '' TERM; read -r gate && test \"$gate\" = ready || exit 1; printf ready; sleep 30",
                     ])
                     .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
                     .process_group(0)
                     .kill_on_drop(true)
                     .spawn()
                     .unwrap();
-                let mut readiness_gate = Some(child.stdin.take().expect("private readiness pipe"));
+                let mut gate = child.stdin.take().expect("private readiness input");
+                let mut readiness = child.stdout.take().expect("private readiness output");
                 let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap());
                 let mut cleanup = FixtureGroup(Some(pid));
                 let mut commands = Commands::new(false, transport_runtime());
                 commands.active = Some(child);
                 tokio::time::timeout(Duration::from_secs(3), async {
-                    loop {
-                        assert!(
-                            commands
-                                .active
-                                .as_mut()
-                                .unwrap()
-                                .try_wait()
-                                .unwrap()
-                                .is_none()
-                        );
-                        if let Some(mut gate) = readiness_gate.take() {
-                            assert!(!ready.is_file(), "child waits for the initial parent probe");
-                            gate.write_all(b"ready\n").await.unwrap();
-                        } else if ready.is_file() {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
+                    gate.write_all(b"ready\n").await.unwrap();
+                    let mut reply = [0; 5];
+                    readiness.read_exact(&mut reply).await.unwrap();
+                    assert_eq!(&reply, b"ready");
                 })
                 .await
                 .expect("TERM-ignore handler installed before cleanup");

@@ -1249,6 +1249,148 @@ class SourceAwareCoverageTests(unittest.TestCase):
         args[5] = 6
         self.assertIsNone(original(*args, caller_entry=True))
 
+    def nested_async_entry_compare(self, mutation=None, body=False):
+        captured = {}
+        def nest(old, new, base, head):
+            for source, members in ((old, base), (new, head)):
+                source.insert(5, '        runtime.block_on(async {')
+                source[6] = '    ' + source[6]
+                source.insert(7, '        });')
+                for owner in members:
+                    for row in owner['regions']:
+                        for column in (0, 2):
+                            number = row[column]
+                            row[column] = number + (1 if number == 6 else 2 if number >= 7 else 0)
+                for parent, outer in zip(members[:4:2], members[1:4:2]):
+                    outer['regions'].extend([
+                        [6, 9, 6, 16, 1, 0, 0, 0],
+                        [6, 17, 6, 25, 1, 0, 0, 0]])
+                    brace = source[5].index('{') + 1
+                    members.append(dict(name='_RNCNC'+parent['name'][2:]+'00B5_', count=1,
+                        filenames=['/src/example.rs'], regions=[
+                            [6, brace, 6, brace+1, 1, 0, 0, 0],
+                            [7, 13, 7, len(source[6])+1, 1, 0, 0, 0],
+                            [8, 9, 8, 10, 1, 0, 0, 0]]))
+            if mutation:
+                mutation(old, new, base, head)
+            captured.update(old=old, new=new, base=base, head=head)
+        self.caller_entry_compare(mutation=nest)
+        first, last = (6, 7) if body else (6, 6)
+        return coverage.positive_source_fragments(
+            'example.rs', captured['old'], captured['new'], {n: 1 for n in range(1, 19)},
+            {n: 1 for n in range(1, 19)}, captured['base'], captured['head'],
+            {'/src/example.rs': 'example.rs'}, {'/src/example.rs': 'example.rs'},
+            [(first-1, last, first-1, last, list(range(first, last+1)))],
+            callback_functions=('fn checked()',))
+
+    def test_nested_async_entry_retains_root_outer_and_async_copies(self):
+        pairs, receipts = self.nested_async_entry_compare()
+        self.assertEqual(pairs, {6: 6})
+        self.assertTrue(any(witness['kind'] == 'nested-async-call-entry'
+                            for receipt in receipts for witness in receipt.get('callback_owners', [])))
+
+    def test_nested_async_entry_refuses_incomplete_or_rebound_phase_authority(self):
+        def mutate(old, new, base, head, mode):
+            if mode == 'cold-root':
+                head[0]['count'] = head[0]['regions'][0][4] = 0
+            elif mode == 'cold-outer':
+                head[1]['count'] = head[1]['regions'][0][4] = 0
+            elif mode == 'cold-async':
+                head[8]['count'] = head[8]['regions'][0][4] = 0
+            elif mode == 'cold-receiver':
+                head[1]['regions'][-2][4] = 0
+            elif mode == 'cold-method':
+                head[1]['regions'][-1][4] = 0
+            elif mode == 'redistributed-copy-states':
+                for members, matrix in ((base, ((1, 0), (0, 1))), (head, ((1, 1), (0, 0)))):
+                    for outer, values in zip((members[1], members[3]), matrix):
+                        outer['regions'][-2][4], outer['regions'][-1][4] = values
+            elif mode == 'stable-root-overlap':
+                for members in (base, head):
+                    for root in (members[0], members[2]):
+                        root['regions'].append([6, 1, 6, 2, 1, 0, 0, 0])
+            elif mode == 'duplicate-method-caller':
+                for source, members in ((old, base), (new, head)):
+                    source[8:8] = ['        runtime.block_on(async {', '        });']
+                    for owner in members:
+                        for row in owner['regions']:
+                            for column in (0, 2):
+                                if row[column] >= 9:
+                                    row[column] += 2
+            elif mode == 'entry-disagrees':
+                head[8]['count'] += 1
+            elif mode == 'missing-copy':
+                del head[9]
+            elif mode == 'extra-copy':
+                head.append(copy.deepcopy(head[8]))
+            elif mode == 'foreign-overlap':
+                head.append(dict(name='foreign', count=1, filenames=['/src/example.rs'],
+                                 regions=[copy.deepcopy(head[8]['regions'][0])]))
+            elif mode == 'foreign-file':
+                head[8]['filenames'] = ['/src/foreign.rs']
+            elif mode == 'sibling-symbol':
+                head[8]['name'] = head[8]['name'].replace('7checked', '7sibling')
+            elif mode == 'wrong-depth':
+                head[8]['name'] = head[8]['name'].replace('_RNCNC', '_RNC')
+            elif mode == 'wrong-span':
+                head[8]['regions'][-1][3] += 1
+            elif mode in ('stable-wrong-slot', 'stable-parent-tail', 'stable-async-tail'):
+                for members in (base, head):
+                    for outer in (members[1], members[3]):
+                        if mode == 'stable-wrong-slot':
+                            outer['regions'][-2][1] += 1
+                        elif mode == 'stable-parent-tail':
+                            outer['regions'][-2][7] = 1
+                    if mode == 'stable-async-tail':
+                        for child in members[8:]:
+                            child['regions'][0][7] = 1
+            elif mode == 'extra-child-overlap':
+                head[8]['regions'].append([6, 1, 6, 2, 1, 0, 0, 0])
+            elif mode == 'body-spanning-slot':
+                head[1]['regions'][-2][2] += 1
+            elif mode == 'changed-outer-context':
+                new[4] = new[4].replace('caller', 'otherf')
+            elif mode == 'changed-method':
+                new[5] = new[5].replace('block_on', 'other_fn')
+            elif mode == 'changed-receiver':
+                new[5] = new[5].replace('runtime', 'another')
+            elif mode == 'async-move':
+                for source in (old, new):
+                    source[5] = source[5].replace('async {', 'async move {')
+            elif mode == 'inline-body':
+                for source in (old, new):
+                    source[5] += ' do_work();'
+            elif mode == 'conditional-placement':
+                for source in (old, new):
+                    source[5] = '        if ready { ' + source[5]
+                    source[7] += ' }'
+        for mode in ('cold-root', 'cold-outer', 'cold-async', 'cold-receiver', 'cold-method',
+                     'entry-disagrees', 'redistributed-copy-states', 'stable-root-overlap', 'duplicate-method-caller', 'missing-copy', 'extra-copy', 'foreign-overlap',
+                     'foreign-file', 'sibling-symbol', 'wrong-depth', 'wrong-span',
+                     'stable-wrong-slot', 'stable-parent-tail', 'stable-async-tail',
+                     'extra-child-overlap', 'body-spanning-slot', 'changed-outer-context',
+                     'changed-method', 'changed-receiver', 'async-move', 'inline-body',
+                     'conditional-placement'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.nested_async_entry_compare(lambda old, new, base, head: mutate(old, new, base, head, mode))
+
+    def test_nested_async_entry_refuses_body_credit_and_exhausted_work(self):
+        with self.assertRaises(ValueError):
+            self.nested_async_entry_compare(body=True)
+        original = coverage.nested_async_call_entry_fragment
+        captured = []
+        def record(*args):
+            result = original(*args)
+            if result is not None:
+                captured.append(args)
+            return result
+        with patch.object(coverage, 'nested_async_call_entry_fragment', side_effect=record):
+            self.nested_async_entry_compare()
+        self.assertTrue(captured)
+        args = list(captured[0]); args[-1] = [0]
+        with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+            original(*args)
+
     def changed_callback_compare(self, mutation=None, context_change=False, joint=False, callback_form='||',
                                  header_end='brace'):
         def function(name, operation, setup='setup'):

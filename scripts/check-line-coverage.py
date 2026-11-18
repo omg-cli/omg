@@ -1417,6 +1417,109 @@ def zero_arg_callback_fragment(source, group, owners, name_counts, first, last, 
     return CallbackFragmentEvidence(tuple(states), tuple(line_states), signature, witness)
 
 
+def nested_async_call_entry_fragment(source, group, owners, name_counts, first, last, inventory, work):
+    """Prove one direct async method-call entry inside a proved test callback."""
+    if inventory is None or first != last:
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(source[first-1]))
+    call = re.fullmatch(r'[ \t]*(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.'
+                       r'(?P<method>[A-Za-z_][A-Za-z0-9_]*)\([ \t]*async[ \t]*\{[ \t]*',
+                       source[first-1])
+    if call is None:
+        return None
+    _construct_charge(work, len(rows) * (2 * len(source).bit_length() + 4))
+    outers = [row for row in rows if row['opening'] is not None
+              and code.words[row['opening']-1] == '||'
+              and code.position(code.starts[row['opening']])[0] < first
+              <= code.position(code.ends[row['end']])[0]]
+    if len(outers) != 1:
+        return None
+    outer = outers[0]
+    outer_line = code.position(code.starts[outer['opening']])[0]
+    authority = zero_arg_callback_fragment(source, group, owners, name_counts,
+        outer_line, outer_line, inventory, work, caller_entry=True)
+    if authority is None:
+        return None
+    _construct_charge(work, len(rows) * (len(source).bit_length() + 4))
+    phases = [row for row in rows if row['opening'] is not None
+              and code.words[row['opening']-1] == 'async'
+              and code.position(code.starts[row['opening']])[0] == first
+              and outer['opening'] < row['opening'] < row['end'] < outer['end']]
+    if len(phases) != 1:
+        return None
+    phase = phases[0]; paren = code.parents[phase['opening']]
+    if (paren is None or code.words[paren] != '(' or code.parents[paren] != outer['opening']
+            or tuple(code.words[paren+1:phase['opening']]) != ('async',)):
+        return None
+    _construct_charge(work, outer['end'] - outer['opening'] + 1)
+    low = code.position(code.starts[outer['opening']])[0]
+    high = code.position(code.ends[outer['end']])[0]
+    _construct_charge(work, high-low+1)
+    _construct_charge(work, sum(len(value)+1 for value in source[low-1:high]))
+    if sum(value == source[first-1] for value in source[low-1:high]) != 1:
+        return None
+    opening = code.position(code.starts[phase['opening']])
+    closing = code.position(code.ends[phase['end']])
+    if opening != (first, source[first-1].index('{') + 1):
+        return None
+    slots = tuple((first, call.start(part)+1, first, call.end(part)+1)
+                  for part in ('receiver', 'method'))
+    _construct_charge(work, len(owners))
+    by_name = {owner['name']: owner for owner in owners}
+    bound = set(); nested_bound = set(); geometries = []; states = []; lines = []; witnesses = []
+    for index, witness in enumerate(authority.witness['owners']):
+        root = by_name[witness['parent']]; parent = by_name[witness['child']]
+        shape = plain_rust_function_symbol(root['name'])
+        children = []
+        for owner in owners:
+            _construct_charge(work, len(owner['name']) + len(owner['regions']))
+            if (direct_rust_callback_symbol(owner['name'], root['name'], shape.modules, 2)
+                    and min(tuple(row[:2]) for row in owner['regions']) == opening
+                    and max(tuple(row[2:4]) for row in owner['regions']) == closing):
+                children.append(owner)
+        if len(children) != 1:
+            return None
+        child = children[0]
+        _construct_charge(work, len(child['regions']) + len(parent['regions']) + len(root['regions']))
+        if any(owner_covers_lines([row], first, first) for row in root['regions']):
+            return None
+        entries = [row for row in child['regions'] if owner_covers_lines([row], first, first)]
+        painted = [row for row in parent['regions'] if owner_covers_lines([row], first, first)]
+        if (child['filenames'] != parent['filenames'] or name_counts[child['name']] != 1
+                or id(child) in nested_bound or type(child.get('count')) is not int
+                or not 0 <= child['count'] < COUNTER_LIMIT or len(entries) != 1
+                or tuple(entries[0][:4]) != (*opening, first, opening[1]+1)
+                or entries[0][4] != child['count'] or len(entries[0]) != 8
+                or list(entries[0][5:]) != [0, 0, 0]
+                or len(painted) != 2 or {tuple(row[:4]) for row in painted} != set(slots)
+                or any(len(row) != 8 or list(row[5:]) != [0, 0, 0] for row in painted)):
+            return None
+        nested_bound.add(id(child)); bound.update((id(root), id(parent), id(child)))
+        parent_geometry, parent_states = fragment_region_states(parent, first, last, source, work)
+        child_geometry, child_states = fragment_region_states(child, first, last, source, work)
+        geometries.append((parent_geometry, child_geometry))
+        states.append((*authority.states[index], int(child['count'] > 0), *parent_states, *child_states))
+        lines.append((int(any(row[4] > 0 for row in (*painted, *entries))),))
+        witnesses.append(dict(parent=root['name'], outer=parent['name'], child=child['name'],
+                              async_entry=int(child['count'] > 0)))
+    if len(set(geometries)) != 1:
+        return None
+    _construct_charge(work, len(owners))
+    _construct_charge(work, sum(len(owner['regions']) for owner in owners))
+    if any(id(owner) not in bound and any(owner_covers_lines([row], first, first)
+           for row in owner['regions']) for owner in owners):
+        return None
+    signature = ('nested-async-call-entry', authority.signature,
+                 call.group('receiver'), call.group('method'), geometries[0])
+    witness = dict(kind='nested-async-call-entry', owners=witnesses,
+        outer_entry=authority.witness, async_span=[list(opening), list(closing)],
+        context_sha256=hashlib.sha256(repr(signature).encode()).hexdigest(),
+        parent_geometry=geometries[0][0], child_geometry=geometries[0][1],
+        limitation='Caller entry only; no setup, argument-value, callee or async-body equivalence')
+    return CallbackFragmentEvidence(tuple(states), tuple(lines), signature, witness)
+
+
 def nominal_phase_fragment(source, group, owners, name_counts, first, last, inventory, work, cache):
     """Bind a nongeneric impl method's complete lexical phase tree to compiled copies."""
     if inventory is None:
@@ -1901,6 +2004,10 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                             callback = zero_arg_callback_fragment(source, group, inventories[side],
                                 inventory_names[side], offset + 1, offset + b - a,
                                 callback_inventories[side], work, caller_entry=True)
+                        if callback is None:
+                            callback = nested_async_call_entry_fragment(source, group, inventories[side],
+                                inventory_names[side], offset + 1, offset + b - a,
+                                callback_inventories[side], work)
                         if callback is None:
                             callback = nominal_fragments.get((side, offset))
                             if callback is None:
