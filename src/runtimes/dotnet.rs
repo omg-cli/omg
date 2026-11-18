@@ -417,13 +417,11 @@ mod tests {
                 Ok(serde_json::to_vec(&report)?)
             }
         }
-        let archive = tar_gz_entries(
-            ".",
-            &[
-                ("dotnet", b"fixture .NET launcher"),
-                ("sdk/payload", b"fixture SDK"),
-            ],
-        )?;
+        let entries: &[(&str, &[u8])] = &[
+            ("dotnet", b"fixture .NET launcher"),
+            ("sdk/payload", b"fixture SDK"),
+        ];
+        let archive = tar_gz_entries(".", entries)?;
         let artifact_path = |version| format!("/dotnet/Sdk/{version}/dotnet-sdk.tar.gz");
         let rid = dotnet_rid()?;
         let sdk = |version, digest| {
@@ -511,10 +509,8 @@ mod tests {
                 .collect()
         };
         let previous_state = publisher_state()?;
-        let lease = super::super::common::try_lock_runtime_file(
-            &fixture.versions,
-            &format!(".admission-{AFFECTED_SDK}.lock"),
-        )?;
+        let lease_name = format!(".admission-{AFFECTED_SDK}.lock");
+        let lease = super::super::common::try_lock_runtime_file(&fixture.versions, &lease_name)?;
         let error = manager
             .install(AFFECTED_SDK)
             .await

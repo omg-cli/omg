@@ -1091,7 +1091,7 @@ def nested_map_err_states(source, group, inventory, name_counts, first, last, co
 
 
 def _compiled_function_groups(name, owners, files, source, work=None, source_structure=None,
-                              validated_spans=None):
+                              validated_spans=None, shared_prefixes=None):
     if work is not None:
         _construct_charge(work, len(source) + len(owners))
         if source_structure is None:
@@ -1108,8 +1108,14 @@ def _compiled_function_groups(name, owners, files, source, work=None, source_str
         if span is None:
             return None
         by_span.setdefault(span[:2], []).append(owner)
+    if shared_prefixes is None:
+        prefixes = source_function_prefixes(source, by_span, work, source_structure)
+    else:
+        if work is not None:
+            _construct_charge(work,len(by_span))
+        prefixes = {span:shared_prefixes[span] for span in by_span if span in shared_prefixes}
     valid = {}
-    for span, prefix in source_function_prefixes(source, by_span, work, source_structure).items():
+    for span, prefix in prefixes.items():
         members = by_span[span]
         shapes = {tuple(sorted(tuple(row[:4] + row[5:]) for row in owner['regions']))
                   for owner in members}
@@ -1180,7 +1186,7 @@ def inherent_async_type(code, row, implementations):
 
 
 def compiled_async_function_groups(name, owners, files, source, work=None, inventory=None,
-                                   owner_counts=None, inherent_lines=()):
+                                   owner_counts=None, inherent_lines=(), compiled_prefixes=None):
     """Bind separate v0 constructor/body owners without merging their counters."""
     work = [20_000_000] if work is None else work
     inventory = _construct_inventory(source, work) if inventory is None else inventory
@@ -1227,7 +1233,16 @@ def compiled_async_function_groups(name, owners, files, source, work=None, inven
         closing = code.position(code.ends[row['end']])
         span = first[0], closing[0]
         declarations.append((declaration, first, opening, closing, span, context, inherent))
-    prefixes = source_function_prefixes(source, [row[4] for row in declarations], work)
+    if not declarations:
+        return {}
+    spans = [row[4] for row in declarations]
+    prefixes = {}
+    if compiled_prefixes is not None:
+        _construct_charge(work,len(spans))
+        prefixes = {span:compiled_prefixes[span] for span in spans if span in compiled_prefixes}
+        spans = [span for span in spans if span not in prefixes]
+    if spans:
+        prefixes.update(source_function_prefixes(source, spans, work))
     if not prefixes:
         return {}
     if owner_counts is None:
@@ -2869,6 +2884,206 @@ _MATCH_PARAMETER_BINDING = re.compile(r'[ \t]*let ([A-Za-z_]\w*) = match ([A-Za-
 _MATCH_DEFAULT_REFUSAL = re.compile(r'[ \t]*_ => false,',re.ASCII)
 
 
+def ensure_entry_source(name, source, inventory, line, work):
+    if source[line-1].strip()!='anyhow::ensure!(':
+        return None
+    code,rows = inventory[:2]
+    _construct_charge(work,len(code.starts).bit_length()+len(rows))
+    start=bisect.bisect_left(code.starts,code.offsets[line-1])
+    if code.words[start:start+5]!=['anyhow','::','ensure','!','(']:
+        return None
+    opening=start+4; close=code.pairs[opening]
+    if code.words[close+1:close+2]!=[';']:
+        return None
+    stop=close+1
+    _construct_charge(work,stop-start+1)
+    args=_boolean_arguments(code,opening)
+    if args is None or len(args)<2 or args[1][1]-args[1][0]!=1:
+        return None
+    message=code.words[args[1][0]]
+    if not message.startswith('"'):
+        return None
+    statements=inventory[3].get(line,())
+    _construct_charge(work,len(statements))
+    if sum(row['kind']=='statement' and row['supported'] and row['first']==start
+           and row['end']==stop for row in statements)!=1:
+        return None
+    ancestry=_construct_ancestors(code,start,work)
+    opening_set=set(ancestry)
+    by_opening={row['opening']:row for row in rows if row['opening'] in opening_set}
+    if by_opening.keys()!=opening_set:
+        return None
+    parents=[by_opening[at] for at in ancestry]
+    function_at=next((i for i,row in enumerate(parents) if row['kind']=='fn'),None)
+    if function_at is None or any(row['kind'] not in ('if','for','while','loop') or not row['supported']
+                                  for row in parents[:function_at]):
+        return None
+    function=parents[function_at]
+    scope=parents[function_at+1:]
+    def fn_identity(row):
+        header=row['header']
+        if not row['supported'] or row['kind']!='fn' or header.count('fn')!=1:
+            return None
+        index=header.index('fn')
+        if header[:index] not in ((),('pub','(','crate',')')):
+            return None
+        first=code.position(code.starts[row['first']+index])[0]
+        last=code.position(code.ends[row['end']])[0]
+        return header[index+1],(first,last)
+    binding=fn_identity(function)
+    if binding is None:
+        return None
+    function_name,span=binding
+    _construct_charge(work,function['end']-function['opening']+1)
+    if code.words[function['opening']+1:function['end']].count(message)!=1:
+        return None
+    modules=('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'))
+    nominal_path=('crate',modules[0])
+    for segment in modules[1:]:
+        nominal_path=('type',nominal_path,(segment,''))
+    method=None
+    if scope:
+        if len(scope)!=2 or scope[1]['kind']!='impl' or len(scope[1]['header'])!=2:
+            return None
+        parent=fn_identity(scope[0])
+        if parent is None or scope[1]['header'][0]!='impl' or not scope[1]['supported']:
+            return None
+        nominal_type=scope[1]['header'][1]
+        if re.fullmatch(r'[A-Za-z_]\w*',nominal_type,re.ASCII) is None:
+            return None
+        method=(parent,nominal_path,('type',nominal_path,(nominal_type,'')))
+    syntax=(tuple(row['header'] for row in parents),message)
+    condition_start,condition_end=args[0]
+    condition_span=code.region(condition_start,condition_end-1)
+    first,last=condition_span[0],condition_span[2]
+    condition=None
+    _construct_charge(work,len(source[first-1])+len(source[last-1]))
+    first_text,last_text=source[first-1].encode('utf-8'),source[last-1].encode('utf-8')
+    if (line<first<=last<code.position(code.starts[args[1][0]])[0]
+            and code.words[condition_end]==','
+            and code.position(code.starts[condition_end])[0]==last
+            and not first_text[:condition_span[1]-1].strip()
+            and last_text[condition_span[3]-1:].strip()==b','):
+        _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
+        condition=condition_span,tuple(source[first-1:last])
+    return syntax,span,code.region(start,stop),code.region(start,start+3),modules,function_name,method,condition
+
+
+def ensure_condition_observation(source_condition, roots, counts, work):
+    if source_condition is None:
+        return None
+    span,text=source_condition
+    low,high=span[:2],span[2:]
+    first,last=low[0],high[0]
+    _construct_charge(work,last-first+1+sum(len(member[3]) for member in roots))
+    mapped={line-first:bool(counts[line]) for line in range(first,last+1) if line in counts}
+    if not mapped:
+        return None
+    vectors=[]
+    regions=[]
+    for _,_,_,statement,_ in roots:
+        raw=[row for row in statement if row[0]<=last and (row[2]>first or row[2]==first and row[3]>1)]
+        if not raw or any(not low<=tuple(row[:2])<tuple(row[2:4])<=high for row in raw):
+            return None
+        _construct_charge(work,len(raw)*(len(raw).bit_length()+1))
+        vector=tuple(sorted((row[0]-first,row[1],row[2]-first,row[3],bool(row[4])) for row in raw))
+        if len({r[:4] for r in vector})!=len(vector):
+            return None
+        regions.extend(raw)
+        vectors.append(vector)
+    projected=_owner_line_counts({'regions':regions},_ObserverWork(work))
+    if projected!={line:counts[line] for line in range(first,last+1) if line in counts}:
+        return None
+    _construct_charge(work,sum(len(row) for row in vectors)*(len(vectors).bit_length()+1))
+    return first,text,tuple(mapped),tuple(sorted(vectors)),tuple(mapped.values())
+
+
+def retained_ensure_entry(name, sides, indexes, work):
+    """Compare the exact entry counters of a directly owned validation macro."""
+    identities=[]; receipts=[]; states=[]; conditions=[]
+    for (source,inventory,spans,counts,line),index in zip(sides,indexes):
+        observed=ensure_entry_source(name,source,inventory,line,work)
+        if observed is None:
+            return None
+        syntax,span,statement,entry,modules,function,method,condition=observed
+        low,high=statement[:2],statement[2:]
+        owners=index.inventories.get(name,())
+        _construct_charge(work,len(owners))
+        roots=[]; compiled_parents=[]
+        for owner in owners:
+            raw_span=spans.get(id(owner))
+            if raw_span is not None and (raw_span[1]<low[0] or raw_span[0]>high[0]):
+                continue
+            _construct_charge(work,len(owner['regions']))
+            touching=[row for row in owner['regions'] if tuple(row[:2])<high and low<tuple(row[2:4])]
+            if not touching and (raw_span is None or raw_span[:2]!=span):
+                if method is not None and raw_span is not None and raw_span[:2]==method[0][1]:
+                    _construct_charge(work,len(owner['name'])+1)
+                    shape=nominal_method_path(owner['name'])
+                    if shape is None:
+                        return None
+                    compiled_parents.append((owner,shape))
+                continue
+            symbol=owner['name']
+            _construct_charge(work,len(symbol)+len(touching)+1)
+            if (not touching or raw_span is None or raw_span[:2]!=span
+                    or index.name_counts[symbol]!=1 or owner.get('branches') or owner.get('mcdc_records')
+                    or not 0<=owner['count']<COUNTER_LIMIT
+                    or any(not low<=tuple(r[:2])<tuple(r[2:4])<=high or r[5:]!=[0,0,0]
+                           or not 0<=r[4]<COUNTER_LIMIT for r in touching)):
+                return None
+            if method is None:
+                shape=plain_rust_function_symbol(symbol)
+                if shape is None or shape.identifiers!=(*modules,function):
+                    return None
+                identity=shape.identity
+                copy=symbol
+            else:
+                decoded=nominal_method_path(symbol,local_function=True)
+                if decoded is None:
+                    return None
+                shape,local=decoded
+                if (shape.namespace!=method[1] or shape.self_type!=method[2]
+                        or shape.method!=(method[0][0],'') or local!=(function,'')):
+                    return None
+                identity=shape.kind,shape.namespace,shape.self_type,shape.method,local
+                copy=shape.copy_identity
+            marker=[r for r in touching if r[0]<=line<=r[2]]
+            if len(marker)!=1 or tuple(marker[0][:4])!=entry or marker[0][4]>owner['count']:
+                return None
+            roots.append((owner,identity,copy,touching,marker[0][4]))
+        _construct_charge(work,len(roots)+len(compiled_parents))
+        if not 1<=len(roots)<=16 or len({r[1] for r in roots})!=1 or len({r[2] for r in roots})!=len(roots):
+            return None
+        if method is not None:
+            if (len(compiled_parents)!=len(roots)
+                    or {p.copy_identity for _,p in compiled_parents}!={r[2] for r in roots}
+                    or any(index.name_counts[parent['name']]!=1 or parent.get('branches') or parent.get('mcdc_records')
+                           for parent,_ in compiled_parents)):
+                return None
+        _construct_charge(work,high[0]-low[0]+1+sum(len(member[3]) for member in roots))
+        projection=_owner_line_counts({'regions':[row for member in roots for row in member[3]]},
+                                      _ObserverWork(work))
+        if counts.get(line,0)<=0 or projection!={n:counts[n] for n in range(low[0],high[0]+1) if n in counts}:
+            return None
+        conditions.append(ensure_condition_observation(condition,roots,counts,work))
+        identities.append((syntax,roots[0][1]))
+        states.append(sorted(r[4]>0 for r in roots))
+        receipts.append(dict(span=list(statement),entry=list(entry),
+                             owners=[dict(name=r[0]['name'], regions=r[3],entry_count=r[4]) for r in roots],
+                             parents=[parent['name'] for parent,_ in compiled_parents]))
+    if identities[0]!=identities[1] or states[0]!=states[1]:
+        return None
+    pairs=[[sides[0][-1],sides[1][-1]]]
+    condition_pairs=[]
+    if all(item is not None for item in conditions) and conditions[0][1:]==conditions[1][1:]:
+        old,new=[item[0] for item in conditions]
+        condition_pairs=[[old+offset,new+offset] for offset in conditions[0][2]]
+        pairs.extend(condition_pairs)
+    return dict(file=name,kind='retained-ensure-entry',pairs=pairs,condition_pairs=condition_pairs,
+                instance_states=states,observations=receipts)
+
+
 def retained_match_selector(name, sides, indexes, work):
     """Bind a parameter selector or exact default refusal across every compiled root."""
     observed = []
@@ -3203,7 +3418,8 @@ _QUALIFIED_FIELD = re.compile(r'[ \t]*[A-Za-z_]\w*: (?:[A-Za-z_]\w*::)+[A-Za-z_]
 _TEST_EXPECTED_ERROR = re.compile(r'[ \t]*\.expect_err\("[A-Za-z_0-9 -]{1,120}"\);', re.ASCII)
 
 
-def async_test_fragment_owners(name, group, owners, names, inventory, first, last, work):
+def async_test_fragment_owners(name, group, owners, names, inventory, first, last, work,
+                               *, result_alias=False):
     if inventory is None or len(group[2])!=1:
         return None
     code, rows = inventory[:2]
@@ -3214,14 +3430,25 @@ def async_test_fragment_owners(name, group, owners, names, inventory, first, las
     if len(functions)!=1:
         return None
     fn, = functions; words=fn['header']; scope=_boolean_module(code,{'start':fn['first']})
-    if (words[:8]!=('#','[','tokio','::','test',']','async','fn')
-            or words[9:]!=_RESULT_TEST_SIGNATURE[6:]
+    if scope is None and result_alias and name=='src/runtimes/rust.rs':
+        enclosing = code.ancestors(fn['first'])
+        if len(enclosing)==1:
+            module, = enclosing
+            if (code.words[module-2:module]==['mod','tests']
+                    and _boolean_attributes(code,module-2)==[
+                        ['expect','(','clippy','::','unwrap_used',')'], ['cfg','(','test',')']]):
+                scope = ['tests'],['tests'],[module]
+    declaration = words.index('fn')
+    tokio_test = ('#','[','tokio','::','test',']','async','fn')
+    headers = (tokio_test, ('#','[','cfg','(','unix',')',']')+tokio_test) if result_alias else (tokio_test,)
+    result = ('(',')','->','Result','<','(',')','>') if result_alias else _RESULT_TEST_SIGNATURE[6:]
+    if (words[:declaration+1] not in headers or words[declaration+2:]!=result
             or scope is None or scope[:2]!=(['tests'],['tests'])):
         return None
     root, = group[2]; shape=plain_rust_function_symbol(root['name'])
-    path = ('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests',words[8])
+    path = ('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'),'tests',words[declaration+1])
     open_at = code.position(code.starts[fn['opening']]); close_at = code.position(code.ends[fn['end']])
-    entry = (*code.position(code.starts[fn['first']+7]),*code.position(code.ends[fn['opening']-1]))
+    entry = (*code.position(code.starts[fn['first']+declaration]),*code.position(code.ends[fn['opening']-1]))
     if (shape is None or shape.identifiers!=path or names[root['name']]!=1
             or type(root.get('count')) is not int or not 0<root['count']<COUNTER_LIMIT
             or [r[4] for r in root['regions'] if tuple(r[:4])==entry and r[5:]==[0,0,0]]!=[root['count']]):
@@ -3311,6 +3538,61 @@ def async_test_expected_error(name, source, counts, group, owners, names, invent
     if counts.get(first)!=hits or witness['regions']!=[[*span,hits,0,0,0] for span in spans]:
         return None
     return (*identity,tuple(binder),slot),witness
+
+
+def async_runtime_fixture_record(name, source, counts, group, owners, names, inventory, first, last, work):
+    """Project a fixture record through the addition of its eager security field."""
+    managers = {'src/runtimes/java.rs':'JavaManager', 'src/runtimes/rust.rs':'RustManager'}
+    manager = managers.get(name)
+    if (manager is None or inventory is None or first!=last
+            or source[first-1].strip()!=f'let manager = {manager} {{'):
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work,len(rows))
+    candidates = [row for row in rows if row.get('header')==('let','manager','=',manager)
+                  and code.position(code.starts[row['first']])[0]==first]
+    if len(candidates)!=1:
+        return None
+    record, = candidates
+    closing = code.position(code.ends[record['end']])[0]
+    if closing-first not in (3,4) or source[closing-1].strip()!='};':
+        return None
+    bound = async_test_fragment_owners(name,group,owners,names,inventory,first,closing,work,result_alias=True)
+    if bound is None:
+        return None
+    function, identity, witness, entry_hits = bound
+    if code.parents[record['first']]!=function['opening'] or counts.get(first,0)<=0:
+        return None
+    initializer = 'crate::runtimes::security::RuntimeSecurity::fixture'
+    insertion = closing-first==4
+    added = first+1
+    if insertion and source[added-1].strip()!=f'security: {initializer}(),':
+        return None
+    source_rows = source[first-1:closing]
+    _construct_charge(work,sum(len(text)+1 for text in source_rows)+len(witness['regions']))
+    if insertion:
+        extra = source_rows.pop(1)
+        start = extra.index(initializer)+1
+        slot = (added,start,added,start+len(initializer))
+    def relative(line):
+        return line-first-int(insertion and line>added)
+    region_states = []; additions = []
+    for row in witness['regions']:
+        if row[5:]!=[0,0,0]:
+            return None
+        if insertion and tuple(row[:4])==slot:
+            additions.append(row)
+            continue
+        if insertion and added in (row[0],row[2]):
+            return None
+        region_states.append((relative(row[0]),row[1],relative(row[2]),row[3],row[4]>0))
+    if insertion and (len(additions)!=1 or additions[0][4]!=entry_hits or counts.get(added,0)<=0):
+        return None
+    observed = _owner_line_counts({'regions':witness['regions']},_ObserverWork(work))
+    if observed!={line:counts[line] for line in range(first,closing+1) if line in counts}:
+        return None
+    witness.update(record_span=[first,closing],security_initializer=additions)
+    return (identity,tuple(source_rows),tuple(sorted(region_states))),witness
 
 
 def async_test_expected_variant(name, source, counts, group, owners, names, inventory, first, last, work):
@@ -3501,6 +3783,146 @@ def retained_direct_unit_assertion(name, source, line, mapped, group, owners, na
             dict(owner=symbol,span=[*low,*high],entry=list(expected_entry),regions=scope))
 
 
+_ALPM_REPLACE_ANCHOR = ('alpm','::','Question','::','Replace','(','q',')','=>')
+_ALPM_CALLBACK_CAPTURE = (
+    ('Arc','::','clone','(','refusals',')',',','|','question',',','refusals','|'),
+    ('(','Arc','::','clone','(','refusals',')',',','policy',')',',',
+     '|','question',',','(','refusals',',','policy',')','|'),
+)
+
+
+def alpm_replacement_scope(source, inventory, groups, first, last, side, work):
+    code,rows=inventory[:2]
+    _construct_charge(work,len(rows)+len(code.starts).bit_length())
+    start=bisect.bisect_left(code.starts,code.offsets[first-1])
+    branch=('let','confirmed','=','if','auto_accept','{','true','}','else')
+    if tuple(code.words[start:start+len(branch)])!=branch or code.position(code.starts[start+6])[0]!=last:
+        return None
+    arm,match,opening,arguments,function_open,*extra=_construct_ancestors(code,start,work)+[None]*5
+    if None in (arm,match,opening,arguments,function_open) or any(item is not None for item in extra):
+        return None
+    candidates={row['opening']:row for row in rows if row['opening'] in (arm,match,function_open)}
+    if len(candidates)!=3:
+        return None
+    function=candidates[function_open]
+    if (candidates[arm]['header']!=_ALPM_REPLACE_ANCHOR
+            or candidates[match]['header']!=('match','question','.','question','(',')')
+            or function['kind']!='fn' or function['header'][0]!='fn'):
+        return None
+    call=arguments-3; close=code.pairs[opening]
+    if (code.words[call:arguments+1]!=['alpm','.','set_question_cb','(']
+            or tuple(code.words[arguments+1:opening])!=_ALPM_CALLBACK_CAPTURE[side]
+            or code.pairs[arguments]!=close+1 or code.words[close+1:close+3]!=[')',';']):
+        return None
+    header=function['header']
+    if header[2:9]!=('(','alpm',':','&','alpm','::','Alpm'):
+        return None
+    root_span=(code.position(code.starts[function['first']])[0],code.position(code.ends[function['end']])[0])
+    _construct_charge(work,len(groups)+function['end']-function_open+1)
+    roots=[group for group in groups.values() if group[:2]==root_span]
+    if len(roots)!=1:
+        return None
+    scopes=[]; nest=('.','map','(','|','package','|','package','.','name','(',')','.','to_string','(',')',')')
+    for token in range(opening+1,close):
+        if code.words[token:token+3]==['.','map','('] and tuple(code.words[token:token+len(nest)])==nest:
+            scopes.append([code.region(token+6,token+10),code.region(token+12,token+12)])
+    if len(scopes)!=2:
+        return None
+    wrapper=None
+    if side:
+        _construct_charge(work,len(rows))
+        witnesses=[row for row in rows if row['kind']=='fn' and row['header'][:8]==
+                   ('#','[','cfg','(','test',')',']','fn') and code.parents[row['opening']] is None
+                   and code.words[row['opening']+1:row['end']]==[
+                       header[1],'(','alpm',',','refusals',',','TransactionPolicy','::','Standard',')']]
+        if len(witnesses)!=1 or header[-7:]!=('policy',':','TransactionPolicy',',',')','->','ProgressTask'):
+            return None
+        wrapper=witnesses[0]['header'][7:]
+        if (header[0],wrapper[1],*header[2:-7],*header[-3:])!=wrapper:
+            return None
+    return (header,wrapper,roots[0],code.region(call,close+2),code.region(opening,close),
+            [code.region(call,call),code.region(call+2,call+2)],scopes,
+            [code.region(token,token) for token in (start+1,start+4,start+6)])
+
+
+def retained_alpm_replace_branch(sides, inventories, names, groups, work):
+    source_claims=[]; copy_receipts=[]; copy_states=[]
+    for side,(source,inventory,counts,first,last) in enumerate(sides):
+        claim=alpm_replacement_scope(source,inventory,groups[side],first,last,side,work)
+        if claim is None:
+            return None
+        header,wrapper,group,statement,closure,registrations,nesting,slots=claim
+        low,high=statement[:2],statement[2:]
+        source_claims.append((header,wrapper,group[:2]))
+        owners=inventories[side]; _construct_charge(work,len(owners))
+        touching={}
+        for owner in owners:
+            _construct_charge(work,len(owner['regions']))
+            selected=[r for r in owner['regions'] if tuple(r[:2])<high and low<tuple(r[2:4])]
+            if selected:
+                _construct_charge(work,len(owner['name'])+len(selected))
+                if (names[side][owner['name']]!=1 or owner.get('branches') or owner.get('mcdc_records')
+                        or any(r[5:]!=[0,0,0] or not low<=tuple(r[:2])<tuple(r[2:4])<=high
+                               or not 0<=r[4]<COUNTER_LIMIT for r in selected)):
+                    return None
+                touching[owner['name']]=owner,selected
+        vectors=[]; raw=[]; copy_evidence=[]
+        if not 1<=len(group[2])<=16:
+            return None
+        for root in group[2]:
+            symbol=root['name']; shape=plain_rust_function_symbol(symbol)
+            prefix='_RNC'+symbol[2:]
+            _construct_charge(work,4*len(symbol)+1)
+            if (shape is None or shape.identifiers!=('omg_lib','package_managers','alpm_ops',header[1])
+                    or not 0<=root['count']<COUNTER_LIMIT):
+                return None
+            member=touching.pop(symbol,None)
+            if member is None or member[0] is not root:
+                return None
+            root_slots=member[1]
+            _construct_charge(work,3*len(root_slots))
+            if (any([r[4] for r in root_slots if tuple(r[:4])==marker]!=[root['count']] for marker in registrations)
+                    or any(r[0]<=last and (r[2]>first or r[2]==first and r[3]>1) for r in root_slots)):
+                return None
+            child_key=prefix+'0'+rust_same_crate_backref(shape.modules,1)
+            member=touching.pop(child_key,None)
+            if member is None or not direct_rust_callback_symbol(child_key,symbol,shape.modules):
+                return None
+            child,child_slots=member
+            _construct_charge(work,3*len(child_slots))
+            if (len(child_slots)!=len(child['regions']) or child['filenames']!=root['filenames']
+                    or not 0<=child['count']<COUNTER_LIMIT
+                    or (*min(tuple(r[:2]) for r in child_slots),*max(tuple(r[2:4]) for r in child_slots))!=closure):
+                return None
+            entry=(*closure[:2],closure[0],closure[1]+1)
+            observed=[r for r in child_slots if r[0]<=last and (r[2]>first or r[2]==first and r[3]>1)]
+            if ([r[4] for r in child_slots if tuple(r[:4])==entry]!=[child['count']]
+                    or [tuple(r[:4]) for r in observed]!=slots):
+                return None
+            descendants=[]
+            for ordinal,expected in zip(('00','0s_0'),nesting):
+                key='_RNCNC'+symbol[2:]+ordinal+rust_same_crate_backref(shape.modules,2)
+                member=touching.pop(key,None)
+                if member is None or not direct_rust_callback_symbol(key,symbol,shape.modules,2):
+                    return None
+                nested,cells=member
+                if (nested['filenames']!=root['filenames'] or len(cells)!=len(nested['regions'])
+                        or [tuple(r[:4]) for r in cells]!=expected
+                        or any(r[0]<=last and (r[2]>first or r[2]==first and r[3]>1) for r in cells)):
+                    return None
+                descendants.append(key)
+            raw.extend(observed)
+            vectors.append(tuple(bool(row[4]) for row in observed))
+            copy_evidence.append(dict(root=symbol,child=child_key,descendants=descendants,regions=observed))
+        if touching or _owner_line_counts({'regions':raw},_ObserverWork(work))!={
+                line:counts[line] for line in range(first,last+1) if line in counts}:
+            return None
+        copy_receipts.append(copy_evidence); copy_states.append(sorted(vectors))
+    if source_claims[0][0]!=source_claims[1][1] or copy_states[0]!=copy_states[1]:
+        return None
+    return source_claims,copy_receipts,copy_states
+
+
 def positive_source_fragments(name, old, new, before, after, base, head, base_files, head_files,
                               fragments, work=None, construct_inventories=None, compiled_groups=None,
                               callback_functions=(), owner_indexes=None, inherent_async_lines=((), ()), macro_expansions=(None, None)):
@@ -3539,9 +3961,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             valid = {prefix: group for prefix, group in valid.items()
                      if all(names[owner['name']] == 1 for owner in group[2])}
         valid = dict(valid)
+        _construct_charge(work,len(valid))
+        lexical_prefixes = {group[:2]:prefix for prefix,group in valid.items()}
         phases = compiled_async_function_groups(name, inventory, files, source, work,
                     None if construct_inventories is None else construct_inventories[side], names,
-                    inherent_async_lines[side])
+                    inherent_async_lines[side],lexical_prefixes)
         phase_bodies = {id(copy.body) for group in phases.values() for copy in group.copies}
         valid = {key: group for key, group in valid.items()
                  if not any(id(owner) in phase_bodies for owner in group[2])}
@@ -3556,9 +3980,12 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
     receipts = []
     nominal_phase_cache = {}; literal_loop_cache = {}; join_cache = {}; callback_phase_cache = {}
     fixture_forests = {}; fixture_receipts = {}
+    fixture_record_pairs = {}
     leaf_inventories = None
     for a, b, c, d, pending in fragments:
         current_fragment = (a, b, c, d, pending)
+        if pending and all(fixture_record_pairs.get(line)==line+c-a for line in pending):
+            continue
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
                       and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
@@ -3610,6 +4037,26 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     _construct_charge(work, sum(len(text) + 1 for text in source[start - 1:end]))
                     excerpts[side, start, end] = ('\n'.join(source[start - 1:end]) + '\n').encode()
                 continue
+        if (name=='src/package_managers/alpm_ops.rs' and construct_inventories is not None
+                and macro_expansions==([],[]) and b-a==d-c==2 and tuple(pending)==(a+1,b)
+                and old[a:b]==new[c:d] and old[a].strip()=='let confirmed = if auto_accept {'
+                and old[b-1].strip()=='true'):
+            sides=((old,construct_inventories[0],before,a+1,b),(new,construct_inventories[1],after,c+1,d))
+            registered=retained_alpm_replace_branch(sides,inventories,inventory_names,groups,work)
+            if registered is not None:
+                scopes,owners,states=registered
+                matched=[[a+1,c+1],[b,d]]
+                if any(line in pairs and pairs[line]!=target for line,target in matched):
+                    refuse()
+                pairs.update(matched)
+                for side,(source,(_,_,scope)) in enumerate(zip((old,new),scopes)):
+                    first,last=scope
+                    _construct_charge(work,sum(len(text)+1 for text in source[first-1:last]))
+                    excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
+                receipts.append(dict(file=name,kind='retained-alpm-replace-branch',pairs=matched,
+                    instance_states=states,owners=owners,
+                    callback_fragments=[dict(pairs=matched,base_range=[a+1,b],head_range=[c+1,d])]))
+                continue
         if (len(candidates) != 1 or old[a:b] != new[c:d]
                 or any(line not in before for line in pending)):
             refuse()
@@ -3623,14 +4070,27 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             async_fragment = async_test_expected_error
         elif b-a==1 and tuple(pending)==(b,) and old[a].strip()=='assert!(matches!(':
             async_fragment = async_test_expected_variant
+        elif b-a==1 and old[a].strip() in ('let manager = JavaManager {','let manager = RustManager {'):
+            async_fragment = async_runtime_fixture_record
         if async_fragment is not None and macro_expansions==([],[]) and construct_inventories is not None:
             observations = [async_fragment(name,source,counts,group,inventories[side],
                 inventory_names[side],construct_inventories[side],first,last,work)
                 for side,(source,counts,group,first,last) in enumerate(((old,before,bg,a+1,b),(new,after,hg,c+1,d)))]
             if (all(observations) and observations[0][0]==observations[1][0]
                 and (async_fragment is not async_test_expected_variant or
-                         [entry[1]['wrapped'] for entry in observations]==[True,False])):
+                         [entry[1]['wrapped'] for entry in observations]==[True,False])
+                and (async_fragment is not async_runtime_fixture_record or
+                         [bool(entry[1]['security_initializer']) for entry in observations]==[False,True])):
                 matched = [(line,line+c-a) for line in pending]
+                if async_fragment is async_runtime_fixture_record:
+                    old_first,old_last = observations[0][1]['record_span']
+                    new_first = observations[1][1]['record_span'][0]
+                    matched = [(line,line+new_first-old_first+int(line>old_first))
+                               for line in range(old_first,old_last+1) if line in before]
+                    _construct_charge(work,len(matched))
+                    if any(target not in after for _,target in matched):
+                        refuse()
+                    fixture_record_pairs.update(matched)
                 if any(line in pairs and pairs[line]!=target for line,target in matched):
                     refuse()
                 pairs.update(matched)
@@ -3640,9 +4100,16 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
                 kind = {initial_async_test_record:'initial-async-test-record',
                         async_test_expected_error:'async-test-expected-error-call',
-                        async_test_expected_variant:'async-test-expected-variant-entry'}[async_fragment]
-                receipts.append(dict(kind=kind,file=name,pairs=matched,
-                    owners=[observation[1] for observation in observations]))
+                        async_test_expected_variant:'async-test-expected-variant-entry',
+                        async_runtime_fixture_record:'async-runtime-fixture-record'}[async_fragment]
+                evidence = [observation[1] for observation in observations]
+                receipt = dict(kind=kind,file=name,pairs=matched,owners=evidence)
+                if async_fragment is async_runtime_fixture_record:
+                    receipt['async_copies'] = {side:[dict(constructor=owner['root'],body=owner['body'],
+                        constructor_state=1,body_state=1)] for side,owner in zip(('base','head'),evidence)}
+                    receipt['async_fragment_regions'] = [dict(base_range=evidence[0]['record_span'],
+                        head_range=evidence[1]['record_span'],geometry=observations[0][0][2])]
+                receipts.append(receipt)
                 continue
         if (construct_inventories is not None and macro_expansions==([],[]) and prefix in callback_functions
                 and a and c and a+1==b and c+1==d and tuple(pending)==(b,)
@@ -4099,11 +4566,12 @@ class RustNominalMethodPath:
 
 _NOMINAL_METHOD_PREFIX = re.compile(r'_R((?:NC){0,8})Nv([MXY])')
 _PATH_REFERENCE_METHOD_PREFIX = re.compile(r'_RI()Nv(M)')
+_LOCAL_MEMBER_FUNCTION_PREFIX = re.compile(r'_R()NvNv(M)')
 _NOMINAL_METHOD_PREFIX_WORK = len('_R' + 'NC' * 8 + 'NvX') + 1
 
 
 @lru_cache(maxsize=4096)
-def nominal_method_path(symbol, *, inventory=False, path_reference=False, local_scope=False):
+def nominal_method_path(symbol, *, inventory=False, path_reference=False, local_scope=False, local_function=False):
     """Decode bounded nominal v0 inherent, trait-impl and default-trait methods.
 
     Replacement identity omits crate disambiguators; callback ownership retains
@@ -4112,7 +4580,11 @@ def nominal_method_path(symbol, *, inventory=False, path_reference=False, local_
     """
     if type(symbol) is not str or len(symbol) > 4096:
         return None
-    prefix = (_PATH_REFERENCE_METHOD_PREFIX if path_reference else _NOMINAL_METHOD_PREFIX).match(symbol)
+    if local_function and (inventory or path_reference or local_scope):
+        return None
+    pattern = (_LOCAL_MEMBER_FUNCTION_PREFIX if local_function else
+               _PATH_REFERENCE_METHOD_PREFIX if path_reference else _NOMINAL_METHOD_PREFIX)
+    prefix = pattern.match(symbol)
     if prefix is None:
         return None
     depth = len(prefix[1]) // 2
@@ -4195,6 +4667,7 @@ def nominal_method_path(symbol, *, inventory=False, path_reference=False, local_
             namespace = path(); self_type = path()
             trait = path() if kind == 'X' else None
         method, item_scope = identifier()
+        local = identifier() if local_function else None
         callbacks = []
         for _ in range(depth):
             callbacks.append(disambiguator())
@@ -4231,9 +4704,10 @@ def nominal_method_path(symbol, *, inventory=False, path_reference=False, local_
             return None
         if not inventory and at != len(symbol):
             return None
-        return RustNominalMethodPath(impl_scope, namespace, self_type, trait,
+        shape = RustNominalMethodPath(impl_scope, namespace, self_type, trait,
             (method, item_scope), tuple(callbacks), kind,
             tuple(sorted(crates.items())), instance or crate, argument)
+        return (shape,local) if local_function else shape
     except ValueError:
         return None
 
@@ -9792,10 +10266,16 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                 or max(scope[2], other[2]) <= min(scope[3], other[3]))
             for other in function_scopes)]
         source_structure = None
+        shared_prefixes = None
         if base_sources[name] == head_sources[name]:
             _construct_charge(construct_work, sum(len(line) + 1 for line in old))
             source_structure = _source_structural_map(old)
-        grouped = [_compiled_function_groups(name, owners, files, source, construct_work, source_structure, spans)
+            if source_structure is not None:
+                _construct_charge(construct_work,len(base_spans)+len(head_spans))
+                spans = dict.fromkeys(span[:2] for side in (base_spans,head_spans) for span in side.values())
+                shared_prefixes = source_function_prefixes(old, spans, construct_work, source_structure)
+        grouped = [_compiled_function_groups(name, owners, files, source, construct_work, source_structure,
+                                             spans, shared_prefixes)
                    for owners, files, source, spans in ((owners_by_file.get(name, []), base_files, old, base_spans),
                                                        (head_owners_by_file.get(name, []), head_files, new, head_spans))]
         base_groups, head_groups = (value[1] if value is not None else {} for value in grouped)
@@ -10015,6 +10495,16 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if (line, target) in proved_eager_pairs:
                     retained[line] = target
                 elif line not in anchored:
+                    if (inventories is not None and old[line-1]==new[target-1]
+                            and old[line-1].strip()=='anyhow::ensure!('
+                            and (bs[name]['expansions'],hs[name]['expansions'])==([],[])):
+                        sides=((old,inventories[0],base_spans,before,line),
+                               (new,inventories[1],head_spans,after,target))
+                        proof=retained_ensure_entry(name,sides,source_owner_indexes(),construct_work)
+                        if proof is not None:
+                            anchored.update(proof['pairs'])
+                            obligation_receipts.append(proof)
+                            continue
                     scopes = [prefix for prefix, group in base_groups.items()
                               if prefix in head_groups
                               and group[0] <= line <= group[1]

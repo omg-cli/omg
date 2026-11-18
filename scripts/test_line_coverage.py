@@ -536,6 +536,187 @@ class AsyncTestExpectedVariantTests(unittest.TestCase):
                 self.assertFalse(any(entry.get('kind')=='async-test-expected-variant-entry' for entry in receipts))
 
 
+class RetainedEnsureEntryTests(unittest.TestCase):
+    def compare(self, *, local=False, fault=None, same_condition=False):
+        name='src/package_managers/aur/client.rs' if local else 'src/example.rs'
+        filename=f'/artifact/{name}'
+        files={filename:name}
+        sides=[]; indexes=[]
+        work=[coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        for side in range(2):
+            source=['pub(crate) fn check(valid: bool) -> anyhow::Result<()> {']
+            if local:
+                source=['struct ReviewedSource;', 'impl ReviewedSource {',
+                        '    fn capture(valid: bool) -> anyhow::Result<()> {',
+                        '        fn visit(valid: bool) -> anyhow::Result<()> {',
+                        '            if valid {']
+            indentation='                ' if local else '    '
+            condition='!valid' if side and not same_condition else 'valid'
+            message='wrong fixture assertion' if side and fault=='changed-label' else 'owned fixture assertion'
+            opener=len(source)+1
+            source.extend([f'{indentation}anyhow::ensure!(',f'{indentation}    {condition},',
+                           f'{indentation}    "{message}: {{}}",',f'{indentation}    '+('new_display()' if side else 'old_display()'),
+                           f'{indentation});'])
+            if side and fault=='duplicate-label':
+                source.append(f'{indentation}let _ = "{message}: {{}}";')
+            if local:
+                source.extend(['            }','            Ok(())','        }','        visit(valid)','    }','}'])
+            else:
+                source.extend(['    Ok(())','}'])
+            first=4 if local else 1
+            last=len(source)-3 if local else len(source)
+            def row(line, text, count):
+                col=source[line-1].index(text)+1
+                return [line,col,line,col+len(text),count,0,0,0]
+            owners=[]
+            for copy in range(2):
+                if side and fault=='missing-cold-copy' and copy==0:
+                    continue
+                counter=4 if copy else 0
+                if side and fault=='moved-cold-state':
+                    counter=2
+                crate=f's{"cf"[side]}{copy}_'
+                parent=None
+                if local:
+                    scope=('s0_' if side else 's_')
+                    namespace=f'NtNtNtC{crate}7omg_lib16package_managers3aur6client'
+                    parent=f'_RNvM{scope}{namespace}NtB{5 if side else 4}_14ReviewedSource7capture'
+                    symbol=f'_RNvNvM{scope}{namespace}NtB{7 if side else 6}_14ReviewedSource7capture5visit'
+                else:
+                    symbol=f'_RNvNtC{crate}7omg_lib7example5check'
+                if side and fault=='trailing-symbol' and copy:
+                    symbol+='x'
+                regions=[row(first,'fn',counter),row(last,'}',counter),
+                         row(opener,'anyhow::ensure!',counter),
+                         row(opener+1,condition,0 if side and fault=='condition-cold' else counter),
+                         row(opener+3,'new_display' if side else 'old_display',counter)]
+                if side and fault=='missing-slot' and not copy:
+                    del regions[2]
+                owners.append(dict(name=symbol,filenames=[filename],count=counter,regions=regions))
+                if parent and not (side and fault=='missing-parent' and copy):
+                    owners.append(dict(name=parent,filenames=[filename],count=counter,
+                        regions=[row(3,'fn',counter),row(len(source)-1,'}',counter)]))
+            if side and fault=='foreign-owner':
+                owners.append(dict(name='opaque',filenames=[filename],count=1,regions=[row(opener,'anyhow',1)]))
+            counts=coverage._owner_line_counts({'regions':[r for owner in owners for r in owner['regions']]},
+                                              coverage._ObserverWork(work))
+            spans={id(owner):coverage.source_owner_span(owner,name,files,source) for owner in owners}
+            sides.append((source,coverage._construct_inventory(source,work),spans,counts,opener))
+            indexes.append(coverage.index_compiled_owner_sources(owners,files,work,{name}))
+        return coverage.retained_ensure_entry(name,sides,indexes,work)
+
+    def test_projects_exact_entry_in_plain_and_local_owners(self):
+        for local in (False,True):
+            with self.subTest(local=local):
+                witness=self.compare(local=local)
+                self.assertIsNotNone(witness)
+                self.assertEqual(witness['instance_states'],[[False,True],[False,True]])
+                self.assertEqual(len(witness['pairs']),1)
+                self.assertEqual([len(side['parents']) for side in witness['observations']],[2 if local else 0]*2)
+
+    def test_condition_projects_only_exact_source_and_complete_copy_counters(self):
+        witness=self.compare(local=True,same_condition=True)
+        self.assertEqual(witness['pairs'],[[6,6],[7,7]])
+        self.assertEqual(witness['condition_pairs'],[[7,7]])
+        for mode in ('changed-source','condition-cold'):
+            with self.subTest(mode=mode):
+                separate=self.compare(local=True,same_condition=mode!='changed-source',fault=mode)
+                self.assertEqual(separate['pairs'],[[6,6]])
+                self.assertEqual(separate['condition_pairs'],[])
+
+    def test_rejects_foreign_or_incomplete_copy_and_source_evidence(self):
+        for local in (False,True):
+            faults=['changed-label','duplicate-label','missing-cold-copy','moved-cold-state',
+                    'trailing-symbol','missing-slot','foreign-owner']
+            if local:
+                faults.append('missing-parent')
+            for fault in faults:
+                with self.subTest(local=local,fault=fault):
+                    self.assertIsNone(self.compare(local=local,fault=fault))
+
+
+class RetainedAlpmRegistrationTests(unittest.TestCase):
+    def compare(self, fault=None):
+        sides=[]; inventories=[]; all_names=[]; groups=[]
+        filename='/artifact/src/package_managers/alpm_ops.rs'
+        for side in range(2):
+            original='setup_alpm_callbacks'
+            declaration=original+'_in' if side else original
+            parameters='alpm: &alpm::Alpm, refusals: &Refusals,'
+            source=[]
+            if side:
+                forwarding='Omarchy' if fault=='wrong-forwarder' else 'Standard'
+                source=['#[cfg(test)]',f'fn {original}({parameters}) -> ProgressTask {{',
+                        f'    {declaration}(alpm, refusals, TransactionPolicy::{forwarding})','}']
+            start=len(source)+1
+            header=parameters+(' policy: TransactionPolicy,' if side else '')
+            callback=('(Arc::clone(refusals), policy), |question, (refusals, policy)| {'
+                      if side else 'Arc::clone(refusals), |question, refusals| {')
+            source.extend([f'fn {declaration}({header}) -> ProgressTask {{',
+                f'    alpm.set_question_cb({callback}',
+                '        match question.question() {',
+                '            alpm::Question::Replace(q) => {',
+                '                let auto_accept = allowed();',
+                '                let confirmed = if auto_accept {',
+                '                    false' if side and fault=='different-branch' else '                    true',
+                '                } else { false };', '            }',
+                '            alpm::Question::RemovePkgs(q) => {',
+                '                q.packages().iter().map(|package| package.name().to_string());',
+                '            }',
+                '            alpm::Question::SelectProvider(q) => {',
+                '                q.providers().iter().map(|package| package.name().to_string());',
+                '            }','        }','    });','    task','}'])
+            end=len(source); first=start+5; last=first+1
+            def slot(line,text,hits):
+                col=source[line-1].index(text)+1
+                return [line,col,line,col+len(text),hits,0,0,0]
+            rows=[]; roots=[]
+            for copy in range(2):
+                count=1
+                hits=1 if copy else 0
+                mangled=(f'NvNtNtCs{side+1}{copy+1}_7omg_lib16package_managers8alpm_ops'
+                         f'{len(declaration)}{declaration}')
+                root_rows=[slot(start,'fn',count),slot(start+1,'alpm',count),
+                           slot(start+1,'set_question_cb',count),slot(end,'}',count)]
+                if side and fault=='missing-registration' and copy:
+                    del root_rows[2]
+                root=dict(name='_R'+mangled,filenames=[filename],regions=root_rows,count=count)
+                roots.append(root); rows.append(root)
+                condition='false' if side and fault=='different-branch' else 'true'
+                condition_hits=0 if side and fault=='lost-accepted-branch' else hits
+                child_rows=[slot(start+1,'{',hits),slot(first,'confirmed',hits),
+                            slot(first,'auto_accept',hits),slot(last,condition,condition_hits),
+                            slot(end-2,'}',hits)]
+                rows.append(dict(root,name='_RNC'+mangled+'0B7_',regions=child_rows,count=hits))
+                for offset,role in ((10,'00B9_'),(13,'0s_0B9_')):
+                    if side and fault=='missing-descendant' and offset==10 and copy:
+                        continue
+                    leaves=[slot(start+offset,'package.name()',hits),slot(start+offset,'to_string',hits)]
+                    if side and fault=='wrong-descendant-layout' and offset==10 and copy:
+                        leaves[0][3]-=1
+                    rows.append(dict(root,name='_RNCNC'+mangled+role,regions=leaves,count=hits))
+            if side and fault=='foreign':
+                rows.append(dict(roots[0],name='opaque',regions=[slot(last,'true',1)]))
+            work=[coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+            counts=coverage._owner_line_counts({'regions':[r for owner in rows for r in owner['regions']]},
+                                              coverage._ObserverWork(work))
+            sides.append((source,coverage._construct_inventory(source,work),counts,first,last))
+            inventories.append(rows); all_names.append(Counter(r['name'] for r in rows))
+            groups.append({declaration:(start,end,roots)})
+        return coverage.retained_alpm_replace_branch(sides,inventories,all_names,groups,work)
+
+    def test_scopes_each_replace_branch_to_its_exact_registration_copy(self):
+        scopes,owners,states=self.compare()
+        self.assertEqual(states,[[(False,False,False),(True,True,True)]]*2)
+        self.assertEqual([[len(row['descendants']) for row in side] for side in owners],[[2,2],[2,2]])
+
+    def test_refuses_changed_registration_or_missing_branch_execution(self):
+        for fault in ('wrong-forwarder','different-branch','lost-accepted-branch','missing-registration',
+                      'missing-descendant','wrong-descendant-layout','foreign'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(self.compare(fault))
+
+
 class QualifiedFunctionCompletionTests(unittest.TestCase):
     def compare(self, fault=None):
         misleading = fault is not None and fault.startswith('misleading-')
@@ -3157,6 +3338,24 @@ class SourceAwareCoverageTests(unittest.TestCase):
             coverage.compiled_async_function_groups('example.rs', [], {},
                 ['async fn checked() {', '    verify();', '}'], work=[0])
 
+    def test_async_phase_reuses_an_already_checked_lexical_signature(self):
+        source = ['async fn checked() {', '    verify();', '}']
+        file = '/src/example.rs'
+        opening = source[0].index('{')+1
+        root = dict(name='_RNvCs1_7example7checked',count=1,filenames=[file],regions=[
+            [1,1,1,opening-1,1,0,0,0]])
+        child = dict(root,name='_RNC'+root['name'][2:]+'0B3_',regions=[
+            [1,opening,1,opening+1,1,0,0,0], [2,5,2,11,0,0,0,0], [3,1,3,2,1,0,0,0]])
+        owners = [root,child]
+        files = {file:'example.rs'}
+        expected = coverage.compiled_async_function_groups('example.rs',owners,files,source)
+        self.assertEqual(len(expected),1)
+        with mock.patch.object(coverage,'source_function_prefixes',wraps=coverage.source_function_prefixes) as parse:
+            actual = coverage.compiled_async_function_groups('example.rs',owners,files,source,
+                compiled_prefixes={(1,3):'async fn checked()'})
+        self.assertEqual(actual,expected)
+        parse.assert_not_called()
+
     def retained_record_field_compare(self, head_counts=(1, 1), ancestor_counts=None,
                                       refinement_counts=None, base_refinement_counts=None):
         old = b'struct Config { name: String }\nimpl Config {\n    pub fn make(section: &str) -> Self {\n        Self {\n            name: section.to_string(),\n        }\n    }\n}\n'
@@ -4370,6 +4569,46 @@ class SourceAwareCoverageTests(unittest.TestCase):
         extra = dict(child, regions=child['regions']+[[6,13,6,14,1,0,0,0]])
         self.assertIsNone(observe(owner=extra))
 
+    def test_async_runtime_fixture_record_keeps_original_regions_and_cold_error_slots(self):
+        source = ['#[cfg(test)]', '#[expect(clippy::unwrap_used)]', 'mod tests {', '    #[tokio::test]',
+                  '    async fn verify() -> Result<()> {', '        let manager = RustManager {',
+                  '            versions_dir: fixture.path(),', '            client: fixture.client()?,',
+                  '        };', '        Ok(())', '    }', '}']
+        field = 'crate::runtimes::security::RuntimeSecurity::fixture'
+
+        def observe(insertion=False, cold=True, foreign=False):
+            texts = source[:]
+            shift = int(insertion)
+            if insertion:
+                texts.insert(6, f'            security: {field}(),')
+            if foreign:
+                texts[1] = '#[cfg(feature = "private")]'
+            opening = source[4].index('{')+1
+            root = dict(name='_RNvNtNtNtCs1_7omg_lib8runtimes4rust5tests6verify', count=1,
+                        filenames=['/src/runtimes/rust.rs'], regions=[
+                            [5,11,5,opening-1,1,0,0,0], [11+shift,5,11+shift,6,1,0,0,0]])
+            cold_column = source[7].index('?')+1
+            raw = [[6,13,6,20,1,0,0,0], [6,23,9+shift,10,1,0,0,0]]
+            if cold:
+                raw.append([8+shift,cold_column,8+shift,cold_column+1,0,0,0,0])
+            if insertion:
+                column = texts[6].index(field)+1
+                raw.append([7,column,7,column+len(field),1,0,0,0])
+            child = dict(root,name='_RNC'+root['name'][2:]+'0B9_', regions=[
+                [5,opening,5,opening+1,1,0,0,0], *raw])
+            return coverage.async_runtime_fixture_record('src/runtimes/rust.rs', texts,
+                coverage._owner_line_counts({'regions':raw},coverage._ObserverWork()),
+                (5,11+shift,[root]), (root,child),Counter((root['name'],child['name'])),
+                coverage._construct_inventory(texts,[1_000_000]),6,6,[1_000_000])
+
+        original = observe()
+        updated = observe(insertion=True)
+        self.assertEqual(original[0],updated[0])
+        self.assertFalse(original[1]['security_initializer'])
+        self.assertEqual(len(updated[1]['security_initializer']),1)
+        self.assertNotEqual(original[0],observe(insertion=True,cold=False)[0])
+        self.assertIsNone(observe(insertion=True,foreign=True))
+
     def test_tail_record_insertion_retains_inherited_and_direct_field_regions(self):
         for direct_first in (False, True):
             with self.subTest(direct_first=direct_first):
@@ -5228,6 +5467,19 @@ class SourceAwareCoverageTests(unittest.TestCase):
                        'foreign-impl', 'foreign-std-copy', 'unknown-suffix', 'duplicate-copy', 'changed-body'):
             with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'complete compiled-copy'):
                 self.path_reference_additions_compare(change)
+
+    def test_identical_source_parses_compiled_declarations_once(self):
+        source = {'example.rs': b'fn retained() {\n    checked();\n}\n'}
+        observed = [(1,1),(2,1),(3,1)]
+
+        def owners(base, head):
+            for document in (base,head):
+                document['data'][0]['functions'] = [dict(name='retained', filenames=['/src/example.rs'],
+                    count=1, regions=[[1,1,3,2,1,0,0,0]])]
+
+        with mock.patch.object(coverage,'source_function_prefixes',wraps=coverage.source_function_prefixes) as parse:
+            self.compare(before=observed,after=observed,mutate=owners,sources=(source,source))
+        self.assertEqual(parse.call_count,1)
 
     def compare(self, before=None, after=None, mutate=None, sources=None):
         default_before, default_after = self.fixture()

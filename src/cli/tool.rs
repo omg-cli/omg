@@ -3207,9 +3207,7 @@ exit 1
         symlink(&previous, bin.join("fixture-tool"))?;
 
         let npm = fixture.path().join("npm");
-        fs::write(
-            &npm,
-            br#"#!/bin/sh
+        let script = br#"#!/bin/sh
 set -eu
 fixture=$(dirname "$0")
 case "$1" in
@@ -3226,8 +3224,8 @@ case "$1" in
     ;;
   *) exit 1 ;;
 esac
-"#,
-        )?;
+"#;
+        fs::write(&npm, script)?;
         fs::set_permissions(&npm, fs::Permissions::from_mode(0o755))?;
         prepare_managed_npm_fixture(&tools, &npm);
 
