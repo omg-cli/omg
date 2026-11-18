@@ -699,7 +699,7 @@ pub async fn download_sources(sources: Vec<SourceFile>, srcdest: &Path) -> Sourc
                 accent: Accent::Network,
             });
 
-            download_file(&source.url, &dest_path, task).await
+            download_file(fetch_public_source(&source.url), &dest_path, task).await
         }
     });
 
@@ -781,9 +781,13 @@ async fn fetch_public_source(value: &str) -> Result<reqwest::Response> {
 }
 
 /// Download a single file with progress tracking
-async fn download_file(url: &str, dest_path: &Path, task: ProgressTask) -> Result<()> {
+async fn download_file(
+    fetch: impl std::future::Future<Output = Result<reqwest::Response>>,
+    dest_path: &Path,
+    task: ProgressTask,
+) -> Result<()> {
     tokio::time::timeout(MAX_AUR_SOURCE_DURATION, async {
-        let response = fetch_public_source(url).await?;
+        let response = fetch.await?;
 
         store_source_response(response, dest_path, &task).await
     })
@@ -949,7 +953,7 @@ mod tests {
                 kind: TaskKind::Bytes { total: None },
                 accent: Accent::Network,
             });
-            let result = store_source_response(response, &destination, &task).await;
+            let result = download_file(std::future::ready(Ok(response)), &destination, task).await;
             server.await??;
             if let Some(message) = expected_error {
                 let error = result.expect_err("inadmissible response must fail");

@@ -6305,6 +6305,24 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_source_rejects_symlinks_to_the_checkout_root_and_missing_entries() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let root = directory.path();
+        let link = root.join("link");
+        let root_error = contained_aur_symlink_target(root, &link, Path::new("."))
+            .expect_err("the checkout root is not a reviewed source entry");
+        assert!(root_error.to_string().contains("escapes the checkout"));
+        std::os::unix::fs::symlink("missing", &link).expect("dangling test symlink");
+        let missing = contained_aur_symlink_target(root, &link, Path::new("missing"))
+            .expect_err("a symlink needs an existing reviewed entry");
+        assert!(
+            missing
+                .to_string()
+                .contains("must resolve to a reviewed checkout entry")
+        );
+    }
+
+    #[test]
     fn reviewed_source_rejects_symlink_chain_escaping_checkout() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("source");

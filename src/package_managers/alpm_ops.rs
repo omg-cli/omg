@@ -2161,9 +2161,8 @@ mod tests {
             ),
         );
 
-        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
-            "[options]\nHookDir = custom-hooks\n",
-        )?;
+        let custom_hooks = "[options]\nHookDir = custom-hooks\n";
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(custom_hooks)?;
         super::configure_transaction_options(&mut alpm, &config)?;
         assert_eq!(
             alpm.hookdirs()

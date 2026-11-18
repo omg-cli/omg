@@ -418,6 +418,15 @@ mod tests {
     }
 
     #[test]
+    fn directives_before_a_section_do_not_configure_a_later_repository() {
+        let input = "Server = https://ignored.invalid\nUsage = Unknown\n[core]\nUsage = All\n";
+        let config = PacmanConfig::parse_str(input).expect("pre-section directives are ignored");
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].name, "core");
+        assert!(config.repos[0].servers.is_empty());
+    }
+
+    #[test]
     fn unsupported_repository_usage_is_not_silently_ignored() {
         for usage in ["", "Sync Search", "Upgrade", "Unknown"] {
             let error = PacmanConfig::parse_str(&format!("[restricted]\nUsage = {usage}\n"))
