@@ -73,6 +73,103 @@ impl NativeOmarchyInteraction {
     }
 }
 
+fn append_platform_keyrings(
+    path: &std::path::Path,
+    names: &mut Vec<String>,
+    is_installed: fn(&str) -> AnyhowResult<bool>,
+) -> AnyhowResult<()> {
+    use anyhow::Context;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+                "Platform keyring list must be a root-controlled regular file"
+            );
+            anyhow::ensure!(
+                metadata.len() <= 65536,
+                "Platform keyring list exceeds its limit"
+            );
+            let mut contents = String::new();
+            file.take(65537).read_to_string(&mut contents)?;
+            anyhow::ensure!(
+                contents.len() <= 65536,
+                "Platform keyring list exceeds its limit"
+            );
+            for line in contents.lines() {
+                let name = line.trim();
+                if name.is_empty() || name.starts_with('#') {
+                    continue;
+                }
+                if !name.ends_with("-keyring")
+                    || crate::core::security::validate_package_name(name).is_err()
+                {
+                    tracing::warn!("Ignoring invalid platform keyring package name");
+                    continue;
+                }
+                if !names.iter().any(|existing| existing == name) && is_installed(name)? {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Cannot read platform keyring packages"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_platform_keyrings;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    #[ignore = "requires root-owned fixture files"]
+    fn platform_keyring_list_requires_a_bounded_root_owned_file() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let list = directory.path().join("keyrings");
+        let mut names = vec!["archlinux-keyring".to_owned()];
+
+        append_platform_keyrings(&list, &mut names, |_| Ok(false))?;
+        assert_eq!(names, ["archlinux-keyring"]);
+
+        let contents = "\n# platform keys\narchlinux-keyring\ninvalid\n/invalid-keyring\ninstalled-keyring\nmissing-keyring\n";
+        std::fs::write(&list, contents)?;
+        append_platform_keyrings(&list, &mut names, |name| match name {
+            "installed-keyring" => Ok(true),
+            "missing-keyring" => Ok(false),
+            other => panic!("unexpected keyring lookup: {other}"),
+        })?;
+        assert_eq!(names, ["archlinux-keyring", "installed-keyring"]);
+
+        let link = directory.path().join("link");
+        symlink(&list, &link)?;
+        let error = append_platform_keyrings(&link, &mut names, |_| Ok(false))
+            .expect_err("root process must not follow a keyring-list symlink");
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot read platform keyring packages")
+        );
+
+        let error = append_platform_keyrings(directory.path(), &mut names, |_| Ok(false))
+            .expect_err("the keyring list must be a regular file");
+        assert!(error.to_string().contains("root-controlled regular file"));
+
+        std::fs::write(&list, vec![b'x'; 65537])?;
+        let error = append_platform_keyrings(&list, &mut names, |_| Ok(false))
+            .expect_err("oversized keyring lists must be refused");
+        assert!(error.to_string().contains("exceeds its limit"));
+        Ok(())
+    }
+}
+
 /// Execute one fixed, already elevated Omarchy package operation.
 ///
 /// # Errors
@@ -109,51 +206,11 @@ pub fn execute_native_omarchy_operation(
             if super::is_installed_fast("archlinuxarm-keyring")? {
                 names.push("archlinuxarm-keyring".to_owned());
             }
-            let path = std::path::Path::new("/usr/share/omarchy-platform/keyrings");
-            use std::io::Read;
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-                .open(path)
-            {
-                Ok(file) => {
-                    let metadata = file.metadata()?;
-                    anyhow::ensure!(
-                        metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
-                        "Platform keyring list must be a root-controlled regular file"
-                    );
-                    anyhow::ensure!(
-                        metadata.len() <= 65536,
-                        "Platform keyring list exceeds its limit"
-                    );
-                    let mut contents = String::new();
-                    file.take(65537).read_to_string(&mut contents)?;
-                    anyhow::ensure!(
-                        contents.len() <= 65536,
-                        "Platform keyring list exceeds its limit"
-                    );
-                    for line in contents.lines() {
-                        let name = line.trim();
-                        if name.is_empty() || name.starts_with('#') {
-                            continue;
-                        }
-                        if !name.ends_with("-keyring")
-                            || crate::core::security::validate_package_name(name).is_err()
-                        {
-                            tracing::warn!("Ignoring invalid platform keyring package name");
-                            continue;
-                        }
-                        if !names.iter().any(|existing| existing == name)
-                            && super::is_installed_fast(name)?
-                        {
-                            names.push(name.to_owned());
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("Cannot read platform keyring packages"),
-            }
+            append_platform_keyrings(
+                std::path::Path::new("/usr/share/omarchy-platform/keyrings"),
+                &mut names,
+                super::is_installed_fast,
+            )?;
             names
         }
         NativeOmarchyOperation::UpgradeRepositories => Vec::new(),

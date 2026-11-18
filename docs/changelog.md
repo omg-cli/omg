@@ -26,6 +26,13 @@ See the [beta release overview, security coverage and upgrade notes](releases/v0
 - Include the accumulated native package, daemon, runtime/environment, QEMU and CI fixes since the previous release.
 - Add Sponsors, governance, a code of conduct, OpenSSF Scorecard and downloadable Sigstore provenance bundles.
 
+### Arch and AUR
+
+- Update the Rust ALPM parser family together to types 0.14.0, SRCINFO 0.7.0, local database 0.3.0 and repository database 0.2.0. Keep C libalpm for transactions and remaining native queries; package counts use Rust by default.
+- Honor pacman's default local hooks and configured download user. Reject unsupported repository `Usage` restrictions explicitly.
+- Isolate AUR build IPC, bound source downloads to fifteen minutes, escape filenames in review and approval, reject source symlinks that resolve outside the checkout, and require attended approval for inspected privileged integration paths.
+- Bound persisted package-cache reads and recheck local source identity while loading. Compare AUR updates against one installed-version snapshot across index and RPC results.
+
 ## [0.1.223] - 2026-09-16
 
 See the [release overview and complete commit ledger](releases/v0.1.223.md).

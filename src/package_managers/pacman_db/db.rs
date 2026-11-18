@@ -4831,6 +4831,28 @@ mod tests {
     }
 
     #[test]
+    fn persisted_package_cache_rejects_symlink_and_oversized_file() -> Result<()> {
+        use nix::sys::stat::Mode;
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("valid");
+        fs::write(&target, bitcode::serialize(&DbCache::default())?)?;
+        let path = directory.path().join("fixture.bin");
+        std::os::unix::fs::symlink(&target, &path)?;
+        assert!(load_cache_from_disk_in::<DbCache>(directory.path(), "fixture").is_err());
+        fs::remove_file(&path)?;
+        let file = fs::File::create(&path)?;
+        file.set_len(MAX_DERIVED_CACHE_BYTES + 1)?;
+        let error = load_cache_from_disk_in::<DbCache>(directory.path(), "fixture")
+            .err()
+            .context("oversized cache must fail before decoding")?;
+        assert!(error.to_string().contains("size limit"), "{error:#}");
+        fs::remove_file(&path)?;
+        nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR)?;
+        assert!(load_cache_from_disk_in::<DbCache>(directory.path(), "fixture").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn sync_identity_cache_uses_versioned_namespace() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let cache = DbCache {
@@ -5845,8 +5867,11 @@ mod tests {
                 let fast = get_counts_fast().expect("fast-path counts must succeed");
                 let ffi = crate::package_managers::alpm_direct::get_counts()
                     .expect("libalpm counts must succeed");
+                let public = crate::package_managers::get_counts()
+                    .expect("public package counts must succeed");
                 assert_eq!(fast, expected, "fast path diverged on fixture");
                 assert_eq!(ffi, expected, "libalpm path diverged on fixture");
+                assert_eq!(public, expected, "public count routing diverged on fixture");
                 assert_eq!(fast, ffi, "fast path and libalpm path must agree");
             },
         );

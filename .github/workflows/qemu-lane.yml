@@ -164,9 +164,11 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
+      - name: Configure signed Ubuntu archive
+        uses: ./.github/actions/ubuntu-apt
+
       - name: Install Dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libapt-pkg-dev python3-venv fish \
             pkg-config \
@@ -362,8 +364,9 @@ jobs:
         if: inputs.distro == 'fedora'
         env:
           SOURCE_REVISION: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          bundle=$(python3 scripts/fedora-sqlite.py select "$RUNNER_TEMP/fedora-sqlite-inputs" \
+          bundle=$(timeout --kill-after=5s 360s python3 scripts/fedora-sqlite.py select "$RUNNER_TEMP/fedora-sqlite-inputs" \
             --arch x86_64 --attempt "$GITHUB_RUN_ATTEMPT" --revision "$SOURCE_REVISION")
           printf 'FEDORA_SQLITE_BUNDLE=%s\n' "$bundle" >> "$GITHUB_ENV"
 

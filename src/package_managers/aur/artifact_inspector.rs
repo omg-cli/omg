@@ -365,14 +365,17 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
         );
         let kind = entry.header().entry_type();
         let member = normalize_member_path(&raw_path, kind.is_dir())?;
+        let mut privileged_integration = false;
         for (reason, prefixes) in PRIVILEGED_PATH_PREFIXES {
             if prefixes.iter().any(|prefix| member.starts_with(prefix)) {
                 paired_build_reasons.insert((*reason).to_owned());
+                privileged_integration = true;
             }
         }
         for (reason, paths) in PRIVILEGED_EXACT_PATHS {
             if paths.contains(&member.as_str()) {
                 paired_build_reasons.insert((*reason).to_owned());
+                privileged_integration = true;
             }
         }
 
@@ -437,7 +440,9 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
         if kind.is_file() && mode & 0o111 != 0 {
             executable_files.push(member.clone());
         }
-        if (kind.is_file() || kind.is_hard_link()) && mode & 0o6000 != 0 || capability.is_some() {
+        let privilege_bearing =
+            (kind.is_file() || kind.is_hard_link()) && mode & 0o6000 != 0 || capability.is_some();
+        if privilege_bearing || (!kind.is_dir() && privileged_integration) {
             // Linux documents set-ID and file capabilities as privilege-bearing
             // mechanisms: https://man7.org/linux/man-pages/man7/capabilities.7.html
             anyhow::ensure!(
@@ -450,7 +455,9 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
                 mode,
                 capability,
             });
-            paired_build_reasons.insert("privilege-bearing-file".to_owned());
+            if privilege_bearing {
+                paired_build_reasons.insert("privilege-bearing-file".to_owned());
+            }
         }
 
         if matches!(
@@ -1366,6 +1373,7 @@ mod tests {
         for (path, reason) in [
             ("etc/demo.conf", "system-configuration"),
             ("usr/lib/systemd/system/demo.service", "systemd-unit"),
+            ("usr/lib/systemd/system-generators/demo", "systemd-unit"),
             ("usr/lib/modules/6.0/extra/demo.ko", "kernel-module"),
             ("usr/share/libalpm/hooks/demo.hook", "package-manager-hook"),
             (
@@ -1379,6 +1387,16 @@ mod tests {
             })?;
             let inspection = inspect_archive(archive.path())?.into_inspection();
             assert!(inspection.requires_paired_build());
+            assert!(
+                inspection.requires_exception(),
+                "{path} needs attended approval"
+            );
+            assert!(
+                inspection
+                    .privileged_files
+                    .iter()
+                    .any(|file| file.path == path)
+            );
             assert!(
                 inspection
                     .paired_build_reasons

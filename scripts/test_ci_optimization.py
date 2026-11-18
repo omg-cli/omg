@@ -82,49 +82,20 @@ class OptimizationContracts(unittest.TestCase):
 
     @unittest.skipIf(os.name == 'nt', 'Ubuntu dependency bootstrap uses POSIX shell tools')
     def test_python_workflow_bootstrap_avoids_unreachable_azure_mirrors(self):
-        script = step_script('ci.yml', 'Install Python workflow test dependencies')
-        for scenario in ('azure', 'healthy', 'missing'):
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory) / 'private fixture'
-                root.mkdir()
-                mirrors, calls = root / 'mirrors.txt', root / 'calls.jsonl'
-                if scenario != 'missing':
-                    mirrors.write_text(('http://azure.archive.ubuntu.com/ubuntu\n' if scenario == 'azure' else '')
-                                       + 'https://archive.ubuntu.com/ubuntu\n')
-                helper = root / 'apt.py'
-                helper.write_text(
-                    'import json,os,sys\nfrom pathlib import Path\n'
-                    'mirror=Path(os.environ["APT_MIRROR_FIXTURE"])\n'
-                    'if sys.argv[1]=="update" and mirror.exists() and "http://azure.archive.ubuntu.com" in mirror.read_text():\n'
-                    '    sys.exit("unreachable Azure mirror retained")\n'
-                    'with open(os.environ["APT_CALLS"],"a") as output: output.write(json.dumps(sys.argv[1:])+"\\n")\n')
-                prefix = '''sudo() {
-  case "$1" in
-    sed)
-      test "${@: -1}" = "$APT_MIRROR_FIXTURE"
-      command "$@"
-      ;;
-    apt-get)
-      shift
-      "$TEST_PYTHON" "$APT_HELPER" "$@"
-      ;;
-    *) return 97 ;;
-  esac
-}
-'''
-                relocated = script.replace('/etc/apt/apt-mirrors.txt', shlex.quote(str(mirrors)))
-                result = subprocess.run([BASH, '-euo', 'pipefail', '-c', prefix + relocated],
-                    env=dict(os.environ, APT_MIRROR_FIXTURE=str(mirrors), APT_CALLS=str(calls),
-                             APT_HELPER=str(helper), TEST_PYTHON=sys.executable),
-                    capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()], [
-                    ['update', '--error-on=any'],
-                    ['install', '-y', '--no-install-recommends', 'python3-venv'],
-                ])
-                if mirrors.exists():
-                    self.assertNotIn('http://azure.archive.ubuntu.com', mirrors.read_text())
-                    self.assertIn('https://archive.ubuntu.com/ubuntu', mirrors.read_text())
+        workflow = job_block((WORKFLOWS / 'ci.yml').read_text(), 'workflow-checks')
+        configure = workflow.index('      - name: Configure signed Ubuntu archive')
+        install = workflow.index('      - name: Install Python workflow test dependencies')
+        self.assertLess(configure, install)
+        self.assertIn('uses: ./.github/actions/ubuntu-apt', workflow[configure:install])
+        self.assertIn('sudo apt-get install -y --no-install-recommends python3-venv', workflow[install:])
+        fixture = WORKFLOWS.parents[1] / 'scripts/test_ubuntu_action_archive.py'
+        result = subprocess.run(
+            [sys.executable, '-B', str(fixture),
+             'UbuntuActionArchive.test_configures_the_signed_archive_for_a_multimirror_runner_source'],
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('Ran 1 test', result.stderr)
 
     @unittest.skipIf(os.name == "nt", "The hosted service workflow uses POSIX executable scripts")
     def test_advisory_service_is_verified_without_remote_deployment(self):
@@ -614,9 +585,12 @@ git() { printf '%040d\\n' 1; }
                 self.assertNotIn(old_prefix, text)
 
     def test_compiler_cache_upload_contains_both_diagnostics_in_one_directory(self):
-        for filename, job in (('ci.yml', 'portable'), ('ci.yml', 'portable-release'),
-                              ('benchmark.yml', 'benchmark')):
-            with self.subTest(workflow=filename, job=job), tempfile.TemporaryDirectory() as directory:
+        cases = [(filename, job, mode)
+                 for filename, job in (('ci.yml', 'portable'), ('ci.yml', 'portable-release'),
+                                       ('benchmark.yml', 'benchmark'))
+                 for mode in (('main', 'READ_ONLY') if filename == 'ci.yml' else ('main',))]
+        for filename, job, mode in cases:
+            with self.subTest(workflow=filename, job=job, mode=mode), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 tools = root / 'bin'
                 tools.mkdir()
@@ -628,10 +602,18 @@ git() { printf '%040d\\n' 1; }
                 report = re.search(r'(?m)^      - name: Report .* compiler cache\n', block)
                 report_step = block[report.end():].split('\n      - ', 1)[0]
                 script = textwrap.dedent(report_step.split('        run: |\n', 1)[1])
+                metadata = dict(OMG_R2_CACHE_MODE='READ_ONLY', OMG_R2_CACHE_SEED_RECIPE='b' * 64,
+                                OMG_R2_CACHE_POLICY='portable-read-v1', OMG_R2_CACHE_EXPIRES_AT='1794424500')
+                environment = {name: value for name, value in os.environ.items() if name not in metadata}
+                if mode == 'READ_ONLY' or filename == 'benchmark.yml':
+                    environment.update(metadata)
+                prefix = 'portable-v1/' if filename == 'ci.yml' else 'benchmark-v1/'
+                credentials = dict(AWS_ACCESS_KEY_ID='fixture-access-key', AWS_SECRET_ACCESS_KEY='fixture-secret-key',
+                                   AWS_SESSION_TOKEN='fixture-session-token', ACTIONS_ID_TOKEN_REQUEST_TOKEN='fixture-oidc-token')
                 result = subprocess.run([BASH, '-eu', '-c', script], capture_output=True, text=True,
-                    env=dict(os.environ, PATH=tools.as_posix() + os.pathsep + os.environ['PATH'],
+                    env=dict(environment, **credentials, PATH=tools.as_posix() + os.pathsep + os.environ['PATH'],
                              RUNNER_TEMP=root.as_posix(), GITHUB_SHA='a' * 40,
-                             SCCACHE_S3_KEY_PREFIX='benchmark-v1/'), timeout=10)
+                             SCCACHE_S3_KEY_PREFIX=prefix), timeout=10)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 upload = re.split(r'      - name: Preserve .* compiler cache diagnostics\n', block)[1]
                 path = re.search(r'(?m)^          path: (.+)$', upload).group(1)
@@ -641,8 +623,15 @@ git() { printf '%040d\\n' 1; }
                                  ['omg-r2-cache-context.txt', 'omg-r2-cache-stats.json'])
                 self.assertEqual(json.loads((uploaded / 'omg-r2-cache-stats.json').read_text()),
                                  {'stats': {'cache_read_errors': 0}})
-                self.assertEqual((uploaded / 'omg-r2-cache-context.txt').read_text(),
-                                 'source=' + 'a' * 40 + '\nprefix=benchmark-v1/\n')
+                context = (uploaded / 'omg-r2-cache-context.txt').read_text()
+                expected = 'source=' + 'a' * 40 + f'\nprefix={prefix}\n'
+                if filename == 'ci.yml':
+                    expected += ('mode=READ_ONLY\nrecipe=' + 'b' * 64 + '\npolicy=portable-read-v1\nexpires=1794424500\n'
+                                 if mode == 'READ_ONLY' else 'mode=main\nrecipe=\npolicy=\nexpires=\n')
+                self.assertEqual(context, expected)
+                for name, value in credentials.items():
+                    self.assertNotIn(name, context)
+                    self.assertNotIn(value, context + result.stdout + result.stderr)
 
     def test_ci_profiles_do_not_retry_failures(self):
         config = tomllib.loads((ROOT / '.config/nextest.toml').read_text())

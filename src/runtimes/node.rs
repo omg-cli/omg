@@ -262,7 +262,9 @@ impl NodeManager {
     async fn fetch_checksum(&self, version: &str, filename: &str) -> Result<String> {
         let verifier = node_release_verifier()?;
         let url = format!("{NODE_DIST_URL}/v{version}/SHASUMS256.txt.asc");
-        let signed = crate::core::http::fetch_metadata_text_limited(self.client, &url, 1024 * 1024)
+        let signed_manifest =
+            crate::core::http::fetch_metadata_text_limited(self.client, &url, 1024 * 1024);
+        let signed = signed_manifest
             .await
             .context("Failed to fetch Node.js checksum manifest")?;
         let plaintext = verifier.verify_cleartext_memory(signed.as_bytes(), 1024 * 1024)

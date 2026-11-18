@@ -1678,13 +1678,14 @@ fn prepare_alpm_transaction_in<'a>(
     validate_transaction_targets(kind, &packages)?;
     let mut admissions = std::collections::BTreeMap::new();
     if kind == TransactionKind::InstallAurArtifact {
-        for target in &packages {
-            if crate::core::security::is_local_package_file(target) {
-                let path = crate::core::security::validate_local_package_file(target)?;
-                let admission =
-                    crate::package_managers::aur::artifact_inspector::inspect_archive(&path)?;
-                admissions.insert(path, admission);
-            }
+        let artifacts = packages
+            .iter()
+            .filter(|target| crate::core::security::is_local_package_file(target));
+        for target in artifacts {
+            let path = crate::core::security::validate_local_package_file(target)?;
+            let admission =
+                crate::package_managers::aur::artifact_inspector::inspect_archive(&path)?;
+            admissions.insert(path, admission);
         }
     }
     check_database_lock(std::path::Path::new(alpm.dbpath().trim_end_matches('/')))?;
@@ -1843,6 +1844,8 @@ fn configure_transaction_options(
     // checks, logging, and package hooks behave like a normal Arch transaction.
     let root = paths::pacman_root_result()?;
     configure_signature_verification(alpm, pacman_config)?;
+    alpm.set_sandbox_user(pacman_config.download_user.as_deref())
+        .context("Failed to configure pacman DownloadUser")?;
     let cache_dirs = paths::pacman_cache_dirs_result()?;
     for cache_dir in &cache_dirs {
         std::fs::create_dir_all(cache_dir).with_context(|| {
@@ -1885,6 +1888,9 @@ fn configure_transaction_options(
     // libalpm gives later hook directories precedence for duplicate hook
     // names. Distribution hooks come first, followed by configured overrides.
     let mut hook_dirs = vec![root.join("usr/share/libalpm/hooks")];
+    if pacman_config.hook_dirs.is_empty() {
+        hook_dirs.push(root.join("etc/pacman.d/hooks"));
+    }
     hook_dirs.extend(
         pacman_config
             .hook_dirs
@@ -4799,6 +4805,74 @@ mod tests {
             classify_alpm_log_level(alpm::LogLevel::FUNCTION),
             ForwardedAlpmLogLevel::Trace
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pacman_transaction_options_honor_default_hooks_and_download_user() -> anyhow::Result<()> {
+        struct ResetPaths;
+        impl Drop for ResetPaths {
+            fn drop(&mut self) {
+                paths::reset_test_overrides();
+            }
+        }
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        for path in [
+            "db",
+            "etc/pacman.d/gnupg",
+            "etc/pacman.d/hooks",
+            "usr/share/libalpm/hooks",
+            "custom-hooks",
+        ] {
+            std::fs::create_dir_all(root.join(path))?;
+        }
+        paths::set_test_overrides(Some(root.to_path_buf()), None);
+        let _reset = ResetPaths;
+        let root_path = root.to_str().expect("UTF-8 root");
+        let db = root.join("db");
+        let db_path = db.to_str().expect("UTF-8 database");
+        let mut alpm = alpm::Alpm::new(root_path, db_path)?;
+        let config =
+            crate::core::pacman_conf::PacmanConfig::parse_str("[options]\nDownloadUser = root\n")?;
+        super::configure_transaction_options(&mut alpm, &config)?;
+        assert_eq!(
+            (
+                alpm.hookdirs()
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>(),
+                alpm.sandbox_user(),
+            ),
+            (
+                vec![
+                    root.join("usr/share/libalpm/hooks"),
+                    root.join("etc/pacman.d/hooks")
+                ],
+                Some("root"),
+            ),
+        );
+
+        let custom_hooks = "[options]\nHookDir = custom-hooks\n";
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(custom_hooks)?;
+        super::configure_transaction_options(&mut alpm, &config)?;
+        assert_eq!(
+            alpm.hookdirs()
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>(),
+            vec![
+                root.join("usr/share/libalpm/hooks"),
+                root.join("custom-hooks")
+            ],
+        );
+        assert_eq!(
+            alpm.sandbox_user(),
+            None,
+            "reconfiguration must clear the old download identity"
+        );
+        Ok(())
     }
 
     #[test]

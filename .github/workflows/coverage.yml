@@ -502,6 +502,8 @@ jobs:
               cases=(
                 package_managers::alpm_direct::tests::native_inventory_and_search_match_pacman
                 package_managers::aur::client::tests::cancelling_logged_sandbox_build_terminates_descendants
+                package_managers::aur::client::tests::sandbox_launcher_isolates_host_ipc_namespace
+                package_managers::arch::tests::platform_keyring_list_requires_a_bounded_root_owned_file
                 cli::self_update::tests::elevated_verifier_rejects_another_users_helper
                 core::pacman_conf::tests::missing_pacman_config_is_not_replaced_with_fabricated_repositories
                 daemon::handlers::tests::daemon_native_initializer_does_not_block_the_async_executor

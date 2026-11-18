@@ -408,9 +408,9 @@ esac
     #[tokio::test]
     async fn install_publishes_exact_version_and_activates_it() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let npm = fake_npm(temp.path(), "0.83.0", true)?;
-        let node = managed_node(temp.path(), &npm)?;
-        let manager = PiManager::with_paths(temp.path().join("versions/pi"), npm);
+        let publishing_npm = fake_npm(temp.path(), "0.83.0", true)?;
+        let node = managed_node(temp.path(), &publishing_npm)?;
+        let manager = PiManager::with_paths(temp.path().join("versions/pi"), publishing_npm);
         manager.install("0.83.0").await?;
         assert_eq!(manager.current_version().as_deref(), Some("0.83.0"));
         assert_eq!(

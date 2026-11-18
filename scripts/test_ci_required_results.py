@@ -30,6 +30,7 @@ class RequiredResultsTests(unittest.TestCase):
                        STANDALONE_SUITES="success", PORTABLE="success", PORTABLE_RELEASE="success", LINUX_MATRIX="success", LINUX_CLIPPY="success", SANDBOX_CANCELLATION="success",
                        FEATURE_INTERSECTIONS="success", MACOS="success", MACOS_NEXTEST_SOURCE="success", UBUNTU="success",
                        DOCS_AUDIT="success", RUNTIME_USAGE="success", FEDORA_SQLITE="success",
+                       NATIVE_READINESS="success",
                        GITHUB_STEP_SUMMARY=str(Path(directory) / "summary"))
             for key, value in (overrides or {}).items():
                 if value is None:
@@ -38,6 +39,14 @@ class RequiredResultsTests(unittest.TestCase):
                     env[key] = value
             bash = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else "bash"
             return subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True, timeout=15)
+
+    def test_native_readiness_is_required_even_if_guests_claim_success(self):
+        for state in ('failure', 'cancelled', 'skipped', '', None):
+            with self.subTest(state=state):
+                result = self.evaluate('true', {'NATIVE_READINESS': state, 'QEMU_REQUIRED': 'true',
+                                               'QEMU': 'success', 'QEMU_FEDORA': 'success'})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Native artifact readiness did not succeed', result.stdout)
 
     def test_fedora_sqlite_supply_failure_cannot_hide_behind_successful_guests(self):
         for result in ('failure', 'cancelled', 'skipped', '', None):
