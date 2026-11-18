@@ -867,15 +867,19 @@ def plain_rust_function_symbol(symbol):
     return RustFunctionPath(modules, tuple(identifiers), tuple(disambiguators))
 
 
+def rust_same_crate_backref(modules, depth):
+    # Each NC adds two bytes; the crate backreference encodes its offset minus one.
+    # https://doc.rust-lang.org/stable/rustc/symbol-mangling/v0.html#backref
+    return 'B' + '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'[1 + 2 * depth + 2 * modules] + '_'
+
+
 def direct_rust_callback_symbol(child, parent, modules, depth=1):
     if type(child) is not str or len(child) > 4096 or not 1 <= depth <= 8:
         return False
-    # Each NC adds two bytes; the crate backreference encodes its offset minus one.
-    # https://doc.rust-lang.org/stable/rustc/symbol-mangling/v0.html#backref
-    backref = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'[1 + 2 * depth + 2 * modules]
+    backref = rust_same_crate_backref(modules,depth)
     return re.fullmatch(re.escape('_R' + 'NC' * depth + parent[2:])
                         + r'(?:(?:s[0-9A-Za-z]{0,32}_)?0){' + str(depth) + '}'
-                        + r'(?:B' + backref + r'_)?', child) is not None
+                        + '(?:' + backref + ')?', child) is not None
 
 
 @lru_cache(maxsize=64)
@@ -1361,7 +1365,7 @@ class DeferredSourceFragment:
     function_prefix: str
 
 
-def fixture_callback_forest(source, group, owners, names, counts, inventory, work):
+def fixture_callback_forest(source, group, owners, names, counts, inventory, work, loop_cache):
     """Observe one complete fixture call and its closed nested async forest."""
     if inventory is None or len(group[2]) != 1:
         return None
@@ -1465,11 +1469,10 @@ def fixture_callback_forest(source, group, owners, names, counts, inventory, wor
     outer_role = lexical_roles[brace]
     statements = {row['first']:row for row in rows if row['kind']=='statement'}
     _construct_charge(work,len(rows))
-    owner_regions = valid[outer_role][3]
-    outer_regions = {id(r) for r in owner_regions}
-    _construct_charge(work,len(outer_regions))
     ident = re.compile(r'[A-Za-z_]\w*',re.ASCII)
-    def retain_statements(parent, *, ignored=None, iterations=None):
+    def retain_statements(parent, *, role=outer_role, ignored=None, iterations=None):
+        owned = {id(r) for r in valid[role][3]}
+        _construct_charge(work,len(owned))
         binding = parent+1
         while binding in statements and code.parents[binding]==parent:
             row = statements[binding]; last = row['end']
@@ -1486,7 +1489,7 @@ def fixture_callback_forest(source, group, owners, names, counts, inventory, wor
             start, column, end_line, end_column = code.region(binding,last)
             raw = [r for r in observed if tuple(r[:2])<(end_line,end_column) and (start,column)<tuple(r[2:4])]
             _construct_charge(work,len(raw)+end_line-start+1)
-            if (not raw or any(id(r) not in outer_regions or tuple(r[:2])<(start,column)
+            if (not raw or any(id(r) not in owned or tuple(r[:2])<(start,column)
                                or tuple(r[2:4])>(end_line,end_column) or iterations is not None and r[4]!=iterations
                                for r in raw)
                     or source[start-1][:column-1].strip() or source[end_line-1][end_column-1:].strip()):
@@ -1502,36 +1505,73 @@ def fixture_callback_forest(source, group, owners, names, counts, inventory, wor
         return binding
     next_statement = retain_statements(brace)
     iteration_shape = None
+    footer = None
     _construct_charge(work,len(rows))
     loop = next((row for row in rows if row['first']==next_statement and row['kind']=='for'
                  and code.parents[row['opening']]==brace),None)
     if loop is not None:
-        parts = loop['header']; _construct_charge(work,len(parts)+len(owner_regions))
-        if (len(parts)>13 and parts[:2]==('for','(') and parts[3]==',' and parts[5:8]==(')','in','[')
-                and parts[-1]==']' and parts[2]!=parts[4] and all(ident.fullmatch(parts[i]) for i in (2,4))):
-            items = parts[8:-1]
-            if items[-1]!=',':
-                items += (',',)
-            entries = [items[i:i+6] for i in range(0,len(items),6)]
-            if all(len(entry)==6 and entry[::2]==('(',',',')') and entry[-1]==','
-                   and all(re.fullmatch(r'"[A-Za-z0-9_ .-]+"',entry[i]) for i in (1,3)) for entry in entries):
-                count = valid[outer_role][2]
-                iterations = count*len(entries)
-                slots = {code.region(next_statement+i,next_statement+i):iterations for i in (2,4)}
-                slots[code.region(next_statement+7,loop['opening']-1)] = count
-                if iterations<COUNTER_LIMIT and all(
-                        [r[4] for r in owner_regions if tuple(r[:4])==at]==[hits] for at,hits in slots.items()):
-                    size = len(bindings)
-                    retain_statements(loop['opening'],ignored=parts[4],iterations=iterations)
-                    if len(bindings)>size:
-                        iteration_shape = parts[2],parts[4],tuple(entry[1] for entry in entries),size
+        line = code.position(code.starts[next_statement])[0]
+        authority = literal_pair_loop_fragment(source,group,owners,names,line,line,inventory,work,
+                                               normalize_second=True,cache=loop_cache)
+        if authority is not None and [item['child'] for item in authority.witness['owners']]==[valid[outer_role][1]]:
+            loop_shape = authority.signature
+            loop_states = authority.states[0]
+            iterations = authority.witness['owners'][0]['binding_counts'][0]
+            ignored = loop['header'][4]
+            size = len(bindings)
+            entry = retain_statements(loop['opening'],ignored=ignored,iterations=iterations)
+            phase = entry+5
+            child_role = lexical_roles.get(phase)
+            async_context = None
+            if (child_role is not None and child_role[:-1]==outer_role
+                    and code.words[entry+1:phase+1]==['.','block_on','(','async','{']):
+                line = code.position(code.starts[entry])[0]
+                entry_proof = nested_async_call_entry_fragment(source,group,owners,names,line,line,
+                                                               inventory,work,loop_cache=loop_cache)
+                if (entry_proof is not None and entry_proof.witness['kind']=='literal-pair-loop-async-call-entry'
+                        and [item['child'] for item in entry_proof.witness['owners']]==[valid[child_role][1]]):
+                    prior = len(bindings)
+                    retain_statements(phase,role=child_role,ignored=ignored,iterations=iterations)
+                    if len(bindings)>prior:
+                        async_context = entry_proof.signature
+                        binding_states.extend(entry_proof.states[0])
+            if len(bindings)>size:
+                iteration_shape = loop_shape,size,async_context
+                binding_states.extend(loop_states)
+            tail = statements.get(loop['end']+1)
+            if tail is not None and tail['end']==code.pairs[brace]-1:
+                at,end_tail = tail['first'],tail['end']
+                words = code.words[at:end_tail+1]; _construct_charge(work,len(words)+len(observed))
+                if (tail['supported'] and code.parents[at]==brace and len(words) in (12,13)
+                        and words[:3]==['assert','!','('] and ident.fullmatch(words[3])
+                        and words[4:9]==['.','is_empty','(',')',','] and words[9].startswith('"')
+                        and words[10:] in ([')',';'],[',',')',';'])):
+                    first,col,last,tail_col = code.region(at,end_tail)
+                    close = code.pairs[brace]
+                    close_line = code.position(code.starts[close])[0]
+                    rows = [r for r in observed if r[0]<=close_line and r[2]>=first]
+                    slots = [code.region(at,at+1),code.region(at+3,at+3),code.region(at+5,at+5),code.region(close,close)]
+                    owned = {id(r) for r in valid[outer_role][3]}
+                    _construct_charge(work,len(owned)+sum(len(text)+1 for text in source[first-1:close_line]))
+                    if (len(rows)==len(slots) and {tuple(r[:4]) for r in rows}==set(slots)
+                            and all(id(r) in owned and r[4]==valid[outer_role][2] for r in rows)
+                            and not source[first-1][:col-1].strip() and not source[last-1][tail_col-1:].strip()
+                            and source[close_line-1].strip()=='});'):
+                        mapped = {n:measured[n] for n in range(first,close_line+1) if n in measured}
+                        if _owner_line_counts({'regions':rows},_ObserverWork(work))==mapped:
+                            footer = (first,close_line), (loop_shape,tuple(source[first-1:close_line]),
+                                tuple((a-first,b,c-first,d) for a,b,c,d in slots)),loop_states,{
+                                    n-first:int(hits>0) for n,hits in mapped.items()}
     entry_signature = (shape.identity,header,previous[0]['digest'],source[low[0]-1],tuple(sorted(valid)),
                        outer_role,iteration_shape)
     entry_states = tuple(int(valid[role][2]>0) for role in sorted(valid))
     prelude = (entry_signature,tuple(bindings)), (*entry_states,*binding_states), mapped_bindings
+    if footer is not None:
+        span, footer_context, footer_states, mapped = footer
+        footer = span, (entry_signature[:-1],footer_context), (*entry_states,*footer_states), mapped
     signature = (shape.identity,header,previous[0]['digest'],call['digest'],
                  tuple(source[low[0]-1:high[0]]),tuple(layout))
-    return signature,(low[0],high[0]),tuple(states),{n-low[0]:int(v>0) for n,v in measured.items()},evidence,prelude
+    return signature,(low[0],high[0]),tuple(states),{n-low[0]:int(v>0) for n,v in measured.items()},evidence,prelude,footer
 
 
 _INHERENT_LEAF = re.compile(r'\s*(?:let [A-Za-z_]\w* = async \{|\.with_context\(\|\| format!\(.+\)\)\?)', re.ASCII)
@@ -2150,8 +2190,11 @@ def biased_join_result_fragment(source, group, owners, name_counts, first, last,
     if ready:
         prepared=ready[0]; macro_first=prepared.witness['header_source_line']
     else:
-        if first == last and source[first-1].lstrip().startswith('if '):
+        if first == last and (source[first-1].lstrip().startswith('if ') or source[first-1].strip()=='}'):
             return joined_async_condition(source, owners, first, inventory, work,
+                [value for key,value in cache.items() if key[:-1]==identity and value is not None])
+        if first == last and source[first-1].strip()=='});':
+            return joined_async_phase_completion(source,owners,first,work,
                 [value for key,value in cache.items() if key[:-1]==identity and value is not None])
         header=pattern.fullmatch(source[first-1]);macro_first=first
         if header is None:
@@ -2160,7 +2203,8 @@ def biased_join_result_fragment(source, group, owners, name_counts, first, last,
                 and code.position(code.starts[row['first']])[0]<=first<=last<=code.position(code.ends[row['end']])[0]
                 and pattern.fullmatch(source[code.position(code.starts[row['first']])[0]-1])]
             if len(candidates)!=1:
-                return None
+                return joined_async_statement(source,owners,first,last,inventory,work,
+                    [value for key,value in cache.items() if key[:-1]==identity and value is not None])
             macro_first=code.position(code.starts[candidates[0]['first']])[0]
             header=pattern.fullmatch(source[macro_first-1])
         if header['left']==header['right']:
@@ -2188,29 +2232,129 @@ def biased_join_result_fragment(source, group, owners, name_counts, first, last,
     return CallbackFragmentEvidence(prepared.states,line_states,signature,witness)
 
 
+def joined_async_phase_completion(source, owners, line, work, authorities):
+    column = source[line-1].index('}')+1
+    _construct_charge(work,len(authorities)+len(source[line-1]))
+    matches = [proof for proof in authorities if proof.witness['phase_entry']['async_span'][1]==[line,column+1]
+               and proof.witness['timer_source_range'][1]+1<line]
+    if len(matches)!=1:
+        return None
+    authority, = matches
+    phases = {copy['phase'] for copy in authority.witness['owners']}
+    _construct_charge(work,sum(len(owner['regions'])+1 for owner in owners))
+    touching = [(owner,rows) for owner in owners
+                if (rows := [r for r in owner['regions'] if owner_covers_lines([r],line,line)])]
+    by_name = {owner['name']:(owner,rows) for owner,rows in touching}
+    if len(touching)!=len(phases) or by_name.keys()!=phases:
+        return None
+    states = []; lines = []; regions = []
+    for copy, state in zip(authority.witness['owners'],authority.states,strict=True):
+        owner, selected = by_name[copy['phase']]
+        if selected!=[[line,column,line,column+1,owner['count'],0,0,0]]:
+            return None
+        bit = int(owner['count']>0)
+        states.append((*state,bit));lines.append((bit,));regions.append([owner['name'],selected[0]])
+    signature = ('joined-async-phase-completion',authority.signature,column)
+    return CallbackFragmentEvidence(tuple(states),tuple(lines),signature,
+        dict(kind=signature[0],regions=regions,scope=authority.witness['phase_entry']['async_span']))
+
+
+def joined_async_statement(source, owners, first, last, inventory, work, authorities):
+    """Match a complete direct statement executed in an authenticated post-join phase."""
+    if not authorities:
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work,len(rows)+len(authorities))
+    choices = []
+    for row in rows:
+        if row['kind']!='statement' or not row['supported'] or code.words[row['end']]!=';':
+            continue
+        low, high = code.position(code.starts[row['first']])[0], code.position(code.ends[row['end']])[0]
+        if not low<=first<=last<=high:
+            continue
+        parent = code.parents[row['first']]
+        if parent is None:
+            continue
+        span = [list(code.position(code.starts[parent])),list(code.position(code.ends[code.pairs[parent]]))]
+        _construct_charge(work,len(authorities))
+        choices.extend((row,low,high,proof) for proof in authorities
+            if proof.witness['phase_entry']['async_span']==span and proof.witness['timer_source_range'][1]+1<low)
+    if len(choices)!=1:
+        return None
+    statement, low, high, authority = choices[0]
+    start, end = statement['first'], statement['end']
+    _construct_charge(work,end-start+1+len(owners)+len(rows))
+    if any(row is not statement and row['kind']=='statement' and row['digest']==statement['digest']
+           and code.parents[row['first']]==code.parents[start] for row in rows):
+        return None
+    words = code.words[start:end]
+    macro = words[:1] in (['assert'],['assert_eq'],['eprintln']) and words[1:3]==['!','(']
+    if (not (macro or words[:1]==['let'] or words[1:2]==['::'])
+            or {'#','{','?','unsafe','async','await','return','break','continue','|','||'}.intersection(words)
+            or words.count('!')!=int(macro)):
+        return None
+    start_pos = code.position(code.starts[start]); end_pos = code.position(code.ends[end])
+    if source[low-1][:start_pos[1]-1].strip() or source[high-1][end_pos[1]-1:].strip():
+        return None
+    phases = {copy['phase'] for copy in authority.witness['owners']}
+    _construct_charge(work,sum(len(owner['regions'])+1 for owner in owners))
+    touching = [(owner,regions) for owner in owners
+                if (regions := [row for row in owner['regions'] if row[0]<=high and row[2]>=low])]
+    by_name = {owner['name']:(owner,regions) for owner,regions in touching}
+    if len(touching)!=len(phases) or by_name.keys()!=phases:
+        return None
+    states = []; line_states = []; proofs = []; geometries = set(); observer = _ObserverWork(work)
+    for copy, state in zip(authority.witness['owners'],authority.states,strict=True):
+        owner, selected = by_name[copy['phase']]
+        _construct_charge(work,len(selected)+len(owner.get('branches',())))
+        if (any(row[5:]!=[0,0,0] or row[4]!=owner['count'] or tuple(row[:2])<start_pos
+                or tuple(row[2:4])>end_pos for row in selected)
+                or any(row[0]<=high and row[2]>=low for row in owner.get('branches',()))
+                or owner.get('mcdc_records')):
+            return None
+        shape,bits = fragment_region_states(dict(regions=selected),low,high,source,work)
+        geometries.add(shape); states.append((*state,*bits))
+        projected = _owner_line_counts({'regions':selected},observer)
+        line_states.append(tuple(int(projected.get(line,0)>0) for line in range(first,last+1)))
+        proofs.append(dict(owner=owner['name'],region_states=bits,regions=selected))
+    if len(geometries)!=1:
+        return None
+    signature = ('joined-async-statement',authority.signature,statement['digest'],next(iter(geometries)),
+                 tuple(source[low-1:high]),(first-low,last-low))
+    witness = dict(kind='joined-async-statement',statement_span=[low,high],owners=proofs,
+                   context_sha256=hashlib.sha256(repr(signature).encode()).hexdigest())
+    return CallbackFragmentEvidence(tuple(states),tuple(line_states),signature,witness)
+
+
 def joined_async_condition(source, owners, line, inventory, work, authorities):
     """Carry a complete direct conditional under an already bound async owner."""
     code, rows = inventory[:2]
     _construct_charge(work, len(rows) + len(authorities))
+    endpoint_only = source[line-1].strip()=='}'
     guards = [row for row in rows if row['kind'] == 'if' and row['supported']
               and row['header'][:1] == ('if',) and row['opening'] > row['first'] + 1
-              and code.position(code.starts[row['first']])[0] == line
-              and code.position(code.starts[row['opening']])[0] == line]
+              and code.position(code.starts[row['first']])[0]==code.position(code.starts[row['opening']])[0]
+              and code.position(code.starts[row['end'] if endpoint_only else row['first']])[0]==line]
     if len(guards) != 1:
         return None
     guard = guards[0]
     opening, closing = guard['opening'], guard['end']
+    first = code.position(code.starts[guard['first']])[0]
     parent = code.parents[opening]
     if parent is None or code.words[parent] != '{' or code.words[closing+1:closing+2] == ['else']:
         return None
     parent_span = [list(code.position(code.starts[parent])), list(code.position(code.ends[code.pairs[parent]]))]
     matches = [proof for proof in authorities if proof.witness['phase_entry']['async_span'] == parent_span
-               and proof.witness['timer_source_range'][1] < line]
+               and proof.witness['timer_source_range'][1]+1 < first]
     if len(matches) != 1:
         return None
     prepared = matches[0]
     _construct_charge(work, closing - guard['first'] + 1)
     if any(word in ('!', '#', 'unsafe', 'async', '||', 'else') for word in code.words[guard['first']:closing+1]):
+        return None
+    _construct_charge(work,len(rows))
+    if any(row is not guard and row['kind']=='if' and row['digest']==guard['digest']
+           and code.parents[row['opening']]==parent for row in rows):
         return None
     expression = code.region(guard['first']+1, opening-1)
     body = code.region(opening, closing)
@@ -2220,7 +2364,7 @@ def joined_async_condition(source, owners, line, inventory, work, authorities):
     by_name = {owner['name']: owner for owner in owners}
     phase_names = {copy['phase'] for copy in prepared.witness['owners']}
     def touches(region):
-        return region[0] <= last and region[2] >= line
+        return region[0] <= last and region[2] >= first
     if any(owner['name'] not in phase_names and any(touches(region) for region in owner['regions'])
            for owner in owners):
         return None
@@ -2238,16 +2382,19 @@ def joined_async_condition(source, owners, line, inventory, work, authorities):
                 or any(not (body[:2] <= region[:2] < region[2:] <= body[2:] and 0 <= count <= roles[body])
                        for region,count in roles.items() if region not in (expression,body,endpoint))):
             return None
-        geometry, bits = fragment_region_states(dict(regions=selected), line, last, source, work)
+        geometry, bits = fragment_region_states(dict(regions=selected), first, last, source, work)
         geometries.add(geometry)
         states.append((*state,*bits))
-        witnesses.append(dict(owner=owner['name'],condition=roles[expression],body=roles[body],regions=selected))
+        witnesses.append(dict(owner=owner['name'],condition=roles[expression],body=roles[body],
+                              completion=roles[endpoint],regions=selected))
     if len(geometries) != 1:
         return None
-    signature = ('joined-async-condition',prepared.signature,guard['digest'],next(iter(geometries)))
-    witness = dict(kind='joined-async-condition',condition_span=[line,last],owners=witnesses,
+    kind = 'joined-async-condition-completion' if endpoint_only else 'joined-async-condition'
+    signature = (kind,prepared.signature,guard['digest'],next(iter(geometries)))
+    witness = dict(kind=kind,condition_span=[first,last],owners=witnesses,
                    context_sha256=hashlib.sha256(repr(signature).encode()).hexdigest())
-    return CallbackFragmentEvidence(tuple(states),tuple((int(row['condition']>0),) for row in witnesses),
+    slot = 'completion' if endpoint_only else 'condition'
+    return CallbackFragmentEvidence(tuple(states),tuple((int(row[slot]>0),) for row in witnesses),
                                     signature,witness)
 
 
@@ -2790,37 +2937,38 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     inventory = (construct_inventories[side] if construct_inventories is not None
                                  else _construct_inventory(source,work))
                     scopes.append(fixture_callback_forest(source,group,inventories[side],inventory_names[side],
-                                                          mapped,inventory,work))
+                                                          mapped,inventory,work,literal_loop_cache))
                 first,second = scopes
+                qualified = []
                 if first is not None and second is not None:
-                    variants = (('intact-fixture-callback-forest', [scope[:1]+scope[2:4] for scope in scopes]),
-                                ('retained-fixture-bindings', [scope[5] for scope in scopes]))
-                    for mode, (previous, current) in variants:
+                    variants = [('intact-fixture-callback-forest', [scope[1:2]+scope[:1]+scope[2:4] for scope in scopes]),
+                                ('retained-fixture-bindings', [scope[1:2]+scope[5] for scope in scopes])]
+                    if first[6] is not None and second[6] is not None:
+                        variants.append(('retained-fixture-loop-completion',[scope[6] for scope in scopes]))
+                    for mode, ((left,*previous),(right,*current)) in variants:
                         _construct_charge(work,len(previous[1])+len(previous[2]))
                         if (previous[0]==current[0] and previous[2] and len(previous[1])==len(current[1])
                                 and all(x<=y for x,y in zip(previous[1],current[1]))
                                 and previous[2].keys()==current[2].keys()
                                 and all(previous[2][n]<=current[2][n] for n in previous[2])):
-                            fixture_forests[prefix] = first,second,mode,previous,current
-                            break
-                fixture_forests.setdefault(prefix,None)
-            if fixture_forests[prefix] is not None:
-                first,second,mode,previous,current = fixture_forests[prefix]
-                left,right = first[1],second[1]
+                            qualified.append((mode,left,right,previous,current,first[4],second[4]))
+                fixture_forests[prefix] = qualified
+            for mode,left,right,previous,current,base_evidence,head_evidence in fixture_forests[prefix]:
                 if (left[0]<=a+1<=b<=left[1] and right[0]<=c+1<=d<=right[1]
                         and c-a==right[0]-left[0] and all(line-left[0] in previous[2] for line in pending)):
-                    if prefix not in fixture_receipts:
+                    key = prefix,mode
+                    if key not in fixture_receipts:
                         receipt = dict(file=name,kind=mode,pairs=[],
                             base_range=list(left),head_range=list(right),
-                            callback_fragments=[],owners=dict(base=first[4],head=second[4]),
+                            callback_fragments=[],owners=dict(base=base_evidence,head=head_evidence),
                             instance_states=[previous[1]],head_instance_states=[current[1]])
-                        fixture_receipts[prefix] = receipt
+                        fixture_receipts[key] = receipt
                         receipts.append(receipt)
                         for side,(source,group) in enumerate(((old,bg),(new,hg))):
                             start,end = group[:2]
                             _construct_charge(work,sum(len(text)+1 for text in source[start-1:end]))
                             excerpts[side,start,end] = ('\n'.join(source[start-1:end])+'\n').encode()
-                    receipt = fixture_receipts[prefix]
+                    receipt = fixture_receipts[key]
                     observed = []
                     for line in pending:
                         target = c+line-a
@@ -2829,7 +2977,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                         pairs[line] = target; observed.append([line,target])
                     receipt['pairs'].extend(observed)
                     receipt['callback_fragments'].append(dict(pairs=observed,base_range=[a+1,b],head_range=[c+1,d]))
-                    continue
+                    break
+            else:
+                mode = None
+            if mode is not None:
+                continue
         for side, source, group in ((0, old, bg), (1, new, hg)):
             excerpts[side, group[0], group[1]] = ("\n".join(source[group[0] - 1:group[1]]) + "\n").encode()
         entry = claimed.setdefault(prefix, {"states": [[[] for _ in group[2]] for group in (bg, hg)],
@@ -2889,10 +3041,23 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             if nominal is not None:
                 nominal_fragments[0, a] = nominal
                 nominal_signature = nominal.signature
+        joined_statements = []
+        if (join_cache and prefix in callback_functions and construct_inventories is not None
+                and macro_expansions==([],[])):
+            for side, source, group, first, last in ((0,old,bg,a+1,b),(1,new,hg,c+1,d)):
+                proof = biased_join_result_fragment(source,group,inventories[side],inventory_names[side],
+                    first,last,construct_inventories[side],work,expansions=[],loop_cache=literal_loop_cache,
+                    cache=join_cache)
+                if proof is None or proof.witness['kind'] not in (
+                        'joined-async-statement','joined-async-condition-completion','joined-async-phase-completion'):
+                    break
+                joined_statements.append(proof)
+        if len(joined_statements)!=2 or joined_statements[0].signature!=joined_statements[1].signature:
+            joined_statements.clear()
         occurrences = []; callback_signature = None; callback_mode = None; precise_signature = None; scoped_callback = False
         for side, source, counts, group, proposed in ((0, old, before, bg, a), (1, new, after, hg, c)):
             start, end, members = group
-            starts = [offset for offset in range(start - 1, end - (b - a) + 1)
+            starts = [proposed] if joined_statements else [offset for offset in range(start - 1, end - (b - a) + 1)
                       if source[offset:offset + b - a] == old[a:b]]
             if nominal_signature is not None:
                 if side not in callback_inventories:
@@ -2972,9 +3137,9 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                         if side not in callback_inventories:
                             callback_inventories[side] = (_construct_inventory(source, work)
                                 if construct_inventories is None else construct_inventories[side])
-                        callback = zero_arg_callback_fragment(source, group, inventories[side],
-                            inventory_names[side], offset + 1, offset + b - a, callback_inventories[side], work,
-                            phase_cache=callback_phase_cache)
+                        callback = joined_statements[side] if joined_statements else zero_arg_callback_fragment(
+                            source, group, inventories[side], inventory_names[side], offset + 1, offset + b - a,
+                            callback_inventories[side], work, phase_cache=callback_phase_cache)
                         if callback is None:
                             callback = zero_arg_callback_fragment(source, group, inventories[side],
                                 inventory_names[side], offset + 1, offset + b - a,
@@ -4362,9 +4527,474 @@ def retained_record_field_obligations(name, sources, counts, descriptors, invent
     return pairs,receipts,proved
 
 
+def retained_inline_callback_source(descriptor, inventory, source, work):
+    """Bind a builtin inline free function ending in one single-argument block closure."""
+    code=inventory[0];fn=descriptor['row'];first,last=descriptor['group'][:2]
+    expected=['#','[','inline',']','pub']
+    if descriptor['attributes']!=expected or descriptor['context'][0] or first<2 or source[first-2]!='#[inline]':
+        return None
+    declaration=fn['first']+len(expected)-1; start=fn['opening']+1
+    _construct_charge(work,fn['end']-start+len(source[first-2])+1)
+    if (fn['end']-start<8 or code.words[declaration:declaration+2]!=['pub','fn']
+            or code.position(code.starts[declaration])[0]!=first
+            or code.words[start+1:start+6]!=['(','|',code.words[start+3],'|','{']
+            or re.fullmatch(r'[A-Za-z_]\w*',code.words[start],re.ASCII) is None
+            or re.fullmatch(r'[A-Za-z_]\w*',code.words[start+3],re.ASCII) is None
+            or code.pairs.get(start+1)!=fn['end']-1 or code.pairs.get(start+5)!=fn['end']-2):
+        return None
+    def span(a,b):
+        return (*code.position(code.starts[a]),*code.position(code.ends[b]))
+    opener=start+5;closer=code.pairs[opener]
+    body=range(opener+1,closer)
+    pipes=[i for i in body if code.words[i] in ('|','||')]
+    inner=None
+    if pipes:
+        if len(pipes)!=2 or pipes[1]!=pipes[0]+2:
+            return None
+        token=pipes[0];parent=code.parents[token]
+        argument=code.words[token+1]
+        nesting=code.words[token+3:token+12]
+        if (parent is None or code.words[parent-2:parent+1]!=['.','map','('] or token!=parent+1
+                or code.pairs.get(parent)!=token+12 or len(nesting)!=9
+                or nesting[0]!=argument or nesting[1:2]!=['.'] or nesting[3:6]!=['(',')','.']
+                or nesting[7:]!=['(',')'] or any(re.fullmatch(r'[A-Za-z_]\w*',word,re.ASCII) is None
+                for word in (argument,nesting[2],nesting[6]))):
+            return None
+        inner=tuple(span(token+i,token+i) for i in (3,5,9))
+    return (span(declaration,fn['opening']-1),span(start,start),span(fn['end'],fn['end']),
+            span(opener,opener),span(closer,closer),inner)
+
+
+def retained_inline_callback_obligations(name,sources,counts,descriptors,inventories,selected,
+                                         indexes,head_counts,work):
+    """Match only source-owned, byte-identical retained rows of a closed inline callback scope."""
+    if head_counts is None or descriptors[0]['context']!=descriptors[1]['context']:
+        return None
+    if any(d['signature']!=descriptors[0]['signature'] for d in descriptors):
+        return None
+    roots=[d['group'] for d in descriptors];spans=[r[:2] for r in roots]
+    if not any(r.get('retained_statements') and r['base_range']==[spans[0][0]+1,spans[0][1]-1]
+               and r['head_range']==[spans[1][0]+1,spans[1][1]-1] for r in selected):
+        return None
+    sides=[retained_inline_callback_source(d,i,s,work) for d,i,s in zip(descriptors,inventories,sources)]
+    if any(side is None for side in sides) or sides[0][-1] is None or sides[1][-1] is not None:
+        return None
+    bodies=[s[first-1:last] for s,(first,last) in zip(sources,spans)]
+    _construct_charge(work,len(bodies[0])*len(bodies[1])+3*sum(len(t)+1 for b in bodies for t in b))
+    if any(not line.isascii() for body in bodies for line in body):
+        return None
+    a,b=spans[0][0],spans[1][0]
+    mapped={a+i:b+c+i-lo for tag,lo,hi,c,d in difflib.SequenceMatcher(
+        None,*bodies,autojunk=False).get_opcodes() if tag=='equal' for i in range(lo,hi)}
+    reverse={target:line for line,target in mapped.items()}
+    nested_line=sides[0][-1][0][0]
+    statements=inventories[0][3].get(nested_line,())
+    _construct_charge(work,len(statements))
+    code=inventories[0][0]
+    retired=[row for row in statements if row['supported']
+             and all(code.position(code.starts[row[k]])[0]==nested_line for k in ('first','end'))]
+    if (nested_line in mapped or len({r[0] for r in sides[0][-1]})!=1 or len(retired)!=1
+            or head_counts.get(retired[0]['digest'],0)):
+        return None
+    lexical=[];forests=[]
+    qualified=tuple(name.removeprefix('src/').removesuffix('.rs').split('/'))
+    for side,(source,inventory,index,group,expected,da) in enumerate(zip(
+            sources,inventories,indexes,roots,sides,counts)):
+        code=inventory[0];first,last=spans[side]; translation=mapped if not side else reverse
+        role_lines={line:line if not side else reverse[line] for line in translation}
+        available=index.inventories.get(name,())
+        _construct_charge(work,sum(len(o['regions'])+1 for o in available))
+        touching=[o for o in available if any(r[0]<=last and r[2]>=first for r in o['regions'])]
+        symbols={o['name']:o for o in touching}; owners=set();copies=[]
+        _construct_charge(work,len(touching)+sum(len(o['name'])+1 for o in touching))
+        if len(symbols)!=len(touching):
+            return None
+        for root in group[2]:
+            symbol=root['name'];stem=symbol[:-3];path=plain_rust_function_symbol(stem)
+            if (path is None or path.identifiers[1:]!=(*qualified,descriptors[side]['declaration'])
+                    or symbol!=stem+rust_same_crate_backref(path.modules,0)):
+                return None
+            parts=[root];depths=1 if side else 2
+            for depth in range(1,depths+1):
+                child='_R'+'NC'*depth+stem[2:]+'0'*depth+rust_same_crate_backref(path.modules,depth)
+                if child not in symbols or not direct_rust_callback_symbol(child,stem,path.modules,depth):
+                    return None
+                parts.append(symbols[child])
+            geometry=[];states=[]
+            for depth,owner in enumerate(parts):
+                rows=owner['regions'];quantity=owner.get('count')
+                _construct_charge(work,len(rows)*8+1)
+                if (id(owner) in owners or symbols.get(owner['name']) is not owner
+                        or index.name_counts[owner['name']]!=1 or owner.get('branches') or owner.get('mcdc_records')
+                        or type(quantity) is not int or not 0<=quantity<COUNTER_LIMIT
+                        or source_owner_span(owner,name,index.files,source) is None
+                        or any(r[4]>=COUNTER_LIMIT for r in rows)):
+                    return None
+                owners.add(id(owner));present={tuple(r[:4]):r[4] for r in rows}
+                need=expected[:3] if depth==0 else expected[3:5] if depth==1 else expected[-1]
+                if len(present)!=len(rows) or any(present.get(span)!=quantity for span in need):
+                    return None
+                if depth!=1 and len(rows)!=len(need) or depth==1 and quantity!=root['count']:
+                    return None
+                if depth==2:
+                    continue
+                limits=(need[0][:2],need[-1][2:])
+                facts=[]
+                for r in rows:
+                    begin,end=r[0],r[2]
+                    _construct_charge(work,end-begin+1)
+                    if tuple(r[:2])<limits[0] or tuple(r[2:4])>limits[1]:
+                        return None
+                    aligned=[role_lines.get(line) for line in range(begin,end+1)]
+                    if all(line is None for line in aligned):
+                        continue
+                    if aligned[0] is None or aligned!=list(range(aligned[0],aligned[0]+len(aligned))):
+                        return None
+                    facts.append(((depth,aligned[0],r[1],aligned[-1],r[3]),int(r[4]>0)))
+                _construct_charge(work,len(facts)*(len(facts).bit_length()+1))
+                facts.sort()
+                geometry.extend(key for key,_ in facts);states.extend(hit for _,hit in facts)
+            copies.append((path.identity,symbol,tuple(geometry),tuple(states),[o['name'] for o in parts]))
+        if owners!={id(o) for o in touching}:
+            return None
+        observer=_ObserverWork(work)
+        total=dict(_llvm22_rows(_llvm22_segments([r for o in touching for r in o['regions']],observer),observer))
+        _construct_charge(work,last-first+1)
+        if total!={n:da[n] for n in range(first,last+1) if n in da}:
+            return None
+        fn=descriptors[side]['row'];tokens=[];line_roles={}
+        for token in range(fn['first'],fn['end']+1):
+            number,col=code.position(code.starts[token])
+            parent=code.parents[token]
+            _construct_charge(work,len(code.words[token])+1)
+            if number not in line_roles:
+                text=source[number-1]
+                _construct_charge(work,len(text)+1)
+                line_roles[number]=(text,parent)
+            if number not in role_lines:
+                continue
+            if parent is None:
+                context=None
+            else:
+                pline,pcol=code.position(code.starts[parent])
+                if pline not in role_lines:
+                    return None
+                context=(role_lines[pline],pcol)
+            tokens.append((role_lines[number],col,code.words[token],context))
+        _construct_charge(work,len(line_roles)+len(da.keys() & role_lines.keys()))
+        occurrences=Counter(line_roles.values())
+        if any(occurrences[line_roles[line]]!=1 for line in da.keys() & role_lines.keys() & line_roles.keys()):
+            return None
+        lexical.append(tokens);forests.append(copies)
+    if lexical[0]!=lexical[1] or not forests[0] or not forests[1]:
+        return None
+    base,head=forests
+    signatures={(o[0],o[2]) for o in base+head}
+    if len(signatures)!=1:
+        return None
+    vectors=[[o[3] for o in members] for members in forests]
+    if sorted(vectors[0])!=sorted(vectors[1]):
+        return None
+    _construct_charge(work,len(base)*len(head)*max(1,len(vectors[0][0])))
+    fitting=compiled_hit_state_matching(*vectors,tuple([o[1] for o in side] for side in forests))
+    if fitting is None:
+        return None
+    pairs={line:target for line,target in mapped.items() if line in counts[0] and target in counts[1]}
+    leftovers=[line for line in range(spans[0][0],spans[0][1]+1) if line in counts[0] and line not in pairs]
+    return pairs,dict(kind='retained-inline-callback-regions',file=name,base_range=list(spans[0]),
+        head_range=list(spans[1]),pairs=[list(row) for row in sorted(pairs.items())],
+        preserved_base_mapped=leftovers,removed_nested_callback_line=nested_line,
+        compiled_forests=[[o[4] for o in side] for side in forests],instance_matching=fitting,
+        claim='Exact retained source only. Every unpaired base line remains in the ratios.')
+
+
+def callback_island_import_context(name, contexts, words, blobs, work):
+    """Allow one additional imported enum, never a changed method-providing trait."""
+    if contexts[0] == contexts[1]:
+        return True
+    if contexts[0][0] != contexts[1][0] or blobs is None:
+        return False
+    old, new = (Counter(context[1]) for context in contexts)
+    removed, added = list((old-new).elements()), list((new-old).elements())
+    if len(removed) != 1 or len(added) != 1:
+        return False
+    parsed = []
+    for clause in (removed[0], added[0]):
+        _construct_charge(work,len(clause)+1)
+        if (len(clause)<8 or clause[0]!='use' or clause[-2:]!=('}',';')
+                or clause.count('{')!=1 or clause.count('}')!=1):
+            return False
+        opening=clause.index('{'); prefix=clause[1:opening]
+        if (not prefix or prefix[-1]!='::' or len(prefix)%2!=0
+                or any(word!='::' for word in prefix[1::2])
+                or any(re.fullmatch(r'[A-Za-z_]\w*',word,re.ASCII) is None for word in prefix[::2])):
+            return False
+        fields=clause[opening+1:-2]
+        fields=fields[:-1] if fields[-1:]==(',',) else fields
+        if (not fields or len(fields)%2!=1 or any(word!=',' for word in fields[1::2])
+                or any(re.fullmatch(r'[A-Za-z_]\w*',word,re.ASCII) is None for word in fields[::2])):
+            return False
+        parsed.append((prefix,list(fields[::2])))
+    if parsed[0][0]!=parsed[1][0]:
+        return False
+    before,after=(row[1] for row in parsed)
+    if len(after)!=len(before)+1 or len(set(after))!=len(after):
+        return False
+    extra=list((Counter(after)-Counter(before)).elements())
+    if len(extra)!=1 or [word for word in after if word!=extra[0]]!=before or extra[0] in words:
+        return False
+    path=list(parsed[0][0][::2]); modules=name.removeprefix('src/').removesuffix('.rs').split('/')
+    if path[0]=='crate':
+        modules=[];path=path[1:]
+    elif path[0]=='self':
+        path=path[1:]
+    elif path[0]!='super':
+        return False
+    while path[:1]==['super']:
+        if not modules:return False
+        modules.pop();path=path[1:]
+    if not path:return False
+    target='src/'+'/'.join(modules+path)+'.rs'; blob=blobs[1].get(target)
+    if blob is None or len(blob)>2**20:return False
+    _construct_charge(work,len(blob)+1)
+    try: code=_boolean_source(blob.decode('utf-8').splitlines())
+    except UnicodeDecodeError:return False
+    if code is None:return False
+    found=[]
+    for at,word in enumerate(code.words):
+        _construct_charge(work,1)
+        if word!=extra[0] or code.parents[at] is not None:continue
+        if at>0 and code.words[at-1] in ('enum','trait','struct','type','union','mod','fn'):
+            found.append((code.words[at-1],at))
+    return len(found)==1 and found[0][0]=='enum'
+
+
+def retained_callback_island_obligations(name, sources, counts, descriptors, inventories,
+                                        replacements, work, indexes_factory, expansions, blobs=None):
+    """Bind an unchanged iterator callback and every overlapping compiled child."""
+    if indexes_factory is None or expansions!=([],[]):
+        return {},[]
+    candidate_sets=[]
+    for side,(inventory,functions) in enumerate(zip(inventories,descriptors)):
+        code,rows=inventory[:2]; candidates={}
+        _construct_charge(work,len(rows)+len(functions))
+        by_opening={r['opening']:r for r in rows if r['opening'] is not None}
+        selected=[]
+        for descriptor in functions.values():
+            group=descriptor['group'];first,last=group[:2]
+            _construct_charge(work,len(replacements))
+            if any(r.get('retained_statements') and max(first,r['base_range' if side==0 else 'head_range'][0])
+                   <=min(last,r['base_range' if side==0 else 'head_range'][1]) for r in replacements.values()):
+                selected.append(descriptor)
+        if not selected:
+            candidate_sets.append(candidates);continue
+        for row in rows:
+            header=row.get('header',());opening=row['opening']
+            if (row['kind']!='expression' or not row['supported'] or opening is None
+                    or len(header)<3 or header[0]!='|' or header[2]!='|'
+                    or re.fullmatch(r'[A-Za-z_]\w*',header[1],re.ASCII) is None):
+                continue
+            parent=code.parents[row['first']]
+            if (parent is None or parent<2 or code.words[parent-2:parent]!=['.','map']
+                    or code.words[parent]!='(' or code.pairs[parent]!=row['end']+1):
+                continue
+            parents=[d for d in selected if d['row']['opening']<row['first']<row['end']<d['row']['end']]
+            _construct_charge(work,len(selected)+row['end']-row['first']+1)
+            if len(parents)!=1:continue
+            descriptor=parents[0];scope=code.parents[parent]
+            if scope is None:continue
+            # Bind the receiver/record-field slot in its direct lexical scope.
+            start=scope+1
+            for at in range(scope+1,parent):
+                _construct_charge(work,1)
+                if code.parents[at]==scope and code.words[at] in (';',','):
+                    start=at+1
+            prefix=list(code.words[start:parent-2]);filters=[];normalized=[];at=0
+            while at<len(prefix):
+                _construct_charge(work,1)
+                if prefix[at:at+3]==['.','filter','(']:
+                    actual=start+at;finish=code.pairs.get(actual+2)
+                    if finish is None or finish>=parent-2:break
+                    callback=next((r for r in rows if r['first']==actual+3 and r.get('header')==('|',header[1],'|')),None)
+                    _construct_charge(work,len(rows))
+                    if callback is None or callback['end']+1!=finish:break
+                    filters.append(callback);at=finish-start+1
+                else:
+                    normalized.append(prefix[at]);at+=1
+            if at!=len(prefix) or len(filters)>1 or not normalized:continue
+            ancestors=[];valid=True
+            for ancestor in [scope]+_construct_ancestors(code,scope,work):
+                if ancestor==descriptor['row']['opening']:break
+                if code.words[ancestor]!='{':continue
+                holding=by_opening.get(ancestor)
+                if holding is None or not holding['supported']:
+                    valid=False;break
+                ancestors.append(tuple(holding.get('header',())))
+            if not valid:continue
+            first,last=code.position(code.starts[row['first']])[0],code.position(code.ends[row['end']])[0]
+            body=tuple(sources[side][first-1:last]);_construct_charge(work,sum(len(line)+1 for line in body))
+            if any(not line.isascii() for line in body):continue
+            key=(descriptor['declaration'],descriptor['signature'],tuple(descriptor['attributes']),tuple(ancestors),
+                 tuple(normalized),tuple(header),body)
+            candidates.setdefault(key,[]).append((descriptor,row,filters))
+        candidate_sets.append(candidates)
+    common=candidate_sets[0].keys()&candidate_sets[1].keys()
+    pairs={};targets={};receipts=[];indexes=None
+    for key in common:
+        _construct_charge(work,len(key[-1])+1)
+        choices=[candidates[key] for candidates in candidate_sets]
+        if any(len(rows)!=1 for rows in choices):continue
+        selected=[rows[0] for rows in choices]
+        if selected[0][2] or len(selected[1][2])>1:continue
+        if not callback_island_import_context(name,[r[0]['context'] for r in selected],key[4]+key[5]+tuple(
+                word for word in inventories[0][0].words[selected[0][1]['first']:selected[0][1]['end']+1]),blobs,work):continue
+        if indexes is None:indexes=indexes_factory()
+        sides=[];valid=True
+        for side,((descriptor,callback,filters),inventory,index) in enumerate(zip(selected,inventories,indexes)):
+            code=inventory[0];opening,closing=code.region(callback['opening'],callback['end'])[:2],code.region(callback['opening'],callback['end'])[2:]
+            available=index.inventories.get(name,());_construct_charge(work,sum(len(o['regions'])+1 for o in available))
+            forest=[o for o in available if any(tuple(r[:2])<closing and opening<tuple(r[2:4]) for r in o['regions'])]
+            # Expression children must occupy unique complete closure argument slots.
+            slots=[];at=callback['opening']+1
+            while at<callback['end']:
+                _construct_charge(work,1)
+                nullary=code.words[at]=='||';unary=(code.words[at]=='|' and at+2<callback['end'] and code.words[at+2]=='|')
+                if not (nullary or unary):at+=1;continue
+                call=code.parents[at];body=at+(1 if nullary else 3)
+                if (call is None or code.words[call]!='(' or body>=code.pairs[call]
+                        or code.words[body] in ('{','async','move')):
+                    valid=False;break
+                end=code.pairs[call]-1
+                slots.append((code.region(body,end),
+                    (*code.position(code.starts[body]),*code.position(code.ends[body+int(code.words[body+1]=='!')]))))
+                at=end+1
+            if not valid or len(slots)>8:valid=False;break
+            roles=[];owned=set();filter_owned=set();filter_evidence=[]
+            filter_touching=[]
+            if filters:
+                low,high=code.region(filters[0]['opening'],filters[0]['end'])[:2],code.region(filters[0]['opening'],filters[0]['end'])[2:]
+                _construct_charge(work,sum(len(owner['regions'])+1 for owner in available))
+                filter_touching=[owner for owner in available if any(
+                    tuple(region[:2])<high and low<tuple(region[2:4]) for region in owner['regions'])]
+            for root in descriptor['group'][2]:
+                shape=plain_rust_function_symbol(root['name'])
+                if (shape is None or index.name_counts[root['name']]!=1 or len(root['filenames'])!=1
+                        or index.files.get(root['filenames'][0])!=name
+                        or type(root.get('count')) is not int or not 0<=root['count']<COUNTER_LIMIT
+                        or shape.identifiers[-1]!=descriptor['declaration']
+                        or name.startswith('src/') and shape.identifiers[:-1] !=
+                            ('omg_lib',*name.removeprefix('src/').removesuffix('.rs').split('/'))):
+                    valid=False;break
+                related={}
+                for owner in forest:
+                    symbol=owner['name'];_construct_charge(work,len(symbol)+len(owner['regions'])+1)
+                    depths=[depth for depth in (1,2) if direct_rust_callback_symbol(symbol,root['name'],shape.modules,depth)]
+                    if len(depths)!=1:continue
+                    depth=depths[0];suffix=symbol[len('_R'+'NC'*depth+root['name'][2:]):]
+                    ordinals=tuple(re.findall(r'(s[0-9A-Za-z]{0,32}_)?0',suffix)[:depth])
+                    if len(ordinals)!=depth or ordinals in related:
+                        valid=False;break
+                    related[ordinals]=owner
+                if not valid:break
+                direct=[(path,o) for path,o in related.items() if len(path)==1]
+                if len(direct)!=1:valid=False;break
+                outer_path,mapper=direct[0];members={():mapper}
+                if type(mapper.get('count')) is not int or not 0<=mapper['count']<COUNTER_LIMIT or (
+                        mapper['count']>0 and root['count']==0):valid=False;break
+                if filters:
+                    _construct_charge(work,len(filter_touching)+sum(len(o['name']) for o in filter_touching))
+                    owned_filters=[o for o in filter_touching if direct_rust_callback_symbol(o['name'],root['name'],shape.modules)]
+                    if len(owned_filters)!=1:
+                        valid=False;break
+                    filter_owner=owned_filters[0];raw=filter_owner['regions'];entry=filter_owner.get('count')
+                    _construct_charge(work,len(raw))
+                    if (filter_owner is mapper or index.name_counts[filter_owner['name']]!=1
+                            or filter_owner['filenames']!=root['filenames'] or filter_owner.get('branches') or filter_owner.get('mcdc_records')
+                            or type(entry) is not int or not 0<=mapper['count']<=entry<COUNTER_LIMIT
+                            or any(len(r)!=8 or r[5:]!=[0,0,0] or r[4]!=entry or not low<=tuple(r[:2])<tuple(r[2:4])<=high for r in raw)
+                            or [r[4] for r in raw if tuple(r[:4])==(*low,low[0],low[1]+1)]!=[entry]
+                            or [r[4] for r in raw if tuple(r[:4])==(*high[:1],high[1]-1,*high)]!=[entry]):
+                        valid=False;break
+                    same_root=[o for o in filter_touching if any(direct_rust_callback_symbol(o['name'],root['name'],shape.modules,d) for d in (1,2))]
+                    if same_root!=owned_filters:
+                        valid=False;break
+                    filter_owned.add(id(filter_owner));filter_evidence.append(dict(name=filter_owner['name'],count=entry))
+                for path,owner in related.items():
+                    if len(path)==1:continue
+                    if path[:1]!=outer_path:valid=False;break
+                    matches=[number for number,(bounds,_) in enumerate(slots)
+                        if all(tuple(bounds[:2])<=tuple(r[:2])<tuple(r[2:4])<=tuple(bounds[2:]) for r in owner['regions'])]
+                    if len(matches)!=1 or matches[0] in members:valid=False;break
+                    members[matches[0]]=owner
+                if not valid or len(members)!=len(slots)+1:valid=False;break
+                geometry=[];states=[int(root['count']>0)];names=[];nested_ordinals=[]
+                for role in [()]+list(range(len(slots))):
+                    owner=members[role];symbol=owner['name'];raw=owner['regions'];entry=owner['count']
+                    if (id(owner) in owned or index.name_counts[symbol]!=1 or len(owner['filenames'])!=1
+                            or index.files.get(owner['filenames'][0])!=name or owner.get('branches') or owner.get('mcdc_records')
+                            or type(entry) is not int or not 0<=entry<COUNTER_LIMIT
+                            or any(len(r)!=8 or r[5:]!=[0,0,0] or not opening<=tuple(r[:2])<tuple(r[2:4])<=closing for r in raw)):
+                        valid=False;break
+                    if role==():
+                        terminal=(*closing[:1],closing[1]-1,*closing)
+                        if [r[4] for r in raw if tuple(r[:4])==terminal]!=[entry]:valid=False;break
+                        if len(callback['header'])==3:
+                            marker=(*opening,opening[0],opening[1]+1)
+                            if [r[4] for r in raw if tuple(r[:4])==marker]!=[entry]:valid=False;break
+                        elif any(r[4]!=entry for r in raw):valid=False;break
+                    else:
+                        suffix=symbol[len('_RNCNC'+root['name'][2:]):]
+                        nested_ordinals.append(tuple(re.findall(r'(s[0-9A-Za-z]{0,32}_)?0',suffix)[:2])[1])
+                        bounds,marker=slots[role]
+                        if (min(tuple(r[:2]) for r in raw)!=tuple(bounds[:2])
+                                or [r[4] for r in raw if tuple(r[:4])==marker]!=[entry]):valid=False;break
+                    owned.add(id(owner));names.append(symbol)
+                    ordered=sorted(raw,key=lambda r:tuple(r[:4]+r[5:]));_construct_charge(work,len(raw)*(len(raw).bit_length()+1))
+                    geometry.append(tuple((r[0]-opening[0],r[1],r[2]-opening[0],r[3],*r[5:]) for r in ordered))
+                    states.extend([int(entry>0),*[int(r[4]>0) for r in ordered]])
+                if not valid:break
+                roles.append(dict(role=shape.identity,identity=root['name'],geometry=tuple(geometry),states=tuple(states),
+                    nested_ordinals=tuple(nested_ordinals),names=names))
+            if (not valid or owned!={id(o) for o in forest}
+                    or filters and filter_owned!={id(o) for o in filter_touching}):valid=False;break
+            observer=_ObserverWork(work);observed=dict(_llvm22_rows(_llvm22_segments([r for o in forest for r in o['regions']],observer),observer))
+            if not observed:valid=False;break
+            first,last=min(observed),max(observed);_construct_charge(work,last-first+1)
+            measured={line:counts[side][line] for line in range(first,last+1) if line in counts[side]}
+            if observed!=measured:valid=False;break
+            sides.append((roles,observed,opening,filter_evidence))
+        if not valid:continue
+        roles={r['role'] for r in sides[0][0]}
+        if roles!={r['role'] for r in sides[1][0]}:continue
+        matches=[]
+        for role in roles:
+            vectors=[[r for r in side[0] if r['role']==role] for side in sides]
+            if len(vectors[0])!=len(vectors[1]) or any(r['geometry']!=vectors[0][0]['geometry']
+                    or r['nested_ordinals']!=vectors[0][0]['nested_ordinals'] for rows in vectors for r in rows):
+                valid=False;break
+            _construct_charge(work,(len(vectors[0])*len(vectors[1])+1)*len(vectors[0][0]['states']))
+            matching=compiled_hit_state_matching(*[tuple(r['states'] for r in rows) for rows in vectors],
+                [tuple(r['identity'] for r in rows) for rows in vectors])
+            if matching is None:raise ValueError('Retained callback island lost complete-copy coverage')
+            matches.append(dict(role=repr(role),matching=matching))
+        if not valid:continue
+        offset=sides[1][2][0]-sides[0][2][0]
+        mapped={line:line+offset for line in sides[0][1]}
+        if set(mapped.values())!=set(sides[1][1]):continue
+        if any(line in pairs and pairs[line]!=target or target in targets and targets[target]!=line for line,target in mapped.items()):
+            raise ValueError('Ambiguous callback island correspondence')
+        pairs.update(mapped);targets.update((target,line) for line,target in mapped.items())
+        receipts.append(dict(kind='closed-retained-callback-island',file=name,
+            base_range=list(selected[0][0]['group'][:2]),head_range=list(selected[1][0]['group'][:2]),pairs=[list(row) for row in sorted(mapped.items())],
+            forest_names=[[r['names'] for r in side[0]] for side in sides],added_filter=sides[1][3],role_matching=matches,
+            source_sha256=hashlib.sha256(('\n'.join(key[-1])+'\n').encode()).hexdigest(),
+            claim='Only unchanged callback lines; complete overlapping forest and cold roles; zero deletion credit'))
+    return pairs,receipts
+
+
 def retained_replacement_obligations(name, old, new, before, after, inventories, grouped,
                                      replacements, work, head_counts=None, parent_files=None,
-                                     record_indexes=None, record_expansions=(None,None)):
+                                     record_indexes=None, record_expansions=(None,None), island_blobs=None):
     if not replacements or any(value is None for value in tuple(inventories) + tuple(grouped)):
         return {}, [], set()
     descriptors = []; context_cache = {}; binding_indexes = {}
@@ -4685,6 +5315,15 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
     record_pairs, record_receipts, record_proved = retained_record_field_obligations(
         name,(old,new),(before,after),descriptors,inventories,grouped,replacements,work,
         record_indexes,record_expansions)
+    island_pairs, island_receipts = retained_callback_island_obligations(
+        name,(old,new),(before,after),descriptors,inventories,replacements,work,
+        record_indexes,record_expansions,island_blobs)
+    _construct_charge(work,len(island_pairs)+len(record_pairs))
+    record_targets={target:line for line,target in record_pairs.items()}
+    if any(line in record_pairs and record_pairs[line]!=target
+           or target in record_targets and record_targets[target]!=line for line,target in island_pairs.items()):
+        raise ValueError('Ambiguous callback island and record correspondence')
+    record_pairs.update(island_pairs);record_receipts.extend(island_receipts)
     _construct_charge(work,len(extra_pairs)+len(record_pairs))
     extra_targets={target:line for line,target in extra_pairs.items()}
     if any(line in extra_pairs and extra_pairs[line]!=target
@@ -4796,6 +5435,18 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
                     and groups[1][0] <= row['head_line'] <= groups[1][1]]
         if not selected:
             continue
+        if (left_prefix==right_prefix and left['attributes']==['#','[','inline',']','pub']
+                and record_indexes is not None and record_expansions==([],[])):
+            inline = retained_inline_callback_obligations(name,(old,new),(before,after),(left,right),
+                inventories,selected,record_indexes(),head_counts,work)
+            if inline is not None:
+                mapped,receipt=inline
+                if any(line in pairs and pairs[line]!=target for line,target in mapped.items()):
+                    raise ValueError('Ambiguous inline callback correspondence')
+                pairs.update(mapped);receipts.append(receipt)
+                excerpts.extend(('\n'.join(source[group[0]-2:group[1]])+'\n').encode()
+                                for source,group in zip((old,new),groups))
+                continue
         if left_prefix == right_prefix:
             eager = eager_call_prefix_obligations(name, (old, new), (before, after),
                 (left, right), inventories, grouped, work)
@@ -7521,7 +8172,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         obligation_pairs, residual_receipts, proved_functions = retained_replacement_obligations(
             name, old, new, before, after, inventories, grouped, replacement_candidates,
             construct_work, head_capsule_counts, parent_files, record_indexes=source_owner_indexes,
-            record_expansions=(bs[name]['expansions'],hs[name]['expansions'])) if inventories is not None else ({}, [], set())
+            record_expansions=(bs[name]['expansions'],hs[name]['expansions']),island_blobs=(base_sources,head_sources)) if inventories is not None else ({}, [], set())
         anchored.update(obligation_pairs); obligation_receipts.extend(residual_receipts)
         retained_statement_rows = {}
         def retire_declaration(line,target):
@@ -7631,6 +8282,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         for start, end in replaced_functions:
             _construct_charge(construct_work, end - start + 1)
             gone.difference_update(range(start, end + 1))
+        for receipt in residual_receipts:
+            protected=receipt.get('preserved_base_mapped',())
+            _construct_charge(construct_work,len(protected))
+            gone.difference_update(protected)
         callback_scopes = []
         callback_functions = {fragment.function_prefix for fragment in deferred_fragments.values()
                               if fragment.kind == 'callback'}

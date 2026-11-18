@@ -619,6 +619,41 @@ fn make_staged_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn fixture_signing_keys(wire: Vec<u8>, compressed: bool) -> Result<Vec<u8>> {
+        use std::io::Read as _;
+
+        if !compressed {
+            return Ok(wire);
+        }
+        const KEY_LIMIT: usize = 1024 * 1024;
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(wire.as_slice())
+            .take(KEY_LIMIT as u64 + 1)
+            .read_to_end(&mut decoded)?;
+        anyhow::ensure!(
+            decoded.len() <= KEY_LIMIT,
+            "Swift key fixture exceeds its decoded size limit"
+        );
+        Ok(decoded)
+    }
+
+    #[test]
+    fn swift_fixture_decodes_gzip_keys_with_a_strict_output_limit() -> Result<()> {
+        use std::io::Write as _;
+
+        let compress = |bytes: &[u8]| -> std::io::Result<Vec<u8>> {
+            let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            writer.write_all(bytes)?;
+            writer.finish()
+        };
+        let keys = b"controlled Swift public key input";
+        assert_eq!(fixture_signing_keys(keys.to_vec(), false)?, keys);
+        assert_eq!(fixture_signing_keys(compress(keys)?, true)?, keys);
+        assert!(fixture_signing_keys(keys.to_vec(), true).is_err());
+        assert!(fixture_signing_keys(compress(&vec![b'x'; 1024 * 1024 + 1])?, true).is_err());
+        Ok(())
+    }
+
     #[cfg(all(target_os = "linux", feature = "pgp"))]
     #[tokio::test]
     #[ignore = "requires budgeted genuine Swift vendor inputs and isolated native namespaces"]
@@ -666,19 +701,11 @@ mod tests {
             &fs::read(directory.join("owner.json")).expect("genuine input representation receipt"),
         )
         .unwrap();
-        let wire_keys = fs::read(directory.join("all-keys.asc")).unwrap();
-        let keys = if owner["sources"]["all-keys.asc"]["content_encoding"] == "gzip" {
-            use std::io::Read as _;
-            let mut decoded = Vec::new();
-            flate2::read::GzDecoder::new(&wire_keys[..])
-                .take(1024 * 1024 + 1)
-                .read_to_end(&mut decoded)
-                .unwrap();
-            assert!(decoded.len() <= 1024 * 1024);
-            decoded
-        } else {
-            wire_keys
-        };
+        let keys = fixture_signing_keys(
+            fs::read(directory.join("all-keys.asc")).unwrap(),
+            owner["sources"]["all-keys.asc"]["content_encoding"] == "gzip",
+        )
+        .expect("decode the bounded genuine Swift keys");
         let manager = SwiftManager {
             security: mutation_security(&fixture.versions),
             versions_dir: fixture.versions.clone(),

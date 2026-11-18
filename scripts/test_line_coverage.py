@@ -1555,7 +1555,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
 
 
     def join_result_compare(self, mutation=None, expansions=([], []), body=False, fragment=None,
-                            with_guard=False):
+                            with_guard=False, with_statements=False, guard_close=False, phase_close=False):
         captured = {}
         def nest(old, new, base, head):
             for source, members, callee, request in ((old, base, 'before', '"fixture-tool"'),
@@ -1598,6 +1598,19 @@ class SourceAwareCoverageTests(unittest.TestCase):
                             [16, elapsed, 16, elapsed+len('elapsed'), 2, 0, 0, 0],
                             [17, end, 17, end+1, 2, 0, 0, 0],
                         ]))
+                if with_statements:
+                    source[18:18] = ['                let error = outcome.expect_err("fixture failure");',
+                                     '                assert!(error.is_expected());',
+                                     '                fs::remove_file(marker).expect("reset marker");']
+                    for owner in members:
+                        for row in owner['regions']:
+                            for column in (0,2):
+                                if row[column]>=19:
+                                    row[column] += 3
+                    for phase in (members[8], members[9]):
+                        for line, word in ((19,'error'),(20,'assert!'),(21,'fs::remove_file')):
+                            start = source[line-1].index(word)+1
+                            phase['regions'].append([line,start,line,start+len(word),2,0,0,0])
                 if with_guard:
                     source[18:18] = ['                if tick_elapsed >= Duration::from_millis(500) {',
                                      '                    starved.push(manager);',
@@ -1624,11 +1637,18 @@ class SourceAwareCoverageTests(unittest.TestCase):
         requested = [(first-1, last, first-1, last, list(range(first,last+1)))]
         if with_guard:
             requested.append((18, 19, 18, 19, [19]))
+            if guard_close:
+                requested.append((20,21,20,21,[21]))
+        if with_statements:
+            requested.extend((line-1,line,line-1,line,[line]) for line in range(19,22))
+        if phase_close:
+            requested.append((18,19,18,19,[19]))
+        inventories = tuple(coverage._construct_inventory(captured[side],[100_000]) for side in ('old','new'))
         return coverage.positive_source_fragments('example.rs', captured['old'], captured['new'],
             {n: 1 for n in range(1, 32)}, {n: 1 for n in range(1, 32)},
             captured['base'], captured['head'], {'/src/example.rs': 'example.rs'},
             {'/src/example.rs': 'example.rs'}, requested,
-            callback_functions=('fn checked()',), macro_expansions=expansions)
+            callback_functions=('fn checked()',), macro_expansions=expansions, construct_inventories=inventories)
 
     def test_join_result_binds_exact_result_roles_and_unchanged_owned_timer(self):
         pairs, receipts = self.join_result_compare()
@@ -1658,6 +1678,18 @@ class SourceAwareCoverageTests(unittest.TestCase):
         self.assertEqual(len(proofs), 2)
         self.assertTrue(all(proof['condition_span'] == [19,21] for proof in proofs))
 
+    def test_join_scope_proves_the_exact_conditional_completion(self):
+        pairs, receipts = self.join_result_compare(with_guard=True, guard_close=True)
+        self.assertEqual(pairs, {11:11,19:19,21:21})
+        self.assertEqual(sum(proof['kind']=='joined-async-condition-completion' for receipt in receipts
+            for proof in receipt.get('callback_owners', [])),2)
+
+    def test_join_scope_proves_its_exact_async_phase_completion(self):
+        pairs, receipts = self.join_result_compare(phase_close=True)
+        self.assertEqual(pairs, {11:11,19:19})
+        self.assertEqual(sum(proof['kind']=='joined-async-phase-completion' for receipt in receipts
+            for proof in receipt.get('callback_owners', [])),2)
+
     def test_join_scope_refuses_changed_conditional_body_and_lost_copy_state(self):
         def change(old, new, base, head, mode):
             if mode == 'different-body':
@@ -1670,6 +1702,25 @@ class SourceAwareCoverageTests(unittest.TestCase):
         for mode in ('different-body','foreign-region','lost-copy'):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
                 self.join_result_compare(lambda *args: change(*args, mode), with_guard=True)
+
+    def test_join_scope_matches_each_unchanged_post_join_statement(self):
+        pairs, receipts = self.join_result_compare(with_statements=True)
+        self.assertEqual(pairs, {11:11,19:19,20:20,21:21})
+        self.assertEqual(sum(proof['kind']=='joined-async-statement' for receipt in receipts
+            for proof in receipt.get('callback_owners',[])),6)
+
+    def test_join_scope_refuses_unbound_or_cold_statement_regions(self):
+        def control(old,new,base,head,mode):
+            if mode=='foreign':
+                head.append(dict(name='foreign',filenames=['/src/example.rs'],count=2,
+                                 regions=[[20,17,20,24,2,0,0,0]]))
+            elif mode=='lost-state':
+                next(row for row in head[8]['regions'] if row[0]==20)[4] = 0
+            else:
+                new[19] = new[19].replace('is_expected','is_unrelated')
+        for mode in ('foreign','lost-state','changed-statement'):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.join_result_compare(lambda *args:control(*args,mode),with_statements=True)
 
     def test_join_prepared_cache_is_scoped_to_exact_immutable_inputs_and_metadata(self):
         original=coverage.biased_join_result_fragment
@@ -3276,6 +3327,124 @@ class SourceAwareCoverageTests(unittest.TestCase):
             self.assertLess(work[0], charged_before)
 
         self.single_bound_phase_fixture(compare=compare)
+
+    def closed_retained_callback_island_fixture(self, record=False, fault=None):
+        if record:
+            old=['fn inventory(input: &[Row]) -> Vec<Row> {','    input.iter()',
+                 '        .map(|row| Row {','            name: row.name.clone(),',
+                 '        })','        .collect()','}']
+        else:
+            old=['fn inventory(input: &[Row]) -> Result<Vec<Row>> {','    input.iter()',
+                 '        .map(|row| {','            let note = fetch(row).with_context(|| format!("missing"))?;',
+                 '            let values = row.values.iter().map(|value| clone_value(value)).collect();',
+                 '            Ok((row.name.clone(), note, values))','        })','        .collect()','}']
+        added=['        .filter(|row| {','            visible(row)','        })']
+        new=old[:2]+added+old[2:];sources=[old,new];documents=[]
+        for side,source in enumerate(sources):
+            mapper=3+3*side;ending=(5 if record else 7)+3*side;members=[]
+            for copy_number,state in enumerate((1,0),1):
+                root=f'_RNvCs{copy_number}_7example9inventory'
+                selected=('_RNC'+root[2:]+('s_' if side else '')+'0B3_')
+                def row(line,start,end,count=state):return [line,start,line,end,count,0,0,0]
+                def owner(name,count,regions):return dict(name=name,count=count,filenames=['/src/example.rs'],regions=regions,branches=[],mcdc_records=[])
+                members.append(owner(root,state,[row(1,1,source[0].index('{')+1),row(len(source),1,2)]))
+                if side:
+                    opening=source[2].index('{')+1
+                    members.append(owner('_RNC'+root[2:]+'0B3_',4*state,[row(3,opening,opening+1,4*state),
+                        row(4,13,20,4*state),row(5,9,10,4*state)]))
+                hits=3*state;raw=[]
+                if record:
+                    line=mapper+1;start=source[line-1].index('row.name')+1
+                    raw.append(row(line,start,len(source[line-1]),hits))
+                else:
+                    opening=source[mapper-1].index('{')+1
+                    raw.append(row(mapper,opening,opening+1,hits))
+                    line=mapper+1;text=source[line-1]
+                    raw.extend([row(line,13,16,hits),row(line,text.index('fetch')+1,text.index('fetch')+6,hits),
+                        row(line,text.index('?')+1,text.index('?')+2,0),row(mapper+2,13,16,hits),row(mapper+3,13,15,hits)])
+                    start=text.index('format!')+1
+                    members.append(owner('_RNCNC'+root[2:]+('s_' if side else '')+'00B5_',0,[row(line,start,start+7,0)]))
+                    line=mapper+2;start=source[line-1].index('clone_value')+1
+                    members.append(owner('_RNCNC'+root[2:]+('s_' if side else '')+'0s_0B5_',2*state,[row(line,start,start+11,2*state)]))
+                raw.append(row(ending,9,10,hits));members.append(owner(selected,hits,raw))
+            documents.append(members)
+        if fault=='missing-cold-descendant':
+            documents[1]=[o for o in documents[1] if not (o['count']==0 and o['name'].startswith('_RNCNC'))]
+        elif fault=='foreign-descendant':
+            documents[1][2]['name']=documents[1][2]['name'].replace('9inventory','7another')
+        elif fault=='lost-hot-mapper':
+            for o in documents[1]:
+                if o['name'].startswith('_RNC') and 's_0B3_' in o['name']:
+                    o['count']=0
+                    for r in o['regions']:r[4]=0
+        elif fault=='lost-region':
+            next(o for o in documents[1] if o['name'].startswith('_RNCNv') and 's_0B3_' in o['name'])['regions'][1][4]=0
+        elif fault=='extra-touching-owner':
+            extra=copy.deepcopy(documents[1][2]);extra['name']='foreign';documents[1].append(extra)
+        elif fault=='changed-body':
+            sources[1][6]=sources[1][6].replace('missing','changed')
+        elif fault=='changed-receiver':sources[1][1]='    other.iter()'
+        elif fault=='changed-signature':sources[1][0]=sources[1][0].replace('&[Row]','&[Other]')
+        elif fault=='changed-lexical-role':sources[1][5]=sources[1][5].replace('.map(','.filter(')
+        elif fault=='wrong-nested-ordinal':
+            documents[1][2]['name']=documents[1][2]['name'].replace('s_00B5_','s_0s_0B5_')
+        elif fault=='missing-filter':documents[1].pop(1)
+        elif fault=='cold-filter':
+            documents[1][1]['count']=0
+            for r in documents[1][1]['regions']:r[4]=0
+        counts=[]
+        for members in documents:
+            work=coverage._ObserverWork();counts.append(list(coverage._llvm22_rows(coverage._llvm22_segments(
+                [r for owner in members for r in owner['regions']],work),work)))
+        if fault=='missing-da':counts[1]=[(n,c) for n,c in counts[1] if n!=7]
+        def owners(base,head):
+            for document,members in zip((base,head),documents):
+                document['data'][0]['functions']=members
+                document['data'][0]['files'][0].update(expansions=[],branches=[],mcdc_records=[])
+        return self.compare(before=counts[0],after=counts[1],mutate=owners,sources=(
+            {'example.rs':('\n'.join(sources[0])+'\n').encode()},
+            {'example.rs':('\n'.join(sources[1])+'\n').encode()}))
+
+    def test_block_mapper_preserves_complete_cold_descendant_and_context(self):
+        receipt=self.closed_retained_callback_island_fixture()
+        proof,=[r for r in receipt['retained_replacement_obligations'] if r['kind']=='closed-retained-callback-island']
+        self.assertEqual(proof['pairs'],[[3,6],[4,7],[5,8],[6,9],[7,10]])
+        self.assertEqual(receipt['deleted_mapped'],0)
+        self.assertEqual(len(proof['forest_names'][0]),2)
+        self.assertEqual([len(names) for names in proof['forest_names'][0]],[3,3])
+
+    def test_record_expression_mapper_preserves_complete_cold_context(self):
+        receipt=self.closed_retained_callback_island_fixture(record=True)
+        proof,=[r for r in receipt['retained_replacement_obligations'] if r['kind']=='closed-retained-callback-island']
+        self.assertEqual(proof['pairs'],[[4,7],[5,8]])
+        self.assertEqual(receipt['deleted_mapped'],0)
+
+    def test_callback_island_refuses_missing_foreign_and_changed_authority(self):
+        for fault in ('missing-cold-descendant','foreign-descendant','lost-hot-mapper','lost-region','extra-touching-owner',
+                      'changed-body','changed-receiver','changed-signature','changed-lexical-role','wrong-nested-ordinal','missing-da'):
+            with self.subTest(fault=fault):
+                try:receipt=self.closed_retained_callback_island_fixture(fault=fault)
+                except ValueError:continue
+                self.assertFalse(any(r['kind']=='closed-retained-callback-island' for r in receipt.get('retained_replacement_obligations',[])))
+
+    def test_callback_island_requires_real_added_filter_owner(self):
+        for fault in ('missing-filter','cold-filter'):
+            with self.subTest(fault=fault):
+                with self.assertRaises(ValueError):self.closed_retained_callback_island_fixture(fault=fault)
+
+    def test_callback_import_change_requires_an_unused_exact_non_trait_enum(self):
+        old=((),(('use','super','::','scan','::','{','Severity',',','Result','}',';'),))
+        new=((),(('use','super','::','scan','::','{','Severity',',','Coverage',',','Result','}',';'),))
+        blobs=({}, {'src/core/security/scan.rs':b'pub enum Coverage { Assessed, Unknown }'})
+        check=coverage.callback_island_import_context
+        self.assertTrue(check('src/core/security/sbom_shared.rs',(old,new),('license','clone'),blobs,[100000]))
+        for source in (b'pub trait Coverage { fn clone(&self); }',b'pub type Coverage = Other;',
+                       b'pub enum Other { Unknown }',b'pub enum Coverage { Unknown } fn Coverage() {}'):
+            with self.subTest(source=source):
+                self.assertFalse(check('src/core/security/sbom_shared.rs',(old,new),('clone',),
+                    ({},{'src/core/security/scan.rs':source}),[100000]))
+        self.assertFalse(check('src/core/security/sbom_shared.rs',(old,new),('Coverage',),blobs,[100000]))
+        self.assertFalse(check('src/core/security/sbom_shared.rs',(old,new),('clone',),None,[100000]))
 
     def closed_record_field_forest_compare(self, kind='free', mutation=None):
         if kind == 'free':
@@ -7809,28 +7978,30 @@ class IntactFixtureCallbackForestTests(unittest.TestCase):
                '            runtime.block_on(async {','                run_fixture();',
                '            });','        });','    }','}']
         if repeated:
-            old[6:7] = ['            for (kind, diagnostic) in [("npm", "before")] {',
+            old[6:7] = ['            for (kind, diagnostic) in [',
+                        '                ("npm", "before"),', '            ] {',
                         '                let runtime = fixture_runtime(kind);',
                         '            }']
         new = old[:4]+['        prepare_fixture();']+old[4:]
-        extra = 2*int(repeated)
+        extra = 4*int(repeated)
+        binding_shift = 3*int(repeated)
         new[9+extra] = '                run_changed();'
         if repeated:
-            new[7] = new[7].replace('"before"','"update"')
+            new[8] = new[8].replace('"before"','"update"')
             if fault == 'different-kind':
-                new[7] = new[7].replace('"npm"','"pip"')
+                new[8] = new[8].replace('"npm"','"pip"')
             if fault == 'reads-diagnostic':
-                for source, position in ((old,7),(new,8)):
+                for source, position in ((old,9),(new,10)):
                     source[position] = source[position].replace('kind','diagnostic')
         if fault == 'binding':
-            new[7+int(repeated)] = new[7+int(repeated)].replace('fixture_runtime', 'prepare_runtime')
+            new[7+binding_shift] = new[7+binding_shift].replace('fixture_runtime', 'prepare_runtime')
         file = '/src/cli/tool.rs'; name = 'src/cli/tool.rs'; files = {file:name}
         reports = []; mapped = []
         for shift, source in enumerate((old, new)):
             root = f'_RNvNtNtNtCs{1+shift}_7omg_lib3cli4tool5testss_5trial'
             outer = source[5+shift].index('{')+1
             inner = source[7+shift+extra].index('{')+1
-            bind_line = 7+shift+int(repeated)
+            bind_line = 7+shift+binding_shift
             indent = 4*int(repeated)
             binding = [bind_line, 17+indent, bind_line, 24+indent, 1, 0, 0, 0]
             value = [bind_line, 27+indent, bind_line, len(source[bind_line-1]), 1, 0, 0, 0]
@@ -7840,24 +8011,24 @@ class IntactFixtureCallbackForestTests(unittest.TestCase):
                 binding[4] = 0
             outer_regions = [[6+shift,outer,6+shift,outer+1,1,0,0,0]]
             if repeated:
-                for token in ('kind','diagnostic','[("'):
-                    line = source[6+shift]
+                line = source[6+shift]
+                for token in ('kind','diagnostic'):
                     start = line.index(token)+1
-                    end = start+len(token) if token != '[("' else line.index(']')+2
-                    outer_regions.append([7+shift,start,7+shift,end,1,0,0,0])
+                    outer_regions.append([7+shift,start,7+shift,start+len(token),1,0,0,0])
+                outer_regions.append([7+shift,line.index('[')+1,9+shift,14,1,0,0,0])
             outer_regions.extend([binding,value,[11+shift+extra,9,11+shift+extra,10,1,0,0,0]])
             inner_regions = [[8+shift+extra,inner,8+shift+extra,inner+1,1,0,0,0],
                              [9+shift+extra,17,9+shift+extra,30,1,0,0,0],
                              [10+shift+extra,13,10+shift+extra,14,1,0,0,0]]
             call_regions = [[6+shift,9,6+shift,41,1,0,0,0],[6+shift,42,6+shift,47,1,0,0,0]]
             reports.append([dict(name=symbol, count=count, filenames=[file], regions=regions) for symbol,count,regions in (
-                (root,2,[[4,5,4,17,2,0,0,0],*call_regions,[12+shift+extra,5,12+shift+extra,6,2,0,0,0]]),
+                (root,2,[[4,5,4,16,2,0,0,0],*call_regions,[12+shift+extra,5,12+shift+extra,6,2,0,0,0]]),
                 ('_RNC'+root[2:]+'0B9_',1,outer_regions),('_RNCNC'+root[2:]+'00Bb_',1,inner_regions))])
             mapped.append(coverage._owner_line_counts({'regions':call_regions+outer_regions+inner_regions},
                                                        coverage._ObserverWork([10_000])))
         if fault == 'missing-child':
             reports[1].pop()
-        line = 7+int(repeated)
+        line = 7+binding_shift
         return coverage.positive_source_fragments(name, old, new, *mapped, *reports, files, files,
             [(line-1,line,line,line+1,[line])], callback_functions={'    fn trial()'}, macro_expansions=([],[]))
 
@@ -7875,10 +8046,71 @@ class IntactFixtureCallbackForestTests(unittest.TestCase):
 
     def test_retained_loop_prefix_uses_unchanged_input_slots(self):
         pairs, _ = self.binding_compare(repeated=True)
-        self.assertEqual(pairs, {8:9})
+        self.assertEqual(pairs, {10:11})
         for fault in ('different-kind', 'reads-diagnostic', 'geometry', 'cold', 'missing-child'):
             with self.subTest(fault=fault), self.assertRaises(ValueError):
                 self.binding_compare(fault, repeated=True)
+
+    def async_binding_compare(self, fault=None, footer=False):
+        old = ['#[cfg(test)]','mod tests {','    #[test]','    fn trial() {',
+               '        let path = std::env::join_paths(paths).expect("fixture PATH");',
+               '        with_managed_fixture_environment(&path, || {',
+               '            for (kind, diagnostic) in [','                ("npm", "before"),','            ] {',
+               '                runtime.block_on(async {','                    let started = Instant::now();',
+               '                    run_fixture();','                });','            }','        });','    }','}']
+        extra = 0
+        if footer:
+            old[14:14] = ['            assert!(', '                observed.is_empty(),',
+                          '                "fixture completed",', '            );']
+            extra = 4
+        new = old[:4]+['        prepare_fixture();']+old[4:]
+        new[8] = new[8].replace('before','after')
+        new[12] = new[12].replace('fixture','changed')
+        if fault == 'receiver':
+            new[10] = new[10].replace('runtime','another')
+        file = '/src/cli/tool.rs'; name = 'src/cli/tool.rs'; files = {file:name}
+        reports = []; mapped = []
+        for shift, source in enumerate((old,new)):
+            root = f'_RNvNtNtNtCs{1+shift}_7omg_lib3cli4tool5testss_5trial'
+            def row(line, column, last, end, hits=1):
+                return [line+shift,column,last+shift,end,hits,0,0,0]
+            def token(line, word, hits=1):
+                at = source[line+shift-1].index(word)+1
+                return row(line,at,line,at+len(word),hits)
+            outer_open = token(6,'{')
+            child_open = token(10,'{')
+            call_regions = [row(6,9,6,41),row(6,42,6,47)]
+            owner_regions = [outer_open,token(7,'kind'),token(7,'diagnostic'),
+                row(7,source[6+shift].index('[')+1,9,14),
+                token(10,'another' if shift and fault=='receiver' else 'runtime'),token(10,'block_on'),row(15+extra,9,15+extra,10)]
+            if footer:
+                owner_regions.extend((token(15,'assert!'),token(16,'observed',0 if shift and fault=='cold-footer' else 1),
+                                      token(16,'is_empty')))
+            child_regions = [child_open,token(11,'started',0 if shift and fault=='cold' else 1),
+                token(11,'Instant::now()'),token(12,'run_changed' if shift else 'run_fixture'),row(13,17,13,18)]
+            reports.append([dict(name=symbol,count=count,filenames=[file],regions=regions) for symbol,count,regions in (
+                (root,2,[[4,5,4,16,2,0,0,0],*call_regions,row(16+extra,5,16+extra,6,2)]),
+                ('_RNC'+root[2:]+'0B9_',1,owner_regions),('_RNCNC'+root[2:]+'00Bb_',1,child_regions))])
+            mapped.append(coverage._owner_line_counts({'regions':call_regions+owner_regions+child_regions},
+                coverage._ObserverWork([10_000])))
+        fragments = [(10,11,11,12,[11])]
+        if footer:
+            fragments.extend(((14,16,15,17,[15,16]),(18,19,19,20,[19])))
+        return coverage.positive_source_fragments(name,old,new,*mapped,*reports,files,files,
+            fragments,callback_functions={'    fn trial()'},macro_expansions=([],[]))
+
+    def test_retained_nested_binding_requires_proved_async_call_and_raw_entry(self):
+        self.assertEqual(self.async_binding_compare()[0],{11:12})
+        for fault in ('receiver','cold'):
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                self.async_binding_compare(fault)
+
+    def test_retained_fixture_completion_is_proved_after_the_literal_loop(self):
+        pairs, receipts = self.async_binding_compare(footer=True)
+        self.assertEqual(pairs,{11:12,15:16,16:17,19:20})
+        self.assertEqual(receipts[-1]['kind'],'retained-fixture-loop-completion')
+        with self.assertRaises(ValueError):
+            self.async_binding_compare('cold-footer',footer=True)
 
     def compare(self, mutation=None, expansions=([],[])):
         old = ['#[cfg(test)]','mod tests {','    #[test]','    fn trial() {',

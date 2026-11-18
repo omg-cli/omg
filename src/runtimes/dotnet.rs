@@ -220,7 +220,7 @@ impl DotnetManager {
                 continue;
             };
             let releases = self.fetch_metadata(channel_url).await?;
-            let Some(matching) = channel_sdks(&releases).find(|sdk| {
+            let Some((release, matching)) = channel_sdks(&releases).find(|(_, sdk)| {
                 sdk.get("version").and_then(serde_json::Value::as_str) == Some(version)
             }) else {
                 continue;
@@ -232,39 +232,17 @@ impl DotnetManager {
                 .unwrap_or_default();
             if let Some((url, checksum)) = select_sdk_file(&files, dotnet_rid()?) {
                 let mut components = BTreeMap::from([("sdk".to_owned(), version.to_owned())]);
-                if let Some(release) = releases
-                    .get("releases")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .find(|release| {
-                        std::iter::once(release.get("sdk"))
-                            .flatten()
-                            .chain(
-                                release
-                                    .get("sdks")
-                                    .and_then(serde_json::Value::as_array)
-                                    .into_iter()
-                                    .flatten(),
-                            )
-                            .any(|sdk| {
-                                sdk.get("version").and_then(serde_json::Value::as_str)
-                                    == Some(version)
-                            })
-                    })
-                {
-                    for (key, component) in [
-                        ("runtime", "runtime"),
-                        ("aspnetcore", "aspnetcore-runtime"),
-                        ("windowsdesktop", "windowsdesktop"),
-                    ] {
-                        if let Some(value) = release
-                            .get(key)
-                            .and_then(|value| value.get("version"))
-                            .and_then(serde_json::Value::as_str)
-                        {
-                            components.insert(component.to_owned(), value.to_owned());
-                        }
+                for (key, component) in [
+                    ("runtime", "runtime"),
+                    ("aspnetcore", "aspnetcore-runtime"),
+                    ("windowsdesktop", "windowsdesktop"),
+                ] {
+                    if let Some(value) = release
+                        .get(key)
+                        .and_then(|value| value.get("version"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        components.insert(component.to_owned(), value.to_owned());
                     }
                 }
                 return Ok((url, checksum, components));
@@ -312,27 +290,33 @@ fn dotnet_rid() -> Result<&'static str> {
     }
 }
 
-fn channel_sdks(channel: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+fn channel_sdks(
+    channel: &serde_json::Value,
+) -> impl Iterator<Item = (&serde_json::Value, &serde_json::Value)> {
     channel
         .get("releases")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
         .flat_map(|release| {
-            release.get("sdk").into_iter().chain(
-                release
-                    .get("sdks")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten(),
-            )
+            release
+                .get("sdk")
+                .into_iter()
+                .chain(
+                    release
+                        .get("sdks")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten(),
+                )
+                .map(move |sdk| (release, sdk))
         })
 }
 
 /// Collect every SDK feature band from one channel document.
 fn parse_channel_sdks(channel: &serde_json::Value, prerelease: bool) -> Vec<DotnetVersion> {
     let mut versions: Vec<_> = channel_sdks(channel)
-        .filter_map(|sdk| {
+        .filter_map(|(_, sdk)| {
             sdk.get("version")
                 .and_then(serde_json::Value::as_str)
                 .filter(|version| !version.is_empty())
@@ -665,7 +649,8 @@ mod tests {
     fn secondary_sdk_feature_bands_are_listed_and_resolvable() {
         let channel = serde_json::json!({"releases":[{
             "sdk":{"version":"9.0.317"},
-            "sdks":[{"version":"9.0.317"},{"version":"9.0.120","files":[]}]
+            "sdks":[{"version":"9.0.317"},{"version":"9.0.120","files":[]}],
+            "runtime":{"version":"9.0.19"}
         }]});
         let versions = parse_channel_sdks(&channel, false);
         assert_eq!(
@@ -675,7 +660,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["9.0.317", "9.0.120"]
         );
-        assert!(channel_sdks(&channel).any(|sdk| sdk["version"] == "9.0.120"));
+        let (release, _) = channel_sdks(&channel)
+            .find(|(_, sdk)| sdk["version"] == "9.0.120")
+            .expect("secondary feature band retains its enclosing release");
+        assert_eq!(release["runtime"]["version"], "9.0.19");
     }
 
     #[test]
