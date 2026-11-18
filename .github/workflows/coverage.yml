@@ -288,8 +288,37 @@ jobs:
           python3 scripts/test-runtime-public-install.py --prepare-swift \
             --output "$RUNNER_TEMP/swift-public-inputs"
 
+      - name: Identify pinned native QEMU image cache
+        id: native_image_cache
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          manifest = Path('tests/qemu-image-provenance/manifest.json').read_bytes()
+          image = json.loads(manifest)['images']['arch-x86_64']
+          filename = image['url'].rsplit('/', 1)[1]
+          if image['algorithm'] != 'sha256' or re.fullmatch(r'[0-9a-f]{64}', image['digest']) is None:
+              raise ValueError('Native QEMU image cache requires the pinned SHA256 digest')
+          if re.fullmatch(r'[A-Za-z0-9_.-]+', filename) is None:
+              raise ValueError('Native QEMU image cache requires a plain pinned image filename')
+          directory = Path(os.environ['RUNNER_TEMP']) / 'native-cli-qemu-image-cache'
+          key = f"v1-coverage-native-arch-x86_64-{filename}-{hashlib.sha256(manifest).hexdigest()}-{image['digest']}"
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"directory={directory}\nfile={directory / ('sha256-' + image['digest'] + '.qcow2')}\nkey={key}\n")
+          PY
+
+      - name: Restore pinned native QEMU image cache
+        id: native_image_restore
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.native_image_cache.outputs.file }}
+          key: ${{ steps.native_image_cache.outputs.key }}
+
       - name: Cover sandbox descendant cancellation
         id: native_fixture_tests
+        env:
+          NATIVE_IMAGE_CACHE: ${{ steps.native_image_cache.outputs.directory }}
         shell: bash
         timeout-minutes: 15
         run: |
@@ -535,6 +564,8 @@ jobs:
             install -m 755 "$artifact" "$staging/bin/$role"
           done < <(jq -r '.artifacts | to_entries[] | [.key, .value.path] | @tsv' "$evidence_dir/cli-manifest.json")
           bash scripts/benchmark-qemu.sh --distro arch --arch x86_64 \
+            --image-cache "$NATIVE_IMAGE_CACHE" \
+            --image-policy tests/qemu-image-provenance/manifest.json \
             --staged-dir "$staging" --native-cli-coverage-dir "$staging" \
             --evidence-dir "$RUNNER_TEMP/native-cli-qemu"
           mapfile -t native_returns < <(find "$RUNNER_TEMP/native-cli-qemu" -type d -name native-evidence)
@@ -573,6 +604,14 @@ jobs:
           receipt = {'source_commit': sys.argv[4], 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'tests': tests}
           (evidence / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
           PY
+
+      - name: Save verified native QEMU image cache
+        if: ${{ success() && steps.native_fixture_tests.outcome == 'success' && steps.native_image_restore.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.native_image_cache.outputs.file }}
+          key: ${{ steps.native_image_cache.outputs.key }}
 
       - name: Cover existing scaffold Git and container privilege drop
         shell: bash

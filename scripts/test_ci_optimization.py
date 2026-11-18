@@ -30,6 +30,56 @@ def step_script(workflow, name):
 
 
 class OptimizationContracts(unittest.TestCase):
+    def test_native_qemu_cache_identity_binds_the_exact_reviewed_image(self):
+        script = step_script('coverage.yml', 'Identify pinned native QEMU image cache')
+        manifest = json.loads((ROOT / 'tests/qemu-image-provenance/manifest.json').read_text())
+        keys = []
+        for mode in ('original', 'new-version', 'new-digest', 'bad-algorithm', 'bad-filename'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / 'tests/qemu-image-provenance/manifest.json'
+                path.parent.mkdir(parents=True)
+                value = json.loads(json.dumps(manifest))
+                image = value['images']['arch-x86_64']
+                if mode == 'new-version':
+                    image['url'] = image['url'].replace('20261101.620452', '20261102.620452')
+                elif mode == 'new-digest':
+                    image['digest'] = 'a' * 64
+                elif mode == 'bad-algorithm':
+                    image['algorithm'] = 'sha512'
+                elif mode == 'bad-filename':
+                    image['url'] += '?injected=1'
+                path.write_text(json.dumps(value))
+                output = root / 'output'
+                result = subprocess.run([sys.executable, '-c', script.split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]],
+                    cwd=root, env=dict(os.environ, RUNNER_TEMP=str(root / 'owned'), GITHUB_OUTPUT=str(output),
+                                       PYTHONOPTIMIZE='1'),
+                    capture_output=True, text=True, timeout=10)
+                if mode.startswith('bad-'):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
+                    continue
+                self.assertEqual(result.returncode, 0, result.stderr)
+                fields = dict(line.split('=', 1) for line in output.read_text().splitlines())
+                self.assertIn(image['digest'], fields['key'])
+                self.assertIn(hashlib.sha256(path.read_bytes()).hexdigest(), fields['key'])
+                self.assertIn(image['url'].rsplit('/', 1)[1], fields['key'])
+                self.assertEqual(Path(fields['file']), Path(fields['directory']) / ('sha256-' + image['digest'] + '.qcow2'))
+                self.assertEqual(Path(fields['directory']), root / 'owned/native-cli-qemu-image-cache')
+                keys.append(fields['key'])
+        self.assertEqual(len(set(keys)), 3)
+        workflow = job_block((WORKFLOWS / 'coverage.yml').read_text(), 'coverage')
+        self.assertIn('--image-cache "$NATIVE_IMAGE_CACHE"', workflow)
+        self.assertIn('NATIVE_IMAGE_CACHE: ${{ steps.native_image_cache.outputs.directory }}', workflow)
+        self.assertIn('--image-policy tests/qemu-image-provenance/manifest.json', workflow)
+        save = workflow.split('      - name: Save verified native QEMU image cache\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn("steps.native_fixture_tests.outcome == 'success'", save)
+        self.assertIn('github.event.pull_request.head.repo.full_name == github.repository', save)
+        self.assertIn("steps.native_image_restore.outputs.cache-hit != 'true'", save)
+        self.assertNotIn('restore-keys:', workflow)
+        self.assertIn('actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9', workflow)
+        self.assertIn('actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9', save)
+
     @unittest.skipIf(os.name == 'nt', 'Ubuntu dependency bootstrap uses POSIX shell tools')
     def test_python_workflow_bootstrap_avoids_unreachable_azure_mirrors(self):
         script = step_script('ci.yml', 'Install Python workflow test dependencies')
@@ -282,7 +332,8 @@ git() { printf '%040d\\n' 1; }
                     env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'],
                              TRACE=str(trace), START_STATUS=str(status), REMOVE_STATUS=str(remove),
                              UNLOAD_STATUS=str(unload), GITHUB_RUN_ID=run_id,
-                             GITHUB_RUN_ATTEMPT=attempt, GITHUB_WORKSPACE=str(root), RUNNER_TEMP=str(runner_temp)),
+                             GITHUB_RUN_ATTEMPT=attempt, GITHUB_WORKSPACE=str(root), RUNNER_TEMP=str(runner_temp),
+                             NATIVE_IMAGE_CACHE=str(runner_temp / 'provided-image-cache')),
                     text=True, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 calls = [json.loads(line) for line in trace.read_text().splitlines()]
