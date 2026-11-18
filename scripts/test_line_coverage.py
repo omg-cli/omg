@@ -1531,6 +1531,37 @@ class OsvRequestMigrationTests(unittest.TestCase):
                 self.assertIsNone(coverage.retained_osv_request((base, scenario(True, fault)), [100_000]))
 
 
+class RetainedFixtureConstructorTests(unittest.TestCase):
+    def test_pi_fixture_exit_requires_the_constructor_and_all_record_regions(self):
+        filename = 'src/runtimes/pi.rs'
+        symbol = '_RNvMNtNtCs1_7omg_lib8runtimes2piNtB2_9PiManager10with_paths'
+
+        def side(modern, cold=False, missing=False):
+            parameter = '_unused_ambient_npm' if modern else 'npm'
+            declaration = f'    fn with_paths(versions_dir: PathBuf, {parameter}: PathBuf) -> Self {{'
+            fields = ['        Self {', '            versions_dir,',
+                      '            advisories: Arc::new(TestAdvisories::default()),',
+                      '            security: RuntimeSecurity::fixture(),', '        }'] if modern else [
+                         '        Self { versions_dir, npm }']
+            lines = ['impl PiManager {','    #[cfg(test)]',declaration,*fields,'    }','}']
+            end = len(lines)-1
+            hits = 11 if modern else 6
+            body = [[4,9,end-1,len(fields[-1])+1,hits,0,0,0]]
+            if modern and not missing:
+                body.append([5,13,5,25,hits,0,0,0])
+            raw = [[3,5,3,len(declaration)-1,hits,0,0,0],*body,[end,5,end,6,0 if cold else hits,0,0,0]]
+            root = dict(name=symbol,filenames=['/artifact/'+filename],regions=raw,count=hits)
+            work = [30_000]
+            counts = coverage._owner_line_counts({'regions':raw}, coverage._ObserverWork(work))
+            return lines,counts,(3,end,[root]),[root],Counter({symbol:1}),end
+
+        oldest = side(False)
+        proof = coverage.retained_pi_fixture_exit((oldest,side(True)),[30_000])
+        self.assertEqual(proof['pairs'],[[5,9]])
+        self.assertIsNone(coverage.retained_pi_fixture_exit((oldest,side(True,cold=True)),[30_000]))
+        self.assertIsNone(coverage.retained_pi_fixture_exit((oldest,side(True,missing=True)),[30_000]))
+
+
 class SbomComponentPushTests(unittest.TestCase):
     def test_audit_fixture_observes_coverage_and_applicability_separately(self):
         name = 'src/core/security/sbom_shared.rs'
@@ -10867,6 +10898,93 @@ class RetiredDeclarationParameterTests(unittest.TestCase):
 
 
 class InherentAsyncLeafTests(unittest.TestCase):
+    def test_arch_install_preparation_keeps_each_reviewed_branch_in_a_compiled_copy(self):
+        source = ['impl PackageManager for ArchPackageManager {','    fn install(&self) {',
+                  '        let packages = packages.to_vec();','        Box::pin(async move {',
+                  '            if packages.is_empty() {','                return Ok(());','            }',
+                  '            crate::core::security::validate_package_names_or_files(&packages)?;',
+                  '        })','    }','}']
+
+        def scenario(modern, lose_empty=False):
+            roots = []; owners = []
+            for index,crate in enumerate(('aJq9CMLDmry','40j12eeWnis')):
+                base = f'NvXs0_NtNtCs{crate}_7omg_lib16package_managers4arch'
+                calls = (24,2)[index] if modern else (2,0)[index]
+                empty = int(index==0 and not lose_empty)
+                remaining = calls-empty
+                root = dict(name=f'_R{base}NtB5_18ArchPackageManagerNtNtB7_6traits14PackageManager7install',
+                            filenames=['/src/package_managers/arch.rs'],count=calls,
+                            regions=[[3,13,3,21,calls,0,0,0],[3,24,3,32,calls,0,0,0],
+                                     [3,33,3,39,calls,0,0,0],[4,9,4,17,calls,0,0,0]])
+                roots.append(root); owners.append(root)
+                hits=[calls,calls,calls,empty,remaining,remaining,remaining,int(modern and index==0)]
+                positions=[(4,29,4,30),(5,16,5,24),(5,25,5,33),(6,24,6,30),(7,13,7,14),
+                           (8,13,8,67),(8,68,8,77),(8,78,8,79)]
+                owners.append(dict(root,name=f'_RNC{base}NtB7_18ArchPackageManagerNtNtB9_6traits14PackageManager7install0Bb_',
+                                   regions=[[*slot,count,0,0,0] for slot,count in zip(positions,hits,strict=True)]))
+            work = [100_000]
+            counts = coverage._owner_line_counts({'regions':[r for o in owners for r in o['regions']]},
+                                                  coverage._ObserverWork(work))
+            return source,counts,(2,10,roots),owners,Counter(o['name'] for o in owners),4
+
+        baseline = scenario(False)
+        proof = coverage.retained_arch_install_prelude((baseline,scenario(True)),[100_000])
+        self.assertEqual(proof['pairs'],[[line,line] for line in range(3,9)])
+        self.assertIsNone(coverage.retained_arch_install_prelude((baseline,scenario(True,True)),[100_000]))
+
+    def test_arch_audit_advisory_await_requires_all_copies_and_rejects_other_providers(self):
+        def scenario(modern, fault=None, finish=False):
+            scanner = 'crate::core::security::vulnerability::VulnerabilityScanner::new()'
+            operation = ['                let operation = '+scanner, '                    .assess_arch_operation(',
+                         '                        &before,',
+                         '                        crate::core::security::vulnerability::AssessmentUse::Admission,',
+                         '                    )'] if modern else [
+                             '                let advisories = '+scanner, '                    .fetch_alsa_issues()']
+            if fault=='provider':
+                operation[1] = '                    .another_operation('
+            source = ['impl PackageManager for ArchPackageManager {', '    fn security_audit(&self) {',
+                      '        Some(Box::pin(async move {', '            use anyhow::Context;', '            async {',
+                      *operation,'                    .await?;']
+            line = 6+len(operation)
+            if finish:
+                if modern:
+                    source.append('                operation.validate_now()?;')
+                source.extend(['                Ok(result)','            }','            .await',
+                               '            .context("Failed to query native security advisories")'])
+                line = len(source)-1
+            else:
+                source.append('            }.await')
+            source.extend(['        }))','    }','}'])
+            roots = []; owners = []
+            for index,crate in enumerate(('aJq9CMLDmry','40j12eeWnis')):
+                base = f'NvXs0_NtNtCs{crate}_7omg_lib16package_managers4arch'
+                root = dict(name=f'_R{base}NtB5_18ArchPackageManagerNtNtB7_6traits14PackageManager14security_audit',
+                            filenames=['/src/package_managers/arch.rs'],count=3,regions=[[3,14,3,22,3,0,0,0]])
+                roots.append(root); owners.append(root)
+                hits = 2 if modern and index==1 else 0
+                if fault!='missing' or index==0:
+                    if finish:
+                        owners.append(dict(root,name=f'_RNC{base}NtB7_18ArchPackageManagerNtNtB9_6traits14PackageManager14security_audit0Bb_',
+                                           count=hits,regions=[[line,14,line,19,hits,0,0,0],
+                                                                [line+1,14,line+1,21,hits,0,0,0]]))
+                    else:
+                        owners.append(dict(root,name=f'_RNCNC{base}NtB9_18ArchPackageManagerNtNtBb_6traits14PackageManager14security_audit00Bd_',
+                                           regions=[[6,operation[0].index(scanner)+1,line,27,hits,0,0,0],
+                                                    [line,27,line,28,hits//2,0,0,0]]))
+            work = [200_000]
+            counts = coverage._owner_line_counts({'regions':[r for o in owners for r in o['regions']]},
+                                                  coverage._ObserverWork(work))
+            return source,counts,(2,len(source)-1,roots),owners,Counter(o['name'] for o in owners),line
+
+        baseline = scenario(False)
+        proof = coverage.retained_arch_advisory_await((baseline,scenario(True)),[200_000])
+        self.assertEqual(proof['pairs'],[[8,11]])
+        self.assertIsNone(coverage.retained_arch_advisory_await((baseline,scenario(True,'missing')),[200_000]))
+        self.assertIsNone(coverage.retained_arch_advisory_await((baseline,scenario(True,'provider')),[200_000]))
+        finished = coverage.retained_arch_advisory_await((scenario(False,finish=True),scenario(True,finish=True)),
+                                                         [200_000],finish=True)
+        self.assertEqual(finished['pairs'],[[11,15],[12,16]])
+
     def test_arch_audit_entry_observes_both_box_and_future_in_each_compiled_copy(self):
         source = ['impl PackageManager for ArchPackageManager {', '    fn security_audit(&self) {',
                   '        Some(Box::pin(async move {', '            use anyhow::Context;',

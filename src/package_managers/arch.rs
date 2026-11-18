@@ -105,9 +105,8 @@ pub fn execute_native_omarchy_operation(
     let targets = match operation {
         NativeOmarchyOperation::RefreshKeyrings => {
             let mut names = vec!["archlinux-keyring".to_owned(), "omarchy-keyring".to_owned()];
-            if std::env::consts::ARCH == "aarch64"
-                && super::is_installed_fast("archlinuxarm-keyring")?
-            {
+            #[cfg(target_arch = "aarch64")]
+            if super::is_installed_fast("archlinuxarm-keyring")? {
                 names.push("archlinuxarm-keyring".to_owned());
             }
             let path = std::path::Path::new("/usr/share/omarchy-platform/keyrings");

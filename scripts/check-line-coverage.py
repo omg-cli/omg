@@ -4621,13 +4621,21 @@ def async_test_expected_variant(name, source, counts, group, owners, names, inve
     return (*identity,code.words[value],message,tuple(named)), dict(witness,wrapped=wrapped)
 
 
-def retained_arch_audit_entry(sides, work):
-    """Observe the Arch audit wrapper and its two future entries in every copy."""
+def arch_package_manager_symbol(symbol, method):
     crate = ('crate', 'omg_lib')
     managers = ('type', crate, ('package_managers', ''))
     namespace = ('type', managers, ('arch', ''))
     parent = ('type', namespace, ('ArchPackageManager', ''))
     trait = ('type', ('type', managers, ('traits', '')), ('PackageManager', ''))
+    shape = nominal_method_path(symbol)
+    if (shape is not None and shape.kind=='X' and shape.namespace==namespace and shape.self_type==parent
+            and shape.trait==trait and shape.method==(method,'') and shape.callbacks in ((), ('',), ('',''))):
+        return shape
+    return None
+
+
+def retained_arch_audit_entry(sides, work):
+    """Observe the Arch audit wrapper and its two future entries in every copy."""
     evidence = []
     for source, counts, group, owners, names, inventory, line in sides:
         code, rows = inventory[:2]
@@ -4655,10 +4663,8 @@ def retained_arch_audit_entry(sides, work):
             if not touching:
                 continue
             _construct_charge(work,len(symbol)+len(touching)+1)
-            shape = nominal_method_path(symbol)
-            if (shape is None or shape.kind!='X' or shape.namespace!=namespace or shape.self_type!=parent
-                    or shape.trait!=trait or shape.method!=('security_audit','') or shape.callbacks not in ((), ('',), ('',''))
-                    or names[symbol]!=1 or owner.get('branches') or owner.get('mcdc_records')):
+            shape = arch_package_manager_symbol(symbol,'security_audit')
+            if shape is None or names[symbol]!=1 or owner.get('branches') or owner.get('mcdc_records'):
                 return None
             depth = len(shape.callbacks)
             count = owner['count']
@@ -4685,6 +4691,174 @@ def retained_arch_audit_entry(sides, work):
         return None
     return dict(kind='retained-arch-audit-entry',pairs=[list(pair) for pair in zip(base[1],head[1],strict=True)],
                 compiled_entries=[base[2],head[2]],summary_credit=[0,0],mapped_credit=[0,0])
+
+
+def retained_arch_advisory_await(sides, work, *, finish=False):
+    """Observe the audit's advisory wait after its migration to prepared admission."""
+    scanner = 'crate::core::security::vulnerability::VulnerabilityScanner::new()'
+    evidence = []
+    for modern,(source,counts,group,owners,names,line) in enumerate(sides):
+        operation = ['                let operation = '+scanner, '                    .assess_arch_operation(',
+                     '                        &before,',
+                     '                        crate::core::security::vulnerability::AssessmentUse::Admission,',
+                     '                    )'] if modern else [
+                         '                let advisories = '+scanner, '                    .fetch_alsa_issues()']
+        if finish:
+            tail = ['                Ok(result)','            }','            .await',
+                    '            .context("Failed to query native security advisories")']
+            if modern:
+                tail.insert(0,'                operation.validate_now()?;')
+            if line+1>group[1] or source[line+1-len(tail):line+1]!=tail:
+                return None
+            selected = (line,line+1)
+            roles = ('',)
+            slots = [(line,14,line,19),(line+1,14,line+1,21)]
+        else:
+            first = line-len(operation)
+            if first<group[0] or source[first-1:line]!=[*operation,'                    .await?;']:
+                return None
+            _construct_charge(work,sum(len(text)+1 for text in operation))
+            selected = (line,)
+            roles = ('','')
+            slots = [(first,operation[0].index(scanner)+1,line,27),(line,27,line,28)]
+        roots = {}
+        for owner in group[2]:
+            shape = arch_package_manager_symbol(owner['name'],'security_audit')
+            if shape is None or shape.callbacks or shape.copy_identity in roots:
+                return None
+            roots[shape.copy_identity] = owner
+        observed = {}; raw = []
+        for owner in owners:
+            _construct_charge(work,len(owner['regions'])+1)
+            touching = [r for r in owner['regions'] if any(r[0]<=number<=r[2] for number in selected)]
+            if not touching:
+                continue
+            symbol = owner['name']
+            shape = arch_package_manager_symbol(symbol,'security_audit')
+            if (shape is None or shape.callbacks!=roles or shape.copy_identity not in roots
+                    or shape.copy_identity in observed or names[symbol]!=1
+                    or owner['filenames']!=roots[shape.copy_identity]['filenames']
+                    or owner.get('branches') or owner.get('mcdc_records') or len(touching)!=2):
+                return None
+            counts_at_slots = [row[4] for row in touching]
+            if (any(tuple(row[:4])!=slot or row[5:]!=[0,0,0] for row,slot in zip(touching,slots,strict=True))
+                    or not 0<=counts_at_slots[1]<=counts_at_slots[0]<=owner['count']<COUNTER_LIMIT
+                    or finish and counts_at_slots!=[owner['count']]*2
+                    or not modern and any(counts_at_slots)):
+                return None
+            observed[shape.copy_identity] = (symbol,counts_at_slots)
+            raw.extend(touching)
+        projection = _owner_line_counts({'regions':raw},_ObserverWork(work))
+        if (not roots or observed.keys()!=roots.keys() or
+                any(number not in projection or projection[number]!=counts.get(number) for number in selected)):
+            return None
+        evidence.append((selected,list(observed.values())))
+    base,head = evidence
+    if len(base[1])!=len(head[1]) or not any(counts[0]>0 for _,counts in head[1]):
+        return None
+    return dict(kind='retained-arch-advisory-finish' if finish else 'retained-arch-advisory-await',
+                pairs=[list(pair) for pair in zip(base[0],head[0],strict=True)],
+                compiled_waits=[base[1],head[1]],summary_credit=[0,0],mapped_credit=[0,0])
+
+
+def retained_arch_install_prelude(sides, work):
+    """Close the raw copy inventory for preparation, empty input and validation."""
+    prelude = ['        let packages = packages.to_vec();','        Box::pin(async move {',
+               '            if packages.is_empty() {','                return Ok(());','            }',
+               '            crate::core::security::validate_package_names_or_files(&packages)?;']
+    evidence = []
+    for source,counts,group,owners,names,line in sides:
+        first,last = line-1,line+4
+        if not group[0]<=first<=last<=group[1] or source[first-1:last]!=prelude:
+            return None
+        slots = [[(0,13,21),(0,24,32),(0,33,39),(1,9,17)],
+                 [(1,29,30),(2,16,24),(2,25,33),(3,24,30),(4,13,14),(5,13,67),(5,68,77),(5,78,79)]]
+        copies = {}; raw = []
+        roots = {id(owner) for owner in group[2]}
+        seen_roots = set()
+        _construct_charge(work,sum(len(text)+1 for text in prelude))
+        for owner in owners:
+            _construct_charge(work,len(owner['regions'])+1)
+            touching = [r for r in owner['regions'] if r[0]<=last and r[2]>=first]
+            if not touching:
+                continue
+            name = owner['name']
+            shape = arch_package_manager_symbol(name,'install')
+            if shape is None or len(shape.callbacks)>1 or names[name]!=1 or owner.get('branches') or owner.get('mcdc_records'):
+                return None
+            depth = len(shape.callbacks)
+            call_count = owner['count']
+            measured = [r[4] for r in touching]
+            if (len(measured)!=len(slots[depth]) or (id(owner) in roots)!=(depth==0)
+                    or any(not 0<=hit<=call_count<COUNTER_LIMIT for hit in measured)
+                    or touching!=[[first+i,a,first+i,b,hit,0,0,0] for (i,a,b),hit in zip(slots[depth],measured,strict=True)]):
+                return None
+            if depth==1:
+                if (measured[:3]!=[call_count]*3 or measured[3]+measured[4]!=call_count
+                        or measured[4:7]!=[measured[4]]*3 or measured[7]>measured[4]):
+                    return None
+            else:
+                if measured!=[call_count]*4:
+                    return None
+                seen_roots.add(id(owner))
+            roles = copies.setdefault(shape.copy_identity,{})
+            if depth in roles:
+                return None
+            roles[depth] = (call_count,owner['filenames'],measured)
+            raw.extend(touching)
+        if (not roots or roots!=seen_roots or len(copies)!=len(roots)
+                or any(roles.keys()!={0,1} or roles[0][:2]!=roles[1][:2] for roles in copies.values())):
+            return None
+        if _owner_line_counts({'regions':raw},_ObserverWork(work))!={i:counts.get(i) for i in range(first,last+1)}:
+            return None
+        evidence.append((first,list(copies),[tuple(hit>0 for depth in (0,1) for hit in roles[depth][2])
+                                           for roles in copies.values()]))
+    base,head = evidence
+    matching = compiled_hit_state_matching(base[2],head[2],[base[1],head[1]])
+    if matching is None:
+        return None
+    return dict(kind='retained-arch-install-prelude',pairs=[[base[0]+i,head[0]+i] for i in range(len(prelude))],
+                role_matching=matching,compiled_states=[base[2],head[2]],summary_credit=[0,0],mapped_credit=[0,0])
+
+
+def retained_pi_fixture_exit(sides, work):
+    namespace = ('type',('type',('crate','omg_lib'),('runtimes','')),('pi',''))
+    expected_type = ('type',namespace,('PiManager',''))
+    lines = []; symbols = []
+    for modern, (source, counts, group, owners, names, line) in enumerate(sides):
+        first,last,roots = group
+        parameter = '_unused_ambient_npm' if modern else 'npm'
+        declaration = f'    fn with_paths(versions_dir: PathBuf, {parameter}: PathBuf) -> Self {{'
+        body = ['        Self {', '            versions_dir,',
+                '            advisories: Arc::new(TestAdvisories::default()),',
+                '            security: RuntimeSecurity::fixture(),', '        }'] if modern else [
+                    '        Self { versions_dir, npm }']
+        expected_source = ['    #[cfg(test)]',declaration,*body,'    }']
+        _construct_charge(work,sum(len(text)+1 for text in expected_source))
+        if (line!=last or first<2 or len(roots)!=1 or source[first-2:last]!=expected_source):
+            return None
+        root, = roots
+        symbol = root['name']
+        shape = nominal_method_path(symbol)
+        hits = root['count']
+        if (shape is None or shape.kind!='M' or shape.namespace!=namespace or shape.self_type!=expected_type
+                or shape.method!=('with_paths','') or shape.callbacks or names[symbol]!=1
+                or not 0<hits<COUNTER_LIMIT or root.get('branches') or root.get('mcdc_records')):
+            return None
+        slots = [(first,5,first,len(declaration)-1),(first+1,9,last-1,len(body[-1])+1)]
+        if modern:
+            slots.append((first+2,13,first+2,25))
+        slots.append((last,5,last,6))
+        if root['regions']!=[[*slot,hits,0,0,0] for slot in slots]:
+            return None
+        _construct_charge(work,sum(len(owner['regions'])+1 for owner in owners))
+        if any(owner is not root and any(r[0]<=last and r[2]>=first for r in owner['regions']) for owner in owners):
+            return None
+        observed = {i:counts[i] for i in range(first,last+1) if i in counts}
+        if _owner_line_counts({'regions':root['regions']},_ObserverWork(work))!=observed:
+            return None
+        lines.append(last); symbols.append(symbol)
+    return dict(kind='retained-pi-fixture-exit',pairs=[lines],owners=symbols)
 
 
 def retained_osv_request(sides, work):
@@ -5702,6 +5876,23 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
         current_fragment = (a, b, c, d, pending)
         if pending and all(preproved_callback_pairs.get(line)==line+c-a for line in pending):
             continue
+        if (name=='src/runtimes/pi.rs' and macro_expansions==([],[]) and a+1==b and c+1==d
+                and tuple(pending)==(b,) and old[a]==new[c]=='    }'):
+            _construct_charge(work,len(groups[0])+len(groups[1]))
+            constructors = [[group for prefix,group in groups[side].items()
+                             if prefix.startswith('    fn with_paths(') and group[1]==line]
+                            for side,line in enumerate((b,d))]
+            if all(len(entries)==1 for entries in constructors):
+                sides = [(source,counts,constructors[side][0],inventories[side],inventory_names[side],line)
+                         for side,(source,counts,line) in enumerate(((old,before,b),(new,after,d)))]
+                entry = retained_pi_fixture_exit(sides,work)
+                if entry is not None:
+                    if b in pairs and pairs[b]!=d:
+                        refuse()
+                    pairs[b]=d
+                    preproved_callback_pairs[b]=d
+                    receipts.append(dict(file=name,**entry,callback_fragments=[dict(pairs=[[b,d]])]))
+                    continue
         candidates = [(prefix, group, groups[1][prefix]) for prefix, group in groups[0].items()
                       if prefix in groups[1] and group[0] <= a + 1 <= b <= group[1]
                       and groups[1][prefix][0] <= c + 1 <= d <= groups[1][prefix][1]]
@@ -5976,9 +6167,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
                     excerpts[side,first,last]=('\n'.join(source[first-1:last])+'\n').encode()
                 continue
         arch_entry = name=='src/package_managers/arch.rs' and old[a].strip()=='Some(Box::pin(async move {'
+        arch_wait = name=='src/package_managers/arch.rs' and old[a].strip() in ('.await?;','.await')
+        arch_install = name=='src/package_managers/arch.rs' and old[a].strip()=='Box::pin(async move {'
         sbom_entry = name=='src/core/security/sbom_shared.rs' and old[a].strip() in (
             'components.push(SbomComponent {', 'vulnerabilities.push(SbomVulnerability {', 'bom_format: "CycloneDX".into(),')
-        if ((arch_entry or sbom_entry) and construct_inventories is not None and macro_expansions==([],[])
+        if ((arch_entry or arch_wait or arch_install or sbom_entry) and construct_inventories is not None and macro_expansions==([],[])
                 and a+1==b and c+1==d and tuple(pending)==(b,) and old[a]==new[c]):
             sides = [
                 (source, counts, group, inventories[side], inventory_names[side],
@@ -5987,6 +6180,11 @@ def positive_source_fragments(name, old, new, before, after, base, head, base_fi
             ]
             if arch_entry:
                 entry = retained_arch_audit_entry(sides,work)
+            elif arch_wait:
+                entry = retained_arch_advisory_await([(*side[:5],side[-1]) for side in sides],work,
+                                                     finish=old[a].strip()=='.await')
+            elif arch_install:
+                entry = retained_arch_install_prelude([(*side[:5],side[-1]) for side in sides],work)
             elif old[a].lstrip().startswith('bom_format:'):
                 entry = retained_sbom_metadata(sides,work)
             else:
