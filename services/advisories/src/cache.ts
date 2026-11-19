@@ -1,5 +1,7 @@
 import { object, sha256 } from "./domain";
 
+const MAX_CACHE_URL_LENGTH = 8 * 1024;
+
 function publicRead(request: Request): boolean {
     return request.method === "GET" && !request.headers.has("authorization") &&
         !request.headers.has("cookie") &&
@@ -55,8 +57,10 @@ export async function cachedRead(
     request: Request, cache: Pick<Cache, "match" | "put">,
     load: (request: Request) => Promise<Response>, now = Date.now(),
 ): Promise<Response> {
-    if (!publicRead(request)) return load(request);
-    const key = new Request(request.url);
+    if (request.url.length > MAX_CACHE_URL_LENGTH || !publicRead(request)) return load(request);
+    const origin = new URL(request.url).origin;
+    // Keep the request's zone and distinguish every query without using it as a cache path.
+    const key = new Request(`${origin}/.omg/advisory-cache/v1/${await sha256(request.url)}`);
     const directives = request.headers.get("cache-control") ?? "";
     const noStore = /(?:^|,)\s*no-store\s*(?:,|$)/i.test(directives);
     const revalidate = noStore || /(?:^|,)\s*(?:no-cache|max-age\s*=\s*0)\s*(?:,|$)/i.test(directives) ||

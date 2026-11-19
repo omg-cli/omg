@@ -108,3 +108,29 @@ test("an edge entry expires before its freshness claim and cache failure falls b
     expect(await (await cachedRead(request, unavailable, load, milliseconds)).text()).toBe("origin");
     expect(loads).toBe(2);
 });
+
+test("edge cache keys stay on the request origin and bound the URL sent to cache storage", async () => {
+    const origin = "https://advisories.example";
+    const request = new Request(`${origin}/v1/cves/recent?limit=2`);
+    const oversized = new Request(`${origin}/v1/cves/recent?cursor=${"a".repeat(8192)}`);
+    const reads: string[] = [];
+    const writes: string[] = [];
+    const loads: string[] = [];
+    const cache: Pick<Cache, "match" | "put"> = {
+        match: async (key) => {
+            reads.push(new Request(key).url);
+            return undefined;
+        },
+        put: async (key) => { writes.push(new Request(key).url); },
+    };
+    const load = async (input: Request) => {
+        loads.push(input.url);
+        return new Response(input.url, { headers: { "Cache-Control": "public, max-age=60" } });
+    };
+    expect(await (await cachedRead(request, cache, load)).text()).toBe(request.url);
+    expect(await (await cachedRead(oversized, cache, load)).text()).toBe(oversized.url);
+    expect(loads).toEqual([request.url, oversized.url]);
+    expect(reads).toEqual(writes);
+    expect(reads).toHaveLength(1);
+    expect(reads[0]).toMatch(/^https:\/\/advisories\.example\/[^?]{1,128}$/);
+});
