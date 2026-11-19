@@ -779,7 +779,7 @@ with socket.socket(socket.AF_UNIX) as server:
             self.assertEqual(result.returncode, 0, result.stderr)
             root = Path(directory)
             self.assertEqual((root / 'advisory-hosts').read_text().splitlines()[-1],
-                             '127.0.0.1 omg-advisories.latham.workers.dev')
+                             '127.0.0.1 omg-advisories.latham.workers.dev aur.archlinux.org')
             self.assertTrue((root / 'advisory-hosts').read_bytes().startswith(original_hosts.rstrip()))
             nss_lines = (root / 'advisory-nss').read_text().splitlines()
             self.assertEqual([line for line in nss_lines if line.startswith('hosts:')], ['hosts: files'])
@@ -1328,6 +1328,10 @@ def evidence_fixture(root):
         if stage == 'omarchy-unknown-signing-key':
             (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(
                 status=PRODUCER.NATIVE_PHASES[case.native_phase], refused_signer='A' * 40)))
+        if stage == 'omarchy-aur-unavailable':
+            (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(
+                status=PRODUCER.NATIVE_PHASES[case.native_phase],
+                unchanged_foreign_package='omg-coverage-foreign-1-1')))
         if case.scene in ('migration-inventory-error', 'migration-directory-untrusted'):
             (evidence / f'{stage}-migrations.txt').write_text(f'boundary_control={case.scene} completion_markers=0\n')
         elif stage == 'omarchy-native-migrations-script-failure':
@@ -1388,7 +1392,9 @@ def evidence_fixture(root):
             'omarchy-native-migrations-script-failure': '0000000000.sh failed: exit status: 7',
             'omarchy-native-migrations-inventory-error': 'Cannot inspect pending Omarchy migrations',
             'omarchy-native-migrations-directory-untrusted': 'Selected Omarchy runtime directory is not root-controlled',
-            'omarchy-current-kernel': '| System is up to date',
+            'omarchy-current-kernel': 'configured_dev_checkout=packaged\n| System is up to date',
+            'omarchy-dev-config-unreadable': 'Cannot open Omarchy dev-link configuration',
+            'omarchy-aur-unavailable': 'AUR is unavailable. Skipping AUR updates and continuing to Omarchy boot verification',
             'omarchy-runtime-unset': 'caller_runtime_hint=unset\n| System is up to date',
             'omarchy-interrupted': 'Omarchy update interrupted',
             'omarchy-output-closed': 'Update output disconnected',
@@ -1434,6 +1440,41 @@ def evidence_fixture(root):
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_omarchy_aur_outage_requires_a_retained_foreign_package_and_boot_verification(self):
+        case = PRODUCER.OMARCHY_CASES['omarchy-aur-unavailable']
+        self.assertEqual(case.native_phase, 'complete')
+        self.assertIn('omarchy-update-boot', case.helpers)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            path = evidence / 'omarchy-aur-unavailable-native-state.json'
+            state = json.loads(path.read_text())
+            self.assertEqual(state.pop('unchanged_foreign_package'), 'omg-coverage-foreign-1-1')
+            path.write_text(json.dumps(state))
+            with self.assertRaisesRegex(ValueError, 'AUR outage'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
+    def test_dev_configuration_controls_require_their_actual_lifecycle_results(self):
+        self.assertEqual(PRODUCER.OMARCHY_CASES['omarchy-current-kernel'].scene, 'packaged-config')
+        self.assertEqual(PRODUCER.OMARCHY_CASES['omarchy-dev-config-unreadable'].native_phase,
+                         'cache-pruned')
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            for stage, witness in (
+                ('omarchy-current-kernel', 'configured_dev_checkout=packaged'),
+                ('omarchy-dev-config-unreadable', 'Cannot open Omarchy dev-link configuration'),
+            ):
+                path = evidence / f'{stage}.log'
+                log = path.read_text()
+                self.assertIn(witness, log)
+                path.write_text(log.replace(witness, 'unrelated fixture output'))
+                try:
+                    with self.assertRaisesRegex(ValueError, 'dev-link|packaged dev configuration'):
+                        PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+                finally:
+                    path.write_text(log)
+
     def test_native_unknown_decisions_require_nonempty_exact_prompt_fingerprints(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
@@ -1631,9 +1672,8 @@ class SupplementalEvidence(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Current kernel'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             state.write_text(original)
-            (evidence / 'omarchy-current-kernel.log').write_text(
-                'System is up to date\nRun omarchy-system reboot when ready.\n'
-                + UnknownFixtureTerminal.prompt().decode())
+            log = evidence / 'omarchy-current-kernel.log'
+            log.write_text(log.read_text() + '\nRun omarchy-system reboot when ready.\n')
             with self.assertRaisesRegex(ValueError, 'Current kernel'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
@@ -1673,7 +1713,7 @@ class SupplementalEvidence(unittest.TestCase):
             files = PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
             receipt = json.loads((evidence / 'verification.json').read_text())
             self.assertEqual(len(receipt['tests']), 22)
-            self.assertEqual(len(receipt['process_checks']), 77)
+            self.assertEqual(receipt['process_checks'], list(PRODUCER.PROCESS_STAGES))
             self.assertEqual(len(receipt['fresh_admission']), 22)
             self.assertEqual(len(receipt['signed_decoders']), 2)
             self.assertEqual(len(files), len(receipt['profiles']))

@@ -546,10 +546,13 @@ class DescriptorTests(unittest.TestCase):
         prefix = 'run-test/native-evidence/cli/'
         included = ('omarchy-vendor-failure.log', 'omarchy-success-native-state.json',
                     'omarchy-unknown-signing-key.log', 'omarchy-unknown-signing-key-native-state.json',
-                    'omarchy-unknown-signing-key-unknown.json', 'test-01.log', 'verification.json')
+                    'omarchy-unknown-signing-key-unknown.json', 'omarchy-current-kernel.log',
+                    'omarchy-dev-config-unreadable.log', 'omarchy-aur-unavailable-native-state.json',
+                    'omarchy-aur-unavailable-unknown.json', 'test-01.log', 'verification.json')
         for name in included:
             self.fixture(prefix + name, b'actual captured case evidence')
-        for name in ('credentials.json', 'private/verification.json', 'config/config.toml'):
+        for name in ('credentials.json', 'private/verification.json', 'config/config.toml',
+                     'omarchy-dev-config-unreadable.conf', 'omarchy-aur-unavailable-profile.profraw'):
             self.fixture(prefix + name, b'private neighbor')
         status, report = self.run_export()
         self.assertEqual(status, 0, report)

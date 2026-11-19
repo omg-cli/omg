@@ -1679,12 +1679,10 @@ fn prepare_alpm_transaction_in<'a>(
     let mut admissions = std::collections::BTreeMap::new();
     if kind == TransactionKind::InstallAurArtifact {
         for target in &packages {
-            if crate::core::security::is_local_package_file(target) {
-                let path = crate::core::security::validate_local_package_file(target)?;
-                let admission =
-                    crate::package_managers::aur::artifact_inspector::inspect_archive(&path)?;
-                admissions.insert(path, admission);
-            }
+            let path = crate::core::security::validate_local_package_file(target)?;
+            let admission =
+                crate::package_managers::aur::artifact_inspector::inspect_archive(&path)?;
+            admissions.insert(path, admission);
         }
     }
     check_database_lock(std::path::Path::new(alpm.dbpath().trim_end_matches('/')))?;
@@ -5838,5 +5836,30 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn aur_archive_preparation_refuses_repository_targets_before_opening_a_transaction()
+    -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_sync("core", &[("omg-fixture-package", "1-1", "")])?;
+        let mut alpm = fixture.open();
+        alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+        let result = super::prepare_alpm_transaction(
+            &mut alpm,
+            vec!["omg-fixture-package".to_owned()],
+            TransactionKind::InstallAurArtifact,
+            &crate::core::pacman_conf::PacmanConfig::default(),
+        );
+        let Err(error) = result else {
+            anyhow::bail!("archive-only preparation accepted a repository target");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("not a supported local package archive path")
+        );
+        assert!(!fixture.database().join("db.lck").exists());
+        Ok(())
     }
 }

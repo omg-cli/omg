@@ -2827,10 +2827,8 @@ mod tests {
         let bin = directory.path().join("bin");
         std::fs::create_dir(&bin)?;
         let helper = bin.join("omarchy-fixture-nested");
-        std::fs::write(
-            &helper,
-            "#!/bin/bash\n[[ \"$OMARCHY_PATH/bin/omarchy-fixture-nested\" == \"$0\" ]]\n",
-        )?;
+        let script = "#!/bin/bash\n[[ \"$OMARCHY_PATH/bin/omarchy-fixture-nested\" == \"$0\" ]]\n";
+        std::fs::write(&helper, script)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
         let shell = crate::core::privilege::root_controlled_program_path("bash")?;
@@ -2856,10 +2854,9 @@ mod tests {
 
     #[test]
     fn dev_link_uses_the_literal_path_written_by_omarchy() -> Result<()> {
+        let config = r#"export OMARCHY_PATH="/home/dev/checkout with \$ and \"quotes\"""#;
         assert_eq!(
-            parse_configured_omarchy_root(
-                r#"export OMARCHY_PATH="/home/dev/checkout with \$ and \"quotes\"""#
-            )?,
+            parse_configured_omarchy_root(config)?,
             Path::new(r#"/home/dev/checkout with $ and "quotes""#),
         );
         for invalid in [
@@ -2870,6 +2867,13 @@ mod tests {
         ] {
             assert!(parse_configured_omarchy_root(invalid).is_err());
         }
+        let invalid = "export OMARCHY_PATH=\"/home/dev\tcheckout\"";
+        assert!(
+            parse_configured_omarchy_root(invalid)
+                .expect_err("a control character must refuse the configured path")
+                .to_string()
+                .contains("Invalid character in Omarchy dev-link path")
+        );
         Ok(())
     }
 

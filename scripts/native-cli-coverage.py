@@ -230,7 +230,7 @@ def fixture_signing_key(signing, identity):
 
 
 def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_audio=False,
-                          repository_compression="gz", unknown_app_signer=False):
+                          repository_compression="gz", unknown_app_signer=False, foreign_package=False):
     require(repository_compression in ("gz", "bz2"), "Unsupported signed repository compression")
     if os.geteuid() != 0:
         raise RuntimeError('Guest root setup required')
@@ -305,6 +305,10 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
             inventory[name]['before_sha256'] = hashlib.sha256(old_payload).hexdigest()
     for name, reason in (('omg-coverage-dead-dep', 1),):
         fixture_local_package(owner / 'root', owner / 'db', name, '1-1', 'usr/share/omg-coverage/' + name + '.txt', b'retain unless actual orphan\n', reason)
+    if foreign_package:
+        fixture_local_package(owner / 'root', owner / 'db', 'omg-coverage-foreign', '1-1',
+                              'usr/share/omg-coverage/omg-coverage-foreign.txt',
+                              b'Explicitly installed foreign package\n', 0)
     for repository, records in repositories.items():
         database = owner / 'repos' / repository / (repository + '.db')
         fixture_repository_database(database, records, repository_compression)
@@ -327,7 +331,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
                'signer_is_authored_throwaway_key': True,
                'host_or_publisher_secret_material_used': False, 'siglevel_weakened': False,
                'initial_packages': initial, 'migration_packages': migration_packages, 'config_sha256': sha(owner / 'pacman.conf'),
-               'running_kernel_modules': running_modules,
+               'running_kernel_modules': running_modules, 'foreign_package': foreign_package,
                'initial_database_sha256': fixture_tree_hashes(owner / 'db/local'),
                'initial_payload_sha256': fixture_tree_hashes(owner / 'root'),
                'public_before_sha256': hashlib.sha256(before_public).hexdigest(),
@@ -975,6 +979,18 @@ def verify_signed_fixture(owner, phase='complete'):
                         'Non-matching hardware received an unrelated package payload')
     versions = {name: '3-1' if completed or name in refreshed else '1-1' for name in packages}
     expected_records = {name + '-' + version for name, version in versions.items()}
+    foreign_record = 'omg-coverage-foreign-1-1'
+    if receipt.get('foreign_package'):
+        expected_records.add(foreign_record)
+        local = owner / 'db/local' / foreign_record
+        initial_database = receipt['initial_database_sha256']
+        require(fixture_tree_hashes(local)
+                == {path.removeprefix(foreign_record + '/'): digest for path, digest in initial_database.items()
+                    if path.startswith(foreign_record + '/')},
+                'AUR outage changed installed foreign package metadata')
+        foreign_payload = 'usr/share/omg-coverage/omg-coverage-foreign.txt'
+        require(sha(owner / 'root' / foreign_payload) == receipt['initial_payload_sha256'][foreign_payload],
+                'AUR outage changed the installed foreign package payload')
     if not completed or phase == 'repository-upgraded':
         expected_records.add('omg-coverage-dead-dep-1-1')
     actual_records = {path.name for path in (owner / 'db/local').iterdir() if path.is_dir()}
@@ -1016,6 +1032,8 @@ def verify_signed_fixture(owner, phase='complete'):
                     'Native cache pruning removed a retained version')
     require(not (owner / 'db/db.lck').exists(), 'Native transaction leaked its database lock')
     result = dict(status=NATIVE_PHASES[phase], packages=packages)
+    if receipt.get('foreign_package'):
+        result['unchanged_foreign_package'] = foreign_record
     signer = receipt.get('fixture_app_signer_fingerprint')
     trusted = receipt.get('fixture_signer_fingerprint')
     if signer is not None and signer != trusted:
@@ -1203,8 +1221,11 @@ OMARCHY_CASES = {
         'omarchy-update-stay-awake\tstop',), scene='migration-inventory-error', native_phase='repository-upgraded'),
     'omarchy-native-migrations-directory-untrusted': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
         'omarchy-update-stay-awake\tstop',), scene='migration-directory-untrusted', native_phase='repository-upgraded'),
-    'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-current-kernel': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='packaged-config', native_phase='complete'),
     'omarchy-runtime-unset': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
+    'omarchy-aur-unavailable': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='aur-unavailable', native_phase='complete'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
     'omarchy-unknown-signing-key': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='keyrings-refreshed'),
     'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
@@ -1258,6 +1279,8 @@ OMARCHY_CASES = {
         scene='confirmation-failure', failure_command='omarchy-update-confirm', failure_status=2),
     'omarchy-development-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
         scene='development-failure', native_phase='cache-pruned', failure_command='omarchy-update-dev'),
+    'omarchy-dev-config-unreadable': OmarchyCase(1, OMARCHY_PREFIX[:3] + ('omarchy-update-stay-awake\tstop',),
+        scene='unreadable-config', native_phase='cache-pruned'),
     'omarchy-inhibitor-start-failure': OmarchyCase(1, OMARCHY_PREFIX[:3] + ('omarchy-update-stay-awake\tstop',),
         scene='inhibitor-start-failure', native_phase='cache-pruned', failure_command='omarchy-update-stay-awake'),
     'omarchy-inhibitor-stop-failure': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX + ('omarchy-update-stay-awake\tstop',),
@@ -1310,10 +1333,11 @@ import re
 import sys
 from pathlib import Path
 root = Path(sys.argv[1])
-host = 'omg-advisories.latham.workers.dev'
+offline_hosts = ('omg-advisories.latham.workers.dev', 'aur.archlinux.org')
 hosts = Path('/etc/hosts').read_text()
-assert all(host not in line.split('#', 1)[0].split()[1:] for line in hosts.splitlines())
-(root / 'advisory-hosts').write_text(hosts.rstrip() + '\n127.0.0.1 ' + host + '\n')
+assert all(host not in line.split('#', 1)[0].split()[1:]
+           for line in hosts.splitlines() for host in offline_hosts)
+(root / 'advisory-hosts').write_text(hosts.rstrip() + '\n127.0.0.1 ' + ' '.join(offline_hosts) + '\n')
 nss = Path('/etc/nsswitch.conf').read_text()
 assert len(re.findall(r'^hosts:.*$', nss, flags=re.M)) == 1
 (root / 'advisory-nss').write_text(re.sub(r'^hosts:.*$', 'hosts: files', nss, flags=re.M))
@@ -1323,14 +1347,14 @@ mount --bind "$fixture/advisory-nss" /etc/nsswitch.conf
 ip link set lo up
 python3 - <<'OMG_OMARCHY_OFFLINE_PROBE'
 import socket
-host = 'omg-advisories.latham.workers.dev'
-assert {row[4][0] for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)} == {'127.0.0.1'}
-try:
-    socket.create_connection((host, 443), timeout=1).close()
-except ConnectionRefusedError:
-    print('[native-coverage] Omarchy advisory provider is explicitly unavailable on private loopback')
-else:
-    raise AssertionError('unexpected advisory listener in private Omarchy network')
+for host in ('omg-advisories.latham.workers.dev', 'aur.archlinux.org'):
+    assert {row[4][0] for row in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)} == {'127.0.0.1'}
+    try:
+        socket.create_connection((host, 443), timeout=1).close()
+    except ConnectionRefusedError:
+        print(f'[native-coverage] {host} is unavailable on private loopback')
+    else:
+        raise AssertionError(f'unexpected provider listener in private Omarchy network: {host}')
 OMG_OMARCHY_OFFLINE_PROBE
 printf 'ID=omarchy\nID_LIKE=arch\n' > "$fixture/release"
 mount --bind "$fixture/release" /etc/os-release
@@ -1363,6 +1387,10 @@ if [[ $name == omarchy-update-dev && ${OMARCHY_FIXTURE_SCENE:-none} == dev-link 
   printf '\nconfigured_dev_checkout=selected nested_helper=packaged\n'
 else
   case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
+  if [[ $name == omarchy-update-dev && ${OMARCHY_FIXTURE_SCENE:-none} == packaged-config ]]; then
+    test "$OMARCHY_PATH" = /usr/share/omarchy
+    printf '\nconfigured_dev_checkout=packaged\n'
+  fi
 fi
 { printf '%s' "$name"; if test "$#" -gt 0; then printf '\t%s' "$@"; fi; printf '\n'; } >> "$OMARCHY_HELPER_TRACE"
 case "$name:${OMARCHY_FIXTURE_SCENE:-none}:${1:-}" in
@@ -1640,6 +1668,7 @@ for stage in OMARCHY_STAGE_NAMES; do
   if [[ $stage == omarchy-native-migrations* ]]; then signed_options=(--native-migrations); fi
   if test "$stage" = omarchy-native-migrations-installed-audio; then signed_options+=(--installed-audio); fi
   if test "$stage" = omarchy-unknown-signing-key; then signed_options+=(--unknown-app-signer); fi
+  if test "$stage" = omarchy-aur-unavailable; then signed_options+=(--foreign-package); fi
   python3 /native-cli-coverage.py signed-fixture --owner "$signed_owner" "${signed_options[@]}"
   sed -i "s|file://$signed_owner/repos/|http://127.0.0.1:18080/${signed_owner##*/}/repos/|g" "$signed_owner/pacman.conf"
   cp "$signed_owner/pacman.conf" "$case_dir/pacman.conf"
@@ -1734,14 +1763,25 @@ OMG_NATIVE_MIGRATION_1794675791
 OMARCHY_CASE_SETUP
   esac
   caller_path=/usr/bin:/bin
-  if test "$scene" = dev-link; then
-    test ! -e /etc/omarchy.conf && test ! -L /etc/omarchy.conf
-    install -d -m 700 -o nobody -g nobody "$case_dir/dev-checkout"
-    printf 'export OMARCHY_PATH="%s"\n' "$case_dir/dev-checkout" > /etc/omarchy.conf
-    chmod 644 /etc/omarchy.conf
-    created+=(/etc/omarchy.conf)
-    caller_path="$case_dir/checkout/bin:$caller_path"
-  fi
+  case "$scene" in
+    dev-link|packaged-config|unreadable-config)
+      test ! -e /etc/omarchy.conf && test ! -L /etc/omarchy.conf
+      created+=(/etc/omarchy.conf)
+      case "$scene" in
+        dev-link)
+          install -d -m 700 -o nobody -g nobody "$case_dir/dev-checkout"
+          printf 'export OMARCHY_PATH="%s"\n' "$case_dir/dev-checkout" > /etc/omarchy.conf
+          chmod 644 /etc/omarchy.conf
+          caller_path="$case_dir/checkout/bin:$caller_path"
+          ;;
+        packaged-config)
+          printf 'export OMARCHY_PATH="/usr/share/omarchy"\n' > /etc/omarchy.conf
+          chmod 644 /etc/omarchy.conf
+          ;;
+        unreadable-config) ln -s "$fixture/missing-dev-config" /etc/omarchy.conf ;;
+      esac
+      ;;
+  esac
   if test -n "$absent_helper"; then
     test -f "/usr/bin/$absent_helper" && test ! -L "/usr/bin/$absent_helper"
     test ! -e "$fixture/saved/$absent_helper"
@@ -1832,9 +1872,9 @@ OMARCHY_CASE_SETUP
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_FIXTURE_SCENE="$scene" OMARCHY_HELPER_TRACE="$case_dir/helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" "${extra[@]}" \
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
-  if test "$scene" = dev-link; then
-    rm -- /etc/omarchy.conf
-  fi
+  case "$scene" in
+    dev-link|packaged-config|unreadable-config) rm -- /etc/omarchy.conf ;;
+  esac
   if test -n "$boundary_job"; then
     if test ! -f "$case_dir/helpers.tsv.boundary-done"; then
       kill "$boundary_job" 2>/dev/null || true
@@ -2383,6 +2423,12 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         if case.scene == 'dev-link':
             require(log.splitlines().count('configured_dev_checkout=selected nested_helper=packaged') == 1,
                     'The dev checkout or packaged nested helper was not selected')
+        elif case.scene == 'packaged-config':
+            require(log.splitlines().count('configured_dev_checkout=packaged') == 1,
+                    'The packaged dev configuration did not retain the selected runtime')
+        elif case.scene == 'unreadable-config':
+            require('Cannot open Omarchy dev-link configuration' in log,
+                    'The unreadable Omarchy dev-link configuration failure was not reported')
         if helpers:
             require((evidence / f'{stage}-coordination.txt').read_text()
                     == 'released private lock; owned transcript mode=600\n',
@@ -2391,9 +2437,13 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require(transcript.startswith('OMG Omarchy update started\n')
                     and '\nOMG Omarchy update finished: ' in transcript,
                     'Omarchy has no complete genuine PTY transcript: ' + stage)
-        require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
-                == NATIVE_PHASES[case.native_phase], 'Native package state differs: ' + stage)
-        if case.native_phase in ('complete', 'migrated', 'migrated-unmatched'):
+        native_state = json.loads((evidence / f'{stage}-native-state.json').read_text())
+        require(native_state['status'] == NATIVE_PHASES[case.native_phase], 'Native package state differs: ' + stage)
+        if case.scene == 'aur-unavailable':
+            require(native_state.get('unchanged_foreign_package') == 'omg-coverage-foreign-1-1'
+                    and 'AUR is unavailable. Skipping AUR updates and continuing to Omarchy boot verification' in log,
+                    'Omarchy AUR outage lacks the warning or unchanged foreign package proof')
+        elif case.native_phase in ('complete', 'migrated', 'migrated-unmatched'):
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
         if case.scene in ('migration-inventory-error', 'migration-directory-untrusted'):
@@ -2677,6 +2727,7 @@ def main():
     signed.add_argument('--native-migrations', action='store_true')
     signed.add_argument('--installed-audio', action='store_true')
     signed.add_argument('--unknown-app-signer', action='store_true')
+    signed.add_argument('--foreign-package', action='store_true')
     fresh = commands.add_parser('fresh-admission-fixture')
     fresh.add_argument('--owner', required=True, type=Path)
     fresh.add_argument('--cli', required=True, type=Path)
@@ -2714,7 +2765,7 @@ def main():
             stream.write('\n')
     elif args.operation == 'signed-fixture':
         create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_audio,
-                              unknown_app_signer=args.unknown_app_signer)
+                              unknown_app_signer=args.unknown_app_signer, foreign_package=args.foreign_package)
     elif args.operation == 'fresh-admission-fixture':
         print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)))
     elif args.operation == 'verify-signed-fixture':
