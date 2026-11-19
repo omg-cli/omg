@@ -230,7 +230,8 @@ def fixture_signing_key(signing, identity):
 
 
 def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_audio=False,
-                          repository_compression="gz", unknown_app_signer=False, foreign_package=False):
+                          repository_compression="gz", unknown_app_signer=False, foreign_package=False,
+                          platform_keyring=False):
     require(repository_compression in ("gz", "bz2"), "Unsupported signed repository compression")
     if os.geteuid() != 0:
         raise RuntimeError('Guest root setup required')
@@ -270,6 +271,8 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         ('archlinux-keyring', 'core', 0, ()), ('omarchy-keyring', 'omarchy', 0, ()),
         ('omg-coverage-app', 'core', 0, ('omg-coverage-dep>=1-1',)),
         ('omg-coverage-dep', 'core', 1, ()), ('omg-coverage-desktop', 'omarchy', 0, ())]
+    if platform_keyring:
+        packages.append(('omg-coverage-platform-keyring', 'omarchy', 0, ()))
     migration_packages = {}
     if native_migrations:
         packages.extend((name, 'core', 0, ()) for name in ('xorg-xrandr', 'hp-omnibook-3-audio'))
@@ -1178,6 +1181,12 @@ OMARCHY_SUFFIX = (
     'omarchy-update-restart\t--services-only', 'omarchy-hook\tpost-update',
     'omarchy-update-mise', 'omarchy-update-boot', 'omarchy-update-stay-awake\tstop')
 
+PLATFORM_KEYRING_FAILURES = {
+    'platform-unreadable': 'Cannot read platform keyring packages',
+    'platform-untrusted': 'Platform keyring list must be a root-controlled regular file',
+    'platform-oversize': 'Platform keyring list exceeds its limit',
+}
+
 
 class OmarchyCase(NamedTuple):
     exit_status: int
@@ -1226,6 +1235,14 @@ OMARCHY_CASES = {
     'omarchy-runtime-unset': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX, native_phase='complete'),
     'omarchy-aur-unavailable': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
         scene='aur-unavailable', native_phase='complete'),
+    'omarchy-platform-keyring': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX,
+        scene='platform-configured', native_phase='complete'),
+    'omarchy-platform-keyring-unreadable': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='platform-unreadable', native_phase='cache-pruned'),
+    'omarchy-platform-keyring-untrusted': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='platform-untrusted', native_phase='cache-pruned'),
+    'omarchy-platform-keyring-oversize': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',),
+        scene='platform-oversize', native_phase='cache-pruned'),
     'omarchy-vendor-failure': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='cache-pruned'),
     'omarchy-unknown-signing-key': OmarchyCase(1, OMARCHY_PREFIX + ('omarchy-update-stay-awake\tstop',), native_phase='keyrings-refreshed'),
     'omarchy-declined': OmarchyCase(0, ('omarchy-update-requires-free-space', 'omarchy-update-confirm')),
@@ -1287,7 +1304,8 @@ OMARCHY_CASES = {
         scene='inhibitor-stop-failure', native_phase='complete', failure_command='omarchy-update-stay-awake'),
 }
 
-ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check')
+ARCH_AUR_UNAVAILABLE_STAGE = 'arch-aur-unavailable'
+ARCH_READONLY_STAGES = ('arch-dry-run', 'arch-check', ARCH_AUR_UNAVAILABLE_STAGE)
 NATIVE_PREFLIGHT_TEST = 'cli::packages::install::arch::tests::native_fresh_snapshot_preflight_defers_evidence_but_enforces_source_policy'
 FRESH_ADMISSION_STAGES = tuple('fresh-' + case.name for case in FRESH_ADMISSION_CASES)
 SIGNED_DECODER_STAGES = tuple('fresh-' + case.name for case in SIGNED_DECODER_CASES)
@@ -1361,6 +1379,8 @@ mount --bind "$fixture/release" /etc/os-release
 mount -t tmpfs -o nosuid,nodev,mode=1777 tmpfs /tmp
 install -d -m 755 "$fixture/runtime" "$fixture/runtime/migrations" /usr/share/omarchy
 mount --bind "$fixture/runtime" /usr/share/omarchy
+install -d -m 755 "$fixture/platform" /usr/share/omarchy-platform
+mount --bind "$fixture/platform" /usr/share/omarchy-platform
 test "$(stat -c '%u:%a' /usr/share/omarchy)" = 0:755
 test "$(stat -c '%u:%a' /usr/share/omarchy/migrations)" = 0:755
 cat > "$fixture/stage" <<'OMG_INERT_OMARCHY_STAGE'
@@ -1669,6 +1689,7 @@ for stage in OMARCHY_STAGE_NAMES; do
   if test "$stage" = omarchy-native-migrations-installed-audio; then signed_options+=(--installed-audio); fi
   if test "$stage" = omarchy-unknown-signing-key; then signed_options+=(--unknown-app-signer); fi
   if test "$stage" = omarchy-aur-unavailable; then signed_options+=(--foreign-package); fi
+  if test "$stage" = omarchy-platform-keyring; then signed_options+=(--platform-keyring); fi
   python3 /native-cli-coverage.py signed-fixture --owner "$signed_owner" "${signed_options[@]}"
   sed -i "s|file://$signed_owner/repos/|http://127.0.0.1:18080/${signed_owner##*/}/repos/|g" "$signed_owner/pacman.conf"
   cp "$signed_owner/pacman.conf" "$case_dir/pacman.conf"
@@ -1763,6 +1784,19 @@ OMG_NATIVE_MIGRATION_1794675791
 OMARCHY_CASE_SETUP
   esac
   caller_path=/usr/bin:/bin
+  platform_file="$fixture/platform/keyrings"
+  case "$scene" in
+    platform-configured)
+      printf '\n# Fixture platform keyrings\nnot-a-keyring-package\nbad name-keyring\narchlinux-keyring\nmissing-platform-keyring\n  omg-coverage-platform-keyring  \n' > "$platform_file"
+      chmod 644 "$platform_file"
+      ;;
+    platform-unreadable) ln -s "$fixture/missing-platform-keyrings" "$platform_file" ;;
+    platform-untrusted) install -m 666 /dev/null "$platform_file" ;;
+    platform-oversize)
+      truncate -s 65537 "$platform_file"
+      chmod 644 "$platform_file"
+      ;;
+  esac
   case "$scene" in
     dev-link|packaged-config|unreadable-config)
       test ! -e /etc/omarchy.conf && test ! -L /etc/omarchy.conf
@@ -1874,6 +1908,17 @@ OMARCHY_CASE_SETUP
     "${launch[@]}" < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
   case "$scene" in
     dev-link|packaged-config|unreadable-config) rm -- /etc/omarchy.conf ;;
+  esac
+  case "$scene" in
+    platform-configured) rm -- "$platform_file" ;;
+    platform-unreadable|platform-untrusted|platform-oversize)
+      rm -- "$platform_file"
+      if test -n "$(find "$signed_owner/db/sync" -mindepth 1 -print -quit)"; then
+        printf 'Rejected platform keyring configuration refreshed repository state\n' >&2
+        exit 1
+      fi
+      printf 'sync_databases=unchanged\n' > "/evidence/cli/$stage-platform-keyrings.txt"
+      ;;
   esac
   if test -n "$boundary_job"; then
     if test ! -f "$case_dir/helpers.tsv.boundary-done"; then
@@ -1987,16 +2032,26 @@ OMG_AUTHORIZATION_RECEIPT
   printf '[native-coverage] completed %s in %ss\n' "$stage" "$((SECONDS-stage_started))"
 done
 printf 'ID=arch\n' > "$fixture/release"
-case_dir="$case_root/omarchy-success"
-signed_owner=/opt/omg-coverage-omarchy-success
-chmod 755 "$signed_owner/gnupg"
-chmod 644 "$signed_owner/gnupg/pubring.gpg" "$signed_owner/gnupg/trustdb.gpg"
 transcript_before=$(sha256sum /tmp/omarchy-update.log)
-for stage in arch-dry-run arch-check; do
-  args=(--dry-run)
-  if test "$stage" = arch-check; then args=(--check); fi
+for stage in ARCH_READONLY_STAGE_NAMES; do
+  source_stage=omarchy-success
+  expected=0
+  case "$stage" in
+    arch-dry-run) args=(--dry-run) ;;
+    arch-check) args=(--check) ;;
+    arch-aur-unavailable)
+      args=(--check --aur-only)
+      source_stage=omarchy-aur-unavailable
+      expected=1
+      ;;
+  esac
+  case_dir="$case_root/$source_stage"
+  signed_owner="/opt/omg-coverage-$source_stage"
+  chmod 755 "$signed_owner/gnupg"
+  chmod 644 "$signed_owner/gnupg/pubring.gpg" "$signed_owner/gnupg/trustdb.gpg"
   : > "$case_dir/arch-helpers.tsv"
   chown nobody:nobody "$case_dir/arch-helpers.tsv"
+  result=0
   timeout --signal=TERM --kill-after=3 40 runuser -u nobody -- env -i \
     PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$case_dir" TMPDIR="$case_dir" \
     XDG_RUNTIME_DIR="$case_dir/run" XDG_CONFIG_HOME="$case_dir/config" \
@@ -2008,7 +2063,9 @@ for stage in arch-dry-run arch-check; do
     OMARCHY_FIXTURE_CASE="$stage" OMARCHY_HELPER_TRACE="$case_dir/arch-helpers.tsv" \
     LLVM_PROFILE_FILE="/profiles/omg-extra-$stage-%p-%m.profraw" \
     bash -c 'test "$(id -u)" -ne 0; test -z "${OMG_TEST_MODE+x}"; test -z "${CARGO_PRIMARY_PACKAGE+x}"; exec /omg-extra-bin/cli update "$@" --no-sync --yes' bash "${args[@]}" \
-    < /dev/null > "/evidence/cli/$stage.log" 2>&1
+    < /dev/null > "/evidence/cli/$stage.log" 2>&1 || result=$?
+  test "$result" = "$expected"
+  printf '%s\n' "$result" > "/evidence/cli/$stage-exit.txt"
   test ! -s "$case_dir/arch-helpers.tsv"
   test "$(sha256sum /tmp/omarchy-update.log)" = "$transcript_before"
   python3 /native-cli-coverage.py verify-signed-fixture --owner "$signed_owner" --phase complete \
@@ -2030,6 +2087,7 @@ OMG_OMARCHY_NAMESPACE
         f'stage_timeout={95 if case.authorization else 40} ;;'
         for stage, case in OMARCHY_CASES.items())
     return (script.replace('OMARCHY_STAGE_NAMES', ' '.join(map(shlex.quote, OMARCHY_CASES)))
+            .replace('ARCH_READONLY_STAGE_NAMES', ' '.join(map(shlex.quote, ARCH_READONLY_STAGES)))
             .replace('OMARCHY_CASE_SETUP', setup))
 
 
@@ -2446,6 +2504,15 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         elif case.native_phase in ('complete', 'migrated', 'migrated-unmatched'):
             require('up to date' in log.lower(),
                     'Native OMG AUR did not complete: ' + stage)
+        if case.scene == 'platform-configured':
+            before_upgrade, refreshed, _ = log.partition('Native Omarchy keyring-refresh completed')
+            require(refreshed and before_upgrade.count('Package: ["omg-coverage-platform-keyring","3-1",') == 1
+                    and 'Package: ["missing-platform-keyring",' not in before_upgrade,
+                    'Platform keyring configuration did not select the installed platform package for refresh')
+        elif case.scene in PLATFORM_KEYRING_FAILURES:
+            require(PLATFORM_KEYRING_FAILURES[case.scene] in log
+                    and (evidence / f'{stage}-platform-keyrings.txt').read_text() == 'sync_databases=unchanged\n',
+                    'Platform keyring configuration must fail before refreshing repository state: ' + stage)
         if case.scene in ('migration-inventory-error', 'migration-directory-untrusted'):
             require((evidence / f'{stage}-migrations.txt').read_text()
                     == f'boundary_control={case.scene} completion_markers=0\n',
@@ -2578,11 +2645,18 @@ def validate_evidence(evidence, profiles, artifacts, commit):
         require((evidence / f'{stage}-isolation.txt').read_text()
                 == 'actual_id=arch ordinary_uid=65534 vendor_helpers=0 transcript_unchanged=yes\n',
                 'Normal Arch update crossed the vendor lifecycle boundary')
-        require(json.loads((evidence / f'{stage}-native-state.json').read_text())['status']
-                == NATIVE_PHASES['complete'], 'Read-only Arch update changed native package state')
+        native_state = json.loads((evidence / f'{stage}-native-state.json').read_text())
+        require(native_state['status'] == NATIVE_PHASES['complete'], 'Read-only Arch update changed native package state')
         log = (evidence / f'{stage}.log').read_text()
-        require('up to date' in log.lower() and 'Omarchy runtime' not in log,
-                'Normal Arch read-only update did not complete independently')
+        exit_status = (evidence / f'{stage}-exit.txt').read_text()
+        if stage == ARCH_AUR_UNAVAILABLE_STAGE:
+            require(exit_status == '1\n' and 'Failed to check AUR updates' in log
+                    and native_state.get('unchanged_foreign_package') == 'omg-coverage-foreign-1-1',
+                    'Normal Arch AUR outage must fail with the foreign package unchanged')
+        else:
+            require(exit_status == '0\n' and 'up to date' in log.lower(),
+                    'Normal Arch read-only update did not complete independently')
+        require('Omarchy runtime' not in log, 'Normal Arch read-only update used Omarchy')
         modules = {PROFILE.fullmatch(p.name)[3] for p in grouped[stage]}
         require(modules == cli_modules, 'Normal Arch profiles do not match the actual CLI')
     for path in evidence.rglob('*'):
@@ -2728,6 +2802,7 @@ def main():
     signed.add_argument('--installed-audio', action='store_true')
     signed.add_argument('--unknown-app-signer', action='store_true')
     signed.add_argument('--foreign-package', action='store_true')
+    signed.add_argument('--platform-keyring', action='store_true')
     fresh = commands.add_parser('fresh-admission-fixture')
     fresh.add_argument('--owner', required=True, type=Path)
     fresh.add_argument('--cli', required=True, type=Path)
@@ -2765,7 +2840,8 @@ def main():
             stream.write('\n')
     elif args.operation == 'signed-fixture':
         create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_audio,
-                              unknown_app_signer=args.unknown_app_signer, foreign_package=args.foreign_package)
+                              unknown_app_signer=args.unknown_app_signer, foreign_package=args.foreign_package,
+                              platform_keyring=args.platform_keyring)
     elif args.operation == 'fresh-admission-fixture':
         print(json.dumps(run_fresh_admission_fixture(args.owner, args.cli, args.case, args.profiles, args.decoder_cases)))
     elif args.operation == 'verify-signed-fixture':

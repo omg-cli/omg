@@ -89,21 +89,16 @@ pub fn execute_native_omarchy_operation(
         "Native Omarchy package operations require elevation"
     );
     crate::core::privilege::set_yes_flag(interaction == NativeOmarchyInteraction::Unattended);
-    if operation == NativeOmarchyOperation::PruneCache {
-        let (files, bytes) = super::alpm_ops::clean_cache(2)?;
-        println!(
-            "Pruned {files} cache files ({bytes} bytes), retaining two versions per directory and architecture"
-        );
-        return Ok(());
-    }
-    if operation == NativeOmarchyOperation::RefreshKeyrings {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(super::sync_databases_parallel())?;
-    }
     let targets = match operation {
+        NativeOmarchyOperation::PruneCache => {
+            let (files, bytes) = super::alpm_ops::clean_cache(2)?;
+            println!(
+                "Pruned {files} cache files ({bytes} bytes), retaining two versions per directory and architecture"
+            );
+            return Ok(());
+        }
         NativeOmarchyOperation::RefreshKeyrings => {
+            const MAX_KEYRING_LIST_BYTES: usize = 64 * 1024;
             let mut names = vec!["archlinux-keyring".to_owned(), "omarchy-keyring".to_owned()];
             #[cfg(target_arch = "aarch64")]
             if super::is_installed_fast("archlinuxarm-keyring")? {
@@ -123,14 +118,11 @@ pub fn execute_native_omarchy_operation(
                         metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
                         "Platform keyring list must be a root-controlled regular file"
                     );
-                    anyhow::ensure!(
-                        metadata.len() <= 65536,
-                        "Platform keyring list exceeds its limit"
-                    );
                     let mut contents = String::new();
-                    file.take(65537).read_to_string(&mut contents)?;
+                    file.take(MAX_KEYRING_LIST_BYTES as u64 + 1)
+                        .read_to_string(&mut contents)?;
                     anyhow::ensure!(
-                        contents.len() <= 65536,
+                        contents.len() <= MAX_KEYRING_LIST_BYTES,
                         "Platform keyring list exceeds its limit"
                     );
                     for line in contents.lines() {
@@ -170,8 +162,13 @@ pub fn execute_native_omarchy_operation(
             }
             vec!["hp-omnibook-3-audio".to_owned()]
         }
-        NativeOmarchyOperation::PruneCache => unreachable!(),
     };
+    if operation == NativeOmarchyOperation::RefreshKeyrings {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(super::sync_databases_parallel())?;
+    }
     if operation == NativeOmarchyOperation::RemoveOrphans && targets.is_empty() {
         return Ok(());
     }

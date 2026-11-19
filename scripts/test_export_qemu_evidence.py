@@ -47,8 +47,8 @@ class AllowlistTests(unittest.TestCase):
 
     def test_arch_readonly_reports_have_exact_boundaries(self):
         root = ('run-test', 'native-evidence', 'cli')
-        for stage in ('arch-dry-run', 'arch-check'):
-            for suffix in ('.log', '-native-state.json', '-isolation.txt'):
+        for stage in ('arch-dry-run', 'arch-check', 'arch-aur-unavailable'):
+            for suffix in ('.log', '-native-state.json', '-isolation.txt', '-exit.txt'):
                 self.assertTrue(exporter.allowed_file((*root, stage + suffix)))
                 self.assertFalse(exporter.allowed_file((*root, 'private', stage + suffix)))
                 self.assertFalse(exporter.allowed_file((*root, stage + suffix + '.bak')))
@@ -548,7 +548,9 @@ class DescriptorTests(unittest.TestCase):
                     'omarchy-unknown-signing-key.log', 'omarchy-unknown-signing-key-native-state.json',
                     'omarchy-unknown-signing-key-unknown.json', 'omarchy-current-kernel.log',
                     'omarchy-dev-config-unreadable.log', 'omarchy-aur-unavailable-native-state.json',
-                    'omarchy-aur-unavailable-unknown.json', 'test-01.log', 'verification.json')
+                    'omarchy-aur-unavailable-unknown.json', 'omarchy-platform-keyring.log',
+                    'omarchy-platform-keyring-unreadable-platform-keyrings.txt',
+                    'test-01.log', 'verification.json')
         for name in included:
             self.fixture(prefix + name, b'actual captured case evidence')
         for name in ('credentials.json', 'private/verification.json', 'config/config.toml',

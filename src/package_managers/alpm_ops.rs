@@ -1720,13 +1720,17 @@ fn prepare_alpm_transaction_in<'a>(
                     std::iter::once(pkg_name.as_str()),
                     &pacman_config.hold_pkg,
                 )?;
-                if let Ok(pkg) = tx_guard.0.localdb().pkg(pkg_name.as_str()) {
-                    tx_guard.0.trans_remove_pkg(pkg).map_err(|e| {
-                        anyhow::anyhow!("Failed to add {pkg_name} to removal list: {e}")
+                let pkg = tx_guard
+                    .0
+                    .localdb()
+                    .pkg(pkg_name.as_str())
+                    .with_context(|| {
+                        format!("Cannot remove '{pkg_name}' from the installed package database")
                     })?;
-                } else {
-                    tracing::warn!("Package '{pkg_name}' is not installed; skipping removal");
-                }
+                tx_guard
+                    .0
+                    .trans_remove_pkg(pkg)
+                    .with_context(|| format!("Failed to add {pkg_name} to removal list"))?;
             } else {
                 if crate::core::security::is_local_package_file(&pkg_name) {
                     let canonical_path =
@@ -1900,19 +1904,8 @@ fn configure_transaction_options(
     alpm.set_hookdirs(hook_dirs.into_iter())
         .context("Failed to configure pacman hooks")?;
 
-    let architectures = pacman_config
-        .architecture
-        .as_deref()
-        .unwrap_or("auto")
-        .split_whitespace()
-        .map(|architecture| {
-            if architecture == "auto" {
-                std::env::consts::ARCH
-            } else {
-                architecture
-            }
-        });
-    alpm.set_architectures(architectures)
+    let architectures = pacman_config.package_architectures()?;
+    alpm.set_architectures(architectures.iter().map(String::as_str))
         .context("Failed to configure package architecture validation")?;
     alpm.set_check_space(true);
     alpm.set_parallel_downloads(
@@ -2237,15 +2230,7 @@ impl AdmissionSignals {
             );
             action.sa_sigaction = cancel_admission as *const () as usize;
             action.sa_flags = 0;
-            // SAFETY: action.sa_mask is an initialized sigset_t whose address remains valid for this call.
-            #[expect(
-                unsafe_code,
-                reason = "the scoped cancellation handler must not inherit unrelated signal masks"
-            )]
-            if unsafe { nix::libc::sigemptyset(&raw mut action.sa_mask) } == -1 {
-                return Err(std::io::Error::last_os_error())
-                    .context("Cannot configure admission signal mask");
-            }
+            action.sa_mask = *nix::sys::signal::SigSet::empty().as_ref();
             let previous = admission_signal_action(signal, Some(&action))?;
             let default = previous.sa_sigaction == nix::libc::SIG_DFL;
             guard.previous.push((signal, previous));
@@ -2812,11 +2797,11 @@ fn format_trans_prepare_error(err: &str) -> String {
 /// Configure ALPM servers for all repos (official + custom)
 fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
     let conf_path = paths::pacman_conf_path();
-    let arch = std::env::consts::ARCH;
 
     if let Ok(config) = crate::core::pacman_conf::PacmanConfig::parse(&conf_path) {
+        let arch = config.primary_package_architecture()?;
         for repo in &config.repos {
-            match config.resolve_servers(repo, arch) {
+            match config.resolve_servers(repo, &arch) {
                 Ok(servers) => {
                     // AlpmListMut is an IntoIterator, not an Iterator.
                     let target_db = alpm
@@ -2853,6 +2838,7 @@ fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
         return ensure_mirror_servers(alpm);
     }
 
+    let arch = crate::core::pacman_conf::PacmanConfig::default().primary_package_architecture()?;
     let content = std::fs::read_to_string(mirrorlist)?;
     let mut servers = Vec::with_capacity(16);
 
@@ -2866,7 +2852,7 @@ fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
     for db in alpm.syncdbs_mut() {
         let db_name = db.name();
         for server in &servers {
-            let url = server.replace("$repo", db_name).replace("$arch", arch);
+            let url = server.replace("$repo", db_name).replace("$arch", &arch);
             if let Err(e) = db.add_server(url.clone()) {
                 tracing::debug!(
                     "Failed to add server '{}' to repo '{db_name}': {e}",
@@ -2990,6 +2976,9 @@ mod tests {
         if crate::core::testing::run_isolated_test(NAME) {
             return Ok(());
         }
+        let invalid_signal = super::admission_signal_action(0, None)
+            .expect_err("the kernel must refuse a signal outside the sigaction domain");
+        assert_eq!(invalid_signal.raw_os_error(), Some(nix::libc::EINVAL));
         let mut guard = super::AdmissionSignals::begin()?;
         assert!(super::AdmissionSignals::begin().is_err());
         assert!(
@@ -3003,6 +2992,7 @@ mod tests {
             "synchronous current-thread SIGINT must cancel admission"
         );
         assert!(guard.finish().is_err());
+        guard.finish()?;
         for signal in [nix::libc::SIGINT, nix::libc::SIGTERM, nix::libc::SIGHUP] {
             assert_eq!(
                 super::admission_signal_action(signal, None)?.sa_sigaction,
@@ -4893,11 +4883,9 @@ mod tests {
         );
         let core = databases.first().expect("registered core database");
         assert_eq!(core.name(), "core");
-        let expected = format!(
-            "file://{}/core/os/{}",
-            mirror.display(),
-            std::env::consts::ARCH
-        );
+        let system = nix::sys::utsname::uname()?;
+        let machine = system.machine().to_str().expect("kernel machine is UTF-8");
+        let expected = format!("file://{}/core/os/{machine}", mirror.display());
         assert_eq!(
             core.servers().into_iter().collect::<Vec<_>>(),
             vec![expected.as_str()]
@@ -5851,15 +5839,57 @@ mod tests {
             TransactionKind::InstallAurArtifact,
             &crate::core::pacman_conf::PacmanConfig::default(),
         );
-        let Err(error) = result else {
-            anyhow::bail!("archive-only preparation accepted a repository target");
-        };
+        let error = result
+            .err()
+            .expect("archive-only preparation must refuse a repository target");
         assert!(
             error
                 .to_string()
                 .contains("not a supported local package archive path")
         );
         assert!(!fixture.database().join("db.lck").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn removal_refuses_missing_targets_and_releases_the_private_transaction() -> anyhow::Result<()>
+    {
+        let fixture = RepositoryFixture::new()?;
+        fixture.write_local("omg-fixture-kept", "1-1")?;
+        let mut alpm = fixture.open();
+        let absent = "omg-fixture-absent".to_owned();
+        let kept = "omg-fixture-kept".to_owned();
+        let kind = TransactionKind::Remove { recursive: false };
+        let config = crate::core::pacman_conf::PacmanConfig::default();
+        for targets in [vec![absent.clone()], vec![kept.clone(), absent.clone()]] {
+            let error = super::prepare_alpm_transaction(&mut alpm, targets, kind, &config)
+                .err()
+                .expect("a missing package must fail the entire removal request");
+            assert!(error.to_string().contains(&absent));
+            assert_eq!(
+                error.downcast_ref::<alpm::Error>(),
+                Some(&alpm::Error::PkgNotFound)
+            );
+            assert_eq!(alpm.localdb().pkg(kept.as_str())?.version().as_str(), "1-1");
+            assert!(!fixture.database().join("db.lck").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn auto_package_architecture_uses_the_running_kernel_machine() -> anyhow::Result<()> {
+        let fixture = RepositoryFixture::new()?;
+        let mut alpm = fixture.open();
+        let kernel = nix::sys::utsname::uname()?;
+        let machine = kernel.machine().to_str().expect("kernel machine is UTF-8");
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
+            "[options]\nArchitecture = explicit-machine auto\n",
+        )?;
+        super::configure_transaction_options(&mut alpm, &config)?;
+        assert_eq!(
+            alpm.architectures().into_iter().collect::<Vec<_>>(),
+            ["explicit-machine", machine],
+        );
         Ok(())
     }
 }

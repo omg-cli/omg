@@ -1379,6 +1379,8 @@ def evidence_fixture(root):
         if case.absent_helper:
             (evidence / f'{stage}-layout.txt').write_text(
                 'absent helper restored after genuine CLI execution\n')
+        if case.scene in PRODUCER.PLATFORM_KEYRING_FAILURES:
+            (evidence / f'{stage}-platform-keyrings.txt').write_text('sync_databases=unchanged\n')
         if stage == 'omarchy-optional-failures':
             (evidence / f'{stage}-layout.txt').write_text(
                 'foreign optional helpers never executed; original helpers restored\n')
@@ -1395,6 +1397,8 @@ def evidence_fixture(root):
             'omarchy-current-kernel': 'configured_dev_checkout=packaged\n| System is up to date',
             'omarchy-dev-config-unreadable': 'Cannot open Omarchy dev-link configuration',
             'omarchy-aur-unavailable': 'AUR is unavailable. Skipping AUR updates and continuing to Omarchy boot verification',
+            'omarchy-platform-keyring': 'Package: ["omg-coverage-platform-keyring","3-1",{}]\n'
+                                       'Native Omarchy keyring-refresh completed\nSystem is up to date',
             'omarchy-runtime-unset': 'caller_runtime_hint=unset\n| System is up to date',
             'omarchy-interrupted': 'Omarchy update interrupted',
             'omarchy-output-closed': 'Update output disconnected',
@@ -1424,6 +1428,8 @@ def evidence_fixture(root):
             'omarchy-unsupported-turbo-mode': 'complete update lifecycle',
             'omarchy-invalid-transport': 'Incomplete Omarchy update transport',
         }.get(stage, '')
+        if case.scene in PRODUCER.PLATFORM_KEYRING_FAILURES:
+            log = PRODUCER.PLATFORM_KEYRING_FAILURES[case.scene]
         if case.failure_command:
             log = f'Omarchy stage {case.failure_command} did not complete: exit status: {case.failure_status}'
             if case.native_phase == 'complete':
@@ -1432,14 +1438,42 @@ def evidence_fixture(root):
             log += '\n' + UnknownFixtureTerminal.prompt().decode()
         (evidence / f'{stage}.log').write_text(log)
     for stage in PRODUCER.ARCH_READONLY_STAGES:
-        (evidence / f'{stage}.log').write_text('System is up to date\n')
+        outage = stage == PRODUCER.ARCH_AUR_UNAVAILABLE_STAGE
+        (evidence / f'{stage}.log').write_text(
+            'Failed to check AUR updates\n' if outage else 'System is up to date\n')
+        (evidence / f'{stage}-exit.txt').write_text('1\n' if outage else '0\n')
         (evidence / f'{stage}-isolation.txt').write_text(
             'actual_id=arch ordinary_uid=65534 vendor_helpers=0 transcript_unchanged=yes\n')
-        (evidence / f'{stage}-native-state.json').write_text(json.dumps(dict(status='PASS_SIGNED_NATIVE_STATE')))
+        state = dict(status='PASS_SIGNED_NATIVE_STATE')
+        if outage:
+            state['unchanged_foreign_package'] = 'omg-coverage-foreign-1-1'
+        (evidence / f'{stage}-native-state.json').write_text(json.dumps(state))
     return evidence, profiles, artifacts
 
 
 class SupplementalEvidence(unittest.TestCase):
+    def test_platform_keyring_configuration_preserves_the_refresh_boundary(self):
+        control = 'omarchy-platform-keyring-unreadable'
+        self.assertEqual(PRODUCER.OMARCHY_CASES[control].native_phase, 'cache-pruned')
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            receipt = evidence / f'{control}-platform-keyrings.txt'
+            receipt.write_text('sync_databases=changed\n')
+            with self.assertRaisesRegex(ValueError, 'Platform keyring configuration'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
+    def test_normal_arch_aur_outage_requires_the_failure_diagnostic(self):
+        stage = 'arch-aur-unavailable'
+        self.assertIn(stage, PRODUCER.ARCH_READONLY_STAGES)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            log = evidence / f'{stage}.log'
+            log.write_text('System is up to date\n')
+            with self.assertRaisesRegex(ValueError, 'Normal Arch AUR outage'):
+                PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_omarchy_aur_outage_requires_a_retained_foreign_package_and_boot_verification(self):
         case = PRODUCER.OMARCHY_CASES['omarchy-aur-unavailable']
         self.assertEqual(case.native_phase, 'complete')

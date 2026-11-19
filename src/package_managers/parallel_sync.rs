@@ -45,16 +45,6 @@ async fn persist_same_dir_temp(
     Ok(())
 }
 
-/// Build the URL for a database file
-fn build_db_url(mirror_template: &str, repo: &str) -> String {
-    mirror_template
-        .replace("$repo", repo)
-        .replace("$arch", std::env::consts::ARCH)
-        + "/"
-        + repo
-        + ".db"
-}
-
 fn build_signature_url(database_url: &str) -> String {
     format!("{database_url}.sig")
 }
@@ -649,7 +639,7 @@ struct StagedRepository {
 pub async fn sync_databases_parallel() -> Result<()> {
     let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())
         .context("Failed to load repository servers from pacman.conf")?;
-    let repository_urls = repository_database_urls(&config, std::env::consts::ARCH)?;
+    let repository_urls = repository_database_urls(&config)?;
 
     // Sync directory (we should already be root at this point)
     let sync_dir = paths::pacman_sync_dir_result()?;
@@ -817,12 +807,12 @@ pub async fn sync_databases_parallel() -> Result<()> {
 
 fn repository_database_urls(
     config: &crate::core::pacman_conf::PacmanConfig,
-    architecture: &str,
 ) -> Result<Vec<(String, Vec<String>)>> {
     anyhow::ensure!(
         !config.repos.is_empty(),
         "pacman configuration contains no repositories"
     );
+    let architecture = config.primary_package_architecture()?;
     config
         .repos
         .iter()
@@ -832,7 +822,7 @@ fn repository_database_urls(
         })
         .map(|repo| {
             let servers = config
-                .resolve_servers(repo, architecture)
+                .resolve_servers(repo, &architecture)
                 .with_context(|| format!("Failed to resolve servers for repo '{}'", repo.name))?;
             anyhow::ensure!(
                 !servers.is_empty(),
@@ -842,7 +832,7 @@ fn repository_database_urls(
             let urls = servers
                 .iter()
                 .take(MAX_MIRRORS_PER_REPO)
-                .map(|server| build_db_url(server, &repo.name))
+                .map(|server| format!("{server}/{}.db", repo.name))
                 .collect();
             Ok((repo.name.clone(), urls))
         })
@@ -856,9 +846,9 @@ mod tests {
     #[test]
     fn repository_database_urls_respect_sync_usage() {
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
-            "[hidden]\nUsage = Search Install Upgrade\n[visible]\nUsage = Sync\nServer = https://mirror.example/$repo/os/$arch\n"
+            "[options]\nArchitecture = x86_64\n[hidden]\nUsage = Search Install Upgrade\n[visible]\nUsage = Sync\nServer = https://mirror.example/$repo/os/$arch\n"
         ).unwrap();
-        let urls = repository_database_urls(&config, "x86_64").unwrap();
+        let urls = repository_database_urls(&config).unwrap();
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0].0, "visible");
         assert_eq!(
@@ -1257,31 +1247,41 @@ mod tests {
     }
 
     #[test]
-    fn db_urls_substitute_repo_and_runtime_arch() {
-        let arch = std::env::consts::ARCH;
-        let url = build_db_url("https://mirror.example.com/$repo/os/$arch", "core");
-        assert_eq!(
-            url,
-            format!("https://mirror.example.com/core/os/{arch}/core.db")
-        );
-        let extra = build_db_url("https://mirror.example.com/$repo/os/$arch", "extra");
-        assert_eq!(
-            extra,
-            format!("https://mirror.example.com/extra/os/{arch}/extra.db")
-        );
+    fn db_urls_substitute_repo_and_running_kernel_machine() -> Result<()> {
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
+            "[options]\nArchitecture = auto explicit-machine\n\n\
+             [core]\nServer = https://mirror.example.com/$repo/os/$arch\n\n\
+             [extra]\nServer = https://mirror.example.com/$repo/os/$arch\n",
+        )?;
+        let kernel = nix::sys::utsname::uname()?;
+        let machine = kernel
+            .machine()
+            .to_str()
+            .context("Kernel machine is not UTF-8")?;
+        let urls = repository_database_urls(&config)?;
+        assert_eq!(urls.len(), 2);
+        for ((name, servers), repo) in urls.into_iter().zip(["core", "extra"]) {
+            assert_eq!(name, repo);
+            assert_eq!(
+                servers,
+                [format!(
+                    "https://mirror.example.com/{repo}/os/{machine}/{repo}.db"
+                )]
+            );
+        }
+        Ok(())
     }
 
     #[test]
     fn every_repository_uses_its_own_configured_servers() {
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
-            "[options]\n\n[core]\nServer = https://internal.example/$repo/os/$arch\n\
+            "[options]\nArchitecture = test-arch auto\n\n[core]\nServer = https://internal.example/$repo/os/$arch\n\
              Server = https://backup.example/$repo/$arch\n\n\
              [chaotic-aur]\nServer = https://community.example/$repo/$arch\n",
         )
         .expect("pacman config");
 
-        let repos =
-            repository_database_urls(&config, "test-arch").expect("repository URLs should resolve");
+        let repos = repository_database_urls(&config).expect("repository URLs should resolve");
         assert_eq!(
             repos,
             [
@@ -1310,8 +1310,8 @@ mod tests {
         )
         .expect("pacman config");
 
-        let error = repository_database_urls(&config, "test-arch")
-            .expect_err("missing repo policy must fail closed");
+        let error =
+            repository_database_urls(&config).expect_err("missing repo policy must fail closed");
         assert!(error.to_string().contains("extra"), "{error:#}");
     }
 }

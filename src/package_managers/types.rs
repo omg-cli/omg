@@ -35,13 +35,32 @@ pub enum SecurityOrigin {
     Unknown,
 }
 
-impl SecurityOrigin {
-    pub(crate) const fn registry_ecosystem(&self) -> Option<&'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryEcosystem {
+    Npm,
+    Cargo,
+    PyPi,
+    Go,
+}
+
+impl RegistryEcosystem {
+    pub(crate) const fn osv_name(self) -> &'static str {
         match self {
-            Self::NpmRegistry => Some("npm"),
-            Self::CargoRegistry => Some("crates.io"),
-            Self::PyPiRegistry => Some("PyPI"),
-            Self::GoModule => Some("Go"),
+            Self::Npm => "npm",
+            Self::Cargo => "crates.io",
+            Self::PyPi => "PyPI",
+            Self::Go => "Go",
+        }
+    }
+}
+
+impl SecurityOrigin {
+    pub(crate) const fn registry_ecosystem(&self) -> Option<RegistryEcosystem> {
+        match self {
+            Self::NpmRegistry => Some(RegistryEcosystem::Npm),
+            Self::CargoRegistry => Some(RegistryEcosystem::Cargo),
+            Self::PyPiRegistry => Some(RegistryEcosystem::PyPi),
+            Self::GoModule => Some(RegistryEcosystem::Go),
             _ => None,
         }
     }

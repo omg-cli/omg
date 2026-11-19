@@ -182,10 +182,12 @@ def allowed_file(parts):
             r"unsupported-mode|invalid-transport|snapshot-missing|snapshot-unsupported|required-helper-missing|"
             r"reboot-decline|reboot-accept|reboot-failure|authorization-refresh|authorization-denied|runtime-fallback|"
             r"runtime-foreign-lock|interrupted|output-closed|terminal-closed|preflight-failure|confirmation-failure|"
-            r"development-failure|inhibitor-start-failure|inhibitor-stop-failure|current-kernel|dev-config-unreadable|aur-unavailable)"
+            r"development-failure|inhibitor-start-failure|inhibitor-stop-failure|current-kernel|dev-config-unreadable|"
+            r"aur-unavailable|platform-keyring(?:-unreadable|-untrusted|-oversize)?)"
             r"(?:\.log|-helpers\.tsv|-native-state\.json|-transcript\.log|-coordination\.txt|-layout\.txt|-interaction\.json|-control\.json|-authorization\.json|-authorization\.log|-exit\.txt)"
             r"|omarchy-(?:unknown-signing-key|aur-unavailable)-unknown\.json"
-            r"|arch-(?:dry-run|check)(?:\.log|-native-state\.json|-isolation\.txt)"
+            r"|omarchy-platform-keyring-(?:unreadable|untrusted|oversize)-platform-keyrings\.txt"
+            r"|arch-(?:dry-run|check|aur-unavailable)(?:\.log|-native-state\.json|-isolation\.txt|-exit\.txt)"
             r"|test-[0-9]{2}\.log|daemon\.log|cli-(?:q|v|vv|vvv)\.log)", name
         ) is not None
     if parent == ("guest",):
