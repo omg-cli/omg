@@ -1231,8 +1231,6 @@ def _compiled_function_groups(name, owners, files, source, work=None, source_str
                               validated_spans=None, shared_prefixes=None):
     if work is not None:
         _construct_charge(work, len(source) + len(owners))
-        if source_structure is None:
-            _construct_charge(work, sum(len(line) + 1 for line in source))
         _construct_charge(work, sum(len(owner['filenames']) for owner in owners))
     names = Counter(owner['name'] for owner in owners)
     inventory = [owner for owner in owners if any(
@@ -1246,8 +1244,13 @@ def _compiled_function_groups(name, owners, files, source, work=None, source_str
         if span is None:
             return None
         by_span.setdefault(span[:2], []).append(owner)
+    if not by_span:
+        return inventory, {}, names
     if shared_prefixes is None:
-        if source_structure is None:source_structure=_source_structural_map(source)
+        if source_structure is None:
+            if work is not None:
+                _construct_charge(work, sum(len(line) + 1 for line in source))
+            source_structure = _source_structural_map(source)
         prefixes = source_function_prefixes(source, by_span, work, source_structure)
         if work is not None:
             qualified=closed_pgp_checksum_prefixes(name,source,inventory,files,by_span,source_structure,work)
@@ -4852,9 +4855,11 @@ def retained_arch_advisory_await(sides, work, *, finish=False):
                     or owner.get('branches') or owner.get('mcdc_records') or len(touching)!=2):
                 return None
             counts_at_slots = [row[4] for row in touching]
+            entered, completed = counts_at_slots
+            # An entered await can suspend without reaching the following context call.
             if (any(tuple(row[:4])!=slot or row[5:]!=[0,0,0] for row,slot in zip(touching,slots,strict=True))
-                    or not 0<=counts_at_slots[1]<=counts_at_slots[0]<=owner['count']<COUNTER_LIMIT
-                    or finish and counts_at_slots!=[owner['count']]*2
+                    or not 0<=completed<=entered<=owner['count']<COUNTER_LIMIT
+                    or finish and (entered!=owner['count'] or entered>0 and completed==0)
                     or not modern and any(counts_at_slots)):
                 return None
             observed[shape.copy_identity] = (symbol,counts_at_slots)
@@ -9621,14 +9626,16 @@ def retained_replacement_obligations(name, old, new, before, after, inventories,
         code = inventory[0]
         _construct_charge(work, 3 * len(inventory[1]) + len(code.words))
         by_opening = {row['opening']: row for row in inventory[1] if row['opening'] is not None}
-        function_rows = {}
+        function_rows = {}; statements = []
         for row in inventory[1]:
-            if row['kind'] == 'fn' and 'fn' in row['header']:
+            if row['kind'] == 'statement':
+                statements.append(row)
+            elif row['kind'] == 'fn' and 'fn' in row['header']:
                 span = (code.position(code.starts[row['first'] + row['header'].index('fn')])[0],
                         code.position(code.starts[row['end']])[0])
                 function_rows.setdefault(span, []).append(row)
-        _construct_charge(work, len(inventory[1]) * (len(inventory[1]).bit_length() + 1))
-        statements = sorted((row for row in inventory[1] if row['kind'] == 'statement'), key=lambda row: row['first'])
+        _construct_charge(work, len(statements) * (len(statements).bit_length() + 1))
+        statements.sort(key=lambda row: row['first'])
         statement_starts = [row['first'] for row in statements]
         functions = {}
         for prefix, group in compiled[1].items():
@@ -10549,7 +10556,7 @@ def _construct_replacements(old, new, work, head_inventory=None, compatible=None
         return [row for row in rows if row['end'] - row['first'] == size]
     proposals = {}
     if line_operations is None:
-        line_operations = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+        line_operations = source_line_diff(old, new)
     for tag, a, b, c, d in line_operations:
         if tag != 'equal':
             continue
@@ -11435,11 +11442,17 @@ def retained_construct_anchors(name, old, new, before, after, base, head, base_f
     return pairs, receipts
 
 
+def source_line_diff(old, new):
+    if old == new:
+        return [('equal', 0, len(old), 0, len(new))] if old else []
+    return difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+
+
 def source_opcodes(old, new, function_scopes, mapped, head_inventory=None, compatible=None,
                    work=None, inventories=None, replacements=None, line_operations=None):
     work = [20_000_000] if work is None else work
     if line_operations is None:
-        line_operations = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+        line_operations = source_line_diff(old, new)
     replacements = replacements if replacements is not None else ({} if old == new else _construct_replacements(
         old, new, work, head_inventory, compatible, inventories, line_operations=line_operations)[0])
     for row in _line_source_opcodes(old, new, function_scopes, mapped, line_operations):
@@ -13189,6 +13202,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 for number in range(group[0], group[1] + 1):
                     rows[number] = (prefix, group) if number not in rows else None
             partitions.append(rows)
+        compatible_head_scopes = {}
+        if inventories is not None:
+            for start, end, newstart, newend in set(function_scopes):
+                _construct_charge(construct_work, end - start + 1)
+                for line in range(start, end + 1):
+                    compatible_head_scopes[line] = (newstart, newend)
         def compatible_replacement(line, target, kind):
             if kind == 'control-endpoint':
                 return before.get(line, 0) > 0 and target not in after
@@ -13213,12 +13232,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             record_projections[key] = _owner_line_counts(owner, record_work)
                         state.append(int(record_projections[key].get(number, 0) > 0))
                 return True
-            _construct_charge(construct_work, len(function_scopes))
-            return (any(start <= line <= end and newstart <= target <= newend
-                        for start, end, newstart, newend in function_scopes)
+            _construct_charge(construct_work, 1)
+            bounds = compatible_head_scopes.get(line)
+            return (bounds is not None and bounds[0] <= target <= bounds[1]
                     or kind == 'statement' and left is not None and right is not None
                     and left[0] in removed_prefixes and len(left[1][2]) == len(right[1][2]))
-        line_operations = difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes()
+        line_operations = source_line_diff(old, new)
         replacement_candidates = {} if old == new else _construct_replacements(
             old, new, construct_work, head_construct_inventory, compatible_replacement, inventories,
             deferred=True, line_operations=line_operations)[0]

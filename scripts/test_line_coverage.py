@@ -29,6 +29,15 @@ def report(hit=1, found=2, counts=(1, 0)):
 
 
 class LineCoverageTests(unittest.TestCase):
+    def test_identical_repeated_sources_keep_all_retained_lines_without_alignment(self):
+        source = ['fn retained() {', *['    same();'] * 64, '}']
+        mapped = dict.fromkeys(range(1, len(source) + 1), 1)
+        with patch.object(coverage.difflib, 'SequenceMatcher', side_effect=AssertionError('redundant diff')):
+            rows = list(coverage.source_opcodes(source, source.copy(), [], mapped))
+            empty = list(coverage.source_opcodes([], [], [], {}))
+        self.assertEqual([row[:5] for row in rows], [('equal', 0, len(source), 0, len(source))])
+        self.assertEqual(empty, [])
+
     def test_single_validated_owner_reuses_its_raw_span_without_sorting_one_shape(self):
         name = 'src/example.rs'
         filename = '/artifact/src/example.rs'
@@ -52,6 +61,25 @@ class LineCoverageTests(unittest.TestCase):
             name, [owner], files, source, [200], source_structure=structure,
             validated_spans=spans, shared_prefixes=prefixes)
         self.assertEqual(reversed_groups, groups)
+
+    def test_invalid_validated_span_stops_before_charging_for_source_parsing(self):
+        name = 'src/example.rs'
+        path = '/artifact/src/example.rs'
+        source = ['fn retained() {', '    example("' + 'a' * 10000 + '");', '}']
+        owner = dict(name='compiled', filenames=[path], regions=[])
+        with patch.object(coverage, '_source_structural_map', side_effect=AssertionError('invalid span parsed')):
+            result = coverage._compiled_function_groups(name, [owner], {path: name}, source,
+                                                        [16], validated_spans={})
+        self.assertIsNone(result)
+
+    def test_valid_span_cannot_parse_before_source_size_admission(self):
+        name = 'src/example.rs'
+        path = '/artifact/src/example.rs'
+        source = ['fn retained() {', '    example("' + 'a' * 10000 + '");', '}']
+        owner = dict(name='compiled', filenames=[path], regions=[[1, 1, 3, 2, 1, 0, 0, 0]])
+        with patch.object(coverage, '_source_structural_map', side_effect=AssertionError('source parsed before admission')):
+            with self.assertRaisesRegex(ValueError, 'work bound exceeded'):
+                coverage._compiled_function_groups(name, [owner], {path: name}, source, [16])
 
     def test_replacement_and_retained_rows_share_the_same_full_source_diff(self):
         old = ['fn retained() {', '    before();', '    keep();', '}']
@@ -2020,6 +2048,11 @@ class SourceConstructCapacityTests(unittest.TestCase):
             report = coverage.read_coverage(lcov)
             return coverage.require_source_no_regression(report, report, regions, regions, sources, sources)
 
+    def test_identical_file_blobs_skip_the_full_line_diff_and_keep_the_proof(self):
+        with patch.object(coverage.difflib, 'SequenceMatcher', side_effect=AssertionError('redundant diff')):
+            receipt = self.compare()
+        self.assertEqual(receipt['deleted_mapped'], 0)
+
     def test_main_capacity_admits_work_above_old_limit_without_changing_other_limits(self):
         original = coverage.retained_construct_anchors
         calls = []
@@ -2114,6 +2147,12 @@ class SourceConstructCapacityTests(unittest.TestCase):
                 failures.append(str(failure.exception))
         self.assertEqual(receipts[0], receipts[1])
         self.assertEqual(failures[0], failures[1])
+
+    def test_retained_capsule_statement_sort_fits_its_work_budget(self):
+        fixture = SourceAwareCoverageTests()
+        expected = fixture.renamed_capsule_compare()
+        with patch.object(coverage, 'SOURCE_CONSTRUCT_WORK_CAPACITY', 3655):
+            self.assertEqual(fixture.renamed_capsule_compare(), expected)
 
 
 class SourceAwareCoverageTests(unittest.TestCase):
@@ -11104,9 +11143,16 @@ class InherentAsyncLeafTests(unittest.TestCase):
                 hits = 2 if modern and index==1 else 0
                 if fault!='missing' or index==0:
                     if finish:
+                        completion = hits
+                        if hits and fault=='pending-await':
+                            completion -= 1
+                        elif hits and fault=='missing-completion':
+                            completion = 0
+                        elif hits and fault=='extra-completion':
+                            completion += 1
                         owners.append(dict(root,name=f'_RNC{base}NtB7_18ArchPackageManagerNtNtB9_6traits14PackageManager14security_audit0Bb_',
                                            count=hits,regions=[[line,14,line,19,hits,0,0,0],
-                                                                [line+1,14,line+1,21,hits,0,0,0]]))
+                                                                [line+1,14,line+1,21,completion,0,0,0]]))
                     else:
                         owners.append(dict(root,name=f'_RNCNC{base}NtB9_18ArchPackageManagerNtNtBb_6traits14PackageManager14security_audit00Bd_',
                                            regions=[[6,operation[0].index(scanner)+1,line,27,hits,0,0,0],
@@ -11124,6 +11170,16 @@ class InherentAsyncLeafTests(unittest.TestCase):
         finished = coverage.retained_arch_advisory_await((scenario(False,finish=True),scenario(True,finish=True)),
                                                          [200_000],finish=True)
         self.assertEqual(finished['pairs'],[[11,15],[12,16]])
+        previous_finish = scenario(False,finish=True)
+        partial = coverage.retained_arch_advisory_await(
+            (previous_finish,scenario(True,'pending-await',finish=True)),[200_000],finish=True)
+        self.assertEqual(partial['pairs'],finished['pairs'])
+        self.assertEqual(sorted(counts for _,counts in partial['compiled_waits'][1]),[[0,0],[2,1]])
+        self.assertEqual(partial['mapped_credit'],[0,0])
+        for control in ('missing-completion','extra-completion'):
+            with self.subTest(control=control):
+                self.assertIsNone(coverage.retained_arch_advisory_await(
+                    (previous_finish,scenario(True,control,finish=True)),[200_000],finish=True))
 
     def test_arch_audit_entry_observes_both_box_and_future_in_each_compiled_copy(self):
         source = ['impl PackageManager for ArchPackageManager {', '    fn security_audit(&self) {',

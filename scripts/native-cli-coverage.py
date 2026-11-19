@@ -229,7 +229,7 @@ def fixture_signing_key(signing, identity):
     return fingerprints[0]
 
 
-def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_audio=False,
+def create_signed_fixture(owner, current_kernel=False, native_migrations=False, installed_migrations=False,
                           repository_compression="gz", unknown_app_signer=False, foreign_package=False,
                           platform_keyring=False):
     require(repository_compression in ("gz", "bz2"), "Unsupported signed repository compression")
@@ -293,7 +293,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         old_payload = before_public if keyring else (name + ': installed1\n').encode()
         new_payload = updated_public if keyring else (name + ': upgraded3\n').encode()
         migration_only = native_migrations and name in ('xorg-xrandr', 'hp-omnibook-3-audio')
-        if not migration_only or installed_audio and name == 'hp-omnibook-3-audio':
+        if not migration_only or installed_migrations:
             fixture_local_package(owner / 'root', owner / 'db', name, '1-1', payload_path, old_payload, reason, depends)
         archive = fixture_package(owner / 'repos' / repository, name, '3-1', payload_path, new_payload, depends)
         package_signer = unknown_signer if name == 'omg-coverage-app' else fingerprint
@@ -302,7 +302,7 @@ def create_signed_fixture(owner, current_kernel=False, native_migrations=False, 
         inventory = migration_packages if migration_only else initial
         inventory[name] = {'version': '3-1' if migration_only else '1-1', 'reason': reason,
                            'payload_path': payload_path, 'after_sha256': hashlib.sha256(new_payload).hexdigest()}
-        if installed_audio and name == 'hp-omnibook-3-audio':
+        if migration_only and installed_migrations:
             initial[name] = dict(inventory[name], version='1-1', before_sha256=hashlib.sha256(old_payload).hexdigest())
         if not migration_only:
             inventory[name]['before_sha256'] = hashlib.sha256(old_payload).hexdigest()
@@ -1222,7 +1222,7 @@ OMARCHY_CASES = {
     ) + OMARCHY_SUFFIX[3:], absent_helper='omarchy-notification-dismiss', native_phase='migrated'),
     'omarchy-native-migrations-script-failure': OmarchyCase(1, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
         'omarchy-update-stay-awake\tstop',), native_phase='repository-upgraded'),
-    'omarchy-native-migrations-installed-audio': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
+    'omarchy-native-migrations-preinstalled': OmarchyCase(0, OMARCHY_PREFIX + OMARCHY_SUFFIX[:2] + (
         'omarchy-hw-aarch64-qualcomm', 'omarchy-hw-match\tOmniBook 3 Laptop',
         'omarchy-notification-dismiss\tOmarchy Migrations',
     ) + OMARCHY_SUFFIX[3:], native_phase='migrated'),
@@ -1686,7 +1686,7 @@ for stage in OMARCHY_STAGE_NAMES; do
   signed_options=()
   if test "$stage" = omarchy-current-kernel; then signed_options=(--current-kernel); fi
   if [[ $stage == omarchy-native-migrations* ]]; then signed_options=(--native-migrations); fi
-  if test "$stage" = omarchy-native-migrations-installed-audio; then signed_options+=(--installed-audio); fi
+  if test "$stage" = omarchy-native-migrations-preinstalled; then signed_options+=(--installed-migrations); fi
   if test "$stage" = omarchy-unknown-signing-key; then signed_options+=(--unknown-app-signer); fi
   if test "$stage" = omarchy-aur-unavailable; then signed_options+=(--foreign-package); fi
   if test "$stage" = omarchy-platform-keyring; then signed_options+=(--platform-keyring); fi
@@ -2530,14 +2530,13 @@ def validate_evidence(evidence, profiles, artifacts, commit):
             require((evidence / f'{stage}-migrations.txt').read_text()
                     == 'ordered_configuration=before,after recognized_native_migrations=2 completion_markers=4\n',
                     'Native migration completion evidence differs')
-            audio_installed = stage.endswith(('-unmatched', '-installed-audio'))
-            operations = ('migration-xrandr',) if audio_installed else ('migration-xrandr', 'migration-omnibook-audio')
-            require(all(f'Native Omarchy {operation} completed' in log
-                        for operation in operations),
-                    'Native migration package operations did not complete')
-            if audio_installed:
-                require('Native Omarchy migration-omnibook-audio completed' not in log,
-                        'Skipped audio migration invoked an unnecessary package transaction')
+            preinstalled = stage.endswith('-preinstalled')
+            for operation, expected in (
+                    ('migration-xrandr', not preinstalled),
+                    ('migration-omnibook-audio', not preinstalled and not stage.endswith('-unmatched'))):
+                completed = f'Native Omarchy {operation} completed' in log
+                require(completed == expected, 'Native migration package operations did not complete'
+                        if expected else 'Skipped migration invoked an unnecessary package transaction')
         if stage == 'omarchy-native-migrations-notification-error':
             require('Cannot dismiss the Omarchy migration notification:' in log,
                     'Migration notification failure was hidden')
@@ -2799,7 +2798,7 @@ def main():
     signed.add_argument('--owner', required=True, type=Path)
     signed.add_argument('--current-kernel', action='store_true')
     signed.add_argument('--native-migrations', action='store_true')
-    signed.add_argument('--installed-audio', action='store_true')
+    signed.add_argument('--installed-migrations', action='store_true')
     signed.add_argument('--unknown-app-signer', action='store_true')
     signed.add_argument('--foreign-package', action='store_true')
     signed.add_argument('--platform-keyring', action='store_true')
@@ -2839,7 +2838,7 @@ def main():
             json.dump(value, stream, indent=2)
             stream.write('\n')
     elif args.operation == 'signed-fixture':
-        create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_audio,
+        create_signed_fixture(args.owner, args.current_kernel, args.native_migrations, args.installed_migrations,
                               unknown_app_signer=args.unknown_app_signer, foreign_package=args.foreign_package,
                               platform_keyring=args.platform_keyring)
     elif args.operation == 'fresh-admission-fixture':

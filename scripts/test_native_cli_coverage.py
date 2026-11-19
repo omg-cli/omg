@@ -1390,7 +1390,7 @@ def evidence_fixture(root):
             'omarchy-native-migrations-unmatched': '| System is up to date\nNative Omarchy migration-xrandr completed',
             'omarchy-native-migrations-notification-error': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed\nCannot dismiss the Omarchy migration notification:',
             'omarchy-native-migrations-notification-missing': '| System is up to date\nNative Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
-            'omarchy-native-migrations-installed-audio': '| System is up to date\nNative Omarchy migration-xrandr completed',
+            'omarchy-native-migrations-preinstalled': '| System is up to date',
             'omarchy-native-migrations-script-failure': '0000000000.sh failed: exit status: 7',
             'omarchy-native-migrations-inventory-error': 'Cannot inspect pending Omarchy migrations',
             'omarchy-native-migrations-directory-untrusted': 'Selected Omarchy runtime directory is not root-controlled',
@@ -1922,11 +1922,24 @@ class FreshAdmissionFixture(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'migration package operations'):
                 PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
 
+    def test_preinstalled_migration_packages_must_not_run_an_install_transaction(self):
+        stage = 'omarchy-native-migrations-preinstalled'
+        with tempfile.TemporaryDirectory() as directory:
+            evidence, profiles, artifacts = evidence_fixture(Path(directory))
+            log = evidence / f'{stage}.log'
+            original = log.read_text()
+            PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+            for operation in ('migration-xrandr', 'migration-omnibook-audio'):
+                with self.subTest(operation=operation):
+                    log.write_text(original + f'\nNative Omarchy {operation} completed\n')
+                    with self.assertRaisesRegex(ValueError, 'unnecessary package transaction'):
+                        PRODUCER.validate_evidence(evidence, profiles, artifacts, 'b' * 40)
+
     def test_native_migration_failure_cases_are_mandatory_and_cannot_forge_completion(self):
         required = {'omarchy-native-migrations-notification-error',
                     'omarchy-native-migrations-notification-missing',
                     'omarchy-native-migrations-script-failure',
-                    'omarchy-native-migrations-installed-audio'}
+                    'omarchy-native-migrations-preinstalled'}
         self.assertTrue(required <= PRODUCER.OMARCHY_CASES.keys())
         with tempfile.TemporaryDirectory() as directory:
             evidence, profiles, artifacts = evidence_fixture(Path(directory))
@@ -1935,11 +1948,7 @@ class FreshAdmissionFixture(unittest.TestCase):
                     ('omarchy-native-migrations-notification-error.log',
                      'Cannot dismiss the Omarchy migration notification:', '', 'notification'),
                     ('omarchy-native-migrations-script-failure-migrations.txt',
-                     'completion_markers=0', 'completion_markers=1', 'completion marker'),
-                    ('omarchy-native-migrations-installed-audio.log',
-                     'Native Omarchy migration-xrandr completed',
-                     'Native Omarchy migration-xrandr completed\nNative Omarchy migration-omnibook-audio completed',
-                     'unnecessary package transaction')):
+                     'completion_markers=0', 'completion_markers=1', 'completion marker')):
                 path = evidence / filename
                 contents = path.read_text()
                 self.assertIn(original, contents)

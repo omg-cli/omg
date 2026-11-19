@@ -150,17 +150,9 @@ pub fn execute_native_omarchy_operation(
         }
         NativeOmarchyOperation::UpgradeRepositories => Vec::new(),
         NativeOmarchyOperation::RemoveOrphans => super::list_orphans_direct()?,
-        NativeOmarchyOperation::InstallTrayMenuDependency => {
-            if super::is_installed_fast("xorg-xrandr")? {
-                return Ok(());
-            }
-            vec!["xorg-xrandr".to_owned()]
-        }
+        NativeOmarchyOperation::InstallTrayMenuDependency => missing_package_target("xorg-xrandr")?,
         NativeOmarchyOperation::InstallOmnibookAudio => {
-            if super::is_installed_fast("hp-omnibook-3-audio")? {
-                return Ok(());
-            }
-            vec!["hp-omnibook-3-audio".to_owned()]
+            missing_package_target("hp-omnibook-3-audio")?
         }
     };
     if operation == NativeOmarchyOperation::RefreshKeyrings {
@@ -169,7 +161,7 @@ pub fn execute_native_omarchy_operation(
             .build()?
             .block_on(super::sync_databases_parallel())?;
     }
-    if operation == NativeOmarchyOperation::RemoveOrphans && targets.is_empty() {
+    if operation != NativeOmarchyOperation::UpgradeRepositories && targets.is_empty() {
         return Ok(());
     }
     let (kind, changes) = if operation == NativeOmarchyOperation::UpgradeRepositories {
@@ -232,6 +224,14 @@ pub fn execute_native_omarchy_operation(
     invalidate_caches()?;
     println!("Native Omarchy {} completed", operation.argument());
     Ok(())
+}
+
+fn missing_package_target(name: &str) -> AnyhowResult<Vec<String>> {
+    Ok(if super::is_installed_fast(name)? {
+        Vec::new()
+    } else {
+        vec![name.to_owned()]
+    })
 }
 
 /// Arch Linux package manager (ALPM) implementation

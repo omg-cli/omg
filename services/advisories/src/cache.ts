@@ -1,6 +1,8 @@
 import { object, sha256 } from "./domain";
 
 const MAX_CACHE_URL_LENGTH = 8 * 1024;
+const CACHE_ORIGIN = /^https?:\/\/(?:[a-z0-9.-]{1,253}|\[[a-f0-9:]{2,39}\])(?::[0-9]{1,5})?$/;
+const CACHE_DIGEST = /^[a-f0-9]{64}$/;
 
 function publicRead(request: Request): boolean {
     return request.method === "GET" && !request.headers.has("authorization") &&
@@ -58,9 +60,12 @@ export async function cachedRead(
     load: (request: Request) => Promise<Response>, now = Date.now(),
 ): Promise<Response> {
     if (request.url.length > MAX_CACHE_URL_LENGTH || !publicRead(request)) return load(request);
-    const origin = new URL(request.url).origin;
+    const origin = CACHE_ORIGIN.exec(new URL(request.url).origin)?.[0];
+    if (!origin) return load(request);
+    const digest = CACHE_DIGEST.exec(await sha256(request.url))?.[0];
+    if (!digest) return load(request);
     // Keep the request's zone and distinguish every query without using it as a cache path.
-    const key = new Request(`${origin}/.omg/advisory-cache/v1/${await sha256(request.url)}`);
+    const key = new Request(`${origin}/.omg/advisory-cache/v1/${digest}`);
     const directives = request.headers.get("cache-control") ?? "";
     const noStore = /(?:^|,)\s*no-store\s*(?:,|$)/i.test(directives);
     const revalidate = noStore || /(?:^|,)\s*(?:no-cache|max-age\s*=\s*0)\s*(?:,|$)/i.test(directives) ||

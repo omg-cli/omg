@@ -1247,18 +1247,16 @@ mod tests {
     }
 
     #[test]
-    fn db_urls_substitute_repo_and_running_kernel_machine() -> Result<()> {
+    fn db_urls_substitute_repo_and_running_kernel_machine() {
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
             "[options]\nArchitecture = auto explicit-machine\n\n\
              [core]\nServer = https://mirror.example.com/$repo/os/$arch\n\n\
              [extra]\nServer = https://mirror.example.com/$repo/os/$arch\n",
-        )?;
-        let kernel = nix::sys::utsname::uname()?;
-        let machine = kernel
-            .machine()
-            .to_str()
-            .context("Kernel machine is not UTF-8")?;
-        let urls = repository_database_urls(&config)?;
+        )
+        .expect("valid repository fixtures");
+        let kernel = nix::sys::utsname::uname().expect("running kernel identity");
+        let machine = kernel.machine().to_str().expect("UTF-8 kernel machine");
+        let urls = repository_database_urls(&config).expect("resolved repository URLs");
         assert_eq!(urls.len(), 2);
         for ((name, servers), repo) in urls.into_iter().zip(["core", "extra"]) {
             assert_eq!(name, repo);
@@ -1269,7 +1267,6 @@ mod tests {
                 )]
             );
         }
-        Ok(())
     }
 
     #[test]

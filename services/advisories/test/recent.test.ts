@@ -112,7 +112,11 @@ test("an edge entry expires before its freshness claim and cache failure falls b
 test("edge cache keys stay on the request origin and bound the URL sent to cache storage", async () => {
     const origin = "https://advisories.example";
     const request = new Request(`${origin}/v1/cves/recent?limit=2`);
+    const anotherPage = new Request(`${origin}/v1/cves/recent?limit=3`);
+    const preview = new Request("http://[::1]:8787/v1/cves/recent?limit=2");
     const oversized = new Request(`${origin}/v1/cves/recent?cursor=${"a".repeat(8192)}`);
+    const oversizedHost = new Request(`https://${"a".repeat(254)}/v1/cves/recent`);
+    const unsupportedHost = new Request("https://under_score.example/v1/cves/recent");
     const reads: string[] = [];
     const writes: string[] = [];
     const loads: string[] = [];
@@ -127,10 +131,13 @@ test("edge cache keys stay on the request origin and bound the URL sent to cache
         loads.push(input.url);
         return new Response(input.url, { headers: { "Cache-Control": "public, max-age=60" } });
     };
-    expect(await (await cachedRead(request, cache, load)).text()).toBe(request.url);
-    expect(await (await cachedRead(oversized, cache, load)).text()).toBe(oversized.url);
-    expect(loads).toEqual([request.url, oversized.url]);
+    const requests = [request, anotherPage, preview, oversized, oversizedHost, unsupportedHost];
+    for (const input of requests)
+        expect(await (await cachedRead(input, cache, load)).text()).toBe(input.url);
+    expect(loads).toEqual(requests.map((input) => input.url));
     expect(reads).toEqual(writes);
-    expect(reads).toHaveLength(1);
-    expect(reads[0]).toMatch(/^https:\/\/advisories\.example\/[^?]{1,128}$/);
+    expect(reads).toHaveLength(3);
+    expect(reads[0]).toMatch(/^https:\/\/advisories\.example\/\.omg\/advisory-cache\/v1\/[a-f0-9]{64}$/);
+    expect(reads[1]).not.toBe(reads[0]);
+    expect(reads[2]).toMatch(/^http:\/\/\[::1\]:8787\/\.omg\/advisory-cache\/v1\/[a-f0-9]{64}$/);
 });

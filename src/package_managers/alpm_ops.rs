@@ -2353,12 +2353,11 @@ fn confirm_advisory_prompt(
     anyhow::bail!("Security acknowledgement requires Linux terminal ownership checks")
 }
 
-fn confirm_unknown_archives(
+fn unknown_archives_prompt(
     packages: &[PreparedAdvisoryPackage],
     digest: &str,
     invoking_uid: u32,
-    signals: &AdmissionSignals,
-) -> Result<UnknownArchiveAcknowledgement> {
+) -> Result<String> {
     use std::fmt::Write as _;
     let unknown = packages
         .iter()
@@ -2390,6 +2389,16 @@ fn confirm_unknown_archives(
             ))?
         )?;
     }
+    Ok(prompt)
+}
+
+fn confirm_unknown_archives(
+    packages: &[PreparedAdvisoryPackage],
+    digest: &str,
+    invoking_uid: u32,
+    signals: &AdmissionSignals,
+) -> Result<UnknownArchiveAcknowledgement> {
+    let prompt = unknown_archives_prompt(packages, digest, invoking_uid)?;
     confirm_advisory_prompt(&prompt, digest, invoking_uid, signals)?;
     Ok(UnknownArchiveAcknowledgement {
         batch_digest: digest.to_owned(),
@@ -2876,6 +2885,49 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn archive_acknowledgement_lists_only_private_archives_and_bounds_the_batch()
+    -> anyhow::Result<()> {
+        use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
+        let prepared =
+            |name: &str, origin: SecurityOrigin, digest: &str| super::PreparedAdvisoryPackage {
+                package: SecurityPackage {
+                    name: name.into(),
+                    version: "1-1".into(),
+                    architecture: Some("x86_64".into()),
+                    origin,
+                    advisory_source: None,
+                    description: String::new(),
+                    licenses: Vec::new(),
+                },
+                sha256: Some(digest.repeat(64)),
+                archive: None,
+            };
+        let aur = prepared("aur-fixture", SecurityOrigin::AurArchive, "a");
+        let local = prepared("local-fixture", SecurityOrigin::LocalArchive, "b");
+        let repository = prepared(
+            "official-fixture",
+            SecurityOrigin::ArchRepository {
+                repository: "core".into(),
+            },
+            "c",
+        );
+        let prompt = super::unknown_archives_prompt(
+            &[aur.clone(), repository, local],
+            "prepared-batch",
+            1000,
+        )?;
+        assert!(prompt.contains("Invoking UID: 1000"));
+        assert!(prompt.contains("Full prepared batch SHA-256: prepared-batch"));
+        assert!(prompt.contains("aur-fixture") && prompt.contains(&"a".repeat(64)));
+        assert!(prompt.contains("local-fixture") && prompt.contains(&"b".repeat(64)));
+        assert!(!prompt.contains("official-fixture"));
+        let error = super::unknown_archives_prompt(&vec![aur; 65], "oversize", 1000)
+            .expect_err("oversized archive acknowledgements must be split");
+        assert!(error.to_string().contains("at most 64 archives"));
+        Ok(())
+    }
+
     #[test]
     fn prepared_unknown_review_is_required_and_bound_without_fabricating_snapshot_authority()
     -> anyhow::Result<()> {
