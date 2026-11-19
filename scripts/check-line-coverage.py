@@ -3434,7 +3434,7 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                 instance_states=states,observations=receipts)
 
 
-def policy_default_record_shape(code, rows, line, work):
+def tail_record_scope(code, rows, line, work):
     token=bisect.bisect_left(code.starts,code.offsets[line-1])
     parents=_construct_ancestors(code,token,work)
     if len(parents)!=3:
@@ -3444,12 +3444,22 @@ def policy_default_record_shape(code, rows, line, work):
     if len(shapes)!=3:
         return None
     record,function,implementation=(shapes[token] for token in parents)
-    if (record['header']!=('Self',) or function['header']!=('fn','default','(',')','->','Self')
-            or implementation['header']!=('impl','Default','for','SecurityPolicy')
-            or record['first']!=function['opening']+1 or record['end']+1!=function['end']):
+    if (record['header']!=('Self',) or record['first']!=function['opening']+1
+            or record['end']+1!=function['end']):
         return None
     arguments=_boolean_arguments(code,record['opening'])
     if not arguments or len(arguments)>8:
+        return None
+    return record,function,implementation,arguments
+
+
+def policy_default_record_shape(code, rows, line, work):
+    scope = tail_record_scope(code, rows, line, work)
+    if scope is None:
+        return None
+    record,function,implementation,arguments=scope
+    if (function['header']!=('fn','default','(',')','->','Self')
+            or implementation['header']!=('impl','Default','for','SecurityPolicy')):
         return None
     fields=[]
     for start,end in arguments:
@@ -3467,7 +3477,7 @@ def policy_default_record_shape(code, rows, line, work):
         field_line=code.position(code.starts[start])[0]
         if marker[0]!=field_line or marker[2]!=field_line:
             return None
-        fields.append((words,field_line,marker))
+        fields.append((words,field_line,(marker,)))
     first=code.position(code.starts[function['first']])[0]
     last=code.position(code.ends[function['end']])[0]
     if (fields[0][1]!=line or len({item[0][0] for item in fields})!=len(fields)
@@ -3475,19 +3485,73 @@ def policy_default_record_shape(code, rows, line, work):
         return None
     anchors=(code.region(function['first'],function['opening']-1),
              code.region(record['first'],record['end']),code.region(function['end'],function['end']))
-    return (first,last),fields,anchors
+    return (first,last),fields,anchors,'default'
 
 
-def retained_policy_default_record(name, sides, indexes, work):
+def scanner_record_shape(code, rows, line, work):
+    scope = tail_record_scope(code, rows, line, work)
+    if scope is None:
+        return None
+    record, function, implementation, arguments = scope
+    if implementation['header'] != ('impl', 'VulnerabilityScanner'):
+        return None
+    header = function['header']
+    if header == ('pub', 'fn', 'new', '(', ')', '->', 'Self'):
+        retained = [
+            (('osv_api_url', ':', '"https://api.osv.dev/v1/query"', '.', 'to_string', '(', ')'), ((2, 2), (4, 4))),
+            (('osv_ecosystem_override', ':', 'None'), ((2, 2),)),
+        ]
+    elif header == ('pub', 'fn', 'with_osv_endpoint', '(', 'osv_api_url', ':', 'String',
+                    ',', 'ecosystem', ':', 'String', ')', '->', 'Self'):
+        retained = [
+            (('osv_api_url',), ((0, 0),)),
+            (('osv_ecosystem_override', ':', 'Some', '(', 'ecosystem', ')'), ((2, 5),)),
+        ]
+    else:
+        return None
+    fields = []
+    expected = [
+        (('client', ':', 'shared_client', '(', ')', '.', 'clone', '(', ')'), ((2, 4), (6, 6))),
+        *retained,
+    ]
+    if len(arguments) == 4:
+        expected.append((('arch_endpoint', ':', 'ARCH_ADVISORY_ENDPOINT', '.', 'to_owned', '(', ')'),
+                         ((2, 2), (4, 4), (2, 6))))
+    if len(arguments) != len(expected):
+        return None
+    for (start, end), (tokens, markings) in zip(arguments, expected, strict=True):
+        _construct_charge(work, end - start + len(markings))
+        if tuple(code.words[start:end]) != tokens or code.words[end] != ',':
+            return None
+        number = code.position(code.starts[start])[0]
+        marks = tuple(code.region(start + lo, start + hi) for lo, hi in markings)
+        if any(mark[0] != number or mark[2] != number for mark in marks):
+            return None
+        fields.append((tokens, number, marks))
+    first = code.position(code.starts[function['first']])[0]
+    last = code.position(code.ends[function['end']])[0]
+    if line != fields[0][1] or [field[1] for field in fields] != list(range(first + 2, last - 1)):
+        return None
+    anchors = (code.region(function['first'], function['opening'] - 1),
+               code.region(record['first'], record['end']), code.region(function['end'], function['end']))
+    return (first, last), fields, anchors, header[2]
+
+
+def retained_eager_tail_record(name, sides, indexes, work):
     records=[]; copies=[]; states=[]; refinements=[]
-    namespace=('type',('type',('type',('crate','omg_lib'),('core','')),('security','')),('policy',''))
-    trait=('type',('type',('crate','core'),('default','')),('Default',''))
+    scanner = name == 'src/core/security/vulnerability.rs'
+    if not scanner and name != 'src/core/security/policy.rs':
+        return None
+    leaf, record_type = ('vulnerability', 'VulnerabilityScanner') if scanner else ('policy', 'SecurityPolicy')
+    namespace=('type',('type',('type',('crate','omg_lib'),('core','')),('security','')),(leaf,''))
+    trait=None if scanner else ('type',('type',('crate','core'),('default','')),('Default',''))
+    shape = scanner_record_shape if scanner else policy_default_record_shape
     for (_,inventory,spans,counts,line),index in zip(sides,indexes,strict=True):
-        parsed=policy_default_record_shape(*inventory[:2],line,work)
+        parsed=shape(*inventory[:2],line,work)
         if parsed is None:
             return None
-        (first,last),fields,anchors=parsed
-        allowed={item[2]:n for n,item in enumerate(fields)}
+        (first,last),fields,anchors,method=parsed
+        allowed={mark:(n, i) for n,item in enumerate(fields) for i,mark in enumerate(item[2])}
         roots=[]
         owners=index.inventories.get(name,())
         _construct_charge(work,len(owners))
@@ -3500,13 +3564,14 @@ def retained_policy_default_record(name, sides, indexes, work):
             if not any(r[0]<=last and (r[2]>first or r[2]==first and r[3]>1) for r in raw):
                 continue
             symbol=owner['name']; _construct_charge(work,len(symbol)+len(raw)+1)
-            decoded=nominal_method_path(symbol,core_default_impl=True)
+            decoded=nominal_method_path(symbol,core_default_impl=not scanner)
             hits=owner['count']
             if (span is None or span[:2]!=(first,last) or index.name_counts[symbol]!=1
-                    or decoded is None or decoded.kind!='X' or decoded.namespace!=namespace
-                    or decoded.self_type!=('type',namespace,('SecurityPolicy','')) or decoded.trait!=trait
-                    or decoded.method!=('default','') or decoded.callbacks
+                    or decoded is None or decoded.kind!=('M' if scanner else 'X') or decoded.namespace!=namespace
+                    or decoded.self_type!=('type',namespace,(record_type,'')) or decoded.trait!=trait
+                    or decoded.method!=(method,'') or decoded.callbacks
                     or owner.get('branches') or owner.get('mcdc_records') or not 0<=hits<COUNTER_LIMIT
+                    or scanner and hits==0
                     or any(r[5:]!=[0,0,0] or r[4]!=hits for r in raw)):
                 return None
             geometry={tuple(r[:4]) for r in raw}
@@ -3522,22 +3587,29 @@ def retained_policy_default_record(name, sides, indexes, work):
         if _owner_line_counts({'regions':raw},_ObserverWork(work))!={
                 n:counts[n] for n in range(first,last+1) if n in counts}:
             return None
-        records.append(((first,last),fields,roots[0][1].parent_scope))
+        scope=roots[0][1].parent_scope
+        # Both scanner cohorts are wholly exercised and bound to the same
+        # lexical constructor. Its impl ordinal can move between crate builds.
+        records.append(((first,last),fields,(scope[0],scope[2:],method) if scanner else scope))
         copies.append([dict(name=owner['name'],count=owner['count'],regions=owner['regions']) for owner,_,_ in roots])
         states.append(sorted(item[0]['count']>0 for item in roots))
-        refinements.append(roots[0][2])
+        refinements.append(roots[0][2] if scanner else tuple(n for n,_ in roots[0][2]))
     (old,left,old_scope),(new,right,new_scope)=records
-    additions=(('advisory_requirement',':','AdvisoryRequirement','::','Optional'),
-               ('arch_advisory_repositories',':','BTreeSet','::','new','(',')'))
-    if (len(left)!=5 or len(right)!=7 or [item[0] for item in left]!=[item[0] for item in right[:5]]
-            or tuple(item[0] for item in right[5:])!=additions or old_scope!=new_scope
+    additions=((('arch_endpoint', ':', 'ARCH_ADVISORY_ENDPOINT', '.', 'to_owned', '(', ')'),) if scanner else
+               (('advisory_requirement',':','AdvisoryRequirement','::','Optional'),
+                ('arch_advisory_repositories',':','BTreeSet','::','new','(',')')))
+    field_count = 3 if scanner else 5
+    if (len(left)!=field_count or len(right)!=field_count+len(additions)
+            or [item[0] for item in left]!=[item[0] for item in right[:field_count]]
+            or tuple(item[0] for item in right[field_count:])!=additions or old_scope!=new_scope
             or states[0]!=states[1] or not any(states[0]) or not set(refinements[0])<=set(refinements[1])
-            or any(sides[1][3].get(item[1],0)<=0 for item in right[5:])):
+            or any(sides[1][3].get(item[1],0)<=0 for item in right[field_count:])):
         return None
     pairs=[[line,new[0]+line-old[0]] for line in range(old[0],old[1]-1)]
     pairs.extend([[old[1]-1,new[1]-1],[old[1],new[1]]])
-    return dict(file=name,kind='retained-policy-default-record',pairs=pairs,owners=copies,
-                instance_states=states,direct_field_indices=refinements,added_lines=[item[1] for item in right[5:]])
+    kind='retained-scanner-constructor-record' if scanner else 'retained-policy-default-record'
+    return dict(file=name,kind=kind,pairs=pairs,owners=copies,
+                instance_states=states,direct_field_indices=refinements,added_lines=[item[1] for item in right[field_count:]])
 
 
 def retained_match_selector(name, sides, indexes, work):
@@ -4344,6 +4416,7 @@ _OSV_PAGINATION_FIXTURE = 'incomplete_osv_pages_fail_without_caching_partial_fin
 def retained_osv_fixture_migration(sides, work):
     """Compare complete fixtures whose explicit OSV scanner calls were renamed."""
     observations = []
+    copies = []
     for source, counts, group, owners, names, inventory in sides:
         first,last,roots = group
         if len(roots)!=1:
@@ -4392,7 +4465,7 @@ def retained_osv_fixture_migration(sides, work):
             if start<position<start+width:
                 return None
             return position-(width-len(methods[0]))*int(position>=start+width)
-        records = {}; all_rows = []
+        records = {}; all_rows = []; body_owners = []
         for owner in owners:
             child = owner['name']
             _construct_charge(work,4*len(owner['regions'])+len(child)+1)
@@ -4404,6 +4477,8 @@ def retained_osv_fixture_migration(sides, work):
                 role = ''
             elif depth and direct_rust_callback_symbol(child,symbol,shape.modules,len(depth[1])//2):
                 role = depth[1]+child[len('_R'+depth[1]+symbol[2:]):]
+                if depth[1] == 'NC':
+                    body_owners.append(owner)
             else:
                 return None
             if (role in records or names[child]!=1 or owner['filenames']!=root['filenames']
@@ -4420,9 +4495,12 @@ def retained_osv_fixture_migration(sides, work):
             records[role] = (owner['count'],tuple(rows))
             all_rows.extend(touching)
         compared = {i:counts[i] for i in range(first,last+1) if i in counts}
-        if ('' not in records or len(records)<2 or
+        if ('' not in records or len(body_owners)!=1 or not body_owners[0]['count'] or
                 _owner_line_counts({'regions':all_rows},_ObserverWork(work))!=compared):
             return None
+        body, = body_owners
+        copies.append(dict(constructor=symbol,body=body['name'],
+                           constructor_state=int(root['count']>0),body_state=int(body['count']>0)))
         observations.append((shape.identity,tuple(projection),records,list(compared),first,widths))
     before, after = observations
     if before[:3]!=after[:3] or before[5]!={len('scan_package')} or after[5]!={len('scan_osv_package')}:
@@ -4430,7 +4508,11 @@ def retained_osv_fixture_migration(sides, work):
     pairs = [[line,line+after[4]-before[4]] for line in before[3]]
     if [target for _,target in pairs]!=after[3]:
         return None
-    return dict(kind='retained-osv-fixture-migration',pairs=pairs,counter_roles=list(before[2]))
+    bounds = [[side[4],side[4]+len(side[1])-1] for side in observations]
+    fragment = dict(base_range=bounds[0],head_range=bounds[1],
+                    geometry={role:[list(row[:4]) for row in data[1]] for role,data in before[2].items()})
+    return dict(kind='retained-osv-fixture-migration',pairs=pairs,counter_roles=list(before[2]),
+                async_copies=dict(base=[copies[0]],head=[copies[1]]),async_fragment_regions=[fragment])
 
 
 def async_runtime_inventory_assertion(name, source, counts, group, owners, names, inventory, first, last, work):
@@ -13253,13 +13335,15 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                 if (line, target) in proved_eager_pairs:
                     retained[line] = target
                 elif line not in anchored:
-                    if (name=='src/core/security/policy.rs' and inventories is not None
+                    if (inventories is not None
                             and old[line-1]==new[target-1]
-                            and old[line-1].strip()=='minimum_grade: SecurityGrade::Community,'
+                            and (name,old[line-1].strip()) in (
+                                ('src/core/security/policy.rs','minimum_grade: SecurityGrade::Community,'),
+                                ('src/core/security/vulnerability.rs','client: shared_client().clone(),'))
                             and (bs[name]['expansions'],hs[name]['expansions'])==([],[])):
                         sides=((old,inventories[0],base_spans,before,line),
                                (new,inventories[1],head_spans,after,target))
-                        proof=retained_policy_default_record(name,sides,source_owner_indexes(),construct_work)
+                        proof=retained_eager_tail_record(name,sides,source_owner_indexes(),construct_work)
                         if proof is not None:
                             if any(n in anchored and anchored[n]!=t for n,t in proof['pairs']):
                                 raise ValueError('Ambiguous policy default correspondence')

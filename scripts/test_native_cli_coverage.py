@@ -953,6 +953,32 @@ with socket.socket(socket.AF_UNIX) as server:
                                  'Forbidden execution must leave a real invocation record')
 
     @unittest.skipIf(os.name == 'nt', 'Guest lifecycle helpers require POSIX Bash')
+    def test_linked_checkout_resolves_packaged_helper_through_aliases(self):
+        script = PRODUCER.omarchy_guest_script()
+        helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for name in ('packaged', 'alias', 'shadow', 'dev-checkout'):
+                (root / name).mkdir()
+            canonical = root / 'packaged/omarchy-migrate'
+            shadow = root / 'shadow/omarchy-migrate'
+            for path in (canonical, shadow):
+                path.write_text('#!/bin/bash\nexit 99\n')
+                path.chmod(0o755)
+            (root / 'alias/omarchy-migrate').symlink_to(canonical)
+            program = root / 'packaged/omarchy-update-dev'
+            program.write_text(helper.replace('/usr/bin/omarchy-migrate', str(canonical)))
+            program.chmod(0o755)
+            env = dict(os.environ, HOME=str(root), OMARCHY_PATH=str(root / 'dev-checkout'),
+                       OMARCHY_FIXTURE_SCENE='dev-link', OMARCHY_HELPER_TRACE=str(root / 'trace'))
+            for name, status in (('alias', 0), ('shadow', 1)):
+                with self.subTest(lookup=name):
+                    result = subprocess.run([program], env=dict(env, PATH=f'{root / name}:/usr/bin:/bin'),
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, status, result.stderr)
+            self.assertEqual((root / 'trace').read_text().splitlines(), ['omarchy-update-dev'])
+
+    @unittest.skipIf(os.name == 'nt', 'Guest lifecycle helpers require POSIX Bash')
     def test_lifecycle_helper_refusals_have_real_exit_statuses(self):
         script = PRODUCER.omarchy_guest_script()
         helper = script.split("<<'OMG_INERT_OMARCHY_STAGE'\n", 1)[1].split('\nOMG_INERT_OMARCHY_STAGE', 1)[0]

@@ -1341,7 +1341,7 @@ class RetainedPolicyDefaultRecordTests(unittest.TestCase):
             spans={id(item):coverage.source_owner_span(item,name,files,source) for item in owners}
             sides.append((source,coverage._construct_inventory(source,work),spans,counts,4))
             indexes.append(coverage.index_compiled_owner_sources(owners,files,work,{name}))
-        return coverage.retained_policy_default_record(name,sides,indexes,work)
+        return coverage.retained_eager_tail_record(name,sides,indexes,work)
 
     def test_retains_record_fields_and_observes_head_only_fields_across_both_copies(self):
         proof=self.compare()
@@ -1353,6 +1353,74 @@ class RetainedPolicyDefaultRecordTests(unittest.TestCase):
                       'foreign','uncovered-new-field'):
             with self.subTest(fault=fault):
                 self.assertIsNone(self.compare(fault))
+
+
+class RetainedScannerConstructorTests(unittest.TestCase):
+    def compare(self, method, fault=None):
+        name = 'src/core/security/vulnerability.rs'
+        filename = '/artifact/' + name
+        sides, indexes = [], []
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        for side in range(2):
+            default = method == 'new'
+            declaration = ('pub fn new() -> Self' if default else
+                           'pub fn with_osv_endpoint(osv_api_url: String, ecosystem: String) -> Self')
+            source = ['impl VulnerabilityScanner {', f'    {declaration} {{', '        Self {',
+                      '            client: shared_client().clone(),',
+                      ('            osv_api_url: "https://api.osv.dev/v1/query".to_string(),' if default
+                       else '            osv_api_url,'),
+                      ('            osv_ecosystem_override: None,' if default
+                       else '            osv_ecosystem_override: Some(ecosystem),')]
+            if side and fault == 'changed-field':
+                source[3] = '            client: another_client().clone(),'
+            if side:
+                source.append('            arch_endpoint: ARCH_ADVISORY_ENDPOINT.to_owned(),')
+            source.extend(['        }', '    }', '}'])
+            last = len(source) - 1
+
+            def row(line, text, count):
+                column = source[line - 1].index(text) + 1
+                return [line, column, line, column + len(text), count, 0, 0, 0]
+
+            owners = []
+            for copy in range(2):
+                if side and fault == 'missing-copy' and copy:
+                    continue
+                count = int(not (side and fault == 'cold-copy' and copy))
+                discriminator, backref = ('s2_', 'B5_') if side else ('s_', 'B4_')
+                symbol = (f'_RNvM{discriminator}NtNtNtCs{side + 1}{copy + 1}_7omg_lib4core8security'
+                          f'13vulnerabilityNt{backref}20VulnerabilityScanner{len(method)}{method}')
+                if side and fault == 'foreign-owner' and copy:
+                    symbol = symbol.replace('20VulnerabilityScanner', '12OtherScanner')
+                regions = [row(2, declaration, count), [3, 9, last - 1, 10, count, 0, 0, 0],
+                           row(4, 'another_client()' if 'another_client' in source[3] else
+                               'shared_client()', count),
+                           row(4, 'clone', count), row(last, '}', count)]
+                if default and (not side or fault != 'lost-refinement'):
+                    regions.append(row(5, '"https://api.osv.dev/v1/query"', count))
+                if side:
+                    regions.append(row(5, 'to_string' if default else 'osv_api_url', count))
+                    regions.append(row(6, 'None' if default else 'Some(ecosystem)', count))
+                owners.append(dict(name=symbol, count=count, filenames=[filename], regions=regions))
+            counts = coverage._owner_line_counts({'regions': [r for o in owners for r in o['regions']]},
+                                                coverage._ObserverWork(work))
+            files = {filename: name}
+            spans = {id(o): coverage.source_owner_span(o, name, files, source) for o in owners}
+            sides.append((source, coverage._construct_inventory(source, work), spans, counts, 4))
+            indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {name}))
+        return coverage.retained_eager_tail_record(name, sides, indexes, work)
+
+    def test_scanner_constructor_retains_the_full_compiled_cohort(self):
+        for method in ('new', 'with_osv_endpoint'):
+            with self.subTest(method=method):
+                proof = self.compare(method)
+                self.assertIsNotNone(proof)
+                self.assertEqual(proof['instance_states'], [[True, True], [True, True]])
+                self.assertEqual(proof['added_lines'], [7])
+                self.assertEqual(proof['pairs'], [[2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 8], [8, 9]])
+        for fault in ('missing-copy', 'cold-copy', 'foreign-owner', 'changed-field', 'lost-refinement'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(self.compare('new', fault))
 
 
 class OsvRequestMigrationTests(unittest.TestCase):
@@ -1387,6 +1455,9 @@ class OsvRequestMigrationTests(unittest.TestCase):
         proof = coverage.retained_osv_fixture_migration((old,side('scan_osv_package')),[100_000])
         self.assertIsNotNone(proof)
         self.assertIn([9,9],proof['pairs'])
+        self.assertEqual(proof['async_copies']['base'][0]['constructor'], symbol)
+        self.assertEqual(proof['async_copies']['head'][0]['body'], '_RNC'+symbol[2:]+'0Bb_')
+        self.assertEqual(proof['async_fragment_regions'][0]['base_range'], [4, 11])
         for mismatch in ({'missing_future':True},{'cold':True},{'endpoint':'"Alpine:v3"'}):
             with self.subTest(mismatch=mismatch):
                 self.assertIsNone(coverage.retained_osv_fixture_migration((old,side('scan_osv_package',**mismatch)),[100_000]))

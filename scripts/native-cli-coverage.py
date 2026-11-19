@@ -1358,8 +1358,9 @@ omarchy_security_require_source_root() {
 }
 if [[ $name == omarchy-update-dev && ${OMARCHY_FIXTURE_SCENE:-none} == dev-link ]]; then
   test "$OMARCHY_PATH" = "$HOME/dev-checkout"
-  test "$(command -v omarchy-migrate)" = /usr/bin/omarchy-migrate
-  printf 'configured_dev_checkout=selected nested_helper=packaged\n'
+  nested=$(command -v omarchy-migrate)
+  test "$(/usr/bin/readlink -e -- "$nested")" = /usr/bin/omarchy-migrate
+  printf '\nconfigured_dev_checkout=selected nested_helper=packaged\n'
 else
   case "$name" in omarchy-*) omarchy_security_require_source_root "$0" ;; esac
 fi
