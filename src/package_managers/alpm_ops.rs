@@ -140,6 +140,22 @@ pub(crate) fn validate_sync_database(alpm: &alpm::Alpm, database: &alpm::Db) -> 
         .with_context(|| format!("Repository '{}' failed native validation", database.name()))
 }
 
+pub(crate) fn omarchy_install_candidate<'a>(
+    alpm: &'a alpm::Alpm,
+    name: &str,
+) -> Result<Option<(&'a alpm::Db, &'a alpm::Package)>> {
+    for database in alpm.syncdbs() {
+        if !database.usage()?.contains(alpm::Usage::INSTALL) {
+            continue;
+        }
+        validate_sync_database(alpm, database)?;
+        if let Ok(package) = database.pkg(name) {
+            return Ok(Some((database, package)));
+        }
+    }
+    Ok(None)
+}
+
 pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
     if crate::core::paths::test_mode() {
         let updates = crate::package_managers::pacman_db::check_updates_cached()?;
@@ -681,18 +697,9 @@ fn execute_transaction_in(
     configure_mirrors(alpm)?;
     if matches!(policy, TransactionPolicy::Omarchy) && kind == TransactionKind::Install {
         for name in &packages {
-            let mut trusted_repository = None;
-            for database in alpm.syncdbs() {
-                if !database.usage()?.contains(alpm::Usage::INSTALL) {
-                    continue;
-                }
-                validate_sync_database(alpm, database)?;
-                if database.pkg(name.as_str()).is_ok() {
-                    trusted_repository = Some(database.siglevel());
-                    break;
-                }
-            }
-            let level = trusted_repository.context("Omarchy package is unavailable")?;
+            let (database, _) =
+                omarchy_install_candidate(alpm, name)?.context("Omarchy package is unavailable")?;
+            let level = database.siglevel();
             anyhow::ensure!(
                 level.contains(alpm::SigLevel::PACKAGE)
                     && !level.intersects(
@@ -2358,7 +2365,6 @@ fn unknown_archives_prompt(
     digest: &str,
     invoking_uid: u32,
 ) -> Result<String> {
-    use std::fmt::Write as _;
     let unknown = packages
         .iter()
         .filter(|item| {
@@ -2377,17 +2383,15 @@ fn unknown_archives_prompt(
         "\nArch advisory applicability is UNKNOWN for these exact archives. This acknowledgement does not establish coverage.\nInvoking UID: {invoking_uid}\nFull prepared batch SHA-256: {digest}\n"
     );
     for item in unknown {
-        writeln!(
-            prompt,
-            "{}",
-            serde_json::to_string(&(
-                &item.package.name,
-                &item.package.version,
-                &item.package.architecture,
-                &item.package.origin,
-                &item.sha256,
-            ))?
-        )?;
+        let identity = (
+            &item.package.name,
+            &item.package.version,
+            &item.package.architecture,
+            &item.package.origin,
+            &item.sha256,
+        );
+        prompt.push_str(&serde_json::to_string(&identity)?);
+        prompt.push('\n');
     }
     Ok(prompt)
 }
@@ -2821,7 +2825,8 @@ fn configure_mirrors(alpm: &mut alpm::Alpm) -> Result<()> {
                         for server in servers {
                             if let Err(e) = db.add_server(server.clone()) {
                                 tracing::debug!(
-                                    "Failed to add server '{server}' to repo '{}': {e}",
+                                    "Failed to add server '{}' to repo '{}': {e}",
+                                    crate::core::http::redact_url(&server),
                                     db.name()
                                 );
                             }
@@ -4670,6 +4675,7 @@ mod tests {
                 let lookup = alpm.syncdbs().first().expect("fixture repository");
                 assert_eq!(lookup.usage()?, alpm::Usage::SEARCH);
                 assert_eq!(lookup.pkg(package)?.name(), package);
+                assert!(super::omarchy_install_candidate(&alpm, package)?.is_none());
 
                 let error = super::execute_transaction_in(
                     vec![package.to_owned()],
@@ -4686,6 +4692,43 @@ mod tests {
                 Ok(())
             },
         )
+    }
+
+    #[test]
+    fn fallback_mirrorlist_substitutes_running_architecture_and_repository() -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::fallback_mirrorlist_substitutes_running_architecture_and_repository";
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
+            return Ok(());
+        }
+        let fixture = RepositoryFixture::new()?;
+        let conf = fixture.directory.path().join("missing-pacman.conf");
+        let mirrorlist = fixture.directory.path().join("mirrorlist");
+        std::fs::write(
+            &mirrorlist,
+            "Server = https://mirror.example/$repo/os/$arch\n",
+        )?;
+        let mut alpm = fixture.open();
+        alpm.register_syncdb("core", alpm::SigLevel::NONE)?;
+        temp_env::with_vars(
+            [
+                ("OMG_PACMAN_CONF", Some(conf.as_os_str())),
+                ("OMG_PACMAN_MIRRORLIST", Some(mirrorlist.as_os_str())),
+            ],
+            || super::configure_mirrors(&mut alpm),
+        )?;
+        let kernel = nix::sys::utsname::uname()?;
+        let expected = format!(
+            "https://mirror.example/core/os/{}",
+            kernel.machine().to_string_lossy()
+        );
+        let core = alpm.syncdbs().first().expect("test repository");
+        assert_eq!(
+            core.servers().iter().collect::<Vec<_>>(),
+            [expected.as_str()]
+        );
+        Ok(())
     }
 
     #[test]

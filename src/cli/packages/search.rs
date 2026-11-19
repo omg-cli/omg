@@ -7,7 +7,7 @@ use crate::cli::packages::common::validate_search_query;
 use crate::cli::{style, ui};
 use crate::core::packages::search::SearchRanker;
 use crate::core::{Package, PackageSource};
-use crate::package_managers::{SearchNameKind, VersionDisplay, get_package_manager};
+use crate::package_managers::{Backend, SearchNameKind, VersionDisplay, get_package_manager};
 
 pub(crate) const DEFAULT_SEARCH_LIMIT: usize = crate::cli::modern_ui::SUMMARY_LIST_CAP;
 
@@ -185,6 +185,15 @@ pub async fn search_with_json(
     search_internal(query, detailed, json, no_aur, limit).await
 }
 
+fn should_search_aur(query: &str, backend: Backend, no_aur: bool) -> Result<bool> {
+    let include = !no_aur && backend == Backend::Arch;
+    if include {
+        crate::core::packages::search::validate_aur_search_length(query)
+            .context("Use --no-aur to search official repositories with a shorter query")?;
+    }
+    Ok(include)
+}
+
 async fn search_internal(
     query: &str,
     detailed: bool,
@@ -193,13 +202,14 @@ async fn search_internal(
     limit: usize,
 ) -> Result<()> {
     validate_search_query(query)?;
-    let name_kind = SearchNameKind::from_backend(crate::package_managers::resolve_backend()?);
+    let backend = crate::package_managers::resolve_backend()?;
+    let name_kind = SearchNameKind::from_backend(backend);
+    let include_aur = should_search_aur(query, backend, no_aur)?;
 
     let official_search = async { search_official_packages(query, limit).await };
 
-    // Skip AUR search if --no-aur flag is set (for benchmarks/official-only searches)
     let aur_search = async {
-        if no_aur {
+        if !include_aur {
             return Ok(Vec::new());
         }
         tokio::time::timeout(
@@ -217,7 +227,8 @@ async fn search_internal(
     let aur_packages = match aur_result {
         Ok(packages) => packages,
         Err(error) if !display_packages.is_empty() => {
-            tracing::debug!("AUR search unavailable; returning official results: {error}");
+            eprintln!("AUR search unavailable. Showing official repository matches.");
+            tracing::debug!(%error, "AUR search failed");
             Vec::new()
         }
         Err(error) => return Err(error).context("Failed to search AUR packages"),
@@ -364,10 +375,6 @@ async fn search_official_packages(
 
 #[cfg(feature = "arch")]
 async fn search_aur_packages(query: &str, detailed: bool) -> Result<Vec<DisplayPackage>> {
-    if crate::package_managers::resolve_backend()? != crate::package_managers::Backend::Arch {
-        return Ok(Vec::new());
-    }
-
     if detailed {
         return crate::package_managers::search_detailed(query)
             .await
@@ -1055,6 +1062,19 @@ mod tests {
         assert!(!search_sync_cli("../passwd", false, true).unwrap());
 
         assert!(!search_sync_cli("test;ls", false, true).unwrap());
+    }
+
+    #[test]
+    fn combined_arch_search_explains_the_aur_minimum_before_querying() -> Result<()> {
+        let error = should_search_aur("x", Backend::Arch, false)
+            .expect_err("the AUR does not support a single-byte query");
+        assert!(error.to_string().contains("--no-aur"));
+        assert!(format!("{error:#}").contains("at least 2 non-whitespace bytes"));
+        assert!(validate_search_query("x").is_ok());
+        assert!(!should_search_aur("x", Backend::Arch, true)?);
+        assert!(!should_search_aur("x", Backend::Debian, false)?);
+        assert!(should_search_aur("é", Backend::Arch, false)?);
+        Ok(())
     }
 
     #[test]

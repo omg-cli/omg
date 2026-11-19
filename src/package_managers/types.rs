@@ -419,36 +419,66 @@ pub fn parse_version_or_zero(s: &str) -> Version {
 
 #[cfg(feature = "arch")]
 pub(crate) fn provision_satisfies(dependency: &str, provision: &str) -> bool {
+    use alpm_types::{PackageRelation, SonameV2, VersionComparison};
     if dependency.as_bytes().contains(&0) || provision.as_bytes().contains(&0) {
         return false;
     }
-    if alpm::Depend::new(dependency).name() != alpm::Depend::new(provision).name() {
+    let (Ok(dependency), Ok(provision)) = (
+        dependency.parse::<PackageRelation>(),
+        provision.parse::<PackageRelation>(),
+    ) else {
+        // A v2 soname is a literal virtual dependency name, including its ABI suffix.
+        return dependency == provision && dependency.parse::<SonameV2>().is_ok();
+    };
+    if dependency.name != provision.name {
         return false;
     }
-    if alpm::Depend::new(dependency).version().is_none() {
+    let provided_version = match provision.version_requirement {
+        None => None,
+        Some(requirement) if requirement.comparison == VersionComparison::Equal => {
+            Some(requirement.version)
+        }
+        Some(_) => return false,
+    };
+    let Some(requirement) = dependency.version_requirement else {
         return true;
-    }
-    let provision = alpm::Depend::new(provision);
-    provision.depmod() == alpm::DepMod::Eq
-        && provision
-            .version()
-            .is_some_and(|version| dependency_version_satisfies(dependency, version.as_ref()))
+    };
+    provided_version
+        .as_ref()
+        .is_some_and(|candidate| matches_version_requirement(&requirement, candidate))
 }
 
 #[cfg(feature = "arch")]
 pub(crate) fn dependency_version_satisfies(dependency: &str, candidate: &str) -> bool {
-    if dependency.as_bytes().contains(&0) || candidate.as_bytes().contains(&0) {
+    use alpm_types::{PackageRelation, SonameV2};
+    if dependency.as_bytes().contains(&0) {
         return false;
     }
-    let dependency = alpm::Depend::new(dependency);
-    let compare = |required: &alpm::Ver| alpm::vercmp(candidate, required.to_string().as_str());
-    match dependency.depmodver() {
-        alpm::DepModVer::Any => true,
-        alpm::DepModVer::Eq(required) => compare(required).is_eq(),
-        alpm::DepModVer::Ge(required) => !compare(required).is_lt(),
-        alpm::DepModVer::Le(required) => !compare(required).is_gt(),
-        alpm::DepModVer::Gt(required) => compare(required).is_gt(),
-        alpm::DepModVer::Lt(required) => compare(required).is_lt(),
+    let Some(candidate) = parse_version(candidate) else {
+        return false;
+    };
+    let Ok(dependency) = dependency.parse::<PackageRelation>() else {
+        return dependency.parse::<SonameV2>().is_ok();
+    };
+    dependency
+        .version_requirement
+        .as_ref()
+        .is_none_or(|requirement| matches_version_requirement(requirement, &candidate))
+}
+
+#[cfg(feature = "arch")]
+fn matches_version_requirement(
+    requirement: &alpm_types::VersionRequirement,
+    candidate: &AlpmVersion,
+) -> bool {
+    use alpm_types::VersionComparison;
+    let ordering = compare_versions(candidate, &requirement.version);
+    match requirement.comparison {
+        VersionComparison::Equal => ordering.is_eq(),
+        VersionComparison::Less => ordering.is_lt(),
+        VersionComparison::LessOrEqual => !ordering.is_gt(),
+        VersionComparison::Greater => ordering.is_gt(),
+        VersionComparison::GreaterOrEqual => !ordering.is_lt(),
     }
 }
 
@@ -548,6 +578,69 @@ mod tests {
                 "{relation} with {rejected}"
             );
         }
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn dependency_and_provision_relations_reject_invalid_pacman_syntax() {
+        for invalid in ["widget>=", "widget=1=2", "widget >=2", "widget/path"] {
+            assert!(!dependency_version_satisfies(invalid, "2"), "{invalid}");
+        }
+        assert!(!provision_satisfies("virtual-api", "virtual-api>=2"));
+        assert!(!provision_satisfies("virtual-api", "virtual-api=1=2"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn dependency_and_provision_relations_preserve_pacman_optional_components() {
+        for (relation, version) in [
+            ("widget=0:1", "1"),
+            ("widget=1-1", "1"),
+            ("widget=1", "1-2"),
+            ("widget<1.999999999999999999999999999", "1.2"),
+        ] {
+            assert!(
+                dependency_version_satisfies(relation, version),
+                "{relation} {version}"
+            );
+        }
+        assert!(provision_satisfies("virtual-api=1-1", "virtual-api=1"));
+        assert!(provision_satisfies("virtual-api=0:1", "virtual-api=1"));
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn dependency_and_provision_relations_preserve_shared_library_names() {
+        assert!(provision_satisfies("libexample.so", "libexample.so=1-64"));
+        assert!(provision_satisfies(
+            "libexample.so>=1",
+            "libexample.so=1-64"
+        ));
+        assert!(provision_satisfies(
+            "lib:libexample.so.1",
+            "lib:libexample.so.1"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "lib:libexample.so.2"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "lib:libexample.so.01"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "lib32:libexample.so.1"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "libexample.so=1-64"
+        ));
+        assert!(!provision_satisfies(
+            "lib:libexample.so.1",
+            "lib:libexample.so.1\0"
+        ));
+        assert!(dependency_version_satisfies("lib:libexample.so.1", "2-1"));
     }
 
     #[cfg(feature = "arch")]

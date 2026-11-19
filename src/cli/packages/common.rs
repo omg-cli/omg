@@ -11,25 +11,7 @@ use crate::package_managers::types::UpdateInfo;
 use anyhow::Context;
 use anyhow::Result;
 
-/// Validate a search query for safety.
-///
-/// Rejects queries that are too long, contain control characters,
-/// path traversal sequences, or shell metacharacters.
-pub fn validate_search_query(query: &str) -> Result<()> {
-    if query.len() > 100 {
-        anyhow::bail!("Search query too long (max 100 characters)");
-    }
-    if query.chars().any(char::is_control) {
-        anyhow::bail!("Search query contains invalid characters");
-    }
-    if query.contains('/') || query.contains('\\') || query.contains("..") {
-        anyhow::bail!("Invalid search query: path traversal detected");
-    }
-    if query.chars().any(|c| ";|&><$".contains(c)) {
-        anyhow::bail!("Invalid search query: shell metacharacters detected");
-    }
-    Ok(())
-}
+pub(crate) use crate::core::packages::search::validate_search_query;
 
 /// Check if a search query passes validation (returns false on failure).
 ///

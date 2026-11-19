@@ -42,6 +42,7 @@ use super::super::aur_sources::{
 use super::super::pkgbuild::PkgBuild;
 use crate::config::{AurBuildMethod, AurSecurityProfile, Settings};
 use crate::core::http::shared_client;
+use crate::core::packages::search::validate_aur_search_query;
 use crate::core::{Package, PackageSource, paths};
 use crate::package_managers::arch_install::{
     InstallIntent, InstallItem, InstallRequest, InstallTarget, OfficialTarget,
@@ -73,7 +74,6 @@ fn sandbox_build_root(mount_destinations: &[&Path]) -> Result<PathBuf> {
 
 const AUR_GIT_URL: &str = "https://aur.archlinux.org";
 const AUR_RPC_MAX_URI: usize = 4400;
-const AUR_SEARCH_MAX_BYTES: usize = 100;
 
 /// Process-wide lock around ALPM database mutations so parallel AUR builds never race.
 /// ALPM serializes installs on `/var/lib/pacman/db.lck`, so concurrent installs — e.g. parallel AUR build
@@ -1420,7 +1420,7 @@ impl AurClient {
 
     /// Search AUR packages
     pub async fn search(&self, query: &str) -> Result<Vec<Package>> {
-        validate_search_query(query)?;
+        validate_aur_search_query(query)?;
 
         // Try the binary index only while its source archive is within the
         // configured TTL. Stale indexes fall through to the live RPC.
@@ -4591,22 +4591,9 @@ fn validate_index_entry_name(name: &str, expected: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn validate_search_query(query: &str) -> Result<()> {
-    if query.len() > AUR_SEARCH_MAX_BYTES {
-        anyhow::bail!("Search query too long (max {AUR_SEARCH_MAX_BYTES} bytes)");
-    }
-    if query.chars().any(char::is_control) {
-        anyhow::bail!("Search query contains invalid control characters");
-    }
-    if query.trim().len() < 2 {
-        anyhow::bail!("Search query must contain at least 2 non-whitespace bytes");
-    }
-    Ok(())
-}
-
 /// Search AUR with detailed info
 pub async fn search_detailed(query: &str) -> Result<Vec<AurPackageDetail>> {
-    validate_search_query(query)?;
+    validate_aur_search_query(query)?;
 
     let url = format!(
         "{AUR_RPC_URL}?v=5&type=search&arg={}",
@@ -9509,14 +9496,18 @@ mod tests {
 
     #[test]
     fn search_query_validation_is_shared_by_all_aur_search_paths() {
-        assert!(validate_search_query("normal package").is_ok());
-        assert!(validate_search_query(&"x".repeat(AUR_SEARCH_MAX_BYTES)).is_ok());
-        assert!(validate_search_query(&"x".repeat(AUR_SEARCH_MAX_BYTES + 1)).is_err());
-        assert!(validate_search_query("").is_err());
-        assert!(validate_search_query("   ").is_err());
-        assert!(validate_search_query("x").is_err());
-        assert!(validate_search_query("package\nname").is_err());
-        assert!(validate_search_query("package\0name").is_err());
+        use crate::core::packages::search::MAX_SEARCH_QUERY_BYTES;
+        assert!(validate_aur_search_query("normal package").is_ok());
+        assert!(validate_aur_search_query(&"x".repeat(MAX_SEARCH_QUERY_BYTES)).is_ok());
+        assert!(validate_aur_search_query(&"x".repeat(MAX_SEARCH_QUERY_BYTES + 1)).is_err());
+        assert!(validate_aur_search_query("").is_err());
+        assert!(validate_aur_search_query("   ").is_err());
+        assert!(validate_aur_search_query("x").is_err());
+        assert!(validate_aur_search_query("é").is_ok());
+        assert!(validate_aur_search_query("package\nname").is_err());
+        assert!(validate_aur_search_query("package\0name").is_err());
+        assert!(validate_aur_search_query("../path").is_err());
+        assert!(validate_aur_search_query("package;name").is_err());
     }
 
     #[test]

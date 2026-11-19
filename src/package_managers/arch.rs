@@ -185,18 +185,11 @@ pub fn execute_native_omarchy_operation(
                 None
             } else {
                 Some(super::alpm_direct::with_handle(|handle| {
-                    for database in handle.syncdbs() {
-                        if !database.usage()?.contains(alpm::Usage::INSTALL) {
-                            continue;
-                        }
-                        super::alpm_ops::validate_sync_database(handle, database)?;
-                        if let Ok(package) = database.pkg(name.as_str()) {
-                            return Ok((package.version().to_string(), database.name().to_owned()));
-                        }
-                    }
-                    anyhow::bail!(
-                        "Omarchy package {name} is unavailable from configured install repositories"
-                    )
+                    let (database, package) = super::alpm_ops::omarchy_install_candidate(handle, name)?
+                        .with_context(|| format!(
+                            "Omarchy package {name} is unavailable from configured install repositories"
+                        ))?;
+                    Ok((package.version().to_string(), database.name().to_owned()))
                 })?)
             };
             changes.push(PackageChange {
