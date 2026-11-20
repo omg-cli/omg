@@ -6095,26 +6095,21 @@ mod tests {
     }
 
     #[test]
-    fn package_cache_refuses_symlinked_cache_files() -> Result<()> {
-        use std::os::unix::fs::symlink;
-        let owner = tempfile::tempdir()?;
-        let target = owner.path().join("target.bin");
-        fs::write(&target, bitcode::serialize(&LocalDbCache::default())?)?;
-        symlink(&target, owner.path().join("fixture.bin"))?;
-        let loaded = load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture");
-        assert!(loaded.is_err(), "derived cache accepted a redirected file");
-        Ok(())
-    }
-
-    #[test]
-    fn package_cache_refuses_oversized_files_before_deserialization() -> Result<()> {
-        let owner = tempfile::tempdir()?;
-        let file = fs::File::create(owner.path().join("fixture.bin"))?;
+    fn persisted_package_cache_rejects_symlink_and_oversized_file() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("valid");
+        fs::write(&target, bitcode::serialize(&DbCache::default())?)?;
+        let path = directory.path().join("fixture.bin");
+        std::os::unix::fs::symlink(&target, &path)?;
+        assert!(load_cache_from_disk_in::<DbCache>(directory.path(), "fixture").is_err());
+        fs::remove_file(&path)?;
+        let file = fs::File::create(&path)?;
         file.set_len(MAX_DERIVED_CACHE_BYTES + 1)?;
-        let error = load_cache_from_disk_in::<LocalDbCache>(owner.path(), "fixture")
+        let error = load_cache_from_disk_in::<DbCache>(directory.path(), "fixture")
             .err()
-            .context("an oversized cache must fail before decoding")?;
+            .context("oversized cache must fail before decoding")?;
         assert!(error.to_string().contains("size limit"), "{error:#}");
+        assert!(load_cache_from_disk_in::<LocalDbCache>(directory.path(), "fixture").is_err());
         Ok(())
     }
 

@@ -926,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn published_generation_survives_failed_publication_and_304() {
+    fn invalid_metadata_does_not_replace_a_valid_generation() {
         let directory = tempfile::tempdir().unwrap();
         let location = MetadataRoot::new(directory.path().join("aur"));
         let root_path = location.path();
@@ -941,10 +941,25 @@ mod tests {
             },
         )
         .unwrap();
+        let (initial, _) = current_generation(root)
+            .expect("read the published generation")
+            .expect("initial AUR metadata is available");
+        let (archive, index) = generation_paths(root, &initial).expect("valid generation paths");
+        let manifest_path = root.join("manifest.json");
+        let published = [&archive, &index, &manifest_path];
+        let read_published =
+            || published.map(|path| std::fs::read(path).expect("read published metadata bytes"));
+        let previous_bytes = read_published();
         let snapshot = open_fresh_metadata_index_at(&location, Duration::from_mins(1))
             .unwrap()
             .unwrap();
-        assert!(publish_generation(root, b"invalid gzip", AurMetaCache::default()).is_err());
+        let error = publish_generation(root, b"invalid gzip", AurMetaCache::default())
+            .expect_err("invalid metadata cannot replace a complete generation");
+        assert_eq!(
+            error.to_string(),
+            "Failed to parse bounded AUR JSON metadata"
+        );
+        assert_eq!(read_published(), previous_bytes);
         let (manifest, _) = current_generation(root).unwrap().unwrap();
         assert_eq!(manifest.validators.etag.as_deref(), Some("etag"));
         commit_manifest(root, &manifest).unwrap();
