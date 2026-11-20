@@ -526,6 +526,7 @@ jobs:
                 package_managers::aur::client::tests::build_only_inner_refuses_an_invalid_package_before_creating_a_checkout
                 package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing
                 package_managers::aur::client::tests::native_isolated_history_requires_hardened_review
+                package_managers::aur::client::tests::native_isolated_dynamic_history_pairs_reviewed_source
                 config::settings::tests::hardened_aur_settings_refuse_incompatible_build_options
                 cli::packages::update::omarchy::tests::media_launcher_cleanup_reports_a_matching_launcher_it_cannot_remove
                 runtimes::npm::admission_tests::banned_transitive_dependency_stops_npm_before_materialization

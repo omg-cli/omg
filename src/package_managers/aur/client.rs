@@ -10156,7 +10156,6 @@ mod tests {
                 mode.as_str(),
                 "history" | "history-accept-failing-build" | "history-accept-rebuilt-archive"
             );
-            let history = history || mode == "history-accept-rebuilt-dynamic";
             let directory = if history {
                 anyhow::ensure!(
                     std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container"),
@@ -10190,18 +10189,6 @@ mod tests {
                     settings,
                     package_base_locks: Arc::new(dashmap::DashMap::new()),
                 };
-                if mode == "history-accept-rebuilt-dynamic" {
-                    let version = client
-                        .rebuild_from_history_with_install("demo", "1-1", async |batches, _| {
-                            assert_eq!(batches.len(), 1);
-                            assert_eq!(batches[0].len(), 1);
-                            Ok(())
-                        })
-                        .await?;
-                    assert_eq!(version, "2-1");
-                    println!("HISTORY_DYNAMIC_VERSION_VERIFIED");
-                    return Ok(());
-                }
                 let error = client
                     .downgrade_from_history("demo", "1-1")
                     .await
@@ -10306,11 +10293,8 @@ if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
     fi
     if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = "$sha" ]; then
         printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\n' > "$2/PKGBUILD"
-        if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-archive ] || [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-dynamic ]; then
+        if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-archive ]; then
             printf 'pkgdesc="Inert historical release fixture"\\nlicense=(MIT)\\npackage() { install -Dm644 /dev/null "$pkgdir/usr/share/demo/empty"; }\\n' >> "$2/PKGBUILD"
-            if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-dynamic ]; then
-                printf 'pkgver() { echo 2; }\\n' >> "$2/PKGBUILD"
-            fi
         else
             printf 'package() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' >> "$2/PKGBUILD"
         fi
@@ -10364,7 +10348,7 @@ if mode == 'git-contract':
 pid, fd = pty.fork()
 if pid == 0:
     os.environ['PATH'] = fixture + ':/usr/bin:/bin'
-    if mode in ('history-accept-rebuilt-archive', 'history-accept-rebuilt-dynamic'):
+    if mode == 'history-accept-rebuilt-archive':
         os.environ['CARGO_PRIMARY_PACKAGE'] = '1'
         os.environ['OMG_DATA_DIR'] = fixture
         os.environ['OMG_SOCKET_PATH'] = os.path.join(fixture, 'absent.sock')
@@ -10374,7 +10358,6 @@ approval = {
     'history': (b'n\n', b'REVIEW_DECLINED'),
     'history-accept-failing-build': (b'y\n', b'HISTORY_BUILD_FAILED'),
     'history-accept-rebuilt-archive': (b'y\n', b'HISTORY_ARCHIVE_VERIFIED'),
-    'history-accept-rebuilt-dynamic': (b'y\n', b'HISTORY_DYNAMIC_VERSION_VERIFIED'),
 }.get(mode)
 output = bytearray()
 sent = False
@@ -10419,8 +10402,6 @@ try:
             (approval and not sent) or
             (expected != b'REVIEW_DECLINED' and b'REVIEW_DECLINED' in output)):
         raise RuntimeError('review child failed or did not show the expected prompt')
-    if mode == 'history-accept-rebuilt-dynamic' and b'Installing demo 2-1' not in output:
-        raise RuntimeError('rollback did not report the actual rebuilt package version')
 finally:
     if status is None:
         os.kill(pid, signal.SIGKILL)
@@ -10435,7 +10416,6 @@ finally:
                 "history",
                 "history-accept-failing-build",
                 "history-accept-rebuilt-archive",
-                "history-accept-rebuilt-dynamic",
             ]);
         }
         for mode in modes {
@@ -10451,6 +10431,148 @@ finally:
             );
             assert!(output.status.success(), "{diagnostic}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the disposable, network-isolated Arch coverage container"]
+    async fn native_isolated_dynamic_history_pairs_reviewed_source() -> Result<()> {
+        const CASE: &str = "package_managers::aur::client::tests::native_isolated_dynamic_history_pairs_reviewed_source";
+        const CHILD: &str = "OMG_AUR_DYNAMIC_HISTORY_FIXTURE_DIR";
+        anyhow::ensure!(
+            std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container")
+                && !crate::core::is_root(),
+            "dynamic history fixture requires the unprivileged isolated container"
+        );
+        if let Some(fixture) = std::env::var_os(CHILD) {
+            let mut settings = Settings::default();
+            settings.aur.security_profile = AurSecurityProfile::Hardened;
+            let client = AurClient {
+                build_dir: PathBuf::from(fixture).join("build"),
+                settings,
+                package_base_locks: Arc::new(dashmap::DashMap::new()),
+            };
+            let rebuilt = client
+                .rebuild_from_history_with_install("demo", "1-1", async |batches, _| {
+                    assert_eq!(batches.len(), 1);
+                    assert_eq!(batches[0].len(), 1);
+                    Ok(())
+                })
+                .await?;
+            assert_eq!(rebuilt, "2-1");
+            println!("HISTORY_DYNAMIC_VERSION_VERIFIED");
+            return Ok(());
+        }
+
+        let fixture = tempfile::tempdir_in(paths::cache_dir())?;
+        let repo = fixture.path().join("source");
+        std::fs::create_dir(&repo)?;
+        std::fs::write(
+            repo.join("PKGBUILD"),
+            "pkgname=demo\npkgver=1\npkgrel=1\narch=(any)\npkgdesc='Historical release fixture'\nlicense=(MIT)\npkgver() { echo 2; }\npackage() { install -Dm644 /dev/null \"$pkgdir/usr/share/demo/empty\"; }\n",
+        )?;
+        std::fs::write(
+            repo.join(".SRCINFO"),
+            "pkgbase = demo\n\tpkgver = 1\n\tpkgrel = 1\n\tarch = any\n\npkgname = demo\n",
+        )?;
+        let git = crate::core::privilege::root_controlled_program_path("git")?;
+        let run_git = |args: &[&str]| -> Result<()> {
+            let output = std::process::Command::new(&git)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(args)
+                .output()?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::ensure!(
+                output.status.success(),
+                "fixture git {args:?} failed: {stderr}"
+            );
+            Ok(())
+        };
+        run_git(&["init", "--quiet", "--template="])?;
+        run_git(&["add", "--", "PKGBUILD", ".SRCINFO"])?;
+        run_git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--message",
+            "Historical package fixture",
+        ])?;
+        let git_config = fixture.path().join("gitconfig");
+        std::fs::write(
+            &git_config,
+            format!(
+                "[url \"file://{}\"]\n\tinsteadOf = https://aur.archlinux.org/demo.git\n",
+                repo.display(),
+            ),
+        )?;
+
+        let terminal_driver = r#"
+import errno, os, pty, select, signal, sys, time
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+
+output = bytearray()
+approved = False
+reaped = False
+deadline = time.monotonic() + 25
+try:
+    while time.monotonic() < deadline:
+        if not select.select([fd], [], [], 0.1)[0]:
+            continue
+        try:
+            data = os.read(fd, 4096)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            break
+        if not data:
+            break
+        output.extend(data)
+        if len(output) > 1024 * 1024:
+            raise RuntimeError('dynamic history fixture output exceeded limit')
+        if not approved and b'Build demo from this PKGBUILD?' in output:
+            os.write(fd, b'y\n')
+            approved = True
+    else:
+        raise RuntimeError('dynamic history review timed out')
+    _, status = os.waitpid(pid, 0)
+    reaped = True
+    if (os.waitstatus_to_exitcode(status) != 0 or not approved
+            or b'Installing demo 2-1' not in output
+            or b'HISTORY_DYNAMIC_VERSION_VERIFIED' not in output):
+        raise RuntimeError('dynamic history review did not reach the approved install boundary')
+finally:
+    if not reaped:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)
+    sys.stdout.buffer.write(output)
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-c", terminal_driver])
+            .arg(std::env::current_exe()?)
+            .args(["--exact", CASE, "--include-ignored", "--nocapture"])
+            .env(CHILD, fixture.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", git_config)
+            .env("CARGO_PRIMARY_PACKAGE", "1")
+            .env("OMG_DATA_DIR", fixture.path())
+            .env("OMG_SOCKET_PATH", fixture.path().join("absent.sock"))
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::ensure!(
+            output.status.success(),
+            "dynamic history fixture failed:\n{stdout}\n{stderr}"
+        );
+        println!("{stdout}");
         Ok(())
     }
 

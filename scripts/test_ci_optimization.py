@@ -415,7 +415,7 @@ git() { printf '%040d\\n' 1; }
             self.assertIn(name, selected)
             self.assertIn('"$test_name" == ' + name, script)
         self.assertIn('runner=(env OMG_ISOLATED_FIXTURE_TEST="$test_name")', script)
-        self.assertEqual(len(selected), 35)
+        self.assertEqual(len(selected), 36)
         self.assertIn('package_managers::aur::client::tests::sandbox_launcher_isolates_host_ipc_namespace', selected)
         for test in ('descriptor_creation_denial_refuses_installation_handoff', 'descriptor_sealing_denial_refuses_installation_handoff'):
             name = 'package_managers::arch_install::native_tests::' + test
@@ -426,6 +426,7 @@ git() { printf '%040d\\n' 1; }
         self.assertIn('package_managers::aur::client::tests::attended_review_requires_hardened_confirmation_even_with_yes', selected)
         self.assertIn('package_managers::aur::client::tests::native_isolated_fixture_builds_reviewed_source_without_installing', selected)
         self.assertIn('package_managers::aur::client::tests::native_isolated_history_requires_hardened_review', selected)
+        self.assertIn('package_managers::aur::client::tests::native_isolated_dynamic_history_pairs_reviewed_source', selected)
         self.assertIn('runner=(runuser -u nobody -- env HOME=/home/omg-fixture', script)
         self.assertIn('NOPASSWD: /usr/bin/true', script)
         self.assertNotIn('NOPASSWD: ALL', script)
