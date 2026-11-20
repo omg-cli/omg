@@ -646,10 +646,8 @@ mod tests {
     fn legacy_mock_state_preserves_installed_and_available_inventory() -> Result<()> {
         let directory = tempdir()?;
         let package_manager = MockPackageManager::new_in("debian", directory.path());
-        fs::write(
-            directory.path().join("mock_state_apt.json"),
-            br#"{"installed":["fixture"],"available":{"fixture":"2.0.0"}}"#,
-        )?;
+        let state = br#"{"installed":["fixture"],"available":{"fixture":"2.0.0"}}"#;
+        fs::write(directory.path().join("mock_state_apt.json"), state)?;
 
         let updates = futures::executor::block_on(package_manager.list_updates())?;
         assert_eq!(updates.len(), 1);
