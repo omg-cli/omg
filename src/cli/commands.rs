@@ -1263,7 +1263,7 @@ pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
         id,
         yes,
         #[cfg(feature = "arch")]
-        crate::package_managers::AurClient::rebuild_from_history,
+        crate::package_managers::AurClient::downgrade_from_history,
     )
     .await
 }

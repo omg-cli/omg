@@ -2092,18 +2092,8 @@ impl AurClient {
     /// commit whose `.SRCINFO` recorded the old version. The clone is fully
     /// isolated under `_rollback/` so the user's cached checkout is never
     /// touched, and no build-cache key is written (this is not the latest
-    /// build).
-    pub async fn downgrade_from_history(&self, package: &str, version: &str) -> Result<()> {
-        self.rebuild_from_history(package, version)
-            .await
-            .map(|_| ())
-    }
-
-    pub(crate) async fn rebuild_from_history(
-        &self,
-        package: &str,
-        version: &str,
-    ) -> Result<String> {
+    /// build). Returns the version installed from the reviewed archive.
+    pub async fn downgrade_from_history(&self, package: &str, version: &str) -> Result<String> {
         self.rebuild_from_history_with_install(package, version, Self::install_built_packages)
             .await
     }
@@ -10164,11 +10154,9 @@ mod tests {
         if let Ok(mode) = std::env::var(MODE) {
             let history = matches!(
                 mode.as_str(),
-                "history"
-                    | "history-accept-failing-build"
-                    | "history-accept-rebuilt-archive"
-                    | "history-accept-rebuilt-dynamic"
+                "history" | "history-accept-failing-build" | "history-accept-rebuilt-archive"
             );
+            let history = history || mode == "history-accept-rebuilt-dynamic";
             let directory = if history {
                 anyhow::ensure!(
                     std::env::var("OMG_AUR_NATIVE_FIXTURE").as_deref() == Ok("isolated-container"),
