@@ -5901,14 +5901,16 @@ mod tests {
     }
 
     fn write_tar_gz(path: &std::path::Path, entries: &[(&str, &[u8])]) {
-        let archive = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .expect("create a private AUR archive fixture");
-        let encoder = flate2::write::GzEncoder::new(archive, flate2::Compression::fast());
+        let encoder = flate2::write::GzEncoder::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .unwrap(),
+            flate2::Compression::fast(),
+        );
         let mut tar = tar::Builder::new(encoder);
         for (name, content) in entries {
             let mut header = tar::Header::new_gnu();

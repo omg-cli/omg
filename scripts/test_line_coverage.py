@@ -339,7 +339,96 @@ class MovedAurSrcinfoCoverageTests(unittest.TestCase):
                     self.assertIsNone(proof)
 
 
+class MetadataPublicationCoverageTests(unittest.TestCase):
+    def test_success_requires_the_durable_publication_step_and_all_compiled_copies(self):
+        filename = 'src/package_managers/aur_metadata.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'wrong-manifest', 'skipped-publication', 'missing-copy'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, done = [], [], []
+                for side in range(2):
+                    declaration = 'publish_generation' if side else 'validate_and_publish_metadata'
+                    header = f'fn {declaration}() -> Result<()> {{'
+                    source = [header]
+                    if side:
+                        source.extend(['    let _persisted = generation.keep();', '    File::open(root)?.sync_all()?;',
+                                       '    let manifest = Manifest {', '        generation: name,', '        validators,', '    };'])
+                        if fault != 'skipped-publication':
+                            source.append('    commit_manifest(root, &manifest).context("Failed to publish AUR metadata generation")?;')
+                    else:
+                        source.extend(['    std::fs::rename(&staged_index, index_path)',
+                                       '        .with_context(|| format!("Failed to publish AUR index at {}", index_path.display()))?;',
+                                       '    crate::core::safe_ops::sync_parent_directory_sync(index_path)?;'])
+                    source.extend(['    Ok(())', '}'])
+                    end = len(source)
+                    done.append(end - 1)
+                    if side:
+                        target = 'other.json' if fault == 'wrong-manifest' else 'manifest.json'
+                        source.extend(['fn commit_manifest(root: &Path, manifest: &Manifest) -> Result<()> {',
+                                       f'    persist_file_atomically(&root.join("{target}"), &serde_json::to_vec(manifest)?)', '}'])
+                    owners = []
+                    for copy in range(2):
+                        if side and copy and fault == 'missing-copy':
+                            continue
+                        hits = int(copy != 0)
+                        symbol = f'_RNvNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers12aur_metadata{len(declaration)}{declaration}'
+                        owners.append(dict(name=symbol, count=hits, filenames=list(files),
+                                           regions=[[1, 1, 1, len(header) - 1, hits, 0, 0, 0],
+                                                    [end - 1, 5, end - 1, 11, hits, 0, 0, 0],
+                                                    [end, 1, end, 2, hits, 0, 0, 0]]))
+                    sides.append((source, coverage._construct_inventory(source, work), {end - 1: 1}))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_metadata_publication_success(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [done])
+                else:
+                    self.assertIsNone(proof)
+
+
 class AurArchiveCaptureCoverageTests(unittest.TestCase):
+    def test_private_fixture_encoder_preserves_the_covered_archive_construction(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'public-file', 'different-compression', 'unproved-encoder', 'foreign-placement'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, encoder_lines, compression_lines = [], [], [], []
+                for side in range(2):
+                    mode = '0o644' if side and fault == 'public-file' else '0o600'
+                    options = ['std::fs::OpenOptions::new()', '.write(true)', '.create(true)',
+                               '.truncate(true)', f'.mode({mode})', '.open(path)']
+                    encoder = 'let encoder = flate2::write::GzEncoder::new('
+                    opener = [*options, '.unwrap(),'] if side else ['std::fs::File::create(path).unwrap(),']
+                    level = 'best' if side and fault == 'different-compression' else 'fast'
+                    body = [encoder, *opener, f'flate2::Compression::{level}(),', ');']
+                    module = 'foreign' if side and fault == 'foreign-placement' else 'tests'
+                    source = ['#[cfg(test)]', f'mod {module} {{',
+                              '    fn write_tar_gz(path: &std::path::Path, entries: &[(&str, &[u8])]) {',
+                              *['        ' + line for line in body], '    }', '}']
+                    line = 4
+                    compression = line + len(opener) + 1
+                    encoder_lines.append(line)
+                    compression_lines.append(compression)
+                    last = len(source) - 1
+                    symbol = f'_RNvNtNtNtNtCs{side + 1}_7omg_lib16package_managers3aur6client5tests12write_tar_gz'
+                    count = 0 if side and fault == 'unproved-encoder' else 1
+                    regions = [[3, 5, 3, len(source[2]) - 1, 1, 0, 0, 0],
+                               [line, 13, line, 20, count, 0, 0, 0],
+                               [line, 23, line, 52, count, 0, 0, 0],
+                               [compression, 9, compression, 34, 1, 0, 0, 0],
+                               [last, 5, last, 6, 1, 0, 0, 0]]
+                    owners = [dict(name=symbol, filenames=list(files), count=1, regions=regions)]
+                    sides.append((source, coverage._construct_inventory(source, work), {line: count, compression: 1}))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_private_aur_fixture_encoder(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [encoder_lines, compression_lines])
+                else:
+                    self.assertIsNone(proof)
+
     def test_archive_capture_keeps_the_same_zipped_path_and_digest_verification(self):
         filename = 'src/package_managers/aur/client.rs'
         files = {'/artifact/' + filename: filename}

@@ -13713,6 +13713,129 @@ def retained_aur_archive_capture(name, sides, indexes, work):
                 geometry=before[1], owners=[before[3], after[3]], instance_matching=matching)
 
 
+def retained_private_aur_fixture_encoder(name, sides, indexes, work):
+    """Bind the fixture's same gzip encoder to its private output descriptor."""
+    header = tuple('fn write_tar_gz ( path : & std :: path :: Path , entries : & [ ( & str , & [ u8 ] ) ] )'.split())
+    private_file = ('std :: fs :: OpenOptions :: new ( ) . write ( true ) . create ( true ) '
+                    '. truncate ( true ) . mode ( 0o600 ) . open ( path )').split()
+    encoder = 'let encoder = flate2 :: write :: GzEncoder :: new ('.split()
+    compression = 'flate2 :: Compression :: fast ( )'.split()
+    witnesses = []
+    for modern, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows))
+        functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == header]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        parent = code.parents[function['opening']]
+        test_module = tuple('# [ cfg ( test ) ] mod tests'.split())
+        test_module_with_expect = tuple('# [ cfg ( test ) ] # [ expect ( clippy :: unwrap_used ) ] mod tests'.split())
+        if not any(row['opening'] == parent and row['kind'] == 'mod'
+                   and row['header'] in (test_module, test_module_with_expect)
+                   and code.parents[row['opening']] is None for row in rows):
+            return None
+        start = function['opening'] + 1
+        opener = ([*private_file, *'. unwrap ( )'.split()] if modern
+                  else 'std :: fs :: File :: create ( path ) . unwrap ( )'.split())
+        shape = [*encoder, *opener, ',', *compression, ',', ')', ';']
+        _construct_charge(work, len(shape))
+        if code.words[start:start + len(shape)] != shape:
+            return None
+        compression_at = start + len(encoder) + len(opener) + 1
+        slots = (code.region(start + 1, start + 1), code.region(start + 3, start + 9),
+                 code.region(compression_at, compression_at + compression.index('fast')))
+        lines = (slots[0][0], slots[-1][0])
+        low = code.region(function['first'], function['opening'] - 1)
+        high = code.region(function['end'], function['end'])
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        touching = [(owner, raw) for owner in owners if (raw := [r for r in owner['regions']
+                    if any(r[0] <= line <= r[2] for line in lines)])]
+        if len(touching) != 1:
+            return None
+        (owner, raw), = touching
+        symbol = owner['name']
+        shape = plain_rust_function_symbol(symbol)
+        hits = owner['count']
+        if (shape is None or shape.identifiers != ('omg_lib', 'package_managers', 'aur', 'client', 'tests', 'write_tar_gz')
+                or index.name_counts[symbol] != 1 or owner.get('branches') or owner.get('mcdc_records')
+                or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                or not 0 < hits < COUNTER_LIMIT or any(counts.get(line) != hits for line in lines)
+                or owner['regions'][0] != [*low, hits, 0, 0, 0] or owner['regions'][-1] != [*high, hits, 0, 0, 0]
+                or [r[4:] for r in raw if tuple(r[:4]) in slots] != [[hits, 0, 0, 0]] * 3):
+            return None
+        witnesses.append((lines, symbol, slots))
+    return dict(file=name, kind='retained-private-aur-fixture-encoder',
+                pairs=[list(pair) for pair in zip(*(row[0] for row in witnesses), strict=True)],
+                owners=[row[1] for row in witnesses],
+                regions=[row[2] for row in witnesses])
+
+
+def retained_metadata_publication_success(name, sides, indexes, work):
+    """Verify the successful publication return after the metadata manifest migration."""
+    previous = ['    std::fs::rename(&staged_index, index_path)',
+                '        .with_context(|| format!("Failed to publish AUR index at {}", index_path.display()))?;',
+                '    crate::core::safe_ops::sync_parent_directory_sync(index_path)?;', '    Ok(())', '}']
+    manifest = ['    let _persisted = generation.keep();', '    File::open(root)?.sync_all()?;',
+                '    let manifest = Manifest {', '        generation: name,', '        validators,', '    };',
+                '    commit_manifest(root, &manifest).context("Failed to publish AUR metadata generation")?;',
+                '    Ok(())', '}']
+    commit = ['fn commit_manifest(root: &Path, manifest: &Manifest) -> Result<()> {',
+              '    persist_file_atomically(&root.join("manifest.json"), &serde_json::to_vec(manifest)?)', '}']
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        declaration = 'publish_generation' if modern else 'validate_and_publish_metadata'
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows))
+        functions = [row for row in rows if row['kind'] == 'fn' and row['header'][:2] == ('fn', declaration)
+                     and code.parents[row['opening']] is None]
+        if len(functions) != 1:
+            return None
+        if modern:
+            publishers = [code.region(row['first'], row['end']) for row in rows if row['kind'] == 'fn'
+                          and row['header'][:2] == ('fn', 'commit_manifest') and code.parents[row['opening']] is None]
+            if len(publishers) != 1 or source[publishers[0][0] - 1:publishers[0][2]] != commit:
+                return None
+        function, = functions
+        entry = code.region(function['first'], function['opening'] - 1)
+        end = code.region(function['end'], function['end'])
+        tail = manifest if modern else previous
+        if source[end[0] - len(tail):end[0]] != tail:
+            return None
+        line = end[0] - 1
+        success = code.region(function['end'] - 5, function['end'] - 1)
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        witnesses = []
+        for owner in owners:
+            raw = [r for r in owner['regions'] if r[0] <= line <= r[2]]
+            symbol = owner['name']
+            shape = plain_rust_function_symbol(symbol) if declaration in symbol else None
+            qualified = shape is not None and shape.identifiers == ('omg_lib', 'package_managers', 'aur_metadata', declaration)
+            if not raw and not qualified:
+                continue
+            count = owner['count']
+            if (not qualified or len(raw) != 1 or tuple(raw[0][:4]) != success
+                    or raw[0][5:] != [0, 0, 0] or not 0 <= raw[0][4] <= count < COUNTER_LIMIT
+                    or index.name_counts[symbol] != 1 or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name or owner.get('branches') or owner.get('mcdc_records')
+                    or owner['regions'][0] != [*entry, count, 0, 0, 0] or owner['regions'][-1] != [*end, count, 0, 0, 0]):
+                return None
+            witnesses.append((symbol, raw[0][4]))
+        total = sum(hits for _, hits in witnesses)
+        if total <= 0 or total != counts.get(line):
+            return None
+        observations.append((line, [[int(hits > 0)] for _, hits in witnesses], success, witnesses))
+    before, after = observations
+    _construct_charge(work, len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-metadata-publication-success', pairs=[[before[0], after[0]]],
+                regions=[before[2], after[2]], compiled_entries=[before[3], after[3]], instance_matching=matching)
+
+
 def retained_artifact_reason_matrix(name, sides, indexes, work):
     """Verify every existing case still checks its reason, including overlapping classes."""
     declaration = 'inspector_requires_paired_build_for_system_integration_payloads'
@@ -15435,7 +15558,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         _AUR_GIT_SOURCE: (retained_aur_git_limits, retained_aur_prefetch_test_wait,
                           retained_aur_git_fixture_limits, retained_aur_git_cancellation_entry),
         _AUR_DEPS_SOURCE: (retained_aur_dependency_packages,),
-        'src/package_managers/aur/client.rs': (retained_aur_archive_capture,),
+        'src/package_managers/aur/client.rs': (retained_aur_archive_capture, retained_private_aur_fixture_encoder),
+        'src/package_managers/aur_metadata.rs': (retained_metadata_publication_success,),
         'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison, retained_pacman_pattern_inputs,
                                                 retained_pacman_pattern_matcher, retained_pacman_foreign_catalog_reads),
         'src/runtimes/node.rs': (retained_node_checksum_wait,),
