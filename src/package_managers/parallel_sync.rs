@@ -621,9 +621,8 @@ fn verify_staged_databases(
         let database = alpm
             .register_syncdb(repo.name.as_str(), siglevel)
             .with_context(|| format!("Failed to register staged database '{}'", repo.name))?;
-        database
-            .is_valid()
-            .with_context(|| format!("Signature verification failed for '{}'", repo.name))?;
+        crate::package_managers::alpm_ops::validate_sync_database(&alpm, database)
+            .with_context(|| format!("Staged database verification failed for '{}'", repo.name))?;
     }
     Ok(())
 }
@@ -1201,13 +1200,22 @@ mod tests {
         let keyring = directory.path().join("gnupg");
         std::fs::create_dir_all(&sync_dir).expect("staged sync directory");
         std::fs::create_dir_all(&keyring).expect("test keyring directory");
-        std::fs::write(sync_dir.join("core.db"), b"database").expect("staged database");
+        let database = sync_dir.join("core.db");
+        std::fs::write(&database, b"database").expect("malformed staged database");
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(&format!(
             "[options]\nGPGDir = {}\nSigLevel = Required DatabaseOptional\n\n[core]\nServer = https://mirror.example/$repo/$arch\n",
             keyring.display()
         ))
         .expect("pacman config");
 
+        assert!(verify_staged_databases(&database_root, &config).is_err());
+        let file = std::fs::File::create(&database).expect("create valid empty catalog");
+        let gzip = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        tar::Builder::new(gzip)
+            .into_inner()
+            .unwrap()
+            .finish()
+            .unwrap();
         verify_staged_databases(&database_root, &config)
             .expect("DatabaseOptional must permit an absent detached signature");
     }
@@ -1231,7 +1239,11 @@ mod tests {
 
         let error = verify_staged_databases(&database_root, &config)
             .expect_err("an invalid detached database signature must fail closed");
-        assert!(error.to_string().contains("Signature verification failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("Staged database verification failed")
+        );
     }
 
     #[test]

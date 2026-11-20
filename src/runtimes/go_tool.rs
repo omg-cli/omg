@@ -305,7 +305,7 @@ pub(crate) fn install_reviewed(
     let archive_sha256 = artifacts::hash(&artifacts::read(archive, 256 * 1024 * 1024)?);
     artifacts::tree(&extracted)?;
     let project = work.join("source");
-    super::common::copy_regular_tree(&extracted, &project)?;
+    super::common::copy_regular_tree(&extracted, &project, false)?;
     verify_module_files(
         &project,
         &selected.path,

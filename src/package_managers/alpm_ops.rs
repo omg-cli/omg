@@ -1850,7 +1850,13 @@ fn configure_transaction_options(
     // checks, logging, and package hooks behave like a normal Arch transaction.
     let root = paths::pacman_root_result()?;
     configure_signature_verification(alpm, pacman_config)?;
-    alpm.set_sandbox_user(pacman_config.download_user.as_deref())
+    let download_user = pacman_config.download_user.as_deref();
+    if let Some(user) = download_user {
+        nix::unistd::User::from_name(user)
+            .context("Failed to resolve pacman DownloadUser")?
+            .with_context(|| format!("Pacman DownloadUser account '{user}' does not exist"))?;
+    }
+    alpm.set_sandbox_user(download_user)
         .context("Failed to configure pacman DownloadUser")?;
     let cache_dirs = paths::pacman_cache_dirs_result()?;
     for cache_dir in &cache_dirs {
@@ -4999,7 +5005,7 @@ mod tests {
         std::fs::write(
             &configuration,
             format!(
-                "[options]\n[core]\nServer = file://{}/$repo/os/$arch\n\n[configured-only]\nServer = file://{}/$repo/os/$arch\n",
+                "[options]\nArchitecture = fixture-arch auto\n[core]\nServer = file://{}/$repo/os/$arch\n\n[configured-only]\nServer = file://{}/$repo/os/$arch\n",
                 mirror.display(),
                 mirror.display()
             ),
@@ -5029,14 +5035,55 @@ mod tests {
         );
         let core = databases.first().expect("registered core database");
         assert_eq!(core.name(), "core");
-        let system = nix::sys::utsname::uname()?;
-        let machine = system.machine().to_str().expect("kernel machine is UTF-8");
-        let expected = format!("file://{}/core/os/{machine}", mirror.display());
+        let expected = format!("file://{}/core/os/fixture-arch", mirror.display());
         assert_eq!(
             core.servers().into_iter().collect::<Vec<_>>(),
             vec![expected.as_str()]
         );
         ensure_mirror_servers(&alpm)?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_options_use_default_local_hooks_and_configured_download_user() -> anyhow::Result<()> {
+        const NAME: &str = "package_managers::alpm_ops::tests::native_options_use_default_local_hooks_and_configured_download_user";
+        if crate::core::testing::run_isolated_test(NAME) {
+            return Ok(());
+        }
+        let fixture = RepositoryFixture::new()?;
+        let root = fixture.directory.path().join("root");
+        let distro = root.join("usr/share/libalpm/hooks");
+        let local = root.join("etc/pacman.d/hooks");
+        let custom = root.join("etc/custom-hooks");
+        for path in [&distro, &local, &custom] {
+            std::fs::create_dir_all(path)?;
+        }
+        std::fs::create_dir_all(root.join("etc/pacman.d/gnupg"))?;
+        crate::core::paths::set_test_overrides(Some(root), Some(fixture.database()));
+        let mut alpm = fixture.open();
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
+            "[options]\nDownloadUser = nobody\n",
+        )?;
+        super::configure_transaction_options(&mut alpm, &config)?;
+        assert_eq!(alpm.sandbox_user(), Some("nobody"));
+        let hooks = |alpm: &alpm::Alpm| {
+            alpm.hookdirs()
+                .into_iter()
+                .map(|path| std::path::PathBuf::from(path.trim_end_matches('/')))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(hooks(&alpm), vec![distro.clone(), local]);
+
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
+            "[options]\nHookDir = etc/custom-hooks\n",
+        )?;
+        super::configure_transaction_options(&mut alpm, &config)?;
+        assert_eq!(hooks(&alpm), vec![distro, custom]);
+        assert_eq!(alpm.sandbox_user(), None);
+        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
+            "[options]\nDownloadUser = omg-no-such-downloader-account\n",
+        )?;
+        assert!(super::configure_transaction_options(&mut alpm, &config).is_err());
         Ok(())
     }
 

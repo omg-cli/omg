@@ -562,36 +562,25 @@ fn smoke_swift(version_dir: &Path, expected: &str) -> Result<()> {
     let swift = version_dir.join(SWIFT_BINARY);
     let mut command = std::process::Command::new(&swift);
     super::common::harden_untrusted_runtime_command(&mut command, version_dir);
-    let output = command
-        .arg("--version")
-        .output()
-        .with_context(|| format!("Failed to run smoke test: {}", swift.display()))?;
-    if output.status.success() {
-        let text =
-            std::str::from_utf8(&output.stdout).context("Swift version output is not UTF-8")?;
-        let actual = text
-            .lines()
-            .find_map(|line| {
-                line.split_once("Swift version ")
-                    .and_then(|(_, rest)| rest.split_whitespace().next())
-            })
-            .context("Swift did not report its version")?;
-        anyhow::ensure!(
-            is_stable_version(actual) && super::common::version_cmp(actual, expected).is_eq(),
-            "Swift artifact version {actual} does not match requested {expected}"
-        );
-        Ok(())
-    } else {
-        let stderr =
-            crate::cli::style::sanitize_terminal_text(&String::from_utf8_lossy(&output.stderr));
-        let stderr: String = stderr.chars().take(300).collect();
-        anyhow::bail!(
-            "Swift smoke test failed with status {}: {}: {}",
-            output.status,
-            swift.display(),
-            stderr.trim()
-        )
-    }
+    command.arg("--version");
+    let output = super::tool_artifacts::run_with_timeout(
+        command,
+        "Swift smoke test",
+        std::time::Duration::from_secs(30),
+    )?;
+    let text = std::str::from_utf8(&output).context("Swift version output is not UTF-8")?;
+    let actual = text
+        .lines()
+        .find_map(|line| {
+            line.split_once("Swift version ")
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+        })
+        .context("Swift did not report its version")?;
+    anyhow::ensure!(
+        is_stable_version(actual) && super::common::version_cmp(actual, expected).is_eq(),
+        "Swift artifact version {actual} does not match requested {expected}"
+    );
+    Ok(())
 }
 
 /// Ensure the installed `swift` is executable (tarballs may drop modes).

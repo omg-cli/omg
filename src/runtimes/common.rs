@@ -1431,7 +1431,11 @@ pub(crate) fn replace_staged_install_with_lease(
 ///
 /// Symlinks and special files are rejected so a staged replacement cannot
 /// inherit a link that later escapes the published version directory.
-pub(crate) fn copy_regular_tree(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn copy_regular_tree(
+    src: &Path,
+    dest: &Path,
+    preserve_directory_modes: bool,
+) -> Result<()> {
     let metadata = fs::symlink_metadata(src)
         .with_context(|| format!("Failed to inspect source path: {}", src.display()))?;
     if !metadata.is_dir() {
@@ -1439,10 +1443,14 @@ pub(crate) fn copy_regular_tree(src: &Path, dest: &Path) -> Result<()> {
     }
     fs::create_dir_all(dest)
         .with_context(|| format!("Failed to create destination directory: {}", dest.display()))?;
-    copy_regular_tree_contents(src, dest)
+    copy_regular_tree_contents(src, dest, preserve_directory_modes)
 }
 
-fn copy_regular_tree_contents(src: &Path, dest: &Path) -> Result<()> {
+fn copy_regular_tree_contents(
+    src: &Path,
+    dest: &Path,
+    preserve_directory_modes: bool,
+) -> Result<()> {
     for entry in
         fs::read_dir(src).with_context(|| format!("Failed to read directory: {}", src.display()))?
     {
@@ -1455,7 +1463,10 @@ fn copy_regular_tree_contents(src: &Path, dest: &Path) -> Result<()> {
         if file_type.is_dir() {
             fs::create_dir_all(&dest_path)
                 .with_context(|| format!("Failed to create directory: {}", dest_path.display()))?;
-            copy_regular_tree_contents(&entry.path(), &dest_path)?;
+            copy_regular_tree_contents(&entry.path(), &dest_path, preserve_directory_modes)?;
+            if preserve_directory_modes {
+                fs::set_permissions(&dest_path, entry.metadata()?.permissions())?;
+            }
         } else if file_type.is_file() {
             fs::copy(entry.path(), &dest_path).with_context(|| {
                 format!(
@@ -4773,7 +4784,7 @@ mod tests {
         fs::create_dir_all(src.join("nested/deeper"))?;
         fs::write(src.join("root.bin"), b"root\0payload")?;
         fs::write(src.join("nested/deeper/tool"), b"nested\xffpayload")?;
-        copy_regular_tree(&src, &dest)?;
+        copy_regular_tree(&src, &dest, false)?;
         assert_eq!(fs::read(dest.join("root.bin"))?, b"root\0payload");
         assert_eq!(
             fs::read(dest.join("nested/deeper/tool"))?,
@@ -4781,7 +4792,7 @@ mod tests {
         );
         std::os::unix::fs::symlink("/tmp", src.join("link"))?;
 
-        let error = copy_regular_tree(&src, &dest).expect_err("symlinks must be rejected");
+        let error = copy_regular_tree(&src, &dest, false).expect_err("symlinks must be rejected");
         assert!(error.to_string().contains("symlink or special file"));
         Ok(())
     }
