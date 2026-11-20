@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -379,6 +380,13 @@ trap 'printf "exit-trap\\n"' EXIT
 
 
 class OutputContracts(unittest.TestCase):
+    def test_runtime_consent_reports_why_a_command_exited_before_review(self):
+        oracle = runpy.run_path(str(ROOT / 'scripts/qemu-runtime-advisory-oracle.py'))
+        command = [sys.executable, '-c',
+                   "import sys; sys.stderr.write('runtime catalog request timed out\\n'); sys.exit(4)"]
+        with self.assertRaisesRegex(ValueError, r'exit=4.*runtime catalog request timed out'):
+            oracle['run_denial'](command, 'node', '24.21.0', time.monotonic() + 5)
+
     def test_update_output_accepts_terminal_gradient_without_losing_required_evidence(self):
         for mode, header, phase in [('fast', 'Fast System Update', 'Synced in 0.09s'),
                                      ('turbo', 'TURBO System Update', 'cached, no sync')]:

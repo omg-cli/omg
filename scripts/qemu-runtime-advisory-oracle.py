@@ -17,6 +17,7 @@ import tempfile
 import time
 
 MAX_TRANSCRIPT = 2 * 1024 * 1024
+MAX_FAILURE_DIAGNOSTIC = 2048
 PROMPT = re.compile(rb"(?:^|\r?\n)Type accept ([0-9a-f]{64}) within 60 seconds to continue \(default: cancel\): ")
 
 
@@ -65,7 +66,10 @@ def run_denial(command, runtime, version, deadline):
         finally:
             if denied.poll() is None: stop(denied.pid)
             denied.wait(timeout=5)
-    require(denied.returncode != 0 and b'Security review requires an attended controlling terminal' in denial, 'command did not refuse its missing attended security decision')
+    if denied.returncode == 0 or b'Security review requires an attended controlling terminal' not in denial:
+        diagnostic = denial[-MAX_FAILURE_DIAGNOSTIC:].strip()
+        raise ValueError(f'command did not refuse its missing attended security decision '
+                         f'(exit={denied.returncode}, output={diagnostic!r})')
     checked_warning(denial, runtime, version)
     return denied.returncode, denial
 
