@@ -14,6 +14,40 @@ MARKER = 'TO' + 'DO'
 REPOSITORY = 'omg-cli/omg'
 
 
+def debt_step_command(workflow):
+    matches = list(re.finditer(
+        r'(?m)^(?P<indent> +)- name: Debt ratchet \(gating\)[ \t]*\n'
+        r'(?:(?P=indent)  if:[^\n]*\n)?'
+        r'(?P=indent)  run: (?P<command>[^\n]+)$', workflow))
+    if len(matches) != 1:
+        raise ValueError('one executable Debt ratchet (gating) step is required')
+    return matches[0]['command']
+
+
+class DebtStepExtractionTests(unittest.TestCase):
+    def test_scoped_and_unscoped_steps_select_the_real_command(self):
+        for condition in ('', '        if: matrix.shard == 0\n'):
+            with self.subTest(condition=condition):
+                workflow = ('      - name: Debt ratchet (gating)\n' + condition +
+                            '        run: python3 scripts/debt-ratchet.py --ci\n')
+                self.assertEqual(debt_step_command(workflow),
+                                 'python3 scripts/debt-ratchet.py --ci')
+
+    def test_missing_command_cannot_borrow_a_neighboring_step(self):
+        workflow = ('      - name: Debt ratchet (gating)\n'
+                    '        if: matrix.shard == 0\n'
+                    '      - name: Another check\n'
+                    '        run: python3 scripts/debt-ratchet.py --ci\n')
+        with self.assertRaises(ValueError):
+            debt_step_command(workflow)
+
+    def test_duplicate_gating_commands_are_ambiguous(self):
+        step = ('      - name: Debt ratchet (gating)\n'
+                '        run: python3 scripts/debt-ratchet.py --ci\n')
+        with self.assertRaises(ValueError):
+            debt_step_command(step + step)
+
+
 class DebtRatchetCITests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -60,9 +94,7 @@ class DebtRatchetCITests(unittest.TestCase):
                    GITHUB_REPOSITORY=REPOSITORY, GITHUB_ACTIONS='true')
         # Exercise the workflow's executable command, including its selected mode.
         workflow = (ROOT / '.github/workflows/ci.yml').read_text(encoding='utf-8')
-        command = re.search(r'- name: Debt ratchet \(gating\)\s+run: ([^\n]+)', workflow)
-        self.assertIsNotNone(command)
-        argv = shlex.split(command.group(1))
+        argv = shlex.split(debt_step_command(workflow))
         return subprocess.run([sys.executable, str(ROOT / argv[1]), *argv[2:],
                                '--root', str(self.root), *extra], env=env,
                               capture_output=True, text=True, timeout=60)

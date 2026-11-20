@@ -26,7 +26,7 @@ const MAX_PATH_BYTES: usize = 4_096;
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PRIVILEGED_FILES: usize = 256;
 
-pub(crate) const INSPECTION_POLICY_VERSION: u32 = 2;
+pub(crate) const INSPECTION_POLICY_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrivilegedFile {
@@ -255,7 +255,9 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
             seen.insert(member.clone()),
             "duplicate normalized path in AUR archive: {member}"
         );
+        let mut privileged_integration = false;
         if member.starts_with("etc/") {
+            privileged_integration = true;
             paired_build_reasons.insert("system-configuration".to_owned());
         }
         // These package locations are consumed by privileged system managers
@@ -265,15 +267,18 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
         // https://man.archlinux.org/man/tmpfiles.d.5
         // https://man.archlinux.org/man/sysusers.d.5
         if member.starts_with("usr/lib/systemd/") || member.starts_with("etc/systemd/") {
+            privileged_integration = true;
             paired_build_reasons.insert("systemd-unit".to_owned());
         }
         if member.starts_with("usr/lib/modules/") || member.starts_with("lib/modules/") {
+            privileged_integration = true;
             paired_build_reasons.insert("kernel-module".to_owned());
         }
         if member.starts_with("usr/share/libalpm/hooks/")
             || member.starts_with("usr/share/libalpm/scripts/")
         {
             paired_build_reasons.insert("package-manager-hook".to_owned());
+            privileged_integration = true;
         }
         if member.starts_with("usr/lib/udev/rules.d/")
             || member.starts_with("usr/lib/tmpfiles.d/")
@@ -289,6 +294,7 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
             || member.starts_with("usr/lib/NetworkManager/dispatcher.d/")
         {
             paired_build_reasons.insert("privileged-system-integration".to_owned());
+            privileged_integration = true;
         }
 
         let kind = entry.header().entry_type();
@@ -319,7 +325,10 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArtifactInspection> {
         if kind.is_file() && mode & 0o111 != 0 {
             executable_files.push(member.clone());
         }
-        if kind.is_file() && (mode & 0o6000 != 0 || capability.is_some()) {
+        if !kind.is_dir()
+            && (privileged_integration
+                || (kind.is_file() && (mode & 0o6000 != 0 || capability.is_some())))
+        {
             // Linux documents set-ID and file capabilities as privilege-bearing
             // mechanisms: https://man7.org/linux/man-pages/man7/capabilities.7.html
             anyhow::ensure!(
@@ -623,6 +632,7 @@ mod tests {
         for (path, reason) in [
             ("etc/demo.conf", "system-configuration"),
             ("usr/lib/systemd/system/demo.service", "systemd-unit"),
+            ("usr/lib/systemd/system-generators/demo", "systemd-unit"),
             ("usr/lib/modules/6.0/extra/demo.ko", "kernel-module"),
             ("usr/share/libalpm/hooks/demo.hook", "package-manager-hook"),
             (
@@ -633,6 +643,16 @@ mod tests {
             let archive = fixture_archive(|builder| append_file(builder, path, b"payload", 0o644))?;
             let inspection = inspect_archive(archive.path())?;
             assert!(inspection.requires_paired_build());
+            assert!(
+                inspection.requires_exception(),
+                "{path} needs attended approval"
+            );
+            assert!(
+                inspection
+                    .privileged_files
+                    .iter()
+                    .any(|file| file.path == path)
+            );
             assert!(
                 inspection
                     .paired_build_reasons

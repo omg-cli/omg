@@ -187,9 +187,10 @@ fn test_docker_real_install() {
     require_docker_tests();
     assert!(ensure_docker_image(), "Docker image not ready");
 
-    // Install and verify in a single container (state persists within one docker run)
-    let (success, stdout, stderr) =
-        run_script_in_docker("sudo omg install -y ripgrep && pacman -Qi ripgrep");
+    // Start the privileged CLI with Landlock's no_new_privs prerequisite.
+    let (success, stdout, stderr) = run_script_in_docker(
+        "sudo setpriv --no-new-privs -- omg install -y ripgrep && pacman -Qi ripgrep",
+    );
 
     if !success {
         eprintln!("STDOUT: {stdout}");
@@ -324,9 +325,9 @@ fn test_docker_install_removes_work_together() {
 
     // All operations in a single container to preserve state
     let (success, _stdout, _stderr) = run_script_in_docker(
-        "sudo omg install -y tree \
+        "sudo setpriv --no-new-privs -- omg install -y tree \
          && which tree \
-         && sudo omg remove -y tree \
+         && sudo setpriv --no-new-privs -- omg remove -y tree \
          && ! which tree",
     );
 

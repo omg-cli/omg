@@ -513,8 +513,8 @@ pub fn zero_version() -> Version {
 #[cfg(feature = "arch")]
 #[must_use]
 pub fn compare_versions(a: &AlpmVersion, b: &AlpmVersion) -> std::cmp::Ordering {
-    if pkgver_has_overflowing_numeric_segment(a.pkgver.inner())
-        || pkgver_has_overflowing_numeric_segment(b.pkgver.inner())
+    if pkgver_has_overflowing_numeric_segment(a.pkgver.as_ref())
+        || pkgver_has_overflowing_numeric_segment(b.pkgver.as_ref())
     {
         // `Display` renders the canonical `epoch:pkgver-pkgrel` form.
         alpm::vercmp(a.to_string(), b.to_string())

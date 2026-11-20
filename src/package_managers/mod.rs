@@ -430,7 +430,7 @@ pub fn get_counts() -> anyhow::Result<(usize, usize, usize)> {
     }
 
     #[cfg(feature = "arch")]
-    return alpm_direct::get_counts();
+    return pacman_db::get_counts_fast();
 
     #[cfg(all(
         not(feature = "arch"),

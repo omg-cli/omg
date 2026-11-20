@@ -44,9 +44,11 @@ jobs:
       - name: Set comparison evidence directory
         run: echo "COMPARISON_ROOT=$RUNNER_TEMP/rust-comparison-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
+      - name: Configure signed Ubuntu archive
+        uses: ./.github/actions/ubuntu-apt
+
       - name: Install comparison dependencies
         run: |
-          sudo apt-get update --error-on=any
           sudo apt-get install -y --no-install-recommends \
             ca-certificates curl git build-essential pkg-config sudo python3 python3-apt python3-venv \
             fish zstd libssl-dev libapt-pkg-dev clang cmake zlib1g-dev liblzma-dev libbz2-dev tar gzip xz-utils
@@ -96,24 +98,88 @@ jobs:
           retention-days: 14
 
   workflow-helpers:
-    name: Test workflow helpers on Linux host
+    name: Admit workflow helpers on Linux host
     if: inputs.rust-comparison != true
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
-      # Native journal and namespace probes require the host, not the
-      # restricted Arch benchmark container. Keep failures release-blocking.
-      - name: Test workflow helpers
+      - name: Admit exact successful CI helper owners
+        id: helpers
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          sudo apt-get update --error-on=any
-          sudo apt-get install -y --no-install-recommends python3-venv
-          python3 -m unittest discover -s scripts -p 'test_*.py'
-          sudo -n python3 -m unittest discover -s scripts -p test_qemu_health.py
-          sudo -n python3 -m unittest discover -s scripts -p test_export_qemu_evidence.py
+          set +e
+          python3 -B scripts/workflow-helpers.py admit --timeout 1200 --output "$RUNNER_TEMP/benchmark-helper-admission.json"
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo 'fallback=false' >> "$GITHUB_OUTPUT" ;;
+            3) echo 'fallback=true' >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+
+      - name: Configure signed Ubuntu archive for independent helper run
+        if: steps.helpers.outputs.fallback == 'true'
+        uses: ./.github/actions/ubuntu-apt
+
+      - name: Install independent helper dependencies
+        if: steps.helpers.outputs.fallback == 'true'
+        run: sudo apt-get install -y --no-install-recommends python3-venv
+
+      - name: Install Rust for independent static checks
+        if: steps.helpers.outputs.fallback == 'true'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+
+      - name: Install independent Worker runtime
+        if: steps.helpers.outputs.fallback == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.1
+
+      - name: Install pinned Worker package manager
+        if: steps.helpers.outputs.fallback == 'true'
+        run: |
+          curl --proto '=https' --tlsv1.2 --max-time 120 -fsSL https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip -o "$RUNNER_TEMP/bun.zip"
+          echo "bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c  $RUNNER_TEMP/bun.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/bun.zip" -d "$RUNNER_TEMP/bun"
+          echo "10702245766b225e70bbf6235fd6b47214fd94b4760d00ffaed8ab0df57ac235  $RUNNER_TEMP/bun/bun-linux-x64/bun" | sha256sum -c -
+          echo "$RUNNER_TEMP/bun/bun-linux-x64" >> "$GITHUB_PATH"
+
+      - name: Prepare independent full helper run
+        if: steps.helpers.outputs.fallback == 'true'
+        run: |
+          bun install --cwd services/ci --frozen-lockfile --ignore-scripts
+          make ci-workflow-static
+          sudo -n python3 -B scripts/workflow-helpers.py privileged --output "$RUNNER_TEMP/helper-native-health.json"
+
+      - name: Execute independent complete helper owner
+        if: steps.helpers.outputs.fallback == 'true'
+        run: |
+          python3 -B scripts/workflow-helpers.py run --shard 0 --shards 1 --timeout 1800 \
+            --output "$RUNNER_TEMP/benchmark-helpers" --static-complete --worker-checks \
+            --privileged-receipt "$RUNNER_TEMP/helper-native-health.json"
+
+      - name: Preserve helper admission or execution
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: benchmark-helpers-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/benchmark-helper-admission.json
+            ${{ runner.temp }}/benchmark-helpers/
+          retention-days: 7
+          if-no-files-found: warn
 
   benchmark:
     name: Run Benchmarks

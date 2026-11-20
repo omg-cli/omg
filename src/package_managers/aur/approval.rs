@@ -33,7 +33,7 @@ pub(crate) fn exception_prompt(inspections: &[ArtifactInspection]) -> Result<Opt
             write!(prompt, "\n  .INSTALL hook sha256={hook}")?;
         }
         for file in &inspection.privileged_files {
-            let path = crate::cli::style::sanitize_terminal_text(&file.path);
+            let path = file.path.escape_debug();
             write!(prompt, "\n  {path} mode={:04o}", file.mode & 0o7777)?;
             if let Some(capability) = &file.capability {
                 write!(prompt, " capability={capability}")?;
@@ -74,6 +74,21 @@ mod tests {
     #[test]
     fn ordinary_archive_needs_no_exception_prompt() -> Result<()> {
         assert!(exception_prompt(&[inspection()])?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prompt_preserves_control_characters_as_visible_escapes() -> Result<()> {
+        let mut inspection = inspection();
+        inspection.privileged_files.push(PrivilegedFile {
+            path: "etc/demo\r\u{202e}.conf".into(),
+            mode: 0o644,
+            capability: None,
+        });
+        let prompt = exception_prompt(&[inspection])?.expect("exception prompt");
+        assert!(prompt.contains("etc/demo\\r\\u{202e}.conf"));
+        assert!(!prompt.contains('\r'));
+        assert!(!prompt.contains('\u{202e}'));
         Ok(())
     }
 

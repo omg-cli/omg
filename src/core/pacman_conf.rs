@@ -20,6 +20,7 @@ pub struct PacmanConfig {
     pub cache_dirs: Vec<String>,
     pub log_file: Option<String>,
     pub gpg_dir: Option<String>,
+    pub download_user: Option<String>,
     pub hook_dirs: Vec<String>,
     pub hold_pkg: Vec<String>,
     pub ignore_pkg: Vec<String>,
@@ -166,16 +167,10 @@ impl PacmanConfig {
                 (line, None)
             };
 
-            match current_section.as_deref() {
-                Some("options") => {
-                    Self::parse_option(&mut config, key, value)?;
-                }
-                Some(_) => {
-                    if let Some(ref mut repo) = current_repo {
-                        Self::parse_repo_option(repo, key, value);
-                    }
-                }
-                None => {}
+            match (current_section.as_deref(), current_repo.as_mut()) {
+                (Some("options"), _) => Self::parse_option(&mut config, key, value)?,
+                (Some(_), Some(repo)) => Self::parse_repo_option(repo, key, value)?,
+                _ => {}
             }
         }
 
@@ -212,6 +207,15 @@ impl PacmanConfig {
             }
             "LogFile" => config.log_file = value.map(String::from),
             "GPGDir" => config.gpg_dir = value.map(String::from),
+            "DownloadUser" => {
+                let username = value.context("DownloadUser requires a username")?;
+                anyhow::ensure!(
+                    username.split_whitespace().count() == 1
+                        && !username.chars().any(char::is_control),
+                    "DownloadUser requires exactly one username without control characters"
+                );
+                config.download_user = Some(username.to_owned());
+            }
             "HookDir" => {
                 if let Some(value) = value {
                     config
@@ -278,7 +282,7 @@ impl PacmanConfig {
         Ok(())
     }
 
-    fn parse_repo_option(repo: &mut RepoConfig, key: &str, value: Option<&str>) {
+    fn parse_repo_option(repo: &mut RepoConfig, key: &str, value: Option<&str>) -> Result<()> {
         match key {
             "Server" => {
                 if let Some(v) = value {
@@ -287,8 +291,16 @@ impl PacmanConfig {
             }
             "SigLevel" => Self::append_signature_option(&mut repo.sig_level, value),
             "Include" => repo.include = value.map(String::from),
+            "Usage" => {
+                anyhow::ensure!(
+                    value == Some("All"),
+                    "Repository '{}' has unsupported Usage restrictions; refusing to ignore them",
+                    repo.name
+                );
+            }
             _ => {}
         }
+        Ok(())
     }
 
     pub fn get_repo_names(&self) -> Vec<&str> {
@@ -403,6 +415,39 @@ mod tests {
             config.resolve_servers(&config.repos[0], "x86_64").unwrap(),
             ["https://mirror.example/core/x86_64"]
         );
+    }
+
+    #[test]
+    fn directives_before_a_section_do_not_configure_a_later_repository() {
+        let input = "Server = https://ignored.invalid\nUsage = Unknown\n[core]\nUsage = All\n";
+        let config = PacmanConfig::parse_str(input).expect("pre-section directives are ignored");
+        assert_eq!(config.repos.len(), 1);
+        assert_eq!(config.repos[0].name, "core");
+        assert!(config.repos[0].servers.is_empty());
+    }
+
+    #[test]
+    fn unsupported_repository_usage_is_not_silently_ignored() {
+        for usage in ["", "Sync Search", "Upgrade", "Unknown"] {
+            let error = PacmanConfig::parse_str(&format!("[restricted]\nUsage = {usage}\n"))
+                .expect_err("unsupported repository restrictions must fail closed");
+            assert!(error.to_string().contains("Usage"), "{error:#}");
+        }
+        PacmanConfig::parse_str("[core]\nUsage = All\n").unwrap();
+    }
+
+    #[test]
+    fn download_user_requires_one_username() {
+        for directive in [
+            "DownloadUser",
+            "DownloadUser =",
+            "DownloadUser = root nobody",
+            "DownloadUser = root\0",
+        ] {
+            let error = PacmanConfig::parse_str(&format!("[options]\n{directive}\n"))
+                .expect_err("an invalid downloader identity must fail closed");
+            assert!(error.to_string().contains("DownloadUser"), "{error:#}");
+        }
     }
 
     #[test]
