@@ -10017,11 +10017,13 @@ mod tests {
                         "rebuilt archive must reach the installation boundary: {error:#}"
                     );
                     let audit =
-                        std::fs::read_to_string(paths::data_dir().join("audit/audit.jsonl"))?;
+                        std::fs::read_to_string(paths::data_dir().join("audit/audit.jsonl"))
+                            .expect("read the isolated rollback audit log");
                     let entries = audit
                         .lines()
                         .map(serde_json::from_str::<crate::core::security::audit::AuditEntry>)
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .expect("parse the rollback audit records");
                     assert!(
                         entries.iter().any(|entry| {
                             entry
