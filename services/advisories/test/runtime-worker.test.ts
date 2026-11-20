@@ -6,6 +6,7 @@ import { unstable_splitSqlQuery } from "wrangler";
 import { ZipWriter, Uint8ArrayWriter, TextReader } from "@zip.js/zip.js/lib/zip-core-native.js";
 
 test("real Worker parses vendor ZIP/YAML, persists D1/R2 evidence and never HTTP-caches partial coverage", async () => {
+    const jobToken = `ghs_12345_fixture.header-${"a".repeat(475)}.signature_fixture`;
     const zip = new ZipWriter(new Uint8ArrayWriter(), { useWebWorkers: false, useCompressionStream: true, level: 6 });
     await zip.add(`ruby-advisory-db-${"a".repeat(40)}/rubies/ruby/CVE-2026-12345.yml`, new TextReader('cve: "2026-12345"\ntitle: Interpreter vulnerability\npatched_versions:\n  - ">= 3.2.1"\n'));
     await zip.add(`ruby-advisory-db-${"a".repeat(40)}/rubies/ruby/CVE-2007-5162.yml`, new TextReader('cve: "2007-5162"\ntitle: Historical patched interpreter vulnerability\npatched_versions:\n  - "~> 1.8.5.114"\n  - ">= 1.8.6.111"\n'));
@@ -24,7 +25,7 @@ test("real Worker parses vendor ZIP/YAML, persists D1/R2 evidence and never HTTP
             if (url.hostname === "api.github.com" && url.pathname === "/repos/rubysec/ruby-advisory-db/commits/master") return Response.json({ sha: "a".repeat(40) });
             if (url.hostname === "codeload.github.com" && url.pathname === `/rubysec/ruby-advisory-db/zip/${"a".repeat(40)}`) return new Response(bytes);
             if (url.hostname === "api.github.com" && url.pathname === "/repos/oven-sh/bun/security-advisories") {
-                expect(request.headers.get("authorization")).toBe(`Bearer ghs_${"a".repeat(36)}`);
+                expect(request.headers.get("authorization")).toBe(`Bearer ${jobToken}`);
                 return Response.json([]);
             }
             if (url.hostname === "raw.githubusercontent.com" && url.pathname === "/nodejs/security-wg/main/vuln/core/index.json") {
@@ -55,7 +56,7 @@ test("real Worker parses vendor ZIP/YAML, persists D1/R2 evidence and never HTTP
         expect(await second.json()).toEqual(body);
         await worker.fetch(url, { headers: { "cache-control": "no-cache" } });
         expect(requests).toBe(2);
-        const refreshed = await worker.fetch("https://advisories.example/internal/runtime-refresh", { method: "POST", headers: { authorization: "Bearer runtime-refresh-only-workerd-secret-at-least-32" }, body: JSON.stringify({ runtime: "bun", github_token: `ghs_${"a".repeat(36)}` }) });
+        const refreshed = await worker.fetch("https://advisories.example/internal/runtime-refresh", { method: "POST", headers: { authorization: "Bearer runtime-refresh-only-workerd-secret-at-least-32" }, body: JSON.stringify({ runtime: "bun", github_token: jobToken }) });
         expect(refreshed.status).toBe(200); expect(await refreshed.json()).toMatchObject({ runtime: "bun", refreshed: true });
         expect(refreshed.headers.get("cache-control")).toBe("no-store"); expect(requests).toBe(3);
         const nodeUrl = "https://advisories.example/v1/runtimes/node?version=3.2.0&vendor=nodejs&os=linux&arch=x86_64";

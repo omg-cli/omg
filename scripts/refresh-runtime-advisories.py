@@ -27,7 +27,7 @@ def secure_opener():
 
 
 def refresh_all(github_token, refresh_secret, opener=None):
-    if not re.fullmatch(r"ghs_[A-Za-z0-9]{20,255}", github_token or "") or not re.fullmatch(
+    if not re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2044}", github_token or "") or not re.fullmatch(
         r"[A-Za-z0-9_-]{32,256}", refresh_secret or ""
     ):
         print("Runtime refresh credentials are missing or invalid", file=sys.stderr)

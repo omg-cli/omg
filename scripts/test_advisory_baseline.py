@@ -23,7 +23,7 @@ SPEC = importlib.util.spec_from_file_location("advisory_baseline", ROOT / "scrip
 DRIVER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DRIVER)
 NOW = datetime(2026, 11, 17, 12, tzinfo=timezone.utc)
-JOB_TOKEN = "ghs_" + "fixturefake" + "0" * 25
+JOB_TOKEN = "ghs_12345_fixture.header-" + "0" * 475 + ".signature_fixture"
 SECRET = "fixture_refresh_secret_" + "x" * 32
 
 

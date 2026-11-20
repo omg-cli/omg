@@ -21,6 +21,11 @@ export function string(value: unknown): string {
     if (typeof value !== "string") throw new Error("expected string");
     return value;
 }
+export function isGitHubInstallationToken(value: unknown): value is string {
+    // Keep space for the other fields in the private routes' 4 KiB bodies.
+    return typeof value === "string" && value.length >= 24 && value.length <= 2048 &&
+        value.startsWith("ghs_") && !/[^A-Za-z0-9._-]/.test(value);
+}
 export function date(value: unknown): string {
     const text = string(value);
     const match =

@@ -102,7 +102,7 @@ def proof_progress(reply, binding):
 
 
 def warm(binding, github_token, secret, *, max_steps=MAX_PROOF_STEPS, opener=None, emit=print, clock=time.monotonic, sleep=time.sleep):
-    if type(max_steps) is not int or not 1 <= max_steps <= MAX_PROOF_STEPS or not re.fullmatch(r"ghs_[A-Za-z0-9]{20,255}", github_token or "") or not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", secret or ""):
+    if type(max_steps) is not int or not 1 <= max_steps <= MAX_PROOF_STEPS or not re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2044}", github_token or "") or not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", secret or ""):
         raise ValueError("invalid proof operator bounds or credentials")
     body = dict(binding, github_token=github_token)
     deadline = clock() + PROOF_SECONDS

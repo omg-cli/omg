@@ -1,4 +1,4 @@
-import { boundedBody, cveId, object, sha256 } from "./domain";
+import { boundedBody, cveId, isGitHubInstallationToken, object, sha256 } from "./domain";
 import type { Fetcher } from "./ingestion";
 import { Store, type Command } from "./storage";
 
@@ -62,7 +62,7 @@ async function activeReceipt(store: Store, input: Record<string, unknown>, endpo
 export async function verifyBaseline(value: unknown, store: Store, endpoint: string, now: string, fetcher: Fetcher) {
     const input = object(value);
     const allowed = new Set(["digest", "instance_id", "session_id", "endpoint", "release_tag", "asset", "github_token", "started", "baseline_at"]);
-    if (Object.keys(input).some((key) => !allowed.has(key)) || typeof input.github_token !== "string" || !/^ghs_[A-Za-z0-9]{20,255}$/.test(input.github_token))
+    if (Object.keys(input).some((key) => !allowed.has(key)) || !isGitHubInstallationToken(input.github_token))
         throw new Error("invalid baseline verification credential or fields");
     const token = input.github_token;
     const initial = await activeReceipt(store, input, endpoint);

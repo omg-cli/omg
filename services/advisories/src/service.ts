@@ -478,7 +478,7 @@ async function route(
                 for (const secret of [token, runtimeRefreshSecret]) {
                     if (secret) message = message.replaceAll(secret, "[redacted]");
                 }
-                reasons.push(message.replace(/ghs_[A-Za-z0-9]{20,255}/g, "[redacted]").slice(0, 300));
+                reasons.push(message.replace(/ghs_[A-Za-z0-9._-]+/g, "[redacted]").slice(0, 300));
                 cause = cause.cause;
             }
             console.error(JSON.stringify({ event: "internal_advisory_failure", path: url.pathname, reasons }));

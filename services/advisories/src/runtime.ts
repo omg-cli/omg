@@ -4,7 +4,7 @@ import { parse as parseToml } from "smol-toml";
 import { ZipReader, Uint8ArrayReader } from "@zip.js/zip.js/lib/zip-core-native.js";
 import { Requirement as RubyRequirement } from "@renovatebot/ruby-semver/dist/ruby/requirement.js";
 import { Version as RubyVersion } from "@renovatebot/ruby-semver/dist/ruby/version.js";
-import { boundedBody, cveId, cveUrl, date, decodeUtf8, object, parseCve, sha256, string } from "./domain";
+import { boundedBody, cveId, cveUrl, date, decodeUtf8, isGitHubInstallationToken, object, parseCve, sha256, string } from "./domain";
 import { type Fetcher } from "./ingestion";
 import { type Store } from "./storage";
 
@@ -769,8 +769,8 @@ export async function refreshRuntime(input: unknown, store: Store, now: string, 
     const body = object(input);
     if (Object.keys(body).sort().join(",") !== "github_token,runtime") throw new Error("invalid runtime refresh fields");
     const runtime = runtimeName(string(body.runtime));
-    const token = string(body.github_token);
-    if (!/^ghs_[A-Za-z0-9]{20,255}$/.test(token)) throw new Error("invalid ephemeral GitHub installation token");
+    const token = body.github_token;
+    if (!isGitHubInstallationToken(token)) throw new Error("invalid ephemeral GitHub installation token");
     let version: string, sourceUrl: string;
     switch (runtime) {
         case "python": version = "3.12.14"; sourceUrl = "https://github.com/psf/advisory-database/tree/main"; break;

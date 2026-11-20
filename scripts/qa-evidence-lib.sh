@@ -95,7 +95,7 @@ scrub() {
   sed -E -e 's/ghp_[A-Za-z0-9]{20,}/[redacted-token]/g' \
     -e 's/github_pat_[A-Za-z0-9_]+/[redacted-token]/g' \
     -e 's/gho_[A-Za-z0-9_]+/[redacted-token]/g' \
-    -e 's/ghs_[A-Za-z0-9_]+/[redacted-token]/g' \
+    -e 's/ghs_[A-Za-z0-9._-]+/[redacted-token]/g' \
     -e 's/Bearer [A-Za-z0-9._~+\/-]+/[redacted-bearer]/g' |
   awk '
     /-----BEGIN [A-Z ]*PRIVATE KEY-----/ {

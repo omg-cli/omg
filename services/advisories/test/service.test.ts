@@ -1005,12 +1005,13 @@ test("official delta fetching accepts large CVE records and preserves checkpoint
 
 test("authenticated ingestion failures retain bounded redacted platform diagnostics", async () => {
     const fixture = setup();
+    const jobToken = `ghs_12345_fixture.header-${"a".repeat(475)}.signature_fixture`;
     const logs: unknown[][] = [];
     const original = console.error;
     console.error = (...parts: unknown[]) => { logs.push(parts); };
     try {
         const failing = new Store({ ...fixture.store.sql, batch: async () => {
-            throw new Error(`D1_ERROR: platform request failed ${token} ${"x".repeat(1000)}`, {cause:new Error("database operation budget exceeded")});
+            throw new Error(`D1_ERROR: platform request failed ${token} ${jobToken} ${"x".repeat(1000)}`, {cause:new Error("database operation budget exceeded")});
         } }, fixture.store.raw, () => now);
         const response = await handle(new Request("https://advisories.example/internal/ingest", {method:"POST",headers:{authorization:`Bearer ${token}`,"content-type":"application/json"},body:JSON.stringify({source:"cve",records:[cve()]})}), failing, token, now);
         expect(response.status).toBe(503);
@@ -1019,6 +1020,7 @@ test("authenticated ingestion failures retain bounded redacted platform diagnost
         expect(encoded).toContain("D1_ERROR");
         expect(encoded).toContain("database operation budget exceeded");
         expect(encoded).not.toContain(token);
+        expect(encoded).not.toContain(".header-");
         expect(encoded.length).toBeLessThan(1200);
     } finally { console.error = original; fixture.db.close(); }
 });
