@@ -1331,6 +1331,7 @@ mod tests {
     #[test]
     fn review_io_preserves_nonblocking_progress_closure_and_kernel_errors() {
         use std::io::{Read, Write};
+        use std::net::Shutdown;
         use std::os::unix::net::UnixStream;
         let (mut sender, mut receiver) = UnixStream::pair().unwrap();
         sender.set_nonblocking(true).unwrap();
@@ -1351,13 +1352,17 @@ mod tests {
             .find_map(|_| sender.write(&payload).err())
             .expect("the bounded real socket buffer must apply backpressure");
         assert_eq!(super::review_io_count(Err(pending)).unwrap(), None);
+        let inherited_receiver = receiver.try_clone().unwrap();
+        receiver.shutdown(Shutdown::Both).unwrap();
         drop(receiver);
         let error = super::review_io_count(sender.write(b"closed")).unwrap_err();
         assert_eq!(
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::BrokenPipe
         );
+        drop(inherited_receiver);
         let (sender, mut receiver) = UnixStream::pair().unwrap();
+        sender.shutdown(Shutdown::Write).unwrap();
         drop(sender);
         assert!(
             super::review_io_count(receiver.read(&mut byte))

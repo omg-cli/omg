@@ -14,7 +14,7 @@ class GuestInfoParityTests(unittest.TestCase):
                  architecture='x86_64', epoch='0', query_status=0,
                  native_version='2.2.1', native_release='4.fc44', records=1):
         source = (ROOT / 'scripts/benchmark-qemu.sh').read_text()
-        start = source.index('case "$distro" in\n  arch) sudo -n pacman -Syu')
+        start = source.index('case "$distro" in\n  arch) arch_system_upgrade')
         stop = source.index('\ninstalled() {', start)
         helpers = source[source.index('fedora_makecache_class() {', 0, start):start]
         commands = helpers + source[start:stop]

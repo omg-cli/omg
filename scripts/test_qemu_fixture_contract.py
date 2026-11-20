@@ -182,7 +182,7 @@ printf '%s %s\\n' "$first" "$second"
 
     def _run_fedora_makecache(self, attempts, copy_fail=False):
         source = (Path(__file__).resolve().parent / 'benchmark-qemu.sh').read_text()
-        case_begin = source.index('case "$distro" in\n  arch) sudo -n pacman -Syu')
+        case_begin = source.index('case "$distro" in\n  arch) arch_system_upgrade')
         helpers = ''
         if 'fedora_makecache_class() {' in source:
             helpers = source[source.index('fedora_makecache_class() {', 0, case_begin):case_begin]

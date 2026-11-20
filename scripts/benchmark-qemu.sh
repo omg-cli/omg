@@ -1171,6 +1171,30 @@ stat -c '%n uid=%u gid=%g mode=%a type=%F' / /opt /opt/omg-qemu "$native_release
 sha256sum "$bin" "$native_bin" > evidence/native-executable-sha256.txt
 [[ $("$bin" --version | head -1 | tr -d '[:space:]') == "omg${tag#v}" ]]
 [[ $("$daemon" --version | head -1 | tr -d '[:space:]') == "omgd${tag#v}" ]]
+arch_system_upgrade() {
+  local attempt log rc
+  for attempt in 1 2; do
+    log="evidence/arch-system-upgrade-$attempt.txt"
+    rc=0
+    sudo -n pacman -Syu --noconfirm > "$log" 2>&1 || rc=$?
+    cp -- "$log" evidence/arch-system-upgrade.txt || return 1
+    (( rc == 0 )) && return 0
+    (( attempt == 1 )) || break
+    if ! awk '
+      /^error: failed retrieving file .* : (Resolving timed out after [0-9]+ milliseconds|Could not resolve host: [^[:space:]]+)$/ {
+        dns = 1
+        next
+      }
+      /^error: failed to (synchronize all databases|commit transaction) [(]failed to retrieve some files[)]$/ { next }
+      /^error:/ { other = 1 }
+      END { exit !(dns && !other) }
+    ' "$log"; then
+      return 1
+    fi
+    sleep 5
+  done
+  return 1
+}
 fedora_makecache_class() {
   local log=$1
   [[ -r "$log" ]] || return 1
@@ -1206,7 +1230,7 @@ fedora_makecache() {
   return 1
 }
 case "$distro" in
-  arch) sudo -n pacman -Syu --noconfirm >evidence/arch-system-upgrade.txt 2>&1 || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
+  arch) arch_system_upgrade || exit 120; native=(pacman -Qi tree); version_cmd=(pacman -Q tree) ;;
   debian|debian-trixie|ubuntu)
     sudo -n systemctl stop apt-daily.timer apt-daily-upgrade.timer
     printf 'Acquire::ForceIPv4 "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Languages "none";\nAcquire::IndexTargets::deb::DEP-11::DefaultEnabled "false";\nAcquire::IndexTargets::deb::CNF::DefaultEnabled "false";\n' | sudo -n tee /etc/apt/apt.conf.d/99omg-qa-network > evidence/apt-network.conf
