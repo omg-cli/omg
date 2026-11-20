@@ -404,13 +404,12 @@ fn publish_generation(root: &Path, bytes: &[u8], validators: AurMetaCache) -> Re
         .to_owned();
     let _persisted = generation.keep();
     File::open(root)?.sync_all()?;
-    commit_manifest(
-        root,
-        &Manifest {
-            generation: name,
-            validators,
-        },
-    )
+    let manifest = Manifest {
+        generation: name,
+        validators,
+    };
+    commit_manifest(root, &manifest).context("Failed to publish AUR metadata generation")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -956,6 +955,21 @@ mod tests {
             .unwrap();
         assert!(current.get("new").unwrap().is_some());
         assert!(current.get("old").unwrap().is_none());
+    }
+
+    #[test]
+    fn manifest_replacement_failure_identifies_metadata_publication() {
+        let directory = tempfile::tempdir().expect("isolated AUR metadata root");
+        let root = directory.path();
+        let manifest = root.join("manifest.json");
+        std::fs::create_dir(&manifest).expect("obstruct replacement of the manifest");
+        let error = publish_generation(root, &catalogue("fixture"), AurMetaCache::default())
+            .expect_err("a staged index is unusable until its manifest is published");
+        assert_eq!(
+            error.to_string(),
+            "Failed to publish AUR metadata generation"
+        );
+        assert!(manifest.is_dir());
     }
 
     #[test]
