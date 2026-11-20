@@ -970,16 +970,19 @@ mod tests {
             backend.set_installed_version("fixture", "1.0.0")?;
             backend.set_available_version("fixture", "2.0.0")?;
             let source = Arc::new(CapturedSubjects(std::sync::Mutex::new(Vec::new())));
-            let service = PackageService::builder(backend.clone())
-                .policy(SecurityPolicy {
+            let service = PackageService {
+                backend: backend.clone(),
+                policy: SecurityPolicy {
                     advisory_requirement:
                         crate::core::security::policy::AdvisoryRequirement::Review,
                     arch_advisory_repositories: ["core".to_owned()].into(),
                     ..SecurityPolicy::default()
-                })
-                .vulnerability_source(source.clone())
-                .without_history()
-                .build()?;
+                },
+                vulnerability_source: source.clone(),
+                history: None,
+                #[cfg(feature = "arch")]
+                aur_client: None,
+            };
             let error = service
                 .update()
                 .await

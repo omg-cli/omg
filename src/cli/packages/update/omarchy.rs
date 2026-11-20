@@ -632,13 +632,15 @@ impl Commands {
             NativeOmarchyInteraction::Attended
         };
         let command = crate::core::privilege::native_omarchy_command(operation, interaction)?;
-        let status = self.run_command(command, operation.argument()).await?;
-        crate::package_managers::arch::complete_native_omarchy_write(status.success()).await?;
-        anyhow::ensure!(
-            status.success(),
-            "Native Omarchy {operation:?} failed: {status}"
-        );
-        Ok(())
+        crate::package_managers::arch::finish_native_write(async {
+            let status = self.run_command(command, operation.argument()).await?;
+            anyhow::ensure!(
+                status.success(),
+                "Native Omarchy {operation:?} failed: {status}"
+            );
+            Ok(())
+        })
+        .await
     }
 
     async fn release_authorization(&mut self) {

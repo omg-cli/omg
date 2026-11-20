@@ -296,7 +296,7 @@ where
 {
     if can_write_pacman_db() {
         tracing::debug!("Using direct ALPM access as root");
-        return finish_alpm_write(operation(), after_privileged_alpm_write()).await;
+        return finish_native_write(operation()).await;
     }
 
     // A live parent spinner redraws over sudo's password prompt and over the
@@ -317,6 +317,12 @@ where
         }
         privilege::run_privileged_child(&args).await
     };
+    finish_native_write(operation).await
+}
+
+pub(crate) async fn finish_native_write(
+    operation: impl Future<Output = AnyhowResult<()>>,
+) -> AnyhowResult<()> {
     finish_alpm_write(operation, after_privileged_alpm_write()).await
 }
 
@@ -339,18 +345,6 @@ fn combine_write_results(
         (Err(operation), Err(completion)) => {
             Err(operation.context(format!("Catalog completion also failed: {completion:#}")))
         }
-    }
-}
-
-pub(crate) async fn complete_native_omarchy_write(success: bool) -> AnyhowResult<()> {
-    let completion = after_privileged_alpm_write().await;
-    if success {
-        completion
-    } else {
-        if let Err(error) = completion {
-            tracing::warn!("Catalog refresh after failed native Omarchy stage: {error:#}");
-        }
-        Ok(())
     }
 }
 
@@ -983,6 +977,59 @@ pub(super) mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("catalog refresh failed"));
+    }
+
+    #[test]
+    fn interrupted_native_write_invalidates_catalog_and_retains_cleanup_error() -> AnyhowResult<()>
+    {
+        const TEST: &str = "package_managers::arch::tests::interrupted_native_write_invalidates_catalog_and_retains_cleanup_error";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !crate::core::is_root(),
+            "catalog fixture needs ordinary UID"
+        );
+        let directory = tempfile::tempdir()?;
+        let catalog = directory.path().join("sync_db.bin");
+        let socket = directory.path().join("absent.sock");
+        temp_env::with_vars(
+            [
+                ("OMG_CACHE_DIR", Some(directory.path().as_os_str())),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+            ],
+            || -> AnyhowResult<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let interrupted = || async { anyhow::bail!("package stage wait was interrupted") };
+
+                std::fs::write(&catalog, b"previous catalog")?;
+                let error = runtime
+                    .block_on(super::finish_native_write(interrupted()))
+                    .expect_err("the interruption remains visible after catalog invalidation");
+                assert_eq!(error.to_string(), "package stage wait was interrupted");
+                assert!(!catalog.exists());
+
+                std::fs::create_dir(&catalog)?;
+                let error = runtime
+                    .block_on(super::finish_native_write(interrupted()))
+                    .expect_err("the interruption and catalog cleanup errors must both be visible");
+                let detail = format!("{error:#}");
+                assert!(
+                    detail.contains("package stage wait was interrupted"),
+                    "{detail}"
+                );
+                assert!(
+                    detail.contains("Failed to remove package cache file"),
+                    "{detail}"
+                );
+                assert!(catalog.is_dir());
+                Ok(())
+            },
+        )
     }
 
     #[test]
