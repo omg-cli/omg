@@ -1258,11 +1258,29 @@ fn history_entry_by_prefix<'a>(
     Ok(first)
 }
 
+pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
+    rollback_with_aur_rebuild(
+        id,
+        yes,
+        #[cfg(feature = "arch")]
+        crate::package_managers::AurClient::rebuild_from_history,
+    )
+    .await
+}
+
 #[allow(
     clippy::unused_async,
     reason = "feature-gated implementations await while fallback builds do not"
 )]
-pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
+async fn rollback_with_aur_rebuild(
+    id: Option<String>,
+    yes: bool,
+    #[cfg(feature = "arch")] rebuild: impl AsyncFn(
+        &crate::package_managers::AurClient,
+        &str,
+        &str,
+    ) -> Result<String>,
+) -> Result<()> {
     let backend = crate::package_managers::resolve_backend()?;
     anyhow::ensure!(
         !matches!(
@@ -1456,7 +1474,7 @@ pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
                 let mut restored = Vec::new();
                 let mut failed: Vec<(String, String)> = Vec::new();
                 for (name, version) in &rebuild_from_aur {
-                    match client.rebuild_from_history(name, version).await {
+                    match rebuild(&client, name, version).await {
                         Ok(installed) => {
                             println!("  {} {name} restored as {installed}", style::success("✓"));
                             restored.push((name.clone(), installed));
@@ -2226,4 +2244,66 @@ mod tests {
         assert!(is_safe_completion(&"a".repeat(512)));
         assert!(!is_safe_completion(&"a".repeat(513)));
     }
+}
+#[cfg(feature = "arch")]
+#[test]
+fn aur_rollback_records_the_rebuilt_version_on_partial_success() -> Result<()> {
+    use crate::core::history::{HistoryManager, PackageChange, TransactionType};
+
+    const CASE: &str =
+        "cli::commands::tests::aur_rollback_records_the_rebuilt_version_on_partial_success";
+    const CHILD: &str = "OMG_TEST_AUR_ROLLBACK_HISTORY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let directory = tempfile::tempdir()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", CASE, "--nocapture"])
+            .env(CHILD, "1")
+            .env("OMG_TEST_MODE", "1")
+            .env("OMG_TEST_DISTRO", "arch")
+            .env("OMG_DATA_DIR", directory.path())
+            .env("OMG_CONFIG_DIR", directory.path().join("config"))
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("example restored as 2.1-1"), "{stdout}");
+        return Ok(());
+    }
+
+    let mut target = transaction(TransactionType::Update, "aur", Some("1.0-1"), true);
+    target.id = "a1b2".to_owned();
+    target.changes.push(PackageChange {
+        name: "unavailable".to_owned(),
+        old_version: Some("1.0-1".to_owned()),
+        new_version: Some("2.0-1".to_owned()),
+        source: "aur".to_owned(),
+    });
+    let history = HistoryManager::new()?;
+    history.save(std::slice::from_ref(&target))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    let result = runtime.block_on(rollback_with_aur_rebuild(
+        Some(target.id),
+        true,
+        async |_, name, requested| {
+            assert_eq!(requested, "1.0-1");
+            anyhow::ensure!(name == "example", "historical source unavailable");
+            Ok("2.1-1".to_owned())
+        },
+    ));
+    let error = result.expect_err("one archive could not be restored");
+    assert!(
+        error
+            .to_string()
+            .contains("1 AUR package(s) could not be downgraded")
+    );
+    let entries = history.load()?;
+    assert_eq!(entries.len(), 2);
+    assert!(entries[1].success);
+    assert_eq!(entries[1].changes.len(), 1);
+    assert_eq!(entries[1].changes[0].name, "example");
+    assert_eq!(entries[1].changes[0].new_version.as_deref(), Some("2.1-1"));
+    Ok(())
 }

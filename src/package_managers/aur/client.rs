@@ -1186,7 +1186,7 @@ struct BuildLog {
 #[derive(Clone, Copy)]
 enum BuildIsolation {
     ProcessGroup,
-    DetachedSession,
+    NativeSession,
 }
 
 struct BuildProcess {
@@ -2104,6 +2104,16 @@ impl AurClient {
         package: &str,
         version: &str,
     ) -> Result<String> {
+        self.rebuild_from_history_with_install(package, version, Self::install_built_packages)
+            .await
+    }
+
+    async fn rebuild_from_history_with_install(
+        &self,
+        package: &str,
+        version: &str,
+        install: impl AsyncFn(&[BuiltPackages], Option<&crate::core::sudoloop::SudoLoop>) -> Result<()>,
+    ) -> Result<String> {
         crate::core::security::validate_package_name(package)?;
         crate::core::security::validate_version(version)?;
         require_unprivileged_builder(package, crate::core::is_root())?;
@@ -2181,21 +2191,22 @@ impl AurClient {
             return Err(AurError::PackageArchiveNotFound(package.to_string()).into());
         };
 
-        // makepkg can write the version returned by pkgver() into PKGBUILD.
-        // Recreate the reviewed source before the independent build when that
-        // first build changed its inputs. Bind the new checkout to the review.
-        let verification_checkout =
-            if reviewed_digest.recomputes_version()? && reviewed_digest.verify(&pkg_dir).is_err() {
-                let checkout = Self::begin_rollback_worktree(&work, &base)?;
-                super::history::checkout_version(&url, checkout.path(), &base, version).await?;
-                reviewed_digest.verify(checkout.path())?;
-                Some(checkout)
-            } else {
-                None
-            };
-        let verification_dir = verification_checkout
-            .as_ref()
-            .map_or(pkg_dir.as_path(), tempfile::TempDir::path);
+        // makepkg can rewrite PKGBUILD after pkgver() and records the checkout
+        // path in .BUILDINFO. Restore verified inputs at the same path so the
+        // independent build can reproduce the archive with private outputs.
+        if reviewed_digest.recomputes_version()? && reviewed_digest.verify(&pkg_dir).is_err() {
+            let checkout = Self::begin_rollback_worktree(&work, &base)?;
+            super::history::checkout_version(&url, checkout.path(), &base, version).await?;
+            reviewed_digest.verify(checkout.path())?;
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                checkout.path(),
+                rustix::fs::CWD,
+                &pkg_dir,
+                rustix::fs::RenameFlags::EXCHANGE,
+            )
+            .context("Failed to restore the reviewed checkout for the independent AUR build")?;
+        }
         let archives = self
             .authorize_with_paired_build(
                 &[archive],
@@ -2204,7 +2215,7 @@ impl AurClient {
                 &[package.to_owned()],
                 &[package.to_owned()],
                 true,
-                verification_dir,
+                &pkg_dir,
                 &env,
             )
             .await?;
@@ -2227,7 +2238,7 @@ impl AurClient {
             ));
         }
         crate::cli::modern_ui::print_info(&format!("Installing {package} {rebuilt}"));
-        Self::install_built_packages(std::slice::from_ref(&archives), sudoloop.as_ref()).await?;
+        install(std::slice::from_ref(&archives), sudoloop.as_ref()).await?;
         crate::cli::modern_ui::print_success(&format!("Installed {package} {rebuilt}"));
         // Use async cleanup on success and report failures. The owner also
         // attempts cleanup on error/cancellation; logs remain outside this tree.
@@ -4019,7 +4030,7 @@ impl AurClient {
         }
 
         cmd.current_dir(pkg_dir).stdin(Stdio::null());
-        self.run_logged_build_command(&mut cmd, package, BuildIsolation::DetachedSession)
+        self.run_logged_build_command(&mut cmd, package, BuildIsolation::NativeSession)
             .await
             .context("Failed to run makepkg")
     }
@@ -4029,6 +4040,22 @@ impl AurClient {
         pkg_dir: &Path,
         env: &MakepkgEnv,
         package: &str,
+    ) -> Result<std::process::ExitStatus> {
+        self.run_chroot_build_with(
+            pkg_dir,
+            env,
+            package,
+            crate::core::privilege::root_controlled_program_path,
+        )
+        .await
+    }
+
+    async fn run_chroot_build_with(
+        &self,
+        pkg_dir: &Path,
+        env: &MakepkgEnv,
+        package: &str,
+        resolve_program: impl Fn(&str) -> Result<PathBuf>,
     ) -> Result<std::process::ExitStatus> {
         anyhow::ensure!(
             self.settings.aur.allow_unsafe_builds,
@@ -4041,10 +4068,7 @@ impl AurClient {
             self.settings.aur.allow_network,
             "Chroot devtools cannot enforce offline builds; choose bubblewrap or explicitly enable aur.allow_network"
         );
-        let mut cmd = chroot_build_command(
-            self.settings.aur.secure_makepkg,
-            crate::core::privilege::root_controlled_program_path,
-        )?;
+        let mut cmd = chroot_build_command(self.settings.aur.secure_makepkg, resolve_program)?;
 
         let (build_user, build_home) = build_identity();
         configure_build_environment(&mut cmd, &build_home, &build_user);
@@ -4060,7 +4084,7 @@ impl AurClient {
             cmd.env(key, value);
         }
 
-        self.run_logged_build_command(&mut cmd, package, BuildIsolation::DetachedSession)
+        self.run_logged_build_command(&mut cmd, package, BuildIsolation::NativeSession)
             .await
             .context("Failed to run chroot build")
     }
@@ -4129,7 +4153,7 @@ impl AurClient {
             BuildIsolation::ProcessGroup => {
                 command.process_group(0);
             }
-            BuildIsolation::DetachedSession => {
+            BuildIsolation::NativeSession => {
                 // A group leader makes util-linux setsid fork, losing the PID
                 // tracked below. Inherit our group so setsid execs in-place;
                 // the build then owns a detached session whose PGID is child.id().
@@ -5982,6 +6006,16 @@ mod tests {
             anyhow::bail!("session launcher unavailable")
         });
         assert!(unavailable.is_err());
+        let unavailable = chroot_build_command(false, |name| {
+            anyhow::ensure!(name == "setsid", "devtools unavailable in fixture");
+            Ok(PathBuf::from("/usr/bin/setsid"))
+        })
+        .expect_err("chroot builds require a devtools launcher");
+        assert!(
+            unavailable
+                .to_string()
+                .contains("Chroot build requires devtools")
+        );
         Ok(())
     }
 
@@ -7256,7 +7290,7 @@ mod tests {
                     } else {
                         Duration::from_secs(3)
                     },
-                    BuildIsolation::DetachedSession,
+                    BuildIsolation::NativeSession,
                 )
                 .await
         });
@@ -8275,6 +8309,27 @@ mod tests {
             .await
             .expect_err("network consent alone cannot authorize host recipe execution");
         assert!(error.to_string().contains("aur.allow_unsafe_builds"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reviewed_chroot_launch_waits_for_the_detached_helper() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let mut client = AurClient::new()?;
+        client.build_dir = state.path().join("build");
+        client.settings.aur.allow_network = true;
+        client.settings.aur.allow_unsafe_builds = true;
+        let env = client.makepkg_env(state.path()).await?;
+        let status = client
+            .run_chroot_build_with(state.path(), &env, "demo", |program| {
+                if program == "pkgctl" {
+                    return crate::core::privilege::root_controlled_program_path("true");
+                }
+                assert_eq!(program, "setsid");
+                crate::core::privilege::root_controlled_program_path(program)
+            })
+            .await?;
+        assert!(status.success());
         Ok(())
     }
 
@@ -10112,7 +10167,10 @@ mod tests {
         if let Ok(mode) = std::env::var(MODE) {
             let history = matches!(
                 mode.as_str(),
-                "history" | "history-accept-failing-build" | "history-accept-rebuilt-archive"
+                "history"
+                    | "history-accept-failing-build"
+                    | "history-accept-rebuilt-archive"
+                    | "history-accept-rebuilt-dynamic"
             );
             let directory = if history {
                 anyhow::ensure!(
@@ -10147,6 +10205,18 @@ mod tests {
                     settings,
                     package_base_locks: Arc::new(dashmap::DashMap::new()),
                 };
+                if mode == "history-accept-rebuilt-dynamic" {
+                    let version = client
+                        .rebuild_from_history_with_install("demo", "1-1", async |batches, _| {
+                            assert_eq!(batches.len(), 1);
+                            assert_eq!(batches[0].len(), 1);
+                            Ok(())
+                        })
+                        .await?;
+                    assert_eq!(version, "2-1");
+                    println!("HISTORY_DYNAMIC_VERSION_VERIFIED");
+                    return Ok(());
+                }
                 let error = client
                     .downgrade_from_history("demo", "1-1")
                     .await
@@ -10251,9 +10321,11 @@ if [ "$#" -ge 4 ] && [ "$1" = -C ]; then
     fi
     if [ "$#" -eq 5 ] && [ "$3" = checkout ] && [ "$4" = --detach ] && [ "$5" = "$sha" ]; then
         printf 'pkgname=demo\\npkgver=1\\npkgrel=1\\narch=(any)\\n' > "$2/PKGBUILD"
-        if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-archive ]; then
+        if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-archive ] || [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-dynamic ]; then
             printf 'pkgdesc="Inert historical release fixture"\\nlicense=(MIT)\\npackage() { install -Dm644 /dev/null "$pkgdir/usr/share/demo/empty"; }\\n' >> "$2/PKGBUILD"
-            printf 'pkgver() { echo 2; }\\n' >> "$2/PKGBUILD"
+            if [ "$OMG_AUR_REVIEW_PTY_MODE" = history-accept-rebuilt-dynamic ]; then
+                printf 'pkgver() { echo 2; }\\n' >> "$2/PKGBUILD"
+            fi
         else
             printf 'package() { printf "intentional-history-fixture-failure\\\\n" >&2; return 1; }\\n' >> "$2/PKGBUILD"
         fi
@@ -10307,7 +10379,7 @@ if mode == 'git-contract':
 pid, fd = pty.fork()
 if pid == 0:
     os.environ['PATH'] = fixture + ':/usr/bin:/bin'
-    if mode == 'history-accept-rebuilt-archive':
+    if mode in ('history-accept-rebuilt-archive', 'history-accept-rebuilt-dynamic'):
         os.environ['CARGO_PRIMARY_PACKAGE'] = '1'
         os.environ['OMG_DATA_DIR'] = fixture
         os.environ['OMG_SOCKET_PATH'] = os.path.join(fixture, 'absent.sock')
@@ -10317,6 +10389,7 @@ approval = {
     'history': (b'n\n', b'REVIEW_DECLINED'),
     'history-accept-failing-build': (b'y\n', b'HISTORY_BUILD_FAILED'),
     'history-accept-rebuilt-archive': (b'y\n', b'HISTORY_ARCHIVE_VERIFIED'),
+    'history-accept-rebuilt-dynamic': (b'y\n', b'HISTORY_DYNAMIC_VERSION_VERIFIED'),
 }.get(mode)
 output = bytearray()
 sent = False
@@ -10361,7 +10434,7 @@ try:
             (approval and not sent) or
             (expected != b'REVIEW_DECLINED' and b'REVIEW_DECLINED' in output)):
         raise RuntimeError('review child failed or did not show the expected prompt')
-    if mode == 'history-accept-rebuilt-archive' and b'Installing demo 2-1' not in output:
+    if mode == 'history-accept-rebuilt-dynamic' and b'Installing demo 2-1' not in output:
         raise RuntimeError('rollback did not report the actual rebuilt package version')
 finally:
     if status is None:
@@ -10377,6 +10450,7 @@ finally:
                 "history",
                 "history-accept-failing-build",
                 "history-accept-rebuilt-archive",
+                "history-accept-rebuilt-dynamic",
             ]);
         }
         for mode in modes {

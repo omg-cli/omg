@@ -494,7 +494,7 @@ fn detect_version_pins(
             }
             Err(error) if reject_bad_pin => return Err(error),
             Err(error) => {
-                tracing::warn!("Ignoring invalid mise pins in {}: {error:#}", dir.display())
+                tracing::warn!("Ignoring invalid mise pins in {}: {error:#}", dir.display());
             }
         }
 
