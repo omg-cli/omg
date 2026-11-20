@@ -3681,6 +3681,49 @@ def retained_ensure_entry(name, sides, indexes, work):
 
 
 _SBOM_DUPLICATE_IDENTITY = '"Duplicate installed SBOM identity"'
+_AUR_DEPENDENCY_PLAN_HEADER = tuple(
+    'fn dependency_plan ( srcinfo : & SourceInfoV1 , requested_outputs : & [ String ] , ) '
+    '-> Result < ( Vec < String > , Vec < String > ) >'.split()
+)
+
+
+def aur_dependency_extension_entry_source(name, source, inventory, line, work):
+    """Locate the unchanged collection prefix before either dependency filter."""
+    if name != 'src/package_managers/aur_deps.rs' or source[line - 1].strip() != 'dependencies.extend(':
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows) + len(code.starts).bit_length())
+    start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+    loop = code.parents[start]
+    parent = code.parents[loop] if loop is not None else None
+    iterations = [row for row in rows if row['kind'] == 'for' and row['opening'] == loop]
+    functions = [row for row in rows if row['opening'] == parent and row['header'] == _AUR_DEPENDENCY_PLAN_HEADER]
+    if len(iterations) != 1 or len(functions) != 1 or code.parents[parent] is not None:
+        return None
+    iteration, = iterations
+    function, = functions
+    initial = 'let mut dependencies = Vec :: new ( ) ;'.split()
+    if (iteration['header'] != tuple('for output in & selected_outputs'.split())
+            or code.words[iteration['first'] - len(initial):iteration['first']] != initial
+            or code.words[loop + 1:start] != 'let package = & packages [ output ] ;'.split()):
+        return None
+    prefix = ('dependencies . extend ( package . dependencies . iter ( ) '
+              '. map ( ToString :: to_string )').split()
+    suffix = '. filter ( | dependency | !'.split()
+    filters = ('all_outputs . contains ( dependency_name ( dependency ) )'.split(),
+               'internal_dependencies . contains ( dependency )'.split())
+    end = code.pairs.get(start + 3)
+    if (end is None or code.words[start: start + len(prefix)] != prefix
+            or code.words[start + len(prefix):end + 2] not in (
+                [*suffix, *predicate, ')', ',', ')', ';'] for predicate in filters)):
+        return None
+    mapping = start + prefix.index('map')
+    bounds = code.region(start, mapping)
+    entries = (code.region(start, start), code.region(start + 2, start + 2))
+    arguments = (code.region(start + 4, start + 10), code.region(mapping, mapping))
+    span = code.region(function['first'], function['end'])[0::2]
+    return (_AUR_DEPENDENCY_PLAN_HEADER, span, bounds, entries, ('omg_lib', 'package_managers', 'aur_deps'),
+            'dependency_plan', None, (tuple(range(line, bounds[2] + 1)), arguments), True)
 
 
 def sbom_identity_guard_entry_source(name, source, inventory, line, work):
@@ -3747,7 +3790,8 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
     cache_receiver = source_observer is alpm_cache_receiver_entry_source
     refusal_diagnostic = source_observer is alpm_refusal_diagnostic_entry_source
     sbom_identity_guard = source_observer is sbom_identity_guard_entry_source
-    fragment = cache_receiver or refusal_diagnostic or sbom_identity_guard
+    aur_extension = source_observer is aur_dependency_extension_entry_source
+    fragment = cache_receiver or refusal_diagnostic or sbom_identity_guard or aur_extension
     option_context = source_observer is alpm_option_context_source
     holdpkg_expectation = source_observer is alpm_holdpkg_expected_error_source
     identities=[]; receipts=[]; states=[]; conditions=[]
@@ -3815,10 +3859,11 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                                 or bool(touching[-1][4]) != bool(hits)):
                 return None
             if fragment:
-                arguments = [r for r in touching if r[0] == condition[1][0][0]]
+                argument_lines = {slot[0] for slot in condition[1]}
+                arguments = [r for r in touching if r[0] in argument_lines]
                 if (tuple(tuple(r[:4]) for r in arguments) != condition[1]
                         or any(r[4] != hits for r in arguments)
-                        or (refusal_diagnostic or sbom_identity_guard)
+                        or (refusal_diagnostic or sbom_identity_guard or aur_extension)
                            and len(touching) != len(entry) + len(arguments)):
                     return None
             roots.append((owner,identity,copy,touching,hits))
@@ -3879,6 +3924,8 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
             return None
         if sbom_identity_guard:
             kind = 'retained-sbom-identity-guard'
+        elif aur_extension:
+            kind = 'retained-aur-dependency-extension'
         else:
             kind = 'retained-alpm-cache-receiver' if cache_receiver else 'retained-alpm-refusal-diagnostic'
         return dict(file=name, kind=kind, pairs=pairs,
@@ -13638,6 +13685,80 @@ def retained_unversioned_aur_dependency(sides, indexes, work):
                 summary_credit=[0, 0], mapped_credit=[0, 0], instance_matching=matching)
 
 
+def retained_aur_dependency_packages(name, sides, indexes, work):
+    """Match the package-name projection after cloning its existing architecture."""
+    observations = []
+    for side, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows))
+        functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == _AUR_DEPENDENCY_PLAN_HEADER
+                     and code.parents[row['opening']] is None]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        first = function['opening'] + 1
+        architecture = 'arch . clone ( )' if side else 'arch'
+        initializer = [
+            *'let arch = super :: aur :: utils :: current_arch ( ) . context ('.split(),
+            '"Unsupported host architecture for AUR dependency resolution"',
+            *f') ? ; let packages = srcinfo . packages_for_architecture ( {architecture} )'.split(),
+            *('. map ( | package | ( package . name . to_string ( ) , package ) ) '
+              '. collect :: < BTreeMap < _ , _ > > ( ) ; '
+              'let all_outputs = packages . keys ( ) . cloned ( ) . collect :: < BTreeSet < _ > > ( ) ;').split(),
+        ]
+        _construct_charge(work, len(initializer))
+        if code.words[first:first + len(initializer)] != initializer:
+            return None
+        mapper = first + initializer.index('map')
+        selected_output = initializer.index('all_outputs')
+        root_tokens = [initializer.index(word) for word in ('packages', 'srcinfo', 'map', 'collect')]
+        root_tokens.extend(initializer.index(word, selected_output)
+                           for word in ('all_outputs', 'packages', 'keys', 'cloned', 'collect'))
+        entries = [code.region(first + token, first + token) for token in root_tokens]
+        operands = (code.region(mapper + 6, mapper + 8), code.region(mapper + 10, mapper + 10),
+                    code.region(mapper + 14, mapper + 14))
+        lines = sorted({slot[0] for slot in entries})
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        roots = [(owner, shape) for owner in owners
+                 if (shape := plain_rust_function_symbol(owner['name'])) is not None
+                 and shape.identifiers == ('omg_lib', 'package_managers', 'aur_deps', 'dependency_plan')]
+        affected = [(owner, raw) for owner in owners if (raw := [
+            r for r in owner['regions'] if any(r[0] <= n <= r[2] for n in lines)])]
+        if (not 1 <= len(roots) <= 16 or len(affected) != 2 * len(roots)
+                or any(not counts.get(n, 0) for n in lines)):
+            return None
+        states = []; symbols = []
+        for root, shape in roots:
+            parents = [rows for owner, rows in affected if owner is root]
+            children = [(owner, raw) for owner, raw in affected
+                        if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules)]
+            if len(parents) != 1 or len(children) != 1:
+                return None
+            (child, raw), = children
+            if (any(index.name_counts[owner['name']] != 1 or owner.get('branches') or owner.get('mcdc_records')
+                    or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                    or not 0 <= owner['count'] < COUNTER_LIMIT for owner in (root, child))
+                    or parents[0] != [[*slot, root['count'], 0, 0, 0] for slot in entries]
+                    or raw != [[*slot, child['count'], 0, 0, 0] for slot in operands]
+                    or (child['count'] > 0 and root['count'] == 0)):
+                return None
+            states.append((root['count'] > 0, child['count'] > 0))
+            symbols.append([root['name'], child['name']])
+        projection = _owner_line_counts({'regions': [r for _, raw in affected for r in raw]}, _ObserverWork(work))
+        if projection != {n: counts[n] for n in lines}:
+            return None
+        observations.append((lines, states, symbols))
+    before, after = observations
+    _construct_charge(work, 2 * len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-aur-dependency-packages',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                owners=[before[2], after[2]], instance_matching=matching)
+
+
 def retained_aur_metadata_policy(name, sides, indexes, work):
     """Bind the metadata opt-out, TTL, and wait to both async phases."""
     observations = []
@@ -13896,22 +14017,98 @@ def retained_aur_git_limits(name, sides, indexes, work):
                 instance_matching=matching)
 
 
-def retained_aur_prefetch_test_wait(name, sides, indexes, work):
-    """Observe polling the same HTTP-refusal fixture after strengthening its assertion."""
-    declaration = 'prefetch_refuses_loopback_before_connecting'
+def aur_source_tokio_fixture(name, inventory, index, declaration, work):
+    """Identify the constructor and future body of a synchronous test entry point."""
+    code, rows = inventory[:2]
     header = tuple(f'# [ tokio :: test ] async fn {declaration} ( )'.split())
+    _construct_charge(work, len(rows))
+    functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == header]
+    if len(functions) != 1:
+        return None
+    function, = functions
+    first, opening, end = (function[field] for field in ('first', 'opening', 'end'))
+    scope = _boolean_module(code, {'start': first})
+    if scope is None or scope[:2] != (['public_source_tests'], ['public_source_tests']):
+        return None
+    owners = index.inventories.get(name, ())
+    _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+    roots = [(owner, shape) for owner in owners
+             if (shape := plain_rust_function_symbol(owner['name'])) is not None
+             and shape.identifiers == ('omg_lib', 'package_managers', 'aur_sources', 'public_source_tests', declaration)]
+    if len(roots) != 1:
+        return None
+    (root, shape), = roots
+    entry = code.region(opening, opening)
+    children = [owner for owner in owners if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules)
+                and [r[4:] for r in owner['regions'] if tuple(r[:4]) == entry] == [[owner['count'], 0, 0, 0]]]
+    if len(children) != 1:
+        return None
+    body, = children
+    if (not 0 < body['count'] <= root['count'] < COUNTER_LIMIT
+            or any(index.name_counts[owner['name']] != 1 or owner.get('branches') or owner.get('mcdc_records')
+                   or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                   for owner in (root, body))):
+        return None
+    markers = (code.region(first + header.index('fn'), opening - 1), code.region(end, end))
+    if any([r[4:] for r in root['regions'] if tuple(r[:4]) == slot] != [[root['count'], 0, 0, 0]]
+           for slot in markers):
+        return None
+    return function, root, body, markers
+
+
+def retained_aur_git_fixture_limits(name, sides, indexes, work):
+    """Verify that the staging test still builds the same cap and interval."""
     witnesses = []
     for side, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
-        code, rows = inventory[:2]
-        _construct_charge(work, len(rows))
-        functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == header]
-        if len(functions) != 1:
+        code = inventory[0]
+        fixture = aur_source_tokio_fixture(name, inventory, index,
+                                          'host_git_clone_has_output_duration_and_staging_budgets', work)
+        if fixture is None:
             return None
-        function, = functions
-        first, opening, end = (function[field] for field in ('first', 'opening', 'end'))
-        scope = _boolean_module(code, {'start': first})
-        if scope is None or scope[:2] != (['public_source_tests'], ['public_source_tests']):
+        function, root, body, _ = fixture
+        start = function['opening'] + 1
+        prelude = [
+            *'let temp = tempfile :: tempdir ( ) . expect ('.split(), '"isolated Git staging"',
+            *') ; let staging = temp . path ( ) . join ('.split(), '"mirror"',
+            *') ; std :: fs :: create_dir ( & staging ) . expect ('.split(), '"staging directory"', ')', ';',
+        ]
+        record = 'GitLimits' if side else 'GitCloneLimits'
+        output = 'stdout_bytes : 64 , stderr_bytes : 64 ,' if side else 'output_bytes : 64 ,'
+        extra = 'staging_entries : 32 ,' if side else 'duration : Duration :: from_millis ( 500 ) ,'
+        shape = f'let limits = {record} {{ {output} staging_bytes : 64 , {extra} poll_interval : Duration :: from_millis ( 10 ) , }} ;'.split()
+        _construct_charge(work, len(prelude) + len(shape))
+        first = start + len(prelude)
+        end = first + len(shape) - 1
+        if code.words[start:end + 1] != [*prelude, *shape]:
             return None
+        slots = (code.region(first + 1, first + 1), code.region(first + 3, end - 1))
+        start_line, stop_line = slots[0][0], slots[1][2]
+        fields = tuple(code.region(first + shape.index(word), first + shape.index(word))[0]
+                       for word in ('staging_bytes', 'poll_interval'))
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in owners))
+        affected = [(owner, raw) for owner in owners if (raw := [
+            r for r in owner['regions'] if r[0] <= stop_line and start_line <= r[2]])]
+        expected = [[*slot, body['count'], 0, 0, 0] for slot in slots]
+        if (len(affected) != 1 or affected[0][0] is not body or affected[0][1] != expected
+                or any(counts.get(line) != body['count'] for line in fields)):
+            return None
+        witnesses.append((fields, root['name'], body['name'], expected))
+    return dict(file=name, kind='retained-aur-git-fixture-limits',
+                pairs=[list(pair) for pair in zip(*(row[0] for row in witnesses), strict=True)],
+                owners=[list(row[1:3]) for row in witnesses], regions=[row[3] for row in witnesses])
+
+
+def retained_aur_prefetch_test_wait(name, sides, indexes, work):
+    """Observe polling the HTTP-refusal fixture after strengthening its assertion."""
+    witnesses = []
+    for side, ((_, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code = inventory[0]
+        fixture = aur_source_tokio_fixture(name, inventory, index, 'prefetch_refuses_loopback_before_connecting', work)
+        if fixture is None:
+            return None
+        function, root, body, markers = fixture
+        opening, end = function['opening'], function['end']
         private = [*'assert ! ( fetch_public_source ('.split(), '"https://127.0.0.1/source"',
                    *') . await . unwrap_err ( ) . to_string ( ) . contains ('.split(),
                    '"non-public"', *') ) ;'.split()]
@@ -13929,37 +14126,21 @@ def retained_aur_prefetch_test_wait(name, sides, indexes, work):
         call = second + check.index('fetch_public_source')
         line = code.region(wait, wait)[0]
         slots = (code.region(call if side else wait, wait), code.region(second, end - 1))
-        owners = index.inventories.get(name, ())
-        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
-        roots = [(owner, shape) for owner in owners
-                 if (shape := plain_rust_function_symbol(owner['name'])) is not None
-                 and shape.identifiers == ('omg_lib', 'package_managers', 'aur_sources', 'public_source_tests', declaration)]
-        touching = [(owner, raw) for owner in owners if (raw := [
-            r for r in owner['regions'] if r[0] <= line <= r[2]])]
-        if len(roots) != 1 or len(touching) != 2:
-            return None
-        (root, shape), = roots
-        children = [(owner, raw) for owner, raw in touching if owner is not root]
-        if len(children) != 1:
-            return None
-        (body, raw), = children
-        regions = [code.region(first + header.index('fn'), opening - 1),
-                   code.region(opening, opening), code.region(end, end)]
         hits = body['count']
-        if (not 0 < hits <= root['count'] or root['count'] >= COUNTER_LIMIT
-                or not direct_rust_callback_symbol(body['name'], root['name'], shape.modules)
-                or any(index.name_counts[owner['name']] != 1 or owner.get('branches') or owner.get('mcdc_records')
-                       or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
-                       for owner in (root, body))
-                or root['regions'] != [[*slot, root['count'], 0, 0, 0]
-                                       for slot in (regions[0], slots[1], regions[2])]
-                or [r[4:] for r in body['regions'] if tuple(r[:4]) == regions[1]] != [[hits, 0, 0, 0]]
-                or raw != [[*slots[0], hits, 0, 0, 0]]):
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['regions']) + 1 for owner in owners))
+        touching = {id(owner): raw for owner in owners if (raw := [
+            r for r in owner['regions'] if r[0] <= line <= r[2]])}
+        raw = [[*slots[0], hits, 0, 0, 0]]
+        assertion = [*slots[1], root['count'], 0, 0, 0]
+        if (touching != {id(root): [assertion], id(body): raw}
+                or root['regions'] != [[*markers[0], root['count'], 0, 0, 0], assertion,
+                                       [*markers[1], root['count'], 0, 0, 0]]):
             return None
-        mapped = _owner_line_counts({'regions': [*raw, root['regions'][1]]}, _ObserverWork(work))
+        mapped = _owner_line_counts({'regions': [*raw, assertion]}, _ObserverWork(work))
         if mapped.get(line) != counts.get(line):
             return None
-        witnesses.append((line, root['name'], body['name'], [*raw, root['regions'][1]]))
+        witnesses.append((line, root['name'], body['name'], [*raw, assertion]))
     return dict(file=name, kind='retained-aur-prefetch-test-wait', pairs=[[row[0] for row in witnesses]],
                 owners=[list(row[1:3]) for row in witnesses], regions=[row[3] for row in witnesses])
 
@@ -14417,6 +14598,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     removed = {}; deleted_mapped = deleted_hit = 0; paint_receipts = []; serial_receipts = []; serial_removed = {}
     positive_receipts = []; endpoint_receipts = []; boolean_receipts = []
     replacement_receipts = []; construct_receipts = []; completion_receipts = []; obligation_receipts = []
+    early_observers_by_file = {
+        _AUR_GIT_SOURCE: (retained_aur_git_limits, retained_aur_prefetch_test_wait, retained_aur_git_fixture_limits),
+        _AUR_DEPS_SOURCE: (retained_aur_dependency_packages,),
+    }
     for name in bs:
         file_replacement_start = len(replacement_receipts)
         old = base_sources[name].decode("utf-8").splitlines()
@@ -14584,10 +14769,11 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                         source_prefix_sha256=hashlib.sha256(prefix.encode()).hexdigest(),
                         base_instance_states=states[0], head_instance_states=states[1], instance_matching=matching))
         inventories = None if old == new else tuple(inventory_for_side(side) for side in (0, 1))
-        if (name == _AUR_GIT_SOURCE and inventories is not None and all(item is not None for item in inventories)
+        early_observers = early_observers_by_file.get(name, ())
+        if (early_observers and inventories is not None and all(item is not None for item in inventories)
                 and bs[name]['expansions'] == hs[name]['expansions'] == []):
             sides = ((old, inventories[0], before), (new, inventories[1], after))
-            for observe in (retained_aur_git_limits, retained_aur_prefetch_test_wait):
+            for observe in early_observers:
                 proof = observe(name, sides, source_owner_indexes(), construct_work)
                 if proof is not None:
                     if any(n in anchored and anchored[n] != t for n, t in proof['pairs']):
@@ -14834,6 +15020,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             entry_source = alpm_option_context_source
                         elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == _HOLDPKG_EXPECTED_ERROR:
                             entry_source = alpm_holdpkg_expected_error_source
+                        elif name == _AUR_DEPS_SOURCE and old[line - 1].strip() == 'dependencies.extend(':
+                            entry_source = aur_dependency_extension_entry_source
                     if entry_source is not None and (bs[name]['expansions'],hs[name]['expansions'])==([],[]):
                         sides=((old,inventories[0],base_spans,before,entry_lines[0]),
                                (new,inventories[1],head_spans,after,entry_lines[1]))

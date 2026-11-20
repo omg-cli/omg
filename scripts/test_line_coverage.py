@@ -973,6 +973,46 @@ class RetainedSourceEntryTests(unittest.TestCase):
                 else:
                     self.assertIsNone(proof)
 
+    def test_aur_dependency_filter_migration_keeps_collection_work(self):
+        filename = 'src/package_managers/aur_deps.rs'
+        for fault in (None, 'wrong-output', 'wrong-receiver', 'missing-copy', 'missing-slot', 'foreign', 'lost-hit'):
+            with self.subTest(fault=fault):
+                variants = []
+                for side in range(2):
+                    names = 'other_outputs' if side and fault == 'wrong-output' else 'selected_outputs'
+                    target = 'elsewhere' if side and fault == 'wrong-receiver' else 'dependencies'
+                    filter_call = ('internal_dependencies.contains(dependency)' if side
+                                   else 'all_outputs.contains(dependency_name(dependency))')
+                    source = [
+                        'fn dependency_plan(srcinfo: &SourceInfoV1, requested_outputs: &[String],) -> Result<(Vec<String>, Vec<String>)> {',
+                        '    let mut dependencies = Vec::new();',
+                        f'    for output in &{names} {{',
+                        '        let package = &packages[output];',
+                        f'        {target}.extend(',
+                        '            package',
+                        '                .dependencies',
+                        '                .iter()',
+                        '                .map(ToString::to_string)',
+                        f'                .filter(|dependency| !{filter_call}),',
+                        '        );',
+                        '    }',
+                        '    Ok((dependencies, selected_outputs.into_iter().collect()))',
+                        '}',
+                    ]
+                    hits = (0, 5) if side else (0, 3)
+                    if side and fault == 'lost-hit':
+                        hits = (0, 0)
+                    markers = [(5, target), (5, 'extend'), (6, 'package', 8, '    .iter()'),
+                               (9, 'map')]
+                    variants.append((source, 5, markers, hits, (0, 2),
+                                     '16package_managers8aur_deps15dependency_plan'))
+                proof = self.observe(filename, variants, coverage.aur_dependency_extension_entry_source, fault=fault)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[5, 5], [6, 6], [7, 7], [8, 8], [9, 9]])
+                else:
+                    self.assertIsNone(proof)
+
     def map_entry(self, fault=None):
         variants=[]
         for side in range(2):
@@ -1955,6 +1995,59 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
 
 
 class RetainedRustRelationCoverageTests(unittest.TestCase):
+    def test_architecture_clone_keeps_the_same_package_mapping(self):
+        filename = 'src/package_managers/aur_deps.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'different-architecture', 'different-name', 'lost-closure', 'missing-slot', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side in range(2):
+                    architecture = 'other.clone()' if side and fault == 'different-architecture' else (
+                        'arch.clone()' if side else 'arch')
+                    field = 'base' if side and fault == 'different-name' else 'name'
+                    source = [
+                        'fn dependency_plan(srcinfo: &SourceInfoV1, requested_outputs: &[String],) -> Result<(Vec<String>, Vec<String>)> {',
+                        '    let arch = super::aur::utils::current_arch()',
+                        '        .context("Unsupported host architecture for AUR dependency resolution")?;',
+                        '    let packages = srcinfo',
+                        f'        .packages_for_architecture({architecture})',
+                        f'        .map(|package| (package.{field}.to_string(), package))',
+                        '        .collect::<BTreeMap<_, _>>();',
+                        '    let all_outputs = packages.keys().cloned().collect::<BTreeSet<_>>();',
+                        '    Ok((Vec::new(), Vec::new()))',
+                        '}',
+                    ]
+                    owners = []
+                    for copy in range(2):
+                        scope = f'NvNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers8aur_deps15dependency_plan'
+                        def raw(token, hits, line=6):
+                            col = source[line - 1].rindex(token) + 1
+                            return [line, col, line, col + len(token), hits, 0, 0, 0]
+                        mapper = 0 if side and fault == 'lost-closure' else 3 * copy
+                        regions = [raw(word, mapper) for word in (f'package.{field}', 'to_string', 'package')]
+                        if side and fault == 'missing-slot' and copy:
+                            regions.pop()
+                        owners.extend([
+                            dict(name='_R' + scope, filenames=list(files), count=copy,
+                                 regions=[raw('packages', copy, 4), raw('srcinfo', copy, 4), raw('map', copy),
+                                          raw('collect', copy, 7), *(raw(token, copy, 8) for token in
+                                          ('all_outputs', 'packages', 'keys', 'cloned', 'collect'))]),
+                            dict(name='_RNC' + scope + '0B7_', filenames=list(files), count=mapper, regions=regions),
+                        ])
+                    if side and fault == 'foreign-owner':
+                        owners.append(dict(owners[-1], name='foreign'))
+                    counts = coverage._owner_line_counts({'regions': [r for member in owners for r in member['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_dependency_packages(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[4, 4], [6, 6], [7, 7], [8, 8]])
+                else:
+                    self.assertIsNone(proof)
+
     def test_unversioned_acceptance_requires_a_covered_rust_option_absence(self):
         filenames = ('src/package_managers/aur_deps.rs', 'src/package_managers/types.rs')
         for fault in (None, 'no-absent-case', 'changed-predicate', 'missing-copy', 'foreign-owner'):
@@ -2123,6 +2216,59 @@ class RetainedArtifactReasonFixtureTests(unittest.TestCase):
 
 
 class RetainedAurGitLimitTests(unittest.TestCase):
+    def test_staging_fixture_keeps_its_literal_limits_in_the_compiled_future(self):
+        filename = 'src/package_managers/aur_sources.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'different-cap', 'different-interval', 'cold-fixture', 'missing-slot', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side in range(2):
+                    cap = 128 if side and fault == 'different-cap' else 64
+                    interval = 20 if side and fault == 'different-interval' else 10
+                    record = 'GitLimits' if side else 'GitCloneLimits'
+                    source = [
+                        '#[cfg(test)]',
+                        'mod public_source_tests {',
+                        '    #[tokio::test]',
+                        '    async fn host_git_clone_has_output_duration_and_staging_budgets() {',
+                        '        let temp = tempfile::tempdir().expect("isolated Git staging");',
+                        '        let staging = temp.path().join("mirror");',
+                        '        std::fs::create_dir(&staging).expect("staging directory");',
+                        f'        let limits = {record} {{',
+                        *(['            stdout_bytes: 64,', '            stderr_bytes: 64,'] if side else [
+                           '            output_bytes: 64,']),
+                        f'            staging_bytes: {cap},',
+                        '            staging_entries: 32,' if side else '            duration: Duration::from_millis(500),',
+                        f'            poll_interval: Duration::from_millis({interval}),',
+                        '        };',
+                        '    }',
+                        '}',
+                    ]
+                    base = f'NvNtNtNtCs{side + 1}1_7omg_lib16package_managers11aur_sources19public_source_testss_54host_git_clone_has_output_duration_and_staging_budgets'
+                    opening = source[3].index('{') + 1
+                    closing = len(source) - 1
+                    count = 0 if side and fault == 'cold-fixture' else 1
+                    roots = [[4, 11, 4, opening - 1, 1, 0, 0, 0], [closing, 5, closing, 6, 1, 0, 0, 0]]
+                    field = [8, 22, closing - 1, 10, count, 0, 0, 0]
+                    raw = [[4, opening, 4, opening + 1, 1, 0, 0, 0], [8, 13, 8, 19, count, 0, 0, 0]]
+                    if not (side and fault == 'missing-slot'):
+                        raw.append(field)
+                    owners = [dict(name=symbol, filenames=list(files), count=1, regions=regions)
+                              for symbol, regions in (('_R' + base, roots), ('_RNC' + base + '0B9_', raw))]
+                    if side and fault == 'foreign-owner':
+                        owners.append(dict(owners[-1], name='foreign', regions=[field]))
+                    counts = coverage._owner_line_counts({'regions': [r for member in owners for r in member['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_git_fixture_limits(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[10, 11], [12, 13]])
+                else:
+                    self.assertIsNone(proof)
+
     def test_git_mirror_keep_staging_bound_after_supervisor_migration(self):
         filename = 'src/package_managers/aur_sources.rs'
         files = {'/artifact/' + filename: filename}
