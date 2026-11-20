@@ -1456,12 +1456,15 @@ pub async fn rollback(id: Option<String>, yes: bool) -> Result<()> {
                 let mut restored = Vec::new();
                 let mut failed: Vec<(String, String)> = Vec::new();
                 for (name, version) in &rebuild_from_aur {
-                    if let Err(error) = client.downgrade_from_history(name, version).await {
-                        println!("  {} {name} {version}: {error:#}", style::warning("⚠"));
-                        failed.push((name.clone(), version.clone()));
-                    } else {
-                        println!("  {} {name} downgraded to {version}", style::success("✓"));
-                        restored.push((name.clone(), version.clone()));
+                    match client.rebuild_from_history(name, version).await {
+                        Ok(installed) => {
+                            println!("  {} {name} restored as {installed}", style::success("✓"));
+                            restored.push((name.clone(), installed));
+                        }
+                        Err(error) => {
+                            println!("  {} {name} {version}: {error:#}", style::warning("⚠"));
+                            failed.push((name.clone(), version.clone()));
+                        }
                     }
                 }
                 if !restored.is_empty() {
