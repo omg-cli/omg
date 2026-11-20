@@ -13391,6 +13391,11 @@ def retained_specialization_additions(name, sides, indexes, inventory_for_side, 
 
 
 _AUR_METADATA_POLICY = 'if !self.settings.aur.use_metadata_archive {'
+_AUR_CLIENT_NAMESPACE = ('type', ('type', ('type', ('crate', 'omg_lib'), ('package_managers', '')),
+                                 ('aur', '')), ('client', ''))
+_AUR_UPDATE_CONFIG_CALL = (
+    'let config = crate::core::pacman_conf::PacmanConfig::parse(paths::pacman_conf_path())'
+)
 
 
 def retained_aur_metadata_policy(name, sides, indexes, work):
@@ -13439,9 +13444,6 @@ def retained_aur_metadata_policy(name, sides, indexes, work):
         if len(groups) != 1 or not 1 <= len(groups[0].copies) <= 16:
             return None
         group, = groups
-        namespace = ('crate', 'omg_lib')
-        for segment in ('package_managers', 'aur', 'client'):
-            namespace = ('type', namespace, (segment, ''))
         _construct_charge(work, sum(len(owner['regions']) + 1 for owner in owners))
         affected = {id(owner): regions for owner in owners if (regions := [
             row for row in owner['regions'] if any(row[0] <= n <= row[2] for n in lines)])}
@@ -13452,7 +13454,7 @@ def retained_aur_metadata_policy(name, sides, indexes, work):
             constructor, body = copy.constructor, copy.body
             shape = nominal_method_path(constructor['name'])
             regions = affected[id(body)]
-            if (shape is None or shape.namespace != namespace
+            if (shape is None or shape.namespace != _AUR_CLIENT_NAMESPACE
                     or any(owner.get('branches') or owner.get('mcdc_records') for owner in (constructor, body))
                     or tuple(tuple(row[:4]) for row in regions) != slots
                     or regions[0][4] != body['count']
@@ -13472,6 +13474,98 @@ def retained_aur_metadata_policy(name, sides, indexes, work):
     if matching is None:
         return None
     return dict(file=name, kind='retained-aur-metadata-policy',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                instance_states=[before[1], after[1]], owners=[before[2], after[2]],
+                instance_matching=matching)
+
+
+def retained_aur_update_config(name, sides, indexes, work):
+    """Observe the same pacman config read inside the foreign-package worker."""
+    observations = []
+    for side, ((_, inventory, counts, line), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows) + len(code.starts).bit_length())
+        start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+        ancestry = _construct_ancestors(code, start, work)
+        if len(ancestry) != 4:
+            return None
+        closure, call, function, implementation = ancestry
+        header = ('# [ instrument ( skip ( self ) ) ] pub async fn get_update_list '
+                  '( & self ) -> Result < Vec < ( String , Version , Version ) > >').split()
+        scopes = {row['opening']: row['header'] for row in rows if row['opening'] in (function, implementation)}
+        worker = ('let ( foreign_packages , installed ) = tokio :: task :: spawn_blocking '
+                  '( || -> Result < _ > {').split()
+        if (scopes != {function: tuple(header), implementation: ('impl', 'AurClient')}
+                or code.parents[implementation] is not None
+                or code.words[function + 1:closure + 1] != worker or code.words[call] != '('):
+            return None
+        discovery = ('let packages = pacman_db :: get_potential_aur_package_records ( ) ? ;'
+                     if side else 'let mut packages = get_potential_aur_packages ( ) ? ;')
+        empty = 'Vec :: new ( )' if side else 'packages'
+        prelude = (f'{discovery} if packages . is_empty ( ) {{ return Ok ( ( {empty} , '
+                   'Arc :: new ( HashMap :: new ( ) ) ) ) ; }').split()
+        config = ['let', 'config', '=', *'crate :: core :: pacman_conf :: PacmanConfig :: parse ( '
+                  'paths :: pacman_conf_path ( ) ) . context ('.split(),
+                  '"Failed to load AUR update filters from pacman.conf"', ')', '?', ';']
+        if (code.words[closure + 1:start] != prelude
+                or code.words[start:start + len(config)] != config):
+            return None
+        slots = (code.region(start + 1, start + 1), code.region(start + 3, start + 11),
+                 code.region(start + 13, start + 15), code.region(start + 20, start + 20),
+                 code.region(start + 24, start + 24))
+        selected = (line, line + 1)
+        bounds = (code.region(closure, closure), code.region(code.pairs[closure], code.pairs[closure]))
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        constructors = {}
+        affected = {}
+        for owner in owners:
+            raw = [r for r in owner['regions'] if any(r[0] <= n <= r[2] for n in selected)]
+            if owner['name'].startswith('_RNvM') or raw:
+                shape = nominal_method_path(owner['name'])
+                if (shape is None or shape.kind != 'M' or shape.namespace != _AUR_CLIENT_NAMESPACE
+                        or shape.self_type != ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
+                        or shape.method != ('get_update_list', '')):
+                    if raw:
+                        return None
+                    continue
+                if raw:
+                    if shape.callbacks != ('', '', '') or shape.copy_identity in affected:
+                        return None
+                    affected[shape.copy_identity] = owner, raw
+                elif not shape.callbacks and shape.copy_identity not in constructors:
+                    constructors[shape.copy_identity] = owner
+                else:
+                    return None
+        if not 1 <= len(affected) <= 16 or affected.keys() != constructors.keys() or not counts.get(line, 0):
+            return None
+        states = []; regions = []; symbols = []
+        for identity, (owner, raw) in affected.items():
+            constructor = constructors[identity]
+            hits = owner['count']
+            if (any(index.name_counts[item['name']] != 1 or item.get('branches') or item.get('mcdc_records')
+                    or len(item['filenames']) != 1 or index.files.get(item['filenames'][0]) != name
+                    for item in (owner, constructor))
+                    or not 0 <= hits < COUNTER_LIMIT
+                    or [tuple(r[:4]) for r in (owner['regions'][0], owner['regions'][-1])] != list(bounds)
+                    or any(r[4:] != [hits, 0, 0, 0] for r in (owner['regions'][0], owner['regions'][-1]))
+                    or tuple(tuple(r[:4]) for r in raw) != slots
+                    or any(r[5:] != [0, 0, 0] or not 0 <= r[4] <= hits for r in raw)
+                    or len({r[4] for r in raw[:-1]}) != 1 or raw[-1][4] > raw[0][4]):
+                return None
+            states.append((constructor['count'] > 0, hits > 0, *(r[4] > 0 for r in raw)))
+            regions.extend(raw)
+            symbols.append([constructor['name'], owner['name']])
+        projected = _owner_line_counts({'regions': regions}, _ObserverWork(work))
+        if projected != {n: counts[n] for n in selected if n in counts}:
+            return None
+        observations.append((selected, states, symbols))
+    before, after = observations
+    _construct_charge(work, len(before[1][0]) * len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-aur-update-config',
                 pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
                 instance_states=[before[1], after[1]], owners=[before[2], after[2]],
                 instance_matching=matching)
@@ -13624,9 +13718,12 @@ def retained_aur_hook_rendering(name, sides, indexes, work):
 
 def retained_callback_statement(name, sides, indexes, work):
     """Prove one unchanged statement at the start of the same tail callback."""
-    if (name == 'src/package_managers/aur/client.rs'
-            and sides[0][0][sides[0][-1] - 1].strip() == 'let contents = text'):
-        return retained_aur_hook_rendering(name, sides, indexes, work)
+    if name == 'src/package_managers/aur/client.rs':
+        entry = sides[0][0][sides[0][-1] - 1].strip()
+        if entry == 'let contents = text':
+            return retained_aur_hook_rendering(name, sides, indexes, work)
+        if entry == _AUR_UPDATE_CONFIG_CALL:
+            return retained_aur_update_config(name, sides, indexes, work)
     identity = None
     evidence = []
     for (source, inventory, counts, line), index in zip(sides, indexes, strict=True):

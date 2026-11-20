@@ -1954,6 +1954,70 @@ class RetainedAurHookRenderingTests(unittest.TestCase):
                     self.assertIsNone(proof)
 
 
+class RetainedAurUpdateFilterTests(unittest.TestCase):
+    def test_shared_pacman_config_read_preserves_the_error_exit_in_each_worker_copy(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'wrong-config', 'changed-guard', 'lost-exit', 'missing-copy', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes = [], []
+                for side in range(2):
+                    discover = ('let packages = pacman_db::get_potential_aur_package_records()?;' if side
+                                else 'let mut packages = get_potential_aur_packages()?;')
+                    empty = 'Vec::new()' if side else 'packages'
+                    guard = 'is_empty' if not (side and fault == 'changed-guard') else 'is_missing'
+                    path = 'pacman_conf_path' if not (side and fault == 'wrong-config') else 'other_conf_path'
+                    source = [
+                        'impl AurClient {',
+                        '    #[instrument(skip(self))]',
+                        '    pub async fn get_update_list(&self) -> Result<Vec<(String, Version, Version)>> {',
+                        '        let (foreign_packages, installed) = tokio::task::spawn_blocking(|| -> Result<_> {',
+                        f'            {discover}',
+                        f'            if packages.{guard}() {{',
+                        f'                return Ok(({empty}, Arc::new(HashMap::new())));',
+                        '            }',
+                        f'            let config = crate::core::pacman_conf::PacmanConfig::parse(paths::{path}())',
+                        '                .context("Failed to load AUR update filters from pacman.conf")?;',
+                        '            Ok((packages, Arc::new(HashMap::new())))',
+                        '        })',
+                        '        .await?;',
+                        '        Ok(Vec::new())',
+                        '    }',
+                        '}',
+                    ]
+                    owners = []
+                    for copy in range(2):
+                        declaration = f'Ms{side + 2}_NtNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers3aur6client'
+                        parent = '_RNv' + declaration + 'NtB5_9AurClient15get_update_list'
+                        worker = '_RNCNCNCNv' + declaration + 'NtBb_9AurClient15get_update_list000Bh_'
+                        def raw(line, token, hits):
+                            col = source[line - 1].index(token) + 1
+                            return [line, col, line, col + len(token), hits, 0, 0, 0]
+                        condition = (copy + 1) if side else copy
+                        exit_hits = 0 if side and fault == 'lost-exit' else copy
+                        geometry = [raw(4, '{', 3), raw(9, 'config', condition),
+                                    raw(9, 'crate::core::pacman_conf::PacmanConfig::parse', condition),
+                                    raw(9, f'paths::{path}', condition), raw(10, 'context', condition),
+                                    raw(10, '?', exit_hits), raw(12, '}', 3)]
+                        owners.append(dict(name=parent, filenames=list(files), count=3,
+                                           regions=[raw(3, 'pub async fn', 3)]))
+                        if not (side and fault == 'missing-copy' and copy == 0):
+                            owners.append(dict(name=worker, filenames=list(files), count=3, regions=geometry))
+                    if side and fault == 'foreign-owner':
+                        owners.append(dict(owners[-1], name='foreign', regions=[owners[-1]['regions'][1]]))
+                    counts = coverage._owner_line_counts({'regions': [r for item in owners for r in item['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((source, coverage._construct_inventory(source, work), counts, 9))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_callback_statement(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[9, 9], [10, 10]])
+                else:
+                    self.assertIsNone(proof)
+
+
 class RetainedAurMetadataPolicyTests(unittest.TestCase):
     def test_metadata_reader_keeps_the_opt_out_and_ttl_across_async_copies(self):
         filename = 'src/package_managers/aur/client.rs'
