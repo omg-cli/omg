@@ -905,6 +905,8 @@ class RetainedSourceEntryTests(unittest.TestCase):
                 prefix = f'_RNv{"Nt" * depth}Cs{side+1}{copy+1}_7omg_lib'
                 symbol=prefix+scope
                 def region(number,text,value,end_number=None,end_text=None):
+                    if isinstance(text, int):
+                        return [number,text,end_number,end_text,value,0,0,0]
                     col=source[number-1].rindex(text)+1
                     if end_number is None:
                         end_number, end_column = number, col + len(text)
@@ -928,6 +930,48 @@ class RetainedSourceEntryTests(unittest.TestCase):
             sides.append((source,coverage._construct_inventory(source,work),spans,counts,line))
             indexes.append(coverage.index_compiled_owner_sources(owners,files,work,{name}))
         return coverage.retained_observed_entry(name,sides,indexes,work,source_observer)
+
+    def test_sbom_duplicate_identity_guard_requires_every_retained_operation(self):
+        repository = 'src/core/security/sbom_shared.rs'
+        for fault in (None, 'changed-key', 'changed-package', 'changed-loop', 'changed-message',
+                      'missing-copy', 'missing-slot', 'foreign', 'lost-hit', 'prefix-lost'):
+            with self.subTest(fault=fault):
+                variants = []
+                for side in range(2):
+                    packages = 'other' if side and fault == 'changed-loop' else 'installed'
+                    key = 'key.clone()' if side else 'key'
+                    if side and fault == 'changed-key':
+                        key = 'alt.clone()'
+                    package = 'other' if side and fault == 'changed-package' else 'package'
+                    message = 'Other duplicate identity' if side and fault == 'changed-message' else 'Duplicate installed SBOM identity'
+                    source = [
+                        'pub(super) fn compose(installed: &[SecurityPackage], audit: Option<&SecurityAuditResult>, distro: Distro) -> anyhow::Result<Sbom> {',
+                        '    let mut identities = std::collections::BTreeMap::new();',
+                        f'    for package in {packages} {{',
+                        '        let reference = purl(package, distro)?;',
+                        f'        let key = ({package}.name.clone(), package.version.clone(), package.architecture.clone(),);',
+                        '        anyhow::ensure!(',
+                        f'            identities.insert({key}, reference.clone()).is_none(),',
+                        f'            "{message}"',
+                        '        );',
+                        '    }',
+                        '}',
+                    ]
+                    offsets = ([(13, 23), (13, 62), (24, 30), (31, 34), (35, 40), (63, 70)]
+                               if side else [(13, 23), (13, 54), (24, 30), (31, 34), (55, 62)])
+                    markers = [(6, 'anyhow::ensure!'), *((7, low, 7, high) for low, high in offsets)]
+                    hits = (1, 17) if side else (0, 14)
+                    if side and fault == 'lost-hit':
+                        hits = (0, 0)
+                    variants.append((source, 6, markers, hits, (9, 15) if side else (6, 10),
+                                     '4core8security11sbom_shared7compose'))
+                proof = self.observe(repository, variants, coverage.sbom_identity_guard_entry_source,
+                                     fault=fault)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[6, 6]])
+                else:
+                    self.assertIsNone(proof)
 
     def map_entry(self, fault=None):
         variants=[]

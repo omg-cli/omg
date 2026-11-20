@@ -3680,13 +3680,74 @@ def retained_ensure_entry(name, sides, indexes, work):
     return retained_observed_entry(name,sides,indexes,work,ensure_entry_source)
 
 
+_SBOM_DUPLICATE_IDENTITY = '"Duplicate installed SBOM identity"'
+
+
+def sbom_identity_guard_entry_source(name, source, inventory, line, work):
+    """Locate the retained check and every slot in its key insertion."""
+    if name != 'src/core/security/sbom_shared.rs':
+        return None
+    observed = ensure_entry_source(name, source, inventory, line, work)
+    if observed is None:
+        return None
+    syntax, _, _, _, _, function, method, conditions, _ = observed
+    scopes, message = syntax
+    if (function != 'compose' or method is not None or message != _SBOM_DUPLICATE_IDENTITY
+            or len(scopes) != 2 or scopes[0] != ('for', 'package', 'in', 'installed')
+            or conditions[0] is None):
+        return None
+    condition_span, condition_text = conditions[0]
+    if len(condition_text) != 1 or condition_span[0] != line + 1:
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows) + 3 * len(code.starts).bit_length() + len(condition_text[0]))
+    macro = bisect.bisect_left(code.starts, code.offsets[line - 1])
+    loop = code.parents[macro]
+    function_opening = code.parents[loop]
+    loops = [row for row in rows if row['opening'] == loop and row['kind'] == 'for']
+    if len(loops) != 1:
+        return None
+    loop_statement, = loops
+    _construct_charge(work, macro - function_opening)
+    setup = code.words[loop + 1:macro]
+    expected_setup = ('let reference = purl ( package , distro ) ? ; '
+                      'let key = ( package . name . clone ( ) , package . version . clone ( ) , '
+                      'package . architecture . clone ( ) , ) ;').split()
+    if setup != expected_setup:
+        return None
+    prefix_words = code.words[function_opening + 1:loop_statement['first']]
+    if prefix_words.count('identities') != 1:
+        return None
+    binding = function_opening + 1 + prefix_words.index('identities') - 2
+    allocation = 'let mut identities = std :: collections :: BTreeMap :: new ( ) ;'.split()
+    if (code.parents[binding] != function_opening
+            or code.words[binding:binding + len(allocation)] != allocation):
+        return None
+    start = bisect.bisect_left(code.starts, code.offsets[line])
+    prefix = 'identities . insert ( key'.split()
+    suffix = ', reference . clone ( ) ) . is_none ( ) ,'.split()
+    plain = [*prefix, *suffix]
+    copied = [*prefix, '.', 'clone', '(', ')', *suffix]
+    words = code.words[start:bisect.bisect_left(code.starts, code.offsets[line + 1])]
+    if words not in (plain, copied):
+        return None
+    insert_end = code.pairs[start + 3]
+    markers = [code.region(start, start), code.region(start, insert_end),
+               code.region(start + 2, start + 2), code.region(start + 4, start + 4)]
+    if words == copied:
+        markers.append(code.region(start + 6, start + 6))
+    markers.append(code.region(insert_end + 2, insert_end + 2))
+    return (*observed[:7], ((line, line + 1), tuple(markers)), observed[-1])
+
+
 def retained_observed_entry(name, sides, indexes, work, source_observer):
     """Compare complete raw copy inventories for a source-owned entry."""
     map_initializer=source_observer is map_initializer_entry_source
     alpm_record = source_observer is alpm_update_record_entry_source
     cache_receiver = source_observer is alpm_cache_receiver_entry_source
     refusal_diagnostic = source_observer is alpm_refusal_diagnostic_entry_source
-    fragment = cache_receiver or refusal_diagnostic
+    sbom_identity_guard = source_observer is sbom_identity_guard_entry_source
+    fragment = cache_receiver or refusal_diagnostic or sbom_identity_guard
     option_context = source_observer is alpm_option_context_source
     holdpkg_expectation = source_observer is alpm_holdpkg_expected_error_source
     identities=[]; receipts=[]; states=[]; conditions=[]
@@ -3757,7 +3818,8 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                 arguments = [r for r in touching if r[0] == condition[1][0][0]]
                 if (tuple(tuple(r[:4]) for r in arguments) != condition[1]
                         or any(r[4] != hits for r in arguments)
-                        or refusal_diagnostic and len(touching) != len(entry) + len(arguments)):
+                        or (refusal_diagnostic or sbom_identity_guard)
+                           and len(touching) != len(entry) + len(arguments)):
                     return None
             roots.append((owner,identity,copy,touching,hits))
         _construct_charge(work,len(roots)+len(compiled_parents))
@@ -3807,12 +3869,18 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
     pairs=[[sides[0][-1],sides[1][-1]]]
     if fragment:
         previous, current = (item[0][0] for item in conditions)
+        if sbom_identity_guard:
+            # The key expression changed. Credit the unchanged macro entry only.
+            previous, current = previous[:1], current[:1]
         pairs = [list(pair) for pair in zip(previous, current, strict=True)]
         if any(sides[0][0][line - 1] != sides[1][0][target - 1]
                or sides[0][3].get(line, 0) <= 0 or sides[1][3].get(target, 0) <= 0
                for line, target in pairs):
             return None
-        kind = 'retained-alpm-cache-receiver' if cache_receiver else 'retained-alpm-refusal-diagnostic'
+        if sbom_identity_guard:
+            kind = 'retained-sbom-identity-guard'
+        else:
+            kind = 'retained-alpm-cache-receiver' if cache_receiver else 'retained-alpm-refusal-diagnostic'
         return dict(file=name, kind=kind, pairs=pairs,
                     instance_states=states, observations=receipts)
     if alpm_record:
@@ -13917,6 +13985,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                     if inventories is not None and old[line-1]==new[target-1]:
                         if old[line-1].strip()=='anyhow::ensure!(':
                             entry_source=ensure_entry_source
+                            if (name == 'src/core/security/sbom_shared.rs' and line + 1 < len(old)
+                                    and old[line + 1].strip() == _SBOM_DUPLICATE_IDENTITY):
+                                entry_source = sbom_identity_guard_entry_source
                         elif (name=='src/package_managers/aur/client.rs' and min(line,target)>3
                               and old[line-1].strip()=='&& files.len() < 10_000,'):
                             entry_source=ensure_entry_source

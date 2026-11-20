@@ -400,6 +400,40 @@ pub(in crate::package_managers) fn open_effective_user_lock(path: &Path) -> Resu
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lifecycle_lease_reports_kernel_unlock_failure() -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if crate::core::testing::run_isolated_test(
+            "package_managers::aur::utils::tests::lifecycle_lease_reports_kernel_unlock_failure",
+        ) {
+            return Ok(());
+        }
+        let directory = tempfile::tempdir()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_PATH)
+            .open(directory.path())?;
+        let error = file
+            .unlock()
+            .expect_err("a path-only descriptor cannot unlock");
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EBADF));
+        let log = directory.path().join("unlock.log");
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(File::create(&log)?))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || drop(BuildLifecycleLease(file)));
+
+        let warning = std::fs::read_to_string(log)?;
+        assert!(warning.contains("Failed to release AUR lifecycle lease"));
+        assert!(warning.contains(&error.to_string()));
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires an explicitly provisioned disposable native root fixture"]
     fn native_lifecycle_original_user_ownership() -> Result<()> {
