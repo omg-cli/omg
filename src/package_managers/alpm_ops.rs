@@ -2460,10 +2460,13 @@ fn require_fresh_arch_coverage(
     Ok(())
 }
 
-fn begin_prepared_review_signals(
+fn ensure_prepared_review_signals(
     signals: &mut Option<AdmissionSignals>,
     details: &str,
 ) -> Result<()> {
+    if let Some(owner) = signals.as_ref() {
+        return owner.check();
+    }
     AdmissionSignals::begin_in(signals).with_context(|| {
         format!("{details}\nAdvisory risk review requires an attended native OMG CLI")
     })
@@ -2615,9 +2618,7 @@ impl PreparedAdvisoryAdmission {
         let digest = advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?;
         let review = prepared_risk_review(&assessments, &digest, policy.advisory_requirement)?;
         if let Some(review) = review {
-            if signals.is_none() {
-                begin_prepared_review_signals(signals, review.details())?;
-            }
+            ensure_prepared_review_signals(signals, review.details())?;
             confirm_advisory_prompt(
                 review.details(),
                 review.id(),
@@ -3016,18 +3017,29 @@ mod tests {
         let invalid_signal = super::admission_signal_action(0, None)
             .expect_err("the kernel must refuse a signal outside the sigaction domain");
         assert_eq!(invalid_signal.raw_os_error(), Some(nix::libc::EINVAL));
-        let mut guard = super::AdmissionSignals::begin()?;
+        let mut owned = None;
+        super::ensure_prepared_review_signals(&mut owned, "first review")?;
         assert!(super::AdmissionSignals::begin().is_err());
-        let error = super::begin_prepared_review_signals(&mut None, "disclosed fixture risk")
+        let error = super::ensure_prepared_review_signals(&mut None, "disclosed fixture risk")
             .expect_err("a second transaction must not take cancellation ownership");
         assert!(error.to_string().contains("disclosed fixture risk"));
         assert!(format!("{error:#}").contains("owns signal cancellation"));
+        super::ensure_prepared_review_signals(&mut owned, "same transaction")?;
         assert!(
             !nix::sys::signal::SigSet::thread_get_mask()?
                 .contains(nix::sys::signal::Signal::SIGINT),
             "the isolated signal fixture requires SIGINT unblocked on its receiving thread"
         );
         nix::sys::signal::raise(nix::sys::signal::Signal::SIGINT)?;
+        assert!(
+            format!(
+                "{:#}",
+                super::ensure_prepared_review_signals(&mut owned, "same transaction")
+                    .expect_err("a cancelled owner must refuse the review")
+            )
+            .contains("admission interrupted")
+        );
+        let mut guard = owned.expect("review preserved the original owner");
         assert!(
             guard.check().is_err(),
             "synchronous current-thread SIGINT must cancel admission"
