@@ -365,19 +365,20 @@ pub(crate) fn inspect_archive(path: &Path) -> Result<ArchiveAdmission> {
         );
         let kind = entry.header().entry_type();
         let member = normalize_member_path(&raw_path, kind.is_dir())?;
-        let mut privileged_integration = false;
-        for (reason, prefixes) in PRIVILEGED_PATH_PREFIXES {
-            if prefixes.iter().any(|prefix| member.starts_with(prefix)) {
-                privileged_integration = true;
-                paired_build_reasons.insert((*reason).to_owned());
-            }
-        }
-        for (reason, paths) in PRIVILEGED_EXACT_PATHS {
-            if paths.contains(&member.as_str()) {
-                privileged_integration = true;
-                paired_build_reasons.insert((*reason).to_owned());
-            }
-        }
+        let prefix_reasons = PRIVILEGED_PATH_PREFIXES
+            .iter()
+            .filter_map(|&(reason, prefixes)| {
+                prefixes
+                    .iter()
+                    .any(|prefix| member.starts_with(prefix))
+                    .then_some(reason)
+            });
+        let exact_reasons = PRIVILEGED_EXACT_PATHS
+            .iter()
+            .filter_map(|&(reason, paths)| paths.contains(&member.as_str()).then_some(reason));
+        let mut integration_reasons = prefix_reasons.chain(exact_reasons).peekable();
+        let privileged_integration = integration_reasons.peek().is_some();
+        paired_build_reasons.extend(integration_reasons.map(str::to_owned));
 
         anyhow::ensure!(
             kind.is_file() || kind.is_dir() || kind.is_symlink() || kind.is_hard_link(),
@@ -1369,17 +1370,25 @@ mod tests {
 
     #[test]
     fn inspector_requires_paired_build_for_system_integration_payloads() -> Result<()> {
-        for (path, reason) in [
-            ("etc/demo.conf", "system-configuration"),
-            ("usr/lib/systemd/system/demo.service", "systemd-unit"),
-            ("usr/lib/systemd/system-generators/demo", "systemd-unit"),
-            ("usr/lib/modules/6.0/extra/demo.ko", "kernel-module"),
-            ("usr/share/libalpm/hooks/demo.hook", "package-manager-hook"),
+        let cases: &[(&str, &[&str])] = &[
+            ("etc/demo.conf", &["system-configuration"]),
+            (
+                "etc/systemd/system/demo.service",
+                &["system-configuration", "systemd-unit"],
+            ),
+            ("usr/lib/systemd/system/demo.service", &["systemd-unit"]),
+            ("usr/lib/systemd/system-generators/demo", &["systemd-unit"]),
+            ("usr/lib/modules/6.0/extra/demo.ko", &["kernel-module"]),
+            (
+                "usr/share/libalpm/hooks/demo.hook",
+                &["package-manager-hook"],
+            ),
             (
                 "usr/lib/udev/rules.d/50-demo.rules",
-                "privileged-system-integration",
+                &["privileged-system-integration"],
             ),
-        ] {
+        ];
+        for &(path, reasons) in cases {
             let mtree = fixture_file_mtree(&[(path, 0o644, 7)]);
             let archive = fixture_archive_with_mtree(&mtree, |builder| {
                 append_file(builder, path, b"payload", 0o644)
@@ -1397,10 +1406,13 @@ mod tests {
                     .any(|file| file.path == path)
             );
             assert!(
-                inspection
-                    .paired_build_reasons
-                    .iter()
-                    .any(|item| item == reason)
+                reasons.iter().all(|reason| {
+                    inspection
+                        .paired_build_reasons
+                        .iter()
+                        .any(|item| item == *reason)
+                }),
+                "missing paired build reason for {path}"
             );
         }
         Ok(())

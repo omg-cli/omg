@@ -1876,6 +1876,83 @@ class RetainedFixtureConstructorTests(unittest.TestCase):
         self.assertIsNone(coverage.retained_pi_fixture_exit((oldest,side(True,missing=True)),[30_000]))
 
 
+class RetainedAurHookRenderingTests(unittest.TestCase):
+    def test_hook_rendering_requires_matching_outer_and_inner_callback_evidence(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'rebound-text', 'changed-rendering', 'lost-inner-hit',
+                      'missing-inner-copy', 'foreign-owner', 'foreign-root-coverage'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side in range(2):
+                    label = 'display_name' if side else 'name'
+                    input_bytes = 'different_bytes' if side and fault == 'rebound-text' else 'bytes'
+                    operation = 'escape_default' if side and fault == 'changed-rendering' else 'to_string'
+                    source = [
+                        'fn declared_install_hook_previews(source: &ReviewedSource) -> Result<Vec<(String, String)>> {',
+                        '    names',
+                        '        .into_iter()',
+                        '        .map(|name| {',
+                        *(['            let display_name = review_path(Path::new(&name));'] if side else []),
+                        '            let bytes = source.files.get(Path::new(&name))',
+                        f'                .with_context(|| format!("Declared install hook is absent: {{{label}}}"))?;',
+                        '            anyhow::ensure!(',
+                        '                bytes.len() <= MAX_PKGBUILD_REVIEW_BYTES,',
+                        f'                "Install hook {{{label}}} exceeds the review limit"',
+                        '            );',
+                        f'            let text = std::str::from_utf8({input_bytes})',
+                        f'                .with_context(|| format!("Install hook {{{label}}} is not UTF-8"))?;',
+                        '            let contents = text',
+                        '                .chars()',
+                        '                .map(|character| {',
+                        f'                    character.{operation}()',
+                        '                })',
+                        '                .collect::<String>();',
+                        '            Ok((name, contents))',
+                        '        })',
+                        '        .collect()',
+                        '}',
+                    ]
+                    line = 13 + side
+                    owners = []
+                    for copy in range(2):
+                        root = f'_RNvNtNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers3aur6client30declared_install_hook_previews'
+                        def raw(row, token, hits):
+                            col = source[row - 1].index(token) + 1
+                            return [row, col, row, col + len(token), hits, 0, 0, 0]
+                        def owner(symbol, regions, hits):
+                            return dict(name=symbol, filenames=list(files), regions=regions, count=hits)
+                        outer = '_RNC' + root[2:] + 's_0B9_'
+                        child = '_RNCNC' + root[2:] + 's_0s0_0Bb_'
+                        entries = 2 * copy
+                        completion = [raw(len(source) - 1, 'collect', 1), raw(len(source), '}', 1)]
+                        if side and fault == 'foreign-root-coverage' and copy == 0:
+                            owners.append(owner('foreign', completion, 1))
+                            completion = []
+                        owners.append(owner(root, [raw(1, 'fn', 1), *completion], 1))
+                        owners.append(owner(outer, [raw(line, 'contents', entries), raw(line, 'text', entries),
+                            raw(line + 1, 'chars', entries), raw(line + 2, 'map', entries),
+                            raw(line + 5, 'collect', entries), raw(line + 6, 'Ok((name, contents))', entries),
+                            raw(line + 7, '}', entries)], entries))
+                        if not (side and fault == 'missing-inner-copy' and copy == 0):
+                            hit = 0 if side and fault == 'lost-inner-hit' else copy
+                            owners.append(owner(child, [raw(line + 2, '{', hit), raw(line + 3, operation, hit),
+                                                       raw(line + 4, '}', hit)], hit))
+                    if side and fault == 'foreign-owner':
+                        owners.append(owner('foreign', [raw(line, 'text', 1)], 1))
+                    counts = coverage._owner_line_counts({'regions': [row for item in owners for row in item['regions']]},
+                                                        coverage._ObserverWork(work))
+                    sides.append((source, coverage._construct_inventory(source, work), counts, line))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_callback_statement(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[line, line + 1] for line in range(13, 23)])
+                else:
+                    self.assertIsNone(proof)
+
+
 class SbomComponentPushTests(unittest.TestCase):
     def test_audit_fixture_observes_coverage_and_applicability_separately(self):
         name = 'src/core/security/sbom_shared.rs'

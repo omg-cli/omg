@@ -13390,8 +13390,154 @@ def retained_specialization_additions(name, sides, indexes, inventory_for_side, 
                 base_types=len(base), head_types=len(head), added_types=sorted(map(repr, added)))
 
 
+def retained_aur_hook_rendering(name, sides, indexes, work):
+    """Observe hook text rendering after the same bounded UTF-8 read."""
+    function_name = 'declared_install_hook_previews'
+    scope = ('omg_lib', 'package_managers', 'aur', 'client', function_name)
+    previous = None
+    evidence = []
+    for (source, inventory, counts, line), index in zip(sides, indexes, strict=True):
+        code, constructs, _, statements, *_ = inventory
+        candidates = [row for row in statements.get(line, ()) if row['supported']
+                      and code.region(row['first'], row['end'])[0] == line]
+        if len(candidates) != 1:
+            return None
+        row, = candidates
+        start, end = row['first'], row['end']
+        rendering = 'let contents = text . chars ( ) . map ( | character | {'.split()
+        collect = '} ) . collect :: < String > ( ) ;'.split()
+        if (code.words[start:start + len(rendering)] != rendering
+                or code.words[end + 1 - len(collect):end + 1] != collect):
+            return None
+        closure = code.parents[start]
+        if closure is None or code.words[closure] != '{':
+            return None
+        call = code.parents[closure]
+        if call is None or call < 7 or code.words[call] != '(':
+            return None
+        function = code.parents[call]
+        if (function is None or code.words[function] != '{'
+                or code.words[call - 7:closure + 1] != 'names . into_iter ( ) . map ( | name | {'.split()
+                or code.words[end + 1:code.pairs[function]] != 'Ok ( ( name , contents ) ) } ) . collect ( )'.split()):
+            return None
+        _construct_charge(work, len(constructs) + end - closure + 1)
+        root_rows = [node for node in constructs if node['kind'] == 'fn' and node['opening'] == function]
+        if (len(root_rows) != 1 or root_rows[0]['header'][:3] != ('fn', function_name, '(')
+                or code.parents[function] is not None):
+            return None
+        prefix = code.words[closure + 1:start]
+        diagnostic = 'let display_name = review_path ( Path :: new ( & name ) ) ;'.split()
+        label = 'display_name' if prefix[:len(diagnostic)] == diagnostic else 'name'
+        setup = [
+            *'let bytes = source . files . get ( Path :: new ( & name ) ) . with_context ( || format ! ('.split(),
+            f'"Declared install hook is absent: {{{label}}}"',
+            *') ) ? ; anyhow :: ensure ! ( bytes . len ( ) < = MAX_PKGBUILD_REVIEW_BYTES ,'.split(),
+            f'"Install hook {{{label}}} exceeds the review limit"',
+            *') ; let text = std :: str :: from_utf8 ( bytes ) . with_context ( || format ! ('.split(),
+            f'"Install hook {{{label}}} is not UTF-8"',
+            *') ) ? ;'.split(),
+        ]
+        if prefix != (setup if label == 'name' else diagnostic + setup):
+            return None
+        function_end = code.pairs[function]
+        finish = code.region(start, function_end)[2]
+        excerpt = tuple(source[line - 1:finish])
+        if previous is not None and previous != excerpt:
+            return None
+        previous = excerpt
+        opening = start + len(rendering) - 1
+        closing = code.pairs[opening]
+        if closing != end + 1 - len(collect):
+            return None
+        outer_slots = [code.region(token, token) for token in
+                       (start + 1, start + 3, start + 5, start + 9, end - 7)]
+        outer_end = code.pairs[closure]
+        outer_slots.extend((code.region(end + 1, code.pairs[end + 2]), code.region(outer_end, outer_end)))
+        root_slots = [code.region(token, token) for token in (code.pairs[call] + 2, function_end)]
+        inner_bounds = code.region(opening, closing)
+        inner_markers = [code.region(token, token) for token in (opening, closing)]
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        roots = [(owner, shape) for owner in owners
+                 if (shape := plain_rust_function_symbol(owner['name'])) is not None
+                 and shape.identifiers == scope]
+        touching = {owner['name']: (owner, raw) for owner in owners if (raw := [
+            region for region in owner['regions'] if region[0] <= finish and line <= region[2]])}
+        if (not 1 <= len(roots) <= 16 or len(touching) != 3 * len(roots)
+                or not counts.get(line, 0)):
+            return None
+        entries = []
+        projection = []
+        function_range = code.region(root_rows[0]['first'], code.pairs[function])[0::2]
+        for root, shape in roots:
+            span = source_owner_span(root, name, index.files, source)
+            if (index.name_counts[root['name']] != 1 or span is None
+                    or span[:2] != function_range or len(root['filenames']) != 1
+                    or root['name'] not in touching):
+                return None
+            _, root_raw = touching.pop(root['name'])
+            if ([tuple(r[:4]) for r in root_raw] != root_slots
+                    or any(r[5:] != [0, 0, 0] or r[4] != root['count'] for r in root_raw)):
+                return None
+            matched = []
+            projection.extend(root_raw)
+            for depth in (1, 2):
+                _construct_charge(work, sum(len(symbol) + 1 for symbol in touching))
+                callbacks = [(symbol, owner, raw) for symbol, (owner, raw) in touching.items()
+                             if direct_rust_callback_symbol(symbol, root['name'], shape.modules, depth)]
+                if len(callbacks) != 1:
+                    return None
+                symbol, owner, raw = callbacks[0]
+                if (index.name_counts[symbol] != 1 or owner['filenames'] != root['filenames']
+                        or owner.get('branches') or owner.get('mcdc_records')
+                        or not 0 <= owner['count'] < COUNTER_LIMIT
+                        or any(r[5:] != [0, 0, 0] or not 0 <= r[4] <= owner['count'] for r in raw)):
+                    return None
+                slots = [tuple(r[:4]) for r in raw]
+                if depth == 1:
+                    if (slots != outer_slots or len({r[4] for r in raw[:-1]}) != 1
+                            or raw[-1][4] != owner['count']):
+                        return None
+                elif (slots[0] != inner_markers[0] or slots[-1] != inner_markers[1]
+                      or raw[0][4] != owner['count'] or raw[-1][4] != owner['count']
+                      or len(set(slots)) != len(slots)
+                      or any(not inner_bounds[:2] <= r[:2] < r[2:] <= inner_bounds[2:] for r in slots)):
+                    return None
+                prefix_length = len('_R' + 'NC' * depth + root['name'][2:])
+                role = symbol[prefix_length:].removesuffix(rust_same_crate_backref(shape.modules, depth))
+                if depth == 2 and not role.startswith(matched[0][1][0]):
+                    return None
+                geometry = (role, tuple((a - line, b, c - line, d) for a, b, c, d in slots))
+                matched.append((symbol, geometry, (owner['count'] > 0, *(r[4] > 0 for r in raw))))
+                projection.extend(raw)
+                del touching[symbol]
+            matched.append((root['name'], (), (root['count'] > 0,)))
+            entries.append(matched)
+        observed = _owner_line_counts({'regions': projection}, _ObserverWork(work))
+        if touching or observed != {n: counts[n] for n in range(line, finish + 1) if n in counts}:
+            return None
+        geometry = [tuple(row[1] for row in members) for members in entries]
+        if len(set(geometry)) != 1:
+            return None
+        evidence.append((list(sorted(observed)), entries, geometry[0]))
+    left, right = evidence
+    if left[2] != right[2]:
+        return None
+    states = [[tuple(hit for row in copy for hit in row[2]) for copy in side[1]] for side in evidence]
+    _construct_charge(work, len(states[0]) * len(states[1]) * len(states[0][0]))
+    if compiled_hit_state_matching(*states) is None:
+        return None
+    return dict(file=name, kind='retained-aur-hook-rendering',
+                pairs=[list(pair) for pair in zip(left[0], right[0], strict=True)],
+                copy_states=states, owners=[[list(row[0] for row in members) for members in side[1]]
+                                            for side in evidence])
+
+
 def retained_callback_statement(name, sides, indexes, work):
     """Prove one unchanged statement at the start of the same tail callback."""
+    if (name == 'src/package_managers/aur/client.rs'
+            and sides[0][0][sides[0][-1] - 1].strip() == 'let contents = text'):
+        return retained_aur_hook_rendering(name, sides, indexes, work)
     identity = None
     evidence = []
     for (source, inventory, counts, line), index in zip(sides, indexes, strict=True):
