@@ -3510,6 +3510,50 @@ def alpm_update_record_entry_source(name, source, inventory, line, work):
             'collect_updates', None, (regions, retained), True)
 
 
+def alpm_cache_receiver_entry_source(name, source, inventory, line, work):
+    """Locate the map receiver without equating the different entry keys."""
+    if name != 'src/package_managers/alpm_ops.rs' or source[line - 1].strip() != 'packages':
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows) + len(code.starts).bit_length())
+    start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+    ancestors = _construct_ancestors(code, start, work)
+    if len(ancestors) < 2 or code.words[start:start + 4] != ['packages', '.', 'entry', '(']:
+        return None
+    scopes = {row['opening']: row for row in rows if row['opening'] in (ancestors[0], ancestors[-1])}
+    branch, function = (scopes.get(opening) for opening in (ancestors[0], ancestors[-1]))
+    if (branch is None or function is None or branch['kind'] != 'if' or function['kind'] != 'fn'
+            or branch['opening'] + 1 != start):
+        return None
+    guard = branch['header']
+    if (guard[:7] != ('if', 'let', 'Some', '(', '(', 'base', ',')
+            or guard[7:-8] not in (('ver',), ('ver', ',', 'architecture'))
+            or guard[-8:] != (')', ')', '=', 'package_cache_info', '(', '&', 'filename', ')')):
+        return None
+    entry_end = code.pairs[start + 3]
+    _construct_charge(work, branch['end'] - entry_end)
+    if code.words[entry_end + 1:branch['end']] != (
+            '. or_default ( ) . push ( ( path , ver . to_string ( ) ) ) ;').split():
+        return None
+    first = code.region(function['first'], function['opening'])[0]
+    _construct_charge(work, line - first + start - function['opening'])
+    allocations = [number for number in range(first + 1, line) if source[number - 1].strip() == _MAP_NEW_LINE]
+    if len(allocations) != 1 or code.words[function['opening'] + 1:start].count('packages') != 1:
+        return None
+    declaration = map_initializer_entry_source(name, source, inventory, allocations[0], work)
+    if declaration is None:
+        return None
+    header, span, _, _, modules, owner, _, _, _ = declaration
+    bounds = code.region(branch['opening'], branch['end'])
+    chain = code.region(start, entry_end + 4)
+    push = code.region(entry_end + 6, entry_end + 6)
+    path = code.region(entry_end + 9, entry_end + 9)
+    if not line < chain[2] < push[0] == path[0] < bounds[2]:
+        return None
+    slots = (bounds, code.region(start, start), chain)
+    return header, span, bounds, slots, modules, owner, None, ((line, chain[2], push[0]), (push, path)), True
+
+
 def retained_ensure_entry(name, sides, indexes, work):
     return retained_observed_entry(name,sides,indexes,work,ensure_entry_source)
 
@@ -3518,6 +3562,7 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
     """Compare complete raw copy inventories for a source-owned entry."""
     map_initializer=source_observer is map_initializer_entry_source
     alpm_record = source_observer is alpm_update_record_entry_source
+    cache_receiver = source_observer is alpm_cache_receiver_entry_source
     identities=[]; receipts=[]; states=[]; conditions=[]
     for (source,inventory,spans,counts,line),index in zip(sides,indexes):
         observed=source_observer(name,source,inventory,line,work)
@@ -3577,6 +3622,11 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                                 or any(row[4] != hits for row in touching[:-1])
                                 or bool(touching[-1][4]) != bool(hits)):
                 return None
+            if cache_receiver:
+                arguments = [r for r in touching if r[0] == condition[0][-1]]
+                if (tuple(tuple(r[:4]) for r in arguments) != condition[1]
+                        or any(r[4] != hits for r in arguments)):
+                    return None
             roots.append((owner,identity,copy,touching,hits))
         _construct_charge(work,len(roots)+len(compiled_parents))
         if not 1<=len(roots)<=16 or len({r[1] for r in roots})!=1 or len({r[2] for r in roots})!=len(roots):
@@ -3590,12 +3640,18 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
         _construct_charge(work,high[0]-low[0]+1+sum(len(member[3]) for member in roots))
         projection=_owner_line_counts({'regions':[row for member in roots for row in member[3]]},
                                       _ObserverWork(work))
-        if counts.get(line,0)<=0 or projection!={n:counts[n] for n in range(low[0],high[0]+1) if n in counts}:
+        observed_lines = range(low[0], high[0] + 1)
+        if cache_receiver:
+            # The guard can contribute separate counts to the opening brace.
+            observed_lines = condition[0]
+            projection = {n: projection[n] for n in observed_lines if n in projection}
+        if counts.get(line,0)<=0 or projection!={n:counts[n] for n in observed_lines if n in counts}:
             return None
         conditions.append((condition,roots,counts))
         identities.append((syntax,roots[0][1]))
         states.append(sorted(r[4]>0 for r in roots))
-        receipts.append(dict(span=list(statement),entry=list(entry) if map_initializer or alpm_record else list(entry[0]),
+        receipts.append(dict(span=list(statement),
+                             entry=list(entry) if map_initializer or alpm_record or cache_receiver else list(entry[0]),
                              owners=[dict(name=r[0]['name'], regions=r[3],entry_count=r[4]) for r in roots],
                              parents=[parent['name'] for parent,_ in compiled_parents]))
     if identities[0]!=identities[1] or len(states[0])!=len(states[1]):
@@ -3603,9 +3659,18 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
     if alpm_record:
         if not all(states[1]):
             return None
-    elif (any(left>right for left,right in zip(*states)) if map_initializer else states[0]!=states[1]):
+    elif (any(left>right for left,right in zip(*states)) if map_initializer or cache_receiver else states[0]!=states[1]):
         return None
     pairs=[[sides[0][-1],sides[1][-1]]]
+    if cache_receiver:
+        previous, current = (item[0][0] for item in conditions)
+        pairs = [list(pair) for pair in zip(previous, current, strict=True)]
+        if any(sides[0][0][line - 1] != sides[1][0][target - 1]
+               or sides[0][3].get(line, 0) <= 0 or sides[1][3].get(target, 0) <= 0
+               for line, target in pairs):
+            return None
+        return dict(file=name, kind='retained-alpm-cache-receiver', pairs=pairs,
+                    instance_states=states, observations=receipts)
     if alpm_record:
         old, new = (item[0][1] for item in conditions)
         pairs = [list(pair) for pair in zip(old, new, strict=True)]
@@ -13714,6 +13779,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             entry_source=map_initializer_entry_source
                         elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == _ALPM_UPDATE_RECORD_LINE:
                             entry_source = alpm_update_record_entry_source
+                        elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == 'packages':
+                            entry_source = alpm_cache_receiver_entry_source
                     if entry_source is not None and (bs[name]['expansions'],hs[name]['expansions'])==([],[]):
                         sides=((old,inventories[0],base_spans,before,entry_lines[0]),
                                (new,inventories[1],head_spans,after,entry_lines[1]))

@@ -974,6 +974,44 @@ class RetainedSourceEntryTests(unittest.TestCase):
                 else:
                     self.assertIsNone(proof)
 
+    def test_cache_insert_retains_only_the_observed_chain_lines(self):
+        for fault in (None, 'changed-receiver', 'changed-guard', 'missing-copy',
+                      'missing-slot', 'foreign', 'lost-hit'):
+            with self.subTest(fault=fault):
+                variants = []
+                for side, key in enumerate(('String', 'CacheArchiveGroup')):
+                    mapped = 'CacheArchiveGroup { name: base.to_owned() }' if side else 'base.to_owned()'
+                    receiver = 'other' if side and fault == 'changed-receiver' else 'packages'
+                    parser = 'different_parser' if side and fault == 'changed-guard' else 'package_cache_info'
+                    source = [
+                        'fn clean_cache_internal(keep_versions: usize, dry_run: bool) -> Result<(usize, u64)> {',
+                        f'    let mut packages: ahash::AHashMap<{key}, Vec<(std::path::PathBuf, String)>> =',
+                        '        ahash::AHashMap::new();',
+                        f'    if let Some((base, ver)) = {parser}(&filename) {{',
+                        f'        {receiver}',
+                        f'            .entry({mapped})',
+                        '            .or_default()',
+                        '            .push((path, ver.to_string()));',
+                        '    }',
+                        '    finish(packages)',
+                        '}',
+                    ]
+                    hits = (12, 14) if side else (0, 10)
+                    if side and fault == 'lost-hit':
+                        hits = (0, 0)
+                    markers = [(4, '{', 9, '    }'), (5, receiver), (5, receiver, 7, '            .or_default()'),
+                               (8, 'push'), (8, 'path')]
+                    variants.append((source, 5, markers, hits, (4, 4) if side else (0, 4),
+                                     '16package_managers8alpm_ops20clean_cache_internal'))
+                proof = self.observe('src/package_managers/alpm_ops.rs', variants,
+                                     coverage.alpm_cache_receiver_entry_source, fault=fault)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[5, 5], [7, 7], [8, 8]])
+                    self.assertEqual(proof['instance_states'], [[False, True], [True, True]])
+                else:
+                    self.assertIsNone(proof)
+
     def alpm_record_entry(self, fault=None):
         variants = []
         for side in range(2):
