@@ -3362,6 +3362,12 @@ omarchy-pkg-drop imv mpv-mpris
                 Some(InstallMediaViewer),
                 &[InstallMediaViewer][..],
             ),
+            (
+                false,
+                "false",
+                None,
+                &[InstallMediaViewer, RemoveLegacyMediaViewers][..],
+            ),
             (true, "false", None, &[InstallMediaViewer][..]),
             (
                 true,
@@ -3386,7 +3392,10 @@ omarchy-pkg-drop imv mpv-mpris
             let result = commands
                 .run_native_migration(NativeMigration::MediaViewer, Some(home.clone()))
                 .await;
-            assert_eq!(result.is_ok(), failure.is_none() && updater == "true");
+            assert_eq!(
+                result.is_ok(),
+                failure.is_none() && (!present || updater == "true")
+            );
             assert_eq!(
                 commands
                     .native_fixture

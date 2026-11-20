@@ -13,13 +13,14 @@ import tomllib
 FAMILY = {"alpm-types", "alpm-srcinfo", "alpm-db", "alpm-repo-db", "alpm-mtree"}
 UPSTREAM = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git"
 MIRROR = "https://github.com/archlinux/alpm.git"
+COMMIT_ID = re.compile(r"[0-9a-f]{40}")
 
 
 def validate(manifest, lock):
     dependencies = manifest["dependencies"]
     pins = {name: dependencies[name] for name in FAMILY}
     revisions = {pin["rev"] for pin in pins.values()}
-    if len(revisions) != 1 or not re.fullmatch(r"[0-9a-f]{40}", next(iter(revisions))):
+    if len(revisions) != 1 or not COMMIT_ID.fullmatch(next(iter(revisions))):
         raise ValueError("All direct Rust ALPM dependencies must share a full immutable commit")
     revision = next(iter(revisions))
     expected_source = f"git+{UPSTREAM}?rev={revision}#{revision}"
@@ -39,6 +40,8 @@ def validate(manifest, lock):
 
 
 def prepare_cargo_source(destination, revision, locked_versions, *, source=MIRROR):
+    if not isinstance(revision, str) or not COMMIT_ID.fullmatch(revision):
+        raise ValueError("Rust ALPM source requires a full immutable commit")
     destination = destination.resolve()
     destination.mkdir(mode=0o700)
     snapshot = destination / "source"
@@ -48,7 +51,7 @@ def prepare_cargo_source(destination, revision, locked_versions, *, source=MIRRO
         subprocess.run(["git", "init", "--quiet", "--bare", str(repo)], check=True, timeout=15)
         git = ["git", "-C", str(repo), "--work-tree", str(snapshot), "-c", "core.autocrlf=false"]
         subprocess.run([*git, "fetch", "--depth=1", "--no-tags", "--no-recurse-submodules",
-                        source, revision], check=True, timeout=120)
+                        "--", source, revision], check=True, timeout=120)
         fetched = subprocess.check_output([*git, "rev-parse", "FETCH_HEAD"], text=True, timeout=15)
         if fetched.strip() != revision:
             raise ValueError("ALPM mirror returned a different commit")

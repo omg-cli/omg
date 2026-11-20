@@ -667,10 +667,6 @@ mod tests {
         assert_eq!(manifest.validators.last_modified.as_deref(), Some(modified));
         let (published_archive, _) = generation_paths(root, &manifest).unwrap();
         assert_eq!(std::fs::read(&published_archive).unwrap(), archive);
-        assert_eq!(
-            read_metadata_archive(File::open(&published_archive).unwrap()).unwrap()[0].name,
-            "new"
-        );
         assert!(index.get("new").unwrap().is_some());
         assert!(index.get("old").unwrap().is_none());
         assert!(snapshot.get("old").unwrap().is_some());

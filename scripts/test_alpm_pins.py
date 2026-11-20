@@ -50,6 +50,14 @@ class AlpmPinsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pins.validate(self.manifest, self.lock)
 
+    def test_prepare_cargo_source_rejects_moving_refs_before_creating_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "prepared"
+            with self.assertRaisesRegex(ValueError, "full immutable commit"):
+                pins.prepare_cargo_source(destination, "HEAD", {}, source=root.as_uri())
+            self.assertFalse(destination.exists())
+
     def test_prepare_cargo_source_uses_the_exact_commit_without_the_website_theme(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
