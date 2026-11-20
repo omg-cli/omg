@@ -847,10 +847,9 @@ pub(super) mod tests {
     fn empty_native_audit_reports_exact_scope_and_preserves_inventory_failures() -> AnyhowResult<()>
     {
         const NAME: &str = "package_managers::arch::tests::empty_native_audit_reports_exact_scope_and_preserves_inventory_failures";
-        if crate::core::testing::run_isolated_test(NAME) {
-            return Ok(());
-        }
-        if crate::config::Settings::rerun_test_unprivileged(NAME) {
+        if crate::core::testing::run_isolated_test(NAME)
+            || crate::config::Settings::rerun_test_unprivileged(NAME)
+        {
             return Ok(());
         }
         assert!(!crate::core::is_root());

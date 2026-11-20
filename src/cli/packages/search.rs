@@ -1098,7 +1098,23 @@ mod tests {
         std::fs::create_dir(database.join("sync"))?;
         std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
         let pacman = fixture.path().join("pacman.conf");
-        std::fs::write(&pacman, "[options]\nSigLevel = Never\n")?;
+        std::fs::write(&pacman, "[options]\nSigLevel = Never\n[fixture]\n")?;
+        let repository = std::fs::File::create(database.join("sync/fixture.db"))?;
+        let mut official = tar::Builder::new(flate2::write::GzEncoder::new(
+            repository,
+            flate2::Compression::fast(),
+        ));
+        let descriptor = b"%NAME%\nomg-search-fixture-official\n\n%VERSION%\n1-1\n\n%DESC%\nOfficial search fixture\n\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(descriptor.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        official.append_data(
+            &mut header,
+            "omg-search-fixture-official-1-1/desc",
+            &descriptor[..],
+        )?;
+        official.into_inner()?.finish()?;
         let cache = fixture.path().join("cache");
         let settings_dir = fixture.path().join("config");
         let data = fixture.path().join("data");
@@ -1120,6 +1136,7 @@ mod tests {
                 settings.aur.use_metadata_archive = true;
                 settings.aur.metadata_cache_ttl_secs = 3600;
                 settings.save()?;
+                let config = crate::config::Settings::config_path()?;
                 let archive = fixture.path().join("metadata.json.gz");
                 let metadata = br#"[{"Name":"omg-search-fixture","Version":"2-1","Description":"Local AUR result","Maintainer":null,"NumVotes":0,"Popularity":0.0,"OutOfDate":null,"LastModified":1}]"#;
                 let file = std::fs::File::create(&archive)?;
@@ -1137,7 +1154,27 @@ mod tests {
                     assert_eq!(matches[0].name, "omg-search-fixture");
                     assert_eq!(matches[0].version, "2-1");
                     super::search_with_json("omg-search-fixture", false, true, false, 10).await?;
-                    super::search_with_json("x", false, true, true, 10).await
+                    super::search_with_json("x", false, true, true, 10).await?;
+
+                    std::fs::write(config, "[aur\n")?;
+                    assert!(
+                        super::search_aur_packages("omg-search-fixture", false)
+                            .await
+                            .is_err()
+                    );
+                    let (source, count) =
+                        super::search_official_packages("omg-search-fixture", 10).await?;
+                    assert_eq!(count, 1);
+                    assert_eq!(source[0].name, "omg-search-fixture-official");
+                    super::search_with_json("omg-search-fixture", false, true, false, 10).await?;
+                    let error =
+                        super::search_with_json("omg-unmatched-fixture", false, true, false, 10)
+                            .await
+                            .expect_err(
+                                "an AUR failure without an official result must fail the search",
+                            );
+                    assert!(error.to_string().contains("Failed to search AUR packages"));
+                    Ok(())
                 })
             },
         )

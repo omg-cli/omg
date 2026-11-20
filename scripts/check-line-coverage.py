@@ -13018,6 +13018,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
     positive_receipts = []; endpoint_receipts = []; boolean_receipts = []
     replacement_receipts = []; construct_receipts = []; completion_receipts = []; obligation_receipts = []
     for name in bs:
+        file_replacement_start = len(replacement_receipts)
         old = base_sources[name].decode("utf-8").splitlines()
         new = head_sources[name].decode("utf-8").splitlines()
         same_source = base_sources[name] == head_sources[name]
@@ -13440,9 +13441,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             _construct_charge(construct_work, (len(states[0]) * len(states[1]) + 1) * max(width, 1))
             if compiled_hit_state_matching(*states) is None:
                 raise ValueError('Record completion lost compiled-copy coverage')
-        _construct_charge(construct_work, len(replacement_receipts))
-        replaced_functions = {tuple(receipt['base_range']) for receipt in replacement_receipts
-                              if receipt['file'] == name and receipt['base_construct'] == 'fn'}
+        _construct_charge(construct_work, len(replacement_receipts) - file_replacement_start)
+        replaced_functions = {tuple(receipt['base_range'])
+                              for receipt in replacement_receipts[file_replacement_start:]
+                              if receipt['base_construct'] == 'fn'}
         for start, end in replaced_functions:
             _construct_charge(construct_work, end - start + 1)
             gone.difference_update(range(start, end + 1))

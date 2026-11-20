@@ -2180,12 +2180,22 @@ mod tests {
         // read errors indicate that visible process inventory is incomplete.
         std::fs::create_dir(process.join("comm"))?;
         assert!(any_manager_running(proc.path(), 4242).is_err());
+
+        let database = tempfile::tempdir()?;
+        let lock = database.path().join("db.lck");
+        std::fs::write(&lock, b"sentinel")?;
+        let database = database.path().to_str().context("database fixture path")?;
+        assert_eq!(
+            check_pacman_lock_with(Some(database), || any_manager_running(proc.path(), 4242)),
+            1
+        );
+        assert_eq!(std::fs::read(lock)?, b"sentinel");
         Ok(())
     }
 
     #[cfg(feature = "arch")]
     #[test]
-    fn lock_without_verified_activity_is_an_issue() {
+    fn stale_lock_without_a_manager_is_an_issue() {
         let dir = tempfile::TempDir::new().expect("isolated db dir");
         let proc = tempfile::TempDir::new().expect("isolated proc dir");
         let dir_str = dir.path().to_string_lossy().into_owned();
@@ -2208,14 +2218,6 @@ mod tests {
             )),
             1
         );
-        assert_eq!(
-            check_pacman_lock_with(Some(&dir_str), || any_manager_running(
-                &proc.path().join("missing"),
-                self_pid
-            )),
-            1
-        );
-
         std::fs::write(proc.path().join("999/comm"), "pacman\n").expect("manager comm");
         assert_eq!(
             check_pacman_lock_with(Some(&dir_str), || any_manager_running(
