@@ -818,8 +818,11 @@ fn inspect_native_local_database(path: &Path, snapshot: &LocalHealthSnapshot) ->
             .packages
             .get(package.name())
             .context("Native local database inventory differs from the validated snapshot")?;
+        // Rust ALPM omits the implied zero epoch, which libalpm can still report.
+        let native_version = package.version().as_str();
+        let native_version = native_version.strip_prefix("0:").unwrap_or(native_version);
         anyhow::ensure!(
-            package.version().as_str() == observed.version.to_string(),
+            native_version == observed.version.to_string(),
             "Native local database version differs for {}",
             package.name()
         );
@@ -868,12 +871,12 @@ mod native_health_tests {
     use super::check_native_local_db_health;
     use std::path::Path;
 
-    fn package(database: &Path, name: &str, extra: &str, files: &str) {
-        let directory = database.join("local").join(format!("{name}-1.0-1"));
+    fn package(database: &Path, name: &str, version: &str, extra: &str, files: &str) {
+        let directory = database.join("local").join(format!("{name}-{version}"));
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join("desc"),
-            format!("%NAME%\n{name}\n\n%VERSION%\n1.0-1\n\n%REASON%\n0\n\n{extra}"),
+            format!("%NAME%\n{name}\n\n%VERSION%\n{version}\n\n%REASON%\n0\n\n{extra}"),
         )
         .unwrap();
         std::fs::write(directory.join("files"), format!("%FILES%\n{files}\n\n")).unwrap();
@@ -887,12 +890,14 @@ mod native_health_tests {
         package(
             database,
             "app",
+            "1.0-1",
             "%DEPENDS%\nvirtual>=2\n\n",
             "usr/\nusr/bin/app",
         );
         package(
             database,
             "provider",
+            "1.0-1",
             "%PROVIDES%\nvirtual=2\n\n",
             "usr/\nusr/lib/provider",
         );
@@ -905,6 +910,27 @@ mod native_health_tests {
         before.revalidate(&local).unwrap();
         assert!(!database.join("db.lck").exists());
         assert!(!database.join("sync").exists());
+    }
+
+    #[tokio::test]
+    async fn native_health_accepts_an_explicit_zero_epoch_in_the_local_database() {
+        let owner = tempfile::tempdir().unwrap();
+        let local = owner.path().join("local");
+        package(owner.path(), "app", "0:1.0-1", "", "usr/bin/app");
+        std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+        let mut before = super::LocalHealthSnapshot::capture(&local).unwrap();
+        let report = check_native_local_db_health(&local).await.unwrap();
+        assert_eq!(report.packages, 1);
+        report.native.unwrap();
+        before.revalidate(&local).unwrap();
+        before.packages.get_mut("app").unwrap().version =
+            super::require_package_version("1:1.0-1").unwrap();
+        let mismatch = super::inspect_native_local_database(&local, &before).unwrap_err();
+        assert_eq!(
+            mismatch.to_string(),
+            "Native local database version differs for app"
+        );
+        assert!(!owner.path().join("db.lck").exists());
     }
 
     #[tokio::test]
@@ -924,8 +950,8 @@ mod native_health_tests {
         ] {
             let owner = tempfile::tempdir().unwrap();
             let local = owner.path().join("local");
-            package(owner.path(), "app", extra, files);
-            package(owner.path(), "other", "", "usr/bin/shared");
+            package(owner.path(), "app", "1.0-1", extra, files);
+            package(owner.path(), "other", "1.0-1", "", "usr/bin/shared");
             std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
             let before = super::LocalHealthSnapshot::capture(&local).unwrap();
             let report = check_native_local_db_health(&local).await.unwrap();
@@ -2424,7 +2450,10 @@ mod tests {
                 alpm_types::FullVersion::from_str(text).expect("valid official version fixture");
             let round_trip = require_package_version(&full.to_string()).unwrap();
             let converted = Version::from(full);
-            assert_eq!(converted, round_trip, "version {text}");
+            assert!(
+                crate::package_managers::types::compare_versions(&converted, &round_trip).is_eq(),
+                "version {text}"
+            );
             assert_eq!(
                 converted.to_string(),
                 round_trip.to_string(),
@@ -3081,8 +3110,14 @@ mod tests {
                     );
                     for update in updates {
                         assert_eq!(update.name, "widget");
-                        assert_eq!(update.old_version.to_string(), installed);
-                        assert_eq!(update.new_version.to_string(), available);
+                        assert_eq!(
+                            update.old_version.to_string(),
+                            installed.strip_prefix("0:").unwrap_or(installed)
+                        );
+                        assert_eq!(
+                            update.new_version.to_string(),
+                            available.strip_prefix("0:").unwrap_or(available)
+                        );
                         assert_eq!(update.repo, "core");
                     }
                 }
@@ -3255,7 +3290,7 @@ mod tests {
             assert_eq!(exact.repo, "extra");
         }
         assert_eq!(all["typed-v2"].version.to_string(), "1:2.3-1");
-        assert_eq!(all["typed-v1"].version.to_string(), "0:2.3-1");
+        assert_eq!(all["typed-v1"].version.to_string(), "2.3-1");
         assert_eq!(all["typed-v2"].groups, ["fixture-group"]);
         assert_eq!(all["typed-v2"].makedepends, ["cmake>=3"]);
         assert_eq!(all["typed-v2"].optdepends, ["optional: runtime support"]);

@@ -82,7 +82,7 @@ dependencies = [
 [[package]]
 name = "alpm-common"
 version = "0.3.0"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=a76c72b44c382e683f9e5556eaf344d4ebc39cdb#a76c72b44c382e683f9e5556eaf344d4ebc39cdb"
 dependencies = [
  "alpm-types",
  "fluent-i18n",
@@ -92,7 +92,7 @@ dependencies = [
 [[package]]
 name = "alpm-db"
 version = "0.3.0"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=a76c72b44c382e683f9e5556eaf344d4ebc39cdb#a76c72b44c382e683f9e5556eaf344d4ebc39cdb"
 dependencies = [
  "alpm-common",
  "alpm-mtree",
@@ -113,7 +113,7 @@ dependencies = [
 [[package]]
 name = "alpm-mtree"
 version = "0.4.0"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=a76c72b44c382e683f9e5556eaf344d4ebc39cdb#a76c72b44c382e683f9e5556eaf344d4ebc39cdb"
 dependencies = [
  "alpm-common",
  "alpm-parsers",
@@ -131,7 +131,7 @@ dependencies = [
 [[package]]
 name = "alpm-parsers"
 version = "0.4.3"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=a76c72b44c382e683f9e5556eaf344d4ebc39cdb#a76c72b44c382e683f9e5556eaf344d4ebc39cdb"
 dependencies = [
  "colored",
  "serde",
@@ -142,8 +142,8 @@ dependencies = [
 
 [[package]]
 name = "alpm-pkgbuild"
-version = "0.2.6"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+version = "0.2.7"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=a76c72b44c382e683f9e5556eaf344d4ebc39cdb#a76c72b44c382e683f9e5556eaf344d4ebc39cdb"
 dependencies = [
  "alpm-parsers",
  "alpm-types",
@@ -159,7 +159,7 @@ dependencies = [
 [[package]]
 name = "alpm-repo-db"
 version = "0.2.0"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=a76c72b44c382e683f9e5556eaf344d4ebc39cdb#a76c72b44c382e683f9e5556eaf344d4ebc39cdb"
 dependencies = [
  "alpm-common",
  "alpm-parsers",
@@ -174,7 +174,7 @@ dependencies = [
 [[package]]
 name = "alpm-srcinfo"
 version = "0.7.0"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=a76c72b44c382e683f9e5556eaf344d4ebc39cdb#a76c72b44c382e683f9e5556eaf344d4ebc39cdb"
 dependencies = [
  "alpm-common",
  "alpm-parsers",
@@ -199,7 +199,7 @@ dependencies = [
 [[package]]
 name = "alpm-types"
 version = "0.14.0"
-source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=7342c1d0b60633d646a87bc1ce53f8c28ea65f9b#7342c1d0b60633d646a87bc1ce53f8c28ea65f9b"
+source = "git+https://gitlab.archlinux.org/archlinux/alpm/alpm.git?rev=a76c72b44c382e683f9e5556eaf344d4ebc39cdb#a76c72b44c382e683f9e5556eaf344d4ebc39cdb"
 dependencies = [
  "alpm-parsers",
  "base64 0.23.1",

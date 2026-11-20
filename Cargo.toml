@@ -228,14 +228,13 @@ jiff = { version = "0.2.21", features = ["serde"] }
 alpm = { version = "5.0.2", optional = true }
 
 # Official Arch Linux pure Rust ALPM ecosystem (archlinux/alpm)
-# One immutable monorepo commit at the alpm-types/0.14.0 release.
-# Reviewed 2026-11-11; compatibility evidence is in docs/arch-audit-2026-11-11.md.
+# One immutable monorepo commit with the upstream zero-epoch formatting fix.
 # C libalpm remains for live queries, dependency solving and transactions.
-alpm-types = { version = "=0.14.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-types", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", optional = true }
-alpm-srcinfo = { version = "=0.7.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-srcinfo", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", optional = true }
-alpm-db = { version = "=0.3.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-db", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", optional = true }
-alpm-mtree = { version = "=0.4.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-mtree", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", default-features = false, optional = true }
-alpm-repo-db = { version = "=0.2.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-repo-db", rev = "7342c1d0b60633d646a87bc1ce53f8c28ea65f9b", optional = true }
+alpm-types = { version = "=0.14.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-types", rev = "a76c72b44c382e683f9e5556eaf344d4ebc39cdb", optional = true }
+alpm-srcinfo = { version = "=0.7.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-srcinfo", rev = "a76c72b44c382e683f9e5556eaf344d4ebc39cdb", optional = true }
+alpm-db = { version = "=0.3.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-db", rev = "a76c72b44c382e683f9e5556eaf344d4ebc39cdb", optional = true }
+alpm-mtree = { version = "=0.4.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-mtree", rev = "a76c72b44c382e683f9e5556eaf344d4ebc39cdb", default-features = false, optional = true }
+alpm-repo-db = { version = "=0.2.0", git = "https://gitlab.archlinux.org/archlinux/alpm/alpm.git", package = "alpm-repo-db", rev = "a76c72b44c382e683f9e5556eaf344d4ebc39cdb", optional = true }
 
 # Process execution
 which = "8.0"
