@@ -3324,6 +3324,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_repository_has_no_full_or_exact_package_matches() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("extra.db");
+        write_sync_identity_fixture(&path, &[]);
+        assert!(parse_sync_db(&path, "extra")?.is_empty());
+        assert!(parse_sync_db_package(&path, "extra", "widget")?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn repository_fallback_rejects_repeated_descriptor_sections_and_values() {
         let directory = tempfile::tempdir().expect("private repository fixture");
         let path = directory.path().join("extra.db");
@@ -6095,6 +6105,49 @@ mod tests {
     }
 
     #[test]
+    fn read_local_package_returns_absent_for_a_missing_database_or_regular_entry() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let local = directory.path().join("local");
+        assert!(read_local_package_at(&local, "widget")?.is_none());
+        fs::create_dir(&local)?;
+        fs::write(local.join("widget-1-1"), b"regular directory entry")?;
+        assert!(read_local_package_at(&local, "widget")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn package_cache_rejects_parent_components_and_missing_existing_directories() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let parent = open_package_cache_directory(&directory.path().join(".."), false)
+            .expect_err("the cache path must stay within its declared scope");
+        assert!(
+            parent
+                .to_string()
+                .contains("must not traverse parent directories")
+        );
+        let missing = directory.path().join("absent");
+        assert!(open_package_cache_directory(&missing, false).is_err());
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_cache_publication_keeps_the_existing_entry_and_cleans_the_temporary_file()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let existing = directory.path().join("fixture.bin");
+        fs::create_dir(&existing)?;
+        fs::write(existing.join("sentinel"), b"existing cache entry")?;
+        assert!(save_cache_to_disk_in(&DbCache::default(), directory.path(), "fixture").is_err());
+        assert_eq!(
+            fs::read(existing.join("sentinel"))?,
+            b"existing cache entry"
+        );
+        assert_eq!(fs::read_dir(directory.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn persisted_package_cache_rejects_symlink_and_oversized_file() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let target = directory.path().join("valid");
@@ -6102,6 +6155,7 @@ mod tests {
         let path = directory.path().join("fixture.bin");
         std::os::unix::fs::symlink(&target, &path)?;
         assert!(load_cache_from_disk_in::<DbCache>(directory.path(), "fixture").is_err());
+        assert!(load_cache_from_disk_in::<LocalDbCache>(directory.path(), "fixture").is_err());
         fs::remove_file(&path)?;
         let file = fs::File::create(&path)?;
         file.set_len(MAX_DERIVED_CACHE_BYTES + 1)?;

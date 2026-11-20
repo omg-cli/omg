@@ -9691,6 +9691,17 @@ mod tests {
         assert!(validate_aur_search_query("package;name").is_err());
     }
 
+    #[tokio::test]
+    async fn detailed_search_rejects_a_short_query_before_rpc() {
+        let error = search_detailed("x")
+            .await
+            .expect_err("a short AUR query must fail before an RPC request");
+        assert_eq!(
+            error.to_string(),
+            "AUR search requires at least 2 non-whitespace bytes"
+        );
+    }
+
     #[test]
     fn test_dependency_name_parses_constraints() {
         assert_eq!(dependency_name("simdutf-git"), "simdutf-git");

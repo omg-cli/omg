@@ -1061,6 +1061,26 @@ mod tests {
     }
 
     #[test]
+    fn unusable_publication_lock_is_reported_instead_of_a_cache_miss() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let lock = location.path().join("publication.lock");
+        std::fs::create_dir_all(&lock)?;
+
+        let error = open_fresh_metadata_index_at(&location, Duration::from_mins(1))
+            .err()
+            .context("a metadata reader must report an unusable publication lock")?;
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::IsADirectory)
+        );
+        assert!(lock.is_dir());
+        Ok(())
+    }
+
+    #[test]
     fn stale_index_is_not_a_fresh_metadata_generation() {
         let directory = tempfile::tempdir().unwrap();
         let location = MetadataRoot::new(directory.path().join("aur"));
