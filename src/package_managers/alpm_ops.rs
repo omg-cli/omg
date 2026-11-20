@@ -2870,8 +2870,7 @@ fn ensure_mirror_servers(alpm: &alpm::Alpm) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn archive_acknowledgement_lists_only_private_archives_and_bounds_the_batch()
-    -> anyhow::Result<()> {
+    fn archive_acknowledgement_lists_only_private_archives_and_bounds_the_batch() {
         use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
         let prepared =
             |name: &str, origin: SecurityOrigin, digest: &str| super::PreparedAdvisoryPackage {
@@ -2900,7 +2899,8 @@ mod tests {
             &[aur.clone(), repository, local],
             "prepared-batch",
             1000,
-        )?;
+        )
+        .expect("mixed batch with two private archives requires acknowledgement");
         assert!(prompt.contains("Invoking UID: 1000"));
         assert!(prompt.contains("Full prepared batch SHA-256: prepared-batch"));
         assert!(prompt.contains("aur-fixture") && prompt.contains(&"a".repeat(64)));
@@ -2909,12 +2909,10 @@ mod tests {
         let error = super::unknown_archives_prompt(&vec![aur; 65], "oversize", 1000)
             .expect_err("oversized archive acknowledgements must be split");
         assert!(error.to_string().contains("at most 64 archives"));
-        Ok(())
     }
 
     #[test]
-    fn prepared_unknown_review_is_required_and_bound_without_fabricating_snapshot_authority()
-    -> anyhow::Result<()> {
+    fn prepared_unknown_review_is_required_and_bound_without_fabricating_snapshot_authority() {
         use crate::core::security::policy::AdvisoryRequirement;
         use crate::core::security::vulnerability::{PackageAssessment, UnknownCoverage};
         use crate::package_managers::types::{SecurityOrigin, SecurityPackage};
@@ -2937,25 +2935,34 @@ mod tests {
             let mut archive = assessment.clone();
             archive.package.origin = origin;
             assert!(super::require_fresh_arch_coverage(&archive, false).is_err());
-            super::require_fresh_arch_coverage(&archive, true)?;
+            super::require_fresh_arch_coverage(&archive, true)
+                .expect("separately acknowledged private archive is eligible for admission");
         }
         for requirement in [AdvisoryRequirement::Optional, AdvisoryRequirement::Review] {
             let review = super::prepared_risk_review(
                 std::slice::from_ref(&assessment),
                 "prepared-batch",
                 requirement,
-            )?
+            )
+            .expect("prepare advisory review")
             .expect("Unknown-only mutation requires an explicit decision");
             assert!(review.details().contains("EvidenceUnavailable"));
             assert!(review.accept("yes").is_err());
-            let accepted = review.accept(&format!("accept {}", review.id()))?;
+            let accepted = review
+                .accept(&format!("accept {}", review.id()))
+                .expect("the exact review identifier is accepted");
             assert!(accepted.matches(&review));
             let mut changed = assessment.clone();
             changed.package.version = "2-1".into();
-            let changed = super::prepared_risk_review(&[changed], "prepared-batch", requirement)?
+            let changed = super::prepared_risk_review(&[changed], "prepared-batch", requirement)
+                .expect("prepare review after a version change")
                 .expect("changed version remains Unknown");
             assert!(!accepted.matches(&changed));
-            assert!(super::prepared_risk_review(&[], "empty-batch", requirement)?.is_none());
+            assert!(
+                super::prepared_risk_review(&[], "empty-batch", requirement)
+                    .expect("prepare review for an empty transaction")
+                    .is_none()
+            );
         }
         let mut archive = assessment;
         archive.package.origin = SecurityOrigin::LocalArchive;
@@ -2965,10 +2972,10 @@ mod tests {
                 &[archive],
                 "fresh-private-archive",
                 AdvisoryRequirement::FreshSnapshot,
-            )?
+            )
+            .expect("private archive acknowledgement is handled separately")
             .is_none()
         );
-        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -2982,17 +2989,16 @@ mod tests {
                 .env("OMG_ISOLATED_FIXTURE_TEST", NAME)
                 .env_remove("OMG_ADVISORY_TERMINAL_FIXTURE")
                 .output()?;
-            anyhow::ensure!(
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
                 output.status.success(),
-                "isolated no-terminal review failed: {}",
-                String::from_utf8_lossy(&output.stdout)
+                "isolated no-terminal review failed: {stdout}\n{stderr}"
             );
             return Ok(());
         }
         let mode = std::env::var("OMG_ADVISORY_TERMINAL_FIXTURE").unwrap_or_default();
-        if mode.is_empty() {
-            assert!(std::fs::File::open("/dev/tty").is_err());
-        }
+        assert!(!mode.is_empty() || std::fs::File::open("/dev/tty").is_err());
         let mut signals = super::AdmissionSignals::begin()?;
         let result = super::confirm_advisory_prompt(
             "SECURITY WARNING: fixture 1.0-1 CVE-2026-12345 https://www.cve.org/CVERecord?id=CVE-2026-12345",
@@ -3001,7 +3007,7 @@ mod tests {
             &signals,
         );
         if mode == "accept" {
-            result?;
+            result.expect("exact attended acceptance authorizes this review");
         } else {
             let error = result
                 .expect_err("missing terminal, generic yes, blank and wrong review must refuse");
@@ -3189,12 +3195,9 @@ mod tests {
             archive: Some(("/var/tmp/private/pkg.tar.zst".into(), 1, 2, 3)),
         };
         let policy = crate::core::security::SecurityPolicy::default();
-        let digest = super::advisory_batch_digest(
-            std::slice::from_ref(&package),
-            &policy,
-            b"profile",
-            1000,
-        )?;
+        let digest =
+            super::advisory_batch_digest(std::slice::from_ref(&package), &policy, b"profile", 1000)
+                .expect("digest a fully prepared archive");
         let mut variants = Vec::new();
         let mut changed = package.clone();
         changed.package.name = "other".into();
@@ -3229,7 +3232,8 @@ mod tests {
                 &changed,
                 b"profile",
                 1000
-            )?,
+            )
+            .expect("digest the updated advisory requirement"),
             digest
         );
         assert_ne!(
@@ -3238,7 +3242,8 @@ mod tests {
                 &policy,
                 b"changed-profile",
                 1000
-            )?,
+            )
+            .expect("digest the changed tool profile"),
             digest
         );
         assert_ne!(
@@ -3536,7 +3541,8 @@ mod tests {
                 .join("pacman.log")
                 .to_str()
                 .context("fixture log path")?,
-        )?;
+        )
+        .expect("set the isolated ALPM log path");
         alpm.set_check_space(false);
         alpm.trans_init(alpm::TransFlag::empty())?;
         let mut transaction =
@@ -3572,9 +3578,9 @@ mod tests {
                 | "hangup"
         );
         let rejection = if refused {
-            let Err(error) = prepared else {
-                anyhow::bail!("risk installed without an explicit attended acceptance");
-            };
+            let error = prepared
+                .err()
+                .expect("risk installed without an explicit attended acceptance");
             let text = format!("{error:#}");
             assert!(
                 text.contains(match case.as_str() {
@@ -3625,7 +3631,8 @@ mod tests {
                 std::fs::write(
                     path.join("policy.toml"),
                     "advisory_requirement = 'optional'\nbanned_packages = ['glibc']\n",
-                )?;
+                )
+                .expect("write the post-review package policy fixture");
             }
             let validated = admission.validate(
                 transaction.0,
@@ -3989,13 +3996,15 @@ mod tests {
         alpm.register_syncdb(
             "core",
             alpm::SigLevel::DATABASE | alpm::SigLevel::DATABASE_OPTIONAL,
-        )?;
+        )
+        .expect("register the fixture database with optional signatures");
         assert!(super::get_pkg_info_from_db(&alpm, "helper")?.is_some());
         fixture.write_sync("core", &[("helper", "2-1", "")])?;
         std::fs::write(
             fixture.database().join("sync/core.db.sig"),
             b"invalid signature",
-        )?;
+        )
+        .expect("replace the fixture database signature with invalid data");
         let error = super::get_pkg_info_from_db(&alpm, "helper").expect_err(
             "current metadata must not reuse an earlier native signature-validation result",
         );
@@ -4661,7 +4670,8 @@ mod tests {
                 keyring.display(),
                 fixture.directory.path().display()
             ),
-        )?;
+        )
+        .expect("write custom native repository lookup configuration");
         let mut alpm = fixture.open();
         temp_env::with_vars(
             [
@@ -4712,7 +4722,8 @@ mod tests {
         std::fs::write(
             &mirrorlist,
             "Server = https://mirror.example/$repo/os/$arch\n",
-        )?;
+        )
+        .expect("write the mirrorlist before loading the ALPM configuration");
         let config = crate::core::pacman_conf::PacmanConfig::parse(&conf)?;
         std::fs::remove_file(&conf)?;
         std::fs::remove_file(&mirrorlist)?;
@@ -5099,9 +5110,9 @@ mod tests {
         std::fs::create_dir_all(root.join("etc/pacman.d/gnupg"))?;
         crate::core::paths::set_test_overrides(Some(root), Some(fixture.database()));
         let mut alpm = fixture.open();
-        let config = crate::core::pacman_conf::PacmanConfig::parse_str(
-            "[options]\nDownloadUser = nobody\n",
-        )?;
+        let config =
+            crate::core::pacman_conf::PacmanConfig::parse_str("[options]\nDownloadUser = nobody\n")
+                .expect("parse the configured ALPM download account");
         super::configure_transaction_options(&mut alpm, &config)?;
         assert_eq!(alpm.sandbox_user(), Some("nobody"));
         let hooks = |alpm: &alpm::Alpm| {
@@ -5114,13 +5125,15 @@ mod tests {
 
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
             "[options]\nHookDir = etc/custom-hooks\n",
-        )?;
+        )
+        .expect("parse the custom ALPM hook directory");
         super::configure_transaction_options(&mut alpm, &config)?;
         assert_eq!(hooks(&alpm), vec![distro, custom]);
         assert_eq!(alpm.sandbox_user(), None);
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
             "[options]\nDownloadUser = omg-no-such-downloader-account\n",
-        )?;
+        )
+        .expect("an unknown account parses and must be refused during native setup");
         assert!(super::configure_transaction_options(&mut alpm, &config).is_err());
         Ok(())
     }
@@ -5445,7 +5458,8 @@ mod tests {
                 second.display(),
                 alias.display()
             ),
-        )?;
+        )
+        .expect("write the configuration for the three package cache paths");
         temp_env::with_vars(
             [
                 ("OMG_PACMAN_CONF", Some(config.as_os_str())),
@@ -5482,8 +5496,7 @@ mod tests {
                     assert_eq!(
                         path.is_file(),
                         *group != "obsolete",
-                        "every archive of a retained version must survive: {}",
-                        path.display()
+                        "every archive of a retained version must survive: {path:?}"
                     );
                     if path.is_file() {
                         assert_ne!(*group, "obsolete");
@@ -6096,7 +6109,8 @@ mod tests {
         let machine = kernel.machine().to_str().expect("kernel machine is UTF-8");
         let config = crate::core::pacman_conf::PacmanConfig::parse_str(
             "[options]\nArchitecture = explicit-machine auto\n",
-        )?;
+        )
+        .expect("parse a mixed explicit and automatic architecture configuration");
         super::configure_transaction_options(&mut alpm, &config)?;
         assert_eq!(
             alpm.architectures().into_iter().collect::<Vec<_>>(),
