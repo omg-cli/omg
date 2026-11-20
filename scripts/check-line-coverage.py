@@ -636,25 +636,26 @@ def _source_structural_map(source):
 
 def source_structure_from_tokens(tokens, work):
     """Index comparison scopes from the already validated delimiter offsets."""
-    # The construct inventory accounts for token bytes. The lexer also visits whitespace and comments.
-    token_bytes = sum(end - start for start, end in zip(tokens.starts, tokens.ends, strict=True))
-    _construct_charge(work, 2 * len(tokens.words) + len(tokens.text) - token_bytes + 1)
-    braces = {}
+    layout = tokens.scope_tokens
+    if layout is None:
+        return None
+    # Charge whitespace and comments visited by the lexer as well as the sparse scope traversal.
+    _construct_charge(work, layout.non_token_chars + len(layout.braces) + len(layout.functions)
+                      + len(tokens.offsets) + len(tokens.module_tokens) + 1)
+    if layout.ambiguous_numbers:
+        return None
+    braces = {tokens.starts[index]: tokens.starts[tokens.pairs[index]] for index in layout.braces}
     functions = {}
     identifier = re.compile(r'[A-Za-z_]\w*')
-    for index, word in enumerate(tokens.words):
-        if word == '{':
-            braces[tokens.starts[index]] = tokens.starts[tokens.pairs[index]]
-        elif word == 'fn' and index + 1 < len(tokens.words):
-            next_word = tokens.words[index + 1]
-            if next_word.startswith(('b"', 'c"')):
-                return None
-            if identifier.fullmatch(next_word):
-                functions.setdefault(next_word, []).append(tokens.starts[index + 1])
-        elif word[0].isdigit():
-            _construct_charge(work, len(word))
-            if 'fn' in word or 'mod' in word:
-                return None
+    for index in layout.functions:
+        if index + 1 == len(tokens.words):
+            continue
+        next_word = tokens.words[index + 1]
+        _construct_charge(work, len(next_word) + 1)
+        if next_word.startswith(('b"', 'c"')):
+            return None
+        if identifier.fullmatch(next_word):
+            functions.setdefault(next_word, []).append(tokens.starts[index + 1])
     offsets = [*tokens.offsets, len(tokens.text) + 1] if tokens.text else [0]
     names = Counter({name: len(positions) for name, positions in functions.items()})
     modules = [tokens.starts[index] for index in tokens.module_tokens]
@@ -12938,6 +12939,14 @@ def retained_block_endpoint_paint(name, old, new, before, after, base, head, bas
 
 
 @dataclass(frozen=True)
+class _ScopeTokens:
+    braces: tuple
+    functions: tuple
+    non_token_chars: int
+    ambiguous_numbers: bool
+
+
+@dataclass(frozen=True)
 class _BooleanSource:
     text: str
     words: list
@@ -12947,6 +12956,7 @@ class _BooleanSource:
     pairs: dict
     offsets: list
     module_tokens: tuple
+    scope_tokens: _ScopeTokens | None = None
 
     def has_module_token(self, start, end, work):
         _construct_charge(work, len(self.module_tokens).bit_length() + 1)
@@ -12975,7 +12985,8 @@ def _boolean_source(source):
     if len(text.encode()) > 1024 * 1024:
         return None
     words = []; starts = []; ends = []; parents = []; pairs = {}; stack = []; at = 0
-    module_tokens = []
+    module_tokens = []; brace_tokens = []; function_tokens = []
+    token_chars = 0; ambiguous_numbers = False
     raw_literal = re.compile(r'(?:br|cr|r)(#*)"')
     token = re.compile(r'''(?:[bc]?"(?:\\[\s\S]|[^"\\])*"|'(?:[^'\\\n]|\\(?:[\\'"nrt0]|x[\da-fA-F]{2}|u\{[\da-fA-F_]+\}))'|'[A-Za-z_]\w*|(?:r\#)?[A-Za-z_]\w*|[0-9][A-Za-z_0-9.]*|::|->|=>|&&|\|\||[^\s])''')
     while at < len(text):
@@ -13018,16 +13029,23 @@ def _boolean_source(source):
         index = len(words)
         words.append(word); starts.append(at); ends.append(end)
         parents.append(stack[-1] if stack else None)
+        token_chars += end - at
         if word == 'mod':
             module_tokens.append(index)
+        elif word == 'fn':
+            function_tokens.append(index)
         elif word in ('(', '[', '{'):
             stack.append(index)
+            if word == '{':
+                brace_tokens.append(index)
             if len(stack) > 32:
                 return None
         elif word in (')', ']', '}'):
             if not stack or words[stack[-1]] != {')': '(', ']': '[', '}': '{'}[word]:
                 return None
             opening = stack.pop(); pairs[opening] = index; pairs[index] = opening
+        elif word[0].isdigit() and ('fn' in word or 'mod' in word):
+            ambiguous_numbers = True
         if len(words) > 131072:
             return None
         at = end
@@ -13036,7 +13054,8 @@ def _boolean_source(source):
     offsets = [0]
     for line in source[:-1]:
         offsets.append(offsets[-1] + len(line) + 1)
-    return _BooleanSource(text, words, starts, ends, parents, pairs, offsets, tuple(module_tokens))
+    scope = _ScopeTokens(tuple(brace_tokens), tuple(function_tokens), len(text) - token_chars, ambiguous_numbers)
+    return _BooleanSource(text, words, starts, ends, parents, pairs, offsets, tuple(module_tokens), scope)
 
 
 @dataclass(frozen=True)
@@ -16013,6 +16032,67 @@ def retained_pi_constructor(name, sides, indexes, work):
                                           callback_depth=0, inherent_type='PiManager')
 
 
+def retained_pi_validation(name, sides, indexes, work):
+    """Follow the old launcher check's successful continuation into the returned executable."""
+    declaration = 'validate_pi_install'
+    windows = (
+        ['    if !launcher_target.starts_with(&canonical_prefix) || !launcher_target.is_file() {',
+         '        anyhow::bail!(', '            "Pi launcher escapes its installation prefix: {}",',
+         '            launcher.display()', '        );', '    }', '    Ok(())', '}'],
+        ['    ensure!(', '        entrypoint.starts_with(package.canonicalize()?),',
+         '        "Pi executable escapes the selected package"', '    );', '    ensure!(',
+         '        fs::metadata(&entrypoint)?.is_file(),', '        "Pi executable is not a regular file"',
+         '    );', '    Ok(entrypoint', '        .strip_prefix(prefix.canonicalize()?)?', '        .to_path_buf())', '}'],
+    )
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        parameter, output = ('version', 'PathBuf') if modern else ('expected_version', '( )')
+        signature = tuple(f'fn {declaration} ( prefix : & Path , {parameter} : & str ) -> Result < {output} >'.split())
+        _construct_charge(work, len(rows))
+        functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == signature
+                     and code.parents[row['opening']] is None]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        first, last = code.region(function['opening'], function['end'])[0::2]
+        _construct_charge(work, last - first + 1)
+        offsets = [10] if modern else [5, 6]
+        window = retained_source_window(source[first:last], windows[modern], offsets)
+        if window is None or first + window[0] + len(windows[modern]) != last:
+            return None
+        lines = [first + offset for offset in window[1]]
+        spans = ([(lines[0], 10, lines[0], 21)] if modern else
+                 [(lines[0], 5, lines[0], 6), (lines[1], 5, lines[1], 11)])
+        owners = compiled_owners_in_range(index, name, lines[0], lines[-1], work, declaration)
+        observed = []
+        for owner in owners:
+            symbol = owner['name']
+            _construct_charge(work, len(symbol) + len(owner['regions']) * len(lines))
+            raw = [row for row in owner['regions'] if any(row[0] <= line <= row[2] for line in lines)]
+            shape = plain_rust_function_symbol(symbol)
+            root = shape is not None and shape.identifiers == ('omg_lib', 'runtimes', 'pi', declaration)
+            if not raw and not root:
+                continue
+            if (not root or index.name_counts[symbol] != 1 or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name or owner.get('branches')
+                    or owner.get('mcdc_records') or [tuple(row[:4]) for row in raw] != spans
+                    or any(row[5:] != [0, 0, 0] or not 0 <= row[4] <= owner['count'] < COUNTER_LIMIT for row in raw)
+                    or len({row[4] for row in raw}) != 1):
+                return None
+            observed.append((symbol, raw[0][4]))
+        total = sum(hits for _, hits in observed)
+        if not 1 <= len(observed) <= 8 or total <= 0 or any(counts.get(line) != total for line in lines):
+            return None
+        observations.append((lines[0], observed))
+    before, after = observations
+    matching = compiled_hit_state_matching(*[[[int(hits > 0)] for _, hits in rows] for _, rows in observations])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-pi-validation', pairs=[[before[0], after[0]]],
+                owners=[before[1], after[1]], instance_matching=matching)
+
+
 def retained_runtime_archive_extraction(name, sides, indexes, work):
     forward = [
         'pub(crate) async fn extract_tar_gz(',
@@ -18182,23 +18262,46 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                                  retained_node_refusal_fixture),
         'src/runtimes/common.rs': (retained_runtime_archive_extraction, retained_runtime_copy_completion),
         'src/runtimes/rust.rs': (retained_rust_incremental_fixture,),
-        'src/runtimes/pi.rs': (retained_pi_runtime_fixtures, retained_pi_constructor),
+        'src/runtimes/pi.rs': (retained_pi_runtime_fixtures, retained_pi_constructor, retained_pi_validation),
         'src/runtimes/python/catalog.rs': (retained_python_catalog_request,),
     }
     archived_symbol_selectors = {
+        _AUR_GIT_SOURCE: (
+            'cancelling_host_git_clone_terminates_descendants', 'prefetch_refuses_loopback_before_connecting',
+            'host_git_clone_has_output_duration_and_staging_budgets',
+        ),
         'src/package_managers/aur/client.rs': (
             '18authorize_archives', *_AUR_MANAGEMENT_TESTS, 'create_scoped_pgp_home', 'capture', 'text',
             'contained_aur_symlink_target', 'begin_rollback_worktree',
             'declared_install_hook_previews_render_every_declared_script',
             'install_hook_review_fails_closed_and_preserves_long_lines', 'authorize_archives', 'clean_all', 'index',
             'install_package_outputs', 'install_authorized_package_outputs',
-            'srcinfo_version_extracts_pkgver_pkgrel',
+            'srcinfo_version_extracts_pkgver_pkgrel', 'declared_install_hook_previews',
+            'acquire_build_lifecycle', 'acquire_package_base_file_lock',
+            '9AurClient6search', '9AurClient4info', '9AurClient15get_update_list',
+            '9AurClient22downgrade_from_history', 'aur_rpc_updates_use_one_installed_snapshot',
+            'aur_updates_honor_exact_and_glob_ignore_pkg_in_fresh_index',
+            'aur_rpc_updates_rejects_unsolicited_installed_official_package',
+            'aur_updates_all_ignored_do_not_require_index_or_rpc',
+            'aur_metadata_task_completion_preserves_snapshots_and_falls_back',
+            'aur_metadata_reader_lock_failure_preserves_generation',
+            'aur_official_dependencies_reject_oversized_install_request_before_mutation',
         ),
         'src/package_managers/pacman_db/db.rs': (
             '14LocalDbPackage', '23load_cache_from_disk_in', 'ensure_local_cache_loaded',
             'check_updates_cached', 'load_sync_packages', 'parse_local_desc_manual', '20bounded_native_check',
-            'sync_identity_cache_uses_versioned_namespace',
-            'compute_required_names',
+            'sync_identity_cache_uses_versioned_namespace', 'compute_required_names',
+            'check_native_local_db_health', 'inspect_native_local_database',
+            'native_check_requires_success_and_bounds_elapsed_and_both_streams',
+        ),
+        'src/runtimes/common.rs': ('extract_tar_gz', 'extract_tar_gz_with_budget', 'copy_regular_tree'),
+        'src/runtimes/node.rs': (
+            'https_alias_resolution_requires_the_exact_release_identity',
+            'metadata_retry_recovers_node_checksum_without_skipping_integrity',
+            'metadata_retry_does_not_retry_invalid_node_checksum',
+            'metadata_retry_recovers_real_connection_interruption',
+            'node_sync_activation_works_inside_current_thread_runtime',
+            'incomplete_node_install_is_not_published_and_can_be_retried', 'assert_node_candidate_refused',
         ),
     }
     for name in bs:

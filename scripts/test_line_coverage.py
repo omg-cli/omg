@@ -423,6 +423,60 @@ class AurArchiveCaptureCoverageTests(unittest.TestCase):
         self.assertEqual((parsed.braces, parsed.names, parsed.modules, parsed.offsets, parsed.function_positions),
                          (full.braces, full.names, full.modules, full.offsets, full.function_positions))
 
+    def test_compiler_scope_index_does_not_rescan_unrelated_tokens(self):
+        source = ['fn sample() {', '    let value = (' + '1, ' * 3000 + ');', '}']
+        baseline = coverage._source_structural_map(source)
+        work = [4000]
+        parsed = coverage.source_structure_from_tokens(coverage._boolean_source(source), work)
+        self.assertEqual(parsed.braces, baseline.braces)
+        self.assertEqual(parsed.function_positions, baseline.function_positions)
+
+    def test_compiler_scope_index_preserves_ambiguous_token_fallback(self):
+        for source in (['fn fixture() { let _ = 1fn; }'], ['fn b"fixture";']):
+            with self.subTest(source=source):
+                self.assertIsNone(coverage.source_structure_from_tokens(coverage._boolean_source(source), [1000]))
+
+    def test_pi_validation_retains_successful_executable_resolution(self):
+        name = 'src/runtimes/pi.rs'
+        files = {'/coverage/' + name: name}
+        old = ['fn validate_pi_install(prefix: &Path, expected_version: &str) -> Result<()> {',
+               '    if !launcher_target.starts_with(&canonical_prefix) || !launcher_target.is_file() {',
+               '        anyhow::bail!(', '            "Pi launcher escapes its installation prefix: {}",',
+               '            launcher.display()', '        );', '    }', '    Ok(())', '}']
+        new = ['fn validate_pi_install(prefix: &Path, version: &str) -> Result<PathBuf> {',
+               '    ensure!(', '        entrypoint.starts_with(package.canonicalize()?),',
+               '        "Pi executable escapes the selected package"', '    );', '    ensure!(',
+               '        fs::metadata(&entrypoint)?.is_file(),',
+               '        "Pi executable is not a regular file"', '    );', '    Ok(entrypoint',
+               '        .strip_prefix(prefix.canonicalize()?)?', '        .to_path_buf())', '}']
+
+        def observe(fault=None):
+            work = [100_000]
+            sides, indexes = [], []
+            for side, source in enumerate((old, new)):
+                if side and fault == 'changed-condition':
+                    source = [line.replace('.is_file()', '.is_dir()') for line in source]
+                owners = []
+                for copy in (1, 2):
+                    value = 0 if side and copy == 2 and fault == 'cold-copy' else 3
+                    regions = ([[12, 10, 12, 21, value, 0, 0, 0]] if side else
+                               [[7, 5, 7, 6, value, 0, 0, 0], [8, 5, 8, 11, value, 0, 0, 0]])
+                    owners.append(dict(name=f'_RNvNtNtCs{side + 1}{copy}_7omg_lib8runtimes2pi19validate_pi_install',
+                                       count=8, filenames=list(files), regions=regions))
+                if side and fault == 'foreign-owner':
+                    owners.append(dict(owners[0], name='foreign'))
+                counts = coverage.Counter()
+                for owner in owners:
+                    counts.update(coverage._owner_line_counts(owner, coverage._ObserverWork(work)))
+                sides.append((source, coverage._construct_inventory(source, work), counts))
+                indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {name}))
+            return coverage.retained_pi_validation(name, sides, indexes, work)
+
+        self.assertEqual(observe()['pairs'], [[7, 12]])
+        for fault in ('changed-condition', 'cold-copy', 'foreign-owner'):
+            with self.subTest(fault=fault):
+                self.assertIsNone(observe(fault))
+
     def test_split_archive_fixture_retains_its_writer_and_package_assertions(self):
         begin = '        let write_split_archive = |path: &Path, pkginfo: &str| {'
         old = [begin, '            let pkginfo = format!("arch = any\\n{pkginfo}");',
