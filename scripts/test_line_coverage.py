@@ -388,6 +388,84 @@ class MetadataPublicationCoverageTests(unittest.TestCase):
 
 
 class AurArchiveCaptureCoverageTests(unittest.TestCase):
+    def test_retained_region_geometry_indexes_braces_once_for_the_same_source(self):
+        source = ['fn first() {', '    emit();', '}', '',
+                  'fn second() {', '    emit();', '}']
+        work = [1000]
+        structure = coverage._source_structural_map(source)
+        self.assertEqual(coverage.source_function_prefixes(source, [(1, 3)], work, structure),
+                         {(1, 3): 'fn first()'})
+        initial_cost = 1000 - work[0]
+        work = [1000]
+        self.assertEqual(coverage.source_function_prefixes(source, [(5, 7)], work, structure),
+                         {(5, 7): 'fn second()'})
+        self.assertLess(1000 - work[0], initial_cost)
+
+    def test_compiler_scope_index_reuses_the_source_token_positions(self):
+        source = ['#[cfg(test)] mod tests {', '    // fn fake() {}',
+                  '    fn sample() { print!(r#"{fn hidden()}"#); }', '}']
+        full = coverage._source_structural_map(source)
+        parsed = coverage.source_structure_from_tokens(coverage._boolean_source(source), [1000])
+        self.assertEqual((parsed.braces, parsed.names, parsed.modules, parsed.offsets, parsed.function_positions),
+                         (full.braces, full.names, full.modules, full.offsets, full.function_positions))
+
+    def test_split_archive_fixture_retains_its_writer_and_package_assertions(self):
+        begin = '        let write_split_archive = |path: &Path, pkginfo: &str| {'
+        old = [begin, '            let pkginfo = format!("arch = any\\n{pkginfo}");',
+               '            archive.into_inner().unwrap().finish().unwrap();', '        };',
+               '        write_split_archive(&app, meta);']
+        new = [begin, '            let pkginfo = format!(',
+               '                "arch = any\\npackager = Fixture Maintainer <fixture@example.invalid>\\n{pkginfo}"',
+               '            );', *old[2:]]
+        declaration = 'cached_artifacts_requires_all_split_outputs_to_match_the_checkout'
+        self.assertEqual(coverage.aur_management_test_source(declaration, old, new),
+                         [(0, 0), (1, 1), (2, 4), (3, 5), (4, 6)])
+        changed = [*new[:-1], '        write_split_archive(&libs, meta);']
+        self.assertIsNone(coverage.aur_management_test_source(declaration, old, changed))
+
+    def test_reviewed_source_completion_keeps_digest_inputs_when_adding_cache(self):
+        before = ['    fn capture(directory: &Path) -> Result<Self> {', '        Ok(Self {',
+                  '            files,', '            digest: hex::encode(hash.finalize()),',
+                  '        })', '    }']
+        after = [*before[:4], '            parsed_srcinfo: OnceLock::new(),', *before[4:]]
+        self.assertEqual(coverage.reviewed_source_completion_window(before, False)[1], [2, 3, 4])
+        self.assertEqual(coverage.reviewed_source_completion_window(after, True)[1], [2, 3, 4])
+        changed = [*after[:3], '            digest: remembered_digest,', *after[4:]]
+        self.assertIsNone(coverage.reviewed_source_completion_window(changed, True))
+
+    def test_cache_limit_matches_guard_expressions_with_the_same_cap(self):
+        cap = 'MAX_DERIVED_CACHE_BYTES'
+        source = [f'const {cap}: u64 = 512 * 1024 * 1024;', 'fn read() {',
+                  '    anyhow::ensure!(', f'        before.len() <= {cap},',
+                  '        "Package cache exceeds size limit"', '    );',
+                  '    anyhow::ensure!(', f'        data.len() as u64 <= {cap},',
+                  '        "Package cache exceeds size limit"', '    );', '}']
+        self.assertEqual(coverage.pacman_cache_guard_lines(source, 2, 11, modern=True), (3, 7))
+        bad_operator = [*source[:3], source[3].replace('<=', '<'), *source[4:]]
+        self.assertIsNone(coverage.pacman_cache_guard_lines(bad_operator, 2, 11, modern=True))
+        bad_cap = [source[0].replace('512', '1024'), *source[1:]]
+        self.assertIsNone(coverage.pacman_cache_guard_lines(bad_cap, 2, 11, modern=True))
+
+    def test_cache_epoch_check_preserves_both_guard_components(self):
+        source = ['    ensure_cache_loaded(&LOCAL_DB_CACHE, LOCAL_CACHE_NAME, current_epoch, || {',
+                  '        let packages = parse_local_db(local_dir)?;',
+                  '        #[cfg(test)]',
+                  '        AFTER_LOCAL_PARSE.with(|hook| {',
+                  '            if let Some(hook) = hook.borrow_mut().take() {',
+                  '                hook();',
+                  '            }',
+                  '        });',
+                  '        anyhow::ensure!(',
+                  '            current_epoch == LocalDbEpoch::from_local_dir(local_dir)?,',
+                  '            "Local package database changed while loading; retry the operation"',
+                  '        );',
+                  '        Ok(packages)',
+                  '    })?;']
+        self.assertEqual(coverage.cache_epoch_guard_window(source, True)[1], [2, 9, 10, 13, 14])
+        changed = source.copy()
+        changed[9] = changed[9].replace('==', '!=')
+        self.assertIsNone(coverage.cache_epoch_guard_window(changed, True))
+
     def test_missing_srcinfo_fixture_keeps_the_same_refusal_after_source_capture(self):
         before = ['        };', '        let error = client',
                   '            .aur_dependency_plan(directory.path(), "example", &["example".to_string()])',
@@ -1285,6 +1363,22 @@ class PacmanFixtureCoverageTests(unittest.TestCase):
 
 
 class CompiledPlainParentFilesTests(unittest.TestCase):
+    def test_owner_interval_lookup_reuses_named_copy_inventory_across_ranges(self):
+        path = '/archive/src/example.rs'
+        name = 'src/example.rs'
+        owners = [dict(name=f'unrelated_{index:03d}', filenames=[path],
+                       regions=[[index, 1, index + 1, 5, 1, 0, 0, 0]])
+                  for index in range(1, 100)]
+        owners.append(dict(name='requested_method', filenames=[path], regions=[[151, 1, 152, 5, 1, 0, 0, 0]]))
+        work = [10000]
+        index = coverage.index_compiled_owner_sources(owners, {path: name}, work, {name})
+        self.assertEqual(coverage.compiled_owners_in_range(index, name, 5, 5, work, 'requested'),
+                         (owners[3], owners[4], owners[-1]))
+        previous = work[0]
+        self.assertEqual(coverage.compiled_owners_in_range(index, name, 10, 10, work, 'requested'),
+                         (owners[8], owners[9], owners[-1]))
+        self.assertLess(previous - work[0], len(owners))
+
     def test_owner_extent_lookup_keeps_overlaps_and_out_of_range_named_copies(self):
         path = '/archive/src/example.rs'
         name = 'src/example.rs'
