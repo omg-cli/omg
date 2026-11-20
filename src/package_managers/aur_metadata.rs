@@ -121,10 +121,16 @@ fn lock_metadata(location: &MetadataRoot, access: MetadataAccess) -> Result<Meta
         open_build_lifecycle_lock, open_effective_user_lock,
     };
 
+    let root = location.path();
+    if let MetadataAccess::Shared = access {
+        anyhow::ensure!(
+            std::fs::metadata(&root)?.is_dir(),
+            "AUR metadata root is not a directory"
+        );
+    }
     let lifecycle =
         BuildLifecycleLease::try_shared(open_build_lifecycle_lock(&location.build_dir)?)
             .context("Failed to acquire AUR metadata ownership; cleanup may be active")?;
-    let root = location.path();
     match access {
         MetadataAccess::Exclusive => std::fs::DirBuilder::new()
             .recursive(true)
@@ -167,9 +173,6 @@ fn open_fresh_metadata_index_at(
     ttl: Duration,
 ) -> Result<Option<AurIndex>> {
     let root = location.path();
-    if !root.is_dir() {
-        return Ok(None);
-    }
     let _lock = match lock_metadata(location, MetadataAccess::Shared) {
         Ok(lock) => lock,
         Err(error)
@@ -1058,6 +1061,28 @@ mod tests {
             directory.path().read_dir().expect("private owner").count(),
             0
         );
+    }
+
+    #[test]
+    fn invalid_metadata_root_is_reported_without_creating_a_lock() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let location = MetadataRoot::new(directory.path().join("aur"));
+        let root = location.path();
+        let build_dir = root.parent().context("isolated metadata parent")?;
+        std::fs::create_dir(build_dir)?;
+        std::fs::write(&root, b"an incomplete metadata layout")?;
+
+        let error = open_fresh_metadata_index_at(&location, Duration::from_mins(1))
+            .err()
+            .context("invalid metadata layout must be reported")?;
+        assert!(
+            error
+                .to_string()
+                .contains("AUR metadata root is not a directory")
+        );
+        assert_eq!(std::fs::read(&root)?, b"an incomplete metadata layout");
+        assert_eq!(std::fs::read_dir(build_dir)?.count(), 1);
+        Ok(())
     }
 
     #[test]
