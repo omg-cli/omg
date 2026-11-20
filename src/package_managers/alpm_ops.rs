@@ -2435,6 +2435,31 @@ fn prepared_risk_review(
     }
 }
 
+fn require_fresh_arch_coverage(
+    assessment: &crate::core::security::vulnerability::PackageAssessment,
+    archive_acknowledged: bool,
+) -> Result<()> {
+    use super::types::SecurityOrigin;
+    let private_archive = matches!(
+        assessment.package.origin,
+        SecurityOrigin::AurArchive | SecurityOrigin::LocalArchive
+    );
+    anyhow::ensure!(
+        assessment.coverage.is_assessed() || private_archive && archive_acknowledged,
+        "FreshSnapshot requires assessed coordinates or an exact private archive acknowledgement"
+    );
+    Ok(())
+}
+
+fn begin_prepared_review_signals(
+    signals: &mut Option<AdmissionSignals>,
+    details: &str,
+) -> Result<()> {
+    AdmissionSignals::begin_in(signals).with_context(|| {
+        format!("{details}\nAdvisory risk review requires an attended native OMG CLI")
+    })
+}
+
 impl PreparedAdvisoryAdmission {
     fn new(
         alpm: &alpm::Alpm,
@@ -2558,15 +2583,7 @@ impl PreparedAdvisoryAdmission {
                 );
                 if policy.advisory_requirement == AdvisoryRequirement::FreshSnapshot {
                     for assessment in operation.assessments() {
-                        anyhow::ensure!(
-                            assessment.coverage.is_assessed()
-                                || matches!(
-                                    assessment.package.origin,
-                                    super::types::SecurityOrigin::AurArchive
-                                        | super::types::SecurityOrigin::LocalArchive
-                                ) && acknowledgement.is_some(),
-                            "FreshSnapshot requires assessed coordinates or an exact private archive acknowledgement"
-                        );
+                        require_fresh_arch_coverage(assessment, acknowledgement.is_some())?;
                     }
                 }
             }
@@ -2586,18 +2603,11 @@ impl PreparedAdvisoryAdmission {
             },
             |operation| operation.assessments().to_vec(),
         );
-        if let Some(review) = prepared_risk_review(
-            &assessments,
-            &advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?,
-            policy.advisory_requirement,
-        )? {
+        let digest = advisory_batch_digest(&packages, &policy, &profile, invoking_uid)?;
+        let review = prepared_risk_review(&assessments, &digest, policy.advisory_requirement)?;
+        if let Some(review) = review {
             if signals.is_none() {
-                AdmissionSignals::begin_in(signals).with_context(|| {
-                    format!(
-                        "{}\nAdvisory risk review requires an attended native OMG CLI",
-                        review.details(),
-                    )
-                })?;
+                begin_prepared_review_signals(signals, review.details())?;
             }
             confirm_advisory_prompt(
                 review.details(),
@@ -2658,11 +2668,9 @@ impl PreparedAdvisoryAdmission {
         if let Some(operation) = &self.operation {
             operation.validate_now()?;
         }
-        if let Some(review) = prepared_risk_review(
-            &self.assessments,
-            &advisory_batch_digest(&current, &policy, &profile, invoking_uid)?,
-            policy.advisory_requirement,
-        )? {
+        let digest = advisory_batch_digest(&current, &policy, &profile, invoking_uid)?;
+        let review = prepared_risk_review(&self.assessments, &digest, policy.advisory_requirement)?;
+        if let Some(review) = review {
             anyhow::ensure!(
                 self.risk_acceptance
                     .as_ref()
@@ -2953,6 +2961,13 @@ mod tests {
             },
             UnknownCoverage::EvidenceUnavailable,
         );
+        assert!(super::require_fresh_arch_coverage(&assessment, true).is_err());
+        for origin in [SecurityOrigin::AurArchive, SecurityOrigin::LocalArchive] {
+            let mut archive = assessment.clone();
+            archive.package.origin = origin;
+            assert!(super::require_fresh_arch_coverage(&archive, false).is_err());
+            super::require_fresh_arch_coverage(&archive, true)?;
+        }
         for requirement in [AdvisoryRequirement::Optional, AdvisoryRequirement::Review] {
             let review = super::prepared_risk_review(
                 std::slice::from_ref(&assessment),
@@ -3038,6 +3053,10 @@ mod tests {
         assert_eq!(invalid_signal.raw_os_error(), Some(nix::libc::EINVAL));
         let mut guard = super::AdmissionSignals::begin()?;
         assert!(super::AdmissionSignals::begin().is_err());
+        let error = super::begin_prepared_review_signals(&mut None, "disclosed fixture risk")
+            .expect_err("a second transaction must not take cancellation ownership");
+        assert!(error.to_string().contains("disclosed fixture risk"));
+        assert!(format!("{error:#}").contains("owns signal cancellation"));
         assert!(
             !nix::sys::signal::SigSet::thread_get_mask()?
                 .contains(nix::sys::signal::Signal::SIGINT),
@@ -5421,37 +5440,28 @@ mod tests {
             || -> anyhow::Result<()> {
                 paths::reset_test_overrides();
                 assert!(super::open_default_alpm()?.localdb().pkgs().is_empty());
-                let mut outcomes = Vec::new();
                 for (field, selected_root, selected_database) in [
                     ("root", &byte_root, &database),
                     ("database", &root, &byte_database),
                 ] {
-                    let outcome = temp_env::with_vars(
+                    let error = temp_env::with_vars(
                         [
                             ("OMG_PACMAN_ROOT", Some(selected_root.as_os_str())),
                             ("OMG_PACMAN_DB_DIR", Some(selected_database.as_os_str())),
                         ],
-                        || match super::open_default_alpm() {
-                            Ok(handle) => Err(handle
-                                .localdb()
-                                .pkgs()
-                                .iter()
-                                .map(|package| package.name().to_owned())
-                                .collect::<Vec<_>>()),
-                            Err(error) => Ok(format!("{error:#}")),
-                        },
+                        || super::open_default_alpm().err(),
+                    )
+                    .expect(
+                        "non-UTF-8 paths must refuse before opening a replacement-character alias",
                     );
-                    outcomes.push((field, outcome));
-                }
-                assert_eq!(std::fs::read(&sentinel)?, sentinel_bytes);
-                assert!(!alias_database.join("db.lck").exists());
-                for (field, outcome) in outcomes {
-                    let diagnostic = outcome.unwrap_or_else(|packages| panic!("non-UTF8 {field} must refuse instead of opening a replacement-character alias; native packages: {packages:?}"));
+                    let diagnostic = format!("{error:#}");
                     assert!(
                         diagnostic.to_ascii_lowercase().contains("utf-8"),
                         "{field}: {diagnostic}"
                     );
                 }
+                assert_eq!(std::fs::read(&sentinel)?, sentinel_bytes);
+                assert!(!alias_database.join("db.lck").exists());
                 Ok(())
             },
         )
@@ -5489,7 +5499,6 @@ mod tests {
                 );
                 std::fs::write(&config, &valid)?;
                 assert!(super::open_default_alpm()?.localdb().pkgs().is_empty());
-                let mut outcomes = Vec::new();
                 for (field, bad) in [
                     ("RootDir", format!("{}\0invalid", root.display())),
                     ("DBPath", format!("{}\0invalid", database.display())),
@@ -5507,20 +5516,11 @@ mod tests {
                         .join("\n")
                         + "\n";
                     std::fs::write(&config, contents)?;
-                    let result = std::panic::catch_unwind(super::open_default_alpm);
-                    let (panicked, diagnostic) = match result {
-                        Ok(Err(error)) => (false, Some(format!("{error:#}"))),
-                        Ok(Ok(_)) => (false, None),
-                        Err(_) => (true, None),
-                    };
-                    outcomes.push((field, panicked, diagnostic));
-                }
-                for (field, panicked, diagnostic) in outcomes {
-                    assert!(
-                        !panicked,
-                        "NUL-bearing {field} configuration must return an error instead of unwinding in the native constructor"
-                    );
-                    let diagnostic = diagnostic.expect("NUL-bearing configuration must refuse");
+                    let refusal = std::panic::catch_unwind(super::open_default_alpm)
+                        .expect("NUL-bearing configuration must return an error without unwinding")
+                        .map(drop)
+                        .expect_err("NUL-bearing configuration must refuse");
+                    let diagnostic = format!("{refusal:#}");
                     assert!(
                         diagnostic.to_ascii_lowercase().contains("nul"),
                         "{field}: {diagnostic}"
