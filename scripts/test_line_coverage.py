@@ -897,10 +897,11 @@ class RetainedSourceEntryTests(unittest.TestCase):
         files={'/artifact/'+name:name}
         for side,(source,line,markers,hit_counts,root_counts,scope) in enumerate(variants):
             owners=[]
+            nested_test = '5tests' in scope
             for copy,(hits,count) in enumerate(zip(hit_counts,root_counts)):
                 if side and fault=='missing-copy' and not copy:
                     continue
-                depth = name.removeprefix('src/').count('/') + 1
+                depth = name.removeprefix('src/').count('/') + 1 + nested_test
                 prefix = f'_RNv{"Nt" * depth}Cs{side+1}{copy+1}_7omg_lib'
                 symbol=prefix+scope
                 def region(number,text,value,end_number=None,end_text=None):
@@ -910,7 +911,8 @@ class RetainedSourceEntryTests(unittest.TestCase):
                     else:
                         end_column = source[end_number - 1].index(end_text) + len(end_text) + 1
                     return [number,col,end_number,end_column,value,0,0,0]
-                raw=[region(1,'fn',count),region(len(source),'}',count)]
+                raw=[region(4 if nested_test else 1,'fn',count),
+                     region(len(source) - nested_test,'}',count)]
                 raw.extend(region(*marker[:2], hits, *marker[2:]) for marker in markers)
                 if side and fault=='missing-slot' and copy:
                     raw.pop()
@@ -1009,6 +1011,111 @@ class RetainedSourceEntryTests(unittest.TestCase):
                     self.assertIsNotNone(proof)
                     self.assertEqual(proof['pairs'], [[5, 5], [7, 7], [8, 8]])
                     self.assertEqual(proof['instance_states'], [[False, True], [True, True]])
+                else:
+                    self.assertIsNone(proof)
+
+    def test_tail_diagnostic_keeps_the_observed_call_and_argument_after_wording_changes(self):
+        for fault in (None, 'changed-format', 'changed-argument', 'missing-copy', 'missing-slot',
+                      'foreign', 'lost-hit'):
+            with self.subTest(fault=fault):
+                variants = []
+                for side in range(2):
+                    message = 'Refused package or signing key' if side else 'Refused package'
+                    slot = '{reason}' if side and fault == 'changed-format' else '{}'
+                    argument = 'other' if side and fault == 'changed-argument' else 'details'
+                    source = [
+                        'fn question_refusal_error(refusals: &Mutex<AlpmQuestionRefusals>) -> Option<anyhow::Error> {',
+                        '    let mut details = Vec::new();',
+                        *(['    if refusals.key_import_refused { details.push("key".to_owned()); }'] if side else []),
+                        '    Some(anyhow::anyhow!(',
+                        f'        "{message}: {slot}",',
+                        f'        {argument}.join("; ")',
+                        '    ))',
+                        '}',
+                    ]
+                    first = 3 + side
+                    markers = [(first, 'Some', first + 3, '    ))'),
+                               (first, 'anyhow::anyhow!'), (first + 2, argument)]
+                    hits = (5, 4) if side else (0, 3)
+                    if side and fault == 'lost-hit':
+                        hits = (0, 0)
+                    variants.append((source, first, markers, hits, (10, 10),
+                                     '16package_managers8alpm_ops22question_refusal_error'))
+                proof = self.observe('src/package_managers/alpm_ops.rs', variants,
+                                     coverage.alpm_refusal_diagnostic_entry_source, fault=fault)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[3, 4], [5, 6], [6, 7]])
+                else:
+                    self.assertIsNone(proof)
+
+    def test_download_user_context_preserves_both_success_and_error_regions(self):
+        for fault in (None, 'different-setter', 'missing-copy', 'prefix-lost', 'foreign'):
+            with self.subTest(fault=fault):
+                variants = []
+                for side in range(2):
+                    inputs = ['    let download_user = pacman_config.download_user.as_deref();'] if side else []
+                    user = 'download_user' if side else 'pacman_config.download_user.as_deref()'
+                    setter = 'set_other_user' if side and fault == 'different-setter' else 'set_sandbox_user'
+                    source = [
+                        'fn configure_transaction_options(alpm: &mut alpm::Alpm, pacman_config: &crate::core::pacman_conf::PacmanConfig) -> Result<()> {',
+                        *inputs,
+                        f'    alpm.{setter}({user})',
+                        '        .context("Failed to configure pacman DownloadUser")?;',
+                        '    Ok(())',
+                        '}',
+                    ]
+                    line = 3 + side
+                    markers = [(line, 'context'), (line, '?')]
+                    variants.append((source, line, markers, (4, 7), (8, 10),
+                                     '16package_managers8alpm_ops29configure_transaction_options'))
+                proof = self.observe('src/package_managers/alpm_ops.rs', variants,
+                                     coverage.alpm_option_context_source, fault=fault)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[3, 4]])
+                else:
+                    self.assertIsNone(proof)
+
+    def test_architecture_context_tracks_the_error_exit_after_changing_the_input(self):
+        variants = []
+        for side, argument in enumerate(('architectures', 'architectures.iter().map(String::as_str)')):
+            source = [
+                'fn configure_transaction_options(alpm: &mut alpm::Alpm, pacman_config: &crate::core::pacman_conf::PacmanConfig) -> Result<()> {',
+                f'    alpm.set_architectures({argument})',
+                '        .context("Failed to configure package architecture validation")?;',
+                '    Ok(())',
+                '}',
+            ]
+            variants.append((source, 3, [(3, 'context'), (3, '?')], (4, 7), (8, 10),
+                             '16package_managers8alpm_ops29configure_transaction_options'))
+        result = self.observe('src/package_managers/alpm_ops.rs', variants,
+                              coverage.alpm_option_context_source)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['pairs'], [[3, 3]])
+
+    def test_holdpkg_keeps_the_same_observed_error_check_after_changing_the_fixture(self):
+        for fault in (None, 'wrong-callee', 'missing-slot', 'foreign'):
+            with self.subTest(fault=fault):
+                variants = []
+                for side, invalid_pattern in enumerate(('"["', '"held\\0"')):
+                    callee = 'other_check' if side and fault == 'wrong-callee' else 'ensure_removals_not_held'
+                    source = [
+                        '#[cfg(test)]', 'mod tests {', '    #[test]',
+                        '    fn invalid_hold_pkg_patterns_fail_closed() {',
+                        f'        let error = {callee}(["anything"], &[{invalid_pattern}.to_string()])',
+                        '            .expect_err("invalid HoldPkg patterns must not be ignored");',
+                        '        assert!(error.to_string().contains("Invalid HoldPkg pattern"));',
+                        '    }', '}',
+                    ]
+                    slots = [(6, 'expect_err'), (6, '"invalid HoldPkg patterns must not be ignored"')]
+                    variants.append((source, 6, slots, (1, 1), (1, 1),
+                                     '16package_managers8alpm_ops5testss_37invalid_hold_pkg_patterns_fail_closed'))
+                proof = self.observe('src/package_managers/alpm_ops.rs', variants,
+                                     coverage.alpm_holdpkg_expected_error_source, fault=fault)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[6, 6]])
                 else:
                     self.assertIsNone(proof)
 

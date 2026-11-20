@@ -3554,6 +3554,128 @@ def alpm_cache_receiver_entry_source(name, source, inventory, line, work):
     return header, span, bounds, slots, modules, owner, None, ((line, chain[2], push[0]), (push, path)), True
 
 
+def alpm_refusal_diagnostic_entry_source(name, source, inventory, line, work):
+    """Locate unchanged evaluation around the refusal message's edited format string."""
+    if name != 'src/package_managers/alpm_ops.rs' or source[line - 1].strip() != 'Some(anyhow::anyhow!(':
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows) + len(code.starts).bit_length())
+    start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+    block = code.parents[start]
+    functions = [row for row in rows if row['kind'] == 'fn' and row['opening'] == block]
+    if len(functions) != 1 or code.parents[block] is not None:
+        return None
+    function, = functions
+    header = tuple('fn question_refusal_error ( refusals : & Mutex < AlpmQuestionRefusals > ) '
+                   '-> Option < anyhow :: Error >'.split())
+    if function['header'] != header:
+        return None
+    tail = code.words[start:function['end']]
+    if (tail[:7] != 'Some ( anyhow :: anyhow ! ('.split()
+            or tail[8:] != [',', 'details', '.', 'join', '(', '"; "', ')', ')', ')']):
+        return None
+    _construct_charge(work, len(tail[7]) + start - block)
+    literal = re.sub(r'\\\n[ \t]*', '', tail[7])
+    if re.fullmatch(r'"[^"{}\\]*\{\}[^"{}\\]*"', literal) is None:
+        return None
+    if {'anyhow', 'Some'}.intersection(code.words[block + 1:start]):
+        return None
+    bounds = code.region(start, function['end'] - 1)
+    argument = code.region(start + 9, start + 9)
+    if not line < argument[0] < bounds[2]:
+        return None
+    span = code.region(function['first'], function['end'])[0::2]
+    slots = (bounds, code.region(start + 2, start + 5))
+    return (header, span, bounds, slots, ('omg_lib', 'package_managers', 'alpm_ops'),
+            'question_refusal_error', None, ((line, argument[0], bounds[2]), (argument,)), False)
+
+
+_ALPM_OPTION_CONTEXTS = {
+    '.context("Failed to configure pacman DownloadUser")?;': (
+        'set_sandbox_user', 'pacman_config . download_user . as_deref ( )', 'download_user'),
+    '.context("Failed to configure package architecture validation")?;': (
+        'set_architectures', 'architectures', 'architectures . iter ( ) . map ( String :: as_str )'),
+}
+
+
+def alpm_option_context_source(name, source, inventory, line, work):
+    """Locate the context call and error exit for a native ALPM setter."""
+    if name != 'src/package_managers/alpm_ops.rs' or not 2 <= line < len(source):
+        return None
+    context = source[line - 1].strip()
+    option = _ALPM_OPTION_CONTEXTS.get(context)
+    if option is None:
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows) + 3 * len(code.starts).bit_length())
+    receiver, start, end = (bisect.bisect_left(code.starts, code.offsets[n])
+                            for n in (line - 2, line - 1, line))
+    block = code.parents[start]
+    functions = [row for row in rows if row['kind'] == 'fn' and row['opening'] == block]
+    if len(functions) != 1 or code.parents[receiver] != block or code.parents[block] is not None:
+        return None
+    function, = functions
+    parameters = tuple(('fn configure_transaction_options ( alpm : & mut alpm :: Alpm , '
+                        'pacman_config : & crate :: core :: pacman_conf :: PacmanConfig').split())
+    result = tuple(') -> Result < ( ) >'.split())
+    header = (*parameters, *result)
+    if function['header'] not in (header, (*parameters, ',', *result)):
+        return None
+    setter, inline, bound = option
+    prefix = ['alpm', '.', setter, '(']
+    call = code.words[receiver:start]
+    if call not in ([*prefix, *inline.split(), ')'], [*prefix, *bound.split(), ')']):
+        return None
+    if setter == 'set_sandbox_user' and call == [*prefix, bound, ')']:
+        _construct_charge(work, receiver - block)
+        preceding = code.words[block + 1:receiver]
+        declaration = ['let', bound, '=', *inline.split(), ';']
+        bindings = [i for i, token in enumerate(preceding) if token == bound and i and preceding[i-1] in ('let', 'mut')]
+        if len(bindings) != 1 or preceding[bindings[0] - 1:bindings[0] - 1 + len(declaration)] != declaration:
+            return None
+    bounds = code.region(start, end - 1)
+    slots = (code.region(start + 1, start + 1), code.region(end - 2, end - 2))
+    span = code.region(function['first'], function['end'])[0::2]
+    return ((*header, context), span, bounds, slots, ('omg_lib', 'package_managers', 'alpm_ops'),
+            'configure_transaction_options', None, None, False)
+
+
+_HOLDPKG_EXPECTED_ERROR = '.expect_err("invalid HoldPkg patterns must not be ignored");'
+
+
+def alpm_holdpkg_expected_error_source(name, source, inventory, line, work):
+    if (name != 'src/package_managers/alpm_ops.rs' or not 2 <= line < len(source)
+            or source[line - 1].strip() != _HOLDPKG_EXPECTED_ERROR):
+        return None
+    code, rows = inventory[:2]
+    _construct_charge(work, len(rows) + len(code.starts).bit_length())
+    start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+    block = code.parents[start]
+    declaration = 'invalid_hold_pkg_patterns_fail_closed'
+    header = ('#', '[', 'test', ']', 'fn', declaration, '(', ')')
+    functions = [row for row in rows if row['kind'] == 'fn'
+                 and row['opening'] == block and row['header'] == header]
+    if len(functions) != 1:
+        return None
+    function, = functions
+    module = _boolean_module(code, {'start': function['first']})
+    if module is None or module[:2] != (['tests'], ['tests']):
+        return None
+    prefix = 'let error = ensure_removals_not_held ( [ "anything" ] , & ['.split()
+    suffix = '. to_string ( ) ] )'.split()
+    bodies = [[*prefix, pattern, *suffix] for pattern in ('"["', '"held\\0"')]
+    assertion = [*'assert ! ( error . to_string ( ) . contains ('.split(),
+                 '"Invalid HoldPkg pattern"', ')', ')', ';']
+    if (code.words[block + 1:start] not in bodies
+            or code.words[start + 6:function['end']] != assertion):
+        return None
+    bounds = code.region(start, start + 5)
+    slots = (code.region(start + 1, start + 1), code.region(start + 3, start + 3))
+    span = code.region(function['first'] + 4, function['end'])[0::2]
+    return (header, span, bounds, slots, ('omg_lib', 'package_managers', 'alpm_ops', 'tests'),
+            declaration, None, (None, None), False)
+
+
 def retained_ensure_entry(name, sides, indexes, work):
     return retained_observed_entry(name,sides,indexes,work,ensure_entry_source)
 
@@ -3563,6 +3685,10 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
     map_initializer=source_observer is map_initializer_entry_source
     alpm_record = source_observer is alpm_update_record_entry_source
     cache_receiver = source_observer is alpm_cache_receiver_entry_source
+    refusal_diagnostic = source_observer is alpm_refusal_diagnostic_entry_source
+    fragment = cache_receiver or refusal_diagnostic
+    option_context = source_observer is alpm_option_context_source
+    holdpkg_expectation = source_observer is alpm_holdpkg_expected_error_source
     identities=[]; receipts=[]; states=[]; conditions=[]
     for (source,inventory,spans,counts,line),index in zip(sides,indexes):
         observed=source_observer(name,source,inventory,line,work)
@@ -3612,9 +3738,14 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                 identity=shape.kind,shape.namespace,shape.self_type,shape.method,local
                 copy=shape.copy_identity
             marker=[r for r in touching if r[0]<=line<=r[2]]
-            if tuple(tuple(r[:4]) for r in marker)!=entry or len({r[4] for r in marker})!=1:
+            if tuple(tuple(r[:4]) for r in marker) != entry:
                 return None
             hits=marker[0][4]
+            if option_context:
+                if marker[1][4] > hits or len(touching) != len(entry):
+                    return None
+            elif any(row[4] != hits for row in marker):
+                return None
             if (hits and owner['count']==0 or not repeatable and hits>owner['count']
                     or map_initializer and hits!=owner['count']):
                 return None
@@ -3622,10 +3753,11 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
                                 or any(row[4] != hits for row in touching[:-1])
                                 or bool(touching[-1][4]) != bool(hits)):
                 return None
-            if cache_receiver:
-                arguments = [r for r in touching if r[0] == condition[0][-1]]
+            if fragment:
+                arguments = [r for r in touching if r[0] == condition[1][0][0]]
                 if (tuple(tuple(r[:4]) for r in arguments) != condition[1]
-                        or any(r[4] != hits for r in arguments)):
+                        or any(r[4] != hits for r in arguments)
+                        or refusal_diagnostic and len(touching) != len(entry) + len(arguments)):
                     return None
             roots.append((owner,identity,copy,touching,hits))
         _construct_charge(work,len(roots)+len(compiled_parents))
@@ -3641,35 +3773,47 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
         projection=_owner_line_counts({'regions':[row for member in roots for row in member[3]]},
                                       _ObserverWork(work))
         observed_lines = range(low[0], high[0] + 1)
-        if cache_receiver:
-            # The guard can contribute separate counts to the opening brace.
+        if fragment:
+            # Only the selected lines belong to the retained operation.
             observed_lines = condition[0]
             projection = {n: projection[n] for n in observed_lines if n in projection}
         if counts.get(line,0)<=0 or projection!={n:counts[n] for n in observed_lines if n in counts}:
             return None
         conditions.append((condition,roots,counts))
         identities.append((syntax,roots[0][1]))
-        states.append(sorted(r[4]>0 for r in roots))
+        if option_context:
+            states.append([tuple(row[4] > 0 for row in member[3]) for member in roots])
+        else:
+            states.append(sorted(r[4] > 0 for r in roots))
         receipts.append(dict(span=list(statement),
-                             entry=list(entry) if map_initializer or alpm_record or cache_receiver else list(entry[0]),
+                             entry=list(entry) if map_initializer or alpm_record or fragment or option_context
+                             or holdpkg_expectation else list(entry[0]),
                              owners=[dict(name=r[0]['name'], regions=r[3],entry_count=r[4]) for r in roots],
                              parents=[parent['name'] for parent,_ in compiled_parents]))
     if identities[0]!=identities[1] or len(states[0])!=len(states[1]):
         return None
+    if option_context:
+        _construct_charge(work, 2 * len(states[0]) * len(states[1]))
+        matching = compiled_hit_state_matching(*states)
+        if matching is None:
+            return None
+        return dict(file=name, kind='retained-alpm-option-context', pairs=[[sides[0][-1], sides[1][-1]]],
+                    instance_states=states, instance_matching=matching, observations=receipts)
     if alpm_record:
         if not all(states[1]):
             return None
-    elif (any(left>right for left,right in zip(*states)) if map_initializer or cache_receiver else states[0]!=states[1]):
+    elif (any(left>right for left,right in zip(*states)) if map_initializer or fragment else states[0]!=states[1]):
         return None
     pairs=[[sides[0][-1],sides[1][-1]]]
-    if cache_receiver:
+    if fragment:
         previous, current = (item[0][0] for item in conditions)
         pairs = [list(pair) for pair in zip(previous, current, strict=True)]
         if any(sides[0][0][line - 1] != sides[1][0][target - 1]
                or sides[0][3].get(line, 0) <= 0 or sides[1][3].get(target, 0) <= 0
                for line, target in pairs):
             return None
-        return dict(file=name, kind='retained-alpm-cache-receiver', pairs=pairs,
+        kind = 'retained-alpm-cache-receiver' if cache_receiver else 'retained-alpm-refusal-diagnostic'
+        return dict(file=name, kind=kind, pairs=pairs,
                     instance_states=states, observations=receipts)
     if alpm_record:
         old, new = (item[0][1] for item in conditions)
@@ -3697,6 +3841,8 @@ def retained_observed_entry(name, sides, indexes, work, source_observer):
     if map_initializer:
         kind = ('retained-map-allocation-entry' if sides[0][0][sides[0][-1] - 1].strip() == _MAP_NEW_LINE
                 else 'retained-map-capacity-entry')
+    elif holdpkg_expectation:
+        kind = 'retained-alpm-holdpkg-expected-error'
     return dict(file=name,kind=kind,pairs=pairs,condition_pairs=condition_pairs,
                 instance_states=states,observations=receipts)
 
@@ -13781,6 +13927,12 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             entry_source = alpm_update_record_entry_source
                         elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == 'packages':
                             entry_source = alpm_cache_receiver_entry_source
+                        elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == 'Some(anyhow::anyhow!(':
+                            entry_source = alpm_refusal_diagnostic_entry_source
+                        elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() in _ALPM_OPTION_CONTEXTS:
+                            entry_source = alpm_option_context_source
+                        elif name == 'src/package_managers/alpm_ops.rs' and old[line - 1].strip() == _HOLDPKG_EXPECTED_ERROR:
+                            entry_source = alpm_holdpkg_expected_error_source
                     if entry_source is not None and (bs[name]['expansions'],hs[name]['expansions'])==([],[]):
                         sides=((old,inventories[0],base_spans,before,entry_lines[0]),
                                (new,inventories[1],head_spans,after,entry_lines[1]))
