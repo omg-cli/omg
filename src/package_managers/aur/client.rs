@@ -599,6 +599,20 @@ fn resolve_official_dependency(
         .transpose()
 }
 
+fn optional_official_package<T>(
+    repository: &str,
+    package: &str,
+    lookup: alpm::Result<T>,
+) -> Result<Option<T>> {
+    match lookup {
+        Ok(package) => Ok(Some(package)),
+        Err(alpm::Error::PkgNotFound) => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to inspect '{repository}/{package}'"))
+        }
+    }
+}
+
 fn reconcile_official_dependency(alpm: &alpm::Alpm, selected: &mut OfficialTarget) -> Result<()> {
     use crate::package_managers::types::{dependency_version_satisfies, provision_satisfies};
 
@@ -606,14 +620,10 @@ fn reconcile_official_dependency(alpm: &alpm::Alpm, selected: &mut OfficialTarge
         if !database.usage()?.contains(alpm::Usage::INSTALL) {
             continue;
         }
-        let candidate = match database.pkg(selected.name.as_str()) {
-            Ok(candidate) => candidate,
-            Err(alpm::Error::PkgNotFound) => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("Failed to inspect '{}/{}'", database.name(), selected.name)
-                });
-            }
+        let lookup = database.pkg(selected.name.as_str());
+        let candidate = optional_official_package(database.name(), &selected.name, lookup)?;
+        let Some(candidate) = candidate else {
+            continue;
         };
         if selected.relations.iter().all(|relation| {
             let direct = candidate.name() == dependency_name(relation)
@@ -5891,16 +5901,14 @@ mod tests {
     }
 
     fn write_tar_gz(path: &std::path::Path, entries: &[(&str, &[u8])]) {
-        let encoder = flate2::write::GzEncoder::new(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-                .unwrap(),
-            flate2::Compression::fast(),
-        );
+        let archive = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .expect("create a private AUR archive fixture");
+        let encoder = flate2::write::GzEncoder::new(archive, flate2::Compression::fast());
         let mut tar = tar::Builder::new(encoder);
         for (name, content) in entries {
             let mut header = tar::Header::new_gnu();
@@ -10555,6 +10563,30 @@ finally:
             archive.into_inner()?.finish()?,
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn official_package_lookup_only_skips_a_missing_candidate() {
+        use super::optional_official_package;
+
+        assert_eq!(
+            optional_official_package("core", "helper", Ok("helper"))
+                .expect("a native lookup returned the package"),
+            Some("helper")
+        );
+        assert_eq!(
+            optional_official_package::<()>("core", "helper", Err(alpm::Error::PkgNotFound))
+                .expect("a missing candidate allows lookup in the next repository"),
+            None
+        );
+        let error =
+            optional_official_package::<()>("core", "helper", Err(alpm::Error::DbInvalidSig))
+                .expect_err("invalid repository signatures must stop reconciliation");
+        assert_eq!(error.to_string(), "Failed to inspect 'core/helper'");
+        assert_eq!(
+            error.downcast_ref::<alpm::Error>(),
+            Some(&alpm::Error::DbInvalidSig)
+        );
     }
 
     #[test]
