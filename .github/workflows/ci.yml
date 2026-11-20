@@ -1987,7 +1987,7 @@ jobs:
     needs: qemu-preflight
     if: needs.qemu-preflight.result == 'success'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 48
     permissions:
       contents: read
       actions: read
@@ -1998,7 +1998,7 @@ jobs:
       - name: Wait for exact current native artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        run: timeout --kill-after=5s 1850s python3 scripts/native-build-artifact.py ready --timeout 1800 --destination "$RUNNER_TEMP/native-readiness"
+        run: timeout --kill-after=5s 2750s python3 scripts/native-build-artifact.py ready --timeout 2700 --destination "$RUNNER_TEMP/native-readiness"
       - name: Preserve native readiness
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -2009,14 +2009,13 @@ jobs:
 
   qemu:
     name: QEMU behavioral verification (non-Fedora)
-    needs: [qemu-preflight, native-readiness]
+    needs: [qemu-preflight]
     if: >-
       !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
     with:
       partition: non-fedora
       preflight-result: ${{ needs.qemu-preflight.result }}
-      native-readiness-result: ${{ needs.native-readiness.result }}
     permissions:
       contents: read
       actions: read
@@ -2025,14 +2024,13 @@ jobs:
 
   qemu-fedora:
     name: QEMU behavioral verification (Fedora)
-    needs: [qemu-preflight, native-readiness, fedora-sqlite]
+    needs: [qemu-preflight, fedora-sqlite]
     if: >-
       !cancelled() && needs.qemu-preflight.result != 'skipped'
     uses: ./.github/workflows/qemu-matrix.yml
     with:
       partition: fedora
       preflight-result: ${{ needs.qemu-preflight.result }}
-      native-readiness-result: ${{ needs.native-readiness.result }}
     permissions:
       contents: read
       actions: read

@@ -233,13 +233,32 @@ jobs:
     with:
       arch: x86_64
 
+  native-ready:
+    name: "Wait for native artifact (${{ inputs.distro }})"
+    if: inputs.staged && inputs.reuse-ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 48
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Wait for this distro's native release pair
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISTRO: ${{ inputs.distro }}
+        run: python3 scripts/native-build-artifact.py wait --distro "$DISTRO" --timeout 2700
+
   guest:
     name: "QEMU guest (${{ inputs.distro }})"
-    needs: [build-staged, build-staged-ubuntu, fedora-sqlite]
+    needs: [build-staged, build-staged-ubuntu, fedora-sqlite, native-ready]
     if: >-
       !cancelled() && (inputs.distro != 'fedora' || inputs.reuse-ci || needs.fedora-sqlite.result == 'success') &&
       ((!inputs.staged && needs.build-staged.result == 'skipped' && needs.build-staged-ubuntu.result == 'skipped') ||
-       (inputs.staged && inputs.reuse-ci && needs.build-staged.result == 'skipped' && needs.build-staged-ubuntu.result == 'skipped') ||
+       (inputs.staged && inputs.reuse-ci && needs.native-ready.result == 'success' && needs.build-staged.result == 'skipped' && needs.build-staged-ubuntu.result == 'skipped') ||
        (inputs.staged && inputs.distro != 'ubuntu' && needs.build-staged.result == 'success' && needs.build-staged-ubuntu.result == 'skipped') ||
        (inputs.staged && inputs.distro == 'ubuntu' && needs.build-staged-ubuntu.result == 'success' && needs.build-staged.result == 'skipped'))
     # Pilot one trusted lane so the single WSL runner does not serialize the matrix.
