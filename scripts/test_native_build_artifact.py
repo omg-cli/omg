@@ -443,6 +443,7 @@ class NativeBuildAdmission(unittest.TestCase):
 
     def test_reuse_checks_live_attempt_and_writes_only_validated_files(self):
         for mode in ('valid', 'in-progress', 'queued', 'queued-artifact', 'waiting-artifact',
+                     'incomplete-listing',
                      'rerun-artifact', 'changed-attempt', 'expired', 'older-attempt',
                      'invalid-artifact-timestamp', 'future-attempt', 'missing'):
             expected, provenance, payload = fixture()
@@ -472,11 +473,15 @@ class NativeBuildAdmission(unittest.TestCase):
             if mode == 'future-attempt':
                 artifact['name'] = 'native-release-debian-2'
             run_lookups = 0
+            artifact_lookups = 0
             def lookup(path):
-                nonlocal run_lookups
+                nonlocal run_lookups, artifact_lookups
                 if path.endswith('/workflows/ci.yml'):
                     return {'id': 42, 'path': '.github/workflows/ci.yml'}
                 if '/artifacts?' in path:
+                    artifact_lookups += 1
+                    if mode == 'incomplete-listing' and artifact_lookups == 1:
+                        return {'total_count': 1, 'artifacts': []}
                     return {'total_count': 0 if mode == 'missing' else 1,
                             'artifacts': [] if mode == 'missing' else [artifact]}
                 if path.endswith('/runs/123'):
@@ -507,9 +512,11 @@ class NativeBuildAdmission(unittest.TestCase):
                         patch.object(BUILD, 'command_output', return_value='a'*40), patch.object(BUILD.time, 'sleep'), \
                         patch.object(BUILD.time, 'monotonic', side_effect=range(0, 10000, 100)):
                     if mode in ('valid', 'in-progress', 'queued', 'queued-artifact',
-                                'waiting-artifact'):
+                                'waiting-artifact', 'incomplete-listing'):
                         result = BUILD.reuse(root, 'debian', expected['image'], 'debian,pgp,license', destination, context, event)
                         self.assertEqual(result, provenance)
+                        if mode == 'incomplete-listing':
+                            self.assertEqual(artifact_lookups, 2)
                         self.assertEqual({path.name for path in destination.iterdir()},
                                          {provenance['archive'], provenance['archive']+'.sha256', 'native-build.json'})
                         self.assertEqual((destination / provenance['archive']).read_bytes(), payload)
