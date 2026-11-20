@@ -205,12 +205,11 @@ notify = "8.2"
 home = "0.5.12"
 
 # Cryptography
-# Retained for the RSA verifier's digest API.
-sha2 = { version = "=0.10.9", features = ["oid"] }
+sha2 = "=0.10.9"
 hex = "0.4.3"
 base64 = "0.23"
 # SLSA/Sigstore verification: RSA (PKCS#1 v1.5, SPKI keys) and P-256 ECDSA
-rsa = { version = "0.9" }
+rsa = { version = "0.10", features = ["pkcs1v15"] } # RUSTSEC-2023-0071
 p256 = { version = "=0.14.0", features = ["ecdsa", "pkcs8"] }
 p384 = { version = "=0.14.0", features = ["ecdsa", "pkcs8"] }
 x509-parser = { version = "=0.18.1", default-features = false, features = ["verify"] }

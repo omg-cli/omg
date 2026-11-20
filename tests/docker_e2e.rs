@@ -117,9 +117,8 @@ fn run_in_docker_with_options(options: &[&str], cmd: &[&str]) -> (bool, String, 
 fn run_install_fixture(package: &str, executable: &str, removal: &str) -> (bool, String, String) {
     run_in_docker(&[
         "python3",
-        "-c",
-        include_str!("../scripts/docker-install-fixture.py"),
-        include_str!("../scripts/attend-unknown-fixture.py"),
+        "-Es",
+        "/usr/local/libexec/omg/docker-install-fixture.py",
         package,
         executable,
         removal,
@@ -311,9 +310,8 @@ fn test_docker_nonexistent_package() {
         &["--network", "none"],
         &[
             "python3",
-            "-c",
-            include_str!("../scripts/docker-info-fixture.py"),
-            include_str!("../scripts/qemu-aur-fixture.py"),
+            "-Es",
+            "/usr/local/libexec/omg/docker-info-fixture.py",
         ],
     );
     assert!(success, "Native info fixture failed: {stdout}\n{stderr}");

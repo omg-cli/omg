@@ -69,13 +69,13 @@ export function parseRustExecution({ stdout, stderr, exitCode, testName, file, s
     const lines = stdout.split(/\r?\n/);
     const summaries = lines.filter((line) => /^test result:/.test(line));
     const expected = exitCode === 0 ? "ok. 1 passed; 0 failed" : "FAILED. 0 passed; 1 failed";
-    const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const summaryPrefix = `test result: ${expected}; 0 ignored; 0 measured; ${catalog.filtered ?? 0} filtered out; finished in `;
+    const summary = summaries[0] ?? "";
     if (
         lines.filter((line) => line === "running 1 test").length !== 1 ||
         summaries.length !== 1 ||
-        !new RegExp(
-            `^test result: ${escaped}; 0 ignored; 0 measured; ${catalog.filtered ?? 0} filtered out; finished in [0-9.]+s$`,
-        ).test(summaries[0]) ||
+        !summary.startsWith(summaryPrefix) ||
+        !/^[0-9]+(?:\.[0-9]+)?s$/.test(summary.slice(summaryPrefix.length)) ||
         lines.filter((line) => line === `test ${testName} ... ${exitCode === 0 ? "ok" : "FAILED"}`)
             .length !== 1
     )

@@ -3,6 +3,7 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("rollout_gate", Path(__file__).with_name("check-cloud-ci-rollout.py"))
 GATE = importlib.util.module_from_spec(spec)
@@ -26,6 +27,16 @@ def fixture():
 
 
 class RolloutTests(unittest.TestCase):
+    def test_cloudflare_readback_rejects_redirects(self):
+        with patch("http.client.HTTPSConnection") as connect:
+            connection = connect.return_value
+            connection.getresponse.return_value.__enter__.return_value.status = 302
+            with self.assertRaisesRegex(OSError, "Cloudflare HTTP 302"):
+                GATE.read_cloudflare("/applications/" + GATE.APPLICATION, "local-test-token")
+        connect.assert_called_once_with("api.cloudflare.com", timeout=30)
+        connection.request.assert_called_once()
+        connection.close.assert_called_once()
+
     def test_settled_exact_target_admits_without_running_slots(self):
         app, rows = fixture()
         self.assertEqual(GATE.admit(app, rows, DIGEST), {

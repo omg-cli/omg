@@ -8,8 +8,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import types
-
 
 def require(condition, message):
     if not condition:
@@ -45,8 +43,10 @@ def deny_unattended(command, before):
 
 
 def main():
-    require(len(sys.argv) == 5, 'Expected Unknown helper source, package, executable and removal mode')
-    helper_source, package, executable, removal = sys.argv[1:]
+    from attend_unknown_fixture import attend
+
+    require(len(sys.argv) == 4, 'Expected package, executable and removal mode')
+    package, executable, removal = sys.argv[1:]
     require((package, executable) in (('ripgrep', 'rg'), ('tree', 'tree')) and removal in ('keep', 'remove'),
             'Unsupported disposable Docker install fixture case')
     require(os.getuid() != 0, 'Docker install fixture must begin as the ordinary test user')
@@ -56,11 +56,9 @@ def main():
     cli = ['sudo', '-n', '/usr/local/bin/omg']
     deny_unattended(cli + ['install', package], before)
     deny_unattended(cli + ['install', '-y', package], before)
-    helper = types.ModuleType('attend_unknown_fixture')
-    exec(compile(helper_source, 'attend-unknown-fixture.py', 'exec'), helper.__dict__)
     with tempfile.TemporaryDirectory(prefix='omg-docker-install-') as directory:
         receipt = Path(directory) / 'security-review.json'
-        code = helper.attend(cli + ['install', '-y', package], receipt, 120)
+        code = attend(cli + ['install', '-y', package], receipt, 120)
         require(code == 0, 'Foreground installation failed after explicit Unknown-only review')
         review = json.loads(receipt.read_text())
         require(review.get('cli_exit_code') == 0 and type(review.get('reviews')) is list

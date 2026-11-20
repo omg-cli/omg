@@ -16,6 +16,7 @@ oracle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(oracle)
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 HASH = re.compile(r"[0-9a-f]{64}\Z")
+ARCHIVE_DIRECTORY = re.compile(r"omg-v[0-9]+\.[0-9]+\.[0-9]+-(?:x86_64|aarch64)-linux")
 
 
 def unique_object(pairs):
@@ -49,13 +50,17 @@ def digest_file(path):
 
 
 def archive_binary_hashes(archive, distro):
+    if distro not in ("arch", "debian", "debian-trixie", "ubuntu", "fedora"):
+        raise ValueError("unsupported native archive distro")
+    suffix = "-" + distro
     hashes = {}
     with tarfile.open(archive, "r:gz") as source:
         for member in source:
             parts = PurePosixPath(member.name).parts
             if not parts or parts[-1] not in ("omg", "omgd"):
                 continue
-            if (len(parts) != 2 or not re.fullmatch(r"omg-v[0-9]+\.[0-9]+\.[0-9]+-(?:x86_64|aarch64)-linux-" + distro, parts[0])
+            if (len(parts) != 2 or not parts[0].endswith(suffix)
+                    or not ARCHIVE_DIRECTORY.fullmatch(parts[0].removesuffix(suffix))
                     or not member.isfile() or member.size > 128 * 1024 * 1024 or parts[-1] in hashes):
                 raise ValueError("invalid native release pair")
             digest = hashlib.sha256()

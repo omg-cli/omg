@@ -20,6 +20,12 @@ spec.loader.exec_module(checker)
 
 
 class FedoraEvidenceTests(unittest.TestCase):
+    def test_repository_metadata_requires_utf8(self):
+        document = "<updates><update/></updates>"
+        self.assertEqual(checker.oracle.parse_repository_xml(document.encode("utf-8")).tag, "updates")
+        with self.assertRaisesRegex(ValueError, "UTF-8"):
+            checker.oracle.parse_repository_xml(document.encode("utf-16"))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name); self.evidence = self.root/'evidence'; self.evidence.mkdir()

@@ -74,7 +74,8 @@ export function validateTestAuditProposal(proposal) {
         throw new Error("Strengthening must insert one additional assertion without changing existing test bytes");
     const code = rustCode(before);
     const leaf = test.testName.split("::").at(-1);
-    const definitions = [...code.matchAll(new RegExp(`\\bfn\\s+${leaf}\\s*\\(`, "g"))];
+    const definitions = [...code.matchAll(/\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)]
+        .filter((definition) => definition[1] === leaf);
     const position = lines.slice(0, test.assertionLine - 1).join("").length;
     if (definitions.length !== 1) throw new Error("Audit test function must have one unambiguous source definition");
     const start = code.indexOf("{", definitions[0].index);

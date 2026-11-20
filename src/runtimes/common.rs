@@ -2517,6 +2517,8 @@ mod tests {
     #[tokio::test]
     async fn runtime_download_recovers_from_transient_status_without_error_body()
     -> anyhow::Result<()> {
+        use rustix::fs::{Mode, OFlags, openat};
+
         for status in [408, 429, 500, 502, 503, 504] {
             let directory = tempfile::tempdir()?;
             let dest = directory.path().join("archive.tar.gz");
@@ -2526,7 +2528,18 @@ mod tests {
             let (temporary, actual) = result?;
             let expected = b"verified runtime archive fixture";
             assert_eq!(actual, hex::encode(Sha256::digest(expected)));
-            assert_eq!(fs::read(&temporary)?, expected);
+            assert_eq!(temporary.parent(), Some(directory.path()));
+            let root = File::open(directory.path())?;
+            let name = temporary.file_name().context("Download lacks a filename")?;
+            let handle = openat(
+                &root,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+            let mut written = Vec::new();
+            File::from(handle).read_to_end(&mut written)?;
+            assert_eq!(written, expected);
             assert!(
                 !dest.exists(),
                 "unverified downloads must remain unpublished"

@@ -46,11 +46,6 @@ def config(text):
     return {section: dict(value.items(section)) for section in value.sections()}
 
 
-def xml_document(data):
-    if b'<!DOCTYPE' in data or b'<!ENTITY' in data: raise ValueError('metadata declarations are refused')
-    return ET.fromstring(data)
-
-
 def validate_structure(directory, archive, fixture):
     try:
         text = lambda name: bound.read_text(directory, name)
@@ -155,7 +150,7 @@ def validate_structure(directory, archive, fixture):
         packed = read_bytes(directory,'updateinfo.xml.gz'); xml = read_bytes(directory,'updateinfo.xml')
         with gzip.GzipFile(fileobj=io.BytesIO(packed)) as compressed: opened = compressed.read(bound.MAX_EVIDENCE_BYTES+1)
         if len(opened)>bound.MAX_EVIDENCE_BYTES or opened!=xml: raise ValueError('compressed native metadata differs from open updateinfo')
-        repomd = xml_document(read_bytes(directory,'repomd.xml')); entries = repomd.findall(NS+'data')
+        repomd = oracle.parse_repository_xml(read_bytes(directory,'repomd.xml')); entries = repomd.findall(NS+'data')
         matches = [entry for entry in entries if entry.get('type')=='updateinfo']
         if len(matches)!=1: raise ValueError('signed repository metadata omitted or repeated updateinfo')
         entry = matches[0]
@@ -165,7 +160,7 @@ def validate_structure(directory, archive, fixture):
         if (entry.find(NS+'size').text != str(len(packed)) or entry.find(NS+'open-size').text != str(len(xml))
                 or not re.fullmatch(r'repodata/[0-9a-f]{64}-updateinfo\.xml\.gz',entry.find(NS+'location').get('href',''))):
             raise ValueError('signed native metadata size or path mismatch')
-        updates = xml_document(xml).findall('update'); expected_ids = ['OMG-QEMU-FEDORA-616','OMG-QEMU-FEDORA-FIXED','OMG-QEMU-FEDORA-FOREIGN']
+        updates = oracle.parse_repository_xml(xml).findall('update'); expected_ids = ['OMG-QEMU-FEDORA-616','OMG-QEMU-FEDORA-FIXED','OMG-QEMU-FEDORA-FOREIGN']
         if [row.findtext('id') for row in updates] != expected_ids: raise ValueError('native positive and exclusion controls are incomplete')
         for index,row in enumerate(updates):
             packages = row.findall('./pkglist/collection/package'); wanted = dict(identity)

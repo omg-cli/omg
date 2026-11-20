@@ -351,11 +351,8 @@ async fn sync_aur_metadata_at(
     Ok(())
 }
 
-/// Read and parse the metadata archive (if you need the raw JSON)
-/// Note: prefer using `AurIndex` for lookups
 #[cfg(test)]
-pub fn read_metadata_archive(path: &Path) -> Result<Vec<AurJsonPackage>> {
-    let file = File::open(path)?;
+fn read_metadata_archive(file: File) -> Result<Vec<AurJsonPackage>> {
     let reader = BufReader::new(file);
     let decoder = GzDecoder::new(reader);
     serde_json::from_reader(decoder).map_err(Into::into)
@@ -671,7 +668,7 @@ mod tests {
         let (published_archive, _) = generation_paths(root, &manifest).unwrap();
         assert_eq!(std::fs::read(&published_archive).unwrap(), archive);
         assert_eq!(
-            read_metadata_archive(&published_archive).unwrap()[0].name,
+            read_metadata_archive(File::open(&published_archive).unwrap()).unwrap()[0].name,
             "new"
         );
         assert!(index.get("new").unwrap().is_some());
@@ -916,7 +913,7 @@ mod tests {
             .set_modified(now - Duration::from_secs(1))
             .unwrap();
         assert_eq!(
-            read_metadata_archive(&archive).unwrap()[0].name,
+            read_metadata_archive(File::open(&archive).unwrap()).unwrap()[0].name,
             "package-b"
         );
         assert!(

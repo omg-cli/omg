@@ -1,5 +1,6 @@
 """Exercise the Arch AUR flag oracle, including false-green product mutants."""
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -108,6 +109,20 @@ class AurContractTests(unittest.TestCase):
                          "aur-detailed.json", "aur-no-aur.json", "aur-basic.json"):
             self.assertIn(f'"{filename}"', exporter)
         self.assertTrue(FIXTURE.is_file())
+
+    def test_docker_uses_the_fixtures_installed_in_the_image(self):
+        dockerfile = (ROOT / "Dockerfile.arch-e2e").read_text(encoding="utf-8")
+        fixture_path = "/usr/local/libexec/omg"
+        self.assertIn(f"COPY scripts/qemu-aur-fixture.py {fixture_path}/qemu_aur_fixture.py", dockerfile)
+        driver = (ROOT / "tests/docker_e2e.rs").read_text(encoding="utf-8")
+        for name in ("docker-info-fixture.py", "docker-install-fixture.py"):
+            with self.subTest(fixture=name):
+                script = (ROOT / "scripts" / name).read_text(encoding="utf-8")
+                calls = (node.func.id for node in ast.walk(ast.parse(script))
+                         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name))
+                self.assertTrue({"exec", "eval", "compile"}.isdisjoint(calls))
+                self.assertIn(f"COPY scripts/{name} {fixture_path}/{name}", dockerfile)
+                self.assertIn(f'"{fixture_path}/{name}"', driver)
 
 
 if __name__ == "__main__":
