@@ -1230,7 +1230,9 @@ def closed_pgp_checksum_prefixes(name, source, inventory, files, spans, structur
 def _compiled_function_groups(name, owners, files, source, work=None, source_structure=None,
                               validated_spans=None, shared_prefixes=None):
     if work is not None:
-        _construct_charge(work, len(source) + len(owners))
+        _construct_charge(work, len(owners))
+        if validated_spans is None or shared_prefixes is None:
+            _construct_charge(work, len(source))
         _construct_charge(work, sum(len(owner['filenames']) for owner in owners))
     names = Counter(owner['name'] for owner in owners)
     inventory = [owner for owner in owners if any(
@@ -13031,13 +13033,17 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         before, after = bs[name]["counts"], hs[name]["counts"]
         if any(line > len(old) for line in before) or any(line > len(new) for line in after):
             raise ValueError("Coverage line exceeds exact source blob")
+        _construct_charge(construct_work, len(old) + (0 if same_source else len(new)))
+        base_occurrences = Counter(old)
+        head_occurrences = base_occurrences if same_source else Counter(new)
         source_owners = []
-        for functions, files, source in [(owners_by_file.get(name, []), base_files, old),
-                                         (head_owners_by_file.get(name, []), head_files, new)]:
+        for functions, files, source, occurrences in [
+            (owners_by_file.get(name, []), base_files, old, base_occurrences),
+            (head_owners_by_file.get(name, []), head_files, new, head_occurrences),
+        ]:
             spans = {}; declarations = {}; headers = {}
-            _construct_charge(construct_work, len(source) + sum(len(owner['regions']) + len(owner['filenames'])
-                                                              for owner in functions))
-            occurrences = Counter(source)
+            _construct_charge(construct_work, sum(len(owner['regions']) + len(owner['filenames'])
+                                                  for owner in functions))
             for function in functions:
                 span = source_owner_span(function, name, files, source)
                 if span is not None:
@@ -13183,27 +13189,26 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}; neutral_declarations = {}
         declaration_roles = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
-        _construct_charge(construct_work, len(base_groups) + len(head_groups))
-        missing_prefixes = base_groups.keys() - head_groups.keys()
-        head_functions = set()
-        if missing_prefixes and old != new:
-            _construct_charge(construct_work, sum(len(line) + 1 for line in new))
-            head_functions.update(re.findall(r'(?=\bfn\s+(\w+)\b)', '\n'.join(new)))
         removed_prefixes = set()
-        for prefix in missing_prefixes:
-            _construct_charge(construct_work, len(prefix))
-            if re.search(r'\bfn\s+(\w+)', prefix)[1] not in head_functions:
-                removed_prefixes.add(prefix)
         partitions = []
-        for groups in (base_groups, head_groups):
-            rows = {}
-            for prefix, group in groups.items():
-                _construct_charge(construct_work, group[1] - group[0] + 1)
-                for number in range(group[0], group[1] + 1):
-                    rows[number] = (prefix, group) if number not in rows else None
-            partitions.append(rows)
         compatible_head_scopes = {}
         if inventories is not None:
+            _construct_charge(construct_work, len(base_groups) + len(head_groups))
+            missing_prefixes = base_groups.keys() - head_groups.keys()
+            if missing_prefixes:
+                _construct_charge(construct_work, sum(len(line) + 1 for line in new))
+                head_functions = set(re.findall(r'(?=\bfn\s+(\w+)\b)', '\n'.join(new)))
+                for prefix in missing_prefixes:
+                    _construct_charge(construct_work, len(prefix))
+                    if re.search(r'\bfn\s+(\w+)', prefix)[1] not in head_functions:
+                        removed_prefixes.add(prefix)
+            for groups in (base_groups, head_groups):
+                rows = {}
+                for prefix, group in groups.items():
+                    _construct_charge(construct_work, group[1] - group[0] + 1)
+                    for number in range(group[0], group[1] + 1):
+                        rows[number] = (prefix, group) if number not in rows else None
+                partitions.append(rows)
             for start, end, newstart, newend in set(function_scopes):
                 _construct_charge(construct_work, end - start + 1)
                 for line in range(start, end + 1):

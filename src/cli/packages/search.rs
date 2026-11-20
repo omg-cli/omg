@@ -1077,6 +1077,72 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "arch")]
+    #[test]
+    fn native_arch_search_reads_the_local_aur_catalog() -> Result<()> {
+        const TEST: &str =
+            "cli::packages::search::tests::native_arch_search_reads_the_local_aur_catalog";
+        if crate::core::testing::run_isolated_test(TEST)
+            || crate::config::Settings::rerun_test_unprivileged(TEST)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !crate::core::is_root(),
+            "search fixture requires an ordinary user"
+        );
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("root");
+        let database = root.join("var/lib/pacman");
+        std::fs::create_dir_all(database.join("local"))?;
+        std::fs::create_dir(database.join("sync"))?;
+        std::fs::write(database.join("local/ALPM_DB_VERSION"), "9\n")?;
+        let pacman = fixture.path().join("pacman.conf");
+        std::fs::write(&pacman, "[options]\nSigLevel = Never\n")?;
+        let cache = fixture.path().join("cache");
+        let settings_dir = fixture.path().join("config");
+        let data = fixture.path().join("data");
+        let socket = fixture.path().join("absent.sock");
+        crate::core::paths::set_test_overrides(Some(root), Some(database));
+        temp_env::with_vars(
+            [
+                ("OMG_TEST_MODE", None),
+                ("OMG_TEST_DISTRO", None),
+                ("OMG_PACMAN_CONF", Some(pacman.as_os_str())),
+                ("OMG_CACHE_DIR", Some(cache.as_os_str())),
+                ("OMG_CONFIG_DIR", Some(settings_dir.as_os_str())),
+                ("OMG_DATA_DIR", Some(data.as_os_str())),
+                ("OMG_SOCKET_PATH", Some(socket.as_os_str())),
+            ],
+            || -> Result<()> {
+                assert_eq!(crate::package_managers::resolve_backend()?, Backend::Arch);
+                let mut settings = crate::config::Settings::default();
+                settings.aur.use_metadata_archive = true;
+                settings.aur.metadata_cache_ttl_secs = 3600;
+                settings.save()?;
+                let archive = fixture.path().join("metadata.json.gz");
+                let metadata = br#"[{"Name":"omg-search-fixture","Version":"2-1","Description":"Local AUR result","Maintainer":null,"NumVotes":0,"Popularity":0.0,"OutOfDate":null,"LastModified":1}]"#;
+                let file = std::fs::File::create(&archive)?;
+                let mut compressed =
+                    flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+                compressed.write_all(metadata)?;
+                compressed.finish()?;
+                crate::package_managers::aur_metadata::publish_test_metadata(&archive)?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime.block_on(async {
+                    let matches = super::search_aur_packages("omg-search-fixture", false).await?;
+                    assert_eq!(matches.len(), 1);
+                    assert_eq!(matches[0].name, "omg-search-fixture");
+                    assert_eq!(matches[0].version, "2-1");
+                    super::search_with_json("omg-search-fixture", false, true, false, 10).await?;
+                    super::search_with_json("x", false, true, true, 10).await
+                })
+            },
+        )
+    }
+
     #[test]
     fn fedora_search_parity_cli_native_literal_rows_are_the_expected_prefix() {
         use crate::daemon::index::search_parity_fixture::{EXPECTED, RECORDS};

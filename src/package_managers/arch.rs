@@ -185,10 +185,8 @@ pub fn execute_native_omarchy_operation(
                 None
             } else {
                 Some(super::alpm_direct::with_handle(|handle| {
-                    let (database, package) = super::alpm_ops::omarchy_install_candidate(handle, name)?
-                        .with_context(|| format!(
-                            "Omarchy package {name} is unavailable from configured install repositories"
-                        ))?;
+                    let (database, package) =
+                        super::alpm_ops::omarchy_install_candidate(handle, name)?;
                     Ok((package.version().to_string(), database.name().to_owned()))
                 })?)
             };

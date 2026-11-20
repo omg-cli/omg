@@ -143,17 +143,17 @@ pub(crate) fn validate_sync_database(alpm: &alpm::Alpm, database: &alpm::Db) -> 
 pub(crate) fn omarchy_install_candidate<'a>(
     alpm: &'a alpm::Alpm,
     name: &str,
-) -> Result<Option<(&'a alpm::Db, &'a alpm::Package)>> {
+) -> Result<(&'a alpm::Db, &'a alpm::Package)> {
     for database in alpm.syncdbs() {
         if !database.usage()?.contains(alpm::Usage::INSTALL) {
             continue;
         }
         validate_sync_database(alpm, database)?;
         if let Ok(package) = database.pkg(name) {
-            return Ok(Some((database, package)));
+            return Ok((database, package));
         }
     }
-    Ok(None)
+    anyhow::bail!("Omarchy package {name} is unavailable from configured install repositories")
 }
 
 pub fn get_update_list() -> Result<Vec<UpdateInfo>> {
@@ -697,8 +697,7 @@ fn execute_transaction_in(
     configure_mirrors(alpm)?;
     if matches!(policy, TransactionPolicy::Omarchy) && kind == TransactionKind::Install {
         for name in &packages {
-            let (database, _) =
-                omarchy_install_candidate(alpm, name)?.context("Omarchy package is unavailable")?;
+            let (database, _) = omarchy_install_candidate(alpm, name)?;
             let level = database.siglevel();
             anyhow::ensure!(
                 level.contains(alpm::SigLevel::PACKAGE)
@@ -4694,7 +4693,15 @@ mod tests {
                 let lookup = alpm.syncdbs().first().expect("fixture repository");
                 assert_eq!(lookup.usage()?, alpm::Usage::SEARCH);
                 assert_eq!(lookup.pkg(package)?.name(), package);
-                assert!(super::omarchy_install_candidate(&alpm, package)?.is_none());
+                let refusal = super::omarchy_install_candidate(&alpm, package)
+                    .map(drop)
+                    .expect_err("a search-only repository cannot supply an install candidate");
+                assert_eq!(
+                    refusal.to_string(),
+                    format!(
+                        "Omarchy package {package} is unavailable from configured install repositories"
+                    )
+                );
 
                 let error = super::execute_transaction_in(
                     vec![package.to_owned()],
@@ -4705,7 +4712,7 @@ mod tests {
                     super::TransactionPolicy::Omarchy,
                 )
                 .expect_err("search visibility cannot authorize a package transaction");
-                assert_eq!(error.to_string(), "Omarchy package is unavailable");
+                assert_eq!(error.to_string(), refusal.to_string());
                 assert!(alpm.localdb().pkg(package).is_err());
                 assert!(!fixture.database().join("db.lck").exists());
                 Ok(())
