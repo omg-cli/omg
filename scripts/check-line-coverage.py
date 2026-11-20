@@ -13602,6 +13602,117 @@ _AUR_DEPS_SOURCE = 'src/package_managers/aur_deps.rs'
 _ALPM_RELATION_SOURCE = 'src/package_managers/types.rs'
 
 
+def retained_aur_archive_capture(name, sides, indexes, work):
+    """Observe capture, digest and identity work under the same zipped archive callback."""
+    prefix = ['        paths', '            .iter()', '            .zip(outputs)', '            .map(|(path, output)| {',
+              '                let snapshot = ArchiveSnapshot::capture(path)?;']
+    tail = ['                snapshot.verify_sha256(&inspection.archive_sha256)?;',
+            '                let identity = Self::cached_archive_identity(Path::new(&snapshot.handoff()))?',
+            '                    .context("Archive lacks package identity")?;']
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows) + len(source))
+        candidates = [line for line, text in enumerate(source) if text == prefix[-1]]
+        if len(candidates) != 1:
+            return None
+        line, = candidates
+        inspect = (['                let admission = artifact_inspector::inspect_archive(&snapshot.path())?;',
+                    '                let inspection = admission.inspection();'] if modern else
+                   ['                let inspection = artifact_inspector::inspect_archive(&snapshot.path())?;'])
+        if line < len(prefix) - 1 or source[line - 4:line + 1 + len(inspect) + len(tail)] != [*prefix, *inspect, *tail]:
+            return None
+        first = bisect.bisect_left(code.starts, code.offsets[line])
+        ancestry = _construct_ancestors(code, first, work)
+        if len(ancestry) != 4:
+            return None
+        callback, call, function, parent = ancestry
+        declared = [row for row in rows if row['opening'] == function and row['kind'] == 'fn'
+                    and row['header'][:3] == ('fn', 'authorize_archives', '(')]
+        if (len(declared) != 1 or first != callback + 1 or code.words[call - 1] != 'map'
+                or not any(row['opening'] == parent and row['header'] == ('impl', 'AurClient') for row in rows)):
+            return None
+        entry = code.region(callback, callback)
+        end = code.region(code.pairs[callback], code.pairs[callback])
+        tail_start = line + 2 + len(inspect)
+        lines = (line + 1, *range(tail_start, end[0]))
+        positions = {selected: ordinal for ordinal, selected in enumerate(lines)}
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['regions']) * (len(lines).bit_length() + 1)
+                                   + len(owner['name']) + 1 for owner in owners))
+        copies = {}; affected = set()
+        for owner in owners:
+            name_key = owner['name']
+            relevant = [r for r in owner['regions'] if (at := bisect.bisect_left(lines, r[0])) < len(lines)
+                        and lines[at] <= r[2]]
+            shape = nominal_method_path(name_key) if '18authorize_archives' in name_key else None
+            if (shape is None or shape.kind != 'M' or shape.namespace != _AUR_CLIENT_NAMESPACE
+                    or shape.self_type != ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
+                    or shape.method != ('authorize_archives', '')
+                    or shape.callbacks not in ((), ('s_',), ('s_', ''), ('s_', 's_'))):
+                if relevant:
+                    return None
+                continue
+            members = copies.setdefault(shape.copy_identity, {})
+            if (shape.callbacks in members or index.name_counts[name_key] != 1 or owner.get('branches')
+                    or owner.get('mcdc_records') or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name):
+                return None
+            if not shape.callbacks or relevant:
+                members[shape.callbacks] = (owner, relevant)
+            if relevant:
+                affected.add(id(owner))
+        if not 1 <= len(copies) <= 16:
+            return None
+        layouts = set(); states = []; witnesses = []; projections = Counter(); covered = set()
+        for members in copies.values():
+            if not {(), ('s_',)} <= members.keys():
+                return None
+            root, parent_regions = members[()]
+            body, regions = members[('s_',)]
+            markers = [r for r in body['regions'] if tuple(r[:4]) in (entry, end)]
+            if (parent_regions or not regions or [tuple(r[:4]) for r in markers] != [entry, end]
+                    or markers[0][4:] != [body['count'], 0, 0, 0]
+                    or not 0 <= markers[1][4] <= body['count'] < COUNTER_LIMIT
+                    or markers[1][5:] != [0, 0, 0] or body['count'] and not root['count']):
+                return None
+            geometry = []; hits = []; selected_regions = []; symbols = [root['name']]
+            for scope in sorted(members.keys() - {()}):
+                owner, raw = members[scope]
+                _construct_charge(work, len(raw))
+                if (not 0 <= owner['count'] <= body['count']
+                        or any(r[0] not in positions or r[2] not in positions or r[5:] != [0, 0, 0]
+                               or not 0 <= r[4] <= owner['count'] for r in raw)):
+                    return None
+                geometry.append((scope, tuple((positions[r[0]], r[1], positions[r[2]], r[3]) for r in raw)))
+                hits.extend(int(r[4] > 0) for r in raw)
+                selected_regions.extend(raw)
+                symbols.append(owner['name'])
+                covered.add(id(owner))
+            layouts.add(tuple(geometry))
+            states.append(tuple(hits))
+            projections.update(_owner_line_counts({'regions': selected_regions}, _ObserverWork(work)))
+            witnesses.append(symbols)
+        _construct_charge(work, len(lines))
+        projection = {n: projections[n] for n in lines if n in projections}
+        if (covered != affected or len(layouts) != 1 or not any(projections.values())
+                or projection != {n: counts[n] for n in lines if n in counts}):
+            return None
+        observations.append(((line + 1, *range(tail_start, end[0])), next(iter(layouts)), states, witnesses,
+                             declared[0]['header'], source[tail_start - 1:end[0] - 1],
+                             tuple(positions[n] for n in projection)))
+    before, after = observations
+    if before[1] != after[1] or before[4:] != after[4:]:
+        return None
+    _construct_charge(work, len(before[2]) * len(after[2]) * len(before[2][0]))
+    matching = compiled_hit_state_matching(before[2], after[2])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-aur-archive-capture',
+                pairs=[[before[0][ordinal], after[0][ordinal]] for ordinal in before[6]],
+                geometry=before[1], owners=[before[3], after[3]], instance_matching=matching)
+
+
 def retained_artifact_reason_matrix(name, sides, indexes, work):
     """Verify every existing case still checks its reason, including overlapping classes."""
     declaration = 'inspector_requires_paired_build_for_system_integration_payloads'
@@ -14377,6 +14488,135 @@ def retained_cached_upgrade_comparison(name, sides, indexes, work):
     return dict(file=name, kind='retained-cached-upgrade-comparison',
                 pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
                 regions=[before[2], after[2]], owners=[before[3], after[3]], instance_matching=matching)
+
+
+def retained_pacman_pattern_inputs(name, sides, indexes, work, *, matcher=False):
+    """Observe the same input bindings on the native pacman pattern compiler."""
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        pattern_type = 'PacmanPatterns' if modern else 'globset::GlobSet'
+        if matcher:
+            declaration = 'package_is_ignored' if modern else 'sync_package_is_ignored'
+            package = ['    name: &str,', '    groups: &[String],'] if modern else ['    package: &SyncDbPackage,']
+            signature = [f'fn {declaration}(', *package, f'    ignored_packages: &{pattern_type},',
+                         f'    ignored_groups: &{pattern_type},', ') -> bool {']
+            predicate = (['    ignored_packages.is_match(name) || groups.iter().any(|group| ignored_groups.is_match(group))']
+                         if modern else ['    ignored_packages.is_match(&package.name)', '        || package',
+                                         '            .groups', '            .iter()',
+                                         '            .any(|group| ignored_groups.is_match(group))'])
+        else:
+            declaration = 'compile_package_patterns' if modern else 'compile_ignore_patterns'
+            signature = [f'pub(crate) fn {declaration}(', '    patterns: &[String],', '    setting: &str,',
+                         f') -> Result<{pattern_type}> {{']
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows) + len(source))
+        functions = [row for row in rows if row['kind'] == 'fn' and declaration in row['header']
+                     and code.parents[row['opening']] is None]
+        if len(functions) != 1:
+            return None
+        function, = functions
+        entry = code.region(function['first'], function['opening'] - 1)
+        line = entry[0]
+        if source[line - 1:line - 1 + len(signature)] != signature or entry[2] != line + len(signature) - 1:
+            return None
+        if matcher and source[entry[2]:code.region(function['end'], function['end'])[2]] != [*predicate, '}']:
+            return None
+        lines = (entry[2],) if matcher else (line + 1, line + 2)
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        witnesses = []
+        for owner in owners:
+            touching = [r for r in owner['regions'] if r[0] <= lines[-1] and lines[0] <= r[2]]
+            symbol = owner['name']
+            shape = plain_rust_function_symbol(symbol) if declaration in symbol else None
+            qualified = shape is not None and shape.identifiers == (
+                'omg_lib', 'package_managers', 'pacman_db', 'db', declaration)
+            if not touching and not qualified:
+                continue
+            hits = owner['count']
+            if (not qualified or touching != [[*entry, hits, 0, 0, 0]] or not 0 <= hits < COUNTER_LIMIT
+                    or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
+                    or index.name_counts[symbol] != 1 or owner.get('branches') or owner.get('mcdc_records')):
+                return None
+            witnesses.append((symbol, hits))
+        total = sum(hits for _, hits in witnesses)
+        if not witnesses or not total or any(counts.get(line) != total for line in lines):
+            return None
+        observations.append((lines, [[int(hits > 0)] for _, hits in witnesses], entry, witnesses))
+    before, after = observations
+    _construct_charge(work, len(before[1]) * len(after[1]))
+    matching = compiled_hit_state_matching(before[1], after[1])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-pacman-pattern-matcher' if matcher else 'retained-pacman-pattern-inputs',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                regions=[before[2], after[2]], compiled_entries=[before[3], after[3]], instance_matching=matching)
+
+
+def retained_pacman_pattern_matcher(name, sides, indexes, work):
+    return retained_pacman_pattern_inputs(name, sides, indexes, work, matcher=True)
+
+
+def retained_pacman_foreign_catalog_reads(name, sides, indexes, work):
+    """Observe the same catalog reads and locks inside the epoch-checked inventory."""
+    reads = ['    let sync_dir = paths::pacman_sync_dir_result()?;', '    let local_dir = paths::pacman_local_dir_result()?;',
+             '', '    ensure_sync_cache_loaded(&sync_dir)?;', '    ensure_local_cache_loaded(&local_dir)?;', '',
+             '    let sync_cache = read_lock(&SYNC_DB_CACHE);', '    let local_cache = read_lock(&LOCAL_DB_CACHE);']
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        declaration = 'get_potential_aur_package_records' if modern else 'get_potential_aur_packages'
+        header = (f'pub(crate) fn {declaration}() -> Result<Vec<LocalDbPackage>> {{' if modern
+                  else f'pub fn {declaration}() -> Result<Vec<String>> {{')
+        guard = ['    let before = AlpmCatalogEpoch::observe()?;'] if modern else []
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows) + len(source))
+        matches = [row for row in rows if row['kind'] == 'fn' and declaration in row['header']
+                   and code.parents[row['opening']] is None]
+        if len(matches) != 1:
+            return None
+        function, = matches
+        first = code.region(function['first'], function['first'])[0]
+        if source[first - 1:first + len(guard) + len(reads)] != [header, *guard, *reads]:
+            return None
+        start = first + len(guard) + 1
+        selected = tuple(start + i for i, text in enumerate(reads) if text)
+        stop = selected[-1]
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        layouts = set(); states = []; witnesses = []; projection = Counter()
+        for owner in owners:
+            symbol = owner['name']
+            raw = [r for r in owner['regions'] if r[0] <= stop and start <= r[2]]
+            shape = plain_rust_function_symbol(symbol) if declaration in symbol else None
+            qualified = shape is not None and shape.identifiers == (
+                'omg_lib', 'package_managers', 'pacman_db', 'db', declaration)
+            if not raw and not qualified:
+                continue
+            if (not qualified or not raw or index.name_counts[symbol] != 1 or owner.get('branches')
+                    or owner.get('mcdc_records') or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name or not 0 <= owner['count'] < COUNTER_LIMIT
+                    or any(not start <= r[0] <= r[2] <= stop or r[5:] != [0, 0, 0]
+                           or not 0 <= r[4] <= owner['count'] for r in raw)):
+                return None
+            _construct_charge(work, len(raw))
+            layouts.add(tuple((r[0] - start, r[1], r[2] - start, r[3]) for r in raw))
+            states.append(tuple(int(r[4] > 0) for r in raw))
+            projection.update(_owner_line_counts({'regions': raw}, _ObserverWork(work)))
+            witnesses.append(symbol)
+        if (len(layouts) != 1 or not any(projection.values())
+                or any(n not in counts or counts[n] != projection.get(n) for n in selected)):
+            return None
+        observations.append((selected, next(iter(layouts)), states, witnesses))
+    before, after = observations
+    if before[1] != after[1]:
+        return None
+    _construct_charge(work, len(before[2]) * len(after[2]) * len(before[2][0]))
+    matching = compiled_hit_state_matching(before[2], after[2])
+    if matching is None:
+        return None
+    return dict(file=name, kind='retained-pacman-foreign-catalog-reads',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                geometry=before[1], owners=[before[3], after[3]], instance_matching=matching)
 
 
 def retained_node_checksum_wait(name, sides, indexes, work):
@@ -15195,7 +15435,9 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         _AUR_GIT_SOURCE: (retained_aur_git_limits, retained_aur_prefetch_test_wait,
                           retained_aur_git_fixture_limits, retained_aur_git_cancellation_entry),
         _AUR_DEPS_SOURCE: (retained_aur_dependency_packages,),
-        'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison,),
+        'src/package_managers/aur/client.rs': (retained_aur_archive_capture,),
+        'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison, retained_pacman_pattern_inputs,
+                                                retained_pacman_pattern_matcher, retained_pacman_foreign_catalog_reads),
         'src/runtimes/node.rs': (retained_node_checksum_wait,),
     }
     for name in bs:

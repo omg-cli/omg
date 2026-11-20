@@ -339,6 +339,57 @@ class MovedAurSrcinfoCoverageTests(unittest.TestCase):
                     self.assertIsNone(proof)
 
 
+class AurArchiveCaptureCoverageTests(unittest.TestCase):
+    def test_archive_capture_keeps_the_same_zipped_path_and_digest_verification(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'changed-path', 'changed-hash', 'changed-output', 'foreign-callback', 'lost-callback'):
+            with self.subTest(fault=fault):
+                sides, indexes = [], []
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                for side in range(2):
+                    path = 'other' if side and fault == 'changed-path' else 'path'
+                    digest = 'different' if side and fault == 'changed-hash' else 'archive_sha256'
+                    output = 'different' if side and fault == 'changed-output' else 'snapshot'
+                    source = [
+                        'impl AurClient {', '    fn authorize_archives() -> Result<()> {',
+                        '        paths', '            .iter()', '            .zip(outputs)',
+                        '            .map(|(path, output)| {',
+                        f'                let snapshot = ArchiveSnapshot::capture({path})?;',
+                        *(['                let admission = artifact_inspector::inspect_archive(&snapshot.path())?;',
+                           '                let inspection = admission.inspection();'] if side else [
+                           '                let inspection = artifact_inspector::inspect_archive(&snapshot.path())?;']),
+                        f'                snapshot.verify_sha256(&inspection.{digest})?;',
+                        '                let identity = Self::cached_archive_identity(Path::new(&snapshot.handoff()))?',
+                        '                    .context("Archive lacks package identity")?;',
+                        f'                Ok({output})', '            })', '            .collect()', '    }', '}',
+                    ]
+                    start = 9 + side
+                    close = len(source) - 3
+                    method = f'NvMs2_NtNtNtCs{side + 1}_7omg_lib16package_managers3aur6clientNtB5_9AurClient18authorize_archives'
+                    callback = method.replace('NtB5_', 'NtB7_')
+                    if side and fault == 'foreign-callback':
+                        callback = callback.replace('18authorize_archives', '15inspect_package')
+                    raw = [[6, 35, 6, 36, 1, 0, 0, 0],
+                           [7, 21, 7, 29, 1, 0, 0, 0], [7, 32, 7, 56, 1, 0, 0, 0],
+                           [7, 57, 7, 61, 1, 0, 0, 0], [7, 62, 7, 63, 0, 0, 0, 0],
+                           *[[line, 17, line, 25, 1, 0, 0, 0] for line in range(start, start + 4)],
+                           [close, 13, close, 14, 1, 0, 0, 0]]
+                    owners = [dict(name='_R' + method, count=1, filenames=list(files),
+                                   regions=[[2, 5, 2, 40, 1, 0, 0, 0]])]
+                    if not (side and fault == 'lost-callback'):
+                        owners.append(dict(name='_RNC' + callback + 's_0Bd_', count=1, filenames=list(files), regions=raw))
+                    counts = {line: 1 for line in (7, *range(start, start + 4))}
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_archive_capture(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[7, 7], [9, 10], [10, 11], [11, 12], [12, 13]])
+                else:
+                    self.assertIsNone(proof)
+
+
 class BudgetedReaderCoverageTests(unittest.TestCase):
     def test_new_decoder_copy_preserves_every_existing_read_specialization(self):
         filename = 'src/runtimes/common.rs'
@@ -431,6 +482,110 @@ class RetainedNodeChecksumWaitTests(unittest.TestCase):
 
 
 class PacmanFixtureCoverageTests(unittest.TestCase):
+    def test_foreign_inventory_reads_both_catalogs_under_the_epoch_guard(self):
+        filename = 'src/package_managers/pacman_db/db.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'missing-guard', 'different-directory', 'cold-copy'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, starts = [], [], []
+                for side in range(2):
+                    declaration = 'get_potential_aur_package_records' if side else 'get_potential_aur_packages'
+                    header = (f'pub(crate) fn {declaration}() -> Result<Vec<LocalDbPackage>> {{' if side
+                              else f'pub fn {declaration}() -> Result<Vec<String>> {{')
+                    source = [header]
+                    if side and fault != 'missing-guard':
+                        source.append('    let before = AlpmCatalogEpoch::observe()?;')
+                    start = len(source) + 1
+                    starts.append(start)
+                    cache_path = 'pacman_cache_dir_result' if side and fault == 'different-directory' else 'pacman_sync_dir_result'
+                    source.extend([f'    let sync_dir = paths::{cache_path}()?;', '    let local_dir = paths::pacman_local_dir_result()?;',
+                                   '', '    ensure_sync_cache_loaded(&sync_dir)?;', '    ensure_local_cache_loaded(&local_dir)?;',
+                                   '', '    let sync_cache = read_lock(&SYNC_DB_CACHE);',
+                                   '    let local_cache = read_lock(&LOCAL_DB_CACHE);', '    Ok(result)', '}'])
+                    lines = [start + offset for offset in (0, 1, 3, 4, 6, 7)]
+                    owners = []
+                    for copy in range(2):
+                        count = 0 if side and copy and fault == 'cold-copy' else 1
+                        symbol = f'_RNvNtNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers9pacman_db2db{len(declaration)}{declaration}'
+                        owners.append(dict(name=symbol, count=count, filenames=list(files),
+                                           regions=[[1, 1, 1, len(header) - 1, count, 0, 0, 0],
+                                                    *[[line, 9, line, 16, count, 0, 0, 0] for line in lines]]))
+                    sides.append((source, coverage._construct_inventory(source, work), dict.fromkeys(lines, 2)))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_pacman_foreign_catalog_reads(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[old + delta for old in starts] for delta in (0, 1, 3, 4, 6, 7)])
+                else:
+                    self.assertIsNone(proof)
+
+    def test_ignore_selection_keeps_package_name_and_group_matching(self):
+        filename = 'src/package_managers/pacman_db/db.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'wrong-group-field', 'no-head-hit'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, entries = [], [], []
+                for side in range(2):
+                    declaration = 'package_is_ignored' if side else 'sync_package_is_ignored'
+                    patterns = 'PacmanPatterns' if side else 'globset::GlobSet'
+                    source = [f'fn {declaration}(', *(['    name: &str,', '    groups: &[String],'] if side else [
+                                  '    package: &SyncDbPackage,']), f'    ignored_packages: &{patterns},',
+                              f'    ignored_groups: &{patterns},', ') -> bool {']
+                    entry = len(source)
+                    entries.append(entry)
+                    group_check = 'ignored_packages' if side and fault == 'wrong-group-field' else 'ignored_groups'
+                    source.extend([f'    ignored_packages.is_match(name) || groups.iter().any(|group| {group_check}.is_match(group))']
+                                  if side else ['    ignored_packages.is_match(&package.name)', '        || package',
+                                                '            .groups', '            .iter()',
+                                                '            .any(|group| ignored_groups.is_match(group))'])
+                    source.append('}')
+                    symbol = f'_RNvNtNtNtCs{side + 1}_7omg_lib16package_managers9pacman_db2db{len(declaration)}{declaration}'
+                    count = 0 if side and fault == 'no-head-hit' else 1
+                    owners = [dict(name=symbol, filenames=list(files), count=count,
+                                   regions=[[1, 1, entry, len(source[entry - 1]) - 1, count, 0, 0, 0]])]
+                    sides.append((source, coverage._construct_inventory(source, work), {entry: count}))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_pacman_pattern_inputs(filename, sides, indexes, work, matcher=True)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [entries])
+                else:
+                    self.assertIsNone(proof)
+
+    def test_native_pattern_compiler_keeps_the_original_input_contract(self):
+        filename = 'src/package_managers/pacman_db/db.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'wrong-input', 'cold-copy', 'foreign-region'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes = [], []
+                for side in range(2):
+                    declaration = 'compile_package_patterns' if side else 'compile_ignore_patterns'
+                    output = 'PacmanPatterns' if side else 'globset::GlobSet'
+                    source = [f'pub(crate) fn {declaration}(', '    patterns: &[String],',
+                              '    setting: &str,', f') -> Result<{output}> {{', '    Ok(result)', '}']
+                    if side and fault == 'wrong-input':
+                        source[1] = '    patterns: &[PathBuf],'
+                    owners = []
+                    for copy in range(2):
+                        count = 0 if side and copy and fault == 'cold-copy' else 1
+                        symbol = f'_RNvNtNtNtCs{side + 1}{copy + 1}_7omg_lib16package_managers9pacman_db2db{len(declaration)}{declaration}'
+                        owners.append(dict(name=symbol, filenames=list(files), count=count,
+                                           regions=[[1, 1, 4, len(source[3]) - 1, count, 0, 0, 0],
+                                                    [6, 1, 6, 2, count, 0, 0, 0]]))
+                    if side and fault == 'foreign-region':
+                        owners.append(dict(owners[-1], name='foreign'))
+                    sides.append((source, coverage._construct_inventory(source, work), {2: 2, 3: 2}))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_pacman_pattern_inputs(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertEqual(proof['pairs'], [[2, 2], [3, 3]])
+                else:
+                    self.assertIsNone(proof)
+
     def test_cached_upgrade_comparison_keeps_the_same_typed_operands(self):
         filename = 'src/package_managers/pacman_db/db.rs'
         files = {'/artifact/' + filename: filename}
