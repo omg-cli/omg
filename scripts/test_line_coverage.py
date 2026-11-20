@@ -7641,6 +7641,60 @@ class SourceAwareCoverageTests(unittest.TestCase):
             self.compare(before=observed,after=observed,mutate=owners,sources=(source,source))
         self.assertEqual(parse.call_count,1)
 
+    def callback_prefix_compare(self, fault=None):
+        filename = 'src/example.rs'
+        old = b'fn query() -> Result<()> {\n    with_handle(|handle| {\n        prepare(handle)?;\n        Ok(collect(handle))\n    })\n}\n'
+        new = old.replace(b'Ok(collect(handle))', b'collect(handle)')
+        if fault == 'different-call':
+            new = new.replace(b'with_handle(', b'other_handle(')
+
+        def bind(base, head):
+            for side, (document, source) in enumerate(((base, old), (head, new))):
+                lines = source.decode().splitlines()
+                document['data'][0]['files'][0]['expansions'] = []
+                owners = []
+                crates = (('1', '2'), ('3', '4'))[side]
+                for instance, crate in enumerate(crates):
+                    hits = int(instance == 0 or fault == 'split-execution')
+                    root = f'_RNvNtCs{crate}_7omg_lib7example5query'
+                    role = 's0_0B5_' if side and fault == 'changed-closure-role' else 's_0B5_'
+                    callback = '_RNC' + root[2:] + role
+                    start = lines[1].index('{') + 1
+                    first, last = (hits, hits)
+                    if fault == 'split-execution':
+                        first = int(instance == 0)
+                        last = int(instance == side)
+                    owners.append(dict(name=root, filenames=['/src/' + filename], count=hits,
+                        regions=[[1, 1, 1, len(lines[0]) + 1, hits, 0, 0, 0],
+                                 [2, 5, 2, lines[1].index('(') + 1, hits, 0, 0, 0],
+                                 [6, 1, 6, 2, hits, 0, 0, 0]]))
+                    if not (side == 1 and fault == 'missing-copy' and not hits):
+                        owners.append(dict(name=callback, filenames=['/src/' + filename], count=hits,
+                            regions=[[2, start, 2, start + 1, hits, 0, 0, 0],
+                                     [3, 9, 3, 16, first, 0, 0, 0],
+                                     [3, 17, 3, 24 if fault == 'short-region' and side else 26, last, 0, 0, 0],
+                                     [4, 9, 4, len(lines[3]) + 1, hits, 0, 0, 0],
+                                     [5, 5, 5, 6, hits, 0, 0, 0]]))
+                if side == 1 and fault == 'foreign-copy':
+                    owners.append(dict(name='foreign', filenames=['/src/' + filename], count=0,
+                                       regions=[[3, 9, 3, 26, 0, 0, 0, 0]]))
+                document['data'][0]['functions'] = owners
+
+        rows = [(line, 2 if fault == 'split-execution' and line != 3 else 1) for line in range(1, 7)]
+        return self.compare(before=rows, after=rows, mutate=bind,
+                            sources=({filename: old}, {filename: new}), filename=filename)
+
+    def test_retains_the_first_statement_of_the_same_callback(self):
+        receipt = self.callback_prefix_compare()
+        self.assertEqual(receipt['retained_callback_statements'][0]['pairs'], [[2, 2], [3, 3], [5, 5]])
+        self.assertEqual(receipt['deleted_mapped'], 0)
+
+    def test_callback_statement_requires_complete_corresponding_copies(self):
+        for fault in ('different-call', 'missing-copy', 'short-region', 'foreign-copy',
+                      'changed-closure-role', 'split-execution'):
+            with self.subTest(fault=fault), self.assertRaisesRegex(ValueError, 'Ambiguous unchanged work'):
+                self.callback_prefix_compare(fault)
+
     def compare(self, before=None, after=None, mutate=None, sources=None, filename="example.rs"):
         default_before, default_after = self.fixture()
         before = default_before if before is None else before

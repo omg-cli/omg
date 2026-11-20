@@ -12913,6 +12913,133 @@ def retained_specialization_additions(name, sides, indexes, inventory_for_side, 
                 base_types=len(base), head_types=len(head), added_types=sorted(map(repr, added)))
 
 
+def retained_callback_statement(name, sides, indexes, work):
+    """Prove one unchanged statement at the start of the same tail callback."""
+    identity = None
+    evidence = []
+    for (source, inventory, counts, line), index in zip(sides, indexes, strict=True):
+        code, constructs, _, statements, *_ = inventory
+        _construct_charge(work, len(constructs) + len(source[line - 1]))
+        candidates = [row for row in statements.get(line, ()) if row['supported']
+                      and code.region(row['first'], row['end'])[0::2] == (line, line)]
+        if len(candidates) != 1:
+            return None
+        statement = candidates[0]
+        first, last = statement['first'], statement['end']
+        opening = code.parents[first]
+        if opening != first - 1 or code.words[last] != ';':
+            return None
+        closures = [row for row in constructs if row['opening'] == opening
+                    and row['kind'] == 'expression' and row['supported']]
+        if len(closures) != 1:
+            return None
+        closure = closures[0]
+        call = code.parents[opening]
+        if (call is None or code.words[call] != '(' or closure['first'] != call + 1
+                or code.pairs[call] != closure['end'] + 1):
+            return None
+        parent = code.parents[call]
+        functions = [row for row in constructs if row['opening'] == parent
+                     and row['kind'] == 'fn' and row['supported']]
+        if len(functions) != 1:
+            return None
+        function = functions[0]
+        header = function['header']
+        if (code.parents[parent] is not None or code.pairs[parent] != code.pairs[call] + 1
+                or code.words[call - 1] in ('.', '!') or _boolean_attributes(code, function['first']) != []
+                or header.count('fn') != 1):
+            return None
+        declaration_token = function['first'] + header.index('fn')
+        start = code.position(code.starts[declaration_token])[0]
+        stop = code.position(code.ends[function['end']])[0]
+        _construct_charge(work, sum(len(text) + 1 for text in source[start - 1:line]))
+        prefix = source[start - 1:line]
+        if identity is not None and prefix != identity:
+            return None
+        identity = prefix
+        scope = ('omg_lib', *name.removeprefix('src/').removesuffix('.rs').split('/'),
+                 code.words[declaration_token + 1])
+        owners = index.inventories.get(name, ())
+        _construct_charge(work, sum(len(owner['name']) + len(owner['regions']) + 1 for owner in owners))
+        roots = [(owner, shape) for owner in owners
+                 if (shape := plain_rust_function_symbol(owner['name'])) is not None
+                 and shape.identifiers == scope]
+        if not 1 <= len(roots) <= 16:
+            return None
+        touching = {id(owner): owner for owner in owners if any(
+            row[0] <= line <= row[2] for row in owner['regions'])}
+        callback_start = code.region(opening, opening)
+        callback_end = code.region(closure['end'], closure['end'])
+        call_line, close_line = callback_start[0], callback_end[0]
+        if call_line != line - 1 or not line < close_line or source[close_line - 1].strip() != '})':
+            return None
+        scope_lines = (call_line, line, close_line)
+        scoped_owners = {id(owner) for owner in owners if any(
+            any(row[0] <= number <= row[2] for number in scope_lines) for row in owner['regions'])}
+        explained_owners = set()
+        lo, hi = code.region(first, last)[1::2]
+        covered = []
+        geometry = None
+        closure_role = None
+        _construct_charge(work, len(roots) * sum(len(owner['name']) + 1 for owner in touching.values()))
+        for root, shape in roots:
+            span = source_owner_span(root, name, index.files, source)
+            if (index.name_counts[root['name']] != 1 or span is None or span[:2] != (start, stop)
+                    or type(root.get('count')) is not int or not 0 <= root['count'] < COUNTER_LIMIT):
+                return None
+            callbacks = [owner for owner in touching.values()
+                         if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules)]
+            if len(callbacks) != 1:
+                return None
+            callback = callbacks[0]
+            markers = [row for row in callback['regions'] if tuple(row[:4]) in (callback_start, callback_end)]
+            if (index.name_counts[callback['name']] != 1 or callback.get('branches')
+                    or callback.get('mcdc_records') or len(callback['filenames']) != 1
+                    or index.files.get(callback['filenames'][0]) != name
+                    or type(callback.get('count')) is not int or not 0 <= callback['count'] <= root['count']
+                    or any(row[5:] != [0, 0, 0] for row in callback['regions'])
+                    or [tuple(row[:4]) for row in markers] != [callback_start, callback_end]
+                    or markers[0][4] != callback['count'] or not 0 <= markers[1][4] <= callback['count']):
+                return None
+            regions = [row for row in callback['regions'] if row[0] <= line <= row[2]]
+            if (any(row[0] != line or row[2] != line or not lo <= row[1] < row[3] <= hi for row in regions)
+                    or regions[0][1] != lo or regions[-1][3] not in (hi - 1, hi)
+                    or any(not 0 <= row[4] <= callback['count'] for row in regions)):
+                return None
+            regions.extend(markers)
+            regions.extend(row for row in root['regions'] if row[0] <= call_line <= row[2])
+            if (any(row[0] != row[2] or row[0] not in scope_lines or row[5:] != [0, 0, 0]
+                    or not 0 <= row[4] <= root['count'] for row in regions)
+                    or len({tuple(row[:4]) for row in regions}) != len(regions)):
+                return None
+            regions.sort(key=lambda row: row[:4])
+            coordinates = tuple((scope_lines.index(row[0]), row[1], row[3]) for row in regions)
+            role = callback['name'][len('_RNC' + root['name'][2:]):]
+            if geometry is not None and (geometry != coordinates or closure_role != role):
+                return None
+            geometry, closure_role = coordinates, role
+            covered.append((root['name'], callback['name'], tuple(regions),
+                            (int(callback['count'] > 0), *(int(row[4] > 0) for row in regions))))
+            del touching[id(callback)]
+            explained_owners.update((id(root), id(callback)))
+        projected = _owner_line_counts({'regions': [row for _, _, rows, _ in covered for row in rows]},
+                                       _ObserverWork(work))
+        if (touching or scoped_owners != explained_owners or any(counts.get(line, 0) <= 0 for line in scope_lines)
+                or {line: projected.get(line) for line in scope_lines} != {line: counts[line] for line in scope_lines}):
+            return None
+        evidence.append((scope_lines, scope, geometry, closure_role, covered))
+    previous, current = evidence
+    if previous[1:4] != current[1:4] or len(previous[4]) != len(current[4]):
+        return None
+    states = [[row[3] for row in side[4]] for side in evidence]
+    _construct_charge(work, len(states[0]) * len(states[1]) * len(states[0][0]))
+    if compiled_hit_state_matching(*states) is None:
+        return None
+    return dict(file=name, pairs=[list(pair) for pair in zip(previous[0], current[0], strict=True)],
+                base_owners=[list(row[:2]) for row in previous[4]],
+                head_owners=[list(row[:2]) for row in current[4]])
+
+
 def require_source_no_regression(base, head, base_regions, head_regions, base_sources, head_sources):
     bf, bs = region_evidence(base_regions, base, base_sources, "base")
     hf, hs = region_evidence(head_regions, head, head_sources, "head")
@@ -12960,7 +13087,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             owners_by_file.setdefault(name, []).append(function)
     construct_work = [SOURCE_CONSTRUCT_WORK_CAPACITY]; complete_head = []; head_inventories = {}; head_capsule_counts = Counter()
     head_fn_names = set(); retirement_receipts = []; retired_declaration_receipts = []
-    specialization_receipts = {}
+    specialization_receipts = {}; callback_statement_receipts = []
     retired_assertion_receipts = []; retired_constructor_receipts = []; retired_policy_metadata = []
     parent_file_cache = {}; method_parent_files = None; plain_parent_files = None; owner_indexes = None
     def source_owner_indexes():
@@ -13188,6 +13315,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             bf, hf, base_files, head_files, construct_work, inventories, grouped)
         anchored.update(construct_pairs); construct_receipts.extend(witnesses)
         retained = {}; gone = set(); unresolved_fragments = []; deferred_fragments = {}; neutral_declarations = {}
+        callback_anchors = {}
         declaration_roles = {}
         record_states = {}; record_projections = {}; record_work = _ObserverWork(construct_work)
         removed_prefixes = set()
@@ -13428,11 +13556,28 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
                             f'{name}:{line} -> {target}; '
                             f'base_count={before.get(line)} head_count={after.get(target)}')
             elif tag == 'replace-construct':
-                if (block.get('retained_statements') and not any(
-                        start <= block['base_line'] <= end for start, end in proved_functions)
-                        and any(line not in anchored and line not in deferred_fragments
-                                for line in retained_statement_lines(block))):
-                    raise ValueError('Ambiguous unchanged work in replaced compiler owner')
+                if block.get('retained_statements') and not any(
+                        start <= block['base_line'] <= end for start, end in proved_functions):
+                    for line in retained_statement_lines(block):
+                        if line in anchored or line in deferred_fragments:
+                            continue
+                        low, high = block['head_range']
+                        _construct_charge(construct_work, high - low + 1)
+                        candidates = [target for target in range(low, high + 1)
+                                      if old[line - 1] == new[target - 1]]
+                        proof = None
+                        if len(candidates) == 1 and bs[name]['expansions'] == hs[name]['expansions'] == []:
+                            target, = candidates
+                            sides = ((old, inventories[0], before, line), (new, inventories[1], after, target))
+                            proof = retained_callback_statement(name, sides, source_owner_indexes(), construct_work)
+                        if proof is None:
+                            raise ValueError(f'Ambiguous unchanged work in replaced compiler owner: {name}:{line}')
+                        for original, current in proof['pairs']:
+                            if original in anchored and anchored[original] != current:
+                                raise ValueError(f'Ambiguous callback statement correspondence: {name}:{original}')
+                            anchored[original] = current
+                            callback_anchors[original] = current
+                        callback_statement_receipts.append(proof)
                 replacement_receipts.append(dict(file=name, **block))
             # Replacement is not proven deletion. Its old counts stay in the
             # strict base ratios, and its new uncovered mappings are refused.
@@ -13452,6 +13597,10 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             protected=receipt.get('preserved_base_mapped',())
             _construct_charge(construct_work,len(protected))
             gone.difference_update(protected)
+        if callback_anchors:
+            _construct_charge(construct_work, sum(len(pending) for *_, pending in unresolved_fragments))
+            unresolved_fragments = [(a, b, c, d, unproved) for a, b, c, d, pending in unresolved_fragments
+                    if (unproved := [line for line in pending if callback_anchors.get(line) != c + line - a])]
         callback_scopes = []
         callback_functions = {fragment.function_prefix for fragment in deferred_fragments.values()
                               if fragment.kind == 'callback'}
@@ -13624,6 +13773,7 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             'callback': {tuple(pair) for receipt in receipts
                          for fragment in receipt.get('callback_fragments', []) for pair in fragment['pairs']},
         }
+        proof_pairs['callback'].update(callback_anchors.items())
         for line, fragment in deferred_fragments.items():
             if (line, fragment.target) not in proof_pairs[fragment.kind]:
                 raise ValueError('Unproved retained execution: complete callback/phase evidence required '
@@ -13744,6 +13894,8 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         paint_receipt['retained_replacement_obligations'] = obligation_receipts
     if completion_receipts:
         paint_receipt['retained_function_completions'] = completion_receipts
+    if callback_statement_receipts:
+        paint_receipt['retained_callback_statements'] = callback_statement_receipts
     if added_receipt:
         paint_receipt["added_files"] = added_receipt
     if serial_receipts:
