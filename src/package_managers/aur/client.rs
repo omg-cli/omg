@@ -26,9 +26,9 @@ use super::history::historical_version_not_found_message;
 use super::history::srcinfo_version;
 use super::parallel_build::BuildJob;
 use super::utils::{
-    build_user, create_dir_as_user, create_dir_as_user_sync, has_word_boundary_match, is_symlink,
-    original_user, original_user_home, remove_dir_as_user, sudo_as_user_program,
-    validate_build_dir,
+    BuildLifecycleLease, build_user, create_dir_as_user, create_dir_as_user_sync,
+    has_word_boundary_match, is_symlink, original_user, original_user_home, remove_dir_as_user,
+    sudo_as_user_program, validate_build_dir,
 };
 use super::{approval, artifact_inspector};
 
@@ -348,7 +348,7 @@ fn prepare_invocation_directory(
 #[derive(Debug)]
 pub(crate) struct AuthorizedBuild {
     // Keep cleanup excluded across the review-to-build handoff and dependency work.
-    lifecycle_guard: File,
+    lifecycle_guard: BuildLifecycleLease,
     package: String,
     requested_outputs: Vec<String>,
     reviewed_digest: ReviewedSource,
@@ -1355,13 +1355,12 @@ impl AurClient {
     /// File ownership spans async build work intentionally. Acquisition never
     /// waits, and cleanup never waits for builders, so this cannot block an
     /// executor thread behind a task holding the same lifecycle lock.
-    async fn acquire_build_lifecycle(&self) -> Result<File> {
+    async fn acquire_build_lifecycle(&self) -> Result<BuildLifecycleLease> {
         let client = self.clone();
         tokio::task::spawn_blocking(move || {
             let file = client.open_lifecycle_lock()?;
-            file.try_lock_shared()
-                .context("Failed to acquire AUR build ownership; cleanup may be active")?;
-            Ok(file)
+            BuildLifecycleLease::try_shared(file)
+                .context("Failed to acquire AUR build ownership; cleanup may be active")
         })
         .await
         .context("AUR lifecycle lock worker failed")?
@@ -4554,9 +4553,7 @@ impl AurClient {
     pub fn clean_all(&self) -> Result<()> {
         // Never unlink the coordination inode. Fail fast rather than wait for
         // a build that may be awaiting user input or resolving dependencies.
-        let lifecycle_guard = self.open_lifecycle_lock()?;
-        lifecycle_guard
-            .try_lock()
+        let _lifecycle_guard = BuildLifecycleLease::try_exclusive(self.open_lifecycle_lock()?)
             .context("Cannot clean AUR cache: a build or another cleanup may be active")?;
         if self.build_dir.exists() {
             if let Some(user) = original_user() {
@@ -7577,6 +7574,7 @@ mod tests {
         };
         let first = client.acquire_build_lifecycle().await.unwrap();
         let second = client.acquire_build_lifecycle().await.unwrap();
+        let inherited = second.duplicate_descriptor().unwrap();
         std::fs::create_dir_all(&client.build_dir).unwrap();
         let marker = client.build_dir.join("active-build");
         std::fs::write(&marker, b"in progress").unwrap();
@@ -7590,8 +7588,9 @@ mod tests {
         client.clean_all().unwrap();
         assert!(!marker.exists());
         assert_eq!(lock_path.metadata().unwrap().ino(), inode);
-        let cleanup = client.open_lifecycle_lock().unwrap();
-        cleanup.try_lock().unwrap();
+        drop(inherited);
+        let cleanup =
+            BuildLifecycleLease::try_exclusive(client.open_lifecycle_lock().unwrap()).unwrap();
         assert!(client.acquire_build_lifecycle().await.is_err());
         drop(cleanup);
         assert!(client.acquire_build_lifecycle().await.is_ok());
@@ -7812,8 +7811,7 @@ mod tests {
             settings: Settings::default(),
             package_base_locks: Arc::new(dashmap::DashMap::new()),
         };
-        let cleaner = client.open_lifecycle_lock()?;
-        cleaner.try_lock()?;
+        let cleaner = BuildLifecycleLease::try_exclusive(client.open_lifecycle_lock()?)?;
         assert!(client.acquire_build_lifecycle().await.is_err());
         assert!(client.clean_all().is_err());
         assert!(!client.build_dir.exists());

@@ -1,3 +1,4 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use alpm_types::SystemArchitecture;
@@ -283,6 +284,36 @@ pub fn create_dir_as_user_sync(path: &Path) -> Result<()> {
 }
 
 /// Open the stable inode shared by AUR builders, metadata and cleanup.
+#[derive(Debug)]
+pub(in crate::package_managers) struct BuildLifecycleLease(File);
+
+impl BuildLifecycleLease {
+    pub(in crate::package_managers) fn try_shared(file: File) -> std::io::Result<Self> {
+        file.try_lock_shared()?;
+        Ok(Self(file))
+    }
+
+    pub(super) fn try_exclusive(file: File) -> std::io::Result<Self> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+
+    #[cfg(test)]
+    pub(super) fn duplicate_descriptor(&self) -> std::io::Result<File> {
+        self.0.try_clone()
+    }
+}
+
+impl Drop for BuildLifecycleLease {
+    fn drop(&mut self) {
+        // A concurrent child can inherit a descriptor until exec closes it.
+        // Release ownership even while that copy of the description still exists.
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "Failed to release AUR lifecycle lease");
+        }
+    }
+}
+
 pub(in crate::package_managers) fn open_build_lifecycle_lock(
     build_dir: &Path,
 ) -> Result<std::fs::File> {

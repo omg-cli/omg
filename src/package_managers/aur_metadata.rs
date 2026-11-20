@@ -20,6 +20,7 @@ use tracing::{info, instrument};
 
 use crate::config::Settings;
 use crate::core::paths;
+use crate::package_managers::aur::utils::BuildLifecycleLease;
 use crate::package_managers::aur_index::{AurIndex, build_index};
 
 const AUR_META_URL: &str = "https://aur.archlinux.org/packages-meta-ext-v1.json.gz";
@@ -93,7 +94,7 @@ enum MetadataAccess {
 
 struct MetadataLock {
     _publication: File,
-    _lifecycle: File,
+    _lifecycle: BuildLifecycleLease,
 }
 
 fn metadata_root() -> MetadataRoot {
@@ -120,10 +121,9 @@ fn lock_metadata(location: &MetadataRoot, access: MetadataAccess) -> Result<Meta
         open_build_lifecycle_lock, open_effective_user_lock,
     };
 
-    let lifecycle = open_build_lifecycle_lock(&location.build_dir)?;
-    lifecycle
-        .try_lock_shared()
-        .context("Failed to acquire AUR metadata ownership; cleanup may be active")?;
+    let lifecycle =
+        BuildLifecycleLease::try_shared(open_build_lifecycle_lock(&location.build_dir)?)
+            .context("Failed to acquire AUR metadata ownership; cleanup may be active")?;
     let root = location.path();
     match access {
         MetadataAccess::Exclusive => std::fs::DirBuilder::new()
