@@ -643,6 +643,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_mock_state_preserves_installed_and_available_inventory() -> Result<()> {
+        let directory = tempdir()?;
+        let package_manager = MockPackageManager::new_in("debian", directory.path());
+        fs::write(
+            directory.path().join("mock_state_apt.json"),
+            br#"{"installed":["fixture"],"available":{"fixture":"2.0.0"}}"#,
+        )?;
+
+        let updates = futures::executor::block_on(package_manager.list_updates())?;
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].name, "fixture");
+        assert_eq!(updates[0].old_version, "0");
+        assert_eq!(updates[0].new_version, "2.0.0");
+
+        let installed = futures::executor::block_on(package_manager.list_installed())?;
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].name, "fixture");
+        assert_eq!(installed[0].version.to_string(), "0");
+        Ok(())
+    }
+
+    #[test]
     fn malformed_mock_state_is_reported() -> Result<()> {
         let dir = tempdir()?;
         fs::write(dir.path().join("mock_state_pacman.json"), b"not json")?;
