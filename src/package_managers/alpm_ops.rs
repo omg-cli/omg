@@ -2833,14 +2833,18 @@ fn configure_mirrors(
     let arch = config.primary_package_architecture()?;
     let mut configured = Vec::new();
     for database in alpm.syncdbs_mut() {
-        if let Some(repo) = config
+        let repo = config
             .repos
             .iter()
             .find(|repo| repo.name == database.name())
-        {
-            let servers = config.resolve_servers(repo, &arch)?;
-            configured.push((database, servers));
-        }
+            .with_context(|| {
+                format!(
+                    "Registered repository '{}' is absent from pacman.conf",
+                    database.name()
+                )
+            })?;
+        let servers = config.resolve_servers(repo, &arch)?;
+        configured.push((database, servers));
     }
     for (database, servers) in configured {
         database
@@ -4723,6 +4727,17 @@ mod tests {
         assert_eq!(
             core.servers().iter().collect::<Vec<_>>(),
             [expected.as_str()]
+        );
+        alpm.register_syncdb_mut("retired", alpm::SigLevel::NONE)?
+            .add_server("https://retired.example/core")?;
+        let error = super::configure_mirrors(&mut alpm, &config).expect_err(
+            "an existing handle must not keep a repository outside the loaded configuration",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Registered repository 'retired' is absent from pacman.conf"),
+            "{error:#}"
         );
         Ok(())
     }
