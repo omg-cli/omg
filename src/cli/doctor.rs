@@ -898,9 +898,7 @@ async fn check_network(distro: Distro) -> usize {
     issues
 }
 
-/// A package-manager process holding the ALPM database lock, by binary name.
-/// Kept small and exact: anything else holding db.lck is either a wrapper
-/// around these or a stale lock from a crashed run.
+/// Process names recognized by the ALPM lock diagnostic.
 #[cfg(feature = "arch")]
 const DB_LOCK_HOLDERS: &[&str] = &["pacman", "yay", "paru", "pikaur", "omg"];
 
@@ -911,65 +909,71 @@ const DB_LOCK_HOLDERS: &[&str] = &["pacman", "yay", "paru", "pikaur", "omg"];
 /// (comm `omg`) always matches itself and a stale lock is misreported as
 /// held by a running manager.
 #[cfg(feature = "arch")]
-fn package_manager_running() -> bool {
+fn package_manager_running() -> std::io::Result<bool> {
     any_manager_running(std::path::Path::new("/proc"), std::process::id())
 }
 
 /// Testable core of [`package_manager_running`]: scan `proc_root` for
 /// [`DB_LOCK_HOLDERS`] entries other than `self_pid`.
 #[cfg(feature = "arch")]
-fn any_manager_running(proc_root: &std::path::Path, self_pid: u32) -> bool {
-    std::fs::read_dir(proc_root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|entry| {
-            let name = entry.file_name();
-            let Some(pid) = name
-                .to_str()
-                .filter(|name| name.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|name| name.parse::<u32>().ok())
-                .filter(|pid| *pid != self_pid)
-            else {
-                return false;
-            };
-            let comm = std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
-                .map(|comm| comm.trim().to_string())
-                .unwrap_or_default();
-            DB_LOCK_HOLDERS.contains(&comm.as_str())
-        })
+fn any_manager_running(proc_root: &std::path::Path, self_pid: u32) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        match std::fs::read_to_string(entry.path().join("comm")) {
+            Ok(comm) if DB_LOCK_HOLDERS.contains(&comm.trim()) => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
-/// Report a stale pacman database lock. A live lock means a manager is
-/// mid-transaction and doctor stays quiet; a lock with no manager behind
-/// it blocks every future transaction until removed.
+/// Report the lock and any visible package-manager activity.
 #[cfg(feature = "arch")]
 fn check_pacman_lock(db_path: Option<&str>) -> usize {
     check_pacman_lock_with(db_path, package_manager_running)
 }
 
 #[cfg(feature = "arch")]
-fn check_pacman_lock_with(db_path: Option<&str>, manager_running: impl FnOnce() -> bool) -> usize {
+fn check_pacman_lock_with(
+    db_path: Option<&str>,
+    manager_running: impl FnOnce() -> std::io::Result<bool>,
+) -> usize {
     let lock = std::path::Path::new(db_path.unwrap_or("/var/lib/pacman")).join("db.lck");
-    if !lock.exists() {
-        return 0;
-    }
-    if manager_running() {
+    if let Err(error) = std::fs::symlink_metadata(&lock) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return 0;
+        }
         println!(
-            "  {} Database lock held by a running package manager ({})",
-            style::success("✓"),
+            "  {} Cannot inspect database lock ({}): {error}",
+            style::error("✗"),
             lock.display()
         );
-        return 0;
+        return 1;
     }
+    let detail = match manager_running() {
+        Ok(true) => {
+            println!(
+                "  {} Database lock present while a package manager is running ({})",
+                style::info("ℹ"),
+                lock.display()
+            );
+            return 0;
+        }
+        Ok(false) => "No recognized package manager was visible".to_owned(),
+        Err(error) => format!("Process scan unavailable: {error}"),
+    };
     println!(
-        "  {} Stale database lock with no package manager running ({})",
+        "  {} Database lock owner could not be verified ({}). {detail}.",
         style::error("✗"),
-        lock.display()
-    );
-    println!(
-        "    {} Remove it: sudo rm {}",
-        style::dim("→"),
         lock.display()
     );
     1
@@ -2152,19 +2156,36 @@ mod tests {
         std::fs::write(proc.path().join(self_pid.to_string()).join("comm"), "omg\n")
             .expect("self comm");
         // Only ourselves present: no other manager running.
-        assert!(!any_manager_running(proc.path(), self_pid));
+        assert!(!any_manager_running(proc.path(), self_pid).expect("visible process list"));
         // An unrelated process does not count either.
         std::fs::create_dir(proc.path().join("999")).expect("other pid dir");
         std::fs::write(proc.path().join("999").join("comm"), "bash\n").expect("other comm");
-        assert!(!any_manager_running(proc.path(), self_pid));
+        assert!(!any_manager_running(proc.path(), self_pid).expect("visible process list"));
         // A real second manager does count.
         std::fs::write(proc.path().join("999").join("comm"), "pacman\n").expect("pacman comm");
-        assert!(any_manager_running(proc.path(), self_pid));
+        assert!(any_manager_running(proc.path(), self_pid).expect("visible process list"));
     }
 
     #[cfg(feature = "arch")]
     #[test]
-    fn stale_lock_without_a_manager_is_an_issue() {
+    fn manager_scan_reports_an_inaccessible_process_list() -> Result<()> {
+        let proc = tempfile::tempdir()?;
+        assert!(any_manager_running(&proc.path().join("missing"), 4242).is_err());
+
+        let process = proc.path().join("999");
+        std::fs::create_dir(&process)?;
+        assert!(!any_manager_running(proc.path(), 4242)?);
+
+        // A process may exit between enumeration and reading its name. Other
+        // read errors indicate that visible process inventory is incomplete.
+        std::fs::create_dir(process.join("comm"))?;
+        assert!(any_manager_running(proc.path(), 4242).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "arch")]
+    #[test]
+    fn lock_without_verified_activity_is_an_issue() {
         let dir = tempfile::TempDir::new().expect("isolated db dir");
         let proc = tempfile::TempDir::new().expect("isolated proc dir");
         let dir_str = dir.path().to_string_lossy().into_owned();
@@ -2183,6 +2204,13 @@ mod tests {
         assert_eq!(
             check_pacman_lock_with(Some(&dir_str), || any_manager_running(
                 proc.path(),
+                self_pid
+            )),
+            1
+        );
+        assert_eq!(
+            check_pacman_lock_with(Some(&dir_str), || any_manager_running(
+                &proc.path().join("missing"),
                 self_pid
             )),
             1
@@ -2224,7 +2252,7 @@ mod tests {
         assert_eq!(check_pacman_lock(Some(database)), 0);
         let lock = directory.path().join("db.lck");
         std::fs::write(&lock, b"live lock")?;
-        assert!(package_manager_running());
+        assert!(package_manager_running()?);
         assert_eq!(check_pacman_lock(Some(database)), 0);
         assert_eq!(std::fs::read(lock)?, b"live lock");
         tokio::time::timeout(Duration::from_secs(2), child.kill()).await??;
