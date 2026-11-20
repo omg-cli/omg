@@ -12,6 +12,7 @@ ACTION = Path(__file__).resolve().parents[1] / '.github/actions/ubuntu-apt/actio
 SETUP = ACTION.with_name('setup.sh')
 BASH = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else 'bash'
 KEYRING = '/usr/share/keyrings/ubuntu-archive-keyring.gpg'
+ARCHIVE = 'https://archive.ubuntu.com/ubuntu/'
 EDGE = 'https://mirrors.edge.kernel.org/ubuntu/'
 
 
@@ -51,7 +52,7 @@ class UbuntuAptSetup(unittest.TestCase):
             'dpkg': 'test "$*" = --print-architecture || exit 91\nprintf "%s\\n" "${FIXTURE_ARCH:-amd64}"\n',
             'sudo': 'test "$1" = -n || exit 92\nshift\nprintf "sudo\\n" >> "$SUDO_LOG"\nexec "$@"\n',
             'install': '''
-                case "$4" in *apt-mirrors.txt) test "${FAIL_MIRROR_WRITE:-0}" = 0 || exit 41 ;; esac
+                case "$4" in *ubuntu.sources) test "${FAIL_SOURCE_WRITE:-0}" = 0 || exit 41 ;; esac
                 exec /usr/bin/install "$@"
             ''',
             'apt-get': '''
@@ -62,15 +63,19 @@ class UbuntuAptSetup(unittest.TestCase):
                   selected=$(grep -i '^URIs:' "$SOURCE_PATH")
                 fi
                 case "$selected" in
-                  *https://mirrors.edge.kernel.org/ubuntu*) scheme=https ;;
-                  *http://mirrors.edge.kernel.org/ubuntu*) scheme=http ;;
-                  *) scheme=canonical ;;
+                  *https://mirrors.edge.kernel.org/ubuntu*) mirror=edge-https ;;
+                  *http://mirrors.edge.kernel.org/ubuntu*) mirror=edge-http ;;
+                  *https://archive.ubuntu.com/ubuntu*) mirror=archive-https ;;
+                  *http://archive.ubuntu.com/ubuntu*) mirror=archive-http ;;
+                  *) exit 94 ;;
                 esac
-                printf '%s\\n' "$scheme" >> "$SCHEME_LOG"
+                printf '%s\\n' "$mirror" >> "$MIRROR_LOG"
                 case " $* " in
                   *' update '*)
                     test "${FAIL_UPDATE:-0}" = 0 || exit 23
-                    if [ "$scheme" = https ] && [ "${FAIL_HTTPS_UPDATE:-0}" = 1 ]; then exit 29; fi
+                    case "$mirror" in
+                      *-https) test "${FAIL_HTTPS_UPDATE:-0}" = 0 || exit 29 ;;
+                    esac
                     case "$selected" in
                       *archive.ubuntu.com*|*security.ubuntu.com*)
                         test "${DNS_BROKEN:-0}" = 0 || exit 100 ;;
@@ -96,10 +101,9 @@ class UbuntuAptSetup(unittest.TestCase):
                    TMPDIR=(root / 'tmp').as_posix(), COMMAND_LOG=log.as_posix(),
                    SOURCE_PATH=source.as_posix(), MIRROR_PATH=mirror.as_posix(),
                    CA_PATH=ca_path.as_posix(), SUDO_LOG=(root / 'sudo.log').as_posix(),
-                   SCHEME_LOG=(root / 'schemes.log').as_posix(), FIXTURE_TOOLS=tools.as_posix())
+                   MIRROR_LOG=(root / 'mirrors.log').as_posix(), FIXTURE_TOOLS=tools.as_posix())
         replacements = {'os_release=/etc/os-release': release,
                         'source_file=/etc/apt/sources.list.d/ubuntu.sources': source,
-                        'mirror_file=/etc/apt/apt-mirrors.txt': mirror,
                         'ca_bundle=/etc/ssl/certs/ca-certificates.crt': ca_path,
                         'keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg': keyring}
         script = 'PATH="$(cd "$FIXTURE_TOOLS" && pwd):$PATH"\n' + SETUP.read_text(encoding='utf-8')
@@ -117,18 +121,21 @@ class UbuntuAptSetup(unittest.TestCase):
     def commands(self, fixture):
         return fixture['log'].read_text().splitlines() if fixture['log'].exists() else []
 
+    def mirrors(self, fixture):
+        return Path(fixture['env']['MIRROR_LOG']).read_text().splitlines()
+
     def test_dns_failure_uses_independent_mirror(self):
         for host in (False, True):
             with self.subTest(host=host), tempfile.TemporaryDirectory() as tmp:
                 f = self.fixture(Path(tmp), host=host)
-                before = f['third_party'].read_bytes()
+                f['mirror'].write_text('http://untrusted.example/ubuntu/\n')
+                before = {name: f[name].read_bytes() for name in ('mirror', 'third_party')}
                 result = self.execute(f, DNS_BROKEN='1')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                selected = f['mirror'] if host else f['source']
-                self.assertIn(EDGE, selected.read_text())
-                self.assertNotIn('archive.ubuntu.com', selected.read_text())
-                self.assertEqual(f['third_party'].read_bytes(), before)
-                self.assertEqual(len(self.commands(f)), 1)
+                self.assertEqual(f['source'].read_text().count('URIs: ' + EDGE), 2)
+                self.assertEqual({name: f[name].read_bytes() for name in before}, before)
+                self.assertEqual(self.mirrors(f), ['archive-https', 'edge-https'])
+                self.assertTrue(all(command.endswith(' update') for command in self.commands(f)))
 
     def test_healthy_sources_preserve_identity_and_are_idempotent(self):
         for codename in ('noble', 'resolute'):
@@ -141,8 +148,9 @@ class UbuntuAptSetup(unittest.TestCase):
                     current = f['source'].read_text().splitlines()
                     self.assertEqual([x for x in current if not x.startswith('URIs:')],
                                      [x for x in original if not x.startswith('URIs:')])
-                    self.assertTrue(all(x == 'URIs: ' + EDGE for x in current if x.startswith('URIs:')))
-                self.assertEqual(len(self.commands(f)), 2)
+                    self.assertEqual([x for x in current if x.startswith('URIs:')],
+                                     ['URIs: ' + ARCHIVE] * 2)
+                self.assertEqual(self.mirrors(f), ['archive-https'] * 2)
 
     def test_missing_ca_bootstraps_signed_http_then_requires_https(self):
         for host in (False, True):
@@ -151,13 +159,13 @@ class UbuntuAptSetup(unittest.TestCase):
                 result = self.execute(f, DNS_BROKEN='1')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 commands = self.commands(f)
-                self.assertEqual(len(commands), 3)
-                self.assertTrue(commands[0].endswith(' update'))
-                self.assertIn(' install -y --no-install-recommends ca-certificates', commands[1])
-                self.assertTrue(commands[2].endswith(' update'))
-                self.assertEqual((Path(tmp) / 'schemes.log').read_text().splitlines(),
-                                 ['http', 'http', 'https'])
-                for command in (commands[0], commands[2]):
+                self.assertEqual(len(commands), 5)
+                self.assertIn(' install -y --no-install-recommends ca-certificates', commands[2])
+                self.assertEqual(self.mirrors(f),
+                                 ['archive-http', 'edge-http', 'edge-http',
+                                  'archive-https', 'edge-https'])
+                for command in commands[:2] + commands[3:]:
+                    self.assertTrue(command.endswith(' update'))
                     self.assertIn('-o APT::Update::Error-Mode=any', command)
                 self.assertTrue(f['ca'].is_file())
                 self.assertNotIn('URIs: http:', f['source'].read_text())
@@ -166,8 +174,9 @@ class UbuntuAptSetup(unittest.TestCase):
         for host in (False, True):
             with self.subTest(host=host), tempfile.TemporaryDirectory() as tmp:
                 f = self.fixture(Path(tmp), host=host)
-                target = f['mirror'] if host else f['source']
-                target.write_text(target.read_text().replace('archive.ubuntu.com', 'unexpected.example'))
+                source = f['source']
+                source.write_text(re.sub(r'^URIs: .*$', 'URIs: https://unexpected.example/ubuntu/',
+                                         source.read_text(), count=1, flags=re.M))
                 before = {name: f[name].read_bytes() for name in ('source', 'mirror')}
                 result = self.execute(f)
                 self.assertNotEqual(result.returncode, 0)
@@ -196,12 +205,15 @@ class UbuntuAptSetup(unittest.TestCase):
                 self.assertEqual(f['source'].read_bytes(), before)
 
     def test_failed_update_or_install_remains_fatal(self):
-        for failure, expected in (('FAIL_UPDATE', 23), ('FAIL_INSTALL', 37)):
+        for failure, expected, mirrors in (
+            ('FAIL_UPDATE', 1, ['archive-http', 'edge-http']),
+            ('FAIL_INSTALL', 37, ['archive-http', 'archive-http']),
+        ):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
                 f = self.fixture(Path(tmp), ca=False)
                 result = self.execute(f, **{failure: '1'})
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
-                self.assertEqual(len(self.commands(f)), 1 if failure == 'FAIL_UPDATE' else 2)
+                self.assertEqual(self.mirrors(f), mirrors)
 
     def test_non_root_execution_uses_noninteractive_sudo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,7 +239,8 @@ class UbuntuAptSetup(unittest.TestCase):
                                    .replace('apt-mirrors.txt\n', 'apt-mirrors.txt  \n'))
             result = self.execute(f, DNS_BROKEN='1')
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(f['mirror'].read_text(), EDGE + '\tpriority:1\n')
+            self.assertEqual(f['source'].read_text().count('URIs: ' + EDGE), 2)
+            self.assertEqual(self.mirrors(f), ['archive-https', 'edge-https'])
 
     def test_comment_only_paragraphs_preserve_valid_stock_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,15 +251,25 @@ class UbuntuAptSetup(unittest.TestCase):
             self.assertTrue(f['source'].read_text().startswith('# Ubuntu source configuration\n\n'))
 
     def test_partial_bootstrap_failures_remain_red_and_can_be_repeated(self):
-        for failure, expected in (('FAIL_MIRROR_WRITE', 41), ('FAIL_INSTALL', 37),
-                                  ('FAIL_HTTPS_UPDATE', 29)):
+        for failure, expected, mirrors in (
+            ('FAIL_SOURCE_WRITE', 1, []),
+            ('FAIL_INSTALL', 37, ['archive-http', 'archive-http']),
+            ('FAIL_HTTPS_UPDATE', 1,
+             ['archive-http', 'archive-http', 'archive-https', 'edge-https']),
+        ):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
                 f = self.fixture(Path(tmp), host=True, ca=False)
+                original_mirror = f['mirror'].read_bytes()
                 result = self.execute(f, **{failure: '1'})
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if not mirrors:
+                    self.assertEqual(self.commands(f), [])
+                else:
+                    self.assertEqual(self.mirrors(f), mirrors)
                 repeated = self.execute(f, DNS_BROKEN='1')
                 self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
-                self.assertEqual(f['mirror'].read_text(), EDGE + '\tpriority:1\n')
+                self.assertEqual(f['source'].read_text().count('URIs: ' + EDGE), 2)
+                self.assertEqual(f['mirror'].read_bytes(), original_mirror)
 
     def test_successful_install_without_ca_bundle_cannot_enable_https(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,7 +277,7 @@ class UbuntuAptSetup(unittest.TestCase):
             result = self.execute(f, OMIT_CA='1')
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(len(self.commands(f)), 2)
-            self.assertEqual((Path(tmp) / 'schemes.log').read_text().splitlines(), ['http', 'http'])
+            self.assertEqual(self.mirrors(f), ['archive-http', 'archive-http'])
 
     def test_composite_wrapper_uses_translated_whole_action_path(self):
         action = ACTION.read_text(encoding='utf-8')
@@ -272,7 +295,8 @@ class UbuntuAptSetup(unittest.TestCase):
                                              DNS_BROKEN='1'),
                                     capture_output=True, text=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(f['mirror'].read_text(), EDGE + '\tpriority:1\n')
+            self.assertEqual(f['source'].read_text().count('URIs: ' + EDGE), 2)
+            self.assertEqual(self.mirrors(f), ['archive-https', 'edge-https'])
 
 
 if __name__ == '__main__':
