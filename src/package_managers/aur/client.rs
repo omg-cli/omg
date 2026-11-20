@@ -6377,7 +6377,9 @@ mod tests {
                 "--ro-bind",
                 "/",
                 "/",
-                "--proc",
+                // The read-only existing procfs can identify this process without a nested mount.
+                "--ro-bind",
+                "/proc",
                 "/proc",
                 "--",
                 "/usr/bin/readlink",

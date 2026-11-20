@@ -195,14 +195,33 @@ class UbuntuMirrorSetupTests(unittest.TestCase):
             "python3", "python3-apt", "python3-venv", "fish", "jq", "zstd",
             "libssl-dev", "libapt-pkg-dev", "clang", "cmake", "zlib1g-dev", "liblzma-dev", "libbz2-dev",
         ]
+        canonical = "archive.ubuntu.com"
+        alternate = "mirrors.edge.kernel.org"
+        install_prefix = ["install", "-y", "--no-install-recommends"]
+        http_update = ("http", canonical, ["update"])
+        https_update = ("https", canonical, ["update"])
+        ca_install = ("http", canonical, [*install_prefix, "ca-certificates"])
+        package_install = ("https", canonical, [*install_prefix, *expected_packages])
+        healthy = [http_update, ca_install, https_update, package_install]
         scenarios = [
-            ("success", "", 0, 4), ("success-slash", "/", 0, 4), ("canonical-dns", "", 0, 4),
-            ("apt-1", "", 41, 1), ("apt-2", "", 42, 2),
-            ("apt-3", "", 43, 3), ("apt-4", "", 44, 4),
-            ("missing-ca", "", 1, 2), ("unknown-archive", "", 1, 0), ("unknown-security", "", 1, 0),
+            ("success", "", 0, healthy),
+            ("success-slash", "/", 0, healthy),
+            ("canonical-dns", "", 0, [
+                http_update, ("http", alternate, ["update"]),
+                ("http", alternate, [*install_prefix, "ca-certificates"]),
+                https_update, ("https", alternate, ["update"]),
+                ("https", alternate, [*install_prefix, *expected_packages]),
+            ]),
+            ("http-index-failure", "", 1, [http_update, ("http", alternate, ["update"])]),
+            ("ca-install-failure", "", 42, healthy[:2]),
+            ("https-index-failure", "", 1, [*healthy[:3], ("https", alternate, ["update"])]),
+            ("package-install-failure", "", 44, healthy),
+            ("missing-ca", "", 1, healthy[:2]),
+            ("unknown-archive", "", 1, []),
+            ("unknown-security", "", 1, []),
         ]
         helper = UbuntuAptSetup("test_dns_failure_uses_independent_mirror")
-        for scenario, slash, status, expected_calls in scenarios:
+        for scenario, slash, status, expected in scenarios:
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 fixture = helper.fixture(root, ca=False, codename="resolute")
@@ -218,13 +237,17 @@ class UbuntuMirrorSetupTests(unittest.TestCase):
                     f"#!{sys.executable}\n"
                     "import json,os,sys\nfrom pathlib import Path\n"
                     "receipt=Path(os.environ['APT_RECEIPT'])\n"
-                    "prior=receipt.read_text().splitlines() if receipt.exists() else []\n"
                     "sources=Path(os.environ['SOURCE_PATH']).read_text()\n"
                     "with receipt.open('a') as out:out.write(json.dumps({'args':sys.argv[1:],'sources':sources})+'\\n')\n"
                     "scenario=os.environ['APT_SCENARIO']\n"
-                    "if scenario=='canonical-dns' and any(host in sources for host in ('archive.ubuntu.com','security.ubuntu.com')):sys.exit(100)\n"
-                    "if scenario=='apt-'+str(len(prior)+1):sys.exit(41+len(prior))\n"
-                    "if sys.argv[-1]=='ca-certificates' and scenario!='missing-ca':Path(os.environ['CA_PATH']).write_text('fixture CA')\n",
+                    "if sys.argv[-1]=='update':\n"
+                    " if scenario=='canonical-dns' and 'archive.ubuntu.com' in sources:sys.exit(100)\n"
+                    " if scenario=='http-index-failure' and 'URIs: http:' in sources:sys.exit(41)\n"
+                    " if scenario=='https-index-failure' and 'URIs: https:' in sources:sys.exit(43)\n"
+                    "elif sys.argv[-1]=='ca-certificates':\n"
+                    " if scenario=='ca-install-failure':sys.exit(42)\n"
+                    " if scenario!='missing-ca':Path(os.environ['CA_PATH']).write_text('fixture CA')\n"
+                    "elif scenario=='package-install-failure':sys.exit(44)\n",
                     encoding="utf-8",
                 )
                 apt.chmod(0o755)
@@ -234,23 +257,19 @@ class UbuntuMirrorSetupTests(unittest.TestCase):
                 result = helper.execute(fixture, APT_RECEIPT=str(receipt), APT_SCENARIO=scenario)
                 self.assertEqual(result.returncode, status, result.stdout + result.stderr)
                 calls = [json.loads(line) for line in receipt.read_text().splitlines()] if receipt.exists() else []
-                self.assertEqual(len(calls), expected_calls)
-                http_source = re.sub(r"(?m)^URIs: http://(?:archive|security)\.ubuntu\.com/ubuntu/?$",
-                                     "URIs: http://mirrors.edge.kernel.org/ubuntu/", original)
-                https_source = http_source.replace("URIs: http://", "URIs: https://")
-                if calls:
-                    self.assertEqual(calls[0]["args"][-1], "update")
-                    self.assertIn("APT::Update::Error-Mode=any", calls[0]["args"])
-                    self.assertEqual(calls[0]["sources"], http_source)
-                if len(calls) >= 2:
-                    self.assertEqual(calls[1]["args"][-4:], ["install", "-y", "--no-install-recommends", "ca-certificates"])
-                    self.assertEqual(calls[1]["sources"], http_source)
-                if len(calls) >= 3:
-                    self.assertEqual(calls[2]["args"][-1], "update")
-                    self.assertEqual(calls[2]["sources"], https_source)
-                if len(calls) >= 4:
-                    self.assertEqual(calls[3]["args"], ["install", "-y", "--no-install-recommends", *expected_packages])
-                    self.assertEqual(calls[3]["sources"], https_source)
+                self.assertEqual(len(calls), len(expected))
+                for call, (scheme, host, args) in zip(calls, expected, strict=True):
+                    command = call["args"]
+                    if args == ["update"]:
+                        self.assertEqual(command[-1:], args)
+                        self.assertIn("APT::Update::Error-Mode=any", command)
+                    elif args[-1] == "ca-certificates":
+                        self.assertEqual(command[-len(args):], args)
+                    else:
+                        self.assertEqual(command, args)
+                    sources = re.sub(r"(?m)^URIs: http://(?:archive|security)\.ubuntu\.com/ubuntu/?$",
+                                     f"URIs: {scheme}://{host}/ubuntu/", original)
+                    self.assertEqual(call["sources"], sources)
                 if not calls:
                     self.assertEqual(fixture["source"].read_text(), original)
 
