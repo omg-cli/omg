@@ -388,6 +388,117 @@ class MetadataPublicationCoverageTests(unittest.TestCase):
 
 
 class AurArchiveCaptureCoverageTests(unittest.TestCase):
+    def test_environment_fixture_launch_keeps_root_dispatch_and_async_entry(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/coverage/' + filename: filename}
+        declaration = 'sample_update_policy'
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        sides, indexes, starts = [], [], []
+        for side in range(2):
+            source = ['#[cfg(test)]', 'mod tests {', '    #[test]',
+                      f'    fn {declaration}() -> Result<()> {{',
+                      '        let fixture = S72Fixture::new(&["example"])?;',
+                      '        fixture.with_environment(async {',
+                      *(['            let another_assertion = true;'] if side else []),
+                      '            Ok(())', '        })', '    }', '}']
+            root = f'NvNtNtNtNtCs{side + 1}_7omg_lib16package_managers3aur6client5tests{len(declaration)}{declaration}'
+            owners = [dict(name='_R' + root, count=1, filenames=list(files),
+                           regions=[[6, 9, 6, 16, 1, 0, 0, 0], [6, 17, 6, 33, 1, 0, 0, 0]]),
+                      dict(name='_RNC' + root + '0Bb_', count=1, filenames=list(files),
+                           regions=[[6, 40, 6, 41, 1, 0, 0, 0]])]
+            starts.append(6)
+            sides.append((source, coverage._construct_inventory(source, work), {6: 1}))
+            indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+        proof = coverage.retained_aur_environment_entries(filename, sides, indexes, work)
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof['pairs'], [starts])
+        missing = coverage.index_compiled_owner_sources([owners[0]], files, work, {filename})
+        self.assertIsNone(coverage.retained_aur_environment_entries(filename, sides, (indexes[0], missing), work))
+
+    def test_rollback_stages_bind_the_reviewed_digest_and_requested_output(self):
+        header = '    pub async fn downgrade_from_history(&self, package: &str, version: &str) -> Result<()> {'
+        build = ['        reviewed_digest.verify(&pkg_dir)?;', '        let status = self',
+                 '            .run_build(&pkg_dir, &env, package)', '            .await',
+                 '            .with_context(|| format!("Failed to run makepkg for \'{package}\'"))?;']
+        authorize = ['        let archives = self', '            .authorize_with_paired_build(',
+                     '                &[archive],', '                &reviewed_digest,', '                &base,',
+                     '                &[package.to_owned()],', '                false,', '                &pkg_dir,',
+                     '                &env,', '            )', '            .await?;']
+        source = ['impl AurClient {', header, *build, *authorize, '    }', '}']
+        modern = list(source)
+        modern[4] = modern[4].replace('package)', 'package, &reviewed_digest)')
+        modern.insert(13, '                &[package.to_owned()],')
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        proofs = []
+        for side, current in enumerate((source, modern)):
+            proof = coverage.rollback_stage_source(current, coverage._construct_inventory(current, work), side, work)
+            self.assertIsNotNone(proof)
+            proofs.append(proof)
+        self.assertIsNone(proofs[0][1])
+        self.assertEqual(modern[proofs[1][1] - 1], '                &[package.to_owned()],')
+        for old, new in (('&reviewed_digest)', '&different_digest)'), ('&[package.to_owned()],', '&[base.to_owned()],')):
+            changed = [line.replace(old, new) for line in modern]
+            self.assertIsNone(coverage.rollback_stage_source(changed, coverage._construct_inventory(changed, work), True, work))
+
+    def test_foreign_update_workers_keep_empty_guard_and_index_filter(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'empty-guard', 'foreign-callback', 'cold-lookup'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, probes = [], [], []
+                for side in range(2):
+                    discovered = ('let packages = pacman_db::get_potential_aur_package_records()?;' if side else
+                                  'let mut packages = get_potential_aur_packages()?;')
+                    empty = 'Vec::new()' if side else 'packages'
+                    guard = 'if !packages.is_empty() {' if side and fault == 'empty-guard' else 'if packages.is_empty() {'
+                    snapshot = ('let Some(index) = self.fresh_metadata_index().await' if side else
+                                'let Some(index_path) = self.fresh_metadata_index_path().await')
+                    result = '(Vec<(String, Version, Version)>, Vec<String>)'
+                    if not side:
+                        result = f'Option<{result}>'
+                    source = ['impl AurClient {', '    #[instrument(skip(self))]',
+                              '    pub async fn get_update_list(&self) -> Result<Vec<(String, Version, Version)>> {',
+                              '        let (foreign_packages, installed) = tokio::task::spawn_blocking(|| -> Result<_> {',
+                              f'            {discovered}', f'            {guard}',
+                              f'                return Ok(({empty}, Arc::new(HashMap::new())));',
+                              '            }', '            Ok((packages, Arc::new(HashMap::new())))',
+                              '        })', '        .await', '        .context("AUR foreign-package scan task failed")??;', '',
+                              '        if foreign_packages.is_empty() {', '            return Ok(Vec::new());', '        }', '',
+                              f'        if {snapshot} {{', '            let local_names = foreign_packages.clone();',
+                              '            let local_installed = Arc::clone(&installed);',
+                              '            let result = tokio::task::spawn_blocking(',
+                              f'                move || -> Result<{result}> {{',
+                              '                    let mut local_pkgs = Vec::with_capacity(local_names.len());',
+                              '                    for name in local_names {',
+                              '                        if let Some(version) = local_installed.get(&name) {',
+                              '                            local_pkgs.push((name, version.clone()));',
+                              '                        }', '                    }',
+                              '                    Ok(result)', '                },', '            )', '            .await?;',
+                              '        }', '        Ok(Vec::new())', '    }', '}']
+                    probes.append(25)
+                    root = f'NvMs2_NtNtNtCs{side + 1}_7omg_lib16package_managers3aur6clientNtB5_9AurClient15get_update_list'
+                    worker = root.replace('NtB5_', 'NtBb_')
+                    lookup = worker.replace('15get_update_list', '15unrelated_fetch') if (
+                        side and fault == 'foreign-callback') else worker
+                    hits = int(not (side and fault == 'cold-lookup'))
+                    owners = [dict(name='_R' + root, count=1, filenames=list(files),
+                                   regions=[[3, 5, 3, 79, 1, 0, 0, 0]]),
+                              dict(name='_RNCNCNC' + worker + '000Bh_', count=1, filenames=list(files),
+                                   regions=[[4, 89, 4, 90, 1, 0, 0, 0], [6, 16, 6, 24, 1, 0, 0, 0]]),
+                              dict(name='_RNCNCNC' + lookup + '00s_0Bh_', count=hits, filenames=list(files),
+                                   regions=[[24, 25, 24, 29, hits, 0, 0, 0], [25, 37, 25, 44, hits, 0, 0, 0],
+                                            [25, 75, 27, 26, hits, 0, 0, 0]])]
+                    counts = dict.fromkeys((4, 6, 24, 25, 26, 27), 1)
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_update_workers(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertIn(probes, proof['pairs'])
+                else:
+                    self.assertIsNone(proof)
+
     def test_index_info_preserves_worker_and_await_when_previously_cold(self):
         filename = 'src/package_managers/aur/client.rs'
         files = {'/artifact/' + filename: filename}
@@ -634,7 +745,8 @@ class AurArchiveCaptureCoverageTests(unittest.TestCase):
     def test_archive_capture_keeps_the_same_zipped_path_and_digest_verification(self):
         filename = 'src/package_managers/aur/client.rs'
         files = {'/artifact/' + filename: filename}
-        for fault in (None, 'changed-path', 'changed-hash', 'changed-output', 'foreign-callback', 'lost-callback'):
+        for fault in (None, 'changed-path', 'changed-hash', 'changed-output', 'foreign-callback', 'lost-callback',
+                      'lost-dispatch'):
             with self.subTest(fault=fault):
                 sides, indexes = [], []
                 work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
@@ -667,16 +779,17 @@ class AurArchiveCaptureCoverageTests(unittest.TestCase):
                            *[[line, 17, line, 25, 1, 0, 0, 0] for line in range(start, start + 4)],
                            [close, 13, close, 14, 1, 0, 0, 0]]
                     owners = [dict(name='_R' + method, count=1, filenames=list(files),
-                                   regions=[[2, 5, 2, 40, 1, 0, 0, 0]])]
+                                   regions=[[2, 5, 2, 40, 1, 0, 0, 0],
+                                            [6, 14, 6, 17, int(not (side and fault == 'lost-dispatch')), 0, 0, 0]])]
                     if not (side and fault == 'lost-callback'):
                         owners.append(dict(name='_RNC' + callback + 's_0Bd_', count=1, filenames=list(files), regions=raw))
-                    counts = {line: 1 for line in (7, *range(start, start + 4))}
+                    counts = {line: 1 for line in (6, 7, *range(start, start + 4))}
                     sides.append((source, coverage._construct_inventory(source, work), counts))
                     indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
                 proof = coverage.retained_aur_archive_capture(filename, sides, indexes, work)
                 if fault is None:
                     self.assertIsNotNone(proof)
-                    self.assertEqual(proof['pairs'], [[7, 7], [9, 10], [10, 11], [11, 12], [12, 13]])
+                    self.assertEqual(proof['pairs'], [[6, 6], [7, 7], [9, 10], [10, 11], [11, 12], [12, 13]])
                 else:
                     self.assertIsNone(proof)
 
@@ -773,6 +886,20 @@ class RetainedNodeChecksumWaitTests(unittest.TestCase):
 
 
 class NodeChecksumFixtureMigrationTests(unittest.TestCase):
+    def test_publication_fixture_keeps_the_failed_stage_before_authorizing_retry(self):
+        declaration = 'incomplete_node_install_is_not_published_and_can_be_retried'
+        base = ['        let manager = NodeManager {', '            client: download_client(),', '        };',
+                '        assert!(manager.publish_install(&staging, "22.0.0").is_err());',
+                '        manager.publish_install(&staging, "22.0.0")?;', '        Ok(())']
+        head = [base[0], '            security: crate::runtimes::security::RuntimeSecurity::fixture(),',
+                *base[1:4], '        crate::runtimes::security::fixture_bind_candidate(', '            "node",',
+                '            "22.0.0",', '            staging.path(),', '            &manager.versions_dir.join("22.0.0"),',
+                '        )', '        .context("Bind complete Node publication retry fixture")?;', *base[4:]]
+        self.assertEqual(coverage.retained_node_retry_sources(declaration, base, head),
+                         [(0, 0), (1, 2), (2, 3), (3, 4), (4, 12), (5, 13)])
+        switched = [*head[:4], *head[5:12], head[4], *head[12:]]
+        self.assertIsNone(coverage.retained_node_retry_sources(declaration, base, switched))
+
     def test_alias_fixture_requires_the_original_requests_and_exact_new_probes(self):
         declaration = 'https_alias_resolution_requires_the_exact_release_identity'
         base = ['            (0..4)', '        let manager = NodeManager {',
@@ -825,6 +952,64 @@ class NodeChecksumFixtureMigrationTests(unittest.TestCase):
             with self.subTest(needle=needle):
                 changed = [line.replace(needle, replacement) for line in signed]
                 self.assertIsNone(coverage.retained_node_retry_sources(declaration, base, changed))
+
+
+class RuntimeSelectionCoverageTests(unittest.TestCase):
+    def test_serial_test_future_keeps_the_qualified_pi_test_identity(self):
+        declaration = 'install_publishes_exact_version_and_activates_it'
+        root = (f'_RNvNtNtNtCsA_7omg_lib8runtimes2pi5testss_'
+                f'{len(declaration)}{declaration}')
+        future = '_RNC' + root[2:] + '0B9_'
+        self.assertEqual(coverage.pi_serial_test_root(future, declaration), root)
+        self.assertIsNone(coverage.pi_serial_test_root(future.replace('2pi', '2go'), declaration))
+        self.assertIsNone(coverage.pi_serial_test_root(future.replace('0B9_', '0Bb_'), declaration))
+
+    def test_pi_selection_requires_same_lease_and_cached_authority_before_activation(self):
+        source = ['impl PiManager {', '    pub fn use_version(&self, version: &str) -> Result<()> {',
+                  '        crate::core::security::validate_runtime_version(version)?;',
+                  '        let lease = common::try_lock_runtime_file(&self.versions_dir, ".mutation.lock")?;',
+                  '        self.select_owned(version, &lease)', '    }', '',
+                  '    fn select_owned(&self, version: &str, lease: &common::RuntimeLease) -> Result<()> {',
+                  '        let prefix = self.versions_dir.join(version);',
+                  '        let entrypoint = validate_pi_install(&prefix, version)?;',
+                  '        if let Ok((admission, reviewed)) = (|| {',
+                  '            let admission = self.security.installed("pi", &prefix, ReviewMode::CachedOnly)?;',
+                  '        })() {',
+                  '            reviewed.verify(&prefix)?;', '            admission.verify(&prefix)?;',
+                  '            common::set_current_version_with_lease(&self.versions_dir, version, lease)?;',
+                  '            print_using("Pi", version, &self.versions_dir.join("current/bin"));',
+                  '            return Ok(());', '        }', '        wait_for_review(entrypoint)', '    }', '}']
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        proof = coverage.pi_runtime_selection_slots(source, True, work)
+        self.assertIsNotNone(proof)
+        self.assertEqual([line for line, _ in proof['use_version']], [3, 4, 5])
+        self.assertEqual([line for line, _ in proof['select_owned']], [14, 15, 16])
+        for old, new in (('".mutation.lock"', '".other.lock"'),
+                         ('ReviewMode::CachedOnly', 'ReviewMode::Standard'),
+                         ('admission.verify(&prefix)?;', 'admission.verify(&other)?;'),
+                         ('version, lease)?;', 'version, &other)?;')):
+            with self.subTest(old=old):
+                bad = [line.replace(old, new) for line in source]
+                self.assertIsNone(coverage.pi_runtime_selection_slots(bad, True, work))
+
+
+class PythonCatalogCoverageTests(unittest.TestCase):
+    def test_each_loopback_response_preserves_the_same_request_bound(self):
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        common = ['let (mut socket, _) = listener.accept().await?;', 'let mut request = Vec::new();',
+                  'while !request.ends_with(b"\\r\\n\\r\\n") {',
+                  '    ensure!(request.len() < 8192, "oversized fixture request");',
+                  '    request.push(socket.read_u8().await?);', '}']
+        for modern in (False, True):
+            source = ['let server = async {']
+            indentation = 8 if modern else 4
+            if modern:
+                source.append('    for (status, body) in &responses {')
+            source.extend(' ' * indentation + line for line in common)
+            self.assertEqual(coverage.python_catalog_request_source(source, modern, work),
+                             (1, 4 + int(modern), indentation))
+            source[-3] = source[-3].replace('8192', '16384')
+            self.assertIsNone(coverage.python_catalog_request_source(source, modern, work))
 
 
 class PacmanFixtureCoverageTests(unittest.TestCase):

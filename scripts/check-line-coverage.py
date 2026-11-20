@@ -5539,6 +5539,106 @@ def retained_pi_fixture_exit(sides, work):
     return dict(kind='retained-pi-fixture-exit',pairs=[lines],owners=symbols)
 
 
+def pi_serial_test_root(symbol, declaration):
+    if not symbol.startswith('_RNCNv') or not symbol.endswith('0B9_'):
+        return None
+    root = '_R' + symbol[4:-4]
+    shape = plain_rust_function_symbol(root)
+    if (shape is not None and shape.identifiers == ('omg_lib', 'runtimes', 'pi', 'tests', declaration)
+            and direct_rust_callback_symbol(symbol, root, shape.modules)):
+        return root
+    return None
+
+
+def retained_pi_runtime_fixtures(name, sides, indexes, work):
+    """Locate unchanged fixture steps under the old serial and current isolated Pi test bodies."""
+    busy = 'busy_npm_remains_unpublished_and_can_be_retried_after_its_writer_closes'
+    tests = ('install_publishes_exact_version_and_activates_it', busy,
+             'hostile_version_is_rejected_before_npm_execution',
+             'failed_install_does_not_publish_or_replace_active_version',
+             'mismatched_registry_version_fails_closed')
+    matched = []
+    for declaration in tests:
+        observations = []
+        for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+            serial = not modern and declaration != busy
+            guard = '# [ cfg ( target_os = "linux" ) ]' if declaration == busy else '# [ cfg ( unix ) ]'
+            previous = '# [ serial_test :: serial ( pi_runtime ) ]' if serial else ''
+            signature = tuple(f'{guard} # [ tokio :: test ] {previous} async fn {declaration} ( ) -> Result < ( ) >'.split())
+            code, rows = inventory[:2]
+            _construct_charge(work, len(rows))
+            scopes = [row for row in rows if row['kind'] == 'fn' and row['header'] == signature]
+            if len(scopes) != 1:
+                break
+            test, = scopes
+            path = _boolean_module(code, {'start': test['first']})
+            if path is None or path[:2] != (['tests'], ['tests']):
+                break
+            opening, closing = test['opening'], test['end']
+            first, last = code.region(opening, closing)[0::2]
+            owners = compiled_owners_in_range(index, name, first, last, work, declaration)
+            _construct_charge(work, sum(len(o['regions']) + len(o['name']) for o in owners))
+            scope = ('omg_lib', 'runtimes', 'pi', 'tests', declaration)
+            if serial:
+                roots = [(owner, symbol) for owner in owners
+                         if (symbol := pi_serial_test_root(owner['name'], declaration)) is not None]
+            else:
+                roots = [(owner, owner['name']) for owner in owners if (shape := plain_rust_function_symbol(owner['name']))
+                         is not None and shape.identifiers == scope]
+            if len(roots) != 1:
+                break
+            ((root, symbol),) = roots
+            module_depth = plain_rust_function_symbol(symbol).modules
+            marker = code.region(opening, opening)
+            bodies = [owner for owner in owners if direct_rust_callback_symbol(
+                owner['name'], symbol, module_depth, depth=2 if serial else 1)
+                and owner['regions'][0][:4] == list(marker)]
+            if len(bodies) != 1:
+                break
+            body, = bodies
+            if (serial and root['regions'][0][:4] != list(marker)
+                    or not 0 < body['count'] <= root['count'] < COUNTER_LIMIT
+                    or any(index.name_counts[o['name']] != 1 or o.get('branches') or o.get('mcdc_records')
+                           or len(o['filenames']) != 1 or index.files.get(o['filenames'][0]) != name
+                           for o in (root, body))):
+                break
+            inside = source[first:last - 1]
+            occurrences = Counter(inside)
+            _construct_charge(work, len(inside))
+            lines = {text: line for line, text in enumerate(inside, first + 1)
+                     if occurrences[text] == 1 and line in counts and text.strip()}
+            observations.append((source, counts, lines, owners, root, body))
+        if len(observations) != 2:
+            continue
+        before, after = observations
+        pairs = []
+        for text in before[2].keys() & after[2].keys():
+            evidence = []
+            for source, counts, lines, owners, root, body in observations:
+                line = lines[text]
+                touching = [(owner, raw) for owner in owners if (raw := [
+                    r for r in owner['regions'] if r[0] <= line <= r[2]])]
+                _construct_charge(work, sum(len(o['regions']) for o in owners))
+                if (any(owner is not root and owner is not body for owner, _ in touching)
+                        or not any(owner is body for owner, _ in touching)):
+                    break
+                raw = [r for _, regions in touching for r in regions]
+                if _owner_line_counts({'regions': raw}, _ObserverWork(work)).get(line) != counts[line]:
+                    break
+                geometry, states = fragment_region_states(body, line, line, source, work)
+                evidence.append((line, geometry, states))
+            if (len(evidence) == 2 and evidence[0][1] == evidence[1][1]
+                    and all(a <= b for a, b in zip(evidence[0][2], evidence[1][2], strict=True))):
+                pairs.append([evidence[0][0], evidence[1][0]])
+        if pairs:
+            matched.append(dict(test=declaration, pairs=sorted(pairs),
+                                owners=[[row[4]['name'], row[5]['name']] for row in observations]))
+    if not matched:
+        return None
+    return dict(file=name, kind='retained-pi-runtime-fixtures',
+                pairs=[pair for row in matched for pair in row['pairs']], fixtures=matched)
+
+
 def retained_osv_request(sides, work):
     """Observe the same request fields before and after extracting the OSV scan."""
     observations = []
@@ -13506,6 +13606,168 @@ def retained_specialization_additions(name, sides, indexes, inventory_for_side, 
                 base_types=len(base), head_types=len(head), added_types=sorted(map(repr, added)))
 
 
+def pi_runtime_selection_slots(source, modern, work):
+    """Locate validation, lease acquisition and the guarded Pi activation call."""
+    header = '    pub fn use_version(&self, version: &str) -> Result<()> {'
+    validate = '        crate::core::security::validate_runtime_version(version)?;'
+    lock = '        let lease = common::try_lock_runtime_file(&self.versions_dir, ".mutation.lock")?;'
+    select = '        self.select_owned(version, &lease)'
+    activate = '        set_current_version(&self.versions_dir, version)?;'
+    announce = '        print_using("Pi", version, &self.versions_dir.join("current/bin"));'
+    legacy = ['        let version_dir = self.versions_dir.join(version);',
+              '        validate_pi_install(&version_dir, version)?;', activate, announce, '        Ok(())']
+    expected = [header, validate, *([lock, select] if modern else legacy), '    }']
+    _construct_charge(work, len(source))
+    if source.count(header) != 1:
+        return None
+    start = source.index(header)
+    if source[start:start + len(expected)] != expected:
+        return None
+
+    def slot(line, token):
+        position = source[line - 1].index(token) + 1
+        return line, (line, position, line, position + len(token))
+
+    if not modern:
+        return {'use_version': [slot(start + 5, 'set_current_version')]}
+    owned = '    fn select_owned(&self, version: &str, lease: &common::RuntimeLease) -> Result<()> {'
+    cached = ['        let prefix = self.versions_dir.join(version);',
+              '        let entrypoint = validate_pi_install(&prefix, version)?;',
+              '        if let Ok((admission, reviewed)) = (|| {']
+    guarded = ['        })() {', '            reviewed.verify(&prefix)?;',
+               '            admission.verify(&prefix)?;',
+               '            common::set_current_version_with_lease(&self.versions_dir, version, lease)?;',
+               '    ' + announce, '            return Ok(());', '        }']
+    if source.count(owned) != 1:
+        return None
+    begin = source.index(owned)
+    if source[begin + 1:begin + 4] != cached:
+        return None
+    ends = [at for at, line in enumerate(source) if at > begin + 3 and line == guarded[0]]
+    for end in ends:
+        if '    }' in source[begin + 4:end]:
+            return None
+        if source[end:end + len(guarded)] == guarded:
+            break
+    else:
+        return None
+    if not any(line.strip().endswith('.installed("pi", &prefix, ReviewMode::CachedOnly)?;')
+               for line in source[begin + 4:end]):
+        return None
+    return {'use_version': [slot(start + 2, 'crate::core::security::validate_runtime_version'),
+                            slot(start + 3, 'common::try_lock_runtime_file'),
+                            slot(start + 4, 'select_owned')],
+            'select_owned': [slot(end + 2, 'verify'), slot(end + 3, 'verify'),
+                             slot(end + 4, 'common::set_current_version_with_lease')]}
+
+
+def retained_runtime_selection_copies(name, sides, indexes, pi_sources, work):
+    """Track the migrated production copy and the preserved test-only copy independently."""
+    source_pi = 'src/runtimes/pi.rs'
+    common_scope = ('omg_lib', 'runtimes', 'common')
+    pi_scope = ('type', ('type', ('crate', 'omg_lib'), ('runtimes', '')), ('pi', ''))
+    wrapper = ['pub(crate) fn set_current_version(versions_dir: &Path, version: &str) -> Result<()> {',
+               '    crate::core::security::validate_runtime_version(version)?;',
+               '    let mutation_lease = try_lock_runtime_file(versions_dir, ".mutation.lock")?;',
+               '    set_current_version_with_lease(versions_dir, version, &mutation_lease)', '}']
+    observations = []
+    for modern, ((source, counts, owners), index, pi) in enumerate(zip(sides, indexes, pi_sources, strict=True)):
+        _construct_charge(work, len(source))
+        if source.count(wrapper[0]) != 1 or len(owners) != (1 if modern else 2):
+            return None
+        start = source.index(wrapper[0]) + 1
+        end = start + len(wrapper) - 1
+        if source[start - 1:end] != wrapper or (source[start - 2] == '#[cfg(test)]') != bool(modern):
+            return None
+        test_name = 'set_current_version_rejects_missing_versions'
+        test_shapes = [owner for owner in index.inventories.get(name, ()) if test_name in owner['name']
+                       and (path := plain_rust_function_symbol(owner['name'])) is not None
+                       and path.identifiers == (*common_scope, 'tests', test_name)
+                       and index.name_counts[owner['name']] == 1 and owner['count'] > 0]
+        if len(test_shapes) != 1:
+            return None
+
+        def crate(owner):
+            code = re.match(r'_RNv(?:Nt){2,3}C(s[0-9A-Za-z]{0,32}_)7omg_lib', owner['name'])
+            return code[1] if code else None
+
+        fixture_crate = crate(test_shapes[0])
+        if fixture_crate is None:
+            return None
+        common_copies = {}
+        for owner in owners:
+            path = plain_rust_function_symbol(owner['name'])
+            copy = crate(owner)
+            raw = owner['regions']
+            if (path is None or path.identifiers != (*common_scope, 'set_current_version') or not copy
+                    or copy in common_copies or index.name_counts[owner['name']] != 1 or owner.get('branches')
+                    or owner.get('mcdc_records') or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name or not 0 < owner['count'] < COUNTER_LIMIT
+                    or any(not start <= r[0] == r[2] <= end or r[5:] != [0, 0, 0]
+                           or not 0 <= r[4] <= owner['count'] for r in raw)):
+                return None
+            common_copies[copy] = owner
+        if fixture_crate not in common_copies:
+            return None
+        projection = _owner_line_counts({'regions': [r for owner in owners for r in owner['regions']]},
+                                        _ObserverWork(work))
+        if projection != {n: counts[n] for n in range(start, end + 1) if n in counts}:
+            return None
+        slots = pi_runtime_selection_slots(pi, modern, work)
+        if slots is None:
+            return None
+        phases = {}
+        first = min(line for values in slots.values() for line, _ in values)
+        last = max(line for values in slots.values() for line, _ in values)
+        for owner in compiled_owners_in_range(index, source_pi, first, last, work, '9PiManager'):
+            key = owner['name']
+            shape = nominal_method_path(key) if '9PiManager' in key else None
+            if (shape is None or shape.kind != 'M' or shape.namespace != pi_scope
+                    or shape.self_type != ('type', pi_scope, ('PiManager', '')) or shape.callbacks):
+                continue
+            role = shape.method[0]
+            if role not in slots or shape.method[1]:
+                continue
+            copy = shape.instantiating_crate[1]
+            entries = phases.setdefault(copy, {})
+            if (role in entries or index.name_counts[key] != 1 or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != source_pi or owner.get('branches')
+                    or owner.get('mcdc_records') or not 0 < owner['count'] < COUNTER_LIMIT
+                    or any(len([r for r in owner['regions'] if tuple(r[:4]) == position
+                                and 0 < r[4] <= owner['count'] and r[5:] == [0, 0, 0]]) != 1
+                           for _, position in slots[role])):
+                return None
+            entries[role] = owner
+        if (len(phases) != 2 or fixture_crate not in phases
+                or any(entries.keys() != slots.keys() for entries in phases.values())):
+            return None
+        native_crate, = phases.keys() - {fixture_crate}
+        if not modern:
+            if common_copies.keys() != phases.keys():
+                return None
+            native = common_copies[native_crate]
+            if (native['count'] != phases[native_crate]['use_version']['count']
+                    or any(r[4] != (0 if source[r[0] - 1][r[1] - 1:r[3] - 1] == '?' else native['count'])
+                           for r in native['regions'])):
+                return None
+        else:
+            native_phases = phases[native_crate]
+            if native_phases['select_owned']['count'] != native_phases['use_version']['count']:
+                return None
+        unit = common_copies[fixture_crate]
+        geometry = tuple((r[0] - start, r[1], r[3]) for r in unit['regions'])
+        states = tuple(r[4] > 0 for r in unit['regions'])
+        observations.append((sorted(projection), geometry, states, unit['name'],
+                             [entry['name'] for entry in phases[native_crate].values()]))
+    before, after = observations
+    if before[1] != after[1] or any(a > b for a, b in zip(before[2], after[2], strict=True)):
+        return None
+    return dict(file=name, kind='retained-runtime-selection-copies',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                test_owners=[before[3], after[3]], production_callers=[before[4], after[4]],
+                summary_credit=[0, 0], mapped_credit=[0, 0])
+
+
 def retained_budgeted_reader_copies(name, sides, indexes, inventory_for_side, work):
     """Verify unchanged Read coverage across the additional archive decoders."""
     container = tuple('impl < R : Read > Read for BudgetedReader < R >'.split())
@@ -13656,8 +13918,9 @@ def retained_aur_archive_capture(name, sides, indexes, work):
             return None
         entry = code.region(callback, callback)
         end = code.region(code.pairs[callback], code.pairs[callback])
+        dispatch = code.region(call - 1, call - 1)
         tail_start = line + 2 + len(inspect)
-        lines = (line + 1, *range(tail_start, end[0]))
+        lines = (dispatch[0], line + 1, *range(tail_start, end[0]))
         positions = {selected: ordinal for ordinal, selected in enumerate(lines)}
         owners = compiled_owners_in_range(index, name, lines[0], lines[-1], work, '18authorize_archives')
         _construct_charge(work, sum(len(owner['regions']) * (len(lines).bit_length() + 1)
@@ -13693,12 +13956,18 @@ def retained_aur_archive_capture(name, sides, indexes, work):
             root, parent_regions = members[()]
             body, regions = members[('s_',)]
             markers = [r for r in body['regions'] if tuple(r[:4]) in (entry, end)]
-            if (parent_regions or not regions or [tuple(r[:4]) for r in markers] != [entry, end]
+            if (len(parent_regions) != 1 or tuple(parent_regions[0][:4]) != dispatch
+                    or parent_regions[0][5:] != [0, 0, 0] or not 0 <= parent_regions[0][4] <= root['count']
+                    or not regions or [tuple(r[:4]) for r in markers] != [entry, end]
                     or markers[0][4:] != [body['count'], 0, 0, 0]
                     or not 0 <= markers[1][4] <= body['count'] < COUNTER_LIMIT
                     or markers[1][5:] != [0, 0, 0] or body['count'] and not root['count']):
                 return None
-            geometry = []; hits = []; selected_regions = []; symbols = [root['name']]
+            geometry = []
+            hits = [parent_regions[0][4] > 0]
+            selected_regions = list(parent_regions)
+            symbols = [root['name']]
+            covered.add(id(root))
             for scope in sorted(members.keys() - {()}):
                 owner, raw = members[scope]
                 _construct_charge(work, len(raw))
@@ -13720,7 +13989,7 @@ def retained_aur_archive_capture(name, sides, indexes, work):
         if (covered != affected or len(layouts) != 1 or not any(projections.values())
                 or projection != {n: counts[n] for n in lines if n in counts}):
             return None
-        observations.append(((line + 1, *range(tail_start, end[0])), next(iter(layouts)), states, witnesses,
+        observations.append((lines, next(iter(layouts)), states, witnesses,
                              declared[0]['header'], source[tail_start - 1:end[0] - 1],
                              tuple(positions[n] for n in projection)))
     before, after = observations
@@ -14428,14 +14697,15 @@ def retained_aur_git_limits(name, sides, indexes, work):
 
 def compiled_tokio_test_fixture(name, inventory, index, declaration, work,
                                 module=('package_managers', 'aur_sources', 'public_source_tests'),
-                                *, feature=None, fallible=False, unix_current_thread=False):
-    """Identify the constructor and future body of a synchronous test entry point."""
+                                *, feature=None, fallible=False, unix_current_thread=False, synchronous=False):
+    """Identify the Rust test entry point and its future body when present."""
     code, rows = inventory[:2]
     guard = f'# [ cfg ( feature = "{feature}" ) ] ' if feature else ''
     output = ' -> Result < ( ) >' if fallible else ''
     attributes = ('# [ cfg ( unix ) ] # [ tokio :: test ( flavor = "current_thread" ) ]'
-                  if unix_current_thread else '# [ tokio :: test ]')
-    header = tuple(f'{attributes} {guard}async fn {declaration} ( ){output}'.split())
+                  if unix_current_thread else '# [ test ]' if synchronous else '# [ tokio :: test ]')
+    qualifier = '' if synchronous else 'async '
+    header = tuple(f'{attributes} {guard}{qualifier}fn {declaration} ( ){output}'.split())
     _construct_charge(work, len(rows))
     functions = [row for row in rows if row['kind'] == 'fn' and row['header'] == header]
     if len(functions) != 1:
@@ -14454,20 +14724,24 @@ def compiled_tokio_test_fixture(name, inventory, index, declaration, work,
     if len(roots) != 1:
         return None
     (root, shape), = roots
+    markers = (code.region(first + header.index('fn'), opening - 1), code.region(end, end))
+    if any([r[4:] for r in root['regions'] if tuple(r[:4]) == slot] != [[root['count'], 0, 0, 0]]
+           for slot in markers):
+        return None
+    if (not 0 < root['count'] < COUNTER_LIMIT or index.name_counts[root['name']] != 1
+            or root.get('branches') or root.get('mcdc_records')
+            or len(root['filenames']) != 1 or index.files.get(root['filenames'][0]) != name):
+        return None
+    if synchronous:
+        return function, root, None, markers
     entry = code.region(opening, opening)
     children = [owner for owner in owners if direct_rust_callback_symbol(owner['name'], root['name'], shape.modules)
                 and [r[4:] for r in owner['regions'] if tuple(r[:4]) == entry] == [[owner['count'], 0, 0, 0]]]
     if len(children) != 1:
         return None
     body, = children
-    if (not 0 < body['count'] <= root['count'] < COUNTER_LIMIT
-            or any(index.name_counts[owner['name']] != 1 or owner.get('branches') or owner.get('mcdc_records')
-                   or len(owner['filenames']) != 1 or index.files.get(owner['filenames'][0]) != name
-                   for owner in (root, body))):
-        return None
-    markers = (code.region(first + header.index('fn'), opening - 1), code.region(end, end))
-    if any([r[4:] for r in root['regions'] if tuple(r[:4]) == slot] != [[root['count'], 0, 0, 0]]
-           for slot in markers):
+    if (not 0 < body['count'] <= root['count'] or index.name_counts[body['name']] != 1
+            or body.get('branches') or body.get('mcdc_records') or body['filenames'] != root['filenames']):
         return None
     return function, root, body, markers
 
@@ -14479,13 +14753,15 @@ _NODE_RETRY_TESTS = (
 )
 _NODE_ACTIVATION_TEST = 'node_sync_activation_works_inside_current_thread_runtime'
 _NODE_ALIAS_TEST = 'https_alias_resolution_requires_the_exact_release_identity'
+_NODE_PUBLICATION_TEST = 'incomplete_node_install_is_not_published_and_can_be_retried'
+_NODE_MIGRATED_TESTS = (*_NODE_RETRY_TESTS, _NODE_ACTIVATION_TEST, _NODE_ALIAS_TEST, _NODE_PUBLICATION_TEST)
 
 
 def retained_node_retry_sources(declaration, base, signed):
     """Align retained steps in the Node TLS and activation fixtures."""
     expected = list(enumerate(base))
     manager = '        let manager = NodeManager {'
-    if declaration not in (*_NODE_RETRY_TESTS, _NODE_ACTIVATION_TEST, _NODE_ALIAS_TEST) or base.count(manager) != 1:
+    if declaration not in _NODE_MIGRATED_TESTS or base.count(manager) != 1:
         return None
     expected.insert(base.index(manager) + 1,
                     (None, '            security: crate::runtimes::security::RuntimeSecurity::fixture(),'))
@@ -14523,13 +14799,17 @@ def retained_node_retry_sources(declaration, base, signed):
         start = expected.index((base.index(alias_probe), alias_probe)) + 1
         expected[start:start] = [(None, f'        assert_eq!(manager.resolve_requested_version("{version}").await?, "20.10.0");')
                                  for version in ('20', '20.10')]
-    elif declaration == _NODE_ACTIVATION_TEST:
+    elif declaration in (_NODE_ACTIVATION_TEST, _NODE_PUBLICATION_TEST):
         target = '            &manager.versions_dir.join("22.0.0"),'
-        for action, candidate, description in (
+        bindings = (
             ('use_version("22.0.0")', target, 'published Node fixture before current-thread activation'),
             ('publish_install(&staging, "22.0.0")', '            staging.path(),',
              'Node staging fixture before current-thread publication'),
-        ):
+        ) if declaration == _NODE_ACTIVATION_TEST else (
+            ('publish_install(&staging, "22.0.0")', '            staging.path(),',
+             'complete Node publication retry fixture'),
+        )
+        for action, candidate, description in bindings:
             marker = f'        manager.{action}?;'
             if base.count(marker) != 1:
                 return None
@@ -14546,13 +14826,14 @@ def retained_node_retry_fixtures(name, sides, indexes, work):
     """Compare unchanged steps in the signed and unsigned local HTTPS fixtures."""
     pairs = []
     witnesses = []
-    for declaration in (*_NODE_RETRY_TESTS, _NODE_ACTIVATION_TEST, _NODE_ALIAS_TEST):
+    for declaration in _NODE_MIGRATED_TESTS:
         observations = []
         for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
             fixture = compiled_tokio_test_fixture(name, inventory, index, declaration, work,
                                                   module=('runtimes', 'node', 'tests'),
                                                   feature='pgp' if modern and declaration in _NODE_RETRY_TESTS else None,
-                                                  fallible=True, unix_current_thread=declaration == _NODE_ACTIVATION_TEST)
+                                                  fallible=True, unix_current_thread=declaration == _NODE_ACTIVATION_TEST,
+                                                  synchronous=declaration == _NODE_PUBLICATION_TEST)
             if fixture is None:
                 break
             function, root, body, _ = fixture
@@ -14573,7 +14854,7 @@ def retained_node_retry_fixtures(name, sides, indexes, work):
                         or index.name_counts[callback['name']] != 1 or callback['filenames'] != body['filenames']
                         or callback.get('branches') or callback.get('mcdc_records')):
                     break
-            members = (root, body, *touching)
+            members = (root, *([body] if body is not None else []), *touching)
             projection = _owner_line_counts({'regions': [r for owner in members for r in owner['regions']]},
                                             _ObserverWork(work))
             if any(projection.get(line) != counts.get(line) for line in range(start + 1, stop)):
@@ -14604,6 +14885,79 @@ def retained_node_retry_fixtures(name, sides, indexes, work):
     if not pairs:
         return None
     return dict(file=name, kind='retained-node-retry-fixtures', pairs=pairs, fixtures=witnesses)
+
+
+def python_catalog_request_source(source, modern, work):
+    _construct_charge(work, len(source))
+    candidates = [at for at, line in enumerate(source) if line.strip() == 'let server = async {']
+    if len(candidates) != 1:
+        return None
+    start, = candidates
+    base = len(source[start]) - len(source[start].lstrip())
+    padding = base + (8 if modern else 4)
+    response = [' ' * (base + 4) + 'for (status, body) in &responses {'] if modern else []
+    request = ['let (mut socket, _) = listener.accept().await?;', 'let mut request = Vec::new();',
+               'while !request.ends_with(b"\\r\\n\\r\\n") {',
+               '    ensure!(request.len() < 8192, "oversized fixture request");',
+               '    request.push(socket.read_u8().await?);', '}']
+    expected = [*response, *[' ' * padding + line for line in request]]
+    if source[start + 1:start + 1 + len(expected)] != expected:
+        return None
+    return start + 1, start + len(response) + 4, padding
+
+
+def retained_python_catalog_request(name, sides, indexes, work):
+    """Compare bounded fixture reads after giving each retry its own response."""
+    declaration = 'http_fetch_preserves_errors_and_requires_valid_catalog'
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        fixture = compiled_tokio_test_fixture(name, inventory, index, declaration, work,
+                                             module=('runtimes', 'python', 'catalog', 'tests'), fallible=True)
+        if fixture is None:
+            return None
+        function, root, body, _ = fixture
+        code = inventory[0]
+        first, last = code.region(function['opening'], function['end'])[0::2]
+        setup = python_catalog_request_source(source[first:last - 1], modern, work)
+        if setup is None:
+            return None
+        server, loop, indent = setup
+        server += first
+        loop += first
+        selected = (server, loop, loop + 1, loop + 2)
+        candidates = compiled_owners_in_range(index, name, selected[0], selected[-1], work)
+        _construct_charge(work, sum(len(o['regions']) + len(o['name']) for o in candidates))
+        touching = [(owner, raw) for owner in candidates if (raw := [
+            r for r in owner['regions'] if any(r[0] <= line <= r[2] for line in selected)])]
+        root_raw = [raw for owner, raw in touching if owner is root]
+        dispatch = [raw for owner, raw in touching if owner is body]
+        remaining = [(owner, raw) for owner, raw in touching if owner is not root and owner is not body]
+        if (len(root_raw) != 1 or len(root_raw[0]) != 1 or len(remaining) != 1
+                or not root_raw[0][0][0] <= server <= selected[-1] <= root_raw[0][0][2]
+                or root_raw[0][0][4:] != [root['count'], 0, 0, 0] or len(dispatch) != 1):
+            return None
+        (owner, raw), = remaining
+        shape = plain_rust_function_symbol(root['name'])
+        entry = [server, len(source[server - 1]), server, len(source[server - 1]) + 1]
+        if (not direct_rust_callback_symbol(owner['name'], root['name'], shape.modules, depth=2)
+                or index.name_counts[owner['name']] != 1 or owner['filenames'] != root['filenames']
+                or owner.get('branches') or owner.get('mcdc_records') or not 0 < owner['count'] < COUNTER_LIMIT
+                or owner['regions'][0] != [*entry, owner['count'], 0, 0, 0]
+                or dispatch[0] != [[server, 17, server, 23, owner['count'], 0, 0, 0]]
+                or {r[0] for r in raw} != set(selected)
+                or any(r[0] != r[2] or r[5:] != [0, 0, 0] or not 0 <= r[4] < COUNTER_LIMIT for r in raw)):
+            return None
+        projected = _owner_line_counts({'regions': root_raw[0] + dispatch[0] + raw}, _ObserverWork(work))
+        if any(projected.get(line) != counts.get(line) or not counts.get(line, 0) for line in selected):
+            return None
+        geometry = tuple((r[0] - loop, r[1] - indent, r[3] - indent) for r in raw if r[0] != server)
+        observations.append((selected, geometry, tuple(r[4] > 0 for r in raw), [root['name'], owner['name']]))
+    before, after = observations
+    if before[1] != after[1] or any(b > h for b, h in zip(before[2], after[2], strict=True)):
+        return None
+    return dict(file=name, kind='retained-python-catalog-request',
+                pairs=[list(pair) for pair in zip(before[0], after[0], strict=True)],
+                owners=[before[3], after[3]], geometry=before[1])
 
 
 _PACMAN_CHILD_FIXTURE_DIGESTS = {
@@ -15816,6 +16170,328 @@ def retained_aur_index_info(name, sides, indexes, work):
     return retained_aur_index_search(name, sides, indexes, work, info=True)
 
 
+def retained_aur_update_workers(name, sides, indexes, work):
+    """Bind the foreign catalog guard and cached-version loop to their workers."""
+    signature = tuple(('# [ instrument ( skip ( self ) ) ] pub async fn get_update_list ( & self ) '
+                       '-> Result < Vec < ( String , Version , Version ) > >').split())
+    call = '        let (foreign_packages, installed) = tokio::task::spawn_blocking(|| -> Result<_> {'
+    collection = ['                    let mut local_pkgs = Vec::with_capacity(local_names.len());',
+                  '                    for name in local_names {',
+                  '                        if let Some(version) = local_installed.get(&name) {',
+                  '                            local_pkgs.push((name, version.clone()));',
+                  '                        }']
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(rows))
+        methods = [row for row in rows if row['kind'] == 'fn' and row['header'] == signature]
+        if len(methods) != 1:
+            return None
+        method, = methods
+        opening = method['opening']
+        parent = code.parents[opening]
+        if (parent is None or code.parents[parent] is not None
+                or not any(row['opening'] == parent and row['header'] == ('impl', 'AurClient') for row in rows)):
+            return None
+        first, last = code.region(opening, method['end'])[0::2]
+        body = source[first:last - 1]
+        _construct_charge(work, len(body))
+        head = 0
+        while head < len(body) and body[head].lstrip().startswith('//'):
+            head += 1
+        discovered = ('let packages = pacman_db::get_potential_aur_package_records()?;' if modern else
+                      'let mut packages = get_potential_aur_packages()?;')
+        empty = 'Vec::new()' if modern else 'packages'
+        if body[head:head + 5] != [call, f'            {discovered}', '            if packages.is_empty() {',
+                                  f'                return Ok(({empty}, Arc::new(HashMap::new())));', '            }']:
+            return None
+        spawn = first + head + 1
+        callback = bisect.bisect_left(code.starts, code.offsets[spawn]) - 1
+        if code.words[callback] != '{' or callback not in code.pairs:
+            return None
+        worker_end = code.region(code.pairs[callback], code.pairs[callback])[0]
+        joined = worker_end - first - 1
+        if body[joined:joined + 7] != ['        })', '        .await',
+                                       '        .context("AUR foreign-package scan task failed")??;', '',
+                                       '        if foreign_packages.is_empty() {', '            return Ok(Vec::new());',
+                                       '        }']:
+            return None
+        snapshot = ('let Some(index) = self.fresh_metadata_index().await' if modern else
+                    'let Some(index_path) = self.fresh_metadata_index_path().await')
+        result = '(Vec<(String, Version, Version)>, Vec<String>)'
+        if not modern:
+            result = f'Option<{result}>'
+        lookup = [f'        if {snapshot} {{', '            let local_names = foreign_packages.clone();',
+                  '            let local_installed = Arc::clone(&installed);',
+                  '            let result = tokio::task::spawn_blocking(',
+                  f'                move || -> Result<{result}> {{', *collection]
+        entries = [at for at, line in enumerate(body) if line == lookup[0]]
+        if len(entries) != 1:
+            return None
+        lookup_at, = entries
+        if lookup_at <= joined + 6 or body[lookup_at:lookup_at + len(lookup)] != lookup:
+            return None
+        loop = first + lookup_at + 7
+        selected = (spawn, spawn + 2, *range(loop, loop + len(collection) - 1))
+        positions = {line: offset for offset, line in enumerate(selected)}
+        roles = ((), ('', '', ''), ('', '', 's_'))
+        symbol_hint = '9AurClient15get_update_list'
+        owners = compiled_owners_in_range(index, name, selected[0], selected[-1], work, symbol_hint)
+        _construct_charge(work, sum(len(owner['name']) + len(selected).bit_length() * len(owner['regions'])
+                                   for owner in owners))
+        copies = {}
+        for owner in owners:
+            key = owner['name']
+            raw = [r for r in owner['regions'] if (at := bisect.bisect_left(selected, r[0])) < len(selected)
+                   and selected[at] <= r[2]]
+            shape = nominal_method_path(key) if symbol_hint in key else None
+            qualified = (shape is not None and shape.kind == 'M' and shape.namespace == _AUR_CLIENT_NAMESPACE
+                         and shape.self_type == ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
+                         and shape.method == ('get_update_list', ''))
+            if not raw and (not qualified or shape.callbacks):
+                continue
+            if (not qualified or shape.callbacks not in roles or index.name_counts[key] != 1
+                    or owner.get('branches') or owner.get('mcdc_records') or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name or not 0 <= owner['count'] < COUNTER_LIMIT
+                    or any(r[0] not in positions or r[2] not in positions or r[5:] != [0, 0, 0]
+                           or not 0 <= r[4] < COUNTER_LIMIT or r[4] and not owner['count'] for r in raw)):
+                return None
+            members = copies.setdefault(shape.copy_identity, {})
+            if shape.callbacks in members:
+                return None
+            members[shape.callbacks] = owner, raw
+        if not 1 <= len(copies) <= 16:
+            return None
+        geometry = set(); states = []; names = []; projection = Counter()
+        for members in copies.values():
+            if set(members) != set(roles):
+                return None
+            (root, root_raw), (inventory_owner, inventory_raw), (lookup_owner, lookup_raw) = (
+                members[role] for role in roles)
+            entry = code.region(callback, callback)
+            if (root_raw or not lookup_owner['count'] <= inventory_owner['count'] <= root['count']
+                    or {r[0] for r in inventory_raw} != {spawn, spawn + 2}
+                    or inventory_raw[0] != [*entry, inventory_owner['count'], 0, 0, 0]
+                    or not lookup_raw or any(r[0] < loop for r in lookup_raw)):
+                return None
+            geometry.add(tuple(tuple((positions[r[0]], r[1], positions[r[2]], r[3]) for r in raw)
+                               for raw in (inventory_raw, lookup_raw)))
+            raw = inventory_raw + lookup_raw
+            states.append(tuple(r[4] > 0 for r in raw))
+            projection.update({line: hits for line, hits in _owner_line_counts({'regions': raw}, _ObserverWork(work)).items()
+                               if line in positions})
+            names.append([owner['name'] for owner in (root, inventory_owner, lookup_owner)])
+        if (len(geometry) != 1 or not projection[spawn]
+                or projection != {line: counts[line] for line in selected if line in counts}):
+            return None
+        observations.append((tuple(positions[line] for line in sorted(projection)), selected,
+                             geometry.pop(), states, names))
+    before, after = observations
+    _construct_charge(work, len(before[3]) * len(after[3]) * len(before[3][0]))
+    if (before[0] != after[0] or before[2] != after[2]
+            or compiled_hit_state_matching(before[3], after[3]) is None):
+        return None
+    return dict(file=name, kind='retained-aur-update-workers',
+                pairs=[[before[1][i], after[1][i]] for i in before[0]],
+                geometry=before[2], owners=[before[4], after[4]], copy_states=[before[3], after[3]])
+
+
+def rollback_stage_source(source, inventory, modern, work):
+    code, rows = inventory[:2]
+    signature = tuple(('pub async fn downgrade_from_history ( & self , package : & str , '
+                       'version : & str ) -> Result < ( ) >').split())
+    _construct_charge(work, len(rows))
+    methods = [row for row in rows if row['kind'] == 'fn' and row['header'] == signature]
+    if len(methods) != 1:
+        return None
+    method, = methods
+    parent = code.parents[method['opening']]
+    if (parent is None or code.parents[parent] is not None
+            or not any(row['opening'] == parent and row['header'] == ('impl', 'AurClient') for row in rows)):
+        return None
+    first, last = code.region(method['opening'], method['end'])[0::2]
+    body = source[first:last - 1]
+    _construct_charge(work, len(body))
+    argument = ', &reviewed_digest' if modern else ''
+    build = ['        reviewed_digest.verify(&pkg_dir)?;', '        let status = self',
+             f'            .run_build(&pkg_dir, &env, package{argument})', '            .await',
+             '            .with_context(|| format!("Failed to run makepkg for \'{package}\'"))?;']
+    package = '                &[package.to_owned()],'
+    authorize = ['        let archives = self', '            .authorize_with_paired_build(',
+                 '                &[archive],', '                &reviewed_digest,', '                &base,',
+                 package, *([package] if modern else []), '                false,', '                &pkg_dir,',
+                 '                &env,', '            )', '            .await?;']
+    starts = []
+    for chunk in (build, authorize):
+        candidates = [at for at, line in enumerate(body) if line == chunk[0]]
+        if len(candidates) != 1 or body[candidates[0]:candidates[0] + len(chunk)] != chunk:
+            return None
+        starts.append(first + candidates[0] + 1)
+    build_start, authorize_start = starts
+    if authorize_start < build_start + len(build):
+        return None
+    ranges = (range(build_start + 1, build_start + len(build)),
+              range(authorize_start, authorize_start + len(authorize)))
+    return ranges, authorize_start + 6 if modern else None
+
+
+def retained_aur_rollback_stages(name, sides, indexes, work):
+    """Retain the reviewed build and paired authorization evidence through the new inputs."""
+    observations = []
+    for modern, ((source, inventory, counts), index) in enumerate(zip(sides, indexes, strict=True)):
+        stage = rollback_stage_source(source, inventory, modern, work)
+        if stage is None:
+            return None
+        ranges, new_argument = stage
+        lines = tuple(line for interval in ranges for line in interval)
+        normalized = tuple(line for line in lines if line != new_argument)
+        positions = {line: ordinal for ordinal, line in enumerate(normalized)}
+        context_role = ('', '' if modern else 's_')
+        roles = ((), ('',), context_role)
+        symbol_hint = '9AurClient22downgrade_from_history'
+        owners = compiled_owners_in_range(index, name, lines[0], lines[-1], work, symbol_hint)
+        _construct_charge(work, sum(len(o['name']) + len(o['regions']) * len(lines).bit_length() for o in owners))
+        copies = {}
+        for owner in owners:
+            symbol = owner['name']
+            relevant = [r for r in owner['regions'] if (at := bisect.bisect_left(lines, r[0])) < len(lines)
+                        and lines[at] <= r[2]]
+            shape = nominal_method_path(symbol) if symbol_hint in symbol else None
+            qualified = (shape is not None and shape.kind == 'M' and shape.namespace == _AUR_CLIENT_NAMESPACE
+                         and shape.self_type == ('type', _AUR_CLIENT_NAMESPACE, ('AurClient', ''))
+                         and shape.method == ('downgrade_from_history', ''))
+            if not relevant and (not qualified or shape.callbacks):
+                continue
+            if (not qualified or shape.callbacks not in roles or index.name_counts[symbol] != 1
+                    or owner.get('branches') or owner.get('mcdc_records') or len(owner['filenames']) != 1
+                    or index.files.get(owner['filenames'][0]) != name or not 0 <= owner['count'] < COUNTER_LIMIT
+                    or any(r[5:] != [0, 0, 0] or not 0 <= r[4] <= owner['count'] for r in relevant)):
+                return None
+            phases = copies.setdefault(shape.copy_identity, {})
+            if shape.callbacks in phases:
+                return None
+            phases[shape.callbacks] = owner, relevant
+        if not 1 <= len(copies) <= 16:
+            return None
+        layouts = set(); states = []; projection = Counter(); witnesses = []
+        for phases in copies.values():
+            if set(phases) != set(roles):
+                return None
+            (root, root_raw), (body, body_raw), (context, context_raw) = (phases[role] for role in roles)
+            diagnostic = ranges[0][-1]
+            if (root_raw or not context['count'] <= body['count'] <= root['count']
+                    or len(context_raw) != 1 or context_raw[0][:4] != [diagnostic, 30, diagnostic, 37]
+                    or not body_raw or body_raw[0][0] != lines[0]):
+                return None
+            included = body_raw
+            if modern:
+                inserted = [r for r in body_raw if r[0] == new_argument]
+                original = [r for r in body_raw if r[0] == new_argument - 1]
+                call = ranges[0][1]
+                package_start = source[call - 1].index('package') + 1
+                package_slot = [call, package_start, call, package_start + len('package')]
+                package_regions = [r for r in body_raw if r[:4] == package_slot]
+                build_entries = [r for r in body_raw if r[:4] == [call, 14, call, 23]]
+                if (len(original) != 1 or len(inserted) != 1 or original[0][1::2] != inserted[0][1::2]
+                        or inserted[0][2] != new_argument or original[0][4:] != inserted[0][4:]
+                        or len(package_regions) != 1 or len(build_entries) != 1
+                        or package_regions[0][4:] != build_entries[0][4:]):
+                    return None
+                included = [r for r in body_raw if r[0] != new_argument and r[:4] != package_slot]
+            raw = included + context_raw
+            if any(r[0] not in positions or r[2] not in positions for r in raw):
+                return None
+            layouts.add(tuple((positions[r[0]], r[1], positions[r[2]], r[3]) for r in raw))
+            states.append(tuple(r[4] > 0 for r in raw))
+            projection.update({line: hit for line, hit in _owner_line_counts(
+                {'regions': body_raw + context_raw}, _ObserverWork(work)).items() if line in lines})
+            witnesses.append([o['name'] for o in (root, body, context)])
+        if (len(layouts) != 1 or (modern and not all(projection[line] for line in (lines[0], ranges[1][0], new_argument)))
+                or projection != {line: counts[line] for line in lines if line in counts}):
+            return None
+        mapped = {positions[line] for line in projection if line in positions}
+        observations.append((source, normalized, mapped, layouts.pop(), states, witnesses))
+    before, after = observations
+    _construct_charge(work, len(before[4]) * len(after[4]) * len(before[4][0]))
+    if (before[2] != after[2] or before[3] != after[3]
+            or compiled_hit_state_matching(before[4], after[4]) is None):
+        return None
+    pairs = []
+    for at in sorted(before[2]):
+        line, target = before[1][at], after[1][at]
+        if before[0][line - 1] == after[0][target - 1]:
+            pairs.append([line, target])
+    return dict(file=name, kind='retained-aur-rollback-stages', pairs=pairs,
+                geometry=before[3], owners=[before[5], after[5]], copy_states=[before[4], after[4]])
+
+
+def retained_aur_environment_entries(name, sides, indexes, work):
+    """Observe activation of retained async AUR fixtures with their isolated environment."""
+    observations = []
+    for (source, inventory, counts), index in zip(sides, indexes, strict=True):
+        code, rows = inventory[:2]
+        _construct_charge(work, len(source) + len(rows))
+        functions = {row['opening']: row for row in rows if row['kind'] == 'fn'}
+        test_modules = {row['opening'] for row in rows if row['kind'] == 'mod'
+                        and row['header'] in (
+                            tuple('# [ cfg ( test ) ] mod tests'.split()),
+                            tuple('# [ cfg ( test ) ] # [ expect ( clippy :: unwrap_used ) ] mod tests'.split()),
+                        ) and code.parents[row['opening']] is None}
+        entries = {}
+        for line, text in enumerate(source, 1):
+            if (text != '        fixture.with_environment(async {' or line <= 1
+                    or not source[line - 2].startswith('        let fixture = S72Fixture::new(')):
+                continue
+            start = bisect.bisect_left(code.starts, code.offsets[line - 1])
+            function = functions.get(code.parents[start])
+            if function is None:
+                continue
+            header = function['header']
+            if header[:5] != ('#', '[', 'test', ']', 'fn') or header[6:] != tuple('( ) -> Result < ( ) >'.split()):
+                continue
+            declaration = header[5]
+            if code.parents[function['opening']] not in test_modules:
+                continue
+            scope = ('omg_lib', 'package_managers', 'aur', 'client', 'tests', declaration)
+            input_source = source[line - 2]
+            owners = compiled_owners_in_range(index, name, line, line, work, declaration)
+            _construct_charge(work, sum(len(o['name']) + len(o['regions']) for o in owners))
+            roots = [(owner, shape) for owner in owners if (shape := plain_rust_function_symbol(owner['name']))
+                     is not None and shape.identifiers == scope]
+            if len(roots) != 1:
+                continue
+            (root, shape), = roots
+            touching = [(owner, raw) for owner in owners if (raw := [
+                r for r in owner['regions'] if r[0] <= line <= r[2]])]
+            if len(touching) != 2 or sum(owner is root for owner, _ in touching) != 1:
+                continue
+            root_raw = next(raw for owner, raw in touching if owner is root)
+            child, child_raw = next((owner, raw) for owner, raw in touching if owner is not root)
+            hits = child['count']
+            if (not direct_rust_callback_symbol(child['name'], root['name'], shape.modules)
+                    or not 0 < hits <= root['count'] < COUNTER_LIMIT
+                    or any(index.name_counts[owner['name']] != 1 or owner.get('branches')
+                           or owner.get('mcdc_records') or len(owner['filenames']) != 1
+                           or index.files.get(owner['filenames'][0]) != name for owner in (root, child))
+                    or root_raw != [[line, 9, line, 16, hits, 0, 0, 0], [line, 17, line, 33, hits, 0, 0, 0]]
+                    or child_raw != [[line, 40, line, 41, hits, 0, 0, 0]]
+                    or counts.get(line) != hits):
+                continue
+            if declaration in entries:
+                return None
+            entries[declaration] = dict(line=line, input=input_source, owners=[root['name'], child['name']])
+        observations.append(entries)
+    previous, current = observations
+    pairs = []; witnesses = []
+    for declaration, before in previous.items():
+        after = current.get(declaration)
+        if after is None or before['input'] != after['input']:
+            continue
+        pairs.append([before['line'], after['line']])
+        witnesses.append(dict(test=declaration, owners=[before['owners'], after['owners']]))
+    return dict(file=name, kind='retained-aur-environment-entries', pairs=pairs, fixtures=witnesses) if pairs else None
+
+
 def retained_callback_statement(name, sides, indexes, work):
     """Prove one unchanged statement at the start of the same tail callback."""
     if name == 'src/package_managers/aur/client.rs':
@@ -16061,11 +16737,14 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
         'src/package_managers/aur/client.rs': (retained_aur_archive_capture, retained_private_aur_fixture_encoder,
                                               retained_aur_hook_preview_map, retained_aur_lifecycle_worker,
                                               retained_aur_package_lock_worker, retained_aur_index_search,
-                                              retained_aur_index_info),
+                                              retained_aur_index_info, retained_aur_update_workers,
+                                              retained_aur_rollback_stages, retained_aur_environment_entries),
         'src/package_managers/aur_metadata.rs': (retained_metadata_publication_success,),
         'src/package_managers/pacman_db/db.rs': (retained_cached_upgrade_comparison, retained_pacman_pattern_inputs,
                                                 retained_pacman_pattern_matcher, retained_pacman_foreign_catalog_reads),
         'src/runtimes/node.rs': (retained_node_checksum_wait, retained_node_retry_fixtures),
+        'src/runtimes/pi.rs': (retained_pi_runtime_fixtures,),
+        'src/runtimes/python/catalog.rs': (retained_python_catalog_request,),
     }
     for name in bs:
         file_replacement_start = len(replacement_receipts)
@@ -16179,6 +16858,22 @@ def require_source_no_regression(base, head, base_regions, head_regions, base_so
             if frozenset(map(id, previous)) not in closed[0]:
                 continue
             if len(previous) != len(current):
+                if (name == 'src/runtimes/common.rs'
+                        and declaration.startswith('pub(crate) fn set_current_version(')
+                        and frozenset(map(id, current)) in closed[1]
+                        and 'src/runtimes/pi.rs' in bs and 'src/runtimes/pi.rs' in hs):
+                    pi = tuple(sources['src/runtimes/pi.rs'].decode('utf-8').splitlines()
+                               for sources in (base_sources, head_sources))
+                    proof = retained_runtime_selection_copies(
+                        name, ((old, before, previous), (new, after, current)),
+                        source_owner_indexes(), pi, construct_work)
+                    if proof is not None:
+                        for line, target in proof['pairs']:
+                            if line in anchored and anchored[line] != target:
+                                raise ValueError('Ambiguous retained runtime selection owner')
+                            anchored[line] = target
+                        specialization_receipts.setdefault('retained_runtime_selection_copies', []).append(proof)
+                        continue
                 if len(current) > len(previous) and frozenset(map(id, current)) in closed[1]:
                     candidates = (*previous, *current)
                     path_reference = all(owner['name'].startswith('_RINvM') for owner in candidates)
