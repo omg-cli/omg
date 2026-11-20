@@ -388,6 +388,99 @@ class MetadataPublicationCoverageTests(unittest.TestCase):
 
 
 class AurArchiveCaptureCoverageTests(unittest.TestCase):
+    def test_index_info_preserves_worker_and_await_when_previously_cold(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+        sides, indexes, lookups = [], [], []
+        for side in range(2):
+            header = '    pub async fn info(&self, package: &str) -> Result<Option<Package>> {'
+            snapshot = ('let Some(index) = self.fresh_metadata_index().await' if side else
+                        'let Some(index_path) = self.fresh_metadata_index_path().await')
+            source = ['impl AurClient {', header, '        crate::core::security::validate_package_name(package)?;',
+                      f'        if {snapshot} {{', '            let package_owned = package.to_string();',
+                      '            let result = tokio::task::spawn_blocking(move || -> Result<Option<Package>> {']
+            if not side:
+                source.append('                let index = AurIndex::open(&index_path)?;')
+            lookup = len(source) + 1
+            lookups.append(lookup)
+            source.extend(['                if let Some(entry) = index.get(&package_owned)? {',
+                           '                    return Ok(Some(entry));', '                }',
+                           '                Ok(None)', '            })', '            .await?;',
+                           '            return result;', '        }', '        Ok(None)', '    }', '}'])
+            root = f'NvMs2_NtNtNtCs{side + 1}_7omg_lib16package_managers3aur6clientNtB5_9AurClient4info'
+            future = root.replace('NtB5_', 'NtB7_')
+            worker = root.replace('NtB5_', 'NtB9_')
+            owners = [dict(name='_R' + root, count=side, filenames=list(files),
+                           regions=[[2, 5, 2, len(header) - 1, side, 0, 0, 0]]),
+                      dict(name='_RNC' + future + '0Bd_', count=side, filenames=list(files),
+                           regions=[[6, 17, 6, 23, side, 0, 0, 0], [lookup + 5, 14, lookup + 5, 19, side, 0, 0, 0]]),
+                      dict(name='_RNCNC' + worker + '00Bf_', count=side, filenames=list(files),
+                           regions=[[6, 89, 6, 90, side, 0, 0, 0], [lookup, 29, lookup, 34, side, 0, 0, 0]])]
+            counts = dict.fromkeys((6, lookup, lookup + 5), side)
+            sides.append((source, coverage._construct_inventory(source, work), counts))
+            indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+        proof = coverage.retained_aur_index_info(filename, sides, indexes, work)
+        self.assertIsNotNone(proof)
+        self.assertIn(lookups, proof['pairs'])
+        self.assertIsNone(coverage.retained_aur_index_info(filename, sides[::-1], indexes[::-1], work))
+
+    def test_index_search_preserves_worker_loop_after_snapshot_moves_outside_worker(self):
+        filename = 'src/package_managers/aur/client.rs'
+        files = {'/artifact/' + filename: filename}
+        for fault in (None, 'lost-deduplication', 'wrong-snapshot', 'cold-loop'):
+            with self.subTest(fault=fault):
+                work = [coverage.SOURCE_CONSTRUCT_WORK_CAPACITY]
+                sides, indexes, loops = [], [], []
+                for side in range(2):
+                    header = '    pub async fn search(&self, query: &str) -> Result<Vec<Package>> {'
+                    validate = 'validate_aur_search_query' if side else 'validate_search_query'
+                    snapshot = ('let Some(index) = self.fresh_metadata_index().await' if side else
+                                'let Some(index_path) = self.fresh_metadata_index_path().await')
+                    if side and fault == 'wrong-snapshot':
+                        snapshot = snapshot.replace('fresh_metadata_index', 'stale_metadata_index')
+                    source = ['impl AurClient {', header, f'        {validate}(query)?;',
+                              f'        if {snapshot} {{', '            let query_owned = query.to_string();',
+                              '            let result = tokio::task::spawn_blocking(move || -> Result<Vec<Package>> {']
+                    if not side:
+                        source.append('                let index = AurIndex::open(&index_path)?;')
+                    begin = len(source) + 1
+                    loops.append(begin)
+                    comparison = '!=' if side and fault == 'lost-deduplication' else '=='
+                    source.extend(['                let mut entries = Vec::with_capacity(50);',
+                                   '                for entry in index.search(&query_owned, 50)? {',
+                                   '                    if !entries.iter().any(|selected| {',
+                                   f'                        selected.name.as_str() {comparison} entry.name.as_str()',
+                                   '                    }) {', '                        entries.push(entry);',
+                                   '                    }', '                }', '                Ok(entries)',
+                                   '            })', '            .await?;', '            return result;', '        }',
+                                   '        Ok(Vec::new())', '    }', '}'])
+                    waited = begin + 10
+                    root = f'NvMs2_NtNtNtCs{side + 1}_7omg_lib16package_managers3aur6clientNtB5_9AurClient6search'
+                    future = root.replace('NtB5_', 'NtB7_')
+                    worker = root.replace('NtB5_', 'NtB9_')
+                    predicate = root.replace('NtB5_', 'NtBb_')
+                    raw = [[begin, 21, begin, 32, 1, 0, 0, 0],
+                           [begin + 1, 21, begin + 1, 26, 4, 0, 0, 0],
+                           [begin + 5, 25, begin + 5, 38, int(not (side and fault == 'cold-loop')), 0, 0, 0]]
+                    owners = [dict(name='_R' + root, count=1, filenames=list(files),
+                                   regions=[[2, 5, 2, len(header) - 1, 1, 0, 0, 0]]),
+                              dict(name='_RNC' + future + '0Bd_', count=1, filenames=list(files),
+                                   regions=[[6, 17, 6, 23, 1, 0, 0, 0], [waited, 14, waited, 19, 1, 0, 0, 0]]),
+                              dict(name='_RNCNC' + worker + '00Bf_', count=1, filenames=list(files),
+                                   regions=[[6, 86, 6, 87, 1, 0, 0, 0], *raw]),
+                              dict(name='_RNCNCNC' + predicate + '000Bh_', count=4, filenames=list(files),
+                                   regions=[[begin + 3, 25, begin + 3, 39, 4, 0, 0, 0]])]
+                    counts = {6: 1, waited: 1, begin: 1, begin + 1: 4, begin + 3: 4, begin + 5: 1}
+                    sides.append((source, coverage._construct_inventory(source, work), counts))
+                    indexes.append(coverage.index_compiled_owner_sources(owners, files, work, {filename}))
+                proof = coverage.retained_aur_index_search(filename, sides, indexes, work)
+                if fault is None:
+                    self.assertIsNotNone(proof)
+                    self.assertIn(loops, proof['pairs'])
+                else:
+                    self.assertIsNone(proof)
+
     def test_package_base_lock_keeps_the_worker_and_blocking_lock(self):
         filename = 'src/package_managers/aur/client.rs'
         files = {'/artifact/' + filename: filename}
@@ -677,6 +770,61 @@ class RetainedNodeChecksumWaitTests(unittest.TestCase):
                     self.assertEqual(proof['pairs'], [waits, [line + 1 for line in waits]])
                 else:
                     self.assertIsNone(proof)
+
+
+class NodeChecksumFixtureMigrationTests(unittest.TestCase):
+    def test_alias_fixture_requires_the_original_requests_and_exact_new_probes(self):
+        declaration = 'https_alias_resolution_requires_the_exact_release_identity'
+        base = ['            (0..4)', '        let manager = NodeManager {',
+                '        assert_eq!(manager.resolve_alias("v20.10.0").await?, "20.10.0");',
+                '        assert_eq!(', '            fixture.finish().await?,',
+                '            vec!["GET /dist/index.json HTTP/1.1"; 4]', '        );']
+        signed = ['            (0..6)', base[1],
+                  '            security: crate::runtimes::security::RuntimeSecurity::fixture()',
+                  base[2], '        assert_eq!(manager.resolve_requested_version("20").await?, "20.10.0");',
+                  '        assert_eq!(manager.resolve_requested_version("20.10").await?, "20.10.0");',
+                  *base[3:5], '            vec!["GET /dist/index.json HTTP/1.1"; 6]', base[6]]
+        # The new security field must have the same Rust punctuation as the fixture.
+        self.assertIsNone(coverage.retained_node_retry_sources(declaration, base, signed))
+        signed[2] += ','
+        self.assertEqual(coverage.retained_node_retry_sources(declaration, base, signed),
+                         [(1, 1), (2, 3), (3, 6), (4, 7), (6, 9)])
+        signed[5] = signed[5].replace('"20.10.0"', '"20.11.0"')
+        self.assertIsNone(coverage.retained_node_retry_sources(declaration, base, signed))
+
+    def test_only_unchanged_retry_steps_map_to_the_signed_fixture(self):
+        setup = ['        let filename = "node-v24.21.0-linux-x64.tar.xz";',
+                 '        let digest = "a".repeat(64);',
+                 '        let path = "/dist/v24.21.0/SHASUMS256.txt";']
+        fixture = ['        let fixture = super::super::test_https::HttpsFixture::new_with_statuses(',
+                   '            "nodejs.org",', '            vec![',
+                   '                (path.into(), 503, b"temporarily unavailable".to_vec()),',
+                   '                (', '                    path.into(),', '                    200,',
+                   '                    format!("{digest}  {filename}\\n").into_bytes(),',
+                   '                ),', '            ],', '        )', '        .await?;']
+        manager = ['        let directory = tempfile::tempdir()?;', '        let manager = NodeManager {',
+                   '            versions_dir: directory.path().to_path_buf(),',
+                   '            client: Box::leak(Box::new(fixture.client(true)?)),', '        };']
+        end = ['        assert_eq!(manager.fetch_checksum("24.21.0", filename).await?, digest);',
+               '        Ok(())']
+        base = setup + fixture + manager + end
+        signed = ['        let filename = "node-v24.22.3-linux-x64.tar.xz";',
+                  '        let digest = SIGNED_NODE_ARCHIVE_SHA256;',
+                  '        let path = "/dist/v24.22.3/SHASUMS256.txt.asc";',
+                  *fixture[:4], '                (path.into(), 200, SIGNED_NODE_MANIFEST.to_vec()),',
+                  *fixture[9:], *manager[:2],
+                  '            security: crate::runtimes::security::RuntimeSecurity::fixture(),',
+                  *manager[2:], end[0].replace('24.21.0', '24.22.3'), end[1]]
+        declaration = 'metadata_retry_recovers_node_checksum_without_skipping_integrity'
+        pairs = coverage.retained_node_retry_sources(declaration, base, signed)
+        self.assertIsNotNone(pairs)
+        self.assertIn((base.index('        .await?;'), signed.index('        .await?;')), pairs)
+        self.assertTrue(all(base[old] == signed[new] for old, new in pairs))
+        for needle, replacement in (('503', '200'), ('SIGNED_NODE_MANIFEST.to_vec()', 'vec![]'),
+                                    ('fixture.client(true)', 'fixture.client(false)')):
+            with self.subTest(needle=needle):
+                changed = [line.replace(needle, replacement) for line in signed]
+                self.assertIsNone(coverage.retained_node_retry_sources(declaration, base, changed))
 
 
 class PacmanFixtureCoverageTests(unittest.TestCase):
@@ -7649,7 +7797,7 @@ class SourceAwareCoverageTests(unittest.TestCase):
             sources=({'example.rs': ('\n'.join(sources[0])+'\n').encode()},
                      {'example.rs': ('\n'.join(sources[1])+'\n').encode()}))
 
-    def synchronous_tail_record_compare(self, direct_first=False, fault=None, shorthand=False):
+    def synchronous_tail_record_compare(self, direct_first=False, fault=None, shorthand=False, impl_scope=''):
         old = ['impl Widget {', '    pub fn create() -> Self {', '        Self {',
                '            directory: super::DATA_DIR.join("widget"),',
                '            client: download_client(),', '        }', '    }', '}',
@@ -7691,7 +7839,9 @@ class SourceAwareCoverageTests(unittest.TestCase):
                     rows.append(value(first+side))
                 if side:
                     rows.append(value(first))
-                owner = f'_RNvMNtCs{copy_number}_7example7exampleNtB2_6Widget6create'
+                scope = 's1_' if side and fault == 'foreign-impl' else impl_scope
+                self_type = 'B5_' if scope else 'B2_'
+                owner = f'_RNvM{scope}NtCs{copy_number}_7example7exampleNt{self_type}6Widget6create'
                 self.assertIsNotNone(coverage.nominal_method_path(owner))
                 members.append(dict(name=owner, count=hits, filenames=['/src/example.rs'],
                                     regions=rows, branches=[], mcdc_records=[]))
@@ -8439,6 +8589,14 @@ class SourceAwareCoverageTests(unittest.TestCase):
                 self.assertEqual(report['deleted_mapped'], 0)
                 self.assertEqual([r['extra_field'][4] for r in proof['forests'][1]],
                                  [4, int(not direct_first)])
+
+    def test_tail_record_matches_the_same_nonzero_impl_disambiguator(self):
+        report = self.synchronous_tail_record_compare(impl_scope='s0_')
+        proof, = [row for row in report['retained_replacement_obligations']
+                  if row.get('kind') == 'retained-record-field-forest']
+        self.assertIn([4, 5], proof['pairs'])
+        with self.assertRaisesRegex(ValueError, 'Unproved retained execution'):
+            self.synchronous_tail_record_compare(fault='foreign-impl', impl_scope='s0_')
 
     def test_cfg_tail_record_insertion_binds_ordered_typed_shorthand_slots(self):
         report = self.synchronous_tail_record_compare(True, shorthand=True)
