@@ -252,24 +252,32 @@ mod filesystem_security {
     }
 
     #[test]
-    fn test_symlink_security() {
+    #[cfg(all(
+        unix,
+        any(feature = "arch", feature = "debian", feature = "debian-pure")
+    ))]
+    fn test_environment_check_refuses_a_symlinked_lockfile() {
         let project = TestProject::new();
+        project.run(&["env", "capture"]).assert_success();
+        project.run(&["env", "check"]).assert_success();
 
-        #[cfg(unix)]
-        {
-            // Create symlink to sensitive file (fail loudly if setup breaks,
-            // otherwise the leak assertion below proves nothing)
-            let link_path = project.path().join("passwd_link");
-            std::os::unix::fs::symlink("/etc/passwd", &link_path)
-                .expect("create /etc/passwd symlink fixture");
+        let lock_path = project.path().join("omg.lock");
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("omg.lock");
+        let contents = std::fs::read(&lock_path).unwrap();
+        std::fs::copy(&lock_path, &target).unwrap();
+        std::fs::remove_file(&lock_path).unwrap();
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
 
-            // OMG should not follow symlinks to sensitive locations
-            let result = project.run(&["status"]);
-            assert!(
-                !result.stdout.contains("root:x:0:0"),
-                "Followed symlink to /etc/passwd"
-            );
-        }
+        let result = project.run(&["env", "check"]);
+        result.assert_failure();
+        assert!(
+            result.contains("Refusing to read lockfile that is not a regular file: omg.lock"),
+            "{}",
+            result.combined_output()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), contents);
+        assert_eq!(std::fs::read_link(&lock_path).unwrap(), target);
     }
 
     #[test]
@@ -297,30 +305,18 @@ mod filesystem_security {
     }
 
     #[test]
-    fn test_temp_file_security() {
+    #[cfg(any(feature = "arch", feature = "debian", feature = "debian-pure"))]
+    fn test_capture_writes_a_private_lockfile() {
         let project = TestProject::new();
-        let result = project.run(&["env", "capture"]);
+        project.run(&["env", "capture"]).assert_success();
         let lock_path = project.path().join("omg.lock");
 
-        if result.success {
-            assert!(
-                lock_path.exists(),
-                "a successful capture must write omg.lock"
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
-                assert_eq!(
-                    mode, 0o600,
-                    "omg.lock must not be group or world accessible, got {mode:o}"
-                );
-            }
-        } else {
-            assert!(
-                !lock_path.exists(),
-                "a failed capture must not write a partial lockfile"
-            );
+        let metadata = std::fs::symlink_metadata(&lock_path).unwrap();
+        assert!(metadata.is_file());
+        #[cfg(unix)]
+        {
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "captured lockfile must be private");
         }
     }
 }

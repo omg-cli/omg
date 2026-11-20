@@ -526,53 +526,51 @@ mod security {
 
     #[test]
     fn test_audit_sbom_generation() {
-        require_system_tests!();
-        require_arch!();
-
-        // SBOM is not paywalled. Success writes CycloneDX JSON; failure must
-        // name a real operational cause, not a paid tier.
         let project = TestProject::new();
-        let result = project.run(&["audit", "sbom", "--output", "sbom.json"]);
-        if result.success {
-            let content = project
-                .read_file("sbom.json")
-                .expect("audit sbom must write its output file on success");
-            let sbom: serde_json::Value =
-                serde_json::from_str(&content).expect("SBOM must be valid JSON");
-            assert!(
-                sbom.get("components").is_some(),
-                "CycloneDX SBOM must contain components"
-            );
-        } else {
-            let output = result.combined_output();
-            assert!(
-                !output.contains("tier") && !output.contains("/pricing"),
-                "SBOM must not be paywalled, got:\n{output}"
-            );
-        }
+        project
+            .mock_install("omg-sbom-fixture", "1.2.3")
+            .expect("seed the installed package inventory");
+        project
+            .run(&["audit", "sbom", "--inventory-only", "--output", "sbom.json"])
+            .assert_success();
+        let content = project
+            .read_file("sbom.json")
+            .expect("audit sbom must write its output file");
+        let sbom: serde_json::Value = serde_json::from_str(&content).expect("valid CycloneDX JSON");
+        assert_eq!(sbom["bomFormat"], "CycloneDX");
+        assert_eq!(sbom["specVersion"], "1.5");
+        assert!(
+            sbom["components"]
+                .as_array()
+                .is_some_and(|components| components.iter().any(|component| {
+                    component["name"] == "omg-sbom-fixture" && component["version"] == "1.2.3"
+                })),
+            "SBOM must contain the seeded package and version"
+        );
+        assert!(
+            sbom["metadata"]["component"]["properties"]
+                .as_array()
+                .is_some_and(|properties| properties.iter().any(|property| {
+                    property["name"] == "omg:advisory-scan" && property["value"] == "not-performed"
+                })),
+            "inventory-only SBOM must disclose skipped advisory matching"
+        );
     }
 
     #[test]
     fn test_audit_secrets_scan() {
-        // Secret scanning is not paywalled. The scanner's password pattern
-        // matches the planted `password=secret123` value.
+        let secret = "fixture-secret-value";
         let project = TestProject::new();
-        project.create_file("config.txt", "password=secret123");
+        project.create_file("config.txt", &format!("password={secret}\n"));
 
         let result = project.run(&["audit", "secrets"]);
-        if result.success {
-            assert!(
-                result.stdout_contains("potential secrets"),
-                "scanner must report the planted secret, got:\n{}",
-                result.stdout
-            );
-        } else {
-            let output = result.combined_output();
-            assert!(
-                !output.contains("tier") && !output.contains("/pricing"),
-                "secret scan must not be paywalled, got:\n{output}"
-            );
-        }
+        result.assert_success();
+        assert!(result.stdout_contains("Found 1 potential secrets"));
+        assert!(result.stdout_contains("config.txt:1"));
+        assert!(
+            !result.contains(secret),
+            "the finding must redact the fixture value"
+        );
     }
 
     #[test]
